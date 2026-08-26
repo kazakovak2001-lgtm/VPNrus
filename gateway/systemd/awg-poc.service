@@ -1,0 +1,25 @@
+# Based on the official amneziawg-tools systemd/wg-quick@.service template
+# (pinned tag v3.1.20260812, see build-awg.sh), instantiated directly for
+# our single POC interface rather than as a parametrized @.service, and
+# pointed at /usr/local/bin (where build-awg.sh installs, not /usr/bin).
+[Unit]
+Description=AmneziaWG POC gateway (awg0) via awg-quick(8)
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+# No Documentation=man:... entries: build-awg.sh installs only the binaries,
+# not the man pages, so pointing at them here would make `systemd-analyze
+# verify` warn on a real deployment too.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/awg-quick up awg0
+ExecStop=/usr/local/bin/awg-quick down awg0
+# Live-apply peer/config changes without dropping the interface (used by
+# scripts/add-peer.sh and scripts/remove-peer.sh via `systemctl reload`).
+ExecReload=/bin/bash -c 'exec /usr/local/bin/awg syncconf awg0 <(exec /usr/local/bin/awg-quick strip awg0)'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

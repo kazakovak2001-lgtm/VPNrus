@@ -1,0 +1,35 @@
+#!/usr/sbin/nft -f
+#
+# Scope: forwarding + NAT for the AmneziaWG tunnel only, in our OWN table
+# (inet pocvpn). This never touches any other nftables table or the host's
+# existing firewall (ufw, etc.) - we only add, never flush unrelated rules.
+#
+# Idempotent by construction: `table inet __NFT_TABLE__` creates the table
+# if missing (no-op if it already exists), then `delete table` removes
+# whatever was there, then it is fully redeclared below - safe to re-run.
+#
+# Rendered by provision.sh: __AWG_IFACE__, __EGRESS_IFACE__, __AWG_SUBNET__.
+
+table inet __NFT_TABLE__
+delete table inet __NFT_TABLE__
+
+table inet __NFT_TABLE__ {
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+
+        ct state established,related accept
+
+        # Only the AWG tunnel <-> detected egress interface may forward.
+        # Everything else through this table's forward hook is dropped
+        # (default-deny except the required VPN path).
+        iifname "__AWG_IFACE__" oifname "__EGRESS_IFACE__" accept
+        iifname "__EGRESS_IFACE__" oifname "__AWG_IFACE__" accept
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+
+        # NAT/masquerade tunnel client traffic out through the egress interface.
+        ip saddr __AWG_SUBNET__ oifname "__EGRESS_IFACE__" masquerade
+    }
+}

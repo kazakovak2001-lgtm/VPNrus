@@ -1,0 +1,27 @@
+# Template only - placeholders, no real secrets. provision.sh renders the
+# real file to /etc/amnezia/amneziawg/awg0.conf (mode 600, root:root), which
+# is never committed (see .gitignore: gateway/generated/, *.conf exclusions).
+#
+# The PrivateKey value below is generated ON THE VPS by provision.sh via
+# `awg genkey` - it is never generated off-device and never committed.
+
+[Interface]
+PrivateKey = __SERVER_PRIVATE_KEY__
+Address = __GATEWAY_TUNNEL_IP__/__GATEWAY_TUNNEL_PREFIX__
+ListenPort = __LISTEN_PORT__
+Jc = __AWG_JC__
+Jmin = __AWG_JMIN__
+Jmax = __AWG_JMAX__
+S1 = __AWG_S1__
+S2 = __AWG_S2__
+S3 = __AWG_S3__
+S4 = __AWG_S4__
+H1 = __AWG_H1__
+H2 = __AWG_H2__
+H3 = __AWG_H3__
+H4 = __AWG_H4__
+RandomTrailers = __AWG_RANDOM_TRAILERS__
+DisableCookies = __AWG_DISABLE_COOKIES__
+
+# --- PEERS BEGIN --- (managed by scripts/add-peer.sh / remove-peer.sh; do not hand-edit below this line)
+# --- PEERS END ---
