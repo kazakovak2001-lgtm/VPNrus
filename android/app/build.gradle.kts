@@ -57,4 +57,6 @@ dependencies {
     implementation(files(awgTunnelAar))
     implementation("androidx.annotation:annotation:1.8.2")
     implementation("androidx.collection:collection:1.4.4")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    testImplementation("junit:junit:4.13.2")
 }
