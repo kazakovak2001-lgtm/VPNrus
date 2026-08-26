@@ -14,4 +14,5 @@ object BuildConfigGatewaySource : GatewayConfigSource {
     override fun serverPublicKey(): String = BuildConfig.GATEWAY_SERVER_PUBLIC_KEY
     override fun clientTunnelIp(): String = BuildConfig.GATEWAY_CLIENT_TUNNEL_IP
     override fun gatewayTunnelIp(): String = BuildConfig.GATEWAY_TUNNEL_IP
+    override fun allowedIps(): String = BuildConfig.GATEWAY_ALLOWED_IPS
 }

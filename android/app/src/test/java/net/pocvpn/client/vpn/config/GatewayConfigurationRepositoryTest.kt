@@ -10,12 +10,14 @@ private class FakeGatewayConfigSource(
     private val publicKey: String = "",
     private val clientIp: String = "",
     private val gatewayIp: String = "",
+    private val allowedIps: String = "",
 ) : GatewayConfigSource {
     override fun endpointHost() = host
     override fun endpointPort() = port
     override fun serverPublicKey() = publicKey
     override fun clientTunnelIp() = clientIp
     override fun gatewayTunnelIp() = gatewayIp
+    override fun allowedIps() = allowedIps
 }
 
 class GatewayConfigurationRepositoryTest {
@@ -100,6 +102,37 @@ class GatewayConfigurationRepositoryTest {
             ),
         )
         assertTrue(repo.get() is GatewayConfiguration.Invalid)
+    }
+
+    @Test
+    fun `unset allowedIps defaults to full-tunnel routing`() {
+        val repo = DefaultGatewayConfigurationRepository(
+            FakeGatewayConfigSource(
+                host = "203.0.113.10",
+                port = "51820",
+                publicKey = validKey,
+                clientIp = "10.77.0.2",
+                gatewayIp = "10.77.0.1",
+            ),
+        )
+        val result = repo.get() as GatewayConfiguration.Configured
+        assertEquals(listOf("0.0.0.0/0", "::/0"), result.allowedIps)
+    }
+
+    @Test
+    fun `allowedIps override narrows routing to the given CIDR`() {
+        val repo = DefaultGatewayConfigurationRepository(
+            FakeGatewayConfigSource(
+                host = "172.27.193.89",
+                port = "51820",
+                publicKey = validKey,
+                clientIp = "10.77.0.2",
+                gatewayIp = "10.77.0.1",
+                allowedIps = "10.77.0.0/24",
+            ),
+        )
+        val result = repo.get() as GatewayConfiguration.Configured
+        assertEquals(listOf("10.77.0.0/24"), result.allowedIps)
     }
 
     @Test

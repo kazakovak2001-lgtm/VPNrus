@@ -31,6 +31,7 @@ android {
         buildConfigField("String", "GATEWAY_SERVER_PUBLIC_KEY", "\"${gatewayDevProp("serverPublicKey")}\"")
         buildConfigField("String", "GATEWAY_CLIENT_TUNNEL_IP", "\"${gatewayDevProp("clientTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_TUNNEL_IP", "\"${gatewayDevProp("gatewayTunnelIp")}\"")
+        buildConfigField("String", "GATEWAY_ALLOWED_IPS", "\"${gatewayDevProp("allowedIps")}\"")
     }
 
     buildTypes {

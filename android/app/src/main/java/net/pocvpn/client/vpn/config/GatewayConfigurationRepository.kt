@@ -7,6 +7,14 @@ interface GatewayConfigSource {
     fun serverPublicKey(): String
     fun clientTunnelIp(): String
     fun gatewayTunnelIp(): String
+
+    /**
+     * Comma-separated AllowedIPs override (e.g. "10.77.0.0/24" for a narrow
+     * local-test route, instead of the full-tunnel default). Blank means
+     * "not specified" - DefaultGatewayConfigurationRepository falls back to
+     * the full-tunnel default in that case.
+     */
+    fun allowedIps(): String = ""
 }
 
 interface GatewayConfigurationRepository {
@@ -59,9 +67,15 @@ class DefaultGatewayConfigurationRepository(
             serverPublicKeyBase64 = serverPublicKey,
             clientTunnelIp = clientTunnelIp,
             gatewayTunnelIp = gatewayTunnelIp,
-            allowedIps = listOf("0.0.0.0/0", "::/0"),
+            allowedIps = resolveAllowedIps(),
             profile = profile,
         )
+    }
+
+    /** Full-tunnel default, unless the source overrides it (e.g. a narrow route for local testing). */
+    private fun resolveAllowedIps(): List<String> {
+        val override = source.allowedIps().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        return override.ifEmpty { listOf("0.0.0.0/0", "::/0") }
     }
 
     private fun isValidIpv4(ip: String): Boolean {
