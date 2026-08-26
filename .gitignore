@@ -37,3 +37,4 @@ android/**/libs/
 # Server-side generated peer configs (contain private keys)
 gateway/generated/
 gateway/wg-keys/
+android/app/build/
