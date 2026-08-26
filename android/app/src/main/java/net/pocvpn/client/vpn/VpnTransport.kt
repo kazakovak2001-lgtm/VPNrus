@@ -1,5 +1,6 @@
 package net.pocvpn.client.vpn
 
+import android.content.Intent
 import kotlinx.coroutines.flow.Flow
 import net.pocvpn.client.vpn.config.TransportConfig
 
@@ -11,6 +12,9 @@ import net.pocvpn.client.vpn.config.TransportConfig
  */
 interface VpnTransport {
     val name: String
+
+    /** Null if no OS-level permission is needed or it's already granted; otherwise the Intent to launch. */
+    fun preparePermissionIntent(): Intent?
 
     suspend fun connect(config: TransportConfig)
     suspend fun disconnect()

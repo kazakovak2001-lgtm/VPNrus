@@ -38,3 +38,8 @@ android/**/libs/
 gateway/generated/
 gateway/wg-keys/
 android/app/build/
+
+# Developer-local, non-secret-but-still-gitignored gateway config for manual
+# testing (B7C) - contains a real server public key + endpoint once a VPS
+# exists. Never committed.
+android/app/gateway-dev.properties

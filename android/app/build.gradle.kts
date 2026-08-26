@@ -1,7 +1,18 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// Optional, gitignored, developer-local gateway config for manual testing
+// against a real VPS once one exists. Never committed - see .gitignore.
+// All values default to "" (interpreted as GatewayConfiguration.Missing).
+val gatewayDevProperties = Properties().apply {
+    val f = file("gateway-dev.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun gatewayDevProp(key: String): String = gatewayDevProperties.getProperty(key, "")
 
 android {
     namespace = "net.pocvpn.client"
@@ -14,6 +25,12 @@ android {
         versionCode = 1
         versionName = "0.1-poc"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "GATEWAY_ENDPOINT_HOST", "\"${gatewayDevProp("endpointHost")}\"")
+        buildConfigField("String", "GATEWAY_ENDPOINT_PORT", "\"${gatewayDevProp("endpointPort")}\"")
+        buildConfigField("String", "GATEWAY_SERVER_PUBLIC_KEY", "\"${gatewayDevProp("serverPublicKey")}\"")
+        buildConfigField("String", "GATEWAY_CLIENT_TUNNEL_IP", "\"${gatewayDevProp("clientTunnelIp")}\"")
+        buildConfigField("String", "GATEWAY_TUNNEL_IP", "\"${gatewayDevProp("gatewayTunnelIp")}\"")
     }
 
     buildTypes {
@@ -24,6 +41,10 @@ android {
 
     buildFeatures {
         buildConfig = true
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 
     compileOptions {
@@ -64,7 +85,9 @@ dependencies {
     implementation("androidx.collection:collection:1.4.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

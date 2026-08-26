@@ -37,8 +37,7 @@ class AmneziaWgTransport(private val context: Context) : VpnTransport {
         }
     }
 
-    /** Null if VPN permission is already granted; otherwise the Intent the caller must launch. */
-    fun preparePermissionIntent(): Intent? = VpnService.prepare(context)
+    override fun preparePermissionIntent(): Intent? = VpnService.prepare(context)
 
     override suspend fun connect(config: TransportConfig) {
         require(config is TransportConfig.Awg) { "AmneziaWgTransport only accepts TransportConfig.Awg" }
