@@ -67,6 +67,32 @@ class MainViewModelTest {
     }
 
     @Test
+    fun `constructing MainViewModel registers the reconnect manager exactly once`() = runTest {
+        val reconnectManager = FakeReconnectManager()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = reconnectManager,
+            diagnosticsStore = DiagnosticsStore(),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        // Activity recreation (rotation) does not construct a new MainViewModel -
+        // the ViewModelStore survives it - so this call count staying at 1 across
+        // this ViewModel's lifetime is what guarantees no duplicate
+        // ConnectivityManager callback registration on rotation.
+        assertEquals(1, reconnectManager.startCallCount)
+
+        // onCleared() is protected; drive it the same way the real Android
+        // lifecycle does - by clearing the ViewModelStore that owns it.
+        val store = androidx.lifecycle.ViewModelStore()
+        store.put("main", viewModel)
+        store.clear()
+        assertEquals(1, reconnectManager.stopCallCount)
+    }
+
+    @Test
     fun `regenerateIdentity clears then recreates identity`() = runTest {
         val keyRepository = FakeClientKeyRepository()
         val viewModel = MainViewModel(
