@@ -1,0 +1,39 @@
+# Secrets - never commit
+*.key
+*.pem
+*.conf
+!*.conf.template
+.env
+.env.*
+!.env.example
+local.properties
+**/secrets/
+*.jks
+*.keystore
+!debug.keystore
+
+# Android / Gradle
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Gradle wrapper distribution cache (not the wrapper jar itself)
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# Native submodule build artifacts
+android/tunnel/tools/amneziawg-tools/
+android/**/obj/
+android/**/libs/
+
+# Server-side generated peer configs (contain private keys)
+gateway/generated/
+gateway/wg-keys/
