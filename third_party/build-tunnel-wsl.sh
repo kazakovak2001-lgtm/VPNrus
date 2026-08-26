@@ -5,13 +5,14 @@
 # Why WSL: the upstream native build (Makefile-driven wireguard-go/amneziawg-go cross-compile,
 # elf-cleaner) requires a POSIX host toolchain (cc, flock) not present on plain Windows.
 #
-# Pinned revision: v3.0.1 (f82900455f1aceaa85658686dc2c5e32c2c42a73) - do not float to master.
+# Pinned revision: v3.1.20260814 (5c16489e2cd9ed3a0a7a27c7445bba5238132f86) - AWG 3.1 generation.
+# Do not float to master - always pin to this exact tag/commit until deliberately re-audited.
 set -euo pipefail
 
 WORK=~/build/amneziawg-android
 ANDROID_HOME=~/android-sdk
-PIN_TAG="v3.0.1"
-PIN_SHA="f82900455f1aceaa85658686dc2c5e32c2c42a73"
+PIN_TAG="v3.1.20260814"
+PIN_SHA="5c16489e2cd9ed3a0a7a27c7445bba5238132f86"
 
 if [ ! -d "$WORK" ]; then
     mkdir -p ~/build
@@ -40,4 +41,4 @@ export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
 OUT="$WORK/tunnel/build/outputs/aar/tunnel-debug.aar"
 echo "Built: $OUT"
-echo "Copy this file into android/app/libs/amneziawg-tunnel-v3.0.1-debug.aar for the app module to consume it."
+echo "Copy this file into android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar for the app module to consume it."
