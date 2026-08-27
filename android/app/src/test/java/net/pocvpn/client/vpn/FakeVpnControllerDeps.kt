@@ -6,6 +6,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import net.pocvpn.client.identity.ClientIdentity
 import net.pocvpn.client.identity.ClientKeyRepository
+import net.pocvpn.client.transport.TransportCapabilities
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.TransportConfig
@@ -13,6 +15,8 @@ import net.pocvpn.client.vpn.config.TransportConfig
 /** Test double for VpnTransport. `connectGate`, if set, makes connect() suspend until completed - for concurrency tests. */
 class FakeVpnTransport(private val permission: Intent? = null) : VpnTransport {
     override val name: String = "fake"
+    override val kind: TransportKind = TransportKind.AMNEZIA_WG
+    override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
 
     private val stateFlow = MutableStateFlow<TransportState>(TransportState.Disconnected)
     var connectCallCount = 0

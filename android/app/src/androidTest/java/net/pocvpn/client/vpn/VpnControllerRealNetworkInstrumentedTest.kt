@@ -13,6 +13,8 @@ import kotlinx.coroutines.runBlocking
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.identity.ClientIdentity
 import net.pocvpn.client.identity.ClientKeyRepository
+import net.pocvpn.client.transport.TransportCapabilities
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewayConfigurationRepository
@@ -63,6 +65,8 @@ class VpnControllerRealNetworkInstrumentedTest {
 
     private class FakeTransport : VpnTransport {
         override val name = "fake-instrumented"
+        override val kind: TransportKind = TransportKind.AMNEZIA_WG
+        override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
         private val stateFlow = MutableStateFlow<TransportState>(TransportState.Disconnected)
         var connectCallCount = 0
             private set

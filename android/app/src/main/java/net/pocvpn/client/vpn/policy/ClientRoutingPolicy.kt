@@ -45,9 +45,3 @@ sealed class ClientRoutingPolicy {
 enum class StrictNetworkAllowlistRequirement {
     REQUIRES_ANDROID_LOCKDOWN_MODE,
 }
-
-/** Placeholder for future Smart Connect - not wired to any routing logic yet. */
-enum class TransportKind {
-    DIRECT,
-    AWG,
-}

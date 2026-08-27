@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import net.pocvpn.client.transport.TransportCapabilities
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.AwgConfigMapper
 import net.pocvpn.client.vpn.config.TransportConfig
 import org.amnezia.awg.backend.GoBackend
@@ -21,6 +23,8 @@ import org.amnezia.awg.backend.Tunnel
 class AmneziaWgTransport(private val context: Context) : VpnTransport {
 
     override val name: String = "amneziawg"
+    override val kind: TransportKind = TransportKind.AMNEZIA_WG
+    override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
 
     private val state = MutableStateFlow<TransportState>(TransportState.Disconnected)
 
