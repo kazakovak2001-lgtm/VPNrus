@@ -8,16 +8,20 @@
 # unmodified and remains the supported fallback for a caller-chosen IP.
 #
 # Allocation is derived entirely from the live gateway config (the same
-# file add-peer.sh writes to) - there is no separate ledger that could
-# drift from it. The whole read-choose-add-verify sequence happens under
-# one exclusive flock so two concurrent callers can never receive the same
-# IP; the lock is released only after add-peer.sh has actually succeeded
-# (or the whole allocation is abandoned and nothing is reported allocated).
+# file add-peer.sh writes to, via the shared lib/peer_mutations.sh core) -
+# there is no separate ledger that could drift from it. The whole
+# read-choose-add-converge sequence happens under one exclusive flock so
+# two concurrent callers can never receive the same IP; the lock is
+# released only after the peer write AND live-state convergence have
+# actually succeeded (or the whole allocation is abandoned and nothing is
+# reported allocated).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=../lib/peer_mutations.sh
+source "$SCRIPT_DIR/lib/peer_mutations.sh"
 load_config
 
 usage() { echo "usage: $0 <CLIENT_PUBLIC_KEY> [label]" >&2; exit 2; }
@@ -75,10 +79,17 @@ done
 
 CHOSEN_IP=$(int_to_ipv4 "$CHOSEN_INT")
 
-log "allocated $CHOSEN_IP for '$LABEL' - handing off to add-peer.sh"
-"$SCRIPT_DIR/scripts/add-peer.sh" "$PUBLIC_KEY" "$CHOSEN_IP" "$LABEL"
+log "allocated $CHOSEN_IP for '$LABEL' - applying"
+# In-process calls, not a subprocess exec of add-peer.sh: both mutate_add_peer
+# and converge_live_state assume the caller already holds .provision.lock
+# (acquired above) and must never re-acquire it themselves - a subprocess
+# that tried to `flock` its own fresh fd on this same lock file, while this
+# script synchronously waited for it, would deadlock (see peer_mutations.sh).
+mutate_add_peer "$PUBLIC_KEY" "$CHOSEN_IP" "$LABEL"
+converge_live_state present "$PUBLIC_KEY"
 
-# add-peer.sh (set -e, sourced common.sh's `die`) would have already exited
-# non-zero on any failure, so reaching here means the peer write genuinely
-# succeeded - only now is it safe to report the IP as allocated.
+# mutate_add_peer/converge_live_state (set -e, common.sh's `die`) would have
+# already exited non-zero on any failure, so reaching here means the peer
+# write AND live convergence genuinely succeeded - only now is it safe to
+# report the IP as allocated.
 echo "$CHOSEN_IP"

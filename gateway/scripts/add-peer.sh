@@ -13,6 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=../lib/peer_mutations.sh
+source "$SCRIPT_DIR/lib/peer_mutations.sh"
 load_config
 
 usage() { echo "usage: $0 <CLIENT_PUBLIC_KEY> <CLIENT_TUNNEL_IP> [label]" >&2; exit 2; }
@@ -26,37 +28,12 @@ is_valid_wg_key "$PUBLIC_KEY" || die "not a valid AmneziaWG/WireGuard key: $PUBL
 ip_in_cidr "$TUNNEL_IP" "$AWG_SUBNET_CIDR" || die "$TUNNEL_IP is not inside the POC subnet $AWG_SUBNET_CIDR"
 [ "$TUNNEL_IP" != "$GATEWAY_TUNNEL_IP" ] || die "$TUNNEL_IP is the gateway's own tunnel address, cannot also be a peer"
 
-CONFIG_PATH="$CONFIG_DIR/$CONFIG_FILE"
-[ -f "$CONFIG_PATH" ] || die "gateway config not found at $CONFIG_PATH - run provision.sh first"
+# Existing-peer/existing-IP lookups happen inside mutate_add_peer, under
+# this lock - never before it, so two concurrent manual invocations can
+# never both decide "not a duplicate" and race each other.
+LOCK_FILE="$CONFIG_DIR/.provision.lock"
+exec 9>"$LOCK_FILE"
+flock -x 9
 
-if grep -qF "PublicKey = $PUBLIC_KEY" "$CONFIG_PATH"; then
-    die "a peer with this public key already exists"
-fi
-if grep -qE "AllowedIPs = ${TUNNEL_IP//./\\.}/32" "$CONFIG_PATH"; then
-    die "tunnel IP $TUNNEL_IP is already assigned to another peer"
-fi
-
-PEER_BLOCK=$(cat <<EOF
-[Peer]
-# label: $LABEL
-PublicKey = $PUBLIC_KEY
-AllowedIPs = $TUNNEL_IP/32
-EOF
-)
-
-TMP_FILE=$(mktemp)
-awk -v block="$PEER_BLOCK" '
-    /^# --- PEERS END ---/ { print block; print "" }
-    { print }
-' "$CONFIG_PATH" > "$TMP_FILE"
-chmod 600 "$TMP_FILE"
-mv "$TMP_FILE" "$CONFIG_PATH"
-
-log "peer added: $LABEL -> $TUNNEL_IP"
-
-if systemctl is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
-    log "reloading $SERVICE_NAME.service to apply the new peer without dropping the tunnel"
-    systemctl reload "$SERVICE_NAME.service"
-else
-    log "$SERVICE_NAME.service is not currently active - peer will apply the next time it starts"
-fi
+mutate_add_peer "$PUBLIC_KEY" "$TUNNEL_IP" "$LABEL"
+converge_live_state present "$PUBLIC_KEY"
