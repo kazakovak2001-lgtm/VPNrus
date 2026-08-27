@@ -60,8 +60,13 @@ systemd/
   awg-poc.service       based on upstream's own wg-quick@.service template
 scripts/
   add-peer.sh           manual peer provisioning (public key + tunnel IP only)
+  allocate-and-add-peer.sh  same, but picks the tunnel IP automatically
   remove-peer.sh
   status.sh              read-only status, never dumps the private key
+  tests/
+    run_tests.sh          allocation + concurrency tests, runs against
+                           isolated temp fixtures only - never touches a
+                           real gateway
 lib/
   common.sh              shared bash helpers (validation, templating)
 ```
@@ -76,9 +81,31 @@ lib/
 
 ```bash
 sudo ./provision.sh          # idempotent - safe to re-run
+
+# manual: you choose the tunnel IP
 sudo ./scripts/add-peer.sh <CLIENT_PUBLIC_KEY> 10.77.0.2 android-poc-1
+
+# or: automatic - the lowest free /32 in AWG_SUBNET_CIDR is chosen for you
+sudo ./scripts/allocate-and-add-peer.sh <CLIENT_PUBLIC_KEY> android-poc-1
+
 ./scripts/status.sh
 sudo ./scripts/remove-peer.sh <CLIENT_PUBLIC_KEY>
+```
+
+`allocate-and-add-peer.sh` reads the same live `awg0.conf` `add-peer.sh`
+writes to (no separate IP ledger to drift out of sync), never allocates the
+gateway/network/broadcast address, and serializes concurrent calls with an
+exclusive `flock` held across the whole read-choose-add-verify sequence -
+two simultaneous calls can never receive the same IP. It shells out to the
+unmodified `add-peer.sh` for the actual write, so an IP is only ever
+reported as allocated once that write has genuinely succeeded. The manual
+`add-peer.sh <key> <ip> [label]` path is unchanged and remains the
+supported fallback when you need to pick the IP yourself.
+
+Test it (isolated fixtures, never touches a real gateway):
+
+```bash
+bash ./scripts/tests/run_tests.sh
 ```
 
 ## Idempotence guarantees
@@ -128,6 +155,12 @@ sudo ./scripts/remove-peer.sh <CLIENT_PUBLIC_KEY>
   (public reachability, external IP change observed from an Android client,
   reboot persistence, coexistence with a real host firewall) remain
   UNVERIFIED until a VPS is provisioned (B6+).
+- **Follow-up finding (not reconciled in this slice):** this repository's
+  `gateway/` implementation is not assumed to be byte-identical to whatever
+  configuration currently runs on the live Oracle VPS reached via B6/B8B/B9/B10
+  (that work is not represented in this repository's git history as of this
+  finding). Any drift between the two should be reconciled explicitly and
+  deliberately in its own change, not assumed away.
 - `HeaderProtectionKey` is not configured for POC-01 - it is an additional
   shared secret (generated like a PSK) and requires `S1-S4 >= 12`. Deferred;
   `S1-S4` in the current profile already satisfy that constraint (15/20/15/20)
