@@ -35,6 +35,7 @@ make_fixture() {
     cp "$REPO_GATEWAY_DIR/scripts/add-peer.sh" "$root/scripts/add-peer.sh"
     cp "$REPO_GATEWAY_DIR/scripts/remove-peer.sh" "$root/scripts/remove-peer.sh"
     cp "$REPO_GATEWAY_DIR/scripts/allocate-and-add-peer.sh" "$root/scripts/allocate-and-add-peer.sh"
+    cp "$REPO_GATEWAY_DIR/scripts/provision-peer.sh" "$root/scripts/provision-peer.sh"
     chmod +x "$root/scripts/"*.sh
 
     # Fake systemctl/awg so converge_live_state's behavior is deterministic
@@ -119,6 +120,8 @@ EOF
 allocate() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/allocate-and-add-peer.sh" "$@" 2>/dev/null; }
 add_manual() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/add-peer.sh" "$@" 2>/dev/null; }
 remove_manual() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/remove-peer.sh" "$@" 2>/dev/null; }
+provision() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/provision-peer.sh" "$@" 2>/dev/null; }
+provision_stderr() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/provision-peer.sh" "$@" 2>&1 >/dev/null; }
 peer_count() { local n; n=$(grep -c '^\[Peer\]' "$1/etc/awg0.conf" 2>/dev/null); echo "${n:-0}"; }
 allowed_ips_of() { local root=$1 key=$2; grep -A2 "PublicKey = $key\$" "$root/etc/awg0.conf" | grep '^AllowedIPs' | sed -E 's#^AllowedIPs = ([0-9.]+)/32.*#\1#'; }
 has_peer() { grep -qF "PublicKey = $2" "$1/etc/awg0.conf"; }
@@ -155,6 +158,37 @@ EOF
     chmod 600 "$root/etc/awg0.conf"
 }
 
+# --- raw peer-block injection helpers (for find_existing_peer fail-closed
+# tests below) - these write directly to awg0.conf, bypassing add-peer.sh's
+# own validation entirely, because that validation is exactly what would
+# normally prevent this state from ever being created. The point of these
+# tests is: if it somehow got there anyway (hand-edit, an older bug, a
+# race outside this codebase's control), provision-peer.sh must still
+# detect it and fail closed rather than trust it. ---
+insert_before_end_marker() {
+    local root=$1 block=$2
+    local tmp; tmp=$(mktemp)
+    awk -v block="$block" '
+        /^# --- PEERS END ---/ { print block; print "" }
+        { print }
+    ' "$root/etc/awg0.conf" > "$tmp"
+    mv "$tmp" "$root/etc/awg0.conf"
+    chmod 600 "$root/etc/awg0.conf"
+}
+corrupt_add_duplicate_key_peer() {
+    local root=$1 key=$2
+    insert_before_end_marker "$root" "$(printf '[Peer]\n# label: dup1\nPublicKey = %s\nAllowedIPs = 10.250.0.9/32' "$key")"
+    insert_before_end_marker "$root" "$(printf '[Peer]\n# label: dup2\nPublicKey = %s\nAllowedIPs = 10.250.0.10/32' "$key")"
+}
+corrupt_add_malformed_allowedips_peer() {
+    local root=$1 key=$2 raw_allowedips=$3
+    insert_before_end_marker "$root" "$(printf '[Peer]\n# label: malformed\nPublicKey = %s\nAllowedIPs = %s' "$key" "$raw_allowedips")"
+}
+corrupt_add_peer_with_ip() {
+    local root=$1 key=$2 ip=$3
+    insert_before_end_marker "$root" "$(printf '[Peer]\n# label: raw\nPublicKey = %s\nAllowedIPs = %s/32' "$key" "$ip")"
+}
+
 # converge_only <root> <present|absent> <key> -> runs ONLY converge_live_state
 # (never mutate_add_peer/mutate_remove_peer), under the same lock discipline,
 # to model an operator/retry repair action against an already-persisted
@@ -171,7 +205,7 @@ converge_only() {
         converge_live_state "$1" "$2"
     ' _ "$expected" "$key" 2>/dev/null
 }
-export -f allocate add_manual remove_manual
+export -f allocate add_manual remove_manual provision provision_stderr
 
 # Bounded-background convention used by every concurrency test below:
 #   timeout 15 bash -c '<fn> "$@"' _ <args...> > "$out" 2>/dev/null &
@@ -760,6 +794,273 @@ test_cli_usage_unchanged() {
     rm -rf "$root"
 }
 
+# ============================================================
+# B8B1A: idempotent machine-facing provision-peer.sh
+# ============================================================
+
+test_provision_first_creates_lowest_free_ip() {
+    local root; root=$(make_fixture "10.151.0.0/29" "10.151.0.1" 29)
+    local out; out=$(provision "$root" "$KEY1")
+    local kind ip; kind=$(printf '%s' "$out" | cut -f1); ip=$(printf '%s' "$out" | cut -f2)
+    if [ "$kind" = "created" ] && [ "$ip" = "10.151.0.2" ] && [ "$(peer_count "$root")" = "1" ]; then
+        pass "provision-peer.sh: first provision creates the lowest free IP"
+    else
+        fail "expected created/10.151.0.2 with 1 peer, got kind='$kind' ip='$ip' peers=$(peer_count "$root")"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_retry_same_key_returns_existing_same_ip() {
+    local root; root=$(make_fixture "10.151.1.0/29" "10.151.1.1" 29)
+    local out1; out1=$(provision "$root" "$KEY1")
+    local ip1; ip1=$(printf '%s' "$out1" | cut -f2)
+    local out2; out2=$(provision "$root" "$KEY1")
+    local kind2 ip2; kind2=$(printf '%s' "$out2" | cut -f1); ip2=$(printf '%s' "$out2" | cut -f2)
+    if [ "$kind2" = "existing" ] && [ "$ip2" = "$ip1" ]; then
+        pass "provision-peer.sh: retry with the same key returns existing + the exact same IP"
+    else
+        fail "expected existing/$ip1, got kind='$kind2' ip='$ip2'"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_retry_no_duplicate_peer() {
+    local root; root=$(make_fixture "10.151.2.0/29" "10.151.2.1" 29)
+    provision "$root" "$KEY1" >/dev/null
+    provision "$root" "$KEY1" >/dev/null
+    provision "$root" "$KEY1" >/dev/null
+    if [ "$(peer_count "$root")" = "1" ]; then
+        pass "provision-peer.sh: repeated retries (simulated lost-response) never create a duplicate peer"
+    else
+        fail "expected 1 peer after repeated retries, got $(peer_count "$root")"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_concurrent_same_key() {
+    local root; root=$(make_fixture "10.151.3.0/24" "10.151.3.1" 24)
+    local out1 out2 pid1 pid2
+    out1=$(mktemp); out2=$(mktemp)
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$KEY1" > "$out1" 2>/dev/null & pid1=$!
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$KEY1" > "$out2" 2>/dev/null & pid2=$!
+    wait "$pid1"; local rc1=$?
+    wait "$pid2"; local rc2=$?
+    local kind1 ip1 kind2 ip2
+    kind1=$(cut -f1 "$out1"); ip1=$(cut -f2 "$out1")
+    kind2=$(cut -f1 "$out2"); ip2=$(cut -f2 "$out2")
+    local kinds_sorted; kinds_sorted=$(printf '%s\n%s\n' "$kind1" "$kind2" | sort | tr '\n' ',')
+    if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] && [ "$kinds_sorted" = "created,existing," ] \
+        && [ -n "$ip1" ] && [ "$ip1" = "$ip2" ] && [ "$(peer_count "$root")" = "1" ]; then
+        pass "concurrent same-key provision: one created, one existing, same IP, exactly one durable peer, no deadlock"
+    else
+        fail "concurrent same-key: rc1=$rc1 rc2=$rc2 kinds=$kinds_sorted ip1='$ip1' ip2='$ip2' peers=$(peer_count "$root")"
+    fi
+    rm -f "$out1" "$out2"; rm -rf "$root"
+}
+
+test_provision_concurrent_different_keys() {
+    local root; root=$(make_fixture "10.151.4.0/24" "10.151.4.1" 24)
+    local out1 out2 pid1 pid2
+    out1=$(mktemp); out2=$(mktemp)
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$KEY1" > "$out1" 2>/dev/null & pid1=$!
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$KEY2" > "$out2" 2>/dev/null & pid2=$!
+    wait "$pid1"; local rc1=$?
+    wait "$pid2"; local rc2=$?
+    local ip1 ip2; ip1=$(cut -f2 "$out1"); ip2=$(cut -f2 "$out2")
+    if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] && [ -n "$ip1" ] && [ "$ip1" != "$ip2" ] && [ "$(peer_count "$root")" = "2" ]; then
+        pass "concurrent different-key provisions: distinct IPs, no lost update, no deadlock"
+    else
+        fail "concurrent different keys: rc1=$rc1 rc2=$rc2 ip1='$ip1' ip2='$ip2' peers=$(peer_count "$root")"
+    fi
+    rm -f "$out1" "$out2"; rm -rf "$root"
+}
+
+test_provision_vs_manual_add() {
+    local root; root=$(make_fixture "10.151.5.0/24" "10.151.5.1" 24)
+    local out1 out2 pid1 pid2
+    out1=$(mktemp); out2=$(mktemp)
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$KEY1" > "$out1" 2>/dev/null & pid1=$!
+    timeout 15 bash -c 'add_manual "$@"' _ "$root" "$KEY2" "10.151.5.50" "manual" > "$out2" 2>/dev/null & pid2=$!
+    wait "$pid1"; local rc1=$?
+    wait "$pid2"; local rc2=$?
+    if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] && has_peer "$root" "$KEY1" && has_peer "$root" "$KEY2" && [ "$(peer_count "$root")" = "2" ]; then
+        pass "provision-peer.sh vs manual add-peer.sh: both persisted, no lost update, no deadlock"
+    else
+        fail "provision vs manual add: rc1=$rc1 rc2=$rc2 peers=$(peer_count "$root")"
+    fi
+    rm -f "$out1" "$out2"; rm -rf "$root"
+}
+
+test_provision_vs_remove() {
+    local root; root=$(make_fixture "10.151.6.0/24" "10.151.6.1" 24)
+    add_manual "$root" "$KEY1" "10.151.6.50" "pre-existing" >/dev/null
+    local out1 out2 pid1 pid2
+    out1=$(mktemp); out2=$(mktemp)
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$KEY2" > "$out1" 2>/dev/null & pid1=$!
+    timeout 15 bash -c 'remove_manual "$@"' _ "$root" "$KEY1" > "$out2" 2>/dev/null & pid2=$!
+    wait "$pid1"; local rc1=$?
+    wait "$pid2"; local rc2=$?
+    if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] && has_peer "$root" "$KEY2" && ! has_peer "$root" "$KEY1" && [ "$(peer_count "$root")" = "1" ]; then
+        pass "provision-peer.sh vs remove-peer.sh: net state correct, no lost update, no deadlock"
+    else
+        fail "provision vs remove: rc1=$rc1 rc2=$rc2 peers=$(peer_count "$root")"
+    fi
+    rm -f "$out1" "$out2"; rm -rf "$root"
+}
+
+test_provision_existing_peer_live_stale_triggers_convergence() {
+    local root; root=$(make_fixture "10.151.9.0/29" "10.151.9.1" 29)
+    local out1; out1=$(provision "$root" "$KEY1")   # service inactive: durable only, no live push
+    local ip1; ip1=$(printf '%s' "$out1" | cut -f2)
+    set_service_active "$root"
+    set_reload_converges "$root"
+    local out2; out2=$(provision "$root" "$KEY1")
+    local kind2 ip2; kind2=$(printf '%s' "$out2" | cut -f1); ip2=$(printf '%s' "$out2" | cut -f2)
+    if [ "$kind2" = "existing" ] && [ "$ip2" = "$ip1" ] && [ "$(reload_count "$root")" -ge "1" ] \
+        && live_peers_of "$root" | grep -qF "$KEY1" && [ "$(peer_count "$root")" = "1" ]; then
+        pass "existing durable peer + stale live state: convergence is attempted and repairs it, no duplicate mutation"
+    else
+        fail "expected existing/$ip1 with >=1 reload and live convergence, got kind='$kind2' ip='$ip2' reloads=$(reload_count "$root") live='$(live_peers_of "$root")' peers=$(peer_count "$root")"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_existing_peer_live_already_correct_no_reload() {
+    local root; root=$(make_fixture "10.151.10.0/29" "10.151.10.1" 29)
+    set_service_active "$root"
+    set_reload_converges "$root"
+    provision "$root" "$KEY1" >/dev/null   # created; converges live via one reload
+    local before; before=$(reload_count "$root")
+    local out2; out2=$(provision "$root" "$KEY1")
+    local kind2; kind2=$(printf '%s' "$out2" | cut -f1)
+    if [ "$kind2" = "existing" ] && [ "$(reload_count "$root")" = "$before" ]; then
+        pass "existing durable peer + live already correct: no unnecessary reload"
+    else
+        fail "expected no additional reload, before=$before after=$(reload_count "$root") kind='$kind2'"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_awg_query_failure_is_nonzero() {
+    local root; root=$(make_fixture "10.151.11.0/29" "10.151.11.1" 29)
+    provision "$root" "$KEY1" >/dev/null   # service inactive: durable only
+    set_service_active "$root"
+    set_awg_query_fails "$root"
+    if provision "$root" "$KEY1" >/dev/null; then
+        fail "expected non-zero when the awg query fails during existing-peer convergence"
+    else
+        pass "AWG query failure during existing-peer convergence is non-zero (never false success)"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_ambiguous_duplicate_key_fails_closed() {
+    local root; root=$(make_fixture "10.151.12.0/29" "10.151.12.1" 29)
+    corrupt_add_duplicate_key_peer "$root" "$KEY1"
+    local before_hash; before_hash=$(md5sum "$root/etc/awg0.conf" | awk '{print $1}')
+    if provision "$root" "$KEY1" >/dev/null; then
+        fail "expected rejection when durable state has multiple entries for the same public key"
+    else
+        local after_hash; after_hash=$(md5sum "$root/etc/awg0.conf" | awk '{print $1}')
+        if [ "$before_hash" = "$after_hash" ]; then
+            pass "ambiguous (duplicate-PublicKey) durable state fails closed, no mutation"
+        else
+            fail "ambiguous state rejected but config was mutated"
+        fi
+    fi
+    rm -rf "$root"
+}
+
+test_provision_malformed_allowedips_fails_closed() {
+    local root; root=$(make_fixture "10.151.13.0/29" "10.151.13.1" 29)
+    corrupt_add_malformed_allowedips_peer "$root" "$KEY1" "not-an-ip"
+    if provision "$root" "$KEY1" >/dev/null; then
+        fail "expected rejection when the existing peer's AllowedIPs is not a valid /32"
+    else
+        pass "malformed/ambiguous AllowedIPs for an existing peer fails closed"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_existing_ip_outside_subnet_fails_closed() {
+    local root; root=$(make_fixture "10.151.14.0/29" "10.151.14.1" 29)
+    corrupt_add_peer_with_ip "$root" "$KEY1" "10.200.200.200"
+    if provision "$root" "$KEY1" >/dev/null; then
+        fail "expected rejection when the existing peer's IP is outside AWG_SUBNET_CIDR"
+    else
+        pass "existing peer IP outside the subnet fails closed"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_existing_ip_equals_gateway_fails_closed() {
+    local root; root=$(make_fixture "10.151.15.0/29" "10.151.15.1" 29)
+    corrupt_add_peer_with_ip "$root" "$KEY1" "10.151.15.1"
+    if provision "$root" "$KEY1" >/dev/null; then
+        fail "expected rejection when the existing peer's IP equals the gateway's own tunnel IP"
+    else
+        pass "existing peer IP equal to the gateway's tunnel IP fails closed"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_subnet_exhaustion_dedicated_exit_code() {
+    local root; root=$(make_fixture "10.151.16.0/30" "10.151.16.1" 30)   # only .2 usable
+    provision "$root" "$KEY1" >/dev/null   # takes the only usable address
+    local before_hash; before_hash=$(md5sum "$root/etc/awg0.conf" | awk '{print $1}')
+    local rc=0
+    provision "$root" "$KEY2" >/dev/null || rc=$?
+    local after_hash; after_hash=$(md5sum "$root/etc/awg0.conf" | awk '{print $1}')
+    if [ "$rc" -eq 20 ] && [ "$before_hash" = "$after_hash" ]; then
+        pass "subnet exhaustion returns the dedicated exit code 20, no mutation"
+    else
+        fail "expected exit code 20 and no mutation, got rc=$rc before=$before_hash after=$after_hash"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_stdout_contract_created_and_existing() {
+    local root; root=$(make_fixture "10.151.17.0/29" "10.151.17.1" 29)
+    local out1; out1=$(provision "$root" "$KEY1")
+    local out2; out2=$(provision "$root" "$KEY1")
+    if [ "$out1" = "$(printf 'created\t10.151.17.2')" ] && [ "$out2" = "$(printf 'existing\t10.151.17.2')" ] \
+        && [ "$(printf '%s' "$out1" | wc -l)" = "0" ] && [ "$(printf '%s' "$out2" | wc -l)" = "0" ]; then
+        pass "stdout is exactly one tab-separated created/existing line, nothing else"
+    else
+        fail "unexpected stdout: out1='$out1' out2='$out2'"
+    fi
+    rm -rf "$root"
+}
+
+test_provision_usage_requires_exactly_one_arg() {
+    local root; root=$(make_fixture "10.151.18.0/29" "10.151.18.1" 29)
+    local usage_none usage_two
+    usage_none=$("$root/scripts/provision-peer.sh" 2>&1 || true)
+    usage_two=$("$root/scripts/provision-peer.sh" "$KEY1" "extra-arg" 2>&1 || true)
+    if echo "$usage_none" | grep -q "usage:.*provision-peer.sh <CLIENT_PUBLIC_KEY>" \
+        && echo "$usage_two" | grep -q "usage:.*provision-peer.sh <CLIENT_PUBLIC_KEY>"; then
+        pass "provision-peer.sh requires exactly one argument - no caller-controlled label accepted"
+    else
+        fail "provision-peer.sh usage/argcount check failed: none='$usage_none' two='$usage_two'"
+    fi
+    rm -rf "$root"
+}
+
+test_allocate_and_add_peer_usage_and_duplicate_unchanged() {
+    local root; root=$(make_fixture "10.151.19.0/29" "10.151.19.1" 29)
+    local usage; usage=$("$root/scripts/allocate-and-add-peer.sh" 2>&1 || true)
+    allocate "$root" "$KEY1" "peer1" >/dev/null
+    local dup_rejected=1
+    if allocate "$root" "$KEY1" "peer1-again" >/dev/null 2>&1; then dup_rejected=0; fi
+    if echo "$usage" | grep -q "usage:.*allocate-and-add-peer.sh <CLIENT_PUBLIC_KEY> \[label\]" \
+        && [ "$dup_rejected" = "1" ] && [ "$(peer_count "$root")" = "1" ]; then
+        pass "allocate-and-add-peer.sh usage text and duplicate-key rejection are unchanged after extraction to shared lib functions"
+    else
+        fail "allocate-and-add-peer.sh regressed after extraction: usage='$usage' dup_rejected=$dup_rejected peers=$(peer_count "$root")"
+    fi
+    rm -rf "$root"
+}
+
 echo "== gateway allocation test suite =="
 test_first_allocation
 test_sequential_allocations
@@ -800,6 +1101,25 @@ test_postcondition_verifies_key_and_ip_after_add
 test_postcondition_verifies_key_absent_after_remove
 test_marker_malformed_fails_even_when_service_inactive
 test_cli_usage_unchanged
+
+test_provision_first_creates_lowest_free_ip
+test_provision_retry_same_key_returns_existing_same_ip
+test_provision_retry_no_duplicate_peer
+test_provision_concurrent_same_key
+test_provision_concurrent_different_keys
+test_provision_vs_manual_add
+test_provision_vs_remove
+test_provision_existing_peer_live_stale_triggers_convergence
+test_provision_existing_peer_live_already_correct_no_reload
+test_provision_awg_query_failure_is_nonzero
+test_provision_ambiguous_duplicate_key_fails_closed
+test_provision_malformed_allowedips_fails_closed
+test_provision_existing_ip_outside_subnet_fails_closed
+test_provision_existing_ip_equals_gateway_fails_closed
+test_provision_subnet_exhaustion_dedicated_exit_code
+test_provision_stdout_contract_created_and_existing
+test_provision_usage_requires_exactly_one_arg
+test_allocate_and_add_peer_usage_and_duplicate_unchanged
 
 echo
 echo "== results: $PASSES passed, $FAILURES failed =="

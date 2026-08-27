@@ -264,3 +264,142 @@ converge_live_state() {
 
     die "durable config was updated but live AWG state did not converge to '$expected' for this peer after reload - config change is retained; retry or investigate $SERVICE_NAME.service manually"
 }
+
+# find_existing_peer <PUBLIC_KEY>
+# Unlocked - caller must already hold .provision.lock (added for B8B1A's
+# provision-peer.sh, the future machine-facing entry point's idempotency
+# check: it needs to know, under the lock, whether this key already has a
+# durable peer BEFORE deciding whether to allocate a new IP - never after).
+#
+# Deliberately does NOT grep an arbitrary "AllowedIPs = " line anywhere in
+# the file - only the one immediately following THIS key's own "PublicKey ="
+# line, matching the exact block shape mutate_add_peer itself writes
+# ([Peer] / # label / PublicKey / AllowedIPs, see above) and the same
+# lookup style _verify_peer_present_with_ip already uses.
+#
+# On stdout: the peer's tunnel IP (only on return 0).
+# Return codes (three-valued - "not found" and "found but broken" must
+# never collapse into the same signal, or a caller would either silently
+# skip the fail-closed checks below or silently treat malformed state as
+# absent and allocate a second IP on top of it):
+#   0 = exactly one peer for this key exists, with a single valid /32
+#       AllowedIPs inside AWG_SUBNET_CIDR, not equal to the gateway's own
+#       tunnel IP
+#   1 = no peer for this key exists
+#   2 = a peer for this key exists but its durable state is malformed or
+#       ambiguous (multiple entries, missing/invalid/multi AllowedIPs, IP
+#       outside the subnet, or IP == GATEWAY_TUNNEL_IP) - fail closed,
+#       reason logged to stderr via log()
+# A missing config file is treated as a harder failure than any of the
+# above (die, i.e. exit 1 from the caller's perspective) since there is
+# nothing to look anything up in - not folded into "not found" (which
+# would wrongly invite an allocation attempt against a nonexistent file)
+# nor "malformed" (which describes a file that exists but is broken).
+find_existing_peer() {
+    local public_key=$1
+    local config_path="$CONFIG_DIR/$CONFIG_FILE"
+
+    [ -f "$config_path" ] || die "gateway config not found at $config_path - run provision.sh first"
+
+    local key_count
+    key_count=$(grep -cF "PublicKey = $public_key" "$config_path" || true)
+
+    if [ "$key_count" -eq 0 ]; then
+        return 1
+    fi
+    if [ "$key_count" -gt 1 ]; then
+        log "durable config is ambiguous: found $key_count PublicKey entries for this public key"
+        return 2
+    fi
+
+    local allowed_ips_line
+    allowed_ips_line=$(grep -A1 -F "PublicKey = $public_key" "$config_path" | tail -n1)
+
+    local ip
+    if [[ "$allowed_ips_line" =~ ^AllowedIPs\ =\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/32[[:space:]]*$ ]]; then
+        ip="${BASH_REMATCH[1]}"
+    else
+        log "durable config is malformed: peer entry for this public key has no single valid /32 AllowedIPs line"
+        return 2
+    fi
+
+    if ! is_valid_ipv4 "$ip"; then
+        log "durable config is malformed: existing peer IP '$ip' is not valid IPv4"
+        return 2
+    fi
+    if ! ip_in_cidr "$ip" "$AWG_SUBNET_CIDR"; then
+        log "durable config is malformed: existing peer IP $ip is outside $AWG_SUBNET_CIDR"
+        return 2
+    fi
+    if [ "$ip" = "$GATEWAY_TUNNEL_IP" ]; then
+        log "durable config is malformed: existing peer IP equals the gateway's own tunnel IP"
+        return 2
+    fi
+
+    printf '%s\n' "$ip"
+    return 0
+}
+
+# allocate_lowest_free_ip
+# Unlocked - caller must already hold .provision.lock. Extracted out of
+# allocate-and-add-peer.sh (B8A) so B8B1A's provision-peer.sh can reuse the
+# exact same lowest-free-IP algorithm instead of maintaining a second,
+# independent implementation that could drift from it. allocate-and-add-
+# peer.sh's own CLI behavior (exit 1 + a die() message on exhaustion) is
+# unchanged - it is unaffected by this call's own error signaling: see
+# below.
+#
+# The durable config remains the sole IP ledger: this scans awg0.conf's
+# existing AllowedIPs entries (same as before extraction), skipping the
+# network/broadcast/gateway addresses.
+#
+# On stdout: the chosen IP (only on return 0).
+# Return codes: 0 = found a free address (on stdout); 3 = subnet
+# exhausted, no free address - a value distinct from 1 (a plain die()'s
+# exit code) so a caller can tell "genuinely exhausted" apart from "some
+# other internal/config error already died with its own stderr message"
+# without parsing stderr text, per B8B1A's exit-code requirement. Any
+# other function-internal failure (missing config, invalid
+# AWG_SUBNET_CIDR) still goes through die() as before extraction.
+allocate_lowest_free_ip() {
+    local config_path="$CONFIG_DIR/$CONFIG_FILE"
+    [ -f "$config_path" ] || die "gateway config not found at $config_path - run provision.sh first"
+
+    local net_addr=${AWG_SUBNET_CIDR%/*} prefix=${AWG_SUBNET_CIDR#*/}
+    is_valid_ipv4 "$net_addr" || die "AWG_SUBNET_CIDR network address is not valid IPv4: $AWG_SUBNET_CIDR"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix >= 0 && prefix <= 32 )) || die "AWG_SUBNET_CIDR prefix is invalid: $AWG_SUBNET_CIDR"
+    (( prefix <= 30 )) || die "AWG_SUBNET_CIDR $AWG_SUBNET_CIDR has no usable host addresses (prefix must be <= 30)"
+
+    local net_int mask broadcast_int gateway_int
+    net_int=$(ipv4_to_int "$net_addr")
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    broadcast_int=$(( (net_int | (~mask & 0xFFFFFFFF)) & 0xFFFFFFFF ))
+    gateway_int=$(ipv4_to_int "$GATEWAY_TUNNEL_IP")
+
+    local candidate
+    for (( candidate = net_int + 1; candidate < broadcast_int; candidate++ )); do
+        if ! _allocate_candidate_is_used "$candidate" "$net_int" "$broadcast_int" "$gateway_int" "$config_path"; then
+            printf '%s\n' "$(int_to_ipv4 "$candidate")"
+            return 0
+        fi
+    done
+    return 3
+}
+
+# _allocate_candidate_is_used <candidate_int> <net_int> <broadcast_int> <gateway_int> <config_path>
+# Internal helper for allocate_lowest_free_ip - not called directly by
+# entry-point scripts.
+_allocate_candidate_is_used() {
+    local candidate=$1 net_int=$2 broadcast_int=$3 gateway_int=$4 config_path=$5
+    (( candidate == net_int )) && return 0
+    (( candidate == broadcast_int )) && return 0
+    (( candidate == gateway_int )) && return 0
+    local existing_ip existing_int
+    while IFS= read -r existing_ip; do
+        [ -n "$existing_ip" ] || continue
+        is_valid_ipv4 "$existing_ip" || continue
+        existing_int=$(ipv4_to_int "$existing_ip")
+        (( candidate == existing_int )) && return 0
+    done < <(grep -E '^AllowedIPs = ' "$config_path" | sed -E 's#^AllowedIPs = ([0-9.]+)/32.*#\1#')
+    return 1
+}

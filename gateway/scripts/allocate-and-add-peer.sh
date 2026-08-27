@@ -7,6 +7,14 @@
 # The manual `add-peer.sh <PUBLIC_KEY> <TUNNEL_IP> [label]` path is
 # unmodified and remains the supported fallback for a caller-chosen IP.
 #
+# This CLI contract is unchanged by B8B1A: a public key that already has a
+# peer is still REJECTED (via mutate_add_peer's own "already exists"
+# check), not treated as idempotent - that idempotent behavior lives only
+# in the new machine-facing scripts/provision-peer.sh, which is the sole
+# entry point future automated callers (B8B1's HTTP API) are expected to
+# use. This script remains the manual/human "always allocate a fresh IP,
+# reject if the key is already provisioned" tool.
+#
 # Allocation is derived entirely from the live gateway config (the same
 # file add-peer.sh writes to, via the shared lib/peer_mutations.sh core) -
 # there is no separate ledger that could drift from it. The whole
@@ -31,20 +39,6 @@ LABEL=${2:-peer-$(date +%s 2>/dev/null || echo unlabeled)}
 
 is_valid_wg_key "$PUBLIC_KEY" || die "not a valid AmneziaWG/WireGuard key: $PUBLIC_KEY"
 
-CONFIG_PATH="$CONFIG_DIR/$CONFIG_FILE"
-[ -f "$CONFIG_PATH" ] || die "gateway config not found at $CONFIG_PATH - run provision.sh first"
-
-NET_ADDR=${AWG_SUBNET_CIDR%/*}
-PREFIX=${AWG_SUBNET_CIDR#*/}
-is_valid_ipv4 "$NET_ADDR" || die "AWG_SUBNET_CIDR network address is not valid IPv4: $AWG_SUBNET_CIDR"
-[[ "$PREFIX" =~ ^[0-9]+$ ]] && (( PREFIX >= 0 && PREFIX <= 32 )) || die "AWG_SUBNET_CIDR prefix is invalid: $AWG_SUBNET_CIDR"
-(( PREFIX <= 30 )) || die "AWG_SUBNET_CIDR $AWG_SUBNET_CIDR has no usable host addresses (prefix must be <= 30)"
-
-NET_INT=$(ipv4_to_int "$NET_ADDR")
-MASK=$(( (0xFFFFFFFF << (32 - PREFIX)) & 0xFFFFFFFF ))
-BROADCAST_INT=$(( (NET_INT | (~MASK & 0xFFFFFFFF)) & 0xFFFFFFFF ))
-GATEWAY_INT=$(ipv4_to_int "$GATEWAY_TUNNEL_IP")
-
 LOCK_FILE="$CONFIG_DIR/.provision.lock"
 
 exec 9>"$LOCK_FILE"
@@ -52,32 +46,19 @@ flock -x 9
 
 # --- everything below runs with the exclusive lock held ---
 
-is_used() {
-    local candidate=$1
-    (( candidate == NET_INT )) && return 0
-    (( candidate == BROADCAST_INT )) && return 0
-    (( candidate == GATEWAY_INT )) && return 0
-    local existing_ip existing_int
-    while IFS= read -r existing_ip; do
-        [ -n "$existing_ip" ] || continue
-        is_valid_ipv4 "$existing_ip" || continue
-        existing_int=$(ipv4_to_int "$existing_ip")
-        (( candidate == existing_int )) && return 0
-    done < <(grep -E '^AllowedIPs = ' "$CONFIG_PATH" | sed -E 's#^AllowedIPs = ([0-9.]+)/32.*#\1#')
-    return 1
-}
-
-CHOSEN_INT=""
-for (( candidate = NET_INT + 1; candidate < BROADCAST_INT; candidate++ )); do
-    if ! is_used "$candidate"; then
-        CHOSEN_INT=$candidate
-        break
-    fi
-done
-
-[ -n "$CHOSEN_INT" ] || die "subnet $AWG_SUBNET_CIDR is exhausted - no free tunnel address available"
-
-CHOSEN_IP=$(int_to_ipv4 "$CHOSEN_INT")
+# allocate_lowest_free_ip (lib/peer_mutations.sh, shared with
+# scripts/provision-peer.sh - see B8B1A) returns 3 specifically for
+# subnet exhaustion; any other internal failure has already die()'d with
+# its own message before returning here. Only the exhaustion case gets
+# this script's own die() message, so the CLI's existing wording for
+# operators is unchanged.
+alloc_rc=0
+CHOSEN_IP=$(allocate_lowest_free_ip) || alloc_rc=$?
+if [ "$alloc_rc" -eq 3 ]; then
+    die "subnet $AWG_SUBNET_CIDR is exhausted - no free tunnel address available"
+elif [ "$alloc_rc" -ne 0 ]; then
+    exit "$alloc_rc"
+fi
 
 log "allocated $CHOSEN_IP for '$LABEL' - applying"
 # In-process calls, not a subprocess exec of add-peer.sh: both mutate_add_peer
