@@ -1,0 +1,14 @@
+# B8B2A - schedules pocvpn-cert-check.service every 6 hours. Frequent
+# enough to catch a stalled renewal well inside the 48h safety threshold
+# checked by the service (a 160h cert renewing on Certbot's own ~80h-out
+# schedule leaves many checks' worth of margin before this could ever be
+# the first sign of trouble).
+[Unit]
+Description=Run pocvpn HTTPS edge certificate expiry check every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 0/6:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

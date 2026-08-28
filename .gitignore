@@ -3,6 +3,10 @@
 *.pem
 *.conf
 !*.conf.template
+# B8B2A - narrow exceptions for the two tracked, non-secret nginx vhost
+# templates (no private key material, no tokens - see their own headers).
+!gateway/edge/nginx-pocvpn-bootstrap.conf
+!gateway/edge/nginx-pocvpn.conf
 .env
 .env.*
 !.env.example

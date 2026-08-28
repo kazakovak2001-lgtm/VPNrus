@@ -1,0 +1,11 @@
+# B8B2A - runs gateway/edge/pocvpn-cert-check.sh on a schedule (see the
+# paired .timer unit). A failing run leaves this unit in `failed` state,
+# visible via `systemctl --failed` and in the journal
+# (`journalctl -u pocvpn-cert-check.service`) - the explicit "fail
+# visibly" requirement for a 160-hour certificate's tight renewal margin.
+[Unit]
+Description=pocvpn HTTPS edge certificate expiry check (read-only)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/pocvpn-cert-check.sh
