@@ -95,7 +95,7 @@ def make_token_store(store_path, entries, lock_path):
         os.close(os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600))
 
 
-def make_app_config(tmp_dir, provision_script_path, subprocess_timeout_seconds=5.0, api_port=0):
+def make_app_config(tmp_dir, provision_script_path, subprocess_timeout_seconds=5.0, api_port=0, sudo_path=""):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
     return config_module.AppConfig(
@@ -108,6 +108,7 @@ def make_app_config(tmp_dir, provision_script_path, subprocess_timeout_seconds=5
         provision_script_path=provision_script_path,
         subprocess_timeout_seconds=subprocess_timeout_seconds,
         api_port=api_port,
+        sudo_path=sudo_path,
     )
 
 

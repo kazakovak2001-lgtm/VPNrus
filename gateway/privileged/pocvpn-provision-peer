@@ -1,0 +1,81 @@
+#!/bin/bash
+# B8B1C2: the ONE root-owned privileged wrapper pocvpn-api is ever allowed
+# to reach via sudo. Deployed (by B8B1C3, not this slice) to:
+#
+#   /usr/local/libexec/pocvpn-provision-peer   (root:root, 0750 or 0755)
+#
+# and invoked ONLY as:
+#
+#   pocvpn-api  --sudo-->  /usr/bin/sudo -n  --sudoers-->  this wrapper
+#
+# See gateway/privileged/pocvpn-api.sudoers for the sudoers rule this
+# depends on, and gateway/privileged/README.md for the full privilege
+# boundary and file-ownership invariant this wrapper is one half of.
+#
+# Deliberately #!/bin/bash, NOT #!/usr/bin/env bash - a fixed, absolute
+# interpreter path, not one resolved by searching a caller-influenced PATH.
+#
+# Deliberately NOT #!/usr/bin/env bash and deliberately not sourcing any
+# repo file (common.sh, poc.env, etc.) before the environment is
+# sanitized below: every check up to and including the exec at the bottom
+# uses ONLY bash builtins ([[ ]], regex, arithmetic) - no external command,
+# no PATH-dependent lookup, nothing that could be redirected by a
+# caller-influenced PATH or a malicious same-named binary earlier in it.
+#
+# What this wrapper does NOT defend against by itself: BASH_ENV/ENV
+# injection is consulted by bash at interpreter startup, before ANY line
+# of this script (including `set -euo pipefail`) ever runs - no script
+# content can neutralize that after the fact. The actual defense is
+# upstream, in sudoers: `env_reset` (Debian/Ubuntu's own default, and
+# additionally forced per-command by pocvpn-api.sudoers) strips BASH_ENV/
+# ENV/LD_PRELOAD/LD_LIBRARY_PATH/PYTHONPATH/PATH from the environment sudo
+# execve()s this wrapper with, before bash ever starts. This wrapper's own
+# `env -i` below is defense in depth for the exec'd child ONLY - it is not
+# what protects the wrapper's own execution.
+set -euo pipefail
+
+# --- fixed, non-configurable target: a literal, not read from any
+# environment variable, argument, or config file. This is precisely the
+# property that keeps "no caller-controlled helper path" true regardless
+# of what pocvpn-api's own environment/argv looks like. ---
+readonly PROVISION_SCRIPT="/opt/pocvpn/gateway/scripts/provision-peer.sh"
+
+# --- exactly one argument: the public key. No label, no path, no flags. ---
+if [ "$#" -ne 1 ]; then
+    echo "usage: pocvpn-provision-peer <CLIENT_PUBLIC_KEY>" >&2
+    exit 2
+fi
+readonly PUBLIC_KEY=$1
+
+# --- conservative structural pre-validation, bash builtin only (mirrors
+# lib/common.sh's is_valid_wg_key: 32 raw bytes, base64-encoded -> 44
+# chars, trailing '='). This is NOT the authoritative check - deliberately
+# not sourcing lib/common.sh here (that would mean sourcing a mutable repo
+# file before the exec'd child's environment is even decided) - the
+# authoritative validation is provision-peer.sh's own is_valid_wg_key call,
+# run again, for real, inside the child. Failing here just means one fewer
+# invocation of the real target for garbage input; it changes no security
+# property that the child's own check doesn't already guarantee. ---
+if ! [[ "$PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "pocvpn-provision-peer: rejected: not a well-formed AmneziaWG/WireGuard public key" >&2
+    exit 2
+fi
+
+# --- exec, not a captured/re-echoed subshell call: this process becomes
+# the child, so there is no wrapper-owned parent left afterward whose own
+# state (env, fds, cwd) could diverge from what was just decided above.
+#
+# /usr/bin/env -i: absolute path, never searched via PATH. -i clears
+# EVERY inherited environment variable (BASH_ENV, ENV, PYTHONPATH,
+# LD_PRELOAD, LD_LIBRARY_PATH, any caller-set CONFIG_DIR/SERVICE_NAME/
+# helper-path override, the caller's own PATH - all of it) before setting
+# exactly the two variables provision-peer.sh actually needs: a fixed,
+# minimal PATH (so ITS OWN external commands - grep/awk/flock/systemctl/
+# awg/mktemp/mv - resolve from trusted system directories only, never a
+# caller-supplied PATH entry) and LANG=C (deterministic, locale-independent
+# parsing/formatting inside the child). Nothing here is `eval`, nothing
+# here is a shell command string - argv is a fixed literal list. ---
+exec /usr/bin/env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    LANG=C \
+    "$PROVISION_SCRIPT" "$PUBLIC_KEY"

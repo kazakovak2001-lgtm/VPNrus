@@ -12,13 +12,31 @@ This module NEVER:
     entirely inside the subprocess)
   - receives the bearer token or any caller-supplied label - the only
     argument ever passed is the validated public key
+  - builds a shell command string, or passes shell=True - argv is always
+    a plain list, so nothing here is ever subject to shell word-splitting
+    or expansion regardless of what a public key or path contains
 
 If provision-peer.sh's actual behavior ever needs to change, that is a
 change to provision-peer.sh (B8B1A) reviewed on its own - this module
 must keep parsing whatever provision-peer.sh's committed contract says,
 not the other way around.
+
+B8B1C2: optional sudo argv. `sudo_path` (see config.py's AppConfig) is
+None/empty by default, which reproduces B8B1B/C1's exact direct-
+invocation argv - `[script_path, public_key]`. When a caller passes a
+non-empty `sudo_path`, argv becomes `[sudo_path, "-n", script_path,
+public_key]` - always `-n` (non-interactive: sudo must fail immediately
+rather than ever block this HTTP request on a password prompt it can
+never satisfy). This is still just an argv list handed to
+subprocess.run(shell=False) - the sudo binary itself, not this process,
+is what actually enforces the privilege boundary (see
+gateway/privileged/). Both script_path and sudo_path (when given) are
+independently required to be absolute here, on top of config.py already
+enforcing that at startup - defense in depth against a future caller of
+run_provision_peer() that bypasses load_config().
 """
 import ipaddress
+import os
 import re
 import subprocess
 
@@ -30,6 +48,8 @@ _EXIT_SUCCESS = 0
 _EXIT_SUBNET_EXHAUSTED = 20
 
 _STDOUT_LINE_RE = re.compile(r"^(created|existing)\t(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$")
+
+_SUDO_NONINTERACTIVE_FLAG = "-n"
 
 
 class ProvisionError(Exception):
@@ -78,18 +98,36 @@ def _parse_stdout(stdout):
     return ProvisionOutcome(state=state, ip=ip)
 
 
-def run_provision_peer(script_path, public_key, timeout_seconds):
-    """Run `script_path <public_key>` and return a ProvisionOutcome, or
-    raise ProvisionError. `public_key` must already be validated by the
-    caller (see wgkey.is_valid_wg_public_key) - this function does not
-    re-validate it, it only ever forwards it as a single argv element,
-    never through a shell."""
+def _require_absolute_path(path, label):
+    if not os.path.isabs(path):
+        raise ProvisionError("internal", f"{label} must be an absolute path, got {path!r}")
+
+
+def _build_argv(script_path, public_key, sudo_path):
+    _require_absolute_path(script_path, "provisioning script path")
+    if sudo_path:
+        _require_absolute_path(sudo_path, "sudo path")
+        return [sudo_path, _SUDO_NONINTERACTIVE_FLAG, script_path, public_key]
+    return [script_path, public_key]
+
+
+def run_provision_peer(script_path, public_key, timeout_seconds, sudo_path=None):
+    """Run `script_path <public_key>` (optionally through `sudo -n`, when
+    `sudo_path` is given - see module docstring) and return a
+    ProvisionOutcome, or raise ProvisionError. `public_key` must already be
+    validated by the caller (see wgkey.is_valid_wg_public_key) - this
+    function does not re-validate it, it only ever forwards it as a single
+    argv element, never through a shell. No bearer token, label, or other
+    request-derived value is ever part of argv - the only HTTP-derived
+    element is `public_key` itself."""
+    argv = _build_argv(script_path, public_key, sudo_path)
     try:
         proc = subprocess.run(
-            [script_path, public_key],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            shell=False,
         )
     except subprocess.TimeoutExpired:
         raise ProvisionError("timeout", "provisioning subprocess timed out")

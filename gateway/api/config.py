@@ -43,6 +43,13 @@ class AppConfig:
     provision_script_path: str
     subprocess_timeout_seconds: float
     api_port: int
+    # B8B1C2: optional absolute path to `sudo` - see provision.py. Empty
+    # string (the default, and the only value B8B1B/C1 ever had) means
+    # "invoke provision_script_path directly, no sudo" - this preserves
+    # every existing direct-invocation test/deployment unchanged. Never
+    # required: B8B1C3 is what actually wires production sudo, this slice
+    # only proves the argv shape is ready for it.
+    sudo_path: str = ""
 
 
 def _get(env, key):
@@ -83,10 +90,27 @@ def load_config(env=None):
     token_lock_path = _get(env, "TOKEN_LOCK_PATH") or (token_store_path + ".lock")
 
     provision_script_path = _get(env, "PROVISION_SCRIPT_PATH")
+    if not os.path.isabs(provision_script_path):
+        raise ConfigError(
+            f"{_ENV_PREFIX}PROVISION_SCRIPT_PATH must be an absolute path: {provision_script_path!r}"
+        )
     if not os.path.isfile(provision_script_path):
         raise ConfigError(
             f"{_ENV_PREFIX}PROVISION_SCRIPT_PATH does not exist or is not a file: {provision_script_path!r}"
         )
+
+    # Optional - see AppConfig.sudo_path. Not in _REQUIRED_KEYS: an unset/
+    # blank value means sudo is not used at all (B8B1B/C1's direct-
+    # invocation behavior, unchanged). When set, it is held to the same
+    # "absolute and actually a file" bar as provision_script_path - a
+    # future production sudo argv must never be built from a relative or
+    # nonexistent path.
+    sudo_path = _get(env, "SUDO_PATH")
+    if sudo_path:
+        if not os.path.isabs(sudo_path):
+            raise ConfigError(f"{_ENV_PREFIX}SUDO_PATH must be an absolute path: {sudo_path!r}")
+        if not os.path.isfile(sudo_path):
+            raise ConfigError(f"{_ENV_PREFIX}SUDO_PATH does not exist or is not a file: {sudo_path!r}")
 
     timeout_raw = _get(env, "SUBPROCESS_TIMEOUT_SECONDS")
     try:
@@ -114,4 +138,5 @@ def load_config(env=None):
         provision_script_path=provision_script_path,
         subprocess_timeout_seconds=subprocess_timeout_seconds,
         api_port=api_port,
+        sudo_path=sudo_path,
     )

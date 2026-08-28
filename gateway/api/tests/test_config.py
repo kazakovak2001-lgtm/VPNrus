@@ -108,6 +108,38 @@ class ConfigTests(unittest.TestCase):
         cfg = config_module.load_config(env=env)
         self.assertEqual(cfg.token_lock_path, override)
 
+    def test_relative_provision_script_path_raises(self):
+        env = self._valid_env()
+        env["POCVPN_API_PROVISION_SCRIPT_PATH"] = "relative/provision-peer.sh"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    # --- B8B1C2: optional POCVPN_API_SUDO_PATH ---
+    def test_sudo_path_absent_defaults_to_empty(self):
+        cfg = config_module.load_config(env=self._valid_env())
+        self.assertEqual(cfg.sudo_path, "")
+
+    def test_sudo_path_valid_absolute_file_honored(self):
+        sudo_path = os.path.join(self._tmp.name, "sudo")
+        with open(sudo_path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env bash\nexit 0\n")
+        env = self._valid_env()
+        env["POCVPN_API_SUDO_PATH"] = sudo_path
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.sudo_path, sudo_path)
+
+    def test_sudo_path_relative_raises(self):
+        env = self._valid_env()
+        env["POCVPN_API_SUDO_PATH"] = "relative/sudo"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_sudo_path_nonexistent_raises(self):
+        env = self._valid_env()
+        env["POCVPN_API_SUDO_PATH"] = os.path.join(self._tmp.name, "does-not-exist")
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
 
 if __name__ == "__main__":
     unittest.main()

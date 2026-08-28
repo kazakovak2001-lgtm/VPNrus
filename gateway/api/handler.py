@@ -183,6 +183,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 self.server.config.provision_script_path,
                 public_key,
                 self.server.config.subprocess_timeout_seconds,
+                sudo_path=self.server.config.sudo_path or None,
             )
         except provision.ProvisionError as exc:
             logger.error("provision_error kind=%s", exc.kind)

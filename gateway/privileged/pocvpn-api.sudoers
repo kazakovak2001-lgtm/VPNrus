@@ -1,0 +1,43 @@
+# B8B1C2: sudoers template for the pocvpn-api -> root privilege boundary.
+#
+# Future installed path (B8B1C3, not this slice):
+#   /etc/sudoers.d/pocvpn-api   (root:root, 0440, installed via `visudo -cf`
+#   validation and ideally `install -m 0440` / a package's own sudoers.d
+#   drop-in mechanism - never edited in place with a plain text editor)
+#
+# Validate with:  visudo -cf gateway/privileged/pocvpn-api.sudoers
+#
+# Design: exactly ONE fixed command, runnable as root, by exactly ONE
+# fixed non-root user, with NO shell, NO argument wildcard, NO SETENV, and
+# an explicit per-command environment reset so this rule's safety does not
+# silently depend on whatever the box's global /etc/sudoers Defaults
+# happen to be.
+
+# The pocvpn-api service account (created by B8B1C3 - this slice does not
+# create it). A Runas_Alias/User_Alias is deliberately NOT used: this file
+# grants exactly one user, and an alias here would only add a second name
+# to keep in sync with no safety benefit.
+
+Cmnd_Alias POCVPN_PROVISION = /usr/local/libexec/pocvpn-provision-peer
+
+# Force env_reset and an empty env_keep for THIS command specifically,
+# regardless of the box's global Defaults. env_reset is what actually
+# strips BASH_ENV/ENV/LD_PRELOAD/LD_LIBRARY_PATH/PYTHONPATH/PATH from the
+# environment sudo executes the wrapper with - this is the real
+# BASH_ENV/ENV injection defense (see pocvpn-provision-peer's own
+# docstring: a bash script cannot defend against BASH_ENV itself, since
+# bash consults it before any of the script's own lines run). secure_path
+# is set too, but only as defense in depth - the wrapper never relies on
+# PATH search for anything it execs (see its own comments).
+Defaults!POCVPN_PROVISION env_reset
+Defaults!POCVPN_PROVISION !env_keep
+Defaults!POCVPN_PROVISION secure_path="/usr/local/bin:/usr/bin:/bin"
+
+# No ALL=(ALL) ALL. No NOPASSWD: ALL. No SETENV. No wildcard argument
+# pattern (sudoers cannot safely validate a public key shape anyway - that
+# job belongs to the wrapper and, authoritatively, to provision-peer.sh -
+# see pocvpn-provision-peer's own comments for why). The command path
+# below is the exact fixed path, with no argument glob at all: sudoers
+# grants running that one program, with whatever arguments the caller
+# supplies, and the wrapper is what bounds/validates those arguments.
+pocvpn-api ALL=(root) NOPASSWD: POCVPN_PROVISION
