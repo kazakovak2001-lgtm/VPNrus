@@ -1,0 +1,117 @@
+"""Required startup configuration for the B8B1B provisioning API.
+
+Fail-closed by design: load_config() raises ConfigError, and the process
+must refuse to start, if any required value is missing or invalid. There
+is deliberately NO bind-host field anywhere in AppConfig - the listen
+address is hard-coded to 127.0.0.1 in server.py and is not configurable
+from here or anywhere else, per the B8B1B server-boundary requirement.
+"""
+import ipaddress
+import os
+from dataclasses import dataclass
+
+from .wgkey import is_valid_wg_public_key
+
+_ENV_PREFIX = "POCVPN_API_"
+
+_REQUIRED_KEYS = (
+    "ENDPOINT_HOST",
+    "ENDPOINT_PORT",
+    "GATEWAY_PUBLIC_KEY",
+    "GATEWAY_TUNNEL_IP",
+    "TOKEN_STORE_PATH",
+    "PROVISION_SCRIPT_PATH",
+    "SUBPROCESS_TIMEOUT_SECONDS",
+    "API_PORT",
+)
+
+
+class ConfigError(Exception):
+    """Raised when required configuration is missing or invalid - the
+    caller (server.py's main()) must let this abort startup, never fall
+    back to a default."""
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    endpoint_host: str
+    endpoint_port: int
+    gateway_public_key: str
+    gateway_tunnel_ip: str
+    token_store_path: str
+    token_lock_path: str
+    provision_script_path: str
+    subprocess_timeout_seconds: float
+    api_port: int
+
+
+def _get(env, key):
+    return env.get(_ENV_PREFIX + key, "").strip()
+
+
+def load_config(env=None):
+    env = os.environ if env is None else env
+
+    missing = [key for key in _REQUIRED_KEYS if not _get(env, key)]
+    if missing:
+        raise ConfigError(
+            "missing required configuration: "
+            + ", ".join(_ENV_PREFIX + k for k in missing)
+        )
+
+    endpoint_host = _get(env, "ENDPOINT_HOST")
+
+    endpoint_port_raw = _get(env, "ENDPOINT_PORT")
+    try:
+        endpoint_port = int(endpoint_port_raw)
+    except ValueError:
+        raise ConfigError(f"{_ENV_PREFIX}ENDPOINT_PORT is not an integer: {endpoint_port_raw!r}")
+    if not (1 <= endpoint_port <= 65535):
+        raise ConfigError(f"{_ENV_PREFIX}ENDPOINT_PORT out of range: {endpoint_port}")
+
+    gateway_public_key = _get(env, "GATEWAY_PUBLIC_KEY")
+    if not is_valid_wg_public_key(gateway_public_key):
+        raise ConfigError(f"{_ENV_PREFIX}GATEWAY_PUBLIC_KEY is not a valid AmneziaWG/WireGuard public key")
+
+    gateway_tunnel_ip = _get(env, "GATEWAY_TUNNEL_IP")
+    try:
+        ipaddress.IPv4Address(gateway_tunnel_ip)
+    except ValueError:
+        raise ConfigError(f"{_ENV_PREFIX}GATEWAY_TUNNEL_IP is not a valid IPv4 address: {gateway_tunnel_ip!r}")
+
+    token_store_path = _get(env, "TOKEN_STORE_PATH")
+    token_lock_path = _get(env, "TOKEN_LOCK_PATH") or (token_store_path + ".lock")
+
+    provision_script_path = _get(env, "PROVISION_SCRIPT_PATH")
+    if not os.path.isfile(provision_script_path):
+        raise ConfigError(
+            f"{_ENV_PREFIX}PROVISION_SCRIPT_PATH does not exist or is not a file: {provision_script_path!r}"
+        )
+
+    timeout_raw = _get(env, "SUBPROCESS_TIMEOUT_SECONDS")
+    try:
+        subprocess_timeout_seconds = float(timeout_raw)
+    except ValueError:
+        raise ConfigError(f"{_ENV_PREFIX}SUBPROCESS_TIMEOUT_SECONDS is not a number: {timeout_raw!r}")
+    if subprocess_timeout_seconds <= 0:
+        raise ConfigError(f"{_ENV_PREFIX}SUBPROCESS_TIMEOUT_SECONDS must be positive: {subprocess_timeout_seconds}")
+
+    api_port_raw = _get(env, "API_PORT")
+    try:
+        api_port = int(api_port_raw)
+    except ValueError:
+        raise ConfigError(f"{_ENV_PREFIX}API_PORT is not an integer: {api_port_raw!r}")
+    if not (1 <= api_port <= 65535):
+        raise ConfigError(f"{_ENV_PREFIX}API_PORT out of range: {api_port}")
+
+    return AppConfig(
+        endpoint_host=endpoint_host,
+        endpoint_port=endpoint_port,
+        gateway_public_key=gateway_public_key,
+        gateway_tunnel_ip=gateway_tunnel_ip,
+        token_store_path=token_store_path,
+        token_lock_path=token_lock_path,
+        provision_script_path=provision_script_path,
+        subprocess_timeout_seconds=subprocess_timeout_seconds,
+        api_port=api_port,
+    )
