@@ -16,4 +16,11 @@ data class DiagnosticsSnapshot(
     val reconnectAttempts: Int = 0,
     val lastError: VpnError? = null,
     val networkType: String = "unknown",
+    // B8B3D - from VpnTransport.stats() (AmneziaWgTransport.stats(), backed
+    // by Backend.getLastHandshake/getStatistics - see that class's own
+    // docs). Non-secret: byte counters and a handshake timestamp, nothing
+    // key-derived.
+    val lastHandshakeEpochMillis: Long? = null,
+    val bytesReceived: Long? = null,
+    val bytesSent: Long? = null,
 )

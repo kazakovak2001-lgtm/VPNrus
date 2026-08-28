@@ -37,4 +37,12 @@ class DiagnosticsStore {
     fun clearError() {
         _snapshot.value = _snapshot.value.copy(lastError = null)
     }
+
+    fun updateStats(lastHandshakeEpochMillis: Long?, bytesReceived: Long?, bytesSent: Long?) {
+        _snapshot.value = _snapshot.value.copy(
+            lastHandshakeEpochMillis = lastHandshakeEpochMillis,
+            bytesReceived = bytesReceived,
+            bytesSent = bytesSent,
+        )
+    }
 }

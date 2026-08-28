@@ -1,25 +1,30 @@
 package net.pocvpn.client.vpn.config
 
 /**
- * The one declared POC-01 AmneziaWG profile, shared with the gateway.
- * Values here MUST match gateway/config/awg-profile.env exactly - see that
- * file and gateway/README.md's B5A section for which fields the protocol
- * actually requires to match (only HeaderProtectionKey, which POC-01 leaves
- * unset) versus which are declared identical here purely for consistency.
+ * The one declared POC-01 AmneziaWG profile.
+ *
+ * B8B3B correction: S1-S4/H1-H4 below are pinned to the LIVE Oracle awg0
+ * server's actual values (confirmed live, not the gateway/config/awg-profile.env
+ * template - that file's declared values had drifted from what is actually
+ * running) - AmneziaWG's receive-side packet-type/padding parsing depends on
+ * these matching, so a mismatch here is a real handshake blocker, not a
+ * client-side-only cosmetic difference. Jc/Jmin/Jmax are unaffected by this
+ * fix (client-only tuning, not the server-dependent mismatch) and are left
+ * exactly as before.
  */
 object PocAwgProfile {
     val value = AwgProfile(
         junkPacketCount = 6,
         junkPacketMinSize = 40,
         junkPacketMaxSize = 100,
-        initPacketJunkSize = 15,
-        responsePacketJunkSize = 20,
-        cookieReplyPacketJunkSize = 15,
-        transportPacketJunkSize = 20,
-        initPacketMagicHeader = "1190494288",
-        responsePacketMagicHeader = "1190494289",
-        underloadPacketMagicHeader = "1190494290",
-        transportPacketMagicHeader = "1190494291",
+        initPacketJunkSize = 113,
+        responsePacketJunkSize = 159,
+        cookieReplyPacketJunkSize = 0,
+        transportPacketJunkSize = 0,
+        initPacketMagicHeader = "1106684696",
+        responsePacketMagicHeader = "3677857287",
+        underloadPacketMagicHeader = "353316806",
+        transportPacketMagicHeader = "2068198996",
         randomTrailers = false,
         disableCookies = false,
         // headerProtectionKeyBase64 intentionally unset for POC-01 - see gateway/README.md.

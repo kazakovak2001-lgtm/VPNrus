@@ -15,6 +15,7 @@ sealed class VpnError(val category: String, val reason: String? = null) {
     object ReconnectExhausted : VpnError("ReconnectExhausted")
     data class ConfigurationMappingFailure(val detail: String) : VpnError("ConfigurationMappingFailure", detail)
     object AlreadyInProgress : VpnError("AlreadyInProgress")
+    object HandshakeTimeout : VpnError("HandshakeTimeout")
 
     /** Safe to show a developer, e.g. in the diagnostics panel - never includes key material. */
     fun displayText(): String = if (reason != null) "$category: $reason" else category

@@ -17,6 +17,7 @@ import kotlin.coroutines.coroutineContext
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.ClientKeyRepository
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.AwgConfig
 import net.pocvpn.client.vpn.config.AwgPeer
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -42,6 +43,12 @@ class VpnController(
     private val diagnostics: DiagnosticsStore,
     private val scope: CoroutineScope,
 ) {
+    private companion object {
+        // B8B3D - "small bounded startup window" per the task's own wording.
+        const val HANDSHAKE_TIMEOUT_MS = 8_000L
+        const val HANDSHAKE_POLL_INTERVAL_MS = 500L
+    }
+
     private val connectMutex = Mutex()
 
     private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
@@ -168,16 +175,31 @@ class VpnController(
                 }
                 return try {
                     hasTouchedTransport = true
+                    // B8B3D: the attempt's own start time - a handshake is only
+                    // trusted as proof of THIS attempt's success if it is at or
+                    // after this timestamp, never a stale one from a prior
+                    // session (see class docs' session-semantics note).
+                    val attemptStartEpochMillis = System.currentTimeMillis()
                     transport.connect(transportConfig)
-                    // Set directly rather than relying solely on the background collector:
-                    // observeState() is a StateFlow, which only guarantees delivery of the
-                    // latest value to a slow collector. A fast reconnect cycle that nets
-                    // back to the same value it last saw (Connected -> Connecting ->
-                    // Connected) can be invisible to it. We know unambiguously, right here,
-                    // that the connect succeeded - the collector remains responsible only
-                    // for genuinely later/async transitions (e.g. a backend-reported drop).
-                    _state.value = TransportState.Connected
-                    true
+                    // Interface-up/TX>0 alone is deliberately NOT treated as
+                    // success here - see awaitFreshHandshake's own docs. Set
+                    // directly (not left to the background collector) for the
+                    // same reason the prior direct-set comment explained: we
+                    // know unambiguously, right here, whether THIS attempt
+                    // produced a real handshake.
+                    if (awaitFreshHandshake(attemptStartEpochMillis)) {
+                        recordCurrentStats()
+                        _state.value = TransportState.Connected
+                        true
+                    } else {
+                        diagnostics.recordError(VpnError.HandshakeTimeout)
+                        // Deliberately does NOT call transport.disconnect() -
+                        // failover/kill-switch policy is out of scope for this
+                        // slice (see class docs). The interface may still be
+                        // up; only the user-visible state reflects the truth.
+                        _state.value = TransportState.HandshakeFailed
+                        false
+                    }
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     _state.value = TransportState.Error("Backend failed to start")
@@ -203,6 +225,55 @@ class VpnController(
             ),
         )
         return TransportConfig.Awg(awgConfig)
+    }
+
+    /**
+     * B8B3D - the authoritative startup-success signal: a REAL AWG handshake
+     * for THIS connection attempt, observed via the existing
+     * VpnTransport.stats() boundary (AmneziaWgTransport.stats(), backed by
+     * Backend.getLastHandshake/getStatistics - no second polling system, no
+     * new state-machine framework). Polls at a fixed virtual-time interval,
+     * bounded by HANDSHAKE_TIMEOUT_MS total - purely delay()-driven (no
+     * wall-clock deadline check), so it is exactly as fast-forwardable under
+     * kotlinx-coroutines-test's virtual time as the existing reconnect
+     * backoff loop already is.
+     *
+     * A handshake only counts if its timestamp is >= attemptStartEpochMillis -
+     * a stale handshake left over from a previous session can never satisfy
+     * a NEW attempt. This is also exactly why an established CONNECTED
+     * session is never re-evaluated later: this function runs ONCE per
+     * connect() attempt and is never invoked again while already connected -
+     * ordinary handshake-age growth during an idle period never reaches this
+     * check at all.
+     *
+     * A transport that cannot report stats at all (Unsupported/NotImplemented -
+     * i.e. there is nothing to observe) is trusted on its own connect()
+     * success, exactly like pre-B8B3D behavior - this check can only make a
+     * transport's reported success LESS trusted when it has real evidence to
+     * evaluate, never penalize a transport that offers none.
+     */
+    private suspend fun awaitFreshHandshake(attemptStartEpochMillis: Long): Boolean {
+        val maxPolls = (HANDSHAKE_TIMEOUT_MS / HANDSHAKE_POLL_INTERVAL_MS).toInt()
+        for (pollIndex in 0..maxPolls) {
+            when (val stats = transport.stats()) {
+                is TransportStats.Counters -> {
+                    if (isFreshHandshake(stats.lastHandshakeEpochMillis, attemptStartEpochMillis)) {
+                        return true
+                    }
+                }
+                TransportStats.Unsupported, TransportStats.NotImplemented -> return true
+                TransportStats.Unavailable -> Unit
+            }
+            if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
+        }
+        return false
+    }
+
+    private suspend fun recordCurrentStats() {
+        val stats = transport.stats()
+        if (stats is TransportStats.Counters) {
+            diagnostics.updateStats(stats.lastHandshakeEpochMillis, stats.bytesReceived, stats.bytesSent)
+        }
     }
 
     private fun handleNetworkLost() {
@@ -250,3 +321,19 @@ class VpnController(
         reconnectManager.stop()
     }
 }
+
+/**
+ * B8B3D - pure, file-scope (not a VpnController member) specifically so it
+ * is directly unit-testable with concrete millisecond values, independent
+ * of FakeVpnTransport/any transport double - the exact thing the seconds-
+ * vs-milliseconds unit bug needed proving against (a value that is only
+ * "fresh" if compared as milliseconds, not seconds).
+ *
+ * `handshakeEpochMillis` must already be real epoch MILLISECONDS - see
+ * AmneziaWgTransport.stats()'s own docs for why it sources this from
+ * Statistics.PeerStats.latestHandshakeEpochMillis(), never from the
+ * seconds-valued Backend.getLastHandshake(). A null input (no handshake
+ * observed, including a normalized 0/sentinel) is never fresh.
+ */
+internal fun isFreshHandshake(handshakeEpochMillis: Long?, attemptStartEpochMillis: Long): Boolean =
+    handshakeEpochMillis != null && handshakeEpochMillis >= attemptStartEpochMillis

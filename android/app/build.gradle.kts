@@ -89,6 +89,12 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // B8B3A - ProvisioningClientTest exercises real org.json.JSONObject
+    // parsing/serialization. Android's own org.json is a stub on the local
+    // (non-instrumented) unit test classpath (returns default/empty values,
+    // not real behavior) - this is the standard real implementation used to
+    // get actual JSON behavior in JVM-only unit tests.
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

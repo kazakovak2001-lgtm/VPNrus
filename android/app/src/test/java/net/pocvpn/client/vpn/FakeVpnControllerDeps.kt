@@ -8,6 +8,7 @@ import net.pocvpn.client.identity.ClientIdentity
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.TransportConfig
@@ -27,6 +28,16 @@ class FakeVpnTransport(private val permission: Intent? = null) : VpnTransport {
     var failConnectWith: Throwable? = null
     var lastConfig: TransportConfig? = null
 
+    // B8B3D - controls what stats() reports. Defaults to a fresh handshake
+    // (real wall-clock "now", computed at call time - see stats() below) so
+    // every pre-existing test, which knows nothing about handshake-awaiting,
+    // keeps observing prompt Connected exactly as before. Set
+    // handshakeAvailable = false to exercise HandshakeFailed/TX-without-
+    // handshake behavior.
+    var handshakeAvailable = true
+    var statsBytesReceived = 0L
+    var statsBytesSent = 0L
+
     override fun preparePermissionIntent(): Intent? = permission
 
     override suspend fun connect(config: TransportConfig) {
@@ -44,6 +55,12 @@ class FakeVpnTransport(private val permission: Intent? = null) : VpnTransport {
     }
 
     override fun observeState(): Flow<TransportState> = stateFlow
+
+    override suspend fun stats(): TransportStats = TransportStats.Counters(
+        bytesReceived = statsBytesReceived,
+        bytesSent = statsBytesSent,
+        lastHandshakeEpochMillis = if (handshakeAvailable) System.currentTimeMillis() else null,
+    )
 }
 
 class FakeGatewayConfigurationRepository(private var config: GatewayConfiguration) : GatewayConfigurationRepository {
