@@ -6,6 +6,7 @@ collide across parallel test runs).
 import base64
 import json
 import os
+import secrets
 import stat
 import sys
 import threading
@@ -64,14 +65,34 @@ def make_public_key(seed_byte=0x01):
     return base64.b64encode(bytes([seed_byte]) * 32).decode("ascii")
 
 
-def make_token_store(store_path, entries):
-    """entries: iterable of (raw_token, expected_public_key, status)."""
+def make_token_store(store_path, entries, lock_path):
+    """entries: iterable of (raw_token, expected_public_key, status) or
+    (raw_token, expected_public_key, status, token_id) - the 3-tuple form
+    auto-generates a synthetic token_id (this is a test fixture, not the
+    production writer - gateway/tools/enrollment_tokens.py is the only
+    real issuer). lock_path is required (not defaulted) so every call
+    site is explicit about which lock file the store it's writing is
+    paired with - see B8B1C1: the HTTP reader now fails closed if the
+    lock file doesn't already exist, so this fixture must create it too,
+    exactly like the operator CLI's `init` would.
+    """
     data = {}
-    for raw_token, expected_public_key, status in entries:
+    for entry in entries:
+        if len(entry) == 4:
+            raw_token, expected_public_key, status, token_id = entry
+        else:
+            raw_token, expected_public_key, status = entry
+            token_id = secrets.token_hex(16)
         digest = tokens_module.token_digest(raw_token)
-        data[digest] = {"expected_public_key": expected_public_key, "status": status}
+        data[digest] = {
+            "token_id": token_id,
+            "expected_public_key": expected_public_key,
+            "status": status,
+        }
     with open(store_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
+    if not os.path.exists(lock_path):
+        os.close(os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600))
 
 
 def make_app_config(tmp_dir, provision_script_path, subprocess_timeout_seconds=5.0, api_port=0):

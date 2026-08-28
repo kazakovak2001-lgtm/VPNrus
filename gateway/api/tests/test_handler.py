@@ -58,6 +58,7 @@ class HandlerTestCase(unittest.TestCase):
                 (self.ACTIVE_TOKEN, self.bound_public_key, tokens_module.ACTIVE),
                 (self.REVOKED_TOKEN, self.bound_public_key, tokens_module.REVOKED),
             ],
+            self.app_config.token_lock_path,
         )
 
         self._log_capture = io.StringIO()
@@ -255,6 +256,7 @@ class ProvisionResultTests(HandlerTestCase):
         make_token_store(
             self.app_config.token_store_path,
             [(self.ACTIVE_TOKEN, self.bound_public_key, tokens_module.ACTIVE)],
+            self.app_config.token_lock_path,
         )
         self.server.close()
         self.server = RunningServer(self.app_config)
