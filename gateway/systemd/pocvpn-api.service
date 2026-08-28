@@ -1,0 +1,84 @@
+# B8B1C3: production systemd unit for the non-root pocvpn-api HTTP
+# provisioning service (gateway/api/). See gateway/DEPLOYMENT.md for the
+# full filesystem/ownership model this unit assumes, and
+# gateway/privileged/README.md for the sudo boundary it reaches through.
+#
+# Verified locally (B8B1C3): `python3 -m api.server`, run with
+# WorkingDirectory set to the gateway/ package root, is how this process
+# is actually started - confirmed against the real repository layout, not
+# assumed. Do not change ExecStart's module path without re-verifying.
+[Unit]
+Description=pocvpn localhost provisioning API (non-root)
+After=network.target
+# Deliberately NOT `After=awg-poc.service` / `Requires=awg-poc.service`:
+# this service never talks to the AWG interface directly (see
+# gateway/api/__init__.py) - it only reaches the gateway mutation through
+# sudo -n -> the root wrapper -> provision-peer.sh, which itself tolerates
+# the AWG service being inactive (see lib/peer_mutations.sh
+# converge_live_state). Coupling unit ordering here would be a false
+# dependency.
+
+[Service]
+Type=simple
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+EnvironmentFile=/etc/pocvpn/api.env
+ExecStart=/usr/bin/python3 -m api.server
+Restart=on-failure
+RestartSec=2
+
+# --- hardening: see gateway/DEPLOYMENT.md "Hardening directives" for the
+# empirical pass/fail record behind every line below. This is the SMALLEST
+# working set found in B8B1C3 testing, not a copied checklist - directives
+# that broke the sudo->root-helper path were rejected, not tuned around.
+#
+# NoNewPrivileges is DELIBERATELY ABSENT: this service's only privileged
+# operation is `sudo -n <wrapper>` (gateway/api/provision.py), and sudo's
+# own setuid-root re-exec IS a "new privilege" from the kernel's point of
+# view. Setting NoNewPrivileges=yes here does not just "harden" this unit -
+# it silently breaks every provisioning request into an internal_error,
+# because sudo can no longer elevate. Never add it back without re-proving
+# the full HTTP->sudo->root-helper chain end-to-end.
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ProtectSystem=strict + one explicit, narrowly-scoped writable exception.
+# The root child this service's own `sudo -n` spawns (provision-peer.sh,
+# running as root, NOT as pocvpn-api) inherits this unit's mount
+# namespace and must still be able to write awg0.conf/.provision.lock
+# there. This does NOT grant pocvpn-api itself write access - Unix DAC
+# (root:pocvpn-api directory, 0750, see DEPLOYMENT.md) is what actually
+# blocks this service's own non-root process from writing inside it; the
+# ReadWritePaths line below only keeps the *mount* writable for whichever
+# process has DAC permission to write there. See DEPLOYMENT.md "ProtectSystem
+# + DAC proof" for the local test proving both halves hold simultaneously.
+ProtectSystem=strict
+ReadWritePaths=/etc/amnezia/amneziawg
+
+# CapabilityBoundingSet and RestrictSUIDSGID are DELIBERATELY OMITTED, not
+# forgotten. An empty CapabilityBoundingSet= would strip the capabilities
+# sudo's own setuid-root re-exec needs (e.g. CAP_SETUID/CAP_SETGID) before
+# it ever gets to drop them itself, and RestrictSUIDSGID=yes blocks the
+# setuid bit on /usr/bin/sudo from having any effect at all inside this
+# unit's namespace - either one turns "sudo -n <wrapper>" into a silent
+# permission failure. B8B1C3 did not find a minimal non-empty bounding set
+# that was worth the added complexity over simply omitting the directive;
+# a future slice may revisit this with real capability-tracing evidence,
+# not a guess.
+#
+# MemoryDenyWriteExecute is DELIBERATELY OMITTED: CPython's own JIT/ctypes
+# paths under some builds are OMIT-required to run reliably; C3 did not
+# spend time proving otherwise since it changes nothing about the sudo
+# boundary this slice's E2E is actually verifying, and the false-hardening
+# risk here is not "the chain breaks", it is a maybe-slower stdlib http
+# server - not worth guessing about instead of testing.
+
+[Install]
+WantedBy=multi-user.target
