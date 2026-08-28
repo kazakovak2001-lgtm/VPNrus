@@ -10,9 +10,11 @@ held to, exercised here so a future refactor that weakens it fails loudly.
 import contextlib
 import io
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _TOOLS_DIR = os.path.abspath(os.path.join(_THIS_DIR, ".."))
@@ -265,6 +267,155 @@ class CliMigrateTests(TempConfMixin, unittest.TestCase):
         _run(mpm.cmd_migrate, _Args(input=without_nl, output=out2))
         with open(out2, "rb") as f:
             self.assertFalse(f.read().endswith(b"\n"))
+
+
+class CandidateSecureCreationTests(TempConfMixin, unittest.TestCase):
+    """ORACLE-MIGRATION-DESIGN-1 output-hardening review: proves the
+    candidate is created with restrictive permissions FROM CREATION (no
+    open()-then-chmod window), fails closed on an existing path or an
+    existing symlink WITHOUT following it, never truncates anything that
+    was already there, cleans up after itself on a forced write failure,
+    and never leaks a secret on any of these failure paths."""
+
+    def _sentinel_source(self):
+        with open(_LIVE_SHAPE_ONE_PEER, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # --- A: mode 0600 from creation ---
+    @unittest.skipUnless(os.name == "posix", "POSIX file mode bits are not meaningful on this platform")
+    def test_a_new_candidate_is_mode_0600_immediately_after_migrate(self):
+        inp = self._write("in.conf", self._sentinel_source())
+        outp = self._path("out.conf")
+        rc, _stdout, _stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=outp))
+        self.assertEqual(rc, 0)
+        mode = stat.S_IMODE(os.stat(outp).st_mode)
+        self.assertEqual(mode, 0o600, f"expected 0o600, got {oct(mode)}")
+
+    # --- B: existing output file causes failure, remains byte-for-byte unchanged ---
+    def test_b_existing_output_file_rejected_and_left_untouched(self):
+        inp = self._write("in.conf", self._sentinel_source())
+        outp = self._write("out.conf", "PRE-EXISTING SENTINEL CONTENT - MUST NOT CHANGE\n")
+        before = self._read(outp)
+
+        rc, _stdout, stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=outp))
+        self.assertEqual(rc, 1)
+        self.assertIn("already exists", stderr)
+
+        after = self._read(outp)
+        self.assertEqual(before, after, "pre-existing output content must be byte-for-byte unchanged")
+
+    # --- C: symlink output path causes failure, symlink target unchanged ---
+    def test_c_symlink_output_path_rejected_and_target_untouched(self):
+        inp = self._write("in.conf", self._sentinel_source())
+        target = self._write("real_target.conf", "SYMLINK TARGET SENTINEL - MUST NOT CHANGE\n")
+        link_path = self._path("out_symlink.conf")
+        try:
+            os.symlink(target, link_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation not permitted in this environment")
+
+        before = self._read(target)
+        rc, _stdout, stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=link_path))
+        self.assertEqual(rc, 1)
+        self.assertIn("already exists", stderr)
+        self.assertTrue(os.path.islink(link_path), "the symlink itself must not be replaced")
+
+        after = self._read(target)
+        self.assertEqual(before, after, "symlink TARGET content must be byte-for-byte unchanged - never written through")
+
+    # --- D: input remains unchanged on every failure path ---
+    def test_d_input_unchanged_after_malformed_input_failure(self):
+        bad_text = "[Peer]\nPublicKey = A\nAllowedIPs = 10.77.0.2/32\n"
+        inp = self._write("bad.conf", bad_text)
+        outp = self._path("out.conf")
+        rc, _stdout, _stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=outp))
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._read(inp), bad_text)
+
+    def test_d_input_unchanged_after_existing_output_failure(self):
+        src = self._sentinel_source()
+        inp = self._write("in.conf", src)
+        outp = self._write("out.conf", "PRE-EXISTING\n")
+        rc, _stdout, _stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=outp))
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._read(inp), src)
+
+    def test_d_input_unchanged_after_symlink_output_failure(self):
+        src = self._sentinel_source()
+        inp = self._write("in.conf", src)
+        target = self._write("real_target.conf", "TARGET\n")
+        link_path = self._path("out_symlink.conf")
+        try:
+            os.symlink(target, link_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation not permitted in this environment")
+        rc, _stdout, _stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=link_path))
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._read(inp), src)
+
+    # --- E: forced write failure does not truncate/modify the source, and
+    # cleans up the partially-created candidate rather than leaving it
+    # behind looking complete ---
+    def test_e_forced_write_failure_cleans_up_candidate_and_leaves_source_untouched(self):
+        src = self._sentinel_source()
+        inp = self._write("in.conf", src)
+        outp = self._path("out.conf")
+
+        real_fdopen = os.fdopen
+
+        class _FailingWriter:
+            """Wraps the REAL fd (so it is still properly closed, never
+            leaked) but makes .write() raise - exercises
+            _write_candidate_exclusive's actual cleanup path rather than
+            a fake that never touches the filesystem at all."""
+
+            def __init__(self, fd):
+                self._fd = fd
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                os.close(self._fd)
+                return False
+
+            def write(self, _data):
+                raise OSError("simulated disk write failure")
+
+        def failing_fdopen(fd, mode):
+            return _FailingWriter(fd)
+
+        with mock.patch.object(mpm.os, "fdopen", side_effect=failing_fdopen):
+            rc, _stdout, stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=outp))
+
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(outp), "a failed write must not leave a partial candidate behind")
+        self.assertEqual(self._read(inp), src, "source must be untouched by a downstream write failure")
+
+    # --- F: secrets absent from stdout/stderr on every failure path above
+    # (the with-PSK fixture, so both PrivateKey and PresharedKey are in
+    # play) - _run() already asserts this on every call in this class, but
+    # this test makes the requirement explicit and independent of that
+    # helper's own implementation ---
+    def test_f_no_secret_leak_across_all_failure_paths_with_psk_fixture(self):
+        with open(_LIVE_SHAPE_WITH_PSK, "r", encoding="utf-8") as f:
+            src = f.read()
+        inp = self._write("in.conf", src)
+
+        outp1 = self._write("existing.conf", "X\n")
+        rc, stdout, stderr = _run(mpm.cmd_migrate, _Args(input=inp, output=outp1))
+        self.assertEqual(rc, 1)
+        for secret in (_SYNTHETIC_PRIVATE_KEY, _SYNTHETIC_PRESHARED_KEY):
+            self.assertNotIn(secret, stdout)
+            self.assertNotIn(secret, stderr)
+
+        bad_inp = self._write("bad.conf", "[Peer]\nPublicKey = A\nAllowedIPs = 10.77.0.2/32\n")
+        outp2 = self._path("out2.conf")
+        rc, stdout, stderr = _run(mpm.cmd_migrate, _Args(input=bad_inp, output=outp2))
+        self.assertEqual(rc, 1)
+        for secret in (_SYNTHETIC_PRIVATE_KEY, _SYNTHETIC_PRESHARED_KEY):
+            self.assertNotIn(secret, stdout)
+            self.assertNotIn(secret, stderr)
 
 
 class CliVerifyTests(TempConfMixin, unittest.TestCase):

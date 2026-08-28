@@ -38,21 +38,32 @@ review:
     mutations; a second, independent migration-specific lock was
     considered and rejected for that reason.
 
-  - Secure candidate/backup file rules the future transaction must follow
-    (NOT implemented by this file - `cmd_migrate` here writes to whatever
-    path the caller supplies with a plain `open(..., "w")`, appropriate
-    for local testing/fixtures only):
+  - Secure candidate file creation - IMPLEMENTED (ORACLE-MIGRATION-
+    DESIGN-1 hardening review): `cmd_migrate`'s output is written by
+    `_write_candidate_exclusive()`, which uses `os.open(path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)` - mode 0600 from the
+    very first filesystem operation, never a permissive create followed
+    by a later `chmod`. `O_EXCL` means an already-existing path (a
+    regular file OR a symlink, dangling or not) is rejected outright and
+    never followed/truncated/written-through - see that function's own
+    docstring for the exact guarantee. When invoked in the future as
+    `sudo -n python3 - ...` (per the transfer design), the candidate is
+    therefore root-owned by construction - no separate `chown` step is
+    needed or added here.
+
+  - Remaining candidate/backup rules the future LIVE transaction must
+    still follow (not implemented by this generic local tool, which only
+    controls file creation mode/exclusivity - it does not choose where
+    the caller points `<output-conf>`, and has no concept of a "backup"
+    at all, which is the transaction's responsibility, not a subcommand
+    here):
       * candidate and backup on the SAME filesystem as awg0.conf (so the
         eventual replace can be a single atomic rename, never a cross-
-        filesystem copy+delete)
-      * in a root-only directory, root:root ownership
-      * mode 0600 from the moment of creation - via `os.open(path,
-        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)` or
-        `tempfile.mkstemp` in the target directory, NEVER a permissive
-        `open()` followed by a later `chmod` (a window where the file is
-        briefly more-than-root-readable must never exist); `O_EXCL` also
-        makes symlink/path-race attacks fail closed instead of silently
-        following an existing link
+        filesystem copy+delete) - this means the CALLER must pass an
+        <output-conf> path inside that same directory; this tool does
+        not enforce that itself
+      * in a root-only directory (already true of the live
+        /etc/amnezia/amneziawg - see reconciliation)
       * NEVER an ordinary world-writable /tmp
       * NEVER printed, copied off-host, committed, or logged
       * backup lifecycle: retained only through post-write verification;
@@ -69,6 +80,14 @@ Three subcommands, each read-only with respect to the input:
         it is malformed or already (partially) marked, and otherwise
         writes a NEW file at <output-conf> - the input is never modified
         in place, and the two are required to be different paths.
+
+        <output-conf> is created with O_CREAT|O_EXCL at mode 0600 from the
+        very first filesystem operation (see _write_candidate_exclusive) -
+        never a permissive create followed by a later chmod, never
+        truncates an existing file, and never follows an existing symlink
+        at that path (O_EXCL rejects it outright). If <output-conf>
+        already exists in any form, `migrate` fails closed rather than
+        overwriting or writing through it.
 
     migrate_peer_markers.py verify <original-conf> <migrated-conf>
         Re-parses both files and checks TWO independent things, both
@@ -136,6 +155,7 @@ value through that path either.
 import argparse
 import difflib
 import hashlib
+import os
 import sys
 
 _BEGIN_MARKER = "# --- PEERS BEGIN --- (managed by scripts/add-peer.sh / remove-peer.sh; do not hand-edit below this line)"
@@ -318,12 +338,58 @@ def _read_text_preserving_newline(path):
     return lines, trailing_newline
 
 
-def _write_text_preserving_newline(path, lines, trailing_newline):
+def _write_candidate_exclusive(path, lines, trailing_newline):
+    """Write the MIGRATED candidate at `path` with restrictive permissions
+    from the very first filesystem operation - never a later chmod.
+
+    Uses os.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600) directly:
+      - O_CREAT | O_EXCL fails with FileExistsError if `path` already
+        exists in ANY form - a regular file, a directory, or a symlink
+        (dangling or not). The kernel's O_EXCL check is on the final path
+        component's directory entry, not on whatever a symlink there
+        might resolve to - so an existing symlink at `path` is rejected
+        outright and is NEVER followed/written-through, satisfying "fail
+        closed on symlink/path collisions" without this function needing
+        any symlink-specific logic of its own.
+      - 0o600 is passed to os.open() itself, so no window exists where
+        the file is created with a more permissive mode and only later
+        tightened - see ORACLE-MIGRATION-DESIGN-1's hardening review.
+      - An existing file (of any kind) at `path` is NEVER truncated -
+        O_TRUNC is deliberately not in the flags, so even if some future
+        edit added O_CREAT-without-O_EXCL by mistake, this call would
+        still refuse to silently overwrite content; as written, that
+        scenario cannot arise at all because O_EXCL is always present.
+
+    Raises FileExistsError if `path` already exists (including as a
+    symlink) - callers should treat this as a normal, expected rejection,
+    not a bug. Raises OSError for other failures (e.g. no write
+    permission on the containing directory).
+
+    On ANY failure while writing the body (not while opening/creating -
+    if os.open() itself fails, nothing was created and there is nothing
+    to clean up), this function makes a best-effort attempt to remove
+    ONLY the path it just created, then re-raises - a caller must never
+    be able to observe a partially-written candidate file as if it were
+    complete. Cleanup failure is swallowed (not raised) so the ORIGINAL
+    error is always what propagates; the caller is responsible for
+    reporting the candidate's path (never its content) if cleanup itself
+    could not be confirmed.
+    """
     text = "\n".join(lines)
     if trailing_newline:
         text += "\n"
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    data = text.encode("utf-8")
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 def cmd_migrate(args):
@@ -341,7 +407,14 @@ def cmd_migrate(args):
         return 1
 
     try:
-        _write_text_preserving_newline(args.output, migrated, trailing_newline)
+        _write_candidate_exclusive(args.output, migrated, trailing_newline)
+    except FileExistsError:
+        print(
+            f"migrate_peer_markers: error: {args.output} already exists (or is a symlink) - "
+            "refusing to overwrite or follow it; choose a new output path",
+            file=sys.stderr,
+        )
+        return 1
     except OSError as exc:
         print(f"migrate_peer_markers: error writing {args.output}: {exc}", file=sys.stderr)
         return 1
