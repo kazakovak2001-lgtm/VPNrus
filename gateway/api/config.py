@@ -50,6 +50,12 @@ class AppConfig:
     # required: B8B1C3 is what actually wires production sudo, this slice
     # only proves the argv shape is ready for it.
     sudo_path: str = ""
+    # B8C1: optional - blank (the default) means POST /v1/activate is not
+    # configured and always fails closed with 503 (see handler.py). Not in
+    # _REQUIRED_KEYS so every existing B8B1 deployment/test that knows
+    # nothing about activations is completely unaffected.
+    activation_store_path: str = ""
+    activation_lock_path: str = ""
 
 
 def _get(env, key):
@@ -128,6 +134,11 @@ def load_config(env=None):
     if not (1 <= api_port <= 65535):
         raise ConfigError(f"{_ENV_PREFIX}API_PORT out of range: {api_port}")
 
+    activation_store_path = _get(env, "ACTIVATION_STORE_PATH")
+    activation_lock_path = _get(env, "ACTIVATION_LOCK_PATH") or (
+        activation_store_path + ".lock" if activation_store_path else ""
+    )
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -139,4 +150,6 @@ def load_config(env=None):
         subprocess_timeout_seconds=subprocess_timeout_seconds,
         api_port=api_port,
         sudo_path=sudo_path,
+        activation_store_path=activation_store_path,
+        activation_lock_path=activation_lock_path,
     )

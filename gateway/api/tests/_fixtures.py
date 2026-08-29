@@ -95,7 +95,10 @@ def make_token_store(store_path, entries, lock_path):
         os.close(os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600))
 
 
-def make_app_config(tmp_dir, provision_script_path, subprocess_timeout_seconds=5.0, api_port=0, sudo_path=""):
+def make_app_config(
+    tmp_dir, provision_script_path, subprocess_timeout_seconds=5.0, api_port=0, sudo_path="",
+    activation_store_path="", activation_lock_path="",
+):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
     return config_module.AppConfig(
@@ -109,7 +112,27 @@ def make_app_config(tmp_dir, provision_script_path, subprocess_timeout_seconds=5
         subprocess_timeout_seconds=subprocess_timeout_seconds,
         api_port=api_port,
         sudo_path=sudo_path,
+        activation_store_path=activation_store_path,
+        activation_lock_path=activation_lock_path,
     )
+
+
+def make_activation_store(store_path, lock_path, activations):
+    """activations: iterable of dicts already shaped like activations.py
+    records (activation_id/status/max_devices/created_at/expires_at/
+    bound_devices), keyed here by credential for convenience: pass
+    (raw_credential, record_dict). Test-only writer - gateway/tools/
+    activation_tokens.py is the only real issuer."""
+    from api import activations as activations_module
+
+    data = {}
+    for raw_credential, record in activations:
+        digest = activations_module.credential_digest(raw_credential)
+        data[digest] = record
+    with open(store_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    if not os.path.exists(lock_path):
+        os.close(os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600))
 
 
 class RunningServer:

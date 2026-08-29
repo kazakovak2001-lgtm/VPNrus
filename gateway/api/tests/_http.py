@@ -89,3 +89,30 @@ def post_peers(
     if extra_headers:
         headers.update(extra_headers)
     return raw_request(port, "POST", "/v1/peers", headers, body)
+
+
+def post_activate(
+    port,
+    credential=None,
+    body_obj=None,
+    raw_body=None,
+    content_type="application/json",
+    set_content_length=True,
+    extra_headers=None,
+):
+    """Same shape as post_peers, against /v1/activate (B8C1)."""
+    if raw_body is not None:
+        body = raw_body
+    else:
+        body = json.dumps({} if body_obj is None else body_obj).encode("utf-8")
+
+    headers = {}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    if set_content_length:
+        headers["Content-Length"] = str(len(body))
+    if credential is not None:
+        headers["Authorization"] = f"Bearer {credential}"
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "POST", "/v1/activate", headers, body)

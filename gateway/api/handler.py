@@ -1,11 +1,15 @@
-"""HTTP request handling for POST /v1/peers - the only endpoint.
+"""HTTP request handling for the two POST-only endpoints this API serves:
+/v1/peers (B8B1B) and /v1/activate (B8C1).
 
-No other endpoint mutates state; no GET/DELETE/admin/token-issuance routes
-exist in this slice. See gateway/api/__init__.py for the architectural
-invariant this handler is built around: it never touches awg0.conf,
-.provision.lock, or a private key directly - it only calls
-gateway/scripts/provision-peer.sh (via provision.py) and reads the
-enrollment-token store read-only (via tokens.py).
+No GET/DELETE/admin/token-issuance routes exist in this slice. See
+gateway/api/__init__.py for the architectural invariant this handler is
+built around: it never touches awg0.conf, .provision.lock, or a private
+key directly - both endpoints only ever reach real gateway mutation
+through gateway/scripts/provision-peer.sh (via provision.py). Credential
+storage differs by endpoint: /v1/peers reads the enrollment-token store
+read-only (via tokens.py); /v1/activate both reads AND durably writes the
+activation store (via activations.py) - see that module's own docstring
+for why device-binding specifically needs write access from this process.
 """
 import hmac
 import json
@@ -16,12 +20,13 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import provision, tokens
+from . import activations, provision, tokens
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
 
 _PATH_PEERS = "/v1/peers"
+_PATH_ACTIVATE = "/v1/activate"
 _MAX_BODY_BYTES = 1024
 _BEARER_PREFIX = "Bearer "
 _SOCKET_TIMEOUT_SECONDS = 5.0
@@ -106,12 +111,18 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         self._log_fields = {}
         status_code = HTTPStatus.INTERNAL_SERVER_ERROR
         try:
-            if self.path != _PATH_PEERS:
-                status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
-            elif method != "POST":
-                status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+            if self.path == _PATH_PEERS:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_post()
+            elif self.path == _PATH_ACTIVATE:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_activate()
             else:
-                status_code = self._handle_post()
+                status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
             # Deliberately no exception message/repr in the log line - only
             # the exception's type name, so a future refactor that ever
@@ -205,6 +216,132 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         }
         status = HTTPStatus.CREATED if outcome.state == provision.CREATED else HTTPStatus.OK
         return self._success(status, payload)
+
+    # --- POST /v1/activate (B8C1) ---
+    def _handle_activate(self):
+        try:
+            return self._handle_activate_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_activate_inner(self):
+        if not self.server.config.activation_store_path:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        # Same header shape as /v1/peers' enrollment token - Authorization:
+        # Bearer <credential> - reused verbatim, not reimplemented.
+        credential = self._require_bearer_token()
+
+        raw_body = self.rfile.read(content_length)
+        # Same {"public_key": "..."} body shape and validation as /v1/peers -
+        # reused verbatim (_parse_and_validate_body is already path-agnostic).
+        public_key = self._parse_and_validate_body(raw_body)
+        self._log_fields["pubkey_prefix"] = public_key[:8]
+
+        credential_digest = activations.credential_digest(credential)
+        self._log_fields["activation_digest"] = credential_digest[:8]
+
+        if not self.server.per_token_limiter.allow(credential_digest):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        # B8C1C: ONE call does decide/reserve -> run_provision_peer ->
+        # finalize-or-rollback, all inside a single per-activation OS lock
+        # (activations.per_activation_lock, keyed by credential digest) that
+        # serializes the ENTIRE logical operation - including the external,
+        # irreversible AWG provisioning side effect itself - against any
+        # other concurrent request for the SAME activation. See
+        # activations.provision_with_activation's own docstring for why
+        # this is what actually closes the max_devices race at the real
+        # gateway-peer level, not just in the JSON store's bookkeeping.
+        try:
+            result = activations.provision_with_activation(
+                credential, public_key,
+                self.server.config.activation_store_path,
+                self.server.config.activation_lock_path,
+                self.server.config.provision_script_path,
+                self.server.config.subprocess_timeout_seconds,
+                sudo_path=self.server.config.sudo_path or None,
+            )
+        except activations.ActivationStoreError:
+            logger.error("activation_store_error")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_store_unavailable")
+
+        decision = result.decision
+        self._log_fields["activation_outcome"] = decision.outcome
+
+        if decision.outcome == activations.INVALID:
+            # Unknown credential and a credential that hashes to no record
+            # are intentionally indistinguishable - same status, same body.
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if decision.outcome == activations.REVOKED_OUTCOME:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+        if decision.outcome == activations.EXPIRED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
+        if decision.outcome == activations.DEVICE_LIMIT:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_limit_reached")
+
+        # decision.outcome is BOUND_NEW or BOUND_EXISTING here - either way
+        # this device was durably entitled at decide time, and
+        # provision_with_activation already attempted the SAME provisioning
+        # boundary /v1/peers uses. No AWG file mutation, no shelling out, is
+        # ever reimplemented here.
+        if result.provision_error is not None:
+            exc = result.provision_error
+            logger.error("provision_error kind=%s", exc.kind)
+            # Rollback (if this request owned a reservation) already
+            # happened inside provision_with_activation, still under the
+            # per-activation lock - see its own docstring.
+            if exc.kind == "exhausted":
+                raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "subnet_exhausted")
+            if exc.kind == "timeout":
+                raise _RequestError(HTTPStatus.GATEWAY_TIMEOUT, "provisioning_timeout")
+            raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+        outcome = result.provision_outcome
+        self._log_fields["state"] = outcome.state
+        self._log_fields["tunnel_ip"] = outcome.ip
+
+        finalize_result = result.finalize_result
+        if not finalize_result.confirmed:
+            # B8C1B: this key's originally-reserved capacity was legitimately
+            # reused by a different key while this request's provisioning
+            # subprocess was in flight - the device WAS actually provisioned
+            # by this request, but recording it now would exceed
+            # max_devices, so it is deliberately not recorded and this
+            # response must not report success.
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_limit_reached")
+
+        if finalize_result.status != activations.ACTIVE:
+            # The device WAS actually provisioned (finalize above still
+            # durably recorded it - un-provisioning it is out of scope for
+            # this slice), but this specific response must not report
+            # success for an activation that is revoked by now.
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+
+        payload = {
+            "client_tunnel_ip": outcome.ip,
+            "gateway_public_key": self.server.config.gateway_public_key,
+            "gateway_tunnel_ip": self.server.config.gateway_tunnel_ip,
+            "endpoint_host": self.server.config.endpoint_host,
+            "endpoint_port": self.server.config.endpoint_port,
+        }
+        # Always 200 - both a new bind and idempotent re-use of an
+        # already-bound device are equally "success" here (unlike /v1/peers'
+        # 201-vs-200 distinction, which is about peer allocation, not
+        # device entitlement).
+        return self._success(HTTPStatus.OK, payload)
 
     def _require_bearer_token(self):
         auth_header = self.headers.get("Authorization")
