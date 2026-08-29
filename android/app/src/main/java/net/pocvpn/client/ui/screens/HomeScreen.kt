@@ -23,10 +23,13 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import net.pocvpn.client.R
+import net.pocvpn.client.ui.HomeConnectedSubtitle
 import net.pocvpn.client.ui.HomeVisualState
 import net.pocvpn.client.ui.components.LocationCard
 import net.pocvpn.client.ui.components.SettingsGlyph
 import net.pocvpn.client.ui.components.VpnPowerButton
+import net.pocvpn.client.ui.homeConnectedSubtitle
+import net.pocvpn.client.vpn.policy.AppRoutingMode
 
 /**
  * B8E - the normal, release-facing Home screen. No technical values here -
@@ -38,16 +41,26 @@ fun HomeScreen(
     visualState: HomeVisualState,
     statusHeadline: String,
     onPowerButtonClick: () -> Unit,
+    onSettingsClick: () -> Unit,
     showDiagnosticsEntry: Boolean,
     onDiagnosticsClick: () -> Unit,
     // B8G - true while the app-session kill switch is holding traffic
     // blocked (see net.pocvpn.client.ui.showsKillSwitchNotice). A small,
     // truthful extra line only - no technical clutter, no redesign.
     showKillSwitchNotice: Boolean = false,
+    // B8H1 - the APPLIED routing policy's mode (VpnController
+    // .appliedRoutingPolicy.mode), NEVER the merely-saved one - see
+    // homeConnectedSubtitle's own docs. Only read while visualState ==
+    // CONNECTED; the default is otherwise unreachable/irrelevant.
+    appliedRoutingMode: AppRoutingMode = AppRoutingMode.ALL_APPS,
     modifier: Modifier = Modifier,
 ) {
     val statusSubtitle = when (visualState) {
-        HomeVisualState.CONNECTED -> stringResource(R.string.home_status_subtitle_connected)
+        HomeVisualState.CONNECTED -> when (homeConnectedSubtitle(appliedRoutingMode)) {
+            HomeConnectedSubtitle.ALL_APPS_SECURE -> stringResource(R.string.home_status_subtitle_connected)
+            HomeConnectedSubtitle.BYPASS_SELECTED_APPS -> stringResource(R.string.home_status_subtitle_connected_bypass_selected)
+            HomeConnectedSubtitle.VPN_ONLY_SELECTED_APPS -> stringResource(R.string.home_status_subtitle_connected_vpn_only_selected)
+        }
         HomeVisualState.DISCONNECTED -> stringResource(R.string.home_status_subtitle_disconnected)
         HomeVisualState.IN_PROGRESS -> stringResource(R.string.home_status_subtitle_connecting)
         HomeVisualState.FAILED -> stringResource(R.string.home_status_subtitle_failed)
@@ -68,7 +81,7 @@ fun HomeScreen(
                 modifier = Modifier.weight(1f),
             )
             val settingsDescription = stringResource(R.string.home_settings_content_description)
-            IconButton(onClick = {}, modifier = Modifier.semantics { contentDescription = settingsDescription }) {
+            IconButton(onClick = onSettingsClick, modifier = Modifier.semantics { contentDescription = settingsDescription }) {
                 SettingsGlyph(tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
             }
         }

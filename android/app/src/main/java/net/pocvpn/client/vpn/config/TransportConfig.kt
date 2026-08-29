@@ -23,6 +23,13 @@ data class AwgConfig(
     val mtu: Int? = null,
     val profile: AwgProfile,
     val peer: AwgPeer,
+    // B8H - split-tunneling (see net.pocvpn.client.vpn.policy.AppRoutingLists,
+    // the only place that decides these). Default empty/empty reproduces the
+    // exact pre-B8H full-tunnel behavior, so every existing call site
+    // (including test fixtures) is unaffected. Mutual exclusivity is
+    // AppRoutingLists' own invariant, not re-checked here.
+    val includedApplications: Set<String> = emptySet(),
+    val excludedApplications: Set<String> = emptySet(),
 )
 
 /** Transport-agnostic config passed into VpnTransport.connect(). */

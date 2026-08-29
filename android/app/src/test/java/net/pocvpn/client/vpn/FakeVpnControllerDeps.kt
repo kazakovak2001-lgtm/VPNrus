@@ -12,6 +12,9 @@ import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.policy.AppRoutingPolicy
+import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
+import net.pocvpn.client.vpn.policy.InstalledPackageChecker
 
 /** Test double for VpnTransport. `connectGate`, if set, makes connect() suspend until completed - for concurrency tests. */
 class FakeVpnTransport(private val permission: Intent? = null) : VpnTransport {
@@ -114,4 +117,30 @@ class FakeClientKeyRepository(private val privateKey: String = "FAKE_PRIVATE_KEY
     override suspend fun clearIdentity() {
         clearCallCount++
     }
+}
+
+/** B8H - in-memory AppRoutingPolicyStore double. read() always reflects the LATEST write(), exactly like the real file-backed store. */
+class FakeAppRoutingPolicyStore(private var policy: AppRoutingPolicy = AppRoutingPolicy.Default) : AppRoutingPolicyStore {
+    var writeCallCount = 0
+        private set
+
+    override fun read(): AppRoutingPolicy = policy
+
+    override fun write(policy: AppRoutingPolicy) {
+        writeCallCount++
+        this.policy = policy
+    }
+}
+
+/** B8H - InstalledPackageChecker double backed by an explicit installed-set, so "stale package" scenarios are one-line to set up. */
+class FakeInstalledPackageChecker(private val installedPackages: MutableSet<String> = mutableSetOf()) : InstalledPackageChecker {
+    fun markInstalled(vararg packageNames: String) {
+        installedPackages.addAll(packageNames)
+    }
+
+    fun markUninstalled(packageName: String) {
+        installedPackages.remove(packageName)
+    }
+
+    override fun isInstalled(packageName: String): Boolean = packageName in installedPackages
 }

@@ -23,6 +23,12 @@ import net.pocvpn.client.vpn.config.AwgPeer
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.policy.AppRoutingLists
+import net.pocvpn.client.vpn.policy.AppRoutingPolicy
+import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
+import net.pocvpn.client.vpn.policy.EffectiveRoutingResult
+import net.pocvpn.client.vpn.policy.InstalledPackageChecker
+import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
 
 sealed class ControllerEvent {
     data class RequestVpnPermission(val intent: Intent) : ControllerEvent()
@@ -83,6 +89,16 @@ class VpnController(
     private val reconnectManager: ReconnectManager,
     private val diagnostics: DiagnosticsStore,
     private val scope: CoroutineScope,
+    // B8H - additive, defaults to an in-memory store that always reads
+    // AppRoutingPolicy.Default (ALL_APPS) and ignores writes, so every
+    // existing call site (real or test, including every B8G/B8G1 test) is
+    // byte-for-byte unaffected - same reasoning as MainViewModel's own
+    // gatewayConfigOverride/profileStore additive-seam params.
+    private val appRoutingPolicyStore: AppRoutingPolicyStore = AppRoutingPolicyStore.allApps(),
+    // B8H - additive, defaults to "every package is installed" so the
+    // default appRoutingPolicyStore above (always ALL_APPS, empty selection)
+    // never spuriously resolves to NoAppsSelected.
+    private val installedPackageChecker: InstalledPackageChecker = InstalledPackageChecker.alwaysInstalled(),
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -97,6 +113,17 @@ class VpnController(
 
     private val _events = MutableSharedFlow<ControllerEvent>(extraBufferCapacity = 1)
     val events: SharedFlow<ControllerEvent> = _events
+
+    // B8H - the AppRoutingPolicy actually baked into the CURRENTLY ACTIVE
+    // VpnService interface, i.e. what doConnectAttempt() last successfully
+    // handed to transport.connect() - never the merely-saved policy (see
+    // appRoutingPolicyStore, which is read fresh but NOT reflected here
+    // until the next real connect()). null whenever no session exists.
+    // reconnectLoop() NEVER writes this - per B8G1's own "Break-before-make"
+    // docs it never rebuilds the tunnel at all, so the policy an automatic
+    // recovery cycle preserves is simply whatever this already says.
+    private val _appliedRoutingPolicy = MutableStateFlow<AppRoutingPolicy?>(null)
+    val appliedRoutingPolicy: StateFlow<AppRoutingPolicy?> = _appliedRoutingPolicy.asStateFlow()
 
     @Volatile private var userInitiatedDisconnect = true
     private var reconnectJob: Job? = null
@@ -179,6 +206,11 @@ class VpnController(
             cancelReconnectLocked()
             hasTouchedTransport = true
             transport.disconnect()
+            // B8H - the interface this policy was baked into is gone; the
+            // NEXT connect() re-reads appRoutingPolicyStore fresh (see
+            // doConnectAttempt), which is what actually applies a changed
+            // saved policy - never an automatic mid-session rebuild.
+            _appliedRoutingPolicy.value = null
         }
     }
 
@@ -207,8 +239,24 @@ class VpnController(
                     configured = true,
                     endpointDisplay = "${config.endpointHost}:${config.endpointPort}",
                 )
+                // B8H - read fresh on every real connect() attempt, exactly
+                // like gatewayConfigurationRepository.get() above - this is
+                // what makes a policy the user saved while disconnected (or
+                // while a PRIOR session was up, see class docs' "Reconnect
+                // to apply changes" note) take effect on THIS attempt.
+                // reconnectLoop() never reaches this function at all, so an
+                // automatic recovery cycle can never pick up a newer saved
+                // policy mid-session - see appliedRoutingPolicy's own docs.
+                val routingPolicy = appRoutingPolicyStore.read()
+                val routingResolution = resolveAppRoutingLists(routingPolicy, installedPackageChecker::isInstalled)
+                if (routingResolution is EffectiveRoutingResult.NoAppsSelected) {
+                    diagnostics.recordError(VpnError.SplitTunnelingNoAppsSelected)
+                    _state.value = TransportState.Error("VPN-only mode has no apps selected - select at least one app")
+                    return false
+                }
+                val appRoutingLists = (routingResolution as EffectiveRoutingResult.Apply).lists
                 val transportConfig = try {
-                    buildTransportConfig(config)
+                    buildTransportConfig(config, appRoutingLists)
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.ConfigurationMappingFailure(e.javaClass.simpleName))
                     _state.value = TransportState.Error("Failed to build tunnel configuration")
@@ -222,6 +270,12 @@ class VpnController(
                     // session (see class docs' session-semantics note).
                     val attemptStartEpochMillis = System.currentTimeMillis()
                     transport.connect(transportConfig)
+                    // B8H - the VpnService interface now reflects
+                    // routingPolicy (whether or not a handshake follows) -
+                    // only a thrown connect() (caught below) means no
+                    // interface was actually built, so this is set here and
+                    // ONLY here, never in the catch branch.
+                    _appliedRoutingPolicy.value = routingPolicy
                     // Interface-up/TX>0 alone is deliberately NOT treated as
                     // success here - see awaitFreshHandshake's own docs. Set
                     // directly (not left to the background collector) for the
@@ -250,13 +304,15 @@ class VpnController(
         }
     }
 
-    private suspend fun buildTransportConfig(config: GatewayConfiguration.Configured): TransportConfig {
+    private suspend fun buildTransportConfig(config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig {
         val privateKey = clientKeyRepository.getPrivateKeyForTunnel()
         val awgConfig = AwgConfig(
             privateKeyBase64 = privateKey,
             localAddresses = listOf("${config.clientTunnelIp}/32"),
             dnsServers = config.dnsServers,
             profile = config.profile,
+            includedApplications = appRoutingLists.includedApplications,
+            excludedApplications = appRoutingLists.excludedApplications,
             peer = AwgPeer(
                 publicKeyBase64 = config.serverPublicKeyBase64,
                 endpointHost = config.endpointHost,

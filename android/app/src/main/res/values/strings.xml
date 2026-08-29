@@ -7,6 +7,12 @@
     <string name="home_power_button_content_description_connect">Connect</string>
     <string name="home_power_button_content_description_disconnect">Disconnect</string>
     <string name="home_status_subtitle_connected">Your connection is secure</string>
+    <!-- B8H1 - truthful split-tunneling wording: shown INSTEAD of
+         home_status_subtitle_connected above whenever the APPLIED routing
+         policy (not merely a newly saved one) is not ALL_APPS - see
+         net.pocvpn.client.ui.homeConnectedSubtitle's own docs. -->
+    <string name="home_status_subtitle_connected_bypass_selected">VPN active · selected apps bypass VPN</string>
+    <string name="home_status_subtitle_connected_vpn_only_selected">VPN active · only selected apps use VPN</string>
     <string name="home_status_subtitle_disconnected">Tap to connect</string>
     <string name="home_status_subtitle_connecting">Setting up a secure tunnel…</string>
     <string name="home_status_subtitle_failed">Tap to try again</string>
@@ -16,6 +22,21 @@
     <string name="home_location_chevron_content_description">Change location (coming soon)</string>
     <string name="home_diagnostics_entry">Diagnostics</string>
     <string name="home_kill_switch_notice">Internet blocked until VPN reconnects</string>
+
+    <!-- Settings / split tunneling -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_back_content_description">Back</string>
+    <string name="settings_split_tunneling_title">Split tunneling</string>
+    <string name="settings_split_tunneling_helper">Choose which apps use Nova VPN</string>
+    <string name="settings_mode_all_apps">All apps</string>
+    <string name="settings_mode_bypass_selected">Bypass selected apps</string>
+    <string name="settings_mode_vpn_only_selected">VPN only selected apps</string>
+    <string name="settings_select_apps">Select apps</string>
+    <string name="settings_select_apps_count">%1$d app(s) selected</string>
+    <string name="settings_reconnect_to_apply">Reconnect to apply changes</string>
+    <string name="app_selector_title">Select apps</string>
+    <string name="app_selector_search_placeholder">Search apps</string>
+    <string name="app_selector_empty">No apps found</string>
 
     <!-- Activation screen -->
     <string name="activation_title">Activate your VPN</string>

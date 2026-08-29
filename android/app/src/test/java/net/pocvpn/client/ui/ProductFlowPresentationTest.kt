@@ -4,6 +4,8 @@ import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.config.ProfileSource
+import net.pocvpn.client.vpn.policy.AppRoutingMode
+import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -126,5 +128,38 @@ class ProductFlowPresentationTest {
         assertTrue(TransportState.HandshakeFailed.isSessionActive())
         assertTrue(TransportState.Error("boom").isSessionActive())
         assertTrue(TransportState.Disconnecting.isSessionActive())
+    }
+
+    // --- B8H1: truthful Home CONNECTED subtitle by APPLIED routing policy ---
+
+    @Test
+    fun `ALL_APPS applied policy shows the plain secure wording`() {
+        assertEquals(HomeConnectedSubtitle.ALL_APPS_SECURE, homeConnectedSubtitle(AppRoutingMode.ALL_APPS))
+    }
+
+    @Test
+    fun `BYPASS_SELECTED applied policy shows the bypass wording`() {
+        assertEquals(HomeConnectedSubtitle.BYPASS_SELECTED_APPS, homeConnectedSubtitle(AppRoutingMode.BYPASS_SELECTED))
+    }
+
+    @Test
+    fun `VPN_ONLY_SELECTED applied policy shows the vpn-only wording`() {
+        assertEquals(HomeConnectedSubtitle.VPN_ONLY_SELECTED_APPS, homeConnectedSubtitle(AppRoutingMode.VPN_ONLY_SELECTED))
+    }
+
+    @Test
+    fun `a pending saved policy never changes Home wording before reconnect - only the APPLIED policy is read`() {
+        // The live tunnel was built with ALL_APPS; the user has since saved
+        // a DIFFERENT policy that has not been applied yet (no reconnect).
+        // homeConnectedSubtitle only ever receives the applied mode - a
+        // caller wiring the SAVED policy in by mistake is exactly what this
+        // guards against, so this asserts against the applied value only.
+        val appliedMode = AppRoutingMode.ALL_APPS
+        val pendingSavedPolicy = AppRoutingPolicy(AppRoutingMode.VPN_ONLY_SELECTED, setOf("com.example.app"))
+
+        assertEquals(HomeConnectedSubtitle.ALL_APPS_SECURE, homeConnectedSubtitle(appliedMode))
+        // The saved policy differing doesn't change the fact above - it's
+        // simply never consulted by this function.
+        assertTrue(hasPendingRoutingPolicyChange(AppRoutingPolicy(appliedMode), pendingSavedPolicy))
     }
 }

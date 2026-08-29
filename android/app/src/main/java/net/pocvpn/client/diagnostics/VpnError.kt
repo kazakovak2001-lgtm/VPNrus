@@ -16,6 +16,10 @@ sealed class VpnError(val category: String, val reason: String? = null) {
     data class ConfigurationMappingFailure(val detail: String) : VpnError("ConfigurationMappingFailure", detail)
     object AlreadyInProgress : VpnError("AlreadyInProgress")
     object HandshakeTimeout : VpnError("HandshakeTimeout")
+    // B8H - VPN_ONLY_SELECTED resolved to zero installed apps (see
+    // EffectiveRoutingResult.NoAppsSelected's own docs for why this must
+    // fail rather than silently behave like ALL_APPS).
+    object SplitTunnelingNoAppsSelected : VpnError("SplitTunnelingNoAppsSelected")
 
     /** Safe to show a developer, e.g. in the diagnostics panel - never includes key material. */
     fun displayText(): String = if (reason != null) "$category: $reason" else category
