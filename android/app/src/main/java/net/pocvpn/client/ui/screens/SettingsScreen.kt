@@ -1,0 +1,158 @@
+package net.pocvpn.client.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import net.pocvpn.client.R
+import net.pocvpn.client.ui.components.ChevronRightGlyph
+import net.pocvpn.client.vpn.policy.AppRoutingMode
+
+/**
+ * B8H - "Settings -> Split tunneling". No raw package-name text field (see
+ * this feature's own UI requirements) - app selection is always via
+ * AppSelectorScreen, reached through the "Select apps" row below, never
+ * typed. showReconnectNotice is purely display-only - selecting a mode here
+ * ONLY saves the policy (see MainViewModel.updateAppRoutingPolicy); it never
+ * itself reconnects or rebuilds the active tunnel.
+ */
+@Composable
+fun SettingsScreen(
+    mode: AppRoutingMode,
+    selectedAppCount: Int,
+    showReconnectNotice: Boolean,
+    onModeSelected: (AppRoutingMode) -> Unit,
+    onSelectAppsClick: () -> Unit,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxSize().padding(horizontal = 24.dp)) {
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            val backDescription = stringResource(R.string.settings_back_content_description)
+            IconButton(
+                onClick = onBack,
+                modifier = Modifier.semantics { contentDescription = backDescription },
+            ) {
+                ChevronRightGlyph(
+                    tint = MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(20.dp).graphicsLayer(rotationZ = 180f),
+                )
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = stringResource(R.string.settings_title),
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Text(
+            text = stringResource(R.string.settings_split_tunneling_title),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_split_tunneling_helper),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        RoutingModeRow(
+            label = stringResource(R.string.settings_mode_all_apps),
+            selected = mode == AppRoutingMode.ALL_APPS,
+            onClick = { onModeSelected(AppRoutingMode.ALL_APPS) },
+        )
+        RoutingModeRow(
+            label = stringResource(R.string.settings_mode_bypass_selected),
+            selected = mode == AppRoutingMode.BYPASS_SELECTED,
+            onClick = { onModeSelected(AppRoutingMode.BYPASS_SELECTED) },
+        )
+        RoutingModeRow(
+            label = stringResource(R.string.settings_mode_vpn_only_selected),
+            selected = mode == AppRoutingMode.VPN_ONLY_SELECTED,
+            onClick = { onModeSelected(AppRoutingMode.VPN_ONLY_SELECTED) },
+        )
+
+        if (mode != AppRoutingMode.ALL_APPS) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(16.dp))
+                    .clickable(onClick = onSelectAppsClick)
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.settings_select_apps),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_select_apps_count, selectedAppCount),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ChevronRightGlyph(tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+            }
+        }
+
+        if (showReconnectNotice) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = stringResource(R.string.settings_reconnect_to_apply),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RoutingModeRow(label: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp),
+    ) {
+        RadioButton(selected = selected, onClick = onClick)
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(text = label, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
+    }
+}

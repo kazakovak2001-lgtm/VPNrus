@@ -25,6 +25,11 @@ object AwgConfigMapper {
         awg.listenPort?.let { iface.setListenPort(it) }
         awg.mtu?.let { iface.setMtu(it) }
         applyProfile(iface, awg.profile)
+        // B8H - see AwgConfig's own docs: exactly one of these is ever
+        // non-empty (AppRoutingLists enforces it before this is reached), so
+        // no coexistence guard is needed here.
+        awg.excludedApplications.forEach { iface.excludeApplication(it) }
+        awg.includedApplications.forEach { iface.includeApplication(it) }
 
         val peer = Peer.Builder()
         peer.setPublicKey(Key.fromBase64(awg.peer.publicKeyBase64))

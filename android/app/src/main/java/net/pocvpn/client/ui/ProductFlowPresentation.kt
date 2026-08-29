@@ -3,6 +3,8 @@ package net.pocvpn.client.ui
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.config.ProfileSource
+import net.pocvpn.client.vpn.policy.AppRoutingMode
+import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 
 /**
  * B8D - pure, Android-framework-free presentation logic for the product
@@ -129,3 +131,38 @@ fun TransportState.showsKillSwitchNotice(): Boolean = when (this) {
  * lifetime (connecting, protected, recovering, or mid-teardown).
  */
 fun TransportState.isSessionActive(): Boolean = this !is TransportState.Disconnected
+
+/**
+ * B8H - "Reconnect to apply changes": true only while a session actually
+ * exists ([appliedPolicy] non-null, i.e. VpnController.appliedRoutingPolicy)
+ * AND the user has since saved a DIFFERENT split-tunneling policy. Never
+ * true while disconnected (nothing to reconnect) and never true merely
+ * because a policy was saved - only a real divergence from what the ACTIVE
+ * tunnel was actually built with. See VpnController class docs' own
+ * "Reconnect to apply changes" flow for why this is read-only/display-only:
+ * saving a policy must never itself trigger a rebuild.
+ */
+fun hasPendingRoutingPolicyChange(appliedPolicy: AppRoutingPolicy?, savedPolicy: AppRoutingPolicy): Boolean =
+    appliedPolicy != null && appliedPolicy != savedPolicy
+
+/**
+ * B8H1 - which Home CONNECTED subtitle to show. Only meaningful while
+ * visualState == CONNECTED (HomeScreen ignores this otherwise) - a plain
+ * enum, not a raw string, so HomeScreen keeps resolving actual copy through
+ * stringResource() exactly like every other Home subtitle, and this stays
+ * pure/JVM-testable with no Android dependency.
+ *
+ * MUST be driven by the APPLIED routing policy (VpnController
+ * .appliedRoutingPolicy - what the live tunnel actually is), never the
+ * merely-saved one: see hasPendingRoutingPolicyChange's own "Reconnect to
+ * apply changes" docs - Home must keep describing the CURRENT tunnel until
+ * an explicit reconnect actually applies a newly saved policy. Callers must
+ * pass appliedRoutingPolicy.mode, never savedAppRoutingPolicy.mode.
+ */
+enum class HomeConnectedSubtitle { ALL_APPS_SECURE, BYPASS_SELECTED_APPS, VPN_ONLY_SELECTED_APPS }
+
+fun homeConnectedSubtitle(appliedRoutingMode: AppRoutingMode): HomeConnectedSubtitle = when (appliedRoutingMode) {
+    AppRoutingMode.ALL_APPS -> HomeConnectedSubtitle.ALL_APPS_SECURE
+    AppRoutingMode.BYPASS_SELECTED -> HomeConnectedSubtitle.BYPASS_SELECTED_APPS
+    AppRoutingMode.VPN_ONLY_SELECTED -> HomeConnectedSubtitle.VPN_ONLY_SELECTED_APPS
+}

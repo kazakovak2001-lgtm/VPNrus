@@ -35,6 +35,11 @@ import net.pocvpn.client.vpn.config.PersistedProfile
 import net.pocvpn.client.vpn.config.ProfileLoadResult
 import net.pocvpn.client.vpn.config.ProfileSource
 import net.pocvpn.client.vpn.config.ProfileStore
+import net.pocvpn.client.vpn.policy.AndroidInstalledPackageChecker
+import net.pocvpn.client.vpn.policy.AppRoutingPolicy
+import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
+import net.pocvpn.client.vpn.policy.FileAppRoutingPolicyStore
+import net.pocvpn.client.vpn.policy.InstalledPackageChecker
 
 /**
  * Thin state holder above VpnController - MainActivity observes this instead
@@ -75,6 +80,12 @@ class MainViewModel(
     // of a real background thread pool, so runCurrent()/advanceUntilIdle()
     // can deterministically observe its result.
     private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
+    // B8H - additive, defaults to null (same reasoning as gatewayConfigOverride/
+    // profileStore above): when non-null, this is the ONE store both
+    // VpnController (read-only, at connect time) and this ViewModel (read +
+    // write, for the Settings UI) share - see updateAppRoutingPolicy below.
+    private val appRoutingPolicyStore: AppRoutingPolicyStore? = null,
+    private val installedPackageChecker: InstalledPackageChecker? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -84,11 +95,32 @@ class MainViewModel(
         reconnectManager = reconnectManager,
         diagnostics = diagnosticsStore,
         scope = viewModelScope,
+        appRoutingPolicyStore = appRoutingPolicyStore ?: AppRoutingPolicyStore.allApps(),
+        installedPackageChecker = installedPackageChecker ?: InstalledPackageChecker.alwaysInstalled(),
     )
 
     val transportState: StateFlow<TransportState> = controller.state
     val diagnostics: StateFlow<DiagnosticsSnapshot> = diagnosticsStore.snapshot
     val events: SharedFlow<ControllerEvent> = controller.events
+
+    // B8H - the saved (not necessarily yet-applied) split-tunneling policy,
+    // read once at startup and kept in sync by updateAppRoutingPolicy(). See
+    // VpnController.appliedRoutingPolicy for what's actually live right now.
+    private val _savedAppRoutingPolicy = MutableStateFlow(appRoutingPolicyStore?.read() ?: AppRoutingPolicy.Default)
+    val savedAppRoutingPolicy: StateFlow<AppRoutingPolicy> = _savedAppRoutingPolicy.asStateFlow()
+    val appliedAppRoutingPolicy: StateFlow<AppRoutingPolicy?> = controller.appliedRoutingPolicy
+
+    /**
+     * B8H - saves ONLY the local policy file; deliberately does NOT touch
+     * the transport/tunnel in any way (no connect/disconnect/rebuild) - see
+     * VpnController class docs' "Reconnect to apply changes" requirement.
+     * The next real connect() (see VpnController.doConnectAttempt) is what
+     * actually applies this.
+     */
+    fun updateAppRoutingPolicy(policy: AppRoutingPolicy) {
+        appRoutingPolicyStore?.write(policy)
+        _savedAppRoutingPolicy.value = policy
+    }
 
     private val _publicKey = MutableStateFlow<String?>(null)
     val publicKey: StateFlow<String?> = _publicKey.asStateFlow()
@@ -257,6 +289,10 @@ class MainViewModel(
             // non-secret but still device/session-specific, so Auto Backup
             // restoring it onto a different device would be meaningless.
             val profileStore = FileProfileStore(context.noBackupFilesDir)
+            // B8H - same noBackupFilesDir as profileStore above, different
+            // file: a device-local UX preference, not something a restore
+            // onto a different device should silently reapply either.
+            val appRoutingPolicyStore = FileAppRoutingPolicyStore(context.noBackupFilesDir)
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -266,6 +302,8 @@ class MainViewModel(
                 diagnosticsStore = DiagnosticsStore(),
                 gatewayConfigOverride = gatewayConfigSource,
                 profileStore = profileStore,
+                appRoutingPolicyStore = appRoutingPolicyStore,
+                installedPackageChecker = AndroidInstalledPackageChecker(context),
             ) as T
         }
     }

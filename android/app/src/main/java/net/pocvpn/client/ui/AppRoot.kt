@@ -15,11 +15,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import net.pocvpn.client.MainViewModel
+import net.pocvpn.client.apps.PackageManagerInstalledAppRepository
 import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.ui.screens.ActivationScreen
+import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
 import net.pocvpn.client.ui.screens.HomeScreen
+import net.pocvpn.client.ui.screens.SettingsScreen
 import net.pocvpn.client.vpn.AlwaysOnDetectionState
 import net.pocvpn.client.vpn.AlwaysOnVpnState
 import net.pocvpn.client.vpn.ControllerEvent
@@ -28,6 +31,16 @@ import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.Ipv6LeakPolicy
 import net.pocvpn.client.vpn.config.ProfileSource
 import net.pocvpn.client.vpn.config.VpnIpv6Policy
+import net.pocvpn.client.vpn.policy.AppRoutingMode
+import net.pocvpn.client.vpn.policy.AppRoutingPolicy
+
+/**
+ * B8H - lightweight in-file navigation for Settings/AppSelector, sitting
+ * "on top of" AppScreen.HOME (see the `when` inside AppRoot below) - no
+ * navigation-compose dependency added for two screens, consistent with
+ * DiagnosticsDialog's existing plain-boolean-toggle approach.
+ */
+private enum class SettingsRoute { Settings, AppSelector }
 
 /**
  * B8E - single Compose entry point for MainActivity. Owns no VPN/profile
@@ -47,9 +60,14 @@ fun AppRoot(
     val publicKey by viewModel.publicKey.collectAsStateWithLifecycle()
     val diagnosticsSnapshot by viewModel.diagnostics.collectAsStateWithLifecycle()
     val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
+    val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
+    val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
+    val context = LocalContext.current
+    val installedApps = remember { PackageManagerInstalledAppRepository(context).listLaunchableApps() }
 
     LaunchedEffect(provisioningState) {
         if (shouldClearCredentialInput(provisioningState)) credential = ""
@@ -64,23 +82,53 @@ fun AppRoot(
 
     Surface(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxSize()) {
-            when (screenFor(profileSource)) {
-                AppScreen.ACTIVATION -> ActivationScreen(
+            when {
+                screenFor(profileSource) == AppScreen.ACTIVATION -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
                     onActivateClick = { viewModel.activateDevice(credential) },
                     errorText = provisioningState.toActivationErrorText(),
                     isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
                 )
-                AppScreen.HOME -> HomeScreen(
+                // B8H - "Select apps" screen, reached only from Settings.
+                settingsRoute == SettingsRoute.AppSelector -> AppSelectorScreen(
+                    apps = installedApps,
+                    selectedPackageNames = savedRoutingPolicy.selectedPackageNames,
+                    onToggle = { packageName, checked ->
+                        val updated = if (checked) {
+                            savedRoutingPolicy.selectedPackageNames + packageName
+                        } else {
+                            savedRoutingPolicy.selectedPackageNames - packageName
+                        }
+                        viewModel.updateAppRoutingPolicy(savedRoutingPolicy.copy(selectedPackageNames = updated))
+                    },
+                    onBack = { settingsRoute = SettingsRoute.Settings },
+                )
+                // B8H - "Settings -> Split tunneling". Saving here NEVER
+                // touches the transport/tunnel (see MainViewModel
+                // .updateAppRoutingPolicy's own docs) - showReconnectNotice
+                // is purely informational.
+                settingsRoute == SettingsRoute.Settings -> SettingsScreen(
+                    mode = savedRoutingPolicy.mode,
+                    selectedAppCount = savedRoutingPolicy.selectedPackageNames.size,
+                    showReconnectNotice = hasPendingRoutingPolicyChange(appliedRoutingPolicy, savedRoutingPolicy),
+                    onModeSelected = { mode -> viewModel.updateAppRoutingPolicy(savedRoutingPolicy.copy(mode = mode)) },
+                    onSelectAppsClick = { settingsRoute = SettingsRoute.AppSelector },
+                    onBack = { settingsRoute = null },
+                )
+                else -> HomeScreen(
                     visualState = transportState.toHomeVisualState(),
                     statusHeadline = transportState.toHomeStatusText(),
                     onPowerButtonClick = {
                         if (transportState.isConnectedOrConnecting()) viewModel.disconnect() else viewModel.connect()
                     },
+                    onSettingsClick = { settingsRoute = SettingsRoute.Settings },
                     showDiagnosticsEntry = isDebugBuild,
                     onDiagnosticsClick = { showDiagnostics = true },
                     showKillSwitchNotice = transportState.showsKillSwitchNotice(),
+                    // B8H1 - the APPLIED policy's mode, never savedRoutingPolicy's -
+                    // see homeConnectedSubtitle's own docs for why.
+                    appliedRoutingMode = appliedRoutingPolicy?.mode ?: AppRoutingMode.ALL_APPS,
                 )
             }
         }
@@ -88,9 +136,11 @@ fun AppRoot(
 
     if (isDebugBuild && showDiagnostics) {
         val clipboard = LocalClipboardManager.current
-        val context = LocalContext.current
         DiagnosticsDialog(
-            lines = buildDiagnosticsLines(viewModel, publicKey, diagnosticsSnapshot, provisioningState, profileSource, transportState, alwaysOnState),
+            lines = buildDiagnosticsLines(
+                viewModel, publicKey, diagnosticsSnapshot, provisioningState, profileSource,
+                transportState, alwaysOnState, savedRoutingPolicy, appliedRoutingPolicy,
+            ),
             onCopyPublicKey = {
                 publicKey?.let {
                     clipboard.setText(AnnotatedString(it))
@@ -111,6 +161,8 @@ private fun buildDiagnosticsLines(
     profileSource: ProfileSource,
     transportState: TransportState,
     alwaysOnState: AlwaysOnDetectionState,
+    savedRoutingPolicy: AppRoutingPolicy,
+    appliedRoutingPolicy: AppRoutingPolicy?,
 ): List<String> {
     val gateway = viewModel.gatewayStatus()
     val gatewayLine = when (gateway) {
@@ -144,6 +196,16 @@ private fun buildDiagnosticsLines(
         AlwaysOnDetectionState.UNKNOWN -> "UNKNOWN"
     }}"
 
+    // B8H - saved (MainViewModel.savedAppRoutingPolicy) vs applied
+    // (VpnController.appliedRoutingPolicy, via the SAME
+    // hasPendingRoutingPolicyChange the Settings screen itself uses - never
+    // a second/different comparison here) - see those classes' own docs.
+    val routingModeLine = "Routing mode: ${savedRoutingPolicy.mode}"
+    val selectedAppsCountLine = "Selected apps count: ${savedRoutingPolicy.selectedPackageNames.size}"
+    val appliedRoutingLine = "Applied routing policy: ${appliedRoutingPolicy?.let { "${it.mode} (${it.selectedPackageNames.size} apps)" } ?: "NONE (no active session)"}"
+    val savedRoutingLine = "Saved routing policy: ${savedRoutingPolicy.mode} (${savedRoutingPolicy.selectedPackageNames.size} apps)"
+    val pendingReconnectLine = "Pending reconnect: ${if (hasPendingRoutingPolicyChange(appliedRoutingPolicy, savedRoutingPolicy)) "YES" else "NO"}"
+
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
         "VPN permission: ${if (diagnostics.permissionGranted) "GRANTED" else "REQUIRED"}",
@@ -155,6 +217,11 @@ private fun buildDiagnosticsLines(
         ipv6PolicyLine,
         killSwitchAppSessionLine,
         killSwitchLockdownLine,
+        routingModeLine,
+        selectedAppsCountLine,
+        appliedRoutingLine,
+        savedRoutingLine,
+        pendingReconnectLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",

@@ -4,6 +4,19 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- B8H - makes launchable apps visible to queryIntentActivities() under
+         Android 11+ package-visibility filtering, WITHOUT the much broader
+         QUERY_ALL_PACKAGES permission - see
+         net.pocvpn.client.apps.PackageManagerInstalledAppRepository's own
+         docs. This is the officially documented pattern for "show the
+         user's list of launchable apps". -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".NovaVpnApplication"
         android:allowBackup="false"
