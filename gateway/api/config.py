@@ -57,6 +57,22 @@ class AppConfig:
     activation_store_path: str = ""
     activation_lock_path: str = ""
 
+    # B8K2: optional - blank/zero (the default) means POST /v1/xray-profile
+    # is not configured and always fails closed with 503 (see handler.py),
+    # exactly like activation_store_path above. None of these fields ever
+    # include the REALITY server PRIVATE key - only public-safe values a
+    # client is allowed to receive verbatim (see xray_config_renderer.py's
+    # own docstring for why the private key never needs to flow through
+    # this API process at all).
+    xray_store_path: str = ""
+    xray_lock_path: str = ""
+    xray_server_port: int = 0
+    xray_server_name: str = ""
+    xray_fingerprint: str = ""
+    xray_reality_public_key: str = ""
+    xray_short_id: str = ""
+    xray_flow: str = ""
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -139,6 +155,25 @@ def load_config(env=None):
         activation_store_path + ".lock" if activation_store_path else ""
     )
 
+    xray_store_path = _get(env, "XRAY_STORE_PATH")
+    xray_lock_path = _get(env, "XRAY_LOCK_PATH") or (
+        xray_store_path + ".lock" if xray_store_path else ""
+    )
+    xray_server_port_raw = _get(env, "XRAY_SERVER_PORT")
+    xray_server_port = 0
+    if xray_server_port_raw:
+        try:
+            xray_server_port = int(xray_server_port_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_SERVER_PORT is not an integer: {xray_server_port_raw!r}")
+        if not (1 <= xray_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_SERVER_PORT out of range: {xray_server_port}")
+    xray_server_name = _get(env, "XRAY_SERVER_NAME")
+    xray_fingerprint = _get(env, "XRAY_FINGERPRINT")
+    xray_reality_public_key = _get(env, "XRAY_REALITY_PUBLIC_KEY")
+    xray_short_id = _get(env, "XRAY_SHORT_ID")
+    xray_flow = _get(env, "XRAY_FLOW")
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -152,4 +187,12 @@ def load_config(env=None):
         sudo_path=sudo_path,
         activation_store_path=activation_store_path,
         activation_lock_path=activation_lock_path,
+        xray_store_path=xray_store_path,
+        xray_lock_path=xray_lock_path,
+        xray_server_port=xray_server_port,
+        xray_server_name=xray_server_name,
+        xray_fingerprint=xray_fingerprint,
+        xray_reality_public_key=xray_reality_public_key,
+        xray_short_id=xray_short_id,
+        xray_flow=xray_flow,
     )

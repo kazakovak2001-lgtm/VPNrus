@@ -1,15 +1,24 @@
-"""HTTP request handling for the two POST-only endpoints this API serves:
-/v1/peers (B8B1B) and /v1/activate (B8C1).
+"""HTTP request handling for the three POST-only endpoints this API
+serves: /v1/peers (B8B1B), /v1/activate (B8C1), and /v1/xray-profile
+(B8K2).
 
 No GET/DELETE/admin/token-issuance routes exist in this slice. See
 gateway/api/__init__.py for the architectural invariant this handler is
 built around: it never touches awg0.conf, .provision.lock, or a private
-key directly - both endpoints only ever reach real gateway mutation
-through gateway/scripts/provision-peer.sh (via provision.py). Credential
-storage differs by endpoint: /v1/peers reads the enrollment-token store
-read-only (via tokens.py); /v1/activate both reads AND durably writes the
-activation store (via activations.py) - see that module's own docstring
-for why device-binding specifically needs write access from this process.
+key directly - /v1/peers and /v1/activate only ever reach real gateway
+mutation through gateway/scripts/provision-peer.sh (via provision.py);
+/v1/xray-profile never shells out at all - it only reads/writes the
+durable JSON stores activations.py and xray_provisioning.py already own,
+and never touches the actual Xray server process or its config file (see
+xray_config_renderer.py - that pipeline is a separate, explicitly-invoked
+step, not part of this request path). Credential storage differs by
+endpoint: /v1/peers reads the enrollment-token store read-only (via
+tokens.py); /v1/activate both reads AND durably writes the activation
+store (via activations.py); /v1/xray-profile reuses the SAME activation
+credential and device public key as /v1/activate - it is never a second,
+independent credential/token system - and both reads activations.py's
+store (read-only, to check eligibility) and durably writes its own,
+separate Xray identity store (via xray_provisioning.py).
 """
 import hmac
 import json
@@ -20,13 +29,14 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, provision, tokens
+from . import activations, provision, tokens, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
 
 _PATH_PEERS = "/v1/peers"
 _PATH_ACTIVATE = "/v1/activate"
+_PATH_XRAY_PROFILE = "/v1/xray-profile"
 _MAX_BODY_BYTES = 1024
 _BEARER_PREFIX = "Bearer "
 _SOCKET_TIMEOUT_SECONDS = 5.0
@@ -121,6 +131,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_activate()
+            elif self.path == _PATH_XRAY_PROFILE:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_xray_profile()
             else:
                 status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
@@ -341,6 +356,94 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # already-bound device are equally "success" here (unlike /v1/peers'
         # 201-vs-200 distinction, which is about peer allocation, not
         # device entitlement).
+        return self._success(HTTPStatus.OK, payload)
+
+    # --- POST /v1/xray-profile (B8K2) ---
+    def _handle_xray_profile(self):
+        try:
+            return self._handle_xray_profile_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_xray_profile_inner(self):
+        cfg = self.server.config
+        if not (cfg.activation_store_path and cfg.xray_store_path and cfg.xray_server_port):
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        # Same Authorization: Bearer <activation credential> as /v1/activate -
+        # this is the SAME activation, never a separate credential/token type.
+        credential = self._require_bearer_token()
+
+        raw_body = self.rfile.read(content_length)
+        # Same {"public_key": "..."} body shape as /v1/activate - this MUST be
+        # the same AWG public key already bound via /v1/activate; the server
+        # issues the VLESS identity, the client never sends one (see
+        # xray_provisioning.py's own eligibility gate).
+        public_key = self._parse_and_validate_body(raw_body)
+        self._log_fields["pubkey_prefix"] = public_key[:8]
+
+        credential_digest = activations.credential_digest(credential)
+        self._log_fields["activation_digest"] = credential_digest[:8]
+
+        if not self.server.per_token_limiter.allow(credential_digest):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        try:
+            result = xray_provisioning.provision_xray_identity(
+                credential, public_key,
+                cfg.activation_store_path, cfg.activation_lock_path,
+                cfg.xray_store_path, cfg.xray_lock_path,
+            )
+        except xray_provisioning.XrayStoreError:
+            logger.error("xray_store_error")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_store_unavailable")
+
+        self._log_fields["xray_outcome"] = result.outcome
+
+        if result.outcome == xray_provisioning.NOT_ELIGIBLE_UNKNOWN:
+            # Unknown credential and a credential that hashes to no record
+            # are intentionally indistinguishable - same status, same body,
+            # matching /v1/activate's own rule.
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if result.outcome == xray_provisioning.NOT_ELIGIBLE_REVOKED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+        if result.outcome == xray_provisioning.NOT_ELIGIBLE_EXPIRED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
+        if result.outcome == xray_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
+            # This exact device must complete POST /v1/activate first - no
+            # Xray identity is ever issued for a device this activation has
+            # not already durably entitled.
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_not_bound")
+
+        # Client-safe fields only - never the REALITY private key, never
+        # server-internal config, never the activation digest, never any
+        # other user's/device's identity. Snake_case keys, matching the
+        # existing /v1/activate and /v1/peers response convention.
+        payload = {
+            "server_address": cfg.endpoint_host,
+            "server_port": cfg.xray_server_port,
+            "uuid": result.vless_uuid,
+            "flow": cfg.xray_flow,
+            "server_name": cfg.xray_server_name,
+            "fingerprint": cfg.xray_fingerprint,
+            "reality_public_key": cfg.xray_reality_public_key,
+            "short_id": cfg.xray_short_id,
+        }
+        # Always 200 - a new issuance and an idempotent retry are equally
+        # "success" here, same rule /v1/activate already uses for its own
+        # new-bind-vs-existing-bind distinction.
         return self._success(HTTPStatus.OK, payload)
 
     def _require_bearer_token(self):

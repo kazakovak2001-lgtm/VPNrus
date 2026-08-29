@@ -98,6 +98,9 @@ def make_token_store(store_path, entries, lock_path):
 def make_app_config(
     tmp_dir, provision_script_path, subprocess_timeout_seconds=5.0, api_port=0, sudo_path="",
     activation_store_path="", activation_lock_path="",
+    xray_store_path="", xray_lock_path="", xray_server_port=0,
+    xray_server_name="", xray_fingerprint="", xray_reality_public_key="",
+    xray_short_id="", xray_flow="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -114,6 +117,37 @@ def make_app_config(
         sudo_path=sudo_path,
         activation_store_path=activation_store_path,
         activation_lock_path=activation_lock_path,
+        xray_store_path=xray_store_path,
+        xray_lock_path=xray_lock_path,
+        xray_server_port=xray_server_port,
+        xray_server_name=xray_server_name,
+        xray_fingerprint=xray_fingerprint,
+        xray_reality_public_key=xray_reality_public_key,
+        xray_short_id=xray_short_id,
+        xray_flow=xray_flow,
+    )
+
+
+def make_xray_app_config(tmp_dir, provision_script_path, activation_store_path, activation_lock_path, **kwargs):
+    """Convenience wrapper: a full app config with /v1/xray-profile
+    actually configured (a representative, non-secret-real REALITY
+    public-facing value set) - the private key itself is never part of
+    AppConfig at all (see config.py's own docs)."""
+    xray_store_path = kwargs.pop("xray_store_path", os.path.join(tmp_dir, "xray-identities.json"))
+    xray_lock_path = kwargs.pop("xray_lock_path", os.path.join(tmp_dir, ".xray-identities.lock"))
+    from api import xray_provisioning as xray_provisioning_module
+    xray_provisioning_module.init_store(xray_store_path, xray_lock_path)
+    return make_app_config(
+        tmp_dir, provision_script_path,
+        activation_store_path=activation_store_path, activation_lock_path=activation_lock_path,
+        xray_store_path=xray_store_path, xray_lock_path=xray_lock_path,
+        xray_server_port=kwargs.pop("xray_server_port", 8444),
+        xray_server_name=kwargs.pop("xray_server_name", "www.microsoft.com"),
+        xray_fingerprint=kwargs.pop("xray_fingerprint", "chrome"),
+        xray_reality_public_key=kwargs.pop("xray_reality_public_key", "A" * 43),
+        xray_short_id=kwargs.pop("xray_short_id", "ab12cd34"),
+        xray_flow=kwargs.pop("xray_flow", "xtls-rprx-vision"),
+        **kwargs,
     )
 
 
