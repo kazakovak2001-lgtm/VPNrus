@@ -42,6 +42,17 @@ android {
 
     buildFeatures {
         buildConfig = true
+        // B8E - Compose scoped to MainActivity's UI only (visual redesign
+        // slice). No other module/architecture change - VpnController,
+        // MainViewModel, and every non-UI class are untouched and remain
+        // plain Kotlin with zero Compose dependency.
+        compose = true
+    }
+
+    composeOptions {
+        // Paired with the Kotlin 1.9.24 Gradle plugin above per the
+        // AndroidX Compose Compiler <-> Kotlin compatibility map.
+        kotlinCompilerExtensionVersion = "1.5.14"
     }
 
     testOptions {
@@ -87,6 +98,15 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
+    // B8E - Compose, scoped to MainActivity's UI only (see buildFeatures.compose above).
+    implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     // B8B3A - ProvisioningClientTest exercises real org.json.JSONObject

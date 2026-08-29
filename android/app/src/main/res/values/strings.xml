@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Nova VPN</string>
+
+    <!-- Home screen -->
+    <string name="home_settings_content_description">Settings</string>
+    <string name="home_power_button_content_description_connect">Connect</string>
+    <string name="home_power_button_content_description_disconnect">Disconnect</string>
+    <string name="home_status_subtitle_connected">Your connection is secure</string>
+    <string name="home_status_subtitle_disconnected">Tap to connect</string>
+    <string name="home_status_subtitle_connecting">Setting up a secure tunnel…</string>
+    <string name="home_status_subtitle_failed">Tap to try again</string>
+    <string name="home_location_country">Germany</string>
+    <string name="home_location_city">Frankfurt</string>
+    <string name="home_location_content_description">Server location</string>
+    <string name="home_location_chevron_content_description">Change location (coming soon)</string>
+    <string name="home_diagnostics_entry">Diagnostics</string>
+
+    <!-- Activation screen -->
+    <string name="activation_title">Activate your VPN</string>
+    <string name="activation_helper_text">Enter the activation credential you received to set up this device. You\'ll only need to do this once.</string>
+    <string name="activation_credential_label">Activation credential</string>
+    <string name="activation_button">ACTIVATE</string>
+
+    <!-- Diagnostics dialog (debug builds only) -->
+    <string name="diagnostics_title">Diagnostics</string>
+    <string name="diagnostics_close">Close</string>
+    <string name="diagnostics_copy_public_key">Copy public key</string>
+    <string name="diagnostics_regenerate_identity">Regenerate identity (debug only)</string>
+    <string name="diagnostics_public_key_copied">Public key copied</string>
+</resources>

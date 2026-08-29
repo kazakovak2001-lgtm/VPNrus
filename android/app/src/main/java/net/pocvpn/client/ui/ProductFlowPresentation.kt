@@ -47,6 +47,24 @@ fun TransportState.toHomeStatusText(): String = when (this) {
     is TransportState.HandshakeFailed -> "Connection failed"
 }
 
+/**
+ * B8E - which of the four visual states (power button style + subtitle
+ * copy) the Home screen should show. Purely a grouping of the SAME
+ * TransportState this file's toHomeStatusText() already maps - Disconnecting
+ * groups with Connecting/Reconnecting (all "something is in flight", same
+ * progress-ring visual) rather than getting a fifth visual state of its own.
+ * Never reads differently from toHomeStatusText() as to which states are
+ * failures vs in-progress vs settled.
+ */
+enum class HomeVisualState { DISCONNECTED, IN_PROGRESS, CONNECTED, FAILED }
+
+fun TransportState.toHomeVisualState(): HomeVisualState = when (this) {
+    is TransportState.Disconnected -> HomeVisualState.DISCONNECTED
+    is TransportState.Connecting, is TransportState.Reconnecting, is TransportState.Disconnecting -> HomeVisualState.IN_PROGRESS
+    is TransportState.Connected -> HomeVisualState.CONNECTED
+    is TransportState.Error, is TransportState.HandshakeFailed -> HomeVisualState.FAILED
+}
+
 /** Whether the primary Home button should currently read DISCONNECT (true) or CONNECT (false). */
 fun TransportState.isConnectedOrConnecting(): Boolean = when (this) {
     is TransportState.Connecting, is TransportState.Connected, is TransportState.Reconnecting -> true

@@ -97,11 +97,24 @@ class ProvisionedProfileStoreTest {
     @Test
     fun `validatePersistedProfile has no way to represent a token or private key`() {
         // Structural proof, not just convention: PersistedProfile's constructor
-        // (and validatePersistedProfile's parameter list) has exactly five
-        // fields, all traced 1:1 to MutableGatewayConfigSource.apply()'s
-        // non-secret parameters - there is no token/privateKey parameter to
-        // accidentally populate anywhere in this file.
-        assertEquals(5, PersistedProfile::class.java.declaredFields.count { !it.isSynthetic })
+        // (and validatePersistedProfile's parameter list) has exactly the five
+        // fields below, all traced 1:1 to MutableGatewayConfigSource.apply()'s
+        // non-secret parameters - there is no token/privateKey field anywhere
+        // in this file. Asserted by exact NAME set, not a raw field count -
+        // B8E's Compose compiler plugin (enabled module-wide, not just on
+        // Composable files) stamps an extra non-synthetic `$stable` field
+        // onto every class in this module for its own stability tracking;
+        // that field carries no data of this class's own and must not make
+        // this assertion look like it passes when a real field was added.
+        val expectedFieldNames = setOf(
+            "endpointHost", "endpointPort", "gatewayPublicKey", "clientTunnelIp", "gatewayTunnelIp",
+        )
+        val actualFieldNames = PersistedProfile::class.java.declaredFields
+            .filterNot { it.isSynthetic }
+            .map { it.name }
+            .filterNot { it == "\$stable" }
+            .toSet()
+        assertEquals(expectedFieldNames, actualFieldNames)
     }
 
     @Test
