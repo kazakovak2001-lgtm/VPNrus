@@ -103,6 +103,16 @@ class RenderStructureTests(RendererTestBase):
         with self.assertRaises(renderer_module.XrayConfigRenderError):
             renderer_module.render_server_config({}, {}, bad_reality)
 
+    def test_odd_length_short_id_is_rejected(self):
+        # REALITY short IDs are raw bytes hex-encoded - "abc" is not a
+        # whole number of bytes, matching Android's own SHORT_ID_REGEX +
+        # length-parity check (XrayVlessRealityConfig.kt).
+        bad_reality = renderer_module.RealityServerConfig(
+            listen_port=8444, server_names=("x",), dest="x:443", private_key="A" * 43, short_ids=("abc",),
+        )
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, bad_reality)
+
 
 class DeterminismTests(RendererTestBase):
     def test_two_renders_of_the_same_input_are_byte_identical(self):

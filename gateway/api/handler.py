@@ -7,18 +7,21 @@ gateway/api/__init__.py for the architectural invariant this handler is
 built around: it never touches awg0.conf, .provision.lock, or a private
 key directly - /v1/peers and /v1/activate only ever reach real gateway
 mutation through gateway/scripts/provision-peer.sh (via provision.py);
-/v1/xray-profile never shells out at all - it only reads/writes the
-durable JSON stores activations.py and xray_provisioning.py already own,
-and never touches the actual Xray server process or its config file (see
-xray_config_renderer.py - that pipeline is a separate, explicitly-invoked
-step, not part of this request path). Credential storage differs by
+/v1/xray-profile never shells out DIRECTLY - it durably writes the
+identity store it owns (xray_provisioning.py) and, in the SAME
+per-activation-locked transaction (B8K2A - see xray_activation.py's own
+docstring), synchronously renders/stages/validates/publishes/reloads the
+running Xray server's config through the SAME narrow privileged-wrapper
+boundary /v1/peers and /v1/activate use for AWG (gateway/api/xray_reload.py,
+mirroring provision.py's own shape) - never a bare shell, never
+`systemctl` invoked from this process directly. A response is only ever
+200 once that activation is CONFIRMED, never merely durably recorded -
+see handler.py's own mapping below. Credential storage differs by
 endpoint: /v1/peers reads the enrollment-token store read-only (via
 tokens.py); /v1/activate both reads AND durably writes the activation
 store (via activations.py); /v1/xray-profile reuses the SAME activation
 credential and device public key as /v1/activate - it is never a second,
-independent credential/token system - and both reads activations.py's
-store (read-only, to check eligibility) and durably writes its own,
-separate Xray identity store (via xray_provisioning.py).
+independent credential/token system.
 """
 import hmac
 import json
@@ -29,7 +32,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, provision, tokens, xray_provisioning
+from . import activations, provision, tokens, xray_activation, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -400,32 +403,54 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not self.server.per_token_limiter.allow(credential_digest):
             raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
 
+        if not cfg.xray_activation_wrapper_path:
+            # The activation boundary (B8K2A) is a separate completeness
+            # group from the client-facing fields checked above - see
+            # config.py's own validation. Both must be configured before
+            # this endpoint can ever return a profile, since a profile is
+            # never usable without a confirmed activation.
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_not_configured")
+
         try:
-            result = xray_provisioning.provision_xray_identity(
-                credential, public_key,
-                cfg.activation_store_path, cfg.activation_lock_path,
-                cfg.xray_store_path, cfg.xray_lock_path,
-            )
+            result = xray_activation.provision_and_activate(credential, public_key, cfg)
         except xray_provisioning.XrayStoreError:
             logger.error("xray_store_error")
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_store_unavailable")
+        except xray_activation.XrayActivationNotConfigured:
+            logger.error("xray_activation_not_configured")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_not_configured")
 
-        self._log_fields["xray_outcome"] = result.outcome
+        identity_outcome = result.identity_outcome
+        self._log_fields["xray_outcome"] = identity_outcome.outcome
 
-        if result.outcome == xray_provisioning.NOT_ELIGIBLE_UNKNOWN:
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_UNKNOWN:
             # Unknown credential and a credential that hashes to no record
             # are intentionally indistinguishable - same status, same body,
             # matching /v1/activate's own rule.
             raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
-        if result.outcome == xray_provisioning.NOT_ELIGIBLE_REVOKED:
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_REVOKED:
             raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
-        if result.outcome == xray_provisioning.NOT_ELIGIBLE_EXPIRED:
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_EXPIRED:
             raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
-        if result.outcome == xray_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
             # This exact device must complete POST /v1/activate first - no
             # Xray identity is ever issued for a device this activation has
             # not already durably entitled.
             raise _RequestError(HTTPStatus.FORBIDDEN, "device_not_bound")
+
+        # B8K2A - the false-success window this whole transaction exists to
+        # close: the identity may be durably written/retrieved above, but it
+        # is NEVER reported as usable unless the running Xray process has
+        # actually been confirmed activated for it, in this SAME request.
+        # See xray_provisioning.provision_and_activate_identity's own docs
+        # for why a failed activation never rolls back a newly-minted
+        # identity - it stays durable and recoverable, just not yet usable.
+        self._log_fields["xray_activated"] = bool(result.activated)
+        if not result.activated:
+            error = result.activation_error
+            kind = getattr(error, "kind", "internal")
+            logger.error("xray_activation_failed kind=%s", kind)
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_activation_failed")
 
         # Client-safe fields only - never the REALITY private key, never
         # server-internal config, never the activation digest, never any
@@ -434,7 +459,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         payload = {
             "server_address": cfg.endpoint_host,
             "server_port": cfg.xray_server_port,
-            "uuid": result.vless_uuid,
+            "uuid": identity_outcome.vless_uuid,
             "flow": cfg.xray_flow,
             "server_name": cfg.xray_server_name,
             "fingerprint": cfg.xray_fingerprint,
@@ -443,7 +468,8 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         }
         # Always 200 - a new issuance and an idempotent retry are equally
         # "success" here, same rule /v1/activate already uses for its own
-        # new-bind-vs-existing-bind distinction.
+        # new-bind-vs-existing-bind distinction - but ONLY once activation
+        # is confirmed (see the check above).
         return self._success(HTTPStatus.OK, payload)
 
     def _require_bearer_token(self):

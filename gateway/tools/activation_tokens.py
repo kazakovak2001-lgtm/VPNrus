@@ -32,6 +32,56 @@ if _GATEWAY_DIR not in sys.path:
     sys.path.insert(0, _GATEWAY_DIR)
 
 from api import activations as activations_module  # noqa: E402
+from api import config as config_module  # noqa: E402
+from api import xray_activation as xray_activation_module  # noqa: E402
+
+
+def _parse_env_file(path):
+    """Minimal KEY=VALUE parser for an env-style file (e.g. /etc/pocvpn/api.env) -
+    blank lines and lines starting with # are skipped. Not a shell parser -
+    values are taken literally, no quoting/expansion, matching this file's
+    own env vars' actual shape (paths, ports, keys - never a value that
+    needs shell semantics)."""
+    result = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            result[key.strip()] = value.strip()
+    return result
+
+
+def _attempt_xray_convergence(args):
+    """B8K2A - optional, opt-in only (--xray-env-file): revoke's effect on
+    the RUNNING Xray process is realized by the SAME activate_if_needed
+    pipeline POST /v1/xray-profile uses (see xray_activation.py's own
+    docstring) - never a second revocation authority. Omitted entirely
+    when --xray-env-file is not given, so every existing pure-AWG operator
+    invocation of this CLI is completely unaffected."""
+    if not getattr(args, "xray_env_file", None):
+        return
+    try:
+        env = dict(os.environ)
+        env.update(_parse_env_file(args.xray_env_file))
+        app_config = config_module.load_config(env=env)
+    except config_module.ConfigError as exc:
+        print(f"activation_tokens: Xray convergence skipped - config error: {exc}", file=sys.stderr)
+        return
+    if not app_config.xray_activation_wrapper_path:
+        print("activation_tokens: Xray activation boundary not configured - convergence skipped", file=sys.stderr)
+        return
+
+    result = xray_activation_module.reconcile(app_config)
+    if result.activated:
+        state = "already converged (no change needed)" if result.skipped else "converged"
+        print(f"activation_tokens: Xray runtime {state}")
+    else:
+        kind = getattr(result.error, "kind", "internal")
+        print(f"activation_tokens: WARNING - Xray runtime convergence FAILED (kind={kind}); "
+              "revocation is still durably recorded and fail-closed, retry convergence "
+              "separately (see gateway/tools/xray_reconcile.py)", file=sys.stderr)
 
 
 def _fail(message):
@@ -75,6 +125,12 @@ def cmd_revoke(args):
         print(f"activation_id={args.activation_id} revoked")
     else:
         print(f"activation_id={args.activation_id} is already REVOKED (no change)")
+
+    # B8K2A - durable revocation is unconditional and already complete above
+    # regardless of what happens next: this can only ever attempt to make
+    # the RUNNING Xray process reflect it sooner, never undo it. See
+    # _attempt_xray_convergence's own docs.
+    _attempt_xray_convergence(args)
 
 
 def _print_record(record):
@@ -120,6 +176,13 @@ def build_parser():
 
     p_revoke = sub.add_parser("revoke", help="revoke an activation by its activation_id")
     p_revoke.add_argument("activation_id")
+    p_revoke.add_argument(
+        "--xray-env-file", default=None,
+        help="B8K2A, optional - path to the pocvpn-api env file (e.g. /etc/pocvpn/api.env); "
+             "if given, attempts to synchronously converge the running Xray process to reflect "
+             "this revocation (see gateway/api/xray_activation.py). Omitted entirely by default - "
+             "existing pure-AWG usage of this command is completely unaffected.",
+    )
 
     p_status = sub.add_parser("status", help="show one activation's non-secret status by activation_id")
     p_status.add_argument("activation_id")

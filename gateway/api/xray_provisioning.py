@@ -304,7 +304,11 @@ def provision_xray_identity(
     xray_store_path, xray_lock_path,
     now=None,
 ):
-    """The ONE entry point POST /v1/xray-profile calls. Idempotent: a
+    """Durable identity decide/create ONLY - see
+    provision_and_activate_identity below for the full transaction
+    POST /v1/xray-profile actually calls as of B8K2A (this function is
+    kept, unmodified, as the piece that owns; it never itself confirms the
+    running Xray process has been told about the identity). Idempotent: a
     retry for the same (credential, public_key) always returns the SAME
     vless_uuid, never generates a second one, and never re-validates
     eligibility more than once per call (a single per-activation-locked
@@ -339,6 +343,109 @@ def provision_xray_identity(
             data[digest] = identities + [new_identity]
             _atomic_write_store_or_raise(xray_store_path, data)
             return XrayIdentityResult(outcome=ISSUED, vless_uuid=new_uuid)
+
+
+@dataclass(frozen=True)
+class ProvisionAndActivateResult:
+    identity_outcome: XrayIdentityResult
+    # None whenever identity_outcome.outcome is not ISSUED (nothing to activate).
+    is_new_identity: bool = False
+    # None until activate_fn() has actually run.
+    activated: bool = None
+    activation_error: object = None  # an xray_reload.XrayReloadError or xray_config_renderer.XrayConfigRenderError
+
+
+def provision_and_activate_identity(
+    credential, public_key,
+    activation_store_path, activation_lock_path,
+    xray_store_path, xray_lock_path,
+    activate_fn,
+    now=None,
+):
+    """B8K2A - the ONE entry point POST /v1/xray-profile actually calls.
+    Extends provision_xray_identity with a synchronous activation step,
+    under the SAME per-activation lock acquisition - deliberately NOT
+    "call provision_xray_identity, then separately call activate_fn()":
+    two separate lock acquisitions would leave a window between minting/
+    confirming an identity and confirming it is live where a concurrent
+    revoke_activation could complete unobserved, and a client could then
+    receive a "usable" profile for an activation that is, by the time the
+    HTTP response is written, already revoked. Holding one lock across
+    both steps closes that window.
+
+    `activate_fn` is called on EVERY successful eligibility check -
+    including when the identity already existed (idempotent retry) - so a
+    retry re-confirms/re-converges the running Xray process to current
+    canonical state, mirroring provision-peer.sh's own
+    converge_live_state being called on its "existing" path too (see that
+    script's own comments). activate_fn is expected to be cheap when
+    nothing has actually changed - see xray_activation.activate_if_needed's
+    own docstring for why (it skips the actual privileged reload when the
+    canonical state's rendered hash hasn't moved since the last successful
+    activation).
+
+    Identity rollback/pending semantic (B8K2A, chosen deliberately, see
+    module-level docs): on activation failure, the durably-written new
+    identity is NEVER rolled back - it is retained as a real, valid
+    identity that simply is not yet confirmed active. This mirrors this
+    codebase's OWN existing AWG pattern (peer_mutations.sh's
+    converge_live_state: durable config change is retained on a reload
+    failure, never rolled back - only the live-convergence claim is
+    withheld). The caller (handler.py) must map activated=False to a
+    fail-closed HTTP response (503) regardless of identity_outcome -
+    never return the vless_uuid as usable until activated is True. A
+    subsequent retry for the SAME device finds the SAME already-durable
+    identity (is_new_identity=False that time) and simply re-attempts
+    activation - never mints a second UUID.
+    """
+    now = now or datetime.now(timezone.utc)
+    digest = activations.credential_digest(credential)
+
+    with activations.per_activation_lock(activation_store_path, digest):
+        ineligible = _check_device_eligibility(
+            credential, public_key, activation_store_path, activation_lock_path, now,
+        )
+        if ineligible is not None:
+            return ProvisionAndActivateResult(identity_outcome=XrayIdentityResult(outcome=ineligible))
+
+        with _exclusive_lock(xray_lock_path, create=False):
+            data = _read_and_validate_under_lock(xray_store_path)
+            identities = data.get(digest, [])
+
+            existing = next((i for i in identities if i["device_public_key"] == public_key), None)
+            if existing is not None:
+                identity_outcome = XrayIdentityResult(outcome=ISSUED, vless_uuid=existing["vless_uuid"])
+                is_new_identity = False
+            else:
+                new_uuid = str(uuid.uuid4())
+                new_identity = {
+                    "device_public_key": public_key,
+                    "vless_uuid": new_uuid,
+                    "created_at": _utc_now_iso(),
+                }
+                data[digest] = identities + [new_identity]
+                _atomic_write_store_or_raise(xray_store_path, data)
+                identity_outcome = XrayIdentityResult(outcome=ISSUED, vless_uuid=new_uuid)
+                is_new_identity = True
+
+        # activate_fn runs OUTSIDE the xray store's own short lock (already
+        # released above) but STILL INSIDE the per-activation lock - the
+        # required nesting order (per-activation -> xray store lock
+        # [released] -> global activation lock, taken inside activate_fn).
+        activation_result = activate_fn()
+        return ProvisionAndActivateResult(
+            identity_outcome=identity_outcome,
+            is_new_identity=is_new_identity,
+            activated=activation_result.activated,
+            activation_error=activation_result.error,
+        )
+
+
+def global_lock(lock_path, create=False):
+    """Public alias of _exclusive_lock for cross-module reuse by
+    xray_activation.py's own global activation lock - see this module's
+    lock-ordering docs (per-activation -> xray store lock -> this)."""
+    return _exclusive_lock(lock_path, create=create)
 
 
 def read_store_shared(store_path, lock_path):

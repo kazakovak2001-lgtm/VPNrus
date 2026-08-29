@@ -34,7 +34,13 @@ from dataclasses import dataclass, field
 from . import activations
 from . import xray_provisioning
 
-_SHORT_ID_RE = re.compile(r"^[0-9a-f]{2,16}$")
+# Same shape Android's XrayVlessRealityConfig validator requires (see
+# android/.../vpn/xray/XrayVlessRealityConfig.kt's SHORT_ID_REGEX) - REALITY
+# short IDs are raw bytes hex-encoded, so the string must have EVEN length
+# (checked separately below - a bare {2,16} character-count regex would
+# wrongly accept an odd length like "abc"). Case-insensitive, matching the
+# Android side exactly (Android's own regex is also case-insensitive).
+_SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
 _REALITY_PRIVATE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
@@ -81,7 +87,7 @@ def _validate_reality_server_config(reality):
     if not reality.short_ids:
         raise XrayConfigRenderError("short_ids must not be empty")
     for short_id in reality.short_ids:
-        if not _SHORT_ID_RE.match(short_id):
+        if not _SHORT_ID_RE.match(short_id) or len(short_id) % 2 != 0:
             raise XrayConfigRenderError(f"malformed short id: {short_id!r}")
 
 

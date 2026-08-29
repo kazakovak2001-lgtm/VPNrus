@@ -101,6 +101,10 @@ def make_app_config(
     xray_store_path="", xray_lock_path="", xray_server_port=0,
     xray_server_name="", xray_fingerprint="", xray_reality_public_key="",
     xray_short_id="", xray_flow="",
+    xray_reality_private_key_file="", xray_staging_config_path="",
+    xray_activation_lock_path="", xray_activation_last_hash_path="",
+    xray_activation_wrapper_path="", xray_activation_timeout_seconds=5.0,
+    xray_dest="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -125,18 +129,78 @@ def make_app_config(
         xray_reality_public_key=xray_reality_public_key,
         xray_short_id=xray_short_id,
         xray_flow=xray_flow,
+        xray_reality_private_key_file=xray_reality_private_key_file,
+        xray_staging_config_path=xray_staging_config_path,
+        xray_activation_lock_path=xray_activation_lock_path,
+        xray_activation_last_hash_path=xray_activation_last_hash_path,
+        xray_activation_wrapper_path=xray_activation_wrapper_path,
+        xray_activation_timeout_seconds=xray_activation_timeout_seconds,
+        xray_dest=xray_dest,
     )
 
 
+_FAKE_XRAY_WRAPPER_BODY = """#!/usr/bin/env bash
+# Fake nova-xray-reload for tests - see _fixtures.py's write_fake_xray_wrapper.
+# Takes ZERO arguments, exactly like the real wrapper - reads its plan from
+# POCVPN_FAKE_XRAY_PLAN, the staged candidate config path from
+# POCVPN_FAKE_XRAY_STAGING (mirrors how the real wrapper hardcodes this
+# path from gateway/config/xray.env instead of taking it as an argument).
+if [ "$#" -ne 0 ]; then
+    echo "usage: fake nova-xray-reload (no arguments)" >&2
+    exit 2
+fi
+plan_file="${POCVPN_FAKE_XRAY_PLAN:?POCVPN_FAKE_XRAY_PLAN not set}"
+staging="${POCVPN_FAKE_XRAY_STAGING:?POCVPN_FAKE_XRAY_STAGING not set}"
+read -r cmd arg1 < "$plan_file"
+case "$cmd" in
+    ACTIVATE)
+        sha=$(sha256sum "$staging" | awk '{print $1}')
+        printf 'activated\\t%s\\n' "$sha"
+        exit 0
+        ;;
+    FAIL_VALIDATION) exit 22 ;;
+    FAIL_ACTIVATION_ROLLED_BACK) exit 23 ;;
+    FAIL_ACTIVATION_ROLLBACK_FAILED) exit 24 ;;
+    EXIT) exit "$arg1" ;;
+    *) exit 99 ;;
+esac
+"""
+
+
+def write_fake_xray_wrapper(tmp_dir):
+    path = os.path.join(tmp_dir, "fake-nova-xray-reload")
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(_FAKE_XRAY_WRAPPER_BODY)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
 def make_xray_app_config(tmp_dir, provision_script_path, activation_store_path, activation_lock_path, **kwargs):
-    """Convenience wrapper: a full app config with /v1/xray-profile
-    actually configured (a representative, non-secret-real REALITY
-    public-facing value set) - the private key itself is never part of
-    AppConfig at all (see config.py's own docs)."""
+    """Convenience wrapper: a full app config with /v1/xray-profile AND
+    the B8K2A activation boundary actually configured (representative,
+    non-secret-real values everywhere - a REAL 43-char-shaped test key,
+    never a production one, written to a throwaway file for
+    xray_reality_private_key_file)."""
     xray_store_path = kwargs.pop("xray_store_path", os.path.join(tmp_dir, "xray-identities.json"))
     xray_lock_path = kwargs.pop("xray_lock_path", os.path.join(tmp_dir, ".xray-identities.lock"))
     from api import xray_provisioning as xray_provisioning_module
     xray_provisioning_module.init_store(xray_store_path, xray_lock_path)
+
+    from api import xray_activation as xray_activation_module
+
+    private_key_file = kwargs.pop("xray_reality_private_key_file", None)
+    if private_key_file is None:
+        private_key_file = os.path.join(tmp_dir, "reality-private-key.txt")
+        with open(private_key_file, "w", encoding="utf-8") as handle:
+            handle.write("B" * 43)
+
+    xray_activation_lock_path = kwargs.pop("xray_activation_lock_path", os.path.join(tmp_dir, ".xray-activation.lock"))
+    xray_activation_module.init_activation_lock(xray_activation_lock_path)
+
+    wrapper_path = kwargs.pop("xray_activation_wrapper_path", None)
+    if wrapper_path is None:
+        wrapper_path = write_fake_xray_wrapper(tmp_dir)
+
     return make_app_config(
         tmp_dir, provision_script_path,
         activation_store_path=activation_store_path, activation_lock_path=activation_lock_path,
@@ -147,6 +211,12 @@ def make_xray_app_config(tmp_dir, provision_script_path, activation_store_path, 
         xray_reality_public_key=kwargs.pop("xray_reality_public_key", "A" * 43),
         xray_short_id=kwargs.pop("xray_short_id", "ab12cd34"),
         xray_flow=kwargs.pop("xray_flow", "xtls-rprx-vision"),
+        xray_reality_private_key_file=private_key_file,
+        xray_staging_config_path=kwargs.pop("xray_staging_config_path", os.path.join(tmp_dir, "candidate-config.json")),
+        xray_activation_lock_path=xray_activation_lock_path,
+        xray_activation_last_hash_path=kwargs.pop("xray_activation_last_hash_path", os.path.join(tmp_dir, ".xray-last-hash")),
+        xray_activation_wrapper_path=wrapper_path,
+        xray_dest=kwargs.pop("xray_dest", "www.microsoft.com:443"),
         **kwargs,
     )
 
