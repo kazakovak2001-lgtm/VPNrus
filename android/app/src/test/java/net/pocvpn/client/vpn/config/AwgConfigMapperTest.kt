@@ -75,4 +75,59 @@ class AwgConfigMapperTest {
         // Diagnostic baseline: mapper must not require any AWG-specific field to build a valid config.
         AwgConfigMapper.toBackendConfig(sampleConfig(AwgProfile.none()))
     }
+
+    // --- B8F: DNS + IPv6 leak protection, proven against the REAL pinned
+    // org.amnezia.awg.config classes (not a fake/mirror of them) ---
+
+    @Test
+    fun `both configured DNS resolvers reach the real backend Interface config`() {
+        val clientKey = KeyPair()
+        val serverKey = KeyPair()
+        val config = AwgConfig(
+            privateKeyBase64 = clientKey.privateKey.toBase64(),
+            localAddresses = listOf("10.77.0.2/32"),
+            dnsServers = VpnDnsPolicy.servers,
+            profile = AwgProfile.none(),
+            peer = AwgPeer(
+                publicKeyBase64 = serverKey.publicKey.toBase64(),
+                endpointHost = "152.70.43.1",
+                endpointPort = 51820,
+            ),
+        )
+        val ifaceString = AwgConfigMapper.toBackendConfig(config).getInterface().toAwgQuickString()
+
+        assertTrue(ifaceString.contains("1.1.1.1"))
+        assertTrue(ifaceString.contains("1.0.0.1"))
+    }
+
+    @Test
+    fun `default peer AllowedIPs captures both 0-0-0-0-0 and colon-colon-0 into the real backend Peer config`() {
+        val clientKey = KeyPair()
+        val serverKey = KeyPair()
+        // AwgPeer built with NO allowedIps argument - proves the real,
+        // production default (TransportConfig.kt's AwgPeer.allowedIps),
+        // not a value this test chose itself.
+        val config = AwgConfig(
+            privateKeyBase64 = clientKey.privateKey.toBase64(),
+            localAddresses = listOf("10.77.0.2/32"),
+            dnsServers = VpnDnsPolicy.servers,
+            profile = AwgProfile.none(),
+            peer = AwgPeer(
+                publicKeyBase64 = serverKey.publicKey.toBase64(),
+                endpointHost = "152.70.43.1",
+                endpointPort = 51820,
+            ),
+        )
+        val peerString = AwgConfigMapper.toBackendConfig(config).getPeers()[0].toAwgQuickString()
+
+        assertTrue(peerString.contains("0.0.0.0/0"))
+        // The real backend's Peer.toAwgQuickString() renders "::/0" via
+        // plain java.net.InetAddress.getHostAddress() - which expands the
+        // IPv6 zero address to its long form, NOT the "::" shorthand.
+        // Verified directly against this pinned AAR (not assumed from
+        // WireGuard-quick convention) - a literal ".contains(\"::/0\")"
+        // assertion would fail here even though the route is present and
+        // correct.
+        assertTrue(peerString.contains("0:0:0:0:0:0:0:0/0"))
+    }
 }

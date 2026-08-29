@@ -135,6 +135,75 @@ class GatewayConfigurationRepositoryTest {
         assertEquals(listOf("10.77.0.0/24"), result.allowedIps)
     }
 
+    // --- B8F: DNS + IPv6 leak protection ---
+
+    @Test
+    fun `effective config carries the canonical DNS resolver policy`() {
+        val repo = DefaultGatewayConfigurationRepository(
+            FakeGatewayConfigSource(
+                host = "203.0.113.10",
+                port = "51820",
+                publicKey = validKey,
+                clientIp = "10.77.0.2",
+                gatewayIp = "10.77.0.1",
+            ),
+        )
+        val result = repo.get() as GatewayConfiguration.Configured
+        assertEquals(VpnDnsPolicy.servers, result.dnsServers)
+        assertEquals(listOf("1.1.1.1", "1.0.0.1"), result.dnsServers)
+    }
+
+    @Test
+    fun `dual-stack full-tunnel is the default even with an allowedIps override present for a different purpose`() {
+        // Requirement 4: nothing other than an explicit, non-blank
+        // GatewayConfigSource.allowedIps() override can ever narrow away
+        // from the dual-stack (0.0.0.0/0 + ::/0) default - there is no
+        // separate "IPv4-only" code path this could silently take.
+        val repoWithoutOverride = DefaultGatewayConfigurationRepository(
+            FakeGatewayConfigSource(
+                host = "203.0.113.10",
+                port = "51820",
+                publicKey = validKey,
+                clientIp = "10.77.0.2",
+                gatewayIp = "10.77.0.1",
+                allowedIps = "", // blank = no explicit policy change
+            ),
+        )
+        val result = repoWithoutOverride.get() as GatewayConfiguration.Configured
+        assertTrue(result.allowedIps.contains("0.0.0.0/0"))
+        assertTrue(result.allowedIps.contains("::/0"))
+    }
+
+    @Test
+    fun `restored-profile-shaped source and dev-fallback-shaped source converge on the identical DNS and AllowedIPs policy`() {
+        // Requirement 5: DNS/IPv6 policy is applied in exactly ONE place
+        // (DefaultGatewayConfigurationRepository.get()) that every profile
+        // source already converges through - so a source standing in for a
+        // RESTORED_PERSISTED profile and one standing in for a fresh
+        // DEV_FALLBACK/provisioned profile must produce the SAME policy,
+        // with no per-source DNS/AllowedIps wiring anywhere to drift.
+        val restoredShapedSource = FakeGatewayConfigSource(
+            host = "152.70.43.1",
+            port = "51820",
+            publicKey = validKey,
+            clientIp = "10.77.0.9",
+            gatewayIp = "10.77.0.1",
+        )
+        val devFallbackShapedSource = FakeGatewayConfigSource(
+            host = "dev.example",
+            port = "51820",
+            publicKey = validKey,
+            clientIp = "10.9.0.2",
+            gatewayIp = "10.9.0.1",
+        )
+
+        val restored = DefaultGatewayConfigurationRepository(restoredShapedSource).get() as GatewayConfiguration.Configured
+        val devFallback = DefaultGatewayConfigurationRepository(devFallbackShapedSource).get() as GatewayConfiguration.Configured
+
+        assertEquals(restored.dnsServers, devFallback.dnsServers)
+        assertEquals(restored.allowedIps, devFallback.allowedIps)
+    }
+
     @Test
     fun `blank endpoint host with other fields present is Invalid, not Missing`() {
         val repo = DefaultGatewayConfigurationRepository(

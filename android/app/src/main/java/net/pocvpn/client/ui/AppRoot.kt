@@ -23,7 +23,9 @@ import net.pocvpn.client.ui.screens.HomeScreen
 import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.config.GatewayConfiguration
+import net.pocvpn.client.vpn.config.Ipv6LeakPolicy
 import net.pocvpn.client.vpn.config.ProfileSource
+import net.pocvpn.client.vpn.config.VpnIpv6Policy
 
 /**
  * B8E - single Compose entry point for MainActivity. Owns no VPN/profile
@@ -114,6 +116,19 @@ private fun buildDiagnosticsLines(
         is GatewayConfiguration.Configured -> "Client tunnel IP: ${gateway.clientTunnelIp}"
         else -> "Client tunnel IP: NOT CONFIGURED"
     }
+    // B8F - the ACTUAL effective values (read off gatewayStatus(), the same
+    // GatewayConfiguration VpnController.buildTransportConfig uses), not
+    // just the VpnDnsPolicy/VpnIpv6Policy constants restated - this proves
+    // what is really wired for THIS session, not merely what the policy says.
+    val dnsLine = when (gateway) {
+        is GatewayConfiguration.Configured -> "DNS servers: ${gateway.dnsServers.ifEmpty { listOf("NONE") }.joinToString()}"
+        else -> "DNS servers: NOT CONFIGURED"
+    }
+    val allowedIpsLine = when (gateway) {
+        is GatewayConfiguration.Configured -> "AllowedIPs: ${gateway.allowedIps.joinToString()}"
+        else -> "AllowedIPs: NOT CONFIGURED"
+    }
+    val ipv6PolicyLine = "IPv6 policy: ${ipv6PolicyDisplayText(VpnIpv6Policy.current)}"
 
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
@@ -121,6 +136,9 @@ private fun buildDiagnosticsLines(
         "Client public key: ${publicKey ?: "(loading...)"}",
         tunnelIpLine,
         gatewayLine,
+        allowedIpsLine,
+        dnsLine,
+        ipv6PolicyLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",
@@ -128,6 +146,11 @@ private fun buildDiagnosticsLines(
         "TX: ${diagnostics.bytesSent ?: "-"}",
         "Last error: ${diagnostics.lastError?.displayText() ?: "-"}",
     )
+}
+
+private fun ipv6PolicyDisplayText(policy: Ipv6LeakPolicy): String = when (policy) {
+    Ipv6LeakPolicy.TUNNELED -> "tunneled"
+    Ipv6LeakPolicy.FAIL_CLOSED -> "blocked/fail-closed"
 }
 
 /** Diagnostics-only, more technical wording than toHomeStatusText() - unchanged from the original View-based Diagnostics section. */

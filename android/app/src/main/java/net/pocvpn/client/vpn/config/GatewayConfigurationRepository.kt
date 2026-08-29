@@ -68,6 +68,10 @@ class DefaultGatewayConfigurationRepository(
             clientTunnelIp = clientTunnelIp,
             gatewayTunnelIp = gatewayTunnelIp,
             allowedIps = resolveAllowedIps(),
+            // B8F - a local client policy, not a server-issued/persisted
+            // fact (see VpnDnsPolicy's own docs) - applied here so every
+            // profile source converges on the same DNS servers.
+            dnsServers = VpnDnsPolicy.servers,
             profile = profile,
         )
     }

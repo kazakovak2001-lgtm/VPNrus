@@ -21,7 +21,12 @@ sealed class GatewayConfiguration {
         val clientTunnelIp: String,
         val gatewayTunnelIp: String,
         val allowedIps: List<String>,
-        /** Placeholder for B10 - not consumed by anything yet. */
+        /**
+         * B8F - always DefaultGatewayConfigurationRepository's VpnDnsPolicy
+         * .servers in production (see that class); the empty-list default
+         * here exists only so existing test fixtures/fakes that predate
+         * B8F don't need to specify it.
+         */
         val dnsServers: List<String> = emptyList(),
         val persistentKeepaliveSeconds: Int? = 25,
         val profile: AwgProfile,
