@@ -128,7 +128,6 @@ def render_server_config(activations_data, xray_data, reality, flow=""):
     vless_clients = [
         {
             "id": client.vless_uuid,
-            "encryption": "none",
             "flow": flow,
             # Not a real email - Xray's own per-client traffic-stats tag.
             # activation_id is a random 32-hex value, never sensitive.
