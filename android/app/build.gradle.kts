@@ -89,10 +89,38 @@ tasks.register("checkAwgTunnelAar") {
 tasks.matching { it.name.startsWith("pre") && it.name.endsWith("Build") }
     .configureEach { dependsOn("checkAwgTunnelAar") }
 
+// B8K1B - pinned AndroidLibXrayLite gomobile AAR, built reproducibly via
+// third_party/xray/build-xray-wsl.sh from 2dust/AndroidLibXrayLite @
+// c634d1baea97e94320c0bf6a9cf637369c4f11d4 (which pins xray-core v26.7.28 /
+// 5ca6f4b7d4dc20a881d4330e498892697627ec0c transitively via its own go.sum -
+// see third_party/xray/VERSION). Same convention as awgTunnelAar above: not
+// committed to git (android/**/libs/ is gitignored), rebuild locally before
+// first app build that touches NovaXrayVpnService/VlessRealityTransport.
+// This is an isolated adapter shell (B8K1B) - XRAY_REALITY stays
+// NOT_IMPLEMENTED in TransportRegistry regardless of this AAR's presence.
+val xrayAar = file("libs/libv2ray-androidlibxraylite-c634d1b.aar")
+
+tasks.register("checkXrayAar") {
+    doFirst {
+        if (!xrayAar.exists()) {
+            throw GradleException(
+                "\nXray (AndroidLibXrayLite) AAR is missing: ${xrayAar.path}\n" +
+                    "Run third_party/xray/build-xray-wsl.sh from WSL2 to generate it,\n" +
+                    "then copy the produced libv2ray.aar into android/app/libs/ as\n" +
+                    "libv2ray-androidlibxraylite-c634d1b.aar.\n" +
+                    "See third_party/xray/README.md and docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md.\n"
+            )
+        }
+    }
+}
+tasks.matching { it.name.startsWith("pre") && it.name.endsWith("Build") }
+    .configureEach { dependsOn("checkXrayAar") }
+
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation(files(awgTunnelAar))
+    implementation(files(xrayAar))
     implementation("androidx.annotation:annotation:1.8.2")
     implementation("androidx.collection:collection:1.4.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

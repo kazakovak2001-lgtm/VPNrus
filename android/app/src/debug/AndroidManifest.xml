@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  B8K1B - debug-only manual entry point for exercising NovaXrayVpnService/
+  VlessRealityTransport on a physical device. This file lives in the
+  `debug` Gradle source set, so Gradle's manifest merger includes
+  XrayDiagnosticsActivity ONLY in debug builds - it is genuinely absent
+  from a release APK's merged manifest, not merely hidden behind a
+  BuildConfig.DEBUG runtime check.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name="net.pocvpn.client.debug.XrayDiagnosticsActivity"
+            android:exported="false"
+            android:label="Xray Diagnostics (debug)" />
+    </application>
+</manifest>

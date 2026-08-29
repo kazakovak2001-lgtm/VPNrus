@@ -40,5 +40,19 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- B8K1B - isolated Xray/VLESS+REALITY adapter shell. Not started by
+             VpnController/TransportOrchestrator; driven only by
+             VlessRealityTransport (itself unregistered in TransportRegistry)
+             and the debug-only manual entry point. See
+             net.pocvpn.client.vpn.xray.NovaXrayVpnService's own docs. -->
+        <service
+            android:name=".vpn.xray.NovaXrayVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

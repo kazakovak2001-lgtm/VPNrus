@@ -35,4 +35,11 @@ data class AwgConfig(
 /** Transport-agnostic config passed into VpnTransport.connect(). */
 sealed class TransportConfig {
     data class Awg(val config: AwgConfig) : TransportConfig()
+
+    /**
+     * B8K1B - config for the isolated VlessRealityTransport/NovaXrayVpnService
+     * adapter shell. TransportKind.XRAY_REALITY stays NOT_IMPLEMENTED in
+     * TransportRegistry, so nothing in production ever constructs this yet.
+     */
+    data class Xray(val config: net.pocvpn.client.vpn.xray.XrayVlessRealityConfig) : TransportConfig()
 }
