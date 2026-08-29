@@ -221,6 +221,27 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config_module.ConfigError):
             config_module.load_config(env=env)
 
+    def test_xray_server_name_and_dest_hostname_mismatch_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SERVER_NAME"] = "example.invalid"
+        env["POCVPN_API_XRAY_DEST"] = "different.invalid:443"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_server_name_matching_dest_hostname_is_accepted(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SERVER_NAME"] = "example.invalid"
+        env["POCVPN_API_XRAY_DEST"] = "example.invalid:443"
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.xray_server_name, "example.invalid")
+
+    def test_xray_server_name_equal_to_gateway_endpoint_host_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SERVER_NAME"] = env["POCVPN_API_ENDPOINT_HOST"]
+        env["POCVPN_API_XRAY_DEST"] = env["POCVPN_API_ENDPOINT_HOST"] + ":443"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
 
 if __name__ == "__main__":
     unittest.main()

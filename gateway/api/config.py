@@ -296,6 +296,33 @@ def load_config(env=None):
                 + " must all be set once any Xray setting is set"
             )
 
+        # B8K3A - the one consistency check that actually matters here:
+        # XRAY_SERVER_NAME (the REALITY camouflage SNI Android is told to
+        # present, and the same value the server's own realitySettings.
+        # serverNames must accept) and XRAY_DEST (the REAL external TLS
+        # target the server proxies non-REALITY-authenticated traffic to)
+        # must name the SAME hostname - never Nova's own gateway address
+        # (endpoint_host/xray_server_address, a completely different axis:
+        # what a client's TCP socket connects to, not what SNI it presents).
+        # A mismatch here would mean the server accepts a REALITY ClientHello
+        # camouflaged as one site while actually proxying disguise traffic
+        # to a different one - either breaks REALITY's own validation inside
+        # the pinned Xray binary, or (worse) silently produces a REALITY
+        # config that doesn't camouflage as the SNI it claims to.
+        dest_host = xray_dest.rsplit(":", 1)[0] if xray_dest else ""
+        if xray_server_name and dest_host and dest_host != xray_server_name:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_SERVER_NAME ({xray_server_name!r}) and the host portion of "
+                f"{_ENV_PREFIX}XRAY_DEST ({dest_host!r}) must be the same hostname - REALITY's "
+                "camouflage SNI and its real proxy target must match"
+            )
+        if xray_server_name == endpoint_host or dest_host == endpoint_host:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_SERVER_NAME/XRAY_DEST must never be Nova's own gateway address "
+                f"({endpoint_host!r}) - that field is the REALITY camouflage target, a real third-party "
+                "site, never this server's own hostname/IP"
+            )
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
