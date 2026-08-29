@@ -243,6 +243,10 @@ private fun buildDiagnosticsLines(
         if (it.result == ConnectionOutcomeResult.SUCCESS) "SUCCESS" else "FAILURE (${it.errorCategory})"
     } ?: "-"}"
 
+    // B8J - the ONLY place a RestrictionClass is computed (see
+    // RestrictionClassifier's own docs) - never a second interpretation here.
+    val restrictionClassLine = "Restriction class: ${viewModel.restrictionClass()}"
+
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
         "VPN permission: ${if (diagnostics.permissionGranted) "GRANTED" else "REQUIRED"}",
@@ -269,6 +273,7 @@ private fun buildDiagnosticsLines(
         lastHandshakeDurationLine,
         lastOutcomeLine,
         smartConnectReasonLine,
+        restrictionClassLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",

@@ -141,4 +141,41 @@ class SmartConnectCandidateSelectorTest {
         // and today's single-candidate decision is unaffected by it either way.
         assertEquals(withoutHistory, withHistory)
     }
+
+    // --- B8J: RestrictionClassifier feeds this ONE decision authority, never a second one ---
+
+    @Test
+    fun `a suspected restriction is carried through truthfully but never changes the selected candidate - no fake transport switching`() {
+        val registry = TransportRegistry.defaults { FakeVpnTransport() }
+        val gateways = SmartConnectCandidateSelector.productionGatewayCandidates(configuredGateway())
+
+        val decision = SmartConnectCandidateSelector.decide(
+            networkProfile = usableProfile(),
+            gatewayCandidates = gateways,
+            registry = registry,
+            restrictionClass = RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING,
+        )
+
+        assertTrue(decision is SmartConnectDecision.Selected)
+        val selected = decision as SmartConnectDecision.Selected
+        // STILL AWG + Frankfurt - the only real candidate - never swapped for
+        // a "less filtered" alternative that doesn't exist.
+        assertEquals(TransportKind.AMNEZIA_WG, selected.score.candidate.transport.kind)
+        assertEquals(ProductionGateway.ID, selected.score.candidate.gateway.id)
+        assertEquals(ConnectionScoreReason.ONLY_AVAILABLE_CANDIDATE, selected.score.reason)
+        // ...but the suspicion IS reported truthfully, not silently dropped.
+        assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, selected.score.restrictionClass)
+    }
+
+    @Test
+    fun `default restrictionClass is UNKNOWN, never a fabricated NO_RESTRICTION_OBSERVED for a call site that didn't classify anything`() {
+        val registry = TransportRegistry.defaults { FakeVpnTransport() }
+        val decision = SmartConnectCandidateSelector.decide(
+            networkProfile = usableProfile(),
+            gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(configuredGateway()),
+            registry = registry,
+        ) as SmartConnectDecision.Selected
+
+        assertEquals(RestrictionClass.UNKNOWN, decision.score.restrictionClass)
+    }
 }

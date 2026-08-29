@@ -55,7 +55,22 @@ enum class ConnectionScoreReason {
     USER_MANUAL_PREFERENCE,
 }
 
-data class ConnectionScore(val candidate: ConnectionCandidate, val reason: ConnectionScoreReason)
+/**
+ * B8J - [restrictionClass] is an INPUT this ONE decision authority carries
+ * through into its output, never a second decision of its own (see
+ * RestrictionClassifier.classify - the ONLY place a RestrictionClass is
+ * computed). Defaults to UNKNOWN so every pre-B8J call site is unaffected.
+ * With exactly one real transport x one real gateway, a suspected
+ * restriction never changes WHICH candidate is selected (there is nothing
+ * else to switch to - "no fake transport switching") - it is carried here
+ * purely so callers can report it truthfully instead of silently omitting
+ * it.
+ */
+data class ConnectionScore(
+    val candidate: ConnectionCandidate,
+    val reason: ConnectionScoreReason,
+    val restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
+)
 
 sealed class SmartConnectDecision {
     data class Selected(val score: ConnectionScore) : SmartConnectDecision()
@@ -90,6 +105,9 @@ object SmartConnectCandidateSelector {
         preference: UserTransportPreference = UserTransportPreference.Auto,
         health: Map<TransportKind, TransportHealth> = emptyMap(),
         connectionHistory: List<ConnectionOutcome> = emptyList(),
+        // B8J - see ConnectionScore's own docs: carried through truthfully,
+        // never used to pick a DIFFERENT candidate (none exists yet).
+        restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
     ): SmartConnectDecision {
         if (gatewayCandidates.isEmpty()) return SmartConnectDecision.NoCandidateAvailable
 
@@ -110,7 +128,7 @@ object SmartConnectCandidateSelector {
             // ONLY_AVAILABLE_CANDIDATE when that would be false.
             ConnectionScoreReason.BEST_MEASURED_HANDSHAKE_HISTORY
         }
-        return SmartConnectDecision.Selected(ConnectionScore(candidate, reason))
+        return SmartConnectDecision.Selected(ConnectionScore(candidate, reason, restrictionClass))
     }
 
     /**

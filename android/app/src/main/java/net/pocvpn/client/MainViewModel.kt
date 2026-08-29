@@ -21,8 +21,15 @@ import net.pocvpn.client.provisioning.ProvisioningClient
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.smartconnect.ConnectionOutcome
+import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.smartconnect.FileConnectionOutcomeStore
+import net.pocvpn.client.smartconnect.GatewayReachabilityProbe
+import net.pocvpn.client.smartconnect.HttpsGatewayReachabilityProbe
+import net.pocvpn.client.smartconnect.RestrictionClass
+import net.pocvpn.client.smartconnect.RestrictionClassifier
+import net.pocvpn.client.smartconnect.RestrictionEvidence
+import net.pocvpn.client.smartconnect.RestrictionMonitor
 import net.pocvpn.client.smartconnect.SmartConnectCandidateSelector
 import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.transport.TransportDescriptor
@@ -118,6 +125,11 @@ class MainViewModel(
     // proven end-to-end against a genuinely USABLE network fact without
     // constructing one.
     initialNetworkProfile: NetworkProfile? = null,
+    // B8J - additive, defaults to null (same reasoning as networkProfiler/
+    // connectionOutcomeStore above). When non-null, a RestrictionMonitor is
+    // built from it (see below) and started in init/stopped in onCleared -
+    // it never itself touches VpnController/VpnTransport (see its own docs).
+    restrictionProbe: GatewayReachabilityProbe? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -158,18 +170,45 @@ class MainViewModel(
      * classes' own docs). Recomputed fresh from CURRENT network/gateway
      * facts on every read (same no-caching pattern as gatewayStatus()
      * below) - never a stale cached decision. Only ever returns AWG +
-     * Frankfurt + ONLY_AVAILABLE_CANDIDATE today (exactly one real
-     * transport x one real gateway exists).
+     * Frankfurt today (exactly one real transport x one real gateway
+     * exists) - restrictionClass() below is carried through TRUTHFULLY
+     * (see ConnectionScore's own docs) but never changes WHICH candidate is
+     * selected, since there is nothing else to select - no fake transport
+     * switching.
      */
     fun smartConnectDecision(): SmartConnectDecision = SmartConnectCandidateSelector.decide(
         networkProfile = networkProfile.value,
         gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
         registry = transportRegistry,
         connectionHistory = recentConnectionOutcomes(),
+        restrictionClass = restrictionClass(),
     )
 
     /** B8I - DEBUG diagnostics only; bounded by connectionOutcomeStore's own maxRecords. */
     fun recentConnectionOutcomes(): List<ConnectionOutcome> = connectionOutcomeStore?.recent().orEmpty()
+
+    // B8J - built ONLY when a probe was actually wired (production: always,
+    // via the Factory below) - null means "no probing at all", same
+    // additive-seam shape as networkProfiler/connectionOutcomeStore.
+    private val restrictionMonitor = restrictionProbe?.let { RestrictionMonitor(it, viewModelScope) }
+
+    /**
+     * B8J - THE ONLY place a RestrictionClass is computed for this
+     * ViewModel, assembled purely from evidence already available
+     * elsewhere (see RestrictionEvidence's own field list: NetworkProfiler's
+     * current facts, VpnController's current state, the MOST RECENT real
+     * ConnectionOutcome, and the MOST RECENT bounded probe result - never a
+     * fresh probe run synchronously here). Recomputed fresh on every read,
+     * same no-caching pattern as gatewayStatus()/smartConnectDecision().
+     */
+    fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(
+        RestrictionEvidence(
+            networkProfile = networkProfile.value,
+            transportState = transportState.value,
+            awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
+            gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
+        ),
+    )
 
     val transportState: StateFlow<TransportState> = controller.state
     val diagnostics: StateFlow<DiagnosticsSnapshot> = diagnosticsStore.snapshot
@@ -224,6 +263,10 @@ class MainViewModel(
         // call and this class's onCleared below) - registered exactly once
         // per ViewModel instance, unregistered exactly once.
         networkProfiler?.start()
+        // B8J - same lifecycle pattern. Probes only on real transportState/
+        // networkProfile transitions (see RestrictionMonitor's own docs) -
+        // never a timer, never continuous polling.
+        restrictionMonitor?.start(transportState, networkProfile)
     }
 
     // B8B3C requirement 6 (fail closed): NotFound and Corrupted are handled
@@ -353,6 +396,8 @@ class MainViewModel(
         // B8I - no leak: unregisters the SAME ConnectivityManager callback
         // start() registered above (see NetworkProfiler.stop's own docs).
         networkProfiler?.stop()
+        // B8J - cancels the observe loop AND any in-flight probe.
+        restrictionMonitor?.stop()
     }
 
     class Factory(private val appContext: Context) : ViewModelProvider.Factory {
@@ -392,6 +437,9 @@ class MainViewModel(
                 installedPackageChecker = AndroidInstalledPackageChecker(context),
                 networkProfiler = NetworkProfiler(context),
                 connectionOutcomeStore = connectionOutcomeStore,
+                // B8J - the one pinned gateway's HTTPS probe (see its own
+                // docs) - default timeout/URL, no credentials/keys involved.
+                restrictionProbe = HttpsGatewayReachabilityProbe(),
             ) as T
         }
     }

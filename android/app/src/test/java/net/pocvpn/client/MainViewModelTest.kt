@@ -334,4 +334,51 @@ class MainViewModelTest {
 
         assertEquals(SmartConnectDecision.NoCandidateAvailable, viewModel.smartConnectDecision())
     }
+
+    // --- B8J: RestrictionClassifier/RestrictionMonitor wiring never touches the transport ---
+
+    @Test
+    fun `a real handshake failure triggers exactly one probe and restrictionClass reflects it, without the classifier ever calling transport connect or disconnect`() = runTest {
+        val configuredGateway = GatewayConfiguration.Configured(
+            endpointHost = "203.0.113.10", endpointPort = 51820,
+            serverPublicKeyBase64 = "hU7ohcV8fjAtDFISvpnfLhYFSlxY4lso0XofszDN81Y=",
+            clientTunnelIp = "10.77.0.2", gatewayTunnelIp = "10.77.0.1",
+            allowedIps = listOf("0.0.0.0/0", "::/0"), profile = AwgProfile.none(),
+        )
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        var probeCallCount = 0
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            initialNetworkProfile = net.pocvpn.client.network.NetworkProfile(
+                type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = true, metered = false,
+                roaming = false, captivePortal = false, ipv4Available = true, ipv6Available = false,
+                vpnActive = false, generation = 1,
+            ),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe {
+                probeCallCount++
+                true // gateway HTTPS reachable
+            },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect() // real, explicit, user-initiated - the ONLY connect() call in this test
+        testDispatcher.scheduler.runCurrent()
+        testDispatcher.scheduler.advanceTimeBy(10_000) // let the handshake-timeout poll loop actually elapse
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(viewModel.transportState.value is TransportState.HandshakeFailed)
+        assertEquals(1, probeCallCount)
+        // validated internet + gateway HTTPS reachable + AWG handshake failed
+        // -> POSSIBLE_UDP_OR_AWG_FILTERING (see RestrictionClassifier's own rules).
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, viewModel.restrictionClass())
+        // The classifier/monitor layer never itself calls transport.connect()/
+        // disconnect() - the ONLY connect() call above is the explicit user one.
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(0, transport.disconnectCallCount)
+    }
 }
