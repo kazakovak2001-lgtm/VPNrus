@@ -1,0 +1,33 @@
+# B8K0 - pinned provenance for the VLESS/REALITY runtime foundation.
+# Do not float to a "latest"/main branch - always re-audit deliberately before bumping.
+
+WRAPPER_REPO=https://github.com/2dust/AndroidLibXrayLite.git
+WRAPPER_COMMIT=c634d1baea97e94320c0bf6a9cf637369c4f11d4
+WRAPPER_COMMIT_DATE=2026-08-20T07:16:03Z
+WRAPPER_LICENSE=LGPL-3.0
+
+# AndroidLibXrayLite's own go.mod pins this exact xray-core commit transitively -
+# recorded here for audit visibility only; the build does not fetch it directly.
+XRAY_CORE_REPO=https://github.com/XTLS/Xray-core.git
+XRAY_CORE_TAG=v26.7.28
+XRAY_CORE_COMMIT=5ca6f4b7d4dc20a881d4330e498892697627ec0c
+XRAY_CORE_LICENSE=MPL-2.0
+
+GO_VERSION_REQUIRED=1.26
+ANDROID_API_LEVEL=24
+# Upstream golang.org/x/mobile/cmd/gomobile - deliberately NOT a fork (see the
+# comparison doc: sing-box requires its own gomobile fork, this path does not).
+GOMOBILE_SOURCE=golang.org/x/mobile/cmd/gomobile
+
+# Checksum/provenance strategy:
+# 1. WRAPPER_COMMIT above is verified by the build script (git rev-parse HEAD
+#    must match exactly, same pattern as third_party/build-tunnel-wsl.sh's
+#    AmneziaWG pin check) - a moved/force-pushed tag or branch cannot silently
+#    substitute different wrapper code.
+# 2. The exact xray-core dependency content is verified automatically by Go's
+#    own module system: AndroidLibXrayLite's committed go.sum records a
+#    cryptographic hash for every dependency (including xray-core) at
+#    WRAPPER_COMMIT; `go mod verify`/an unmodified `go build` refuses to use
+#    a dependency whose downloaded content does not match go.sum. This is
+#    the SAME assurance level `go.sum` gives any Go build - not a
+#    project-specific mechanism.
