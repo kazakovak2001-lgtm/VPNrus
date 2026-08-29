@@ -1,0 +1,87 @@
+package net.pocvpn.client.ui
+
+import net.pocvpn.client.provisioning.ProvisioningUiState
+import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.config.ProfileSource
+
+/**
+ * B8D - pure, Android-framework-free presentation logic for the product
+ * flow (first-run activation vs normal Home). Kept out of MainActivity so
+ * it is unit-testable on the JVM without Robolectric/instrumentation -
+ * MainActivity should only call these, never re-derive the same decisions
+ * inline.
+ */
+
+/** Which top-level screen the user sees. */
+enum class AppScreen { ACTIVATION, HOME }
+
+/**
+ * B8D requirement: "the existence of a valid provisioned/restored profile
+ * should determine whether the user sees Activation or Home". ProfileSource
+ * .DEV_FALLBACK is the ONLY value MainViewModel ever leaves in place when
+ * NO profile has ever been provisioned or restored - see
+ * MainViewModel.restorePersistedProfile(), which deliberately leaves it
+ * untouched for BOTH ProfileLoadResult.NotFound and ProfileLoadResult
+ * .Corrupted (fail closed - a corrupt file is treated exactly like no
+ * file). So this one comparison already implements "corrupt/missing
+ * profile -> activation screen, valid persisted/provisioned profile ->
+ * home screen" with no new state of its own.
+ */
+fun screenFor(profileSource: ProfileSource): AppScreen =
+    if (profileSource == ProfileSource.DEV_FALLBACK) AppScreen.ACTIVATION else AppScreen.HOME
+
+/**
+ * B8D "CONNECTION WORDING" - truthful, non-technical status text for the
+ * normal Home screen. Never reads "Protected" before TransportState
+ * .Connected - that state is only reached after a real handshake was
+ * already observed (see VpnController.awaitFreshHandshake), never from
+ * interface-up/TX>0 alone.
+ */
+fun TransportState.toHomeStatusText(): String = when (this) {
+    is TransportState.Disconnected -> "Disconnected"
+    is TransportState.Connecting -> "Connecting…"
+    is TransportState.Connected -> "Protected"
+    is TransportState.Disconnecting -> "Disconnecting…"
+    is TransportState.Reconnecting -> "Reconnecting…"
+    is TransportState.Error -> "Connection failed"
+    is TransportState.HandshakeFailed -> "Connection failed"
+}
+
+/** Whether the primary Home button should currently read DISCONNECT (true) or CONNECT (false). */
+fun TransportState.isConnectedOrConnecting(): Boolean = when (this) {
+    is TransportState.Connecting, is TransportState.Connected, is TransportState.Reconnecting -> true
+    is TransportState.Disconnected, is TransportState.Disconnecting, is TransportState.Error, is TransportState.HandshakeFailed -> false
+}
+
+/**
+ * B8D "ACTIVATION SCREEN" simple user-facing errors. Returns null for
+ * Idle/Provisioning/Success - the caller should treat null as "no error
+ * banner to show". The Error branch's text match is coupled to the exact
+ * strings MainViewModel.activateDevice emits for ProvisioningResult
+ * .ServiceUnavailable/BadRequest - deliberately NOT re-deriving that
+ * mapping here (this file never touches provisioning logic), just
+ * translating its existing output into product copy.
+ */
+fun ProvisioningUiState.toActivationErrorText(): String? = when (this) {
+    is ProvisioningUiState.Unauthorized -> "Invalid activation"
+    is ProvisioningUiState.Revoked -> "Activation revoked"
+    is ProvisioningUiState.Expired -> "Activation expired"
+    is ProvisioningUiState.DeviceLimitReached -> "Device limit reached"
+    is ProvisioningUiState.Error ->
+        if (message == "service temporarily unavailable") "Service temporarily unavailable" else "Invalid activation"
+    is ProvisioningUiState.Idle, is ProvisioningUiState.Provisioning, is ProvisioningUiState.Success -> null
+}
+
+/**
+ * B8D requirement 4: "clear the credential from UI memory" as soon as
+ * activation succeeds - a pure predicate so MainActivity's clearing logic
+ * is unit-testable without Robolectric/instrumentation.
+ */
+fun shouldClearCredentialInput(state: ProvisioningUiState): Boolean = state is ProvisioningUiState.Success
+
+/**
+ * B8D "DEBUG / DIAGNOSTICS" gate, expressed as a pure function of an
+ * explicit flag rather than reading BuildConfig.DEBUG directly, so the
+ * decision itself (not just the compile-time constant) is unit-testable.
+ */
+fun shouldShowDiagnostics(isDebugBuild: Boolean): Boolean = isDebugBuild
