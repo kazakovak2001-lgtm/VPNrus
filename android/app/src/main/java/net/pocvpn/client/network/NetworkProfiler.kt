@@ -69,23 +69,60 @@ class NetworkProfiler(context: Context) {
 
     private fun emit() {
         val capabilities = currentCapabilities ?: return
-        val type = when {
-            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> NetworkType.WIFI
-            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> NetworkType.CELLULAR
-            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkType.ETHERNET
-            else -> NetworkType.OTHER
-        }
         val linkAddresses = currentLinkProperties?.linkAddresses.orEmpty()
-        _profile.value = NetworkProfile(
-            type = type,
+        val signals = RawNetworkSignals(
+            hasWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+            hasCellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+            hasEthernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
             validatedInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
-            metered = !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
-            roaming = !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING),
+            notMetered = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+            notRoaming = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING),
             captivePortal = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL),
-            ipv4Available = linkAddresses.any { it.address is Inet4Address },
-            ipv6Available = linkAddresses.any { it.address is Inet6Address },
-            vpnActive = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
-            generation = generationCounter.incrementAndGet(),
+            hasIpv4Address = linkAddresses.any { it.address is Inet4Address },
+            hasIpv6Address = linkAddresses.any { it.address is Inet6Address },
+            isVpnTransport = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
         )
+        _profile.value = buildNetworkProfile(signals, generationCounter.incrementAndGet())
     }
+}
+
+/**
+ * B8I - the raw booleans a real NetworkCapabilities/LinkProperties pair
+ * exposes, already extracted - no android.net.* type appears here, so this
+ * (and buildNetworkProfile below) stays directly unit-testable on the plain
+ * JVM without Robolectric/mocking, same pattern as isFreshHandshake/
+ * resolveAppRoutingLists elsewhere in this codebase. NetworkProfiler.emit()
+ * is the ONLY place that constructs one from real Android objects.
+ */
+internal data class RawNetworkSignals(
+    val hasWifi: Boolean,
+    val hasCellular: Boolean,
+    val hasEthernet: Boolean,
+    val validatedInternet: Boolean,
+    val notMetered: Boolean,
+    val notRoaming: Boolean,
+    val captivePortal: Boolean,
+    val hasIpv4Address: Boolean,
+    val hasIpv6Address: Boolean,
+    val isVpnTransport: Boolean,
+)
+
+internal fun buildNetworkProfile(signals: RawNetworkSignals, generation: Long): NetworkProfile {
+    val type = when {
+        signals.hasWifi -> NetworkType.WIFI
+        signals.hasCellular -> NetworkType.CELLULAR
+        signals.hasEthernet -> NetworkType.ETHERNET
+        else -> NetworkType.OTHER
+    }
+    return NetworkProfile(
+        type = type,
+        validatedInternet = signals.validatedInternet,
+        metered = !signals.notMetered,
+        roaming = !signals.notRoaming,
+        captivePortal = signals.captivePortal,
+        ipv4Available = signals.hasIpv4Address,
+        ipv6Available = signals.hasIpv6Address,
+        vpnActive = signals.isVpnTransport,
+        generation = generation,
+    )
 }

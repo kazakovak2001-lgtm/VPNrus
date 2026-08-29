@@ -38,6 +38,11 @@
     <string name="app_selector_search_placeholder">Search apps</string>
     <string name="app_selector_empty">No apps found</string>
 
+    <!-- B8I - Smart Connect foundation, informational only (see SettingsScreen's own docs) -->
+    <string name="settings_smart_connect_title">Smart Connect</string>
+    <string name="settings_smart_connect_status">Smart Connect: ON</string>
+    <string name="settings_smart_connect_explanation">Automatically chooses the best available VPN connection.</string>
+
     <!-- Activation screen -->
     <string name="activation_title">Activate your VPN</string>
     <string name="activation_helper_text">Enter the activation credential you received to set up this device. You\'ll only need to do this once.</string>

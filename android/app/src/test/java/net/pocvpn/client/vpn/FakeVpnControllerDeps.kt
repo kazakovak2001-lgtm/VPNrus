@@ -6,6 +6,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import net.pocvpn.client.identity.ClientIdentity
 import net.pocvpn.client.identity.ClientKeyRepository
+import net.pocvpn.client.smartconnect.ConnectionOutcome
+import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportStats
@@ -143,4 +145,15 @@ class FakeInstalledPackageChecker(private val installedPackages: MutableSet<Stri
     }
 
     override fun isInstalled(packageName: String): Boolean = packageName in installedPackages
+}
+
+/** B8I - in-memory ConnectionOutcomeStore double; recorded() exposes every call in order for assertions. */
+class FakeConnectionOutcomeStore : ConnectionOutcomeStore {
+    private val outcomes = mutableListOf<ConnectionOutcome>()
+
+    override fun recent(): List<ConnectionOutcome> = outcomes.toList()
+
+    override fun record(outcome: ConnectionOutcome) {
+        outcomes.add(outcome)
+    }
 }

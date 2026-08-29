@@ -17,6 +17,11 @@ import kotlin.coroutines.coroutineContext
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.ClientKeyRepository
+import net.pocvpn.client.smartconnect.ConnectionErrorCategory
+import net.pocvpn.client.smartconnect.ConnectionOutcome
+import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
+import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
+import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.AwgConfig
 import net.pocvpn.client.vpn.config.AwgPeer
@@ -99,6 +104,11 @@ class VpnController(
     // default appRoutingPolicyStore above (always ALL_APPS, empty selection)
     // never spuriously resolves to NoAppsSelected.
     private val installedPackageChecker: InstalledPackageChecker = InstalledPackageChecker.alwaysInstalled(),
+    // B8I - additive, defaults to null so every existing call site (real or
+    // test) is byte-for-byte unaffected: with no store, recordConnectionOutcome
+    // below is simply a no-op. Recording never changes control flow - see
+    // that function's own docs for the "real evidence only" invariant.
+    private val connectionOutcomeStore: ConnectionOutcomeStore? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -262,13 +272,15 @@ class VpnController(
                     _state.value = TransportState.Error("Failed to build tunnel configuration")
                     return false
                 }
+                // B8B3D: the attempt's own start time - a handshake is only
+                // trusted as proof of THIS attempt's success if it is at or
+                // after this timestamp, never a stale one from a prior
+                // session (see class docs' session-semantics note). B8I:
+                // declared outside the try below (not inside it) so it is
+                // also visible to the catch branch's own outcome recording.
+                val attemptStartEpochMillis = System.currentTimeMillis()
                 return try {
                     hasTouchedTransport = true
-                    // B8B3D: the attempt's own start time - a handshake is only
-                    // trusted as proof of THIS attempt's success if it is at or
-                    // after this timestamp, never a stale one from a prior
-                    // session (see class docs' session-semantics note).
-                    val attemptStartEpochMillis = System.currentTimeMillis()
                     transport.connect(transportConfig)
                     // B8H - the VpnService interface now reflects
                     // routingPolicy (whether or not a handshake follows) -
@@ -285,6 +297,7 @@ class VpnController(
                     if (awaitFreshHandshake(attemptStartEpochMillis)) {
                         recordCurrentStats()
                         _state.value = TransportState.Connected
+                        recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
                         true
                     } else {
                         diagnostics.recordError(VpnError.HandshakeTimeout)
@@ -293,11 +306,13 @@ class VpnController(
                         // slice (see class docs). The interface may still be
                         // up; only the user-visible state reflects the truth.
                         _state.value = TransportState.HandshakeFailed
+                        recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
                         false
                     }
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     _state.value = TransportState.Error("Backend failed to start")
+                    recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.BACKEND_START_FAILURE, attemptStartEpochMillis)
                     false
                 }
             }
@@ -373,6 +388,35 @@ class VpnController(
         }
     }
 
+    /**
+     * B8I - no-op unless connectionOutcomeStore was actually wired (see its
+     * own additive-default docs). [attemptStartEpochMillis] is always the
+     * REAL start of the connection/recovery attempt this outcome reports on
+     * - never a fabricated/backfilled value - so [handshakeDurationMs] is a
+     * genuine measured duration, exactly the same real-time-vs-virtual-time
+     * split awaitFreshHandshake's own docs already establish elsewhere in
+     * this class. Called ONLY from real evidence (a completed connect()
+     * attempt or an exhausted reconnect cycle) - never speculatively.
+     */
+    private fun recordConnectionOutcome(
+        result: ConnectionOutcomeResult,
+        errorCategory: ConnectionErrorCategory,
+        attemptStartEpochMillis: Long,
+    ) {
+        val store = connectionOutcomeStore ?: return
+        val nowEpochMillis = System.currentTimeMillis()
+        store.record(
+            ConnectionOutcome(
+                transport = transport.kind,
+                gatewayId = ProductionGateway.ID,
+                result = result,
+                handshakeDurationMs = nowEpochMillis - attemptStartEpochMillis,
+                errorCategory = errorCategory,
+                timestampEpochMillis = nowEpochMillis,
+            ),
+        )
+    }
+
     private fun handleNetworkLost() {
         if (userInitiatedDisconnect) return
         if (_state.value !is TransportState.Connected) return
@@ -408,6 +452,10 @@ class VpnController(
             if (attempt > ReconnectBackoff.MAX_ATTEMPTS) {
                 diagnostics.recordError(VpnError.ReconnectExhausted)
                 _state.value = TransportState.Error("Reconnect attempts exhausted")
+                // B8I - ONE outcome for the whole exhausted recovery cycle,
+                // not one per backoff attempt - keeps the bounded history
+                // meaningful instead of filling up with per-attempt noise.
+                recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.RECONNECT_EXHAUSTED, reconnectionThresholdEpochMillis)
                 return
             }
 
@@ -423,6 +471,18 @@ class VpnController(
                 recordCurrentStats()
                 _state.value = TransportState.Connected
                 diagnostics.updateReconnectAttempts(0)
+                // B8I1 - OUTCOME OWNERSHIP: deliberately does NOT call
+                // recordConnectionOutcome() here. The chosen model is: one
+                // record per doConnectAttempt() (the initial SUCCESS/FAILURE)
+                // plus one record if a recovery cycle exhausts (see the
+                // RECONNECT_EXHAUSTED branch above) - a recovery that
+                // succeeds before exhausting is not a second/duplicate
+                // "connection" in this model, just the SAME session's
+                // handshake coming back, so it produces no new outcome
+                // record. This is the ONLY place in the codebase that
+                // records outcomes for THIS controller/session - a future
+                // TransportOrchestrator executing a decision must never add
+                // a second, competing record for the same real attempt.
                 return
             }
         }

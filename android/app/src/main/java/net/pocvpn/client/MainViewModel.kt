@@ -15,9 +15,19 @@ import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.ClientKeyRepositoryFactory
+import net.pocvpn.client.network.NetworkProfile
+import net.pocvpn.client.network.NetworkProfiler
 import net.pocvpn.client.provisioning.ProvisioningClient
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
+import net.pocvpn.client.smartconnect.ConnectionOutcome
+import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
+import net.pocvpn.client.smartconnect.FileConnectionOutcomeStore
+import net.pocvpn.client.smartconnect.SmartConnectCandidateSelector
+import net.pocvpn.client.smartconnect.SmartConnectDecision
+import net.pocvpn.client.transport.TransportDescriptor
+import net.pocvpn.client.transport.TransportRegistry
+import net.pocvpn.client.transport.TransportStatus
 import net.pocvpn.client.vpn.AmneziaWgTransport
 import net.pocvpn.client.vpn.AndroidReconnectManager
 import net.pocvpn.client.vpn.ControllerEvent
@@ -50,7 +60,11 @@ import net.pocvpn.client.vpn.policy.InstalledPackageChecker
  */
 class MainViewModel(
     private val clientKeyRepository: ClientKeyRepository,
-    transport: VpnTransport,
+    // B8I1 - retained (not just a constructor-only param) so
+    // smartConnectDecision() below can build a TransportRegistry from the
+    // SAME real transport instance VpnController uses - never a second,
+    // independently-constructed one.
+    private val transport: VpnTransport,
     gatewayConfigurationRepository: GatewayConfigurationRepository,
     reconnectManager: ReconnectManager,
     private val diagnosticsStore: DiagnosticsStore,
@@ -86,6 +100,24 @@ class MainViewModel(
     // write, for the Settings UI) share - see updateAppRoutingPolicy below.
     private val appRoutingPolicyStore: AppRoutingPolicyStore? = null,
     private val installedPackageChecker: InstalledPackageChecker? = null,
+    // B8I - additive, defaults to null (same reasoning as gatewayConfigOverride/
+    // profileStore above). When non-null, started in init/stopped in
+    // onCleared - see this class's own lifecycle block. NetworkProfiler
+    // itself never touches VpnController/the tunnel (see its own docs) -
+    // purely an observation layer.
+    private val networkProfiler: NetworkProfiler? = null,
+    // B8I - additive, defaults to null; the SAME instance VpnController
+    // records real connection outcomes into (see controller construction
+    // below) and this ViewModel reads back for diagnostics.
+    private val connectionOutcomeStore: ConnectionOutcomeStore? = null,
+    // B8I1 - additive test seam, defaults to null (production behavior
+    // unchanged: still NetworkProfile.unavailable(0) until a real
+    // NetworkProfiler is wired). NetworkProfiler is a concrete Android class
+    // (real ConnectivityManager underneath) with no fake substitute
+    // possible in a plain JVM test - this lets smartConnectDecision() be
+    // proven end-to-end against a genuinely USABLE network fact without
+    // constructing one.
+    initialNetworkProfile: NetworkProfile? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -97,7 +129,47 @@ class MainViewModel(
         scope = viewModelScope,
         appRoutingPolicyStore = appRoutingPolicyStore ?: AppRoutingPolicyStore.allApps(),
         installedPackageChecker = installedPackageChecker ?: InstalledPackageChecker.alwaysInstalled(),
+        connectionOutcomeStore = connectionOutcomeStore,
     )
+
+    // B8I - CURRENT network facts only (see NetworkProfile's own docs for
+    // why this is deliberately separate from connectionOutcomeStore's
+    // HISTORICAL outcomes). Falls back to a static "no profiler wired"
+    // unavailable value so this StateFlow is never null.
+    val networkProfile: StateFlow<NetworkProfile> =
+        networkProfiler?.profile ?: MutableStateFlow(initialNetworkProfile ?: NetworkProfile.unavailable(0)).asStateFlow()
+
+    // B8I1 - built ONCE from the SAME real `transport` VpnController uses
+    // (never a second/independent instance) - the registry
+    // SmartConnectCandidateSelector's reused SmartConnectDecisionEngine
+    // consults for transport availability. Single-descriptor by
+    // construction (see class docs - "Do NOT implement transport switching
+    // yet"), but this is the SAME TransportRegistry shape a future
+    // multi-transport registry would slot into without a VpnController
+    // rewrite - see TransportRegistry's own docs.
+    private val transportRegistry = TransportRegistry.build(
+        listOf(TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport })),
+    )
+
+    /**
+     * B8I1 - THE single call site for THE ONE Smart Connect decision
+     * authority (SmartConnectCandidateSelector, which itself reuses
+     * SmartConnectDecisionEngine for the transport sub-decision - see both
+     * classes' own docs). Recomputed fresh from CURRENT network/gateway
+     * facts on every read (same no-caching pattern as gatewayStatus()
+     * below) - never a stale cached decision. Only ever returns AWG +
+     * Frankfurt + ONLY_AVAILABLE_CANDIDATE today (exactly one real
+     * transport x one real gateway exists).
+     */
+    fun smartConnectDecision(): SmartConnectDecision = SmartConnectCandidateSelector.decide(
+        networkProfile = networkProfile.value,
+        gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
+        registry = transportRegistry,
+        connectionHistory = recentConnectionOutcomes(),
+    )
+
+    /** B8I - DEBUG diagnostics only; bounded by connectionOutcomeStore's own maxRecords. */
+    fun recentConnectionOutcomes(): List<ConnectionOutcome> = connectionOutcomeStore?.recent().orEmpty()
 
     val transportState: StateFlow<TransportState> = controller.state
     val diagnostics: StateFlow<DiagnosticsSnapshot> = diagnosticsStore.snapshot
@@ -147,6 +219,11 @@ class MainViewModel(
             _publicKey.value = clientKeyRepository.getPublicKey()
         }
         restorePersistedProfile()
+        // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
+        // onCleared lifecycle (see VpnController's own reconnectManager.start
+        // call and this class's onCleared below) - registered exactly once
+        // per ViewModel instance, unregistered exactly once.
+        networkProfiler?.start()
     }
 
     // B8B3C requirement 6 (fail closed): NotFound and Corrupted are handled
@@ -273,6 +350,9 @@ class MainViewModel(
 
     override fun onCleared() {
         controller.shutdown()
+        // B8I - no leak: unregisters the SAME ConnectivityManager callback
+        // start() registered above (see NetworkProfiler.stop's own docs).
+        networkProfiler?.stop()
     }
 
     class Factory(private val appContext: Context) : ViewModelProvider.Factory {
@@ -293,6 +373,12 @@ class MainViewModel(
             // file: a device-local UX preference, not something a restore
             // onto a different device should silently reapply either.
             val appRoutingPolicyStore = FileAppRoutingPolicyStore(context.noBackupFilesDir)
+            // B8I - same noBackupFilesDir as the stores above, different
+            // file: bounded technical connection-metadata history (see
+            // ConnectionOutcomeStore's own privacy docs), still device-
+            // specific rather than something a cross-device restore should
+            // silently reapply.
+            val connectionOutcomeStore = FileConnectionOutcomeStore(context.noBackupFilesDir)
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -304,6 +390,8 @@ class MainViewModel(
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 installedPackageChecker = AndroidInstalledPackageChecker(context),
+                networkProfiler = NetworkProfiler(context),
+                connectionOutcomeStore = connectionOutcomeStore,
             ) as T
         }
     }
