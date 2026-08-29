@@ -33,6 +33,12 @@ object ProvisioningClient {
     // reused verbatim via buildRequestBody/parseSuccessBody - only the path
     // and the error-status mapping differ.
     private const val ACTIVATE_ENDPOINT_URL = "https://152.70.43.1/v1/activate"
+    // B8K4A - POST /v1/xray-profile: same B8B2A HTTPS edge, same
+    // {"public_key": "..."} body shape and Authorization: Bearer <credential>
+    // header shape as the endpoints above, reused verbatim via
+    // buildRequestBody - only the path, response shape, and error-status
+    // mapping differ.
+    private const val XRAY_PROFILE_ENDPOINT_URL = "https://152.70.43.1/v1/xray-profile"
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 10_000
 
@@ -42,6 +48,23 @@ object ProvisioningClient {
     // catches a malformed/truncated field before it is ever trusted here.
     private val WG_KEY_REGEX = Regex("^[A-Za-z0-9+/]{43}=$")
     private val IPV4_REGEX = Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")
+
+    // REALITY's public key is also a 32-byte X25519 key, base64-encoded the
+    // same way as an AWG key - same regex, kept separate so the two domains
+    // don't share a "key" concept beyond their coincidentally identical wire
+    // format.
+    private val REALITY_KEY_REGEX = WG_KEY_REGEX
+
+    // REALITY's short_id: 1-8 raw bytes, hex-encoded (an even number of hex
+    // digits, 2 to 16 of them) - matches Xray-core's own short_id validation.
+    // Required non-blank here since a real provisioned profile always carries one.
+    private val SHORT_ID_REGEX = Regex("^([0-9a-fA-F]{2}){1,8}$")
+
+    // Standard RFC 4122 textual UUID form - the shape the server's own
+    // uuid generation/validation produces.
+    private val UUID_REGEX = Regex(
+        "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    )
 
     /**
      * Synchronous - the caller (MainViewModel) is responsible for running
@@ -60,6 +83,16 @@ object ProvisioningClient {
      */
     fun activate(publicKey: String, activationCredential: String): ProvisioningResult =
         execute(buildActivateRequest(publicKey, activationCredential), ::mapActivateResponse)
+
+    /**
+     * B8K4A - POST /v1/xray-profile: existing activation credential ->
+     * existing device AWG public key -> validated VLESS+REALITY profile.
+     * Same request shape as [activate], a distinct response shape and
+     * [XrayProfileResult] outcome type. Does not persist the result - the
+     * caller decides whether/when to save it.
+     */
+    fun fetchXrayProfile(publicKey: String, bearerToken: String): XrayProfileResult =
+        executeXrayProfile(buildXrayProfileRequest(publicKey, bearerToken))
 
     /**
      * B8C2 - the exact outgoing request shape (url/headers/body), built as
@@ -84,16 +117,33 @@ object ProvisioningClient {
             body = buildRequestBody(publicKey),
         )
 
+    internal fun buildXrayProfileRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        OutgoingRequest(
+            url = XRAY_PROFILE_ENDPOINT_URL,
+            headers = authHeaders(bearerToken),
+            body = buildRequestBody(publicKey),
+        )
+
     private fun authHeaders(credential: String): Map<String, String> = mapOf(
         "Content-Type" to "application/json",
         "Authorization" to "Bearer $credential",
     )
 
-    private fun execute(request: OutgoingRequest, mapResponse: (Int, String) -> ProvisioningResult): ProvisioningResult {
+    private fun execute(request: OutgoingRequest, mapResponse: (Int, String) -> ProvisioningResult): ProvisioningResult =
+        executeGeneric(request, ProvisioningResult::NetworkError, mapResponse)
+
+    private fun executeXrayProfile(request: OutgoingRequest): XrayProfileResult =
+        executeGeneric(request, XrayProfileResult::NetworkError, ::mapXrayProfileResponse)
+
+    private fun <T> executeGeneric(
+        request: OutgoingRequest,
+        networkError: (String) -> T,
+        mapResponse: (Int, String) -> T,
+    ): T {
         val connection = try {
             URL(request.url).openConnection() as HttpsURLConnection
         } catch (e: IOException) {
-            return ProvisioningResult.NetworkError("could not open connection: ${e.javaClass.simpleName}")
+            return networkError("could not open connection: ${e.javaClass.simpleName}")
         }
 
         return try {
@@ -115,7 +165,7 @@ object ProvisioningClient {
         } catch (e: IOException) {
             // Covers connection refused, TLS handshake/certificate failure,
             // DNS (n/a here - literal IP), and read/connect timeouts alike.
-            ProvisioningResult.NetworkError("${e.javaClass.simpleName}: ${e.message ?: "I/O failure"}")
+            networkError("${e.javaClass.simpleName}: ${e.message ?: "I/O failure"}")
         } finally {
             connection.disconnect()
         }
@@ -161,6 +211,77 @@ object ProvisioningClient {
         400 -> ProvisioningResult.BadRequest
         503, 504 -> ProvisioningResult.ServiceUnavailable
         else -> ProvisioningResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * POST /v1/xray-profile response mapping - `internal` so each status/
+     * error_code combination is unit-testable without a live HTTP
+     * connection. The 403 body's "error" field is the ONLY thing
+     * distinguishing revoked/device_not_bound, since both share HTTP 403.
+     */
+    internal fun mapXrayProfileResponse(status: Int, rawBody: String): XrayProfileResult = when (status) {
+        200, 201 -> parseXrayProfileSuccessBody(rawBody)
+        401 -> XrayProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> XrayProfileResult.Revoked
+            "device_not_bound" -> XrayProfileResult.DeviceNotBound
+            else -> XrayProfileResult.Unauthorized
+        }
+        503 -> XrayProfileResult.ServiceUnavailable
+        else -> XrayProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    private fun parseXrayProfileSuccessBody(raw: String): XrayProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return XrayProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val uuid = json.optString("uuid", "")
+        val flow = json.optString("flow", "")
+        val serverName = json.optString("server_name", "")
+        val fingerprint = json.optString("fingerprint", "")
+        val realityPublicKey = json.optString("reality_public_key", "")
+        val shortId = json.optString("short_id", "")
+
+        if (serverAddress.isBlank()) {
+            return XrayProfileResult.MalformedResponse("server_address missing or blank")
+        }
+        if (serverPort !in 1..65535) {
+            return XrayProfileResult.MalformedResponse("server_port missing or out of range")
+        }
+        if (!UUID_REGEX.matches(uuid)) {
+            return XrayProfileResult.MalformedResponse("uuid missing or not a well-formed UUID")
+        }
+        if (flow.isBlank()) {
+            return XrayProfileResult.MalformedResponse("flow missing or blank")
+        }
+        if (serverName.isBlank()) {
+            return XrayProfileResult.MalformedResponse("server_name missing or blank")
+        }
+        if (fingerprint.isBlank()) {
+            return XrayProfileResult.MalformedResponse("fingerprint missing or blank")
+        }
+        if (!REALITY_KEY_REGEX.matches(realityPublicKey)) {
+            return XrayProfileResult.MalformedResponse("reality_public_key missing or not a well-formed public key")
+        }
+        if (!SHORT_ID_REGEX.matches(shortId)) {
+            return XrayProfileResult.MalformedResponse("short_id missing or not well-formed hex")
+        }
+
+        return XrayProfileResult.Success(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            uuid = uuid,
+            flow = flow,
+            serverName = serverName,
+            fingerprint = fingerprint,
+            realityPublicKey = realityPublicKey,
+            shortId = shortId,
+        )
     }
 
     /** Reads {"error": "..."} - the shape every _error() response uses (gateway/api/handler.py). */
