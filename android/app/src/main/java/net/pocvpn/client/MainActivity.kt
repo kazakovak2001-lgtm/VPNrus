@@ -50,7 +50,7 @@ class MainActivity : AppCompatActivity() {
     // the pasted token must never end up in a saved instance state Bundle
     // or an autofill store. Nothing here is retained by MainActivity itself
     // beyond the current EditText widget; MainViewModel doesn't persist it
-    // either - see MainViewModel.provisionDevice's own comment.
+    // either - see MainViewModel.activateDevice's own comment.
     private lateinit var tokenInputView: EditText
     private lateinit var provisioningStatusView: TextView
     private lateinit var effectiveConfigView: TextView
@@ -116,21 +116,21 @@ class MainActivity : AppCompatActivity() {
                 setOnClickListener { viewModel.regenerateIdentity() }
             })
 
-            // B8B3A - one-time live provisioning against the real
-            // production endpoint. Token is pasted here, held only in
-            // memory (see MainViewModel.provisionDevice), never written to
-            // source/BuildConfig/resources/git/logs.
-            root.addView(TextView(this).apply { text = "-- B8B3A: live provisioning (debug only) --" })
+            // B8C2 - one-time live activation against the real production
+            // endpoint. The activation credential is pasted here, held only
+            // in memory (see MainViewModel.activateDevice), never written
+            // to source/BuildConfig/resources/git/logs.
+            root.addView(TextView(this).apply { text = "-- B8C2: device activation (debug only) --" })
             tokenInputView = EditText(this).apply {
-                hint = "Paste enrollment token"
+                hint = "Activation credential"
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
                 isSaveEnabled = false
                 importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
             }
             root.addView(tokenInputView)
             root.addView(Button(this).apply {
-                text = "Provision device"
-                setOnClickListener { viewModel.provisionDevice(tokenInputView.text.toString()) }
+                text = "ACTIVATE DEVICE"
+                setOnClickListener { viewModel.activateDevice(tokenInputView.text.toString()) }
             })
             provisioningStatusView = label("Provisioning: -")
 
@@ -288,7 +288,10 @@ private fun TransportState.toDisplayString(): String = when (this) {
 private fun ProvisioningUiState.toDisplayString(): String = when (this) {
     is ProvisioningUiState.Idle -> "Provisioning: -"
     is ProvisioningUiState.Provisioning -> "Provisioning: in progress..."
-    is ProvisioningUiState.Unauthorized -> "Provisioning: UNAUTHORIZED - check token"
+    is ProvisioningUiState.Unauthorized -> "Provisioning: INVALID ACTIVATION"
+    is ProvisioningUiState.Revoked -> "Provisioning: ACTIVATION REVOKED"
+    is ProvisioningUiState.Expired -> "Provisioning: ACTIVATION EXPIRED"
+    is ProvisioningUiState.DeviceLimitReached -> "Provisioning: DEVICE LIMIT REACHED"
     is ProvisioningUiState.Error -> "Provisioning: ERROR - $message"
     is ProvisioningUiState.Success -> {
         val r = result

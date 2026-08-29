@@ -103,4 +103,90 @@ class ProvisioningClientTest {
         val result = ProvisioningClient.mapHttpResponse(200, bad)
         assertTrue(result is ProvisioningResult.MalformedResponse)
     }
+
+    // --- B8C2A: POST /v1/activate outgoing request contract ---
+
+    @Test
+    fun `activate request targets the activate endpoint with POST semantics`() {
+        val request = ProvisioningClient.buildActivateRequest(validKey, "some-activation-credential")
+        assertEquals("https://152.70.43.1/v1/activate", request.url)
+    }
+
+    @Test
+    fun `activate request Authorization header is exactly Bearer plus the activation credential`() {
+        val request = ProvisioningClient.buildActivateRequest(validKey, "my-activation-credential-123")
+        assertEquals("Bearer my-activation-credential-123", request.headers["Authorization"])
+        assertEquals("application/json", request.headers["Content-Type"])
+    }
+
+    @Test
+    fun `activate request body contains exactly the supplied public_key and nothing else`() {
+        val request = ProvisioningClient.buildActivateRequest(validKey, "irrelevant-credential")
+        val parsed = JSONObject(request.body)
+        assertEquals(setOf("public_key"), parsed.keys().asSequence().toSet())
+        assertEquals(validKey, parsed.getString("public_key"))
+    }
+
+    @Test
+    fun `activate request body never contains the activation credential`() {
+        val credential = "SHOULD-NEVER-APPEAR-IN-BODY"
+        val request = ProvisioningClient.buildActivateRequest(validKey, credential)
+        assertTrue(!request.body.contains(credential))
+    }
+
+    // --- B8C2: POST /v1/activate response mapping ---
+
+    @Test
+    fun `activate 200 status parses into Success just like provision`() {
+        val result = ProvisioningClient.mapActivateResponse(200, validSuccessBody)
+        assertTrue(result is ProvisioningResult.Success)
+    }
+
+    @Test
+    fun `activate 401 maps to Unauthorized regardless of body`() {
+        val result = ProvisioningClient.mapActivateResponse(401, """{"error":"unauthorized"}""")
+        assertEquals(ProvisioningResult.Unauthorized, result)
+    }
+
+    @Test
+    fun `activate 403 revoked maps to Revoked`() {
+        val result = ProvisioningClient.mapActivateResponse(403, """{"error":"revoked"}""")
+        assertEquals(ProvisioningResult.Revoked, result)
+    }
+
+    @Test
+    fun `activate 403 expired maps to Expired`() {
+        val result = ProvisioningClient.mapActivateResponse(403, """{"error":"expired"}""")
+        assertEquals(ProvisioningResult.Expired, result)
+    }
+
+    @Test
+    fun `activate 403 device_limit_reached maps to DeviceLimitReached`() {
+        val result = ProvisioningClient.mapActivateResponse(403, """{"error":"device_limit_reached"}""")
+        assertEquals(ProvisioningResult.DeviceLimitReached, result)
+    }
+
+    @Test
+    fun `activate 403 with unrecognized or missing error code falls back to Unauthorized`() {
+        assertEquals(ProvisioningResult.Unauthorized, ProvisioningClient.mapActivateResponse(403, """{"error":"something_new"}"""))
+        assertEquals(ProvisioningResult.Unauthorized, ProvisioningClient.mapActivateResponse(403, "not json"))
+    }
+
+    @Test
+    fun `activate 400 maps to BadRequest`() {
+        val result = ProvisioningClient.mapActivateResponse(400, """{"error":"invalid_public_key"}""")
+        assertEquals(ProvisioningResult.BadRequest, result)
+    }
+
+    @Test
+    fun `activate 503 and 504 map to ServiceUnavailable`() {
+        assertEquals(ProvisioningResult.ServiceUnavailable, ProvisioningClient.mapActivateResponse(503, """{"error":"activation_store_unavailable"}"""))
+        assertEquals(ProvisioningResult.ServiceUnavailable, ProvisioningClient.mapActivateResponse(504, """{"error":"provisioning_timeout"}"""))
+    }
+
+    @Test
+    fun `activate other non-mapped status falls back to NetworkError`() {
+        val result = ProvisioningClient.mapActivateResponse(500, """{"error":"internal_error"}""")
+        assertTrue(result is ProvisioningResult.NetworkError)
+    }
 }

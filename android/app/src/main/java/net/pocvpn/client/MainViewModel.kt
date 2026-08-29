@@ -61,6 +61,20 @@ class MainViewModel(
     // durably saved, and where a prior session's result is restored from at
     // startup (see the init block below).
     private val profileStore: ProfileStore? = null,
+    // B8C2A - additive, defaults to the real ProvisioningClient.activate call
+    // so every existing (non-test) call site is byte-for-byte unchanged. Exists
+    // ONLY so activateDevice()'s public-key sourcing and its Success ->
+    // apply()/write() wiring are unit-testable without a live HTTPS call to
+    // the real production edge (same reasoning as gatewayConfigOverride/
+    // profileStore above - an additive seam, not a network abstraction).
+    private val activationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
+        ProvisioningClient::activate,
+    // B8C2A - additive, defaults to Dispatchers.IO (byte-for-byte unchanged
+    // production behavior). Lets tests run activateDevice()'s coroutine on
+    // the SAME (virtual-time) test dispatcher as the rest of the test instead
+    // of a real background thread pool, so runCurrent()/advanceUntilIdle()
+    // can deterministically observe its result.
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -130,10 +144,18 @@ class MainViewModel(
         }
     }
 
-    fun provisionDevice(token: String) {
-        val trimmedToken = token.trim()
-        if (trimmedToken.isEmpty()) {
-            _provisioningState.value = ProvisioningUiState.Error("enrollment token is empty")
+    /**
+     * B8C2 - activation credential -> the EXISTING device public key
+     * (never a newly generated one - see ClientKeyRepository's own docs) ->
+     * POST /v1/activate. The credential is never stored here or anywhere
+     * else in this ViewModel - it only ever exists as this function's
+     * `activationCredential` parameter for the duration of one call, then
+     * falls out of scope, exactly like provisionDevice's token before it.
+     */
+    fun activateDevice(activationCredential: String) {
+        val trimmedCredential = activationCredential.trim()
+        if (trimmedCredential.isEmpty()) {
+            _provisioningState.value = ProvisioningUiState.Error("activation credential is empty")
             return
         }
         val key = _publicKey.value
@@ -144,8 +166,8 @@ class MainViewModel(
 
         _provisioningState.value = ProvisioningUiState.Provisioning
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                ProvisioningClient.provision(publicKey = key, bearerToken = trimmedToken)
+            val result = withContext(ioDispatcher) {
+                activationClient(key, trimmedCredential)
             }
             _provisioningState.value = when (result) {
                 is ProvisioningResult.Success -> {
@@ -185,6 +207,11 @@ class MainViewModel(
                     ProvisioningUiState.Success(result)
                 }
                 is ProvisioningResult.Unauthorized -> ProvisioningUiState.Unauthorized
+                is ProvisioningResult.Revoked -> ProvisioningUiState.Revoked
+                is ProvisioningResult.Expired -> ProvisioningUiState.Expired
+                is ProvisioningResult.DeviceLimitReached -> ProvisioningUiState.DeviceLimitReached
+                is ProvisioningResult.BadRequest -> ProvisioningUiState.Error("invalid request/device")
+                is ProvisioningResult.ServiceUnavailable -> ProvisioningUiState.Error("service temporarily unavailable")
                 is ProvisioningResult.MalformedResponse -> ProvisioningUiState.Error("malformed response: ${result.reason}")
                 is ProvisioningResult.NetworkError -> ProvisioningUiState.Error(result.message)
             }

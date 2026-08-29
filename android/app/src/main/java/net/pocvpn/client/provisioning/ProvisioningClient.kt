@@ -27,6 +27,12 @@ import javax.net.ssl.HttpsURLConnection
 object ProvisioningClient {
 
     private const val ENDPOINT_URL = "https://152.70.43.1/v1/peers"
+    // B8C2 - POST /v1/activate (gateway/api/handler.py's _handle_activate):
+    // same B8B2A HTTPS edge, same {"public_key": "..."} body shape and
+    // Authorization: Bearer <credential> header shape as ENDPOINT_URL above,
+    // reused verbatim via buildRequestBody/parseSuccessBody - only the path
+    // and the error-status mapping differ.
+    private const val ACTIVATE_ENDPOINT_URL = "https://152.70.43.1/v1/activate"
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 10_000
 
@@ -41,9 +47,51 @@ object ProvisioningClient {
      * Synchronous - the caller (MainViewModel) is responsible for running
      * this off the main thread (e.g. Dispatchers.IO).
      */
-    fun provision(publicKey: String, bearerToken: String): ProvisioningResult {
+    fun provision(publicKey: String, bearerToken: String): ProvisioningResult =
+        execute(buildProvisionRequest(publicKey, bearerToken), ::mapHttpResponse)
+
+    /**
+     * B8C2 - POST /v1/activate: activation credential -> existing device
+     * public key -> validated provisioning response, exactly like
+     * provision() above but against the activation endpoint and with
+     * mapActivateResponse's richer error mapping. Never logs
+     * activationCredential - only the structural ProvisioningResult is
+     * ever returned.
+     */
+    fun activate(publicKey: String, activationCredential: String): ProvisioningResult =
+        execute(buildActivateRequest(publicKey, activationCredential), ::mapActivateResponse)
+
+    /**
+     * B8C2 - the exact outgoing request shape (url/headers/body), built as
+     * plain data with NO network I/O. `internal` so the request CONTRACT
+     * (method target, exact Authorization header, exact JSON body) is
+     * unit-testable directly, the same reasoning as buildRequestBody below -
+     * instead of only indirectly through a live connection.
+     */
+    internal data class OutgoingRequest(
+        val url: String,
+        val headers: Map<String, String>,
+        val body: String,
+    )
+
+    internal fun buildProvisionRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        OutgoingRequest(url = ENDPOINT_URL, headers = authHeaders(bearerToken), body = buildRequestBody(publicKey))
+
+    internal fun buildActivateRequest(publicKey: String, activationCredential: String): OutgoingRequest =
+        OutgoingRequest(
+            url = ACTIVATE_ENDPOINT_URL,
+            headers = authHeaders(activationCredential),
+            body = buildRequestBody(publicKey),
+        )
+
+    private fun authHeaders(credential: String): Map<String, String> = mapOf(
+        "Content-Type" to "application/json",
+        "Authorization" to "Bearer $credential",
+    )
+
+    private fun execute(request: OutgoingRequest, mapResponse: (Int, String) -> ProvisioningResult): ProvisioningResult {
         val connection = try {
-            URL(ENDPOINT_URL).openConnection() as HttpsURLConnection
+            URL(request.url).openConnection() as HttpsURLConnection
         } catch (e: IOException) {
             return ProvisioningResult.NetworkError("could not open connection: ${e.javaClass.simpleName}")
         }
@@ -53,19 +101,17 @@ object ProvisioningClient {
             connection.readTimeout = READ_TIMEOUT_MS
             connection.requestMethod = "POST"
             connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json")
-            connection.setRequestProperty("Authorization", "Bearer $bearerToken")
+            request.headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }
 
-            val requestBody = buildRequestBody(publicKey)
-            connection.outputStream.use { it.write(requestBody.toByteArray(Charsets.UTF_8)) }
+            connection.outputStream.use { it.write(request.body.toByteArray(Charsets.UTF_8)) }
 
             val status = connection.responseCode
             val rawBody = if (status == 200 || status == 201) {
                 connection.inputStream.bufferedReader().use { it.readText() }
             } else {
-                ""
+                connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
             }
-            mapHttpResponse(status, rawBody)
+            mapResponse(status, rawBody)
         } catch (e: IOException) {
             // Covers connection refused, TLS handshake/certificate failure,
             // DNS (n/a here - literal IP), and read/connect timeouts alike.
@@ -94,6 +140,34 @@ object ProvisioningClient {
         200, 201 -> parseSuccessBody(rawBody)
         401 -> ProvisioningResult.Unauthorized
         else -> ProvisioningResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * POST /v1/activate response mapping (gateway/api/handler.py's
+     * _handle_activate) - `internal` so each status/error_code combination
+     * is unit-testable without a live HTTP connection. The 403 body's
+     * "error" field is the ONLY thing distinguishing revoked/expired/
+     * device_limit_reached, since all three share HTTP 403.
+     */
+    internal fun mapActivateResponse(status: Int, rawBody: String): ProvisioningResult = when (status) {
+        200, 201 -> parseSuccessBody(rawBody)
+        401 -> ProvisioningResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> ProvisioningResult.Revoked
+            "expired" -> ProvisioningResult.Expired
+            "device_limit_reached" -> ProvisioningResult.DeviceLimitReached
+            else -> ProvisioningResult.Unauthorized
+        }
+        400 -> ProvisioningResult.BadRequest
+        503, 504 -> ProvisioningResult.ServiceUnavailable
+        else -> ProvisioningResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /** Reads {"error": "..."} - the shape every _error() response uses (gateway/api/handler.py). */
+    private fun errorCode(rawBody: String): String? = try {
+        JSONObject(rawBody).optString("error", "").ifBlank { null }
+    } catch (e: JSONException) {
+        null
     }
 
     private fun parseSuccessBody(raw: String): ProvisioningResult {

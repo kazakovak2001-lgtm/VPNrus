@@ -17,8 +17,23 @@ sealed class ProvisioningResult {
         val endpointPort: Int,
     ) : ProvisioningResult()
 
-    /** HTTP 401 - unknown or revoked bearer token. */
+    /** HTTP 401 - unknown/invalid bearer token or activation credential. */
     object Unauthorized : ProvisioningResult()
+
+    /** POST /v1/activate, HTTP 403 error=revoked - a once-valid activation credential was revoked. */
+    object Revoked : ProvisioningResult()
+
+    /** POST /v1/activate, HTTP 403 error=expired - the activation credential's validity window has passed. */
+    object Expired : ProvisioningResult()
+
+    /** POST /v1/activate, HTTP 403 error=device_limit_reached - this activation already has as many devices as it's allowed. */
+    object DeviceLimitReached : ProvisioningResult()
+
+    /** POST /v1/activate, HTTP 400 - malformed request or an invalid device public key. */
+    object BadRequest : ProvisioningResult()
+
+    /** POST /v1/activate, HTTP 503/504 - the activation service is temporarily unavailable. */
+    object ServiceUnavailable : ProvisioningResult()
 
     /** HTTP 200/201 but the body failed narrow structural validation - never used unparsed. */
     data class MalformedResponse(val reason: String) : ProvisioningResult()
