@@ -291,10 +291,10 @@ private fun ipv6PolicyDisplayText(policy: Ipv6LeakPolicy): String = when (policy
 /** Diagnostics-only, more technical wording than toHomeStatusText() - unchanged from the original View-based Diagnostics section. */
 private fun transportDisplayText(state: TransportState): String = when (state) {
     is TransportState.Disconnected -> "Disconnected"
-    is TransportState.Connecting -> "Connecting…"
+    is TransportState.Connecting -> "ConnectingвЂ¦"
     is TransportState.Connected -> "Connected"
-    is TransportState.Disconnecting -> "Disconnecting…"
-    is TransportState.Reconnecting -> "Reconnecting (attempt ${state.attempt})…"
+    is TransportState.Disconnecting -> "DisconnectingвЂ¦"
+    is TransportState.Reconnecting -> "Reconnecting (attempt ${state.attempt})вЂ¦"
     is TransportState.Error -> "Connection failed: ${state.message}"
     is TransportState.HandshakeFailed -> "Connection failed: no VPN handshake"
 }
