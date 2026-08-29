@@ -20,6 +20,8 @@ import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
 import net.pocvpn.client.ui.screens.HomeScreen
+import net.pocvpn.client.vpn.AlwaysOnDetectionState
+import net.pocvpn.client.vpn.AlwaysOnVpnState
 import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -44,6 +46,7 @@ fun AppRoot(
     val provisioningState by viewModel.provisioningState.collectAsStateWithLifecycle()
     val publicKey by viewModel.publicKey.collectAsStateWithLifecycle()
     val diagnosticsSnapshot by viewModel.diagnostics.collectAsStateWithLifecycle()
+    val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
@@ -77,6 +80,7 @@ fun AppRoot(
                     },
                     showDiagnosticsEntry = isDebugBuild,
                     onDiagnosticsClick = { showDiagnostics = true },
+                    showKillSwitchNotice = transportState.showsKillSwitchNotice(),
                 )
             }
         }
@@ -86,7 +90,7 @@ fun AppRoot(
         val clipboard = LocalClipboardManager.current
         val context = LocalContext.current
         DiagnosticsDialog(
-            lines = buildDiagnosticsLines(viewModel, publicKey, diagnosticsSnapshot, provisioningState, profileSource),
+            lines = buildDiagnosticsLines(viewModel, publicKey, diagnosticsSnapshot, provisioningState, profileSource, transportState, alwaysOnState),
             onCopyPublicKey = {
                 publicKey?.let {
                     clipboard.setText(AnnotatedString(it))
@@ -105,6 +109,8 @@ private fun buildDiagnosticsLines(
     diagnostics: DiagnosticsSnapshot,
     provisioningState: ProvisioningUiState,
     profileSource: ProfileSource,
+    transportState: TransportState,
+    alwaysOnState: AlwaysOnDetectionState,
 ): List<String> {
     val gateway = viewModel.gatewayStatus()
     val gatewayLine = when (gateway) {
@@ -129,6 +135,14 @@ private fun buildDiagnosticsLines(
         else -> "AllowedIPs: NOT CONFIGURED"
     }
     val ipv6PolicyLine = "IPv6 policy: ${ipv6PolicyDisplayText(VpnIpv6Policy.current)}"
+    // B8G - see ProductFlowPresentation.isSessionActive/AlwaysOnVpnState's
+    // own docs. Android lockdown NEVER reports a fabricated "NOT ENABLED" -
+    // only a confirmed-positive signal, or UNKNOWN.
+    val killSwitchAppSessionLine = "Kill switch - App session: ${if (transportState.isSessionActive()) "ACTIVE" else "INACTIVE"}"
+    val killSwitchLockdownLine = "Kill switch - Android lockdown: ${when (alwaysOnState) {
+        AlwaysOnDetectionState.CONFIRMED_ENABLED -> "ENABLED (auto-detected)"
+        AlwaysOnDetectionState.UNKNOWN -> "UNKNOWN"
+    }}"
 
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
@@ -139,6 +153,8 @@ private fun buildDiagnosticsLines(
         allowedIpsLine,
         dnsLine,
         ipv6PolicyLine,
+        killSwitchAppSessionLine,
+        killSwitchLockdownLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",

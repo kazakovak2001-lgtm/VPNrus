@@ -101,4 +101,30 @@ class ProductFlowPresentationTest {
         assertEquals(null, ProvisioningUiState.Idle.toActivationErrorText())
         assertEquals(null, ProvisioningUiState.Provisioning.toActivationErrorText())
     }
+
+    // --- B8G: app-session kill-switch presentation ---
+
+    @Test
+    fun `kill switch notice shows during in-flight or failed states, never while Connected, Disconnected, or Disconnecting`() {
+        assertTrue(TransportState.Connecting.showsKillSwitchNotice())
+        assertTrue(TransportState.Reconnecting(attempt = 1).showsKillSwitchNotice())
+        assertTrue(TransportState.HandshakeFailed.showsKillSwitchNotice())
+        assertTrue(TransportState.Error("boom").showsKillSwitchNotice())
+
+        assertFalse(TransportState.Connected.showsKillSwitchNotice())
+        assertFalse(TransportState.Disconnected.showsKillSwitchNotice())
+        assertFalse(TransportState.Disconnecting.showsKillSwitchNotice())
+    }
+
+    @Test
+    fun `session is active for every state except Disconnected`() {
+        assertFalse(TransportState.Disconnected.isSessionActive())
+
+        assertTrue(TransportState.Connecting.isSessionActive())
+        assertTrue(TransportState.Connected.isSessionActive())
+        assertTrue(TransportState.Reconnecting(attempt = 2).isSessionActive())
+        assertTrue(TransportState.HandshakeFailed.isSessionActive())
+        assertTrue(TransportState.Error("boom").isSessionActive())
+        assertTrue(TransportState.Disconnecting.isSessionActive())
+    }
 }

@@ -15,6 +15,7 @@
     <string name="home_location_content_description">Server location</string>
     <string name="home_location_chevron_content_description">Change location (coming soon)</string>
     <string name="home_diagnostics_entry">Diagnostics</string>
+    <string name="home_kill_switch_notice">Internet blocked until VPN reconnects</string>
 
     <!-- Activation screen -->
     <string name="activation_title">Activate your VPN</string>

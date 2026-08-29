@@ -34,6 +34,47 @@ sealed class ControllerEvent {
  * disconnect serialization (no overlapping backend operations), and the
  * client-side reconnect state machine. Holds no UI references and survives
  * independently of any Activity.
+ *
+ * B8G1 - "Break-before-make" and why reconnectLoop() never re-calls connect():
+ * decompiling the pinned AmneziaWG AAR's org.amnezia.awg.backend.GoBackend
+ * .setState(tunnel, UP, config) shows that whenever a tunnel is ALREADY up,
+ * bringing up ANY config (even an unchanged one) first tears the existing
+ * one down (setStateInternal(oldTunnel, null, DOWN)) before establishing the
+ * new one - a real, brief window where the OS-level VpnService interface
+ * and its 0.0.0.0/0+::/0 routes could be gone, before the replacement comes
+ * up (GoBackend attempts to roll back to the previous tunnel only if the
+ * NEW one throws - it does not avoid the teardown itself). This is internal
+ * to that pinned, unmodified dependency - not something this class can
+ * avoid by "not calling disconnect" alone.
+ *
+ * The fix: reconnectLoop() below NEVER calls transport.connect() to retry
+ * an unchanged config. Once a tunnel is established, the AmneziaWG/
+ * WireGuard protocol itself keeps attempting handshakes on its own - no
+ * app-level "nudge" is needed or even available (the pinned AAR's native
+ * JNI bridge, org.amnezia.awg.GoBackend, exposes only awgTurnOn / awgTurnOff
+ * / awgGetConfig / awgGetSocketV4 / awgGetSocketV6 / awgVersion - no
+ * incremental "retry"/"rekey" native call exists to call instead). This is
+ * standard, documented
+ * WireGuard behavior ("you don't need to worry about asking it to
+ * reconnect... everything else is handled for you automatically"),
+ * reinforced here by AwgPeer's own default persistentKeepaliveSeconds=25,
+ * which keeps the underlying engine periodically retrying even with no
+ * real outbound traffic queued. So reconnectLoop() only WAITS (polling the
+ * exact same awaitFreshHandshake() the initial connect already uses) for
+ * that automatic recovery, leaving the established interface/routes
+ * completely untouched throughout - no setState call, no teardown window,
+ * for as long as the session is merely recovering rather than being
+ * explicitly reconfigured. A real rebuild (a new setState(UP, ...) call)
+ * only ever happens for a genuine INITIAL connect() or an explicit
+ * reactivation - never as an automatic retry.
+ *
+ * This closes the automatic-failure leak window Level A (this class) can
+ * control. It does NOT make this a strict, OS-enforced kill switch: if the
+ * VpnService process itself is killed by the OS (not merely a lost
+ * handshake), only Android's own Always-on VPN + "Block connections
+ * without VPN" system setting (Level B, entirely outside this app's
+ * control - see AlwaysOnVpnState's own docs) can guarantee no leak in that
+ * case. Never claim otherwise in the UI.
  */
 class VpnController(
     private val transport: VpnTransport,
@@ -283,8 +324,26 @@ class VpnController(
         reconnectJob = scope.launch { reconnectLoop() }
     }
 
+    /**
+     * B8G1 - kill-switch fix: this loop NEVER calls transport.connect() (=
+     * backend.setState(UP, config)) to "retry" - see the class doc's own
+     * "Break-before-make" section for exactly why that would be
+     * counterproductive. It only WAITS for the SAME already-established
+     * tunnel to recover a fresh handshake on its own, polling via the exact
+     * same awaitFreshHandshake() helper doConnectAttempt() uses for the
+     * initial connect - reused verbatim, not reimplemented.
+     *
+     * reconnectionThresholdEpochMillis is captured ONCE, at the moment this
+     * reconnect session begins - not recomputed per attempt - because the
+     * underlying AmneziaWG tunnel keeps retrying handshakes entirely on its
+     * own timeline (protocol-level retry backed by PersistentKeepalive, see
+     * class docs), asynchronously to this loop's own polling cadence. A
+     * per-attempt "now" threshold could miss a handshake that already
+     * landed moments before this loop happened to check.
+     */
     private suspend fun reconnectLoop() {
         var attempt = 0
+        val reconnectionThresholdEpochMillis = System.currentTimeMillis()
         while (coroutineContext.isActive && !userInitiatedDisconnect) {
             attempt++
             diagnostics.updateReconnectAttempts(attempt)
@@ -303,8 +362,10 @@ class VpnController(
                 continue // keep backing off until a network reappears
             }
 
-            val succeeded = connectMutex.withLock { doConnectAttempt() }
-            if (succeeded) {
+            val recovered = connectMutex.withLock { awaitFreshHandshake(reconnectionThresholdEpochMillis) }
+            if (recovered) {
+                recordCurrentStats()
+                _state.value = TransportState.Connected
                 diagnostics.updateReconnectAttempts(0)
                 return
             }

@@ -103,3 +103,29 @@ fun shouldClearCredentialInput(state: ProvisioningUiState): Boolean = state is P
  * decision itself (not just the compile-time constant) is unit-testable.
  */
 fun shouldShowDiagnostics(isDebugBuild: Boolean): Boolean = isDebugBuild
+
+/**
+ * B8G - true whenever the app-session kill switch is genuinely "holding":
+ * a full-tunnel VpnService session that has been intentionally requested is
+ * either recovering from a hiccup or has not yet proven itself, so internet
+ * access is expected to be blocked rather than silently available outside
+ * the tunnel. Deliberately EXCLUDES Connected (working normally) and
+ * Disconnected/Disconnecting (no protection requested, or a user-initiated
+ * teardown in progress - not a failure the kill switch is "holding" against).
+ * See VpnController.doConnectAttempt/reconnectLoop's own docs for why none
+ * of these automatic states ever call transport.disconnect() themselves.
+ */
+fun TransportState.showsKillSwitchNotice(): Boolean = when (this) {
+    is TransportState.Connecting, is TransportState.Reconnecting,
+    is TransportState.HandshakeFailed, is TransportState.Error -> true
+    is TransportState.Connected, is TransportState.Disconnected, is TransportState.Disconnecting -> false
+}
+
+/**
+ * B8G diagnostics-only: whether a VPN session currently exists at all (has
+ * been intentionally requested and not yet fully torn down), regardless of
+ * whether it is presently succeeding. Disconnected is the ONLY state that
+ * means "no session" - every other state is some phase of one session's
+ * lifetime (connecting, protected, recovering, or mid-teardown).
+ */
+fun TransportState.isSessionActive(): Boolean = this !is TransportState.Disconnected

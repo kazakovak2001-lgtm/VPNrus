@@ -164,6 +164,10 @@ class VpnControllerTest {
         controller.disconnect()
         runCurrent()
         assertTrue(controller.state.value is TransportState.Disconnected)
+        // B8G: the explicit user disconnect is what actually tore the
+        // session down - the only transport.disconnect() call anywhere in
+        // this whole scenario.
+        assertEquals(1, transport.disconnectCallCount)
 
         // User-initiated disconnect must permanently suppress auto-reconnect,
         // even across many backoff intervals.
@@ -171,6 +175,7 @@ class VpnControllerTest {
         runCurrent()
         assertTrue(controller.state.value is TransportState.Disconnected)
         assertEquals(1, transport.connectCallCount)
+        assertEquals(1, transport.disconnectCallCount)
     }
 
     @Test
@@ -202,7 +207,12 @@ class VpnControllerTest {
         reconnectManager.triggerNetworkAvailable()
         advanceTimeBy(ReconnectBackoff.delayForAttempt(2, maxJitter) + 50)
         runCurrent()
-        assertEquals(2, transport.connectCallCount)
+        // B8G1: recovery never re-calls transport.connect() - the SAME
+        // established tunnel is just polled for a fresh handshake (see
+        // VpnController.reconnectLoop's own docs) - connectCallCount stays
+        // at the original 1 throughout this whole scenario.
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(0, transport.disconnectCallCount)
         assertTrue("expected Connected, was ${controller.state.value}", controller.state.value is TransportState.Connected)
     }
 

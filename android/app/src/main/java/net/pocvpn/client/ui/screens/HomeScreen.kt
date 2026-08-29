@@ -40,6 +40,10 @@ fun HomeScreen(
     onPowerButtonClick: () -> Unit,
     showDiagnosticsEntry: Boolean,
     onDiagnosticsClick: () -> Unit,
+    // B8G - true while the app-session kill switch is holding traffic
+    // blocked (see net.pocvpn.client.ui.showsKillSwitchNotice). A small,
+    // truthful extra line only - no technical clutter, no redesign.
+    showKillSwitchNotice: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val statusSubtitle = when (visualState) {
@@ -94,6 +98,14 @@ fun HomeScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (showKillSwitchNotice) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.home_kill_switch_notice),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
 
