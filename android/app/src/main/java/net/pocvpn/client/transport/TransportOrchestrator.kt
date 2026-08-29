@@ -1,19 +1,26 @@
 package net.pocvpn.client.transport
 
-import net.pocvpn.client.network.NetworkProfile
-import net.pocvpn.client.smartconnect.SmartConnectDecisionEngine
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.vpn.VpnTransport
 
 /**
- * Resolves a Smart Connect decision into an actual transport instance (or a
- * typed reason it can't). Owns: candidate selection via the registry,
- * availability checks, and attempt ordering for a future failover sequence.
+ * B8I1 - RECONCILED: pure EXECUTOR only. Turns an ALREADY-MADE
+ * TransportSelectionDecision into a real VpnTransport instance (or a typed
+ * reason it can't) - it does NOT call SmartConnectDecisionEngine.decide()
+ * itself any more (that was the "two decision authorities" risk: this class
+ * previously re-derived its own transport choice from raw
+ * NetworkProfile/preference/health, which could disagree with whatever the
+ * real Smart Connect decision boundary - net.pocvpn.client.smartconnect
+ * .SmartConnectCandidateSelector - had already decided for the SAME
+ * connection attempt). The ONE decision authority is
+ * SmartConnectCandidateSelector; this class only executes what it produced.
  *
- * Does NOT own: user intent, permission flow, connect/disconnect lifecycle,
- * or reconnect - those remain VpnController's responsibility. Not wired
- * into VpnController in Phase 2A - see Phase 2A report for why (the proven
- * AWG connect path stays untouched until live Smart Connect is a real gate).
+ * Owns: candidate->instance resolution via the registry, and attempt
+ * ordering for a future failover sequence. Does NOT own: user intent,
+ * permission flow, connect/disconnect lifecycle, or reconnect - those
+ * remain VpnController's responsibility. Not wired into VpnController yet -
+ * the proven AWG connect path stays untouched until live Smart Connect is a
+ * real gate.
  */
 class TransportOrchestrator(private val registry: TransportRegistry) {
 
@@ -22,12 +29,15 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
         data class NotSelectable(val decision: TransportSelectionDecision) : Resolution()
     }
 
-    fun resolve(
-        networkProfile: NetworkProfile,
-        preference: UserTransportPreference = UserTransportPreference.Auto,
-        health: Map<TransportKind, TransportHealth> = emptyMap(),
-    ): Resolution {
-        val decision = SmartConnectDecisionEngine.decide(networkProfile, registry, preference, health)
+    /**
+     * [decision] must already be the output of the ONE decision authority
+     * (SmartConnectCandidateSelector, which itself delegates the transport
+     * sub-decision to SmartConnectDecisionEngine) - this function never
+     * second-guesses it. A decision naming a kind the registry can't
+     * actually construct (e.g. stale/misconfigured registry) still fails
+     * safe as NotSelectable, never silently substitutes a different kind.
+     */
+    fun resolve(decision: TransportSelectionDecision): Resolution {
         val selected = decision as? TransportSelectionDecision.SelectTransport
             ?: return Resolution.NotSelectable(decision)
         val transport = registry.createTransport(selected.kind)

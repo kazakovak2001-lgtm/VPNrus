@@ -11,10 +11,10 @@
          home_status_subtitle_connected above whenever the APPLIED routing
          policy (not merely a newly saved one) is not ALL_APPS - see
          net.pocvpn.client.ui.homeConnectedSubtitle's own docs. -->
-    <string name="home_status_subtitle_connected_bypass_selected">VPN active · selected apps bypass VPN</string>
-    <string name="home_status_subtitle_connected_vpn_only_selected">VPN active · only selected apps use VPN</string>
+    <string name="home_status_subtitle_connected_bypass_selected">VPN active В· selected apps bypass VPN</string>
+    <string name="home_status_subtitle_connected_vpn_only_selected">VPN active В· only selected apps use VPN</string>
     <string name="home_status_subtitle_disconnected">Tap to connect</string>
-    <string name="home_status_subtitle_connecting">Setting up a secure tunnel…</string>
+    <string name="home_status_subtitle_connecting">Setting up a secure tunnelвЂ¦</string>
     <string name="home_status_subtitle_failed">Tap to try again</string>
     <string name="home_location_country">Germany</string>
     <string name="home_location_city">Frankfurt</string>
@@ -37,6 +37,11 @@
     <string name="app_selector_title">Select apps</string>
     <string name="app_selector_search_placeholder">Search apps</string>
     <string name="app_selector_empty">No apps found</string>
+
+    <!-- B8I - Smart Connect foundation, informational only (see SettingsScreen's own docs) -->
+    <string name="settings_smart_connect_title">Smart Connect</string>
+    <string name="settings_smart_connect_status">Smart Connect: ON</string>
+    <string name="settings_smart_connect_explanation">Automatically chooses the best available VPN connection.</string>
 
     <!-- Activation screen -->
     <string name="activation_title">Activate your VPN</string>

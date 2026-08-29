@@ -8,6 +8,7 @@ from here or anywhere else, per the B8B1B server-boundary requirement.
 """
 import ipaddress
 import os
+import re
 from dataclasses import dataclass
 
 from .wgkey import is_valid_wg_public_key
@@ -56,6 +57,35 @@ class AppConfig:
     # nothing about activations is completely unaffected.
     activation_store_path: str = ""
     activation_lock_path: str = ""
+
+    # B8K2: optional - blank/zero (the default) means POST /v1/xray-profile
+    # is not configured and always fails closed with 503 (see handler.py),
+    # exactly like activation_store_path above. Every field below except
+    # xray_reality_private_key_file is a public-safe value a client is
+    # allowed to receive verbatim - see xray_config_renderer.py's own docstring.
+    xray_store_path: str = ""
+    xray_lock_path: str = ""
+    xray_server_port: int = 0
+    xray_server_name: str = ""
+    xray_fingerprint: str = ""
+    xray_reality_public_key: str = ""
+    xray_short_id: str = ""
+    xray_flow: str = ""
+
+    # B8K2A - the activation boundary. xray_reality_private_key_file is a
+    # FILE PATH, never a raw value in this dataclass or in any environment
+    # variable - see xray_activation.py's own docstring for the one place
+    # (and only place) this process ever reads its contents: transiently,
+    # in memory, immediately before rendering a candidate config for the
+    # privileged wrapper to independently re-validate - never logged, never
+    # part of any HTTP response, never cached beyond one render call.
+    xray_reality_private_key_file: str = ""
+    xray_staging_config_path: str = ""
+    xray_activation_lock_path: str = ""
+    xray_activation_last_hash_path: str = ""
+    xray_activation_wrapper_path: str = ""
+    xray_activation_timeout_seconds: float = 15.0
+    xray_dest: str = ""
 
 
 def _get(env, key):
@@ -139,6 +169,160 @@ def load_config(env=None):
         activation_store_path + ".lock" if activation_store_path else ""
     )
 
+    xray_store_path = _get(env, "XRAY_STORE_PATH")
+    xray_lock_path = _get(env, "XRAY_LOCK_PATH") or (
+        xray_store_path + ".lock" if xray_store_path else ""
+    )
+    xray_server_port_raw = _get(env, "XRAY_SERVER_PORT")
+    xray_server_port = 0
+    if xray_server_port_raw:
+        try:
+            xray_server_port = int(xray_server_port_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_SERVER_PORT is not an integer: {xray_server_port_raw!r}")
+        if not (1 <= xray_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_SERVER_PORT out of range: {xray_server_port}")
+    xray_server_name = _get(env, "XRAY_SERVER_NAME")
+
+    # Same whitelist as Android's XrayVlessRealityConfig validator (confirmed
+    # against xray-core's common/utils/browser.go - see
+    # docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md) - a fingerprint Android would
+    # reject must never be handed out by the server either.
+    xray_fingerprint = _get(env, "XRAY_FINGERPRINT")
+    if xray_fingerprint and xray_fingerprint not in ("chrome", "firefox", "safari", "edge"):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_FINGERPRINT is not one of chrome/firefox/safari/edge: {xray_fingerprint!r}")
+
+    # Same base64.RawURLEncoding X25519 public-key shape the pinned `xray
+    # x25519` tool emits and Android's REALITY_PUBLIC_KEY_REGEX requires -
+    # 32 raw bytes -> 43 chars, no padding.
+    xray_reality_public_key = _get(env, "XRAY_REALITY_PUBLIC_KEY")
+    if xray_reality_public_key and not re.match(r"^[A-Za-z0-9_-]{43}$", xray_reality_public_key):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_REALITY_PUBLIC_KEY is not a well-formed X25519 public key")
+
+    # Even-length hex, matching both xray_config_renderer.py's own
+    # RealityServerConfig validation and Android's SHORT_ID_REGEX.
+    xray_short_id = _get(env, "XRAY_SHORT_ID")
+    if xray_short_id and not re.match(r"^[0-9a-fA-F]{2,16}$", xray_short_id):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_SHORT_ID is not valid hex: {xray_short_id!r}")
+    if xray_short_id and len(xray_short_id) % 2 != 0:
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_SHORT_ID must have an even number of hex digits: {xray_short_id!r}")
+
+    # Same whitelist as Android's XrayVlessRealityConfig validator and
+    # xray-core's own proxy/vless package (only "xtls-rprx-vision" is
+    # actually implemented there, besides no flow at all).
+    xray_flow = _get(env, "XRAY_FLOW")
+    if xray_flow and xray_flow != "xtls-rprx-vision":
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_FLOW must be blank or 'xtls-rprx-vision': {xray_flow!r}")
+
+    # B8K2A - the activation boundary's own paths/settings. Same
+    # optional/blank-by-default convention: unset means the activation
+    # pipeline is not configured, in which case provision_and_activate
+    # must fail closed rather than silently skip activation - see
+    # xray_activation.py.
+    xray_reality_private_key_file = _get(env, "XRAY_REALITY_PRIVATE_KEY_FILE")
+    if xray_reality_private_key_file:
+        if not os.path.isabs(xray_reality_private_key_file):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_REALITY_PRIVATE_KEY_FILE must be an absolute path")
+        if not os.path.isfile(xray_reality_private_key_file):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_REALITY_PRIVATE_KEY_FILE does not exist or is not a file")
+    xray_staging_config_path = _get(env, "XRAY_STAGING_CONFIG_PATH")
+    xray_activation_lock_path = _get(env, "XRAY_ACTIVATION_LOCK_PATH")
+    xray_activation_last_hash_path = _get(env, "XRAY_ACTIVATION_LAST_HASH_PATH")
+    xray_activation_wrapper_path = _get(env, "XRAY_ACTIVATION_WRAPPER_PATH")
+    if xray_activation_wrapper_path and not os.path.isabs(xray_activation_wrapper_path):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH must be an absolute path")
+    xray_activation_timeout_raw = _get(env, "XRAY_ACTIVATION_TIMEOUT_SECONDS")
+    xray_activation_timeout_seconds = 15.0
+    if xray_activation_timeout_raw:
+        try:
+            xray_activation_timeout_seconds = float(xray_activation_timeout_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_ACTIVATION_TIMEOUT_SECONDS is not a number: {xray_activation_timeout_raw!r}")
+        if xray_activation_timeout_seconds <= 0:
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_ACTIVATION_TIMEOUT_SECONDS must be positive")
+    # xray_dest is server-only (never returned to a client - see
+    # xray_config_renderer.RealityServerConfig.dest) so it is deliberately
+    # NOT part of the client-facing completeness check below; it has its
+    # own check in the activation-specific completeness group instead.
+    xray_dest = _get(env, "XRAY_DEST")
+
+    # /v1/xray-profile is considered "configured" the instant a store path
+    # and a port are set (see handler.py's own gate) - if that much is
+    # present, every other public-facing field it would hand to a client
+    # must ALSO be present and well-formed. Half-configured is not a safe
+    # middle ground: it would let the endpoint return a response with a
+    # blank server_name/fingerprint/reality_public_key/short_id, which
+    # Android's own XrayVlessRealityConfig validator would then reject -
+    # fail closed at startup instead of at every request.
+    xray_partially_configured = bool(xray_store_path or xray_server_port)
+    if xray_partially_configured:
+        missing = [
+            name for name, value in (
+                ("XRAY_STORE_PATH", xray_store_path),
+                ("XRAY_SERVER_PORT", xray_server_port_raw),
+                ("XRAY_SERVER_NAME", xray_server_name),
+                ("XRAY_FINGERPRINT", xray_fingerprint),
+                ("XRAY_REALITY_PUBLIC_KEY", xray_reality_public_key),
+                ("XRAY_SHORT_ID", xray_short_id),
+            ) if not value
+        ]
+        if missing:
+            raise ConfigError(
+                "partial Xray configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in missing)
+                + " must all be set once any Xray setting is set (or none of them, to leave /v1/xray-profile unconfigured)"
+            )
+
+        # B8K2A - the activation pipeline is a SEPARATE completeness group:
+        # a deployment could (in principle) want /v1/xray-profile to
+        # answer with static, pre-activated client-facing values while
+        # the activation boundary is provisioned in a later step - so this
+        # is checked only once xray_partially_configured is already true,
+        # not folded into the group above.
+        activation_missing = [
+            name for name, value in (
+                ("XRAY_REALITY_PRIVATE_KEY_FILE", xray_reality_private_key_file),
+                ("XRAY_STAGING_CONFIG_PATH", xray_staging_config_path),
+                ("XRAY_ACTIVATION_LOCK_PATH", xray_activation_lock_path),
+                ("XRAY_ACTIVATION_LAST_HASH_PATH", xray_activation_last_hash_path),
+                ("XRAY_ACTIVATION_WRAPPER_PATH", xray_activation_wrapper_path),
+                ("XRAY_DEST", xray_dest),
+            ) if not value
+        ]
+        if activation_missing:
+            raise ConfigError(
+                "partial Xray activation configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in activation_missing)
+                + " must all be set once any Xray setting is set"
+            )
+
+        # B8K3A - the one consistency check that actually matters here:
+        # XRAY_SERVER_NAME (the REALITY camouflage SNI Android is told to
+        # present, and the same value the server's own realitySettings.
+        # serverNames must accept) and XRAY_DEST (the REAL external TLS
+        # target the server proxies non-REALITY-authenticated traffic to)
+        # must name the SAME hostname - never Nova's own gateway address
+        # (endpoint_host/xray_server_address, a completely different axis:
+        # what a client's TCP socket connects to, not what SNI it presents).
+        # A mismatch here would mean the server accepts a REALITY ClientHello
+        # camouflaged as one site while actually proxying disguise traffic
+        # to a different one - either breaks REALITY's own validation inside
+        # the pinned Xray binary, or (worse) silently produces a REALITY
+        # config that doesn't camouflage as the SNI it claims to.
+        dest_host = xray_dest.rsplit(":", 1)[0] if xray_dest else ""
+        if xray_server_name and dest_host and dest_host != xray_server_name:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_SERVER_NAME ({xray_server_name!r}) and the host portion of "
+                f"{_ENV_PREFIX}XRAY_DEST ({dest_host!r}) must be the same hostname - REALITY's "
+                "camouflage SNI and its real proxy target must match"
+            )
+        if xray_server_name == endpoint_host or dest_host == endpoint_host:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_SERVER_NAME/XRAY_DEST must never be Nova's own gateway address "
+                f"({endpoint_host!r}) - that field is the REALITY camouflage target, a real third-party "
+                "site, never this server's own hostname/IP"
+            )
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -152,4 +336,19 @@ def load_config(env=None):
         sudo_path=sudo_path,
         activation_store_path=activation_store_path,
         activation_lock_path=activation_lock_path,
+        xray_store_path=xray_store_path,
+        xray_lock_path=xray_lock_path,
+        xray_server_port=xray_server_port,
+        xray_server_name=xray_server_name,
+        xray_fingerprint=xray_fingerprint,
+        xray_reality_public_key=xray_reality_public_key,
+        xray_short_id=xray_short_id,
+        xray_flow=xray_flow,
+        xray_reality_private_key_file=xray_reality_private_key_file,
+        xray_staging_config_path=xray_staging_config_path,
+        xray_activation_lock_path=xray_activation_lock_path,
+        xray_activation_last_hash_path=xray_activation_last_hash_path,
+        xray_activation_wrapper_path=xray_activation_wrapper_path,
+        xray_activation_timeout_seconds=xray_activation_timeout_seconds,
+        xray_dest=xray_dest,
     )

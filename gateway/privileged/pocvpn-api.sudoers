@@ -20,6 +20,13 @@
 
 Cmnd_Alias POCVPN_PROVISION = /usr/local/libexec/pocvpn-provision-peer
 
+# B8K2A - the Xray activation boundary's ONE fixed command. See
+# gateway/privileged/nova-xray-reload's own docstring: it takes ZERO
+# arguments (every path it touches is fixed inside the wrapper/
+# xray-activate.sh), so this rule does not even need to reason about an
+# argument shape the way POCVPN_PROVISION's public-key argument does.
+Cmnd_Alias NOVA_XRAY_RELOAD = /usr/local/libexec/nova-xray-reload
+
 # Force env_reset and an empty env_keep for THIS command specifically,
 # regardless of the box's global Defaults. env_reset is what actually
 # strips BASH_ENV/ENV/LD_PRELOAD/LD_LIBRARY_PATH/PYTHONPATH/PATH from the
@@ -33,11 +40,18 @@ Defaults!POCVPN_PROVISION env_reset
 Defaults!POCVPN_PROVISION !env_keep
 Defaults!POCVPN_PROVISION secure_path="/usr/local/bin:/usr/bin:/bin"
 
-# No ALL=(ALL) ALL. No NOPASSWD: ALL. No SETENV. No wildcard argument
-# pattern (sudoers cannot safely validate a public key shape anyway - that
-# job belongs to the wrapper and, authoritatively, to provision-peer.sh -
-# see pocvpn-provision-peer's own comments for why). The command path
-# below is the exact fixed path, with no argument glob at all: sudoers
-# grants running that one program, with whatever arguments the caller
-# supplies, and the wrapper is what bounds/validates those arguments.
+Defaults!NOVA_XRAY_RELOAD env_reset
+Defaults!NOVA_XRAY_RELOAD !env_keep
+Defaults!NOVA_XRAY_RELOAD secure_path="/usr/local/bin:/usr/bin:/bin"
+
+# No ALL=(ALL) ALL. No NOPASSWD: ALL. No SETENV. No general systemctl, no
+# general cp/mv/chown, no shell access - exactly the two fixed command
+# paths below, nothing else. No wildcard argument pattern (sudoers cannot
+# safely validate a public key shape anyway - that job belongs to the
+# wrapper and, authoritatively, to provision-peer.sh/xray-activate.sh -
+# see their own comments for why). Each command path is exact, with no
+# argument glob at all: sudoers grants running that one program, with
+# whatever arguments the caller supplies, and the wrapper is what bounds/
+# validates those arguments (nova-xray-reload accepts none at all).
 pocvpn-api ALL=(root) NOPASSWD: POCVPN_PROVISION
+pocvpn-api ALL=(root) NOPASSWD: NOVA_XRAY_RELOAD

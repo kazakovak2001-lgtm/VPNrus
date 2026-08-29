@@ -9,11 +9,16 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.provisioning.ProvisioningResult
+import net.pocvpn.client.smartconnect.ConnectionScoreReason
+import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.smartconnect.SmartConnectDecision
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.FakeClientKeyRepository
 import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeVpnTransport
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.DefaultGatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.GatewayConfigSource
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -281,5 +286,99 @@ class MainViewModelTest {
         val configured = viewModel.gatewayStatus()
         assertTrue(configured is GatewayConfiguration.Configured)
         assertEquals("10.77.0.5", (configured as GatewayConfiguration.Configured).clientTunnelIp)
+    }
+
+    // --- B8I1: ONE Smart Connect decision authority, reached only via MainViewModel.smartConnectDecision() ---
+
+    @Test
+    fun `smartConnectDecision is the single call site MainViewModel exposes - AWG plus Frankfurt plus ONLY_AVAILABLE_CANDIDATE for a configured gateway`() = runTest {
+        val configuredGateway = GatewayConfiguration.Configured(
+            endpointHost = "203.0.113.10", endpointPort = 51820,
+            serverPublicKeyBase64 = "hU7ohcV8fjAtDFISvpnfLhYFSlxY4lso0XofszDN81Y=",
+            clientTunnelIp = "10.77.0.2", gatewayTunnelIp = "10.77.0.1",
+            allowedIps = listOf("0.0.0.0/0", "::/0"), profile = AwgProfile.none(),
+        )
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = net.pocvpn.client.network.NetworkProfile(
+                type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = true, metered = false,
+                roaming = false, captivePortal = false, ipv4Available = true, ipv6Available = false,
+                vpnActive = false, generation = 1,
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val decision = viewModel.smartConnectDecision()
+
+        assertTrue(decision is SmartConnectDecision.Selected)
+        val selected = decision as SmartConnectDecision.Selected
+        assertEquals(TransportKind.AMNEZIA_WG, selected.score.candidate.transport.kind)
+        assertEquals(ProductionGateway.ID, selected.score.candidate.gateway.id)
+        assertEquals(ConnectionScoreReason.ONLY_AVAILABLE_CANDIDATE, selected.score.reason)
+    }
+
+    @Test
+    fun `smartConnectDecision with no gateway configured is truthfully NoCandidateAvailable, never a fabricated pick`() = runTest {
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(SmartConnectDecision.NoCandidateAvailable, viewModel.smartConnectDecision())
+    }
+
+    // --- B8J: RestrictionClassifier/RestrictionMonitor wiring never touches the transport ---
+
+    @Test
+    fun `a real handshake failure triggers exactly one probe and restrictionClass reflects it, without the classifier ever calling transport connect or disconnect`() = runTest {
+        val configuredGateway = GatewayConfiguration.Configured(
+            endpointHost = "203.0.113.10", endpointPort = 51820,
+            serverPublicKeyBase64 = "hU7ohcV8fjAtDFISvpnfLhYFSlxY4lso0XofszDN81Y=",
+            clientTunnelIp = "10.77.0.2", gatewayTunnelIp = "10.77.0.1",
+            allowedIps = listOf("0.0.0.0/0", "::/0"), profile = AwgProfile.none(),
+        )
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        var probeCallCount = 0
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            initialNetworkProfile = net.pocvpn.client.network.NetworkProfile(
+                type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = true, metered = false,
+                roaming = false, captivePortal = false, ipv4Available = true, ipv6Available = false,
+                vpnActive = false, generation = 1,
+            ),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe {
+                probeCallCount++
+                true // gateway HTTPS reachable
+            },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect() // real, explicit, user-initiated - the ONLY connect() call in this test
+        testDispatcher.scheduler.runCurrent()
+        testDispatcher.scheduler.advanceTimeBy(10_000) // let the handshake-timeout poll loop actually elapse
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(viewModel.transportState.value is TransportState.HandshakeFailed)
+        assertEquals(1, probeCallCount)
+        // validated internet + gateway HTTPS reachable + AWG handshake failed
+        // -> POSSIBLE_UDP_OR_AWG_FILTERING (see RestrictionClassifier's own rules).
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, viewModel.restrictionClass())
+        // The classifier/monitor layer never itself calls transport.connect()/
+        // disconnect() - the ONLY connect() call above is the explicit user one.
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(0, transport.disconnectCallCount)
     }
 }

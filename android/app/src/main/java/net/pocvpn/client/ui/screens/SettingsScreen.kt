@@ -139,6 +139,31 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.error,
             )
         }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        // B8I - exactly one real transport x one real gateway exists today
+        // (see SmartConnectCandidateSelector's own docs) - so this is
+        // deliberately a plain informational row, never a fake picker/toggle
+        // with choices that don't actually exist yet.
+        Text(
+            text = stringResource(R.string.settings_smart_connect_title),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_smart_connect_status),
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_smart_connect_explanation),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

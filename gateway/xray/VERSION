@@ -1,0 +1,23 @@
+# B8K2 - pinned provenance for the SERVER-side Xray-core runtime.
+# Same xray-core family/commit already pinned for the Android client (see
+# third_party/xray/VERSION) - not an independently-chosen version, per the
+# B8K2 requirement to reuse the same pinned family where practical.
+# Do not float to "latest" - always re-audit deliberately before bumping.
+
+XRAY_CORE_REPO=https://github.com/XTLS/Xray-core.git
+XRAY_CORE_TAG=v26.7.28
+XRAY_CORE_COMMIT=5ca6f4b7d4dc20a881d4330e498892697627ec0c
+XRAY_CORE_LICENSE=MPL-2.0
+
+# Official upstream release asset for a linux/amd64 server (Oracle VM shape) -
+# NOT a `curl | sh` installer, NOT built from source on the gateway host.
+# Verified for real this slice (not fabricated): downloaded, sha256sum'd
+# locally, and cross-checked against the asset's own published .dgst file -
+# both matched exactly.
+XRAY_RELEASE_ASSET=Xray-linux-64.zip
+XRAY_RELEASE_ASSET_URL=https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-linux-64.zip
+XRAY_RELEASE_ASSET_SHA256=8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40
+
+# `xray version` output from the actual extracted binary, confirming the
+# asset really is built from XRAY_CORE_COMMIT above (not just a matching
+# tag name): "Xray 26.7.28 (Xray, Penetrates Everything.) 5ca6f4b (go1.26.5 linux/amd64)"

@@ -17,7 +17,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import net.pocvpn.client.MainViewModel
 import net.pocvpn.client.apps.PackageManagerInstalledAppRepository
 import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
+import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.provisioning.ProvisioningUiState
+import net.pocvpn.client.smartconnect.ConnectionOutcome
+import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
+import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
@@ -62,6 +66,7 @@ fun AppRoot(
     val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
     val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
+    val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
@@ -139,7 +144,7 @@ fun AppRoot(
         DiagnosticsDialog(
             lines = buildDiagnosticsLines(
                 viewModel, publicKey, diagnosticsSnapshot, provisioningState, profileSource,
-                transportState, alwaysOnState, savedRoutingPolicy, appliedRoutingPolicy,
+                transportState, alwaysOnState, savedRoutingPolicy, appliedRoutingPolicy, networkProfile,
             ),
             onCopyPublicKey = {
                 publicKey?.let {
@@ -163,6 +168,7 @@ private fun buildDiagnosticsLines(
     alwaysOnState: AlwaysOnDetectionState,
     savedRoutingPolicy: AppRoutingPolicy,
     appliedRoutingPolicy: AppRoutingPolicy?,
+    networkProfile: NetworkProfile,
 ): List<String> {
     val gateway = viewModel.gatewayStatus()
     val gatewayLine = when (gateway) {
@@ -206,6 +212,41 @@ private fun buildDiagnosticsLines(
     val savedRoutingLine = "Saved routing policy: ${savedRoutingPolicy.mode} (${savedRoutingPolicy.selectedPackageNames.size} apps)"
     val pendingReconnectLine = "Pending reconnect: ${if (hasPendingRoutingPolicyChange(appliedRoutingPolicy, savedRoutingPolicy)) "YES" else "NO"}"
 
+    // B8I - CURRENT network facts (NetworkProfiler, real ConnectivityManager
+    // callbacks - see that class's own docs), never inferred/estimated.
+    val networkTypeLine = "Network type: ${networkProfile.type}"
+    val validatedLine = "Validated: ${networkProfile.validatedInternet}"
+    val meteredLine = "Metered: ${networkProfile.metered}"
+    val ipv4AvailableLine = "IPv4 available: ${networkProfile.ipv4Available}"
+    val ipv6AvailableLine = "IPv6 available: ${networkProfile.ipv6Available}"
+
+    val smartConnectDecision = viewModel.smartConnectDecision()
+    val currentTransportLine = "Current transport: ${when (smartConnectDecision) {
+        is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.transport.kind
+        SmartConnectDecision.NoCandidateAvailable -> "NONE"
+    }}"
+    val smartConnectGatewayLine = "Gateway: ${when (smartConnectDecision) {
+        is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.gateway.region
+        SmartConnectDecision.NoCandidateAvailable -> "NONE"
+    }}"
+    val smartConnectReasonLine = "Smart Connect decision reason: ${when (smartConnectDecision) {
+        is SmartConnectDecision.Selected -> smartConnectDecision.score.reason
+        SmartConnectDecision.NoCandidateAvailable -> "NO_CANDIDATE_AVAILABLE"
+    }}"
+
+    // B8I - HISTORICAL outcomes (see ConnectionOutcomeStore's own docs);
+    // only ever the LAST recorded one is surfaced here - no raw endpoint/IP,
+    // just the technical result/duration/category ConnectionOutcome models.
+    val lastOutcome = viewModel.recentConnectionOutcomes().lastOrNull()
+    val lastHandshakeDurationLine = "Last handshake duration: ${lastOutcome?.handshakeDurationMs?.let { "${it}ms" } ?: "-"}"
+    val lastOutcomeLine = "Last connection outcome: ${lastOutcome?.let {
+        if (it.result == ConnectionOutcomeResult.SUCCESS) "SUCCESS" else "FAILURE (${it.errorCategory})"
+    } ?: "-"}"
+
+    // B8J - the ONLY place a RestrictionClass is computed (see
+    // RestrictionClassifier's own docs) - never a second interpretation here.
+    val restrictionClassLine = "Restriction class: ${viewModel.restrictionClass()}"
+
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
         "VPN permission: ${if (diagnostics.permissionGranted) "GRANTED" else "REQUIRED"}",
@@ -222,6 +263,17 @@ private fun buildDiagnosticsLines(
         appliedRoutingLine,
         savedRoutingLine,
         pendingReconnectLine,
+        networkTypeLine,
+        validatedLine,
+        meteredLine,
+        ipv4AvailableLine,
+        ipv6AvailableLine,
+        currentTransportLine,
+        smartConnectGatewayLine,
+        lastHandshakeDurationLine,
+        lastOutcomeLine,
+        smartConnectReasonLine,
+        restrictionClassLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",
@@ -239,10 +291,10 @@ private fun ipv6PolicyDisplayText(policy: Ipv6LeakPolicy): String = when (policy
 /** Diagnostics-only, more technical wording than toHomeStatusText() - unchanged from the original View-based Diagnostics section. */
 private fun transportDisplayText(state: TransportState): String = when (state) {
     is TransportState.Disconnected -> "Disconnected"
-    is TransportState.Connecting -> "Connecting…"
+    is TransportState.Connecting -> "ConnectingвЂ¦"
     is TransportState.Connected -> "Connected"
-    is TransportState.Disconnecting -> "Disconnecting…"
-    is TransportState.Reconnecting -> "Reconnecting (attempt ${state.attempt})…"
+    is TransportState.Disconnecting -> "DisconnectingвЂ¦"
+    is TransportState.Reconnecting -> "Reconnecting (attempt ${state.attempt})вЂ¦"
     is TransportState.Error -> "Connection failed: ${state.message}"
     is TransportState.HandshakeFailed -> "Connection failed: no VPN handshake"
 }

@@ -140,6 +140,108 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config_module.ConfigError):
             config_module.load_config(env=env)
 
+    def _valid_xray_env(self):
+        private_key_file = os.path.join(self._tmp.name, "reality-private-key.txt")
+        with open(private_key_file, "w", encoding="utf-8") as handle:
+            handle.write("B" * 43)
+
+        env = self._valid_env()
+        env.update({
+            "POCVPN_API_XRAY_STORE_PATH": os.path.join(self._tmp.name, "xray.json"),
+            "POCVPN_API_XRAY_SERVER_PORT": "2053",
+            "POCVPN_API_XRAY_SERVER_NAME": "example.invalid",
+            "POCVPN_API_XRAY_FINGERPRINT": "chrome",
+            "POCVPN_API_XRAY_REALITY_PUBLIC_KEY": "A" * 43,
+            "POCVPN_API_XRAY_SHORT_ID": "ab12cd34",
+            "POCVPN_API_XRAY_FLOW": "xtls-rprx-vision",
+            "POCVPN_API_XRAY_REALITY_PRIVATE_KEY_FILE": private_key_file,
+            "POCVPN_API_XRAY_STAGING_CONFIG_PATH": os.path.join(self._tmp.name, "candidate.json"),
+            "POCVPN_API_XRAY_ACTIVATION_LOCK_PATH": os.path.join(self._tmp.name, ".xray-activation.lock"),
+            "POCVPN_API_XRAY_ACTIVATION_LAST_HASH_PATH": os.path.join(self._tmp.name, ".xray-last-hash"),
+            "POCVPN_API_XRAY_ACTIVATION_WRAPPER_PATH": "/usr/local/libexec/nova-xray-reload",
+            "POCVPN_API_XRAY_DEST": "example.invalid:443",
+        })
+        return env
+
+    def test_fully_configured_xray_settings_load(self):
+        cfg = config_module.load_config(env=self._valid_xray_env())
+        self.assertEqual(cfg.xray_server_port, 2053)
+        self.assertEqual(cfg.xray_reality_public_key, "A" * 43)
+
+    def test_xray_completely_unset_is_fine(self):
+        cfg = config_module.load_config(env=self._valid_env())
+        self.assertEqual(cfg.xray_server_port, 0)
+        self.assertEqual(cfg.xray_store_path, "")
+
+    def test_xray_partially_configured_raises(self):
+        env = self._valid_xray_env()
+        del env["POCVPN_API_XRAY_SERVER_NAME"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_invalid_fingerprint_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_FINGERPRINT"] = "netscape-navigator"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_wrong_length_public_key_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_REALITY_PUBLIC_KEY"] = "tooshort"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_odd_length_short_id_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SHORT_ID"] = "abc"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_invalid_flow_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_FLOW"] = "made-up-flow"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_activation_partially_configured_raises(self):
+        env = self._valid_xray_env()
+        del env["POCVPN_API_XRAY_ACTIVATION_WRAPPER_PATH"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_private_key_file_nonexistent_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_REALITY_PRIVATE_KEY_FILE"] = os.path.join(self._tmp.name, "does-not-exist.txt")
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_activation_wrapper_relative_path_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_ACTIVATION_WRAPPER_PATH"] = "relative/nova-xray-reload"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_server_name_and_dest_hostname_mismatch_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SERVER_NAME"] = "example.invalid"
+        env["POCVPN_API_XRAY_DEST"] = "different.invalid:443"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xray_server_name_matching_dest_hostname_is_accepted(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SERVER_NAME"] = "example.invalid"
+        env["POCVPN_API_XRAY_DEST"] = "example.invalid:443"
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.xray_server_name, "example.invalid")
+
+    def test_xray_server_name_equal_to_gateway_endpoint_host_raises(self):
+        env = self._valid_xray_env()
+        env["POCVPN_API_XRAY_SERVER_NAME"] = env["POCVPN_API_ENDPOINT_HOST"]
+        env["POCVPN_API_XRAY_DEST"] = env["POCVPN_API_ENDPOINT_HOST"] + ":443"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
 
 if __name__ == "__main__":
     unittest.main()

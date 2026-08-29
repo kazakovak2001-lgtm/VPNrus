@@ -1,0 +1,50 @@
+# B8K2 - systemd unit for the pinned server-side Xray-core process
+# (VLESS+REALITY inbound only, see gateway/xray/README.md). NOT installed/
+# started against Oracle in this slice - a real, runnable unit file,
+# reviewed before any real deployment.
+#
+# Unlike pocvpn-api.service, this process never shells out to sudo or any
+# root helper - it only reads its own config file and the REALITY private
+# key embedded in it, and answers inbound VLESS+REALITY connections. That
+# means, unlike pocvpn-api.service, NoNewPrivileges=yes is safe here (see
+# that unit's own comment for why it's unsafe THERE) and ProtectSystem can
+# be strict with no writable exception at all - this process never writes
+# any file at runtime.
+[Unit]
+Description=Nova Xray VLESS+REALITY server (non-root)
+After=network.target
+
+[Service]
+Type=simple
+User=nova-xray
+Group=nova-xray
+# Pinned, versioned install path - see gateway/xray/fetch-xray-server.sh.
+# Update this line deliberately when bumping gateway/xray/VERSION, never
+# via a floating "latest" symlink.
+ExecStart=/opt/pocvpn/xray/v26.7.28/xray run -config /etc/nova-xray/config.json
+Restart=on-failure
+RestartSec=2
+
+# --- hardening ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+
+# ProtectSystem=strict with NO ReadWritePaths exception at all - this
+# process never writes anything at runtime (unlike pocvpn-api.service,
+# which needs one exception for its root child's AWG writes). The config
+# file (containing the REALITY private key) and the binary are both
+# read-only from this unit's point of view.
+ProtectSystem=strict
+ReadOnlyPaths=/etc/nova-xray /opt/pocvpn/xray
+
+[Install]
+WantedBy=multi-user.target

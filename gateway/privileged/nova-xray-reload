@@ -1,0 +1,51 @@
+#!/bin/bash
+# B8K2A - the ONE root-owned privileged wrapper pocvpn-api is ever allowed
+# to reach, via sudo, for the Xray activation boundary. Deployed (by a
+# future deployment slice, not this one) to:
+#
+#   /usr/local/libexec/nova-xray-reload   (root:root, 0750 or 0755)
+#
+# and invoked ONLY as:
+#
+#   pocvpn-api  --sudo-->  /usr/bin/sudo -n  --sudoers-->  this wrapper
+#
+# Mirrors gateway/privileged/pocvpn-provision-peer's exact security
+# philosophy - see gateway/privileged/README.md for the full chain-of-trust
+# diagram this is the Xray-side counterpart of.
+#
+# Deliberately #!/bin/bash, NOT #!/usr/bin/env bash - a fixed, absolute
+# interpreter path.
+#
+# Deliberately NOT sourcing any repo file before the environment is
+# sanitized: every check up to and including the exec at the bottom uses
+# ONLY bash builtins - no external command, no PATH-dependent lookup.
+#
+# BASH_ENV/ENV injection defense is upstream in sudoers (env_reset forced
+# per-command by gateway/privileged/pocvpn-api.sudoers's Xray rule) -
+# exactly the same reasoning as pocvpn-provision-peer's own docstring;
+# not repeated in full here.
+set -euo pipefail
+
+# --- fixed, non-configurable target: a literal, never read from any
+# environment variable, argument, or config file. ---
+readonly ACTIVATE_SCRIPT="/opt/pocvpn/gateway/scripts/xray-activate.sh"
+
+# --- ZERO arguments accepted - stricter than pocvpn-provision-peer (which
+# takes exactly one, the public key). xray-activate.sh's own paths are all
+# fixed too (config/xray.env) - there is no caller-supplied value of any
+# kind for this wrapper to validate or pass through, so none is accepted
+# at all. This is what makes "no arbitrary path traversal" true
+# structurally, not just by convention. ---
+if [ "$#" -ne 0 ]; then
+    echo "usage: nova-xray-reload (no arguments)" >&2
+    exit 2
+fi
+
+# --- exec, not a captured/re-echoed subshell call - see
+# pocvpn-provision-peer's own comment for why this matters. /usr/bin/env -i
+# clears every inherited environment variable before setting exactly the
+# two xray-activate.sh actually needs. ---
+exec /usr/bin/env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    LANG=C \
+    "$ACTIVATE_SCRIPT"
