@@ -3,12 +3,21 @@
 package net.pocvpn.client
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
+import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
+import net.pocvpn.client.identity.FileXrayProfileStore
+import net.pocvpn.client.identity.SecureXrayProfileRepository
+import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.provisioning.ProvisioningResult
+import net.pocvpn.client.provisioning.XrayProfileProvisioner
+import net.pocvpn.client.provisioning.XrayProfileProvisioningOutcome
+import net.pocvpn.client.provisioning.XrayProfileResult
+import net.pocvpn.client.provisioning.toXrayProfile
 import net.pocvpn.client.smartconnect.ConnectionScoreReason
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.SmartConnectDecision
@@ -52,6 +61,17 @@ private val SAMPLE_ACTIVATION_SUCCESS = ProvisioningResult.Success(
     gatewayTunnelIp = "10.77.0.1",
     endpointHost = "152.70.43.1",
     endpointPort = 51820,
+)
+
+private val SAMPLE_XRAY_PROFILE_SUCCESS = XrayProfileResult.Success(
+    serverAddress = "152.70.43.1",
+    serverPort = 443,
+    uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+    flow = "xtls-rprx-vision",
+    serverName = "www.microsoft.com",
+    fingerprint = "chrome",
+    realityPublicKey = "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU=",
+    shortId = "a1b2c3d4",
 )
 
 class MainViewModelTest {
@@ -286,6 +306,108 @@ class MainViewModelTest {
         val configured = viewModel.gatewayStatus()
         assertTrue(configured is GatewayConfiguration.Configured)
         assertEquals("10.77.0.5", (configured as GatewayConfiguration.Configured).clientTunnelIp)
+    }
+
+    // --- B8K4B: Xray profile provisioning wiring ---
+
+    @Test
+    fun `successful activation and Xray fetch saves exactly one validated profile`() = runTest {
+        val xrayRepository = SecureXrayProfileRepository(FileXrayProfileStore(tmp.newFolder("xray-success")), FakeAesGcmKeyEncryptor())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "DEVICE_PUBLIC_KEY_ABCDEFGHIJKLMNOPQRSTUVWXYZ0="),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            ioDispatcher = testDispatcher,
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _ -> SAMPLE_XRAY_PROFILE_SUCCESS },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateDevice("some-activation-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(XrayProfileProvisioningOutcome.Saved, viewModel.xrayProfileProvisioningState.value)
+        assertEquals(SAMPLE_XRAY_PROFILE_SUCCESS.toXrayProfile(), xrayRepository.getProfileOrNull())
+    }
+
+    @Test
+    fun `AWG activation and Xray fetch use the same existing device public key and same activation credential`() = runTest {
+        var awgPublicKey: String? = null
+        var awgCredential: String? = null
+        var xrayPublicKey: String? = null
+        var xrayCredential: String? = null
+        val xrayRepository = SecureXrayProfileRepository(FileXrayProfileStore(tmp.newFolder("xray-shared-identity")), FakeAesGcmKeyEncryptor())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "SHARED_DEVICE_PUBLIC_KEY_ABCDEFGHIJKLMNOP===="),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            activationClient = { publicKey, credential ->
+                awgPublicKey = publicKey
+                awgCredential = credential
+                SAMPLE_ACTIVATION_SUCCESS
+            },
+            ioDispatcher = testDispatcher,
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { publicKey, credential ->
+                xrayPublicKey = publicKey
+                xrayCredential = credential
+                SAMPLE_XRAY_PROFILE_SUCCESS
+            },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateDevice("shared-activation-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals("SHARED_DEVICE_PUBLIC_KEY_ABCDEFGHIJKLMNOP====", awgPublicKey)
+        assertEquals("SHARED_DEVICE_PUBLIC_KEY_ABCDEFGHIJKLMNOP====", xrayPublicKey)
+        assertEquals(awgPublicKey, xrayPublicKey)
+        assertEquals("shared-activation-credential", awgCredential)
+        assertEquals("shared-activation-credential", xrayCredential)
+        assertEquals(awgCredential, xrayCredential)
+    }
+
+    @Test
+    fun `Xray profile retrieval failure does not affect AWG activation success, and does not overwrite an existing stored profile`() = runTest {
+        val xrayFolder = tmp.newFolder("xray-failure-keeps-existing")
+        val xrayRepository = SecureXrayProfileRepository(FileXrayProfileStore(xrayFolder), FakeAesGcmKeyEncryptor())
+        val existingProfile = XrayProfile(
+            server = "existing.example.net", serverPort = 8443,
+            uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f", flow = "xtls-rprx-vision",
+            serverName = "existing.example.net", fingerprint = "chrome",
+            realityPublicKey = "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU=", shortId = "deadbeef",
+        )
+        runBlocking { xrayRepository.saveProfile(existingProfile) }
+        val gatewayConfigSource = MutableGatewayConfigSource(EmptyGatewayConfigSource())
+        val profileStore = FileProfileStore(tmp.newFolder("profile-xray-failure"))
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "DEVICE_PUBLIC_KEY_ABCDEFGHIJKLMNOPQRSTUVWXYZ0="),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = DefaultGatewayConfigurationRepository(gatewayConfigSource),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            gatewayConfigOverride = gatewayConfigSource,
+            profileStore = profileStore,
+            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            ioDispatcher = testDispatcher,
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _ -> XrayProfileResult.ServiceUnavailable },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateDevice("some-activation-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        // AWG activation succeeded exactly as it does with no Xray provisioner wired at all.
+        assertTrue(viewModel.gatewayStatus() is GatewayConfiguration.Configured)
+        assertEquals(ProfileSource.PROVISIONED_LIVE, viewModel.profileSource.value)
+        assertTrue((profileStore.read() as ProfileLoadResult.Found).profile.endpointHost.isNotBlank())
+
+        // Xray outcome surfaced, but the previously stored profile is untouched.
+        assertEquals(XrayProfileProvisioningOutcome.Unavailable, viewModel.xrayProfileProvisioningState.value)
+        assertEquals(existingProfile, xrayRepository.getProfileOrNull())
     }
 
     // --- B8I1: ONE Smart Connect decision authority, reached only via MainViewModel.smartConnectDecision() ---

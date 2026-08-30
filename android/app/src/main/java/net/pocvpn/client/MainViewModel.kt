@@ -15,11 +15,14 @@ import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.ClientKeyRepositoryFactory
+import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkProfiler
 import net.pocvpn.client.provisioning.ProvisioningClient
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
+import net.pocvpn.client.provisioning.XrayProfileProvisioner
+import net.pocvpn.client.provisioning.XrayProfileProvisioningOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
@@ -130,6 +133,14 @@ class MainViewModel(
     // built from it (see below) and started in init/stopped in onCleared -
     // it never itself touches VpnController/VpnTransport (see its own docs).
     restrictionProbe: GatewayReachabilityProbe? = null,
+    // B8K4B - additive, defaults to null (same reasoning as gatewayConfigOverride/
+    // profileStore above): when non-null, activateDevice() below fetches and
+    // persists an Xray VLESS+REALITY profile immediately after a successful
+    // AWG activation, using the SAME activation credential and SAME existing
+    // device public key - no second identity, no new credential. Does not
+    // wire TransportRegistry/Smart Connect/VlessRealityTransport/
+    // NovaXrayVpnService - see XrayProfileProvisioner's own docs.
+    private val xrayProfileProvisioner: XrayProfileProvisioner? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -253,6 +264,13 @@ class MainViewModel(
     private val _profileSource = MutableStateFlow(ProfileSource.DEV_FALLBACK)
     val profileSource: StateFlow<ProfileSource> = _profileSource.asStateFlow()
 
+    // B8K4B - null until the first activateDevice() call that reaches Xray
+    // provisioning (i.e. only after a successful AWG activation, and only
+    // when xrayProfileProvisioner is wired). See XrayProfileProvisioningOutcome
+    // for what each state means.
+    private val _xrayProfileProvisioningState = MutableStateFlow<XrayProfileProvisioningOutcome?>(null)
+    val xrayProfileProvisioningState: StateFlow<XrayProfileProvisioningOutcome?> = _xrayProfileProvisioningState.asStateFlow()
+
     init {
         viewModelScope.launch {
             _publicKey.value = clientKeyRepository.getPublicKey()
@@ -356,6 +374,19 @@ class MainViewModel(
                         )
                     )
                     _profileSource.value = ProfileSource.PROVISIONED_LIVE
+                    // B8K4B - runs only after the AWG activation above has
+                    // already fully succeeded (applied + persisted). Reuses
+                    // the SAME `key`/`trimmedCredential` this activation call
+                    // used - no second identity, no new credential. Any
+                    // outcome other than Saved (network error/401/403/503/
+                    // malformed) leaves this AWG success and any previously
+                    // stored Xray profile completely untouched - see
+                    // XrayProfileProvisioner's own docs.
+                    xrayProfileProvisioner?.let { provisioner ->
+                        _xrayProfileProvisioningState.value = withContext(ioDispatcher) {
+                            provisioner.provision(key, trimmedCredential)
+                        }
+                    }
                     ProvisioningUiState.Success(result)
                 }
                 is ProvisioningResult.Unauthorized -> ProvisioningUiState.Unauthorized
@@ -440,6 +471,10 @@ class MainViewModel(
                 // B8J - the one pinned gateway's HTTPS probe (see its own
                 // docs) - default timeout/URL, no credentials/keys involved.
                 restrictionProbe = HttpsGatewayReachabilityProbe(),
+                // B8K4B - same real SecureXrayProfileRepository wiring
+                // NovaXrayVpnService reads from (see XrayProfileRepositoryFactory's
+                // own docs) - no new store, no plaintext persistence.
+                xrayProfileProvisioner = XrayProfileProvisioner(XrayProfileRepositoryFactory.create(context)),
             ) as T
         }
     }
