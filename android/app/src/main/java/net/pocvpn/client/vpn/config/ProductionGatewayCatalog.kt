@@ -66,11 +66,25 @@ object ProductionGatewayCatalog {
         displayCountry = "Germany",
         displayCity = "Frankfurt",
         provider = "Oracle Cloud",
+        // B13 (2026-08-30 Germany data-plane root cause) - clientTunnelIp
+        // MUST match the gateway's OWN live peer registration for this
+        // device's public key, never an assumed/stale value: SSH diagnosis
+        // found the server's add-peer.sh-managed peer list assigns THIS
+        // device's real public key AllowedIPs = 10.77.0.5/32 (a later
+        // re-provisioning, label provision-peer-1788077883) - the app was
+        // still configured with the OLDER 10.77.0.2, which now belongs to a
+        // DIFFERENT peer entirely. WireGuard's AllowedIPs is both a route
+        // table AND a source-IP ingress filter, so packets from the wrong
+        // local address get silently dropped post-handshake (the handshake
+        // itself doesn't check AllowedIPs, which is exactly why it kept
+        // succeeding while all data traffic timed out). Zero server-side
+        // change was needed - gateway A's firewall/NAT/forwarding were
+        // already correct; this was purely a stale client-side value.
         awg = AwgGatewayConnection(
             endpointHost = "152.70.43.1",
             endpointPort = 51820,
             serverPublicKeyBase64 = "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU=",
-            clientTunnelIp = "10.77.0.2",
+            clientTunnelIp = "10.77.0.5",
             gatewayTunnelIp = "10.77.0.1",
         ),
         awgProfile = AwgProfile(

@@ -216,6 +216,12 @@ private fun buildDiagnosticsLines(
         is GatewayConfiguration.Invalid -> "Gateway: INVALID (${gateway.reason})"
         is GatewayConfiguration.Configured -> "Gateway: ${gateway.endpointHost}:${gateway.endpointPort}"
     }
+    // B13 - provider/ASN-adjacent metadata is diagnostics-only (debug build,
+    // this dialog only) - never shown in the normal picker/LocationCard/Home
+    // screen (see GatewayPickerDialog/LocationCard's own docs).
+    val selectedGatewayCatalogEntry = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(viewModel.selectedGateway.value)
+    val selectedGatewayLine = "Selected gateway: ${selectedGatewayCatalogEntry.displayCountry} / ${selectedGatewayCatalogEntry.displayCity} " +
+        "(${selectedGatewayCatalogEntry.provider}, endpointId=${selectedGatewayCatalogEntry.endpointId.value})"
     val tunnelIpLine = when (gateway) {
         is GatewayConfiguration.Configured -> "Client tunnel IP: ${gateway.clientTunnelIp}"
         else -> "Client tunnel IP: NOT CONFIGURED"
@@ -308,6 +314,7 @@ private fun buildDiagnosticsLines(
         "Client public key: ${publicKey ?: "(loading...)"}",
         tunnelIpLine,
         gatewayLine,
+        selectedGatewayLine,
         allowedIpsLine,
         dnsLine,
         ipv6PolicyLine,

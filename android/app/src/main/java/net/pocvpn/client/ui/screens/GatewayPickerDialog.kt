@@ -63,13 +63,19 @@ fun GatewayPickerDialog(
                     ) {
                         RadioButton(selected = selected, onClick = { onSelect(descriptor.id) })
                         Column {
+                            // B13 - geographic labels only in normal
+                            // user-facing UI: NO provider/ASN/infrastructure
+                            // names here (descriptor.provider deliberately
+                            // unused) - see ProductionGatewayCatalog's own
+                            // docs for where that metadata still lives
+                            // (internal fields, diagnostics-only surfaces).
                             Text(
-                                text = "${descriptor.displayCountry} · ${descriptor.displayCity}",
+                                text = descriptor.displayCountry,
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = MaterialTheme.colorScheme.onSurface,
                             )
                             Text(
-                                text = descriptor.provider,
+                                text = descriptor.displayCity,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
