@@ -64,16 +64,6 @@ fun DiagnosticsDialog(
     onTlsCredentialChange: (String) -> Unit = {},
     onProvisionTlsProfile: (String) -> Unit = {},
     tlsProvisioningResultText: String? = null,
-    // B8O2-ops - additive, defaults so the widely-used call shape stays
-    // valid. No product UI exposes transport selection yet (Smart Connect
-    // Auto is the only wired preference - see MainViewModel's own docs) -
-    // this is a debug-only way to reach the EXISTING, already-safe
-    // UserTransportPreference.Manual(TLS_TCP) path for physical-device
-    // verification, never a new automatic selection/failover rule.
-    transportPreferenceOverrideText: String = "Auto",
-    onForceManualTlsTcp: () -> Unit = {},
-    onForceManualReality: () -> Unit = {},
-    onClearTransportPreferenceOverride: () -> Unit = {},
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
 
@@ -143,22 +133,6 @@ fun DiagnosticsDialog(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(stringResource(R.string.diagnostics_provision_tls_button))
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "Transport preference override: $transportPreferenceOverrideText",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                TextButton(onClick = onForceManualTlsTcp, modifier = Modifier.fillMaxWidth()) {
-                    Text("Force Manual TLS_TCP (debug only)")
-                }
-                TextButton(onClick = onForceManualReality, modifier = Modifier.fillMaxWidth()) {
-                    Text("Force Manual XRAY_REALITY (debug only)")
-                }
-                TextButton(onClick = onClearTransportPreferenceOverride, modifier = Modifier.fillMaxWidth()) {
-                    Text("Clear override - use Auto (debug only)")
                 }
 
                 TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {

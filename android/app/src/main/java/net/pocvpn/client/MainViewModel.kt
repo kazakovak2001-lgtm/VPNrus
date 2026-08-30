@@ -250,27 +250,6 @@ class MainViewModel(
     // activateDevice() success), same "never polled" discipline.
     private val xrayTlsAvailable = MutableStateFlow(false)
 
-    // B8O2-ops - debug-only override of [userTransportPreference], null by
-    // default so production behavior (the constructor-supplied preference,
-    // always Auto today - see Factory below) is completely unaffected. This
-    // is the ONLY way to reach UserTransportPreference.Manual(TLS_TCP)
-    // today (no product UI exposes transport selection yet) - it exercises
-    // the EXISTING, already-safe SmartConnectDecisionEngine.decideManual
-    // code path (the same one a future real "choose transport" screen would
-    // use), never a bespoke bypass of connect()'s own resolution/support
-    // checks. Does NOT change Auto's own PREFERRED_ORDER or
-    // AwgXrayFailoverPolicy - no new automatic TLS failover is introduced by
-    // this override existing.
-    private val _debugTransportPreferenceOverride = MutableStateFlow<UserTransportPreference?>(null)
-    val debugTransportPreferenceOverride: StateFlow<UserTransportPreference?> = _debugTransportPreferenceOverride.asStateFlow()
-    private val effectiveTransportPreference: UserTransportPreference
-        get() = _debugTransportPreferenceOverride.value ?: userTransportPreference
-
-    /** Debug-only - see [_debugTransportPreferenceOverride]'s own docs. */
-    fun debugSetTransportPreference(preference: UserTransportPreference?) {
-        _debugTransportPreferenceOverride.value = preference
-    }
-
     /**
      * B8O3 - the kind of the transport actually running/last attempted
      * (VpnController.currentTransportKind - set only when a resolved,
@@ -376,7 +355,7 @@ class MainViewModel(
         networkProfile = networkProfile.value,
         gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
         registry = buildTransportRegistry(),
-        preference = effectiveTransportPreference,
+        preference = userTransportPreference,
         health = transportHealth(),
         connectionHistory = recentConnectionOutcomes(),
         restrictionClass = restrictionClass(),
@@ -785,7 +764,7 @@ class MainViewModel(
                             val permissionPending = resolution.transport.preparePermissionIntent() != null
                             val attempt = PendingFailoverAttempt(
                                 initialKind = kind,
-                                preference = effectiveTransportPreference,
+                                preference = userTransportPreference,
                                 registry = registry,
                                 orchestrator = orchestrator,
                             )

@@ -28,7 +28,6 @@ import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.transport.TransportHealthState
 import net.pocvpn.client.transport.TransportKind
-import net.pocvpn.client.transport.UserTransportPreference
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
@@ -75,7 +74,6 @@ fun AppRoot(
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
     val tlsProfileProvisioningState by viewModel.tlsProfileProvisioningState.collectAsStateWithLifecycle()
-    val debugTransportPreferenceOverride by viewModel.debugTransportPreferenceOverride.collectAsStateWithLifecycle()
 
     var credential by remember { mutableStateOf("") }
     // B8O2-ops - a SEPARATE field from `credential` above: that one is
@@ -190,14 +188,6 @@ fun AppRoot(
             onTlsCredentialChange = { tlsCredential = it },
             onProvisionTlsProfile = { viewModel.provisionTlsProfile(it) },
             tlsProvisioningResultText = tlsProfileProvisioningState?.let { "TLS profile: $it" },
-            transportPreferenceOverrideText = debugTransportPreferenceOverride?.toString() ?: "Auto",
-            onForceManualTlsTcp = {
-                viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.TLS_TCP))
-            },
-            onForceManualReality = {
-                viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.XRAY_REALITY))
-            },
-            onClearTransportPreferenceOverride = { viewModel.debugSetTransportPreference(null) },
         )
     }
 }
