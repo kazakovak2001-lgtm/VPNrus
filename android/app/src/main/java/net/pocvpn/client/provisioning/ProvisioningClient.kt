@@ -49,11 +49,17 @@ object ProvisioningClient {
     private val WG_KEY_REGEX = Regex("^[A-Za-z0-9+/]{43}=$")
     private val IPV4_REGEX = Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")
 
-    // REALITY's public key is also a 32-byte X25519 key, base64-encoded the
-    // same way as an AWG key - same regex, kept separate so the two domains
-    // don't share a "key" concept beyond their coincidentally identical wire
-    // format.
-    private val REALITY_KEY_REGEX = WG_KEY_REGEX
+    // B8K6A fix - REALITY's public key is also a 32-byte X25519 key, but
+    // NOT encoded the same way as an AWG key: xray-core's own `xray x25519`
+    // tool (and this server's config.py/gateway_config_renderer validation)
+    // emit it as url-safe base64, UNPADDED (43 chars) - never standard
+    // base64-with-padding. Confirmed against a real server response: the
+    // previous `= WG_KEY_REGEX` alias rejected EVERY real Reality profile
+    // this server has ever issued as "malformed", so no device has ever
+    // been able to save a working Xray profile - this is the same shape
+    // XrayVlessRealityConfig.REALITY_PUBLIC_KEY_REGEX already validates
+    // correctly on the config side; this is the one place that disagreed.
+    private val REALITY_KEY_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
 
     // REALITY's short_id: 1-8 raw bytes, hex-encoded (an even number of hex
     // digits, 2 to 16 of them) - matches Xray-core's own short_id validation.
