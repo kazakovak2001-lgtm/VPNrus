@@ -26,6 +26,7 @@ import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.SmartConnectDecision
+import net.pocvpn.client.transport.TransportHealthState
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
@@ -266,6 +267,12 @@ private fun buildDiagnosticsLines(
     // RestrictionClassifier's own docs) - never a second interpretation here.
     val restrictionClassLine = "Restriction class: ${viewModel.restrictionClass()}"
 
+    // B8L - the CURRENTLY SELECTED kind's real health (see
+    // TransportHealthCalculator's own docs) - UNKNOWN whenever no candidate
+    // is selected or that kind has no recorded outcome history yet.
+    val selectedKind = (smartConnectDecision as? SmartConnectDecision.Selected)?.score?.candidate?.transport?.kind
+    val transportHealthLine = "Transport health: ${selectedKind?.let { viewModel.transportHealth()[it]?.state } ?: TransportHealthState.UNKNOWN}"
+
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
         "VPN permission: ${if (diagnostics.permissionGranted) "GRANTED" else "REQUIRED"}",
@@ -293,6 +300,7 @@ private fun buildDiagnosticsLines(
         lastOutcomeLine,
         smartConnectReasonLine,
         restrictionClassLine,
+        transportHealthLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",
