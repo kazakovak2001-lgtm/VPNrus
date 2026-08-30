@@ -152,10 +152,11 @@ class VpnController(
         if (xrayTlsProfileRepository != null) add(TransportKind.TLS_TCP)
     }
 
-    // B8O3 - the kind of the LAST attempt actually validated/passed to
-    // switchActiveTransport() below (never a hypothetical Smart Connect
-    // pick) - see [currentTransportKind]'s own docs for why the diagnostics
-    // UI must read this instead of recomputing a fresh decision.
+    // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
+    // for the exact states that count as "running") - never a merely
+    // attempted/selected/hypothetical one. Set/cleared ONLY by [setState],
+    // the ONE place [_state] itself ever changes (see that function's own
+    // docs) - so this can never drift out of sync with what [state] reports.
     private val _currentTransportKind = MutableStateFlow<TransportKind?>(null)
     val currentTransportKind: StateFlow<TransportKind?> = _currentTransportKind.asStateFlow()
 
@@ -163,6 +164,28 @@ class VpnController(
 
     private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
     val state: StateFlow<TransportState> = _state.asStateFlow()
+
+    /**
+     * B8O3 - the ONE place [_state] is ever assigned (every direct
+     * `_state.value = ...` call site in this class has been replaced with
+     * this function) - centralized specifically so [_currentTransportKind]
+     * can never fall out of sync with [state]: whichever path changes the
+     * visible state (a real transport event forwarded by
+     * [switchActiveTransport]'s own collector, a preflight rejection, a
+     * precondition failure inside [doConnectAttempt], a backend/runtime
+     * failure, or the reconnect loop) always goes through here. Preserves
+     * the "attempted/selected transport" ([pendingConnectKind]) vs
+     * "actually running transport" ([currentTransportKind]) distinction the
+     * diagnostics UI depends on (see that field's own docs) - a permission
+     * denial, a configuration failure, or any other terminal [TransportState.Error]
+     * always clears [currentTransportKind] back to null in the SAME
+     * assignment that sets the visible error state, never a separate/
+     * possibly-missed step.
+     */
+    private fun setState(newState: TransportState) {
+        _state.value = newState
+        _currentTransportKind.value = if (isRunningTransportState(newState)) pendingConnectKind else null
+    }
 
     private val _events = MutableSharedFlow<ControllerEvent>(extraBufferCapacity = 1)
     val events: SharedFlow<ControllerEvent> = _events
@@ -260,7 +283,7 @@ class VpnController(
                 // don't let a transient Disconnected from an internal retry attempt
                 // flicker the UI back to plain Disconnected.
                 if (reconnectJob?.isActive != true) {
-                    _state.value = transportState
+                    setState(transportState)
                 }
                 diagnostics.updateTransportState(_state.value)
             }
@@ -282,7 +305,7 @@ class VpnController(
      */
     fun rejectPreflight(error: VpnError, message: String) {
         diagnostics.recordError(error)
-        _state.value = TransportState.Error(message)
+        setState(TransportState.Error(message))
     }
 
     /** Call once, early, from the UI layer to know whether a permission prompt will be needed. */
@@ -327,8 +350,14 @@ class VpnController(
                 return
             }
             switchActiveTransport(resolved.transport)
+            // B8O3 fix - pendingConnectKind records which kind THIS attempt
+            // is for (needed by onVpnPermissionResult's resume, and by
+            // setState() to attribute a later running state to the right
+            // kind), but is NOT itself "the current transport" - see
+            // currentTransportKind's own docs. It must never be set here:
+            // permission has not been requested yet, let alone granted, and
+            // no real connect attempt has been made.
             pendingConnectKind = resolved.kind
-            _currentTransportKind.value = resolved.kind
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -355,7 +384,7 @@ class VpnController(
         diagnostics.updatePermission(granted)
         if (!granted) {
             diagnostics.recordError(VpnError.PermissionDenied)
-            _state.value = TransportState.Error("VPN permission denied")
+            setState(TransportState.Error("VPN permission denied"))
             return
         }
         connectMutex.withLock { doConnectAttempt(pendingConnectKind) }
@@ -392,12 +421,12 @@ class VpnController(
             is GatewayConfiguration.Missing -> {
                 diagnostics.recordError(VpnError.GatewayConfigurationMissing)
                 diagnostics.updateGateway(configured = false, endpointDisplay = "NOT CONFIGURED")
-                _state.value = TransportState.Error("Gateway configuration is not configured. Real VPS required.")
+                setState(TransportState.Error("Gateway configuration is not configured. Real VPS required."))
                 return false
             }
             is GatewayConfiguration.Invalid -> {
                 diagnostics.recordError(VpnError.InvalidGatewayConfiguration(config.reason))
-                _state.value = TransportState.Error("Invalid gateway configuration: ${config.reason}")
+                setState(TransportState.Error("Invalid gateway configuration: ${config.reason}"))
                 return false
             }
             is GatewayConfiguration.Configured -> {
@@ -422,7 +451,7 @@ class VpnController(
                 // never even read appRoutingLists.
                 if (kind == TransportKind.AMNEZIA_WG && routingResolution is EffectiveRoutingResult.NoAppsSelected) {
                     diagnostics.recordError(VpnError.SplitTunnelingNoAppsSelected)
-                    _state.value = TransportState.Error("VPN-only mode has no apps selected - select at least one app")
+                    setState(TransportState.Error("VPN-only mode has no apps selected - select at least one app"))
                     return false
                 }
                 val appRoutingLists = (routingResolution as? EffectiveRoutingResult.Apply)?.lists ?: AppRoutingLists.AllApps
@@ -430,7 +459,7 @@ class VpnController(
                     buildTransportConfig(kind, config, appRoutingLists)
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.ConfigurationMappingFailure(e.javaClass.simpleName))
-                    _state.value = TransportState.Error("Failed to build tunnel configuration")
+                    setState(TransportState.Error("Failed to build tunnel configuration"))
                     return false
                 }
                 // B8B3D: the attempt's own start time - a handshake is only
@@ -458,7 +487,7 @@ class VpnController(
                         // produced a real handshake.
                         if (awaitFreshHandshake(attemptStartEpochMillis)) {
                             recordCurrentStats()
-                            _state.value = TransportState.Connected
+                            setState(TransportState.Connected)
                             recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
                             true
                         } else {
@@ -467,7 +496,7 @@ class VpnController(
                             // failover/kill-switch policy is out of scope for this
                             // slice (see class docs). The interface may still be
                             // up; only the user-visible state reflects the truth.
-                            _state.value = TransportState.HandshakeFailed
+                            setState(TransportState.HandshakeFailed)
                             recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
                             false
                         }
@@ -491,7 +520,7 @@ class VpnController(
                     }
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
-                    _state.value = TransportState.Error("Backend failed to start")
+                    setState(TransportState.Error("Backend failed to start"))
                     recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.BACKEND_START_FAILURE, attemptStartEpochMillis)
                     false
                 }
@@ -686,11 +715,11 @@ class VpnController(
         while (coroutineContext.isActive && !userInitiatedDisconnect) {
             attempt++
             diagnostics.updateReconnectAttempts(attempt)
-            _state.value = TransportState.Reconnecting(attempt)
+            setState(TransportState.Reconnecting(attempt))
 
             if (attempt > ReconnectBackoff.MAX_ATTEMPTS) {
                 diagnostics.recordError(VpnError.ReconnectExhausted)
-                _state.value = TransportState.Error("Reconnect attempts exhausted")
+                setState(TransportState.Error("Reconnect attempts exhausted"))
                 // B8I - ONE outcome for the whole exhausted recovery cycle,
                 // not one per backoff attempt - keeps the bounded history
                 // meaningful instead of filling up with per-attempt noise.
@@ -708,7 +737,7 @@ class VpnController(
             val recovered = connectMutex.withLock { awaitFreshHandshake(reconnectionThresholdEpochMillis) }
             if (recovered) {
                 recordCurrentStats()
-                _state.value = TransportState.Connected
+                setState(TransportState.Connected)
                 diagnostics.updateReconnectAttempts(0)
                 // B8I1 - OUTCOME OWNERSHIP: deliberately does NOT call
                 // recordConnectionOutcome() here. The chosen model is: one
@@ -772,3 +801,19 @@ private class XrayProfileNotReadyException(reason: String) : Exception(reason)
  */
 internal fun isFreshHandshake(handshakeEpochMillis: Long?, attemptStartEpochMillis: Long): Boolean =
     handshakeEpochMillis != null && handshakeEpochMillis >= attemptStartEpochMillis
+
+/**
+ * B8O3 - pure, file-scope predicate (same reasoning as [isFreshHandshake]
+ * above): which [TransportState]s count as "a transport is genuinely
+ * running" for [VpnController.currentTransportKind] purposes. Deliberately
+ * narrow - [TransportState.Connected] (a real, confirmed session) and
+ * [TransportState.Reconnecting] (a previously-Connected session recovering
+ * on its own, per this class's own "Break-before-make" docs - the interface
+ * is still up throughout) - and nothing else. In particular
+ * [TransportState.HandshakeFailed] is NOT running: the class's own docs
+ * note the interface MAY still be up, but no confirmed working tunnel was
+ * ever established for this attempt, so it must not be reported as the
+ * current transport any more than [TransportState.Error] is.
+ */
+internal fun isRunningTransportState(state: TransportState): Boolean =
+    state is TransportState.Connected || state is TransportState.Reconnecting

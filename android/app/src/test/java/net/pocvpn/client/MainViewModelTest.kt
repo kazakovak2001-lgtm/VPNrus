@@ -804,6 +804,33 @@ class MainViewModelTest {
     }
 
     @Test
+    fun `a decryptable but semantically invalid stored TLS profile never registers TLS_TCP as AVAILABLE`() = runTest {
+        // B8O2 audit fix - a profile that exists (decrypts fine) but fails
+        // XrayRuntimeResolver.resolveTls's own validation (here: a
+        // malformed uuid) must NOT register TLS_TCP as AVAILABLE, even
+        // though a naive "profile != null" check would wrongly say it is -
+        // this is the exact bug the fix closes.
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val invalidProfile = SAMPLE_XRAY_TLS_PROFILE_SUCCESS.toXrayTlsProfile().copy(uuid = "not-a-uuid")
+        val tlsRepository = net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(invalidProfile)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayTlsTransport = tlsTransport,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val registry = viewModel.buildTransportRegistry()
+
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.TLS_TCP)?.status)
+        assertNull(registry.createTransport(TransportKind.TLS_TCP))
+    }
+
+    @Test
     fun `Manual TLS_TCP preference selects it once available`() = runTest {
         val transport = FakeVpnTransport()
         val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)

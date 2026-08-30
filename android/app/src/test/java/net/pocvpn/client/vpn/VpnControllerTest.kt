@@ -666,6 +666,147 @@ class VpnControllerTest {
     }
 
     @Test
+    fun `currentTransportKind stays null throughout a gateway-configuration-missing failure`() = runTest {
+        // B8O2 audit fix - previously _currentTransportKind was set to the
+        // resolved kind BEFORE any of these preconditions were checked; a
+        // configuration failure never actually runs a transport, so this
+        // must never transiently (or permanently) report AMNEZIA_WG.
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(0, transport.connectCallCount)
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout an invalid-gateway-configuration failure`() = runTest {
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(GatewayConfiguration.Invalid("bad port")),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout a permission-denial failure`() = runTest {
+        val transport = FakeVpnTransport(permission = android.content.Intent())
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+        // Not yet running - permission is still pending. Must not already
+        // report AMNEZIA_WG as current merely because it was resolved/selected.
+        assertEquals(null, controller.currentTransportKind.value)
+
+        controller.onVpnPermissionResult(false)
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(0, transport.connectCallCount)
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout a backend runtime failure`() = runTest {
+        val transport = FakeVpnTransport()
+        transport.failConnectWith = IllegalStateException("boom")
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        // Note: intentionally not asserting on controller.state.value here -
+        // FakeVpnTransport's own stateFlow is left at "Connecting" when
+        // connect() throws (a pre-existing test-double/collector-replay
+        // detail unrelated to this fix), so the visible state can end up
+        // overwritten back to Connecting after the catch block's Error was
+        // set. currentTransportKind must be null EITHER way - see
+        // isRunningTransportState, which treats Connecting the same as
+        // Error (not running) - that is the actual invariant this test
+        // proves.
+        assertEquals(VpnError.BackendStartFailure("IllegalStateException"), diagnostics.snapshot.value.lastError)
+        assertEquals(null, controller.currentTransportKind.value)
+        assertFalse(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `currentTransportKind stays null when the split-tunneling no-apps-selected failure fires`() = runTest {
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val appRoutingPolicyStore = FakeAppRoutingPolicyStore(
+            net.pocvpn.client.vpn.policy.AppRoutingPolicy(
+                mode = net.pocvpn.client.vpn.policy.AppRoutingMode.VPN_ONLY_SELECTED,
+                selectedPackageNames = emptySet(),
+            ),
+        )
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            appRoutingPolicyStore = appRoutingPolicyStore,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        assertEquals(VpnError.SplitTunnelingNoAppsSelected, diagnostics.snapshot.value.lastError)
+        assertEquals(0, transport.connectCallCount)
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind is not reported while merely Connecting - only once a real handshake lands`() = runTest {
+        val transport = FakeVpnTransport()
+        transport.connectGate = CompletableDeferred()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        val job = backgroundScope.launch { controller.connect() }
+        runCurrent()
+        assertEquals(1, transport.connectCallCount)
+        // connect() is still suspended inside transport.connect() (the gate
+        // hasn't been completed) - nothing is running yet.
+        assertEquals(null, controller.currentTransportKind.value)
+
+        transport.connectGate?.complete(Unit)
+        runCurrent()
+        job.join()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(TransportKind.AMNEZIA_WG, controller.currentTransportKind.value)
+    }
+
+    @Test
     fun `currentTransportKind never flips to an unsupported kind that was refused before switching`() = runTest {
         val awgTransport = FakeVpnTransport()
         val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)

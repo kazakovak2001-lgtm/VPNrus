@@ -72,6 +72,8 @@ import net.pocvpn.client.vpn.config.PersistedProfile
 import net.pocvpn.client.vpn.config.ProfileLoadResult
 import net.pocvpn.client.vpn.config.ProfileSource
 import net.pocvpn.client.vpn.config.ProfileStore
+import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
+import net.pocvpn.client.vpn.xray.XrayTlsRuntimeResolution
 import net.pocvpn.client.vpn.policy.AndroidInstalledPackageChecker
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
@@ -488,13 +490,15 @@ class MainViewModel(
                 }
             }
         }
+        // B8O2 fix - a decryptable-but-invalid stored profile must NOT
+        // register TLS_TCP as AVAILABLE: this uses the SAME authoritative
+        // validation XrayCoreController/VlessTlsTransport actually run at
+        // connect time (XrayRuntimeResolver.resolveTls) - never a
+        // duplicated/looser "profile exists" check that could disagree with
+        // what connect() itself will accept.
         xrayTlsProfileRepository?.let { repository ->
             viewModelScope.launch {
-                xrayTlsAvailable.value = try {
-                    repository.getProfileOrNull() != null
-                } catch (t: Throwable) {
-                    false
-                }
+                xrayTlsAvailable.value = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
             }
         }
         // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
@@ -624,8 +628,17 @@ class MainViewModel(
                         val tlsOutcome = withContext(ioDispatcher) {
                             provisioner.provision(key, trimmedCredential)
                         }
+                        // B8O2 fix - re-derive from the SAME authoritative
+                        // resolveTls() check the startup path uses (see its
+                        // own docs), rather than assuming a structurally-
+                        // valid-at-the-wire Saved outcome is automatically
+                        // connect()-ready - one validation authority, never
+                        // two rules that could silently disagree.
                         if (tlsOutcome == XrayProfileProvisioningOutcome.Saved) {
-                            xrayTlsAvailable.value = true
+                            val repository = xrayTlsProfileRepository
+                            if (repository != null) {
+                                xrayTlsAvailable.value = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
+                            }
                         }
                     }
                     ProvisioningUiState.Success(result)
