@@ -154,8 +154,8 @@ in the project history for that boundary.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Connection Memory | PLANNED | No code. |
-| Transport Scoring | PLANNED | `TransportCapabilities`/`TransportHealth` (FOUNDATION) give the typed fields a future scorer would read; no scoring algorithm exists. |
+| Connection Memory | **FOUNDATION** | `ConnectionOutcomeStore`/`FileConnectionOutcomeStore` (B8I) are real: durable (`connection_outcomes.bin`, survives app restart), bounded, tested, and already wired into every real connect attempt (`VpnController.recordConnectionOutcome`) - "did AWG/Frankfurt tend to work, and how fast," exactly this row's own description. Kept at FOUNDATION, not IMPLEMENTED: it is pure storage - nothing yet reads it to change a Smart Connect decision (see Transport Scoring below, and `SmartConnectCandidateSelector`'s own "genuinely UNUSED for a single-candidate decision today" doc). |
+| Transport Scoring | **FOUNDATION** | `TransportScorer` (B8N) is real and unit-tested: a deterministic score combining each transport's real `TransportHealth` (B8L1, dominant signal - a NOT_IMPLEMENTED transport always scores lowest) with its declared `TransportCapabilities.maturity` (tie-break only). Live-wired: `MainViewModel.transportScores()` computes it from the real registry/health on every read and surfaces it in the diagnostics UI. Kept at FOUNDATION, not IMPLEMENTED: deliberately NOT passed into `smartConnectDecision()` - same "real evidence, truthfully surfaced, not yet decision-driving" boundary as `RestrictionClassifier`/`TransportHealth` - `SmartConnectDecisionEngine` still picks by its own fixed `PREFERRED_ORDER`, not this score. |
 | Emergency Gateway Rotation | PLANNED | No code; requires Gateway Pool first. |
 | Shadowsocks fallback | PLANNED | No code. |
 | multi-hop | PLANNED | No code. |

@@ -14,8 +14,14 @@ import net.pocvpn.client.transport.UserTransportPreference
  */
 object SmartConnectDecisionEngine {
 
-    /** Fixed, deterministic priority when more than one transport is AVAILABLE. Only AMNEZIA_WG is real today. */
-    private val PREFERRED_ORDER = listOf(
+    /**
+     * Fixed, deterministic priority when more than one transport is
+     * AVAILABLE. Only AMNEZIA_WG is real today. `internal` (not private) -
+     * TransportScorer.rank() (B8N) reuses THIS SAME list for its own
+     * tie-break, rather than an independent copy that could silently drift
+     * out of sync with the actual decision authority's own order.
+     */
+    internal val PREFERRED_ORDER = listOf(
         TransportKind.AMNEZIA_WG,
         TransportKind.QUIC,
         TransportKind.XRAY_REALITY,

@@ -40,6 +40,7 @@ import net.pocvpn.client.smartconnect.RestrictionMonitor
 import net.pocvpn.client.smartconnect.SmartConnectCandidateSelector
 import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.smartconnect.TransportHealthCalculator
+import net.pocvpn.client.smartconnect.TransportScorer
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportDescriptor
@@ -330,6 +331,22 @@ class MainViewModel(
     fun transportHealth(): Map<TransportKind, TransportHealth> {
         val outcomes = recentConnectionOutcomes()
         return TransportKind.entries.associateWith { kind -> TransportHealthCalculator.fromOutcomes(outcomes, kind) }
+    }
+
+    /**
+     * B8N - real TransportScorer.score() over each registered kind's
+     * ACTUAL TransportCapabilities (buildTransportRegistry() - never a
+     * fabricated capability set) and REAL TransportHealth (transportHealth()
+     * above, same store). Recomputed fresh on every read, same no-caching
+     * pattern as transportHealth()/smartConnectDecision(). Deliberately
+     * NOT passed into smartConnectDecision() - see TransportScorer's own
+     * "not yet decision-driving" docs.
+     */
+    fun transportScores(): Map<TransportKind, Int> {
+        val health = transportHealth()
+        return buildTransportRegistry().all().associate { descriptor ->
+            descriptor.kind to TransportScorer.score(descriptor.kind, descriptor.capabilities, health.getValue(descriptor.kind))
+        }
     }
 
     // B8J - built ONLY when a probe was actually wired (production: always,
