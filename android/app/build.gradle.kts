@@ -32,6 +32,11 @@ android {
         buildConfigField("String", "GATEWAY_CLIENT_TUNNEL_IP", "\"${gatewayDevProp("clientTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_TUNNEL_IP", "\"${gatewayDevProp("gatewayTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_ALLOWED_IPS", "\"${gatewayDevProp("allowedIps")}\"")
+        // B12 - blank (the default) means ManifestDistributionClient is
+        // never wired at all (see MainViewModel.Factory) - the app relies
+        // solely on the embedded bootstrap/LKG, same "unconfigured means
+        // inert, never a behavior change" convention as every field above.
+        buildConfigField("String", "MANIFEST_URL", "\"${gatewayDevProp("manifestUrl")}\"")
     }
 
     buildTypes {

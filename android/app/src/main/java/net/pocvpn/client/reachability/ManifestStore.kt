@@ -1,8 +1,5 @@
 package net.pocvpn.client.reachability
 
-import java.io.ByteArrayOutputStream
-import java.io.DataInputStream
-import java.io.DataOutputStream
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -59,19 +56,7 @@ class FileLastKnownGoodManifestStore(
     private fun readFromDisk(): SignedManifest? {
         if (!file.exists()) return null
         return try {
-            DataInputStream(file.inputStream().buffered()).use { input ->
-                val version = input.readInt()
-                if (version != FORMAT_VERSION) return null
-                val canonicalLen = input.readInt()
-                require(canonicalLen in 0..MAX_CANONICAL_BYTES) { "implausible canonical manifest length: $canonicalLen" }
-                val canonicalBytes = ByteArray(canonicalLen)
-                input.readFully(canonicalBytes)
-                val sigLen = input.readInt()
-                require(sigLen in 0..MAX_SIGNATURE_BYTES) { "implausible signature length: $sigLen" }
-                val signature = ByteArray(sigLen)
-                input.readFully(signature)
-                SignedManifest(ManifestCanonicalizer.decode(canonicalBytes), signature)
-            }
+            SignedManifestCodec.decode(file.readBytes())
         } catch (e: java.io.IOException) {
             null
         } catch (e: IllegalArgumentException) {
@@ -82,28 +67,12 @@ class FileLastKnownGoodManifestStore(
     private fun writeToDisk(signed: SignedManifest) {
         directory.mkdirs()
         val tmp = File(directory, "$fileName.tmp")
-        val canonicalBytes = ManifestCanonicalizer.canonicalBytes(signed.manifest)
-        val bytes = ByteArrayOutputStream().also { buffer ->
-            DataOutputStream(buffer).use { out ->
-                out.writeInt(FORMAT_VERSION)
-                out.writeInt(canonicalBytes.size)
-                out.write(canonicalBytes)
-                out.writeInt(signed.signature.size)
-                out.write(signed.signature)
-            }
-        }.toByteArray()
-        tmp.writeBytes(bytes)
+        tmp.writeBytes(SignedManifestCodec.encode(signed))
         try {
             Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         } catch (e: java.nio.file.FileSystemException) {
             tmp.delete()
             throw java.io.IOException("failed to atomically replace LKG manifest file", e)
         }
-    }
-
-    private companion object {
-        const val FORMAT_VERSION = 1
-        const val MAX_CANONICAL_BYTES = 1_000_000
-        const val MAX_SIGNATURE_BYTES = 256
     }
 }

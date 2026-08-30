@@ -329,5 +329,53 @@ class ConfigTests(unittest.TestCase):
             config_module.load_config(env=env)
 
 
+class ManifestConfigTests(unittest.TestCase):
+    """B12 - AppConfig.manifest_path's own optional completeness group."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.script_path = os.path.join(self._tmp.name, "provision-peer.sh")
+        with open(self.script_path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env bash\nexit 0\n")
+
+    def _valid_env(self):
+        return {
+            "POCVPN_API_ENDPOINT_HOST": "203.0.113.1",
+            "POCVPN_API_ENDPOINT_PORT": "51820",
+            "POCVPN_API_GATEWAY_PUBLIC_KEY": _valid_key(),
+            "POCVPN_API_GATEWAY_TUNNEL_IP": "10.77.0.1",
+            "POCVPN_API_TOKEN_STORE_PATH": os.path.join(self._tmp.name, "enrollment-tokens.json"),
+            "POCVPN_API_PROVISION_SCRIPT_PATH": self.script_path,
+            "POCVPN_API_SUBPROCESS_TIMEOUT_SECONDS": "5",
+            "POCVPN_API_API_PORT": "8765",
+        }
+
+    def test_manifest_path_absent_is_fine(self):
+        cfg = config_module.load_config(env=self._valid_env())
+        self.assertEqual(cfg.manifest_path, "")
+
+    def test_manifest_path_valid_absolute_file_honored(self):
+        manifest_file = os.path.join(self._tmp.name, "endpoint-manifest.bin")
+        with open(manifest_file, "wb") as handle:
+            handle.write(b"\x00\x00\x00\x01fake")
+        env = dict(self._valid_env())
+        env["POCVPN_API_MANIFEST_PATH"] = manifest_file
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.manifest_path, manifest_file)
+
+    def test_manifest_path_relative_raises(self):
+        env = dict(self._valid_env())
+        env["POCVPN_API_MANIFEST_PATH"] = "relative/manifest.bin"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_manifest_path_nonexistent_raises(self):
+        env = dict(self._valid_env())
+        env["POCVPN_API_MANIFEST_PATH"] = os.path.join(self._tmp.name, "does-not-exist.bin")
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+
 if __name__ == "__main__":
     unittest.main()

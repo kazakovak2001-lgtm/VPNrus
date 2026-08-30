@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
 import net.pocvpn.client.diagnostics.DiagnosticsStore
@@ -221,6 +222,13 @@ class MainViewModel(
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
+    // B12 - additive, defaults to null (same seam as every optional
+    // dependency above): with no client, refreshManifest() below is a
+    // no-op that returns null, and manifestRepository's trusted state is
+    // whatever the embedded bootstrap/previously-adopted LKG already say -
+    // this constructor param existing does not, by itself, cause any
+    // network access.
+    private val manifestDistributionClient: net.pocvpn.client.reachability.ManifestDistributionClient? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -452,28 +460,49 @@ class MainViewModel(
         val profile = networkProfile.value
         val now = System.currentTimeMillis()
 
+        // B12 - CONTROL PLANE evidence (the gateway's HTTPS API - manifest
+        // distribution/activation/provisioning) is a SEPARATE signal from
+        // DATA PLANE evidence (an actual tunnel attempt outcome for this
+        // exact endpoint+transport) - see ReachabilityEvidenceSummary's own
+        // "do not collapse" docs. Only the pinned production gateway's own
+        // control-plane probe exists today (restrictionMonitor).
+        val controlPlaneReachableByEndpoint: (net.pocvpn.client.reachability.EndpointId) -> Boolean? = { id ->
+            if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) restrictionMonitor?.lastProbeResult?.value else null
+        }
+        // B12 - real per-(endpoint, transport) DATA PLANE evidence, derived
+        // from ConnectionOutcomeStore's own real per-attempt history
+        // (ConnectionOutcome.gatewayId/.transport) - never fabricated, and
+        // never requiring any change to VpnController's proven connect
+        // path: the SAME outcomes already recorded for TransportHealth are
+        // reused here, just re-filtered by endpoint as well as transport.
+        // (PR #24 audit fix) - the NEWEST matching outcome wins (explicit
+        // maxByOrNull on its own real timestamp, not merely "last in the
+        // list"), and its OWN timestamp is threaded through to
+        // ReachabilityEngine.assess so stale evidence can actually decay -
+        // see that function's own "never TransportHealth's age as a fake
+        // proxy" docs for why this is a real, separate timestamp.
+        val outcomes = recentConnectionOutcomes()
+
         val reachability = manifest.endpoints.flatMap { endpoint ->
             endpoint.transports.map { binding ->
-                val endpointSpecificReachable = if (endpoint.id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) {
-                    restrictionMonitor?.lastProbeResult?.value
-                } else {
-                    null
-                }
+                val matchedOutcome = net.pocvpn.client.reachability.EndpointOutcomeMatcher.latestMatching(outcomes, endpoint.id, binding.kind)
                 net.pocvpn.client.reachability.ReachabilityEngine.assess(
                     endpoint = endpoint,
                     transportKind = binding.kind,
                     networkUsable = profile.isUsable,
                     transportHealth = health.getValue(binding.kind),
-                    endpointSpecificReachable = endpointSpecificReachable,
+                    endpointSpecificReachable = matchedOutcome?.let { it.result == net.pocvpn.client.smartconnect.ConnectionOutcomeResult.SUCCESS },
                     restrictionClass = restriction,
                     nowEpochMillis = now,
+                    controlPlaneReachable = controlPlaneReachableByEndpoint(endpoint.id),
+                    endpointSpecificOutcomeEpochMillis = matchedOutcome?.timestampEpochMillis,
                 )
             }
         }
         fun reachabilityFor(id: net.pocvpn.client.reachability.EndpointId, kind: TransportKind) =
             reachability.first { it.endpointId == id && it.transportKind == kind }
 
-        val candidates = manifest.endpoints.flatMap { endpoint ->
+        val directCandidates = manifest.endpoints.flatMap { endpoint ->
             endpoint.transports.mapNotNull { binding ->
                 net.pocvpn.client.reachability.PathCandidateBuilder.buildDirect(
                     endpoint,
@@ -482,6 +511,32 @@ class MainViewModel(
                 )
             }
         }
+        // B12 (PR #24 second audit fix) - Relayed candidates are now
+        // ACTUALLY built when the manifest expresses an INGRESS -> EXIT/
+        // GATEWAY relayTo relationship (previously reachabilityDiagnostics()
+        // only ever produced Direct candidates, even though PathCandidate
+        // has always been a sealed Direct/Relayed type - see the scoring
+        // loop below for why that omission made an unsafe cast look safe
+        // by coincidence, not by design). One relayed candidate per
+        // INGRESS endpoint, over its FIRST declared transport (deterministic;
+        // this slice does not yet score multiple transport choices for the
+        // ingress hop specifically) - PathCandidateBuilder.buildRelayed
+        // itself rejects anything the manifest doesn't actually support
+        // (wrong role, unsupported transport, relayTo mismatch), returning
+        // null rather than a fabricated candidate.
+        val relayedCandidates = manifest.endpoints.mapNotNull { ingress ->
+            if (net.pocvpn.client.reachability.EndpointRole.INGRESS !in ingress.roles) return@mapNotNull null
+            val exitId = ingress.relayTo ?: return@mapNotNull null
+            val exit = manifest.endpoints.firstOrNull { it.id == exitId } ?: return@mapNotNull null
+            val ingressTransport = ingress.transports.firstOrNull()?.kind ?: return@mapNotNull null
+            val exitTransport = exit.transports.firstOrNull()?.kind ?: return@mapNotNull null
+            net.pocvpn.client.reachability.PathCandidateBuilder.buildRelayed(
+                ingress, exit, ingressTransport,
+                reachabilityFor(ingress.id, ingressTransport),
+                reachabilityFor(exit.id, exitTransport),
+            )
+        }
+        val candidates: List<net.pocvpn.client.reachability.PathCandidate> = directCandidates + relayedCandidates
 
         val fingerprint = fingerprintKeyProvider?.let {
             net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
@@ -489,9 +544,43 @@ class MainViewModel(
                 it.keyBytes(),
             )
         }
+        // B12 (PR #24 audit fix) - DEFERRED, not implemented here: a
+        // meaningful "diversity bonus" needs a per-CANDIDATE signal (does
+        // choosing THIS candidate specifically add provider/ASN diversity
+        // relative to some reference - e.g. the currently active
+        // connection, or the rest of the ranked set), not one batch-wide
+        // Boolean computed once and handed identically to every candidate -
+        // that was reviewed and found to have literally no effect on
+        // ranking (every candidate got the same +5 or +0). This slice has
+        // no natural asymmetric reference point to diff against (nothing
+        // has been selected yet at the point this is computed), and
+        // inventing one risks an arbitrary provider preference PathScorer's
+        // own docs explicitly warn against. PathScorer.score's
+        // `diverseProviderOrAsnSeenElsewhere` parameter itself is unchanged
+        // and still real/tested (see PathScorerTest) - only THIS call site
+        // is deliberately disabled until a future slice defines a real
+        // per-candidate reference. See docs/ROADMAP.md's own note.
         val scored = candidates.map { candidate ->
-            val gateway = (candidate as net.pocvpn.client.reachability.PathCandidate.Direct).gateway.endpoint
-            val history = fingerprint?.let { pathHistoryStore?.get(it, gateway.id, candidate.transport) }
+            // B12 (PR #24 second audit fix) - exhaustive `when` over the
+            // sealed PathCandidate type, never an unchecked cast: PathScorer.score
+            // itself already accepts PathCandidate generically (it doesn't
+            // need hop-shape-specific data), so the ONLY reason to
+            // distinguish Direct/Relayed at all here is the history lookup
+            // below, which IS genuinely hop-shape-specific.
+            val history = when (candidate) {
+                is net.pocvpn.client.reachability.PathCandidate.Direct ->
+                    fingerprint?.let { pathHistoryStore?.get(it, candidate.gateway.endpoint.id, candidate.transport) }
+                // Deferred, not invented: FilePathHistoryStore is keyed
+                // networkFingerprint x endpointId x transportKind - a
+                // single endpoint id, which has no well-defined meaning yet
+                // for a multi-hop chain (the ingress? the exit? a
+                // synthetic composite key?). Rather than guess, a Relayed
+                // candidate simply carries no local history credit until a
+                // future slice deliberately designs that key - explicitly
+                // null, never a fabricated lookup against one hop that
+                // could misrepresent the OTHER hop's own history.
+                is net.pocvpn.client.reachability.PathCandidate.Relayed -> null
+            }
             val capabilities = registry.descriptorFor(candidate.transport)?.capabilities
                 ?: TransportCapabilities.notImplemented()
             net.pocvpn.client.reachability.PathScorer.score(
@@ -510,6 +599,40 @@ class MainViewModel(
             pathCandidates = candidates,
             rankedPaths = net.pocvpn.client.reachability.PathScorer.rank(scored),
         )
+    }
+
+    // B12 (PR #24 second audit fix) - guards refreshManifest() against
+    // concurrent execution: the init{}-block startup trigger and any
+    // future caller (a manual "check for updates" action, say) must never
+    // both be in flight at once, and a second call arriving while one is
+    // already running must be SKIPPED, not queued - a queued second fetch
+    // right after the first completes would still be pointless (nothing
+    // changed control-plane-side in that instant) and is exactly the
+    // "fetch storm" this guard exists to prevent.
+    private val manifestRefreshMutex = Mutex()
+
+    /**
+     * B12 - attempts one bounded manifest download+adoption via
+     * [manifestDistributionClient] (see its own docs: fetch failure/invalid
+     * signature/expiry/rollback all reject WITHOUT touching LKG, exactly
+     * ManifestUpdateResult's own contract). Returns null in TWO distinct,
+     * equally-benign cases a caller must treat identically - "do nothing
+     * further": no client was wired (feature not configured), OR a refresh
+     * was already in flight and this call was skipped rather than queued
+     * (see [manifestRefreshMutex]). OBSERVATIONAL in the SAME sense as
+     * reachabilityDiagnostics(): a successful adoption only changes which
+     * manifest is trusted (endpoints/candidates), never which transport
+     * Smart Connect automatically selects, and never gates or delays
+     * connect() - this function is never awaited by any connect path.
+     */
+    suspend fun refreshManifest(): net.pocvpn.client.reachability.ManifestUpdateResult? {
+        val client = manifestDistributionClient ?: return null
+        if (!manifestRefreshMutex.tryLock()) return null
+        return try {
+            client.refresh()
+        } finally {
+            manifestRefreshMutex.unlock()
+        }
     }
 
     val transportState: StateFlow<TransportState> = controller.state
@@ -601,6 +724,21 @@ class MainViewModel(
         // networkProfile transitions (see RestrictionMonitor's own docs) -
         // never a timer, never continuous polling.
         restrictionMonitor?.start(transportState, networkProfile)
+        // B12 (PR #24 second audit fix) - the ONE production trigger for
+        // manifest distribution: fires exactly once per ViewModel instance
+        // (same "one-time startup check" pattern as the xrayProfileRepository/
+        // xrayTlsProfileRepository blocks above - ViewModel init runs once
+        // per instance, survives configuration changes, and is NEVER
+        // re-invoked by Compose recomposition, which only re-reads existing
+        // state/StateFlow values from an already-constructed ViewModel).
+        // No timer, no polling. refreshManifest() itself is a no-op when
+        // manifestDistributionClient is null (BuildConfig.MANIFEST_URL
+        // blank - see Factory), so an unconfigured client performs
+        // ZERO network work here. Fire-and-forget: never awaited, never
+        // gates connect() or any other user action.
+        manifestDistributionClient?.let {
+            viewModelScope.launch { refreshManifest() }
+        }
     }
 
     // B8B3C requirement 6 (fail closed): NotFound and Corrupted are handled
@@ -1034,6 +1172,25 @@ class MainViewModel(
             // XrayTlsProfileRepositoryFactory's own docs), shared by its own
             // provisioner and xrayTlsTransport's own pre-flight check.
             val xrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context)
+            // B12 - the ONE authoritative EndpointManifestRepository instance -
+            // shared by reachabilityDiagnostics() (read-only) and
+            // manifestDistributionClient below (the only real writer, via
+            // offer()) - never a second, independently-constructed repository
+            // that could disagree with what diagnostics reports.
+            val manifestRepository = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createManifestRepository(context)
+            // B12 - blank BuildConfig.MANIFEST_URL (the default - see
+            // build.gradle.kts) means this stays null: refreshManifest()
+            // becomes a no-op, and manifestRepository is driven ONLY by its
+            // embedded bootstrap/whatever LKG already exists on disk. Never
+            // constructed against a blank URL (HttpsRemoteManifestFetcher
+            // would just fail every request, which is a worse failure mode
+            // than "clearly not configured").
+            val manifestDistributionClient = BuildConfig.MANIFEST_URL.takeIf { it.isNotBlank() }?.let { url ->
+                net.pocvpn.client.reachability.ManifestDistributionClient(
+                    net.pocvpn.client.reachability.HttpsRemoteManifestFetcher(url),
+                    manifestRepository,
+                )
+            }
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -1081,9 +1238,10 @@ class MainViewModel(
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see
                 // reachabilityDiagnostics()'s own docs for why this cannot
                 // change automatic selection in this slice.
-                manifestRepository = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createManifestRepository(context),
+                manifestRepository = manifestRepository,
                 pathHistoryStore = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createPathHistoryStore(context),
                 fingerprintKeyProvider = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createFingerprintKeyProvider(context),
+                manifestDistributionClient = manifestDistributionClient,
             ) as T
         }
     }
