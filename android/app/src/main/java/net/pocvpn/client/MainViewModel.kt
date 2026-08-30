@@ -16,6 +16,7 @@ import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.ClientKeyRepositoryFactory
+import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkProfiler
@@ -37,6 +38,7 @@ import net.pocvpn.client.smartconnect.RestrictionMonitor
 import net.pocvpn.client.smartconnect.SmartConnectCandidateSelector
 import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
+import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportDescriptor
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportRegistry
@@ -46,6 +48,7 @@ import net.pocvpn.client.vpn.AndroidReconnectManager
 import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.ReconnectManager
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.VlessRealityTransport
 import net.pocvpn.client.vpn.VpnController
 import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.BuildConfigGatewaySource
@@ -144,6 +147,22 @@ class MainViewModel(
     // wire TransportRegistry/Smart Connect/VlessRealityTransport/
     // NovaXrayVpnService - see XrayProfileProvisioner's own docs.
     private val xrayProfileProvisioner: XrayProfileProvisioner? = null,
+    // B8I7 - additive, defaults to null (same reasoning as gatewayConfigOverride/
+    // profileStore above): when non-null, this is the SAME real
+    // VlessRealityTransport instance registered in BOTH the Smart Connect
+    // registry (buildTransportRegistry below) AND handed to VpnController as
+    // its resolvable XRAY_REALITY executor - never a second, independently-
+    // constructed instance. Still requires xrayAvailable (see below) before
+    // its descriptor is ever AVAILABLE - constructing it is not the same as
+    // it being usable.
+    private val xrayTransport: VpnTransport? = null,
+    // B8I7 - additive, defaults to null: the SAME XrayProfileRepository
+    // instance xrayProfileProvisioner/VpnController/xrayTransport already
+    // read from (see Factory) - used ONLY to check, at startup and again
+    // the instant a fresh provisioning succeeds, whether a real persisted
+    // Xray profile actually exists, so xrayTransport's registry-descriptor
+    // availability reflects reality rather than a hardcoded true.
+    private val xrayProfileRepository: XrayProfileRepository? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -156,6 +175,7 @@ class MainViewModel(
         appRoutingPolicyStore = appRoutingPolicyStore ?: AppRoutingPolicyStore.allApps(),
         installedPackageChecker = installedPackageChecker ?: InstalledPackageChecker.alwaysInstalled(),
         connectionOutcomeStore = connectionOutcomeStore,
+        xrayProfileRepository = xrayProfileRepository,
     )
 
     // B8I - CURRENT network facts only (see NetworkProfile's own docs for
@@ -165,24 +185,46 @@ class MainViewModel(
     val networkProfile: StateFlow<NetworkProfile> =
         networkProfiler?.profile ?: MutableStateFlow(initialNetworkProfile ?: NetworkProfile.unavailable(0)).asStateFlow()
 
-    // B8I1 - built ONCE from the SAME real `transport` VpnController uses
-    // (never a second/independent instance) - the registry
-    // SmartConnectCandidateSelector's reused SmartConnectDecisionEngine
-    // consults for transport availability. Single-descriptor by
-    // construction (see class docs - "Do NOT implement transport switching
-    // yet"), but this is the SAME TransportRegistry shape a future
-    // multi-transport registry would slot into without a VpnController
-    // rewrite - see TransportRegistry's own docs.
-    private val transportRegistry = TransportRegistry.build(
-        listOf(TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport })),
-    )
+    // B8I7 - flips true the moment a real Xray profile is CONFIRMED to
+    // exist: checked once at startup (init block below, for a profile
+    // persisted by a PRIOR session) and again the instant activateDevice()
+    // saves a fresh one (XrayProfileProvisioningOutcome.Saved, below) -
+    // never polled, never inferred from elapsed time. buildTransportRegistry()
+    // reads this synchronously (a plain StateFlow.value read) so the
+    // registry it builds always reflects the CURRENT truth.
+    private val xrayAvailable = MutableStateFlow(false)
 
-    // B8I3 - the ONE execution-side resolver, built from the SAME registry
-    // smartConnectDecision() itself consults - never a second/independent
-    // registry. TransportOrchestrator does not call SmartConnectDecisionEngine
-    // itself (see its own docs) - connect() below only ever hands it a
-    // decision this ViewModel already obtained from smartConnectDecision().
-    private val transportOrchestrator = TransportOrchestrator(transportRegistry)
+    /**
+     * B8I1/B8I7 - built FRESH on every call (never cached as a field) so
+     * XRAY_REALITY's AVAILABLE/NOT_IMPLEMENTED status always reflects the
+     * CURRENT [xrayAvailable] signal, same "no caching" discipline
+     * [smartConnectDecision] itself already documents. The factory closures
+     * always return the SAME already-constructed `transport`/[xrayTransport]
+     * instances - rebuilding this registry object never constructs a new
+     * transport instance, so selection (smartConnectDecision) and execution
+     * (connect()'s own orchestrator, built from THIS SAME function) can
+     * never end up looking at two different Xray instances.
+     *
+     * `internal` (not private) so tests can inspect the exact descriptors
+     * this produces directly, without needing a real Android Context to
+     * drive smartConnectDecision()/connect() end to end.
+     */
+    internal fun buildTransportRegistry(): TransportRegistry {
+        val descriptors = mutableListOf(
+            TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport }),
+        )
+        val xray = xrayTransport
+        if (xray != null) {
+            val available = xrayAvailable.value
+            descriptors += TransportDescriptor(
+                kind = xray.kind,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) xray.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ xray }) else null,
+            )
+        }
+        return TransportRegistry.build(descriptors)
+    }
 
     /**
      * B8I1 - THE single call site for THE ONE Smart Connect decision
@@ -190,17 +232,14 @@ class MainViewModel(
      * SmartConnectDecisionEngine for the transport sub-decision - see both
      * classes' own docs). Recomputed fresh from CURRENT network/gateway
      * facts on every read (same no-caching pattern as gatewayStatus()
-     * below) - never a stale cached decision. Only ever returns AWG +
-     * Frankfurt today (exactly one real transport x one real gateway
-     * exists) - restrictionClass() below is carried through TRUTHFULLY
-     * (see ConnectionScore's own docs) but never changes WHICH candidate is
-     * selected, since there is nothing else to select - no fake transport
-     * switching.
+     * below) - never a stale cached decision. restrictionClass() below is
+     * carried through TRUTHFULLY (see ConnectionScore's own docs) but never
+     * changes WHICH candidate is selected - no restriction-driven switching.
      */
     fun smartConnectDecision(): SmartConnectDecision = SmartConnectCandidateSelector.decide(
         networkProfile = networkProfile.value,
         gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
-        registry = transportRegistry,
+        registry = buildTransportRegistry(),
         connectionHistory = recentConnectionOutcomes(),
         restrictionClass = restrictionClass(),
     )
@@ -286,6 +325,20 @@ class MainViewModel(
             _publicKey.value = clientKeyRepository.getPublicKey()
         }
         restorePersistedProfile()
+        // B8I7 - one-time startup check: does a real Xray profile already
+        // exist from a PRIOR session? Never polled again after this - the
+        // only other place xrayAvailable changes is the real
+        // XrayProfileProvisioningOutcome.Saved event in activateDevice()
+        // below.
+        xrayProfileRepository?.let { repository ->
+            viewModelScope.launch {
+                xrayAvailable.value = try {
+                    repository.getProfileOrNull() != null
+                } catch (t: Throwable) {
+                    false
+                }
+            }
+        }
         // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
         // onCleared lifecycle (see VpnController's own reconnectManager.start
         // call and this class's onCleared below) - registered exactly once
@@ -393,8 +446,16 @@ class MainViewModel(
                     // stored Xray profile completely untouched - see
                     // XrayProfileProvisioner's own docs.
                     xrayProfileProvisioner?.let { provisioner ->
-                        _xrayProfileProvisioningState.value = withContext(ioDispatcher) {
+                        val outcome = withContext(ioDispatcher) {
                             provisioner.provision(key, trimmedCredential)
+                        }
+                        _xrayProfileProvisioningState.value = outcome
+                        if (outcome == XrayProfileProvisioningOutcome.Saved) {
+                            // B8I7 - the real, event-driven moment Xray
+                            // becomes selectable - never polled, never
+                            // inferred from elapsed time (see xrayAvailable's
+                            // own docs).
+                            xrayAvailable.value = true
                         }
                     }
                     ProvisioningUiState.Success(result)
@@ -414,29 +475,32 @@ class MainViewModel(
     fun gatewayStatus(): GatewayConfiguration = controller.gatewayStatus()
 
     /**
-     * B8I4 - Smart Connect preflight: a fresh smartConnectDecision() (THE
-     * single decision authority - see that function's own docs) is obtained
-     * immediately before every connect attempt. For a Selected decision, the
-     * ALREADY-selected kind is handed to transportOrchestrator.resolve() -
-     * this never re-derives a choice, it only turns an existing choice into
-     * a real VpnTransport (or a typed reason it can't - see
-     * TransportOrchestrator's own docs). A resolved candidate is now handed
-     * STRAIGHT to controller.connect(resolution) - VpnController itself is
-     * the one place that validates whether IT can safely execute that exact
+     * B8I4/B8I7 - Smart Connect preflight: a fresh smartConnectDecision()
+     * (THE single decision authority - see that function's own docs) is
+     * obtained immediately before every connect attempt. The ALREADY-
+     * selected kind is then handed to a TransportOrchestrator built from a
+     * SECOND buildTransportRegistry() call - two separate registry OBJECTS,
+     * but built back-to-back with no suspension in between and from the
+     * exact same underlying state (xrayAvailable.value, the transport
+     * instances themselves), so they are guaranteed to describe the SAME
+     * availability/instances - selection and execution can never disagree
+     * within one connect() attempt. A resolved candidate is handed STRAIGHT to
+     * controller.connect(resolution) - VpnController itself is the one
+     * place that validates whether IT can safely execute that exact
      * resolution (per-attempt execution boundary - see its own docs) and
-     * fails closed via rejectPreflight() if not; this ViewModel no longer
-     * duplicates that "is this AWG and this controller's own instance" check.
-     * Every other outcome (NoCandidateAvailable, or an unresolvable kind)
-     * still fails closed here via VpnController.rejectPreflight() before
-     * controller.connect() is ever reached - no VPN permission is requested,
-     * no VPN service is started.
+     * fails closed via rejectPreflight() if not. Every other outcome
+     * (NoCandidateAvailable, or an unresolvable kind) still fails closed
+     * here via VpnController.rejectPreflight() before controller.connect()
+     * is ever reached - no VPN permission is requested, no VPN service is
+     * started.
      */
     fun connect() {
         viewModelScope.launch {
             when (val decision = smartConnectDecision()) {
                 is SmartConnectDecision.Selected -> {
                     val kind = decision.score.candidate.transport.kind
-                    when (val resolution = transportOrchestrator.resolve(TransportSelectionDecision.SelectTransport(kind))) {
+                    val orchestrator = TransportOrchestrator(buildTransportRegistry())
+                    when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind))) {
                         is TransportOrchestrator.Resolution.Resolved -> controller.connect(resolution)
                         is TransportOrchestrator.Resolution.NotSelectable -> {
                             controller.rejectPreflight(
@@ -501,6 +565,11 @@ class MainViewModel(
             // specific rather than something a cross-device restore should
             // silently reapply.
             val connectionOutcomeStore = FileConnectionOutcomeStore(context.noBackupFilesDir)
+            // B8I7 - the ONE authoritative Xray profile repository instance -
+            // shared by the provisioner, VpnController's config builder, and
+            // xrayTransport's own pre-flight check (see each class's own
+            // docs) - never a second, independently-constructed store.
+            val xrayProfileRepository = XrayProfileRepositoryFactory.create(context)
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -517,10 +586,14 @@ class MainViewModel(
                 // B8J - the one pinned gateway's HTTPS probe (see its own
                 // docs) - default timeout/URL, no credentials/keys involved.
                 restrictionProbe = HttpsGatewayReachabilityProbe(),
-                // B8K4B - same real SecureXrayProfileRepository wiring
-                // NovaXrayVpnService reads from (see XrayProfileRepositoryFactory's
-                // own docs) - no new store, no plaintext persistence.
-                xrayProfileProvisioner = XrayProfileProvisioner(XrayProfileRepositoryFactory.create(context)),
+                xrayProfileProvisioner = XrayProfileProvisioner(xrayProfileRepository),
+                // B8I7 - the SAME real VlessRealityTransport instance is
+                // registered for BOTH Smart Connect selection
+                // (buildTransportRegistry) and execution
+                // (VpnController.connect(resolved)/TransportOrchestrator) -
+                // never a second, independently-constructed one.
+                xrayTransport = VlessRealityTransport(context, xrayProfileRepository),
+                xrayProfileRepository = xrayProfileRepository,
             ) as T
         }
     }

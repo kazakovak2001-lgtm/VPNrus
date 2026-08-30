@@ -3,27 +3,32 @@ package net.pocvpn.client.vpn
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
+import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
+import net.pocvpn.client.vpn.xray.XrayRuntimeState
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * B8K1B - VpnTransport wrapper around the isolated NovaXrayVpnService. This
- * class is intentionally NOT registered in TransportRegistry.defaults() -
- * TransportKind.XRAY_REALITY stays TransportStatus.NOT_IMPLEMENTED there, so
- * nothing in VpnController/TransportOrchestrator/Smart Connect can construct
- * or select this transport. It exists only so the debug-only manual test
- * entry point (see the `debug` source set) has a real VpnTransport to drive,
- * proving the service/runtime boundary end to end without touching
- * production selection logic.
+ * B8K1B - VpnTransport wrapper around NovaXrayVpnService. As of B8I7 this is
+ * registered as a real production Smart Connect candidate (see
+ * MainViewModel.buildTransportRegistry) whenever a persisted Xray profile is
+ * actually available - not only reachable from the debug-only manual entry
+ * point (see the `debug` source set) that first proved this boundary.
  *
  * B8K4C - the `config` parameter's embedded XrayVlessRealityConfig is
  * deliberately NOT what gets validated or used below (only its TYPE is
@@ -35,15 +40,17 @@ import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
  * against the SAME repository as a genuine pre-flight check - one
  * authoritative configuration source, never Intent extras.
  *
- * State fidelity limitation (honest, not a bug to "fix" casually): this
- * shell has no IPC/binder channel back from NovaXrayVpnService reporting
- * real core status, unlike AmneziaWgTransport's Tunnel.onStateChange
- * callback. [observeState] therefore never reports [TransportState.Connected]
- * for a request that merely returned from startService() - it stays at
- * [TransportState.Connecting] ("request accepted"), not a confirmed Xray core
- * handshake/traffic state - that requires either the physical-device
- * verification described in docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md, or a real
- * service->transport status channel this slice does not add.
+ * B8I7 - a real, in-process, typed confirmation channel: [connect] assigns
+ * a fresh [sessionId] (an app-lifetime-monotonic counter - never a secret),
+ * threads it into the ACTION_START Intent as
+ * [NovaXrayVpnService.EXTRA_SESSION_ID], and observes [XrayRuntimeState]
+ * filtering for events tagged with THIS sessionId - see
+ * [XrayRuntimeEvent]/[XrayRuntimeState]'s own docs for why this, not
+ * polling/elapsed time, and why a stale/older session's event can never
+ * flip [state] here. [observeState] therefore only ever reports
+ * [TransportState.Connected] after NovaXrayVpnService's own
+ * XrayCoreStartOutcome.Started - a REAL positive confirmation the Xray core
+ * actually started, never merely because startService() returned.
  */
 class VlessRealityTransport(
     private val context: Context,
@@ -60,6 +67,14 @@ class VlessRealityTransport(
     override val capabilities: TransportCapabilities = TransportCapabilities.xrayRealityAdapterShell()
 
     private val state = MutableStateFlow<TransportState>(TransportState.Disconnected)
+
+    // B8I7 - a private, isolated scope: this class has no ViewModel/Activity
+    // lifecycle of its own to piggyback on (it is a long-lived singleton
+    // collaborator, constructed once in MainViewModel.Factory), so it owns
+    // exactly one background job for observing XrayRuntimeState, replaced
+    // (never doubled) on every fresh connect() attempt.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var observerJob: Job? = null
 
     override fun preparePermissionIntent(): Intent? = VpnService.prepare(context)
 
@@ -79,27 +94,81 @@ class VlessRealityTransport(
             is XrayRuntimeResolution.Ready -> Unit
         }
 
+        // B8I7 - a FRESH session id for THIS attempt, and a FRESH observer
+        // filtering on it - the previous attempt's observer (if any) is
+        // cancelled first so an event tagged with an OLDER sessionId can
+        // never be delivered to (let alone accepted by) this new one; the
+        // sessionId check inside the collector is a second, redundant guard
+        // against the same race switchActiveTransport's own docs describe
+        // (cancel() takes effect at the next suspension point, not
+        // necessarily synchronously).
+        val sessionId = nextSessionId.incrementAndGet()
+        observerJob?.cancel()
+        observerJob = scope.launch {
+            XrayRuntimeState.events.collect { event ->
+                xrayTransportStateFor(event, sessionId)?.let { state.value = it }
+            }
+        }
+
         state.value = TransportState.Connecting
         try {
-            val intent = Intent(context, NovaXrayVpnService::class.java).setAction(NovaXrayVpnService.ACTION_START)
+            val intent = Intent(context, NovaXrayVpnService::class.java)
+                .setAction(NovaXrayVpnService.ACTION_START)
+                .putExtra(NovaXrayVpnService.EXTRA_SESSION_ID, sessionId)
             context.startService(intent)
-            // See this class's own docs: no confirmation channel yet - stays
-            // Connecting (request accepted only), never a fabricated Connected.
+            // Real confirmation arrives asynchronously via XrayRuntimeState
+            // (see the observer above) - never claim Connected merely
+            // because startService() returned.
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "connect failed", t)
         }
     }
 
     override suspend fun disconnect() {
+        if (state.value is TransportState.Error) {
+            // B8I7 - a prior connect() attempt already failed and
+            // NovaXrayVpnService already self-stopped (Rejected/
+            // EstablishFailed/CoreStartFailed all call stopSelf()) - there is
+            // nothing left running to tear down, and no Stopped event will
+            // ever arrive for that session. Reflect that directly instead of
+            // sending ACTION_STOP and hanging at Disconnecting forever.
+            state.value = TransportState.Disconnected
+            return
+        }
         state.value = TransportState.Disconnecting
         try {
             val intent = Intent(context, NovaXrayVpnService::class.java).setAction(NovaXrayVpnService.ACTION_STOP)
             context.startService(intent)
-            state.value = TransportState.Disconnected
+            // Real confirmation (Stopped, tagged with the SAME sessionId
+            // connect() is still observing) arrives via the SAME observer
+            // job connect() already started - deliberately does NOT force
+            // Disconnected here.
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "disconnect failed", t)
         }
     }
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
+
+    private companion object {
+        val nextSessionId = AtomicLong(0)
+    }
+}
+
+/**
+ * B8I7 - pure mapping: does THIS [event] (matched by [sessionId]) become a
+ * new [TransportState], or is it stale/irrelevant (a null event, or one
+ * tagged with a DIFFERENT session) and therefore must be ignored? This is
+ * the exact crux of "a stale/old service event can never mark a newer Xray
+ * session Connected" - kept as a free function (not inlined into
+ * connect()'s collector) so it is unit-testable on the plain JVM with no
+ * Context, mirroring isFreshHandshake's own reasoning in VpnController.kt.
+ */
+internal fun xrayTransportStateFor(event: XrayRuntimeEvent?, sessionId: Long): TransportState? {
+    if (event == null || event.sessionId != sessionId) return null
+    return when (event) {
+        is XrayRuntimeEvent.Started -> TransportState.Connected
+        is XrayRuntimeEvent.Failed -> TransportState.Error(event.reason)
+        is XrayRuntimeEvent.Stopped -> TransportState.Disconnected
+    }
 }

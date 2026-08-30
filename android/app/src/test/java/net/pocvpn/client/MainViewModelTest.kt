@@ -21,11 +21,15 @@ import net.pocvpn.client.provisioning.toXrayProfile
 import net.pocvpn.client.smartconnect.ConnectionScoreReason
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.SmartConnectDecision
+import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.transport.TransportOrchestrator
+import net.pocvpn.client.transport.TransportStatus
 import net.pocvpn.client.vpn.FakeClientKeyRepository
 import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeVpnTransport
+import net.pocvpn.client.vpn.FakeXrayProfileRepository
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.DefaultGatewayConfigurationRepository
@@ -39,6 +43,7 @@ import net.pocvpn.client.vpn.config.ProfileSource
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -639,5 +644,130 @@ class MainViewModelTest {
         // disconnect() - the ONLY connect() call above is the explicit user one.
         assertEquals(1, transport.connectCallCount)
         assertEquals(0, transport.disconnectCallCount)
+    }
+
+    // --- B8I7: production Xray registration + trustworthy Xray connection-state signal ---
+
+    @Test
+    fun `buildTransportRegistry registers exactly one real XRAY_REALITY transport once a profile is available`() = runTest {
+        val transport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(SAMPLE_XRAY_PROFILE_SUCCESS.toXrayProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = xrayRepository,
+        )
+        testDispatcher.scheduler.runCurrent() // let init's startup xrayAvailable check complete
+
+        val registry = viewModel.buildTransportRegistry()
+
+        val xrayDescriptor = registry.descriptorFor(TransportKind.XRAY_REALITY)
+        assertEquals(TransportStatus.AVAILABLE, xrayDescriptor?.status)
+        // The registered instance IS the exact one this ViewModel was given -
+        // never a second/independently-constructed one.
+        assertEquals(xrayTransport, registry.createTransport(TransportKind.XRAY_REALITY))
+        // AWG's own descriptor is completely unaffected by Xray being wired.
+        assertEquals(TransportStatus.AVAILABLE, registry.descriptorFor(TransportKind.AMNEZIA_WG)?.status)
+        assertEquals(transport, registry.createTransport(TransportKind.AMNEZIA_WG))
+    }
+
+    @Test
+    fun `XRAY_REALITY stays NOT_IMPLEMENTED - never a hardcoded true - when no Xray profile is available`() = runTest {
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(profile = null)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = xrayRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val registry = viewModel.buildTransportRegistry()
+
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.XRAY_REALITY)?.status)
+        assertNull(registry.createTransport(TransportKind.XRAY_REALITY))
+    }
+
+    @Test
+    fun `TransportOrchestrator resolves the exact registered XRAY_REALITY transport instance`() = runTest {
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(SAMPLE_XRAY_PROFILE_SUCCESS.toXrayProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = xrayRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val orchestrator = TransportOrchestrator(viewModel.buildTransportRegistry())
+        val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY))
+
+        assertTrue(resolution is TransportOrchestrator.Resolution.Resolved)
+        assertEquals(xrayTransport, (resolution as TransportOrchestrator.Resolution.Resolved).transport)
+    }
+
+    @Test
+    fun `AWG registry entry and connect behavior are unchanged when Xray is also wired but unavailable`() = runTest {
+        val transport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(profile = null),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(0, xrayTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Xray becomes available the instant a profile is provisioned - never polled, never a startup-only check`() = runTest {
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(profile = null)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "DEVICE_PUBLIC_KEY_ABCDEFGHIJKLMNOPQRSTUVWXYZ0="),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            ioDispatcher = testDispatcher,
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _ -> SAMPLE_XRAY_PROFILE_SUCCESS },
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = xrayRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        // Before provisioning: no profile exists yet, so Xray is not selectable.
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, viewModel.buildTransportRegistry().descriptorFor(TransportKind.XRAY_REALITY)?.status)
+
+        viewModel.activateDevice("some-activation-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(XrayProfileProvisioningOutcome.Saved, viewModel.xrayProfileProvisioningState.value)
+        assertEquals(TransportStatus.AVAILABLE, viewModel.buildTransportRegistry().descriptorFor(TransportKind.XRAY_REALITY)?.status)
     }
 }
