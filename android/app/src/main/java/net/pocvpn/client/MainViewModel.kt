@@ -250,6 +250,27 @@ class MainViewModel(
     // activateDevice() success), same "never polled" discipline.
     private val xrayTlsAvailable = MutableStateFlow(false)
 
+    // B8O2-ops - debug-only override of [userTransportPreference], null by
+    // default so production behavior (the constructor-supplied preference,
+    // always Auto today - see Factory below) is completely unaffected. This
+    // is the ONLY way to reach UserTransportPreference.Manual(TLS_TCP)
+    // today (no product UI exposes transport selection yet) - it exercises
+    // the EXISTING, already-safe SmartConnectDecisionEngine.decideManual
+    // code path (the same one a future real "choose transport" screen would
+    // use), never a bespoke bypass of connect()'s own resolution/support
+    // checks. Does NOT change Auto's own PREFERRED_ORDER or
+    // AwgXrayFailoverPolicy - no new automatic TLS failover is introduced by
+    // this override existing.
+    private val _debugTransportPreferenceOverride = MutableStateFlow<UserTransportPreference?>(null)
+    val debugTransportPreferenceOverride: StateFlow<UserTransportPreference?> = _debugTransportPreferenceOverride.asStateFlow()
+    private val effectiveTransportPreference: UserTransportPreference
+        get() = _debugTransportPreferenceOverride.value ?: userTransportPreference
+
+    /** Debug-only - see [_debugTransportPreferenceOverride]'s own docs. */
+    fun debugSetTransportPreference(preference: UserTransportPreference?) {
+        _debugTransportPreferenceOverride.value = preference
+    }
+
     /**
      * B8O3 - the kind of the transport actually running/last attempted
      * (VpnController.currentTransportKind - set only when a resolved,
@@ -355,7 +376,7 @@ class MainViewModel(
         networkProfile = networkProfile.value,
         gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
         registry = buildTransportRegistry(),
-        preference = userTransportPreference,
+        preference = effectiveTransportPreference,
         health = transportHealth(),
         connectionHistory = recentConnectionOutcomes(),
         restrictionClass = restrictionClass(),
@@ -470,6 +491,16 @@ class MainViewModel(
     // for what each state means.
     private val _xrayProfileProvisioningState = MutableStateFlow<XrayProfileProvisioningOutcome?>(null)
     val xrayProfileProvisioningState: StateFlow<XrayProfileProvisioningOutcome?> = _xrayProfileProvisioningState.asStateFlow()
+
+    // B8O2-ops - the outcome of the LAST standalone provisionTlsProfile()
+    // call (see that function's own docs). Separate from
+    // xrayProfileProvisioningState above since this can be triggered
+    // independently of a fresh AWG activation (a device already activated
+    // in an earlier session has no reachable ActivationScreen - see
+    // screenFor's own gate - so this is the only way such a device can
+    // (re)fetch its TLS profile without a destructive reset).
+    private val _tlsProfileProvisioningState = MutableStateFlow<XrayProfileProvisioningOutcome?>(null)
+    val tlsProfileProvisioningState: StateFlow<XrayProfileProvisioningOutcome?> = _tlsProfileProvisioningState.asStateFlow()
 
     init {
         viewModelScope.launch {
@@ -655,6 +686,43 @@ class MainViewModel(
         }
     }
 
+    /**
+     * B8O2-ops - debug-only standalone TLS profile (re)fetch for a device
+     * that is ALREADY activated (see DiagnosticsDialog's own gate - this is
+     * only ever reachable from the debug diagnostics surface, never the
+     * normal onboarding flow). Reuses the EXISTING device identity/public
+     * key and the EXISTING [xrayTlsProfileProvisioner] - creates no new
+     * activation, no new identity, and never touches AWG/REALITY state.
+     * Exists specifically because a device activated in an earlier session
+     * has no reachable [net.pocvpn.client.ui.screens.ActivationScreen] (see
+     * `screenFor`'s own profileSource gate) to re-run [activateDevice]
+     * through, yet the SAME activation credential is exactly what
+     * POST /v1/xray-profile?transport=tls still requires - this is the
+     * narrowest addition that lets an already-activated device obtain a TLS
+     * profile without a destructive identity reset.
+     */
+    fun provisionTlsProfile(activationCredential: String) {
+        val trimmedCredential = activationCredential.trim()
+        val provisioner = xrayTlsProfileProvisioner
+        val key = _publicKey.value
+        if (trimmedCredential.isEmpty() || provisioner == null || key == null) {
+            _tlsProfileProvisioningState.value = XrayProfileProvisioningOutcome.Malformed("credential/public key/provisioner not ready")
+            return
+        }
+        viewModelScope.launch {
+            val outcome = withContext(ioDispatcher) { provisioner.provision(key, trimmedCredential) }
+            _tlsProfileProvisioningState.value = outcome
+            if (outcome == XrayProfileProvisioningOutcome.Saved) {
+                val repository = xrayTlsProfileRepository
+                if (repository != null) {
+                    // B8O2 fix - same single validation authority as the
+                    // startup/activateDevice paths (see their own docs).
+                    xrayTlsAvailable.value = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
+                }
+            }
+        }
+    }
+
     fun gatewayStatus(): GatewayConfiguration = controller.gatewayStatus()
 
     /**
@@ -717,7 +785,7 @@ class MainViewModel(
                             val permissionPending = resolution.transport.preparePermissionIntent() != null
                             val attempt = PendingFailoverAttempt(
                                 initialKind = kind,
-                                preference = userTransportPreference,
+                                preference = effectiveTransportPreference,
                                 registry = registry,
                                 orchestrator = orchestrator,
                             )

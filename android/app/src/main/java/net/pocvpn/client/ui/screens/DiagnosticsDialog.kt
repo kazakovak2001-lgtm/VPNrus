@@ -7,8 +7,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -17,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import net.pocvpn.client.R
@@ -47,6 +51,29 @@ fun DiagnosticsDialog(
     onCopyPublicKey: () -> Unit,
     onRegenerateIdentity: () -> Unit,
     onDismiss: () -> Unit,
+    // B8O2-ops - additive, defaults so the widely-used call shape above
+    // (onCopyPublicKey/onRegenerateIdentity/onDismiss only) stays valid:
+    // a minimal standalone TLS-profile-fetch action for a device that is
+    // ALREADY activated and therefore has no reachable ActivationScreen -
+    // see MainViewModel.provisionTlsProfile's own docs for why this exists
+    // instead of reusing that screen. Never touches AWG/REALITY identity or
+    // activation state - the credential typed here exists only for the
+    // duration of one onProvisionTlsProfile(credential) call, the same
+    // "never stored" discipline ActivationScreen's own credential field uses.
+    tlsCredential: String = "",
+    onTlsCredentialChange: (String) -> Unit = {},
+    onProvisionTlsProfile: (String) -> Unit = {},
+    tlsProvisioningResultText: String? = null,
+    // B8O2-ops - additive, defaults so the widely-used call shape stays
+    // valid. No product UI exposes transport selection yet (Smart Connect
+    // Auto is the only wired preference - see MainViewModel's own docs) -
+    // this is a debug-only way to reach the EXISTING, already-safe
+    // UserTransportPreference.Manual(TLS_TCP) path for physical-device
+    // verification, never a new automatic selection/failover rule.
+    transportPreferenceOverrideText: String = "Auto",
+    onForceManualTlsTcp: () -> Unit = {},
+    onForceManualReality: () -> Unit = {},
+    onClearTransportPreferenceOverride: () -> Unit = {},
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
 
@@ -92,6 +119,48 @@ fun DiagnosticsDialog(
                 TextButton(onClick = onRegenerateIdentity, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_regenerate_identity))
                 }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = tlsCredential,
+                    onValueChange = onTlsCredentialChange,
+                    label = { Text(stringResource(R.string.diagnostics_tls_credential_label)) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        cursorColor = MaterialTheme.colorScheme.primary,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                tlsProvisioningResultText?.let {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(text = it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                TextButton(
+                    onClick = { onProvisionTlsProfile(tlsCredential) },
+                    enabled = tlsCredential.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.diagnostics_provision_tls_button))
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Transport preference override: $transportPreferenceOverrideText",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(onClick = onForceManualTlsTcp, modifier = Modifier.fillMaxWidth()) {
+                    Text("Force Manual TLS_TCP (debug only)")
+                }
+                TextButton(onClick = onForceManualReality, modifier = Modifier.fillMaxWidth()) {
+                    Text("Force Manual XRAY_REALITY (debug only)")
+                }
+                TextButton(onClick = onClearTransportPreferenceOverride, modifier = Modifier.fillMaxWidth()) {
+                    Text("Clear override - use Auto (debug only)")
+                }
+
                 TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_close))
                 }
