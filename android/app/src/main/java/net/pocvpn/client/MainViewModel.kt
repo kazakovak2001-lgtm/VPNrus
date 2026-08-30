@@ -243,7 +243,44 @@ class MainViewModel(
     // selectedGateway/selectGateway() below, never a second, competing
     // source of truth for the actual connect-time config).
     private val selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = net.pocvpn.client.vpn.config.SelectedGatewayStore.germanyOnly(),
+    // B13 review fix - additive, defaults to null (same "no wiring, no
+    // behavior" seam as every other optional dependency above). When
+    // non-null, this is the SAME per-device ClientTunnelIdentityStore
+    // instance the Factory's real SelectedProductionGatewaySource already
+    // resolves clientTunnelIp() from (see that class's own docs) - never a
+    // second, independently-constructed store that could disagree with
+    // what connect() actually resolves. Drives isGatewayProvisioned()/
+    // provisionedGatewayIds below AND the startup reconciliation the
+    // _selectedGateway initializer runs. With no store wired, every
+    // gateway is treated as provisioned - byte-for-byte unchanged
+    // behavior for every pre-existing call site/test.
+    private val clientTunnelIdentityStore: net.pocvpn.client.vpn.config.ClientTunnelIdentityStore? = null,
 ) : ViewModel() {
+
+    /**
+     * B13 review fix - whether THIS DEVICE has a client tunnel identity
+     * provisioned for [id] (see ClientTunnelIdentityStore's own docs) -
+     * i.e. whether [id] is actually connectable, not merely a catalog
+     * entry. With no store wired ([clientTunnelIdentityStore] null), every
+     * gateway is considered provisioned.
+     */
+    fun isGatewayProvisioned(id: net.pocvpn.client.vpn.config.ProductionGatewayId): Boolean {
+        val store = clientTunnelIdentityStore ?: return true
+        return store.read(id) != null
+    }
+
+    /**
+     * The subset of [net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all]
+     * this device can actually connect to right now - GatewayPickerDialog
+     * uses this to decide which rows to disable. The catalog itself stays
+     * fully visible regardless (see that dialog's own docs) - this is
+     * readiness, never a second, competing gateway list.
+     */
+    val provisionedGatewayIds: Set<net.pocvpn.client.vpn.config.ProductionGatewayId>
+        get() = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all
+            .map { it.id }
+            .filter(::isGatewayProvisioned)
+            .toSet()
 
     // B13 - the CURRENT manual gateway selection, for the UI (LocationCard/
     // the gateway picker) to render and react to. Read once at construction
@@ -253,8 +290,34 @@ class MainViewModel(
     // every get() regardless of this StateFlow's value (see
     // SelectedProductionGatewaySource's own docs), so this is purely a UI
     // convenience, never a second authoritative copy.
-    private val _selectedGateway = MutableStateFlow(selectedGatewayStore.read())
+    //
+    // B13 review fix - reconciled through reconcileSelectedGateway() below
+    // rather than the raw store read: a PERSISTED selection this device
+    // turns out not to be provisioned for (e.g. Stockholm was selected
+    // before this device's Stockholm identity was ever set, or the
+    // evidence-based migration left it unprovisioned) is deterministically
+    // switched to another provisioned gateway - and that switch is
+    // PERSISTED too, so it survives a restart rather than re-drifting back
+    // every launch. If NO gateway is provisioned, the persisted selection
+    // is left exactly as read: no identity is invented, no gateway is
+    // substituted as a guess, and the existing fail-closed connect-time
+    // validation (DefaultGatewayConfigurationRepository - blank
+    // clientTunnelIp() -> Invalid, never a silent default) is preserved
+    // untouched.
+    private val _selectedGateway = MutableStateFlow(reconcileSelectedGateway(selectedGatewayStore.read()))
     val selectedGateway: StateFlow<net.pocvpn.client.vpn.config.ProductionGatewayId> = _selectedGateway.asStateFlow()
+
+    private fun reconcileSelectedGateway(
+        persisted: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    ): net.pocvpn.client.vpn.config.ProductionGatewayId {
+        if (isGatewayProvisioned(persisted)) return persisted
+        val fallback = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all
+            .map { it.id }
+            .firstOrNull(::isGatewayProvisioned)
+            ?: return persisted
+        selectedGatewayStore.write(fallback)
+        return fallback
+    }
 
     /**
      * B13 - THE one place a manual gateway selection is made. Deterministic:
@@ -267,8 +330,15 @@ class MainViewModel(
      * updateAppRoutingPolicy's own docs) - a currently active session keeps
      * running on whichever gateway it already connected to until the user
      * disconnects/reconnects.
+     *
+     * B13 review fix - a no-op for an [id] this device has no client tunnel
+     * identity for (see [isGatewayProvisioned]): GatewayPickerDialog itself
+     * already disables that row's tap target/RadioButton (see its own
+     * docs), and this is the same guard enforced again at the one real
+     * selection boundary, never relying on the UI alone.
      */
     fun selectGateway(id: net.pocvpn.client.vpn.config.ProductionGatewayId) {
+        if (!isGatewayProvisioned(id)) return
         selectedGatewayStore.write(id)
         _selectedGateway.value = id
     }
@@ -1338,6 +1408,12 @@ class MainViewModel(
                 diagnosticsStore = DiagnosticsStore(),
                 gatewayConfigOverride = gatewayConfigSource,
                 selectedGatewayStore = selectedGatewayStore,
+                // B13 review fix - the SAME instance selectedProductionGatewaySource
+                // above already resolves clientTunnelIp() from, so
+                // isGatewayProvisioned()/provisionedGatewayIds/the startup
+                // reconciliation this feeds ALWAYS agree with what a real
+                // connect() attempt would actually resolve.
+                clientTunnelIdentityStore = clientTunnelIdentityStore,
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 installedPackageChecker = AndroidInstalledPackageChecker(context),

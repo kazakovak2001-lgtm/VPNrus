@@ -24,6 +24,10 @@
     <!-- Gateway picker -->
     <string name="gateway_picker_title">Choose a server</string>
     <string name="gateway_picker_close">Close</string>
+    <!-- B13 review fix - shown instead of the city label for a gateway this
+         specific device has no client tunnel identity for (see
+         ClientTunnelIdentityStore's own docs) - that row is disabled. -->
+    <string name="gateway_picker_unavailable">Unavailable on this device</string>
 
     <!-- Settings / split tunneling -->
     <string name="settings_title">Settings</string>

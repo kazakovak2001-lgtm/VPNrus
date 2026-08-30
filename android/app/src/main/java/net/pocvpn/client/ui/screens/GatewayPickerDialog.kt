@@ -24,17 +24,30 @@ import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 
 /**
- * B13 - the real gateway picker: lists every [ProductionGatewayDescriptor]
- * in [options] (today Germany and Stockholm), radio-selected against
- * [current], and calls [onSelect] with a DETERMINISTIC choice - the tapped
- * row's own id, never inferred/derived. Selection alone does not
- * reconnect/touch the tunnel (see MainViewModel.selectGateway's own docs) -
- * this dialog is purely the input surface.
+ * B13 - the real gateway picker: lists EVERY [ProductionGatewayDescriptor]
+ * in [options] (today Germany and Stockholm) - the catalog stays fully
+ * visible regardless of readiness - radio-selected against [current], and
+ * calls [onSelect] with a DETERMINISTIC choice - the tapped row's own id,
+ * never inferred/derived. Selection alone does not reconnect/touch the
+ * tunnel (see MainViewModel.selectGateway's own docs) - this dialog is
+ * purely the input surface.
+ *
+ * B13 review fix - [provisionedGatewayIds] is THIS DEVICE'S actual
+ * readiness (MainViewModel.provisionedGatewayIds, itself sourced from
+ * ClientTunnelIdentityStore - see that class's own docs for why this is
+ * per-device, not a gateway/catalog fact). A gateway NOT in that set has no
+ * client tunnel identity on this device and is rendered disabled - its row
+ * is not clickable, its RadioButton is disabled, and its city label is
+ * replaced with an explicit "unavailable" string - neither the row's
+ * `clickable` modifier nor the RadioButton's `onClick` invoke [onSelect]
+ * for it. A provisioned gateway is completely unaffected - normal tap
+ * target, normal label, normal onSelect.
  */
 @Composable
 fun GatewayPickerDialog(
     current: ProductionGatewayId,
     options: List<ProductionGatewayDescriptor>,
+    provisionedGatewayIds: Set<ProductionGatewayId>,
     onSelect: (ProductionGatewayId) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -53,15 +66,21 @@ fun GatewayPickerDialog(
 
                 options.forEach { descriptor ->
                     val selected = descriptor.id == current
+                    val provisioned = descriptor.id in provisionedGatewayIds
+                    val rowModifier = Modifier
+                        .fillMaxWidth()
+                        .let { base -> if (provisioned) base.clickable { onSelect(descriptor.id) } else base }
+                        .padding(vertical = 8.dp)
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelect(descriptor.id) }
-                            .padding(vertical = 8.dp),
+                        modifier = rowModifier,
                     ) {
-                        RadioButton(selected = selected, onClick = { onSelect(descriptor.id) })
+                        RadioButton(
+                            selected = selected,
+                            enabled = provisioned,
+                            onClick = { if (provisioned) onSelect(descriptor.id) },
+                        )
                         Column {
                             // B13 - geographic labels only in normal
                             // user-facing UI: NO provider/ASN/infrastructure
@@ -72,10 +91,10 @@ fun GatewayPickerDialog(
                             Text(
                                 text = descriptor.displayCountry,
                                 style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
+                                color = if (provisioned) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                             Text(
-                                text = descriptor.displayCity,
+                                text = if (provisioned) descriptor.displayCity else stringResource(R.string.gateway_picker_unavailable),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )

@@ -16,10 +16,13 @@ import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayId
+import net.pocvpn.client.vpn.config.ClientTunnelIdentityStore
 import net.pocvpn.client.vpn.config.SelectedGatewayStore
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -58,13 +61,28 @@ private val USABLE_WIFI = net.pocvpn.client.network.NetworkProfile(
     vpnActive = false, generation = 1,
 )
 
-private fun newViewModel(store: SelectedGatewayStore) = MainViewModel(
+/** In-memory fake mirroring FileClientTunnelIdentityStore's own read()-returns-null-when-unset contract. */
+private class InMemoryClientTunnelIdentityStore(
+    initial: Map<ProductionGatewayId, String> = emptyMap(),
+) : ClientTunnelIdentityStore {
+    private val entries = initial.toMutableMap()
+    override fun read(id: ProductionGatewayId): String? = entries[id]
+    override fun write(id: ProductionGatewayId, clientTunnelIp: String) {
+        entries[id] = clientTunnelIp
+    }
+}
+
+private fun newViewModel(
+    store: SelectedGatewayStore,
+    identityStore: ClientTunnelIdentityStore? = null,
+) = MainViewModel(
     clientKeyRepository = FakeClientKeyRepository(),
     transport = FakeVpnTransport(),
     gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
     reconnectManager = FakeReconnectManager(),
     diagnosticsStore = DiagnosticsStore(),
     selectedGatewayStore = store,
+    clientTunnelIdentityStore = identityStore,
     initialNetworkProfile = USABLE_WIFI,
 )
 
@@ -134,5 +152,102 @@ class MainViewModelGatewaySelectionTest {
 
         assertEquals(ProductionGatewayCatalog.STOCKHOLM.endpointId.value, decision.score.candidate.gateway.id)
         assertNotEquals(ProductionGatewayCatalog.GERMANY.endpointId.value, decision.score.candidate.gateway.id)
+    }
+
+    // --- B13 review fix: gateway readiness (ClientTunnelIdentityStore-backed) ---
+
+    @Test
+    fun `no identity store wired - every gateway is treated as provisioned, unchanged pre-fix behavior`() {
+        val viewModel = newViewModel(InMemorySelectedGatewayStore())
+
+        assertTrue(viewModel.isGatewayProvisioned(ProductionGatewayId.GERMANY))
+        assertTrue(viewModel.isGatewayProvisioned(ProductionGatewayId.STOCKHOLM))
+        assertEquals(setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM), viewModel.provisionedGatewayIds)
+    }
+
+    @Test
+    fun `only Germany provisioned - Stockholm reports unprovisioned and is excluded from provisionedGatewayIds`() {
+        val identity = InMemoryClientTunnelIdentityStore(mapOf(ProductionGatewayId.GERMANY to "10.77.0.5"))
+        val viewModel = newViewModel(InMemorySelectedGatewayStore(), identity)
+
+        assertTrue(viewModel.isGatewayProvisioned(ProductionGatewayId.GERMANY))
+        assertFalse(viewModel.isGatewayProvisioned(ProductionGatewayId.STOCKHOLM))
+        assertEquals(setOf(ProductionGatewayId.GERMANY), viewModel.provisionedGatewayIds)
+    }
+
+    @Test
+    fun `both provisioned - both report provisioned and both are selectable`() {
+        val identity = InMemoryClientTunnelIdentityStore(
+            mapOf(ProductionGatewayId.GERMANY to "10.77.0.5", ProductionGatewayId.STOCKHOLM to "10.77.0.2")
+        )
+        val viewModel = newViewModel(InMemorySelectedGatewayStore(), identity)
+
+        assertEquals(setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM), viewModel.provisionedGatewayIds)
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+        assertEquals(ProductionGatewayId.STOCKHOLM, viewModel.selectedGateway.value)
+    }
+
+    @Test
+    fun `neither provisioned - provisionedGatewayIds is empty and selecting either gateway is a no-op`() {
+        val identity = InMemoryClientTunnelIdentityStore()
+        val store = InMemorySelectedGatewayStore()
+        val viewModel = newViewModel(store, identity)
+
+        assertEquals(emptySet<ProductionGatewayId>(), viewModel.provisionedGatewayIds)
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        // No identity anywhere - the persisted default (Germany) is left
+        // exactly as-is, never guessed at or substituted.
+        assertEquals(ProductionGatewayId.GERMANY, viewModel.selectedGateway.value)
+        assertEquals(0, store.writeCallCount)
+    }
+
+    @Test
+    fun `selecting an unprovisioned gateway is a no-op - selectedGateway and the store are both unchanged`() {
+        val identity = InMemoryClientTunnelIdentityStore(mapOf(ProductionGatewayId.GERMANY to "10.77.0.5"))
+        val store = InMemorySelectedGatewayStore()
+        val viewModel = newViewModel(store, identity)
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        assertEquals(ProductionGatewayId.GERMANY, viewModel.selectedGateway.value)
+        assertEquals(0, store.writeCallCount)
+    }
+
+    @Test
+    fun `stale persisted selection - Stockholm was selected but is no longer provisioned, reconciles to Germany`() {
+        val identity = InMemoryClientTunnelIdentityStore(mapOf(ProductionGatewayId.GERMANY to "10.77.0.5"))
+        val store = InMemorySelectedGatewayStore(initial = ProductionGatewayId.STOCKHOLM)
+
+        val viewModel = newViewModel(store, identity)
+
+        assertEquals(ProductionGatewayId.GERMANY, viewModel.selectedGateway.value)
+        // The reconciliation is PERSISTED, not just an in-memory display fix.
+        assertEquals(ProductionGatewayId.GERMANY, store.read())
+        assertEquals(1, store.writeCallCount)
+    }
+
+    @Test
+    fun `stale persisted selection but nothing at all is provisioned - left exactly as persisted, no invented identity`() {
+        val identity = InMemoryClientTunnelIdentityStore()
+        val store = InMemorySelectedGatewayStore(initial = ProductionGatewayId.STOCKHOLM)
+
+        val viewModel = newViewModel(store, identity)
+
+        assertEquals(ProductionGatewayId.STOCKHOLM, viewModel.selectedGateway.value)
+        assertEquals(0, store.writeCallCount)
+    }
+
+    @Test
+    fun `persisted selection already provisioned - no reconciliation write happens at all`() {
+        val identity = InMemoryClientTunnelIdentityStore(mapOf(ProductionGatewayId.STOCKHOLM to "10.77.0.2"))
+        val store = InMemorySelectedGatewayStore(initial = ProductionGatewayId.STOCKHOLM)
+
+        val viewModel = newViewModel(store, identity)
+
+        assertEquals(ProductionGatewayId.STOCKHOLM, viewModel.selectedGateway.value)
+        assertEquals(0, store.writeCallCount)
     }
 }

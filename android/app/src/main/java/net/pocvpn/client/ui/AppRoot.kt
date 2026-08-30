@@ -171,6 +171,7 @@ fun AppRoot(
         net.pocvpn.client.ui.screens.GatewayPickerDialog(
             current = selectedGatewayId,
             options = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+            provisionedGatewayIds = viewModel.provisionedGatewayIds,
             onSelect = { id ->
                 viewModel.selectGateway(id)
                 showGatewayPicker = false
