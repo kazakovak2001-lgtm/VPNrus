@@ -15,13 +15,14 @@ import net.pocvpn.client.BuildConfig
 import net.pocvpn.client.identity.XrayProfileRepository
 
 /**
- * B8K1B - the first REAL Android integration for Xray/VLESS+REALITY. This is
- * an ISOLATED, debug-only test service: it is not started by
- * VpnController/TransportOrchestrator, is not reachable from Smart Connect,
- * and XRAY_REALITY stays NOT_IMPLEMENTED in TransportRegistry regardless of
- * this class existing (see docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md §10/§13 for
- * why this is the smallest safe next slice, and this file's own AGENTS-style
- * invariants below).
+ * B8K1B - the REAL Android integration for Xray/VLESS+REALITY. As of B8I7,
+ * XRAY_REALITY is a genuine production Smart Connect candidate (see
+ * MainViewModel.buildTransportRegistry/VlessRealityTransport's own docs) -
+ * this service is reachable from a real connect() attempt whenever a
+ * persisted Xray profile is available, not only from the debug-only manual
+ * entry point (see the `debug` source set) that first proved this
+ * service/runtime boundary end to end (see docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md
+ * §10/§13, and this file's own AGENTS-style invariants below).
  *
  * Recursion prevention: [buildXrayVpnPlan] always disallows this app's own
  * package (ALL_APPS only, this slice) - see docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md
@@ -84,6 +85,14 @@ class NovaXrayVpnService : VpnService() {
         )
     }
 
+    // B8I7 - the CURRENT (or most recently started) attempt's session id -
+    // see XrayRuntimeEvent's own docs for why this exists at all. Defaults
+    // to 0 (never a real VlessRealityTransport-assigned id) so a teardown
+    // reached without ACTION_START ever having run (there is nothing this
+    // could correspond to) still publishes SOMETHING rather than silently
+    // doing nothing.
+    @Volatile private var currentSessionId: Long = 0L
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -92,7 +101,9 @@ class NovaXrayVpnService : VpnService() {
             }
 
             ACTION_START -> {
-                startIfNotAlreadyRunning()
+                val sessionId = intent.getLongExtra(EXTRA_SESSION_ID, currentSessionId)
+                currentSessionId = sessionId
+                startIfNotAlreadyRunning(sessionId)
                 return Service.START_NOT_STICKY
             }
 
@@ -113,24 +124,34 @@ class NovaXrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning() {
+    private fun startIfNotAlreadyRunning(sessionId: Long) {
         scope.launch {
             when (val outcome = controller.requestStart()) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
                     Log.w(TAG, "refusing to start: ${outcome.reason}")
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
                 is XrayCoreStartOutcome.EstablishFailed -> {
                     Log.e(TAG, "failed to establish VPN interface: ${outcome.reason}")
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
                 is XrayCoreStartOutcome.CoreStartFailed -> {
                     Log.e(TAG, "Xray core failed to start: ${outcome.reason}")
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
-                is XrayCoreStartOutcome.Started -> Log.i(TAG, "Xray core started")
+                is XrayCoreStartOutcome.Started -> {
+                    Log.i(TAG, "Xray core started")
+                    // B8I7 - the ONE real, positive confirmation
+                    // VlessRealityTransport waits for before ever reporting
+                    // Connected - never fabricated from startService()
+                    // merely returning.
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Started(sessionId))
+                }
             }
         }
     }
@@ -165,6 +186,7 @@ class NovaXrayVpnService : VpnService() {
         }
         Log.i(TAG, "tearing down: $reason")
         outcome.stopLoopFailureReason?.let { Log.e(TAG, "stopLoop failed: $it") }
+        XrayRuntimeState.publish(XrayRuntimeEvent.Stopped(currentSessionId))
         stopSelf()
     }
 
@@ -181,6 +203,13 @@ class NovaXrayVpnService : VpnService() {
     companion object {
         const val ACTION_START = "net.pocvpn.client.vpn.xray.action.START"
         const val ACTION_STOP = "net.pocvpn.client.vpn.xray.action.STOP"
+
+        // B8I7 - a plain correlation id (never a secret, never config
+        // material) VlessRealityTransport assigns per connect() attempt and
+        // this service echoes back via XrayRuntimeState so a stale session's
+        // events can never be mistaken for the CURRENT attempt's - see
+        // XrayRuntimeEvent's own docs.
+        const val EXTRA_SESSION_ID = "net.pocvpn.client.vpn.xray.extra.SESSION_ID"
 
         private const val TAG = "NovaXrayVpnService"
         private const val KEYSTORE_ALIAS = "nova_xray_profile_key"
