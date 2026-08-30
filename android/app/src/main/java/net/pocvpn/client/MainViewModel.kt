@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -25,6 +26,7 @@ import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.provisioning.XrayProfileProvisioner
 import net.pocvpn.client.provisioning.XrayProfileProvisioningOutcome
+import net.pocvpn.client.smartconnect.AwgXrayFailoverPolicy
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
@@ -40,9 +42,11 @@ import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportDescriptor
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportRegistry
 import net.pocvpn.client.transport.TransportStatus
+import net.pocvpn.client.transport.UserTransportPreference
 import net.pocvpn.client.vpn.AmneziaWgTransport
 import net.pocvpn.client.vpn.AndroidReconnectManager
 import net.pocvpn.client.vpn.ControllerEvent
@@ -66,6 +70,23 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.FileAppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
+
+/**
+ * B8I8A - everything needed to evaluate [AwgXrayFailoverPolicy] for ONE
+ * connect() request, captured at resolution time and carried unchanged
+ * across an async VPN-permission prompt so the LATER evaluation (in
+ * [MainViewModel.onVpnPermissionResult]) uses the EXACT same context the
+ * SYNCHRONOUS path would have used - never re-derived after the gap (Xray
+ * availability, in particular, must reflect what was true FOR THIS REQUEST,
+ * not whatever happens to be true whenever the user eventually responds to
+ * the system permission dialog).
+ */
+private class PendingFailoverAttempt(
+    val initialKind: TransportKind,
+    val preference: UserTransportPreference,
+    val registry: TransportRegistry,
+    val orchestrator: TransportOrchestrator,
+)
 
 /**
  * Thin state holder above VpnController - MainActivity observes this instead
@@ -163,6 +184,13 @@ class MainViewModel(
     // Xray profile actually exists, so xrayTransport's registry-descriptor
     // availability reflects reality rather than a hardcoded true.
     private val xrayProfileRepository: XrayProfileRepository? = null,
+    // B8I8 - additive, defaults to Auto (byte-for-byte unchanged production
+    // behavior - no product UI sets anything else yet). Threaded into every
+    // smartConnectDecision() call AND consulted by the AWG -> Xray failover
+    // check below - a user who pins Manual(AMNEZIA_WG)/Manual(XRAY_REALITY)
+    // gets exactly that transport, success or failure, never a silent
+    // automatic substitute (see AwgXrayFailoverPolicy's own docs).
+    private val userTransportPreference: UserTransportPreference = UserTransportPreference.Auto,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -193,6 +221,37 @@ class MainViewModel(
     // reads this synchronously (a plain StateFlow.value read) so the
     // registry it builds always reflects the CURRENT truth.
     private val xrayAvailable = MutableStateFlow(false)
+
+    // B8I8A/B8K6A - the CURRENT connect() request's retained failover
+    // context, non-null from the moment a resolved AWG attempt starts until
+    // its failover has been decided (once, ever) or the request is
+    // superseded. Written ONLY by connect() (a fresh request always
+    // supersedes/invalidates whatever was here), consumed (and ALWAYS
+    // cleared first) ONLY by armFailoverWatch's own collector - see that
+    // function's own docs for why clearing first is what makes a stale/
+    // duplicate signal a safe no-op rather than a second fallback attempt.
+    // disconnect() also clears this (a user-initiated cancellation abandons
+    // any pending attempt). @Volatile: connect()/onVpnPermissionResult()/
+    // disconnect() are independent viewModelScope.launch bodies - a plain
+    // field write in one must be visible to a read in another.
+    @Volatile private var pendingFailoverAttempt: PendingFailoverAttempt? = null
+
+    // B8K6A - the single live collector (if any) currently watching
+    // controller.state on behalf of [pendingFailoverAttempt]. Tracked so
+    // every place that invalidates the attempt (a NEW connect() request,
+    // disconnect(), permission denial, or the watch's own successful/stale
+    // completion) can also stop the collector deterministically instead of
+    // leaving it running for the rest of this ViewModel's lifetime.
+    @Volatile private var failoverObserverJob: Job? = null
+
+    // B8K6A - the ONE place both halves of the retained failover context
+    // (the attempt object AND its observer coroutine) are torn down
+    // together, so neither can ever exist without the other.
+    private fun clearFailoverWatch() {
+        pendingFailoverAttempt = null
+        failoverObserverJob?.cancel()
+        failoverObserverJob = null
+    }
 
     /**
      * B8I1/B8I7 - built FRESH on every call (never cached as a field) so
@@ -240,6 +299,7 @@ class MainViewModel(
         networkProfile = networkProfile.value,
         gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
         registry = buildTransportRegistry(),
+        preference = userTransportPreference,
         connectionHistory = recentConnectionOutcomes(),
         restrictionClass = restrictionClass(),
     )
@@ -475,7 +535,7 @@ class MainViewModel(
     fun gatewayStatus(): GatewayConfiguration = controller.gatewayStatus()
 
     /**
-     * B8I4/B8I7 - Smart Connect preflight: a fresh smartConnectDecision()
+     * B8I4/B8I7/B8I8 - Smart Connect preflight: a fresh smartConnectDecision()
      * (THE single decision authority - see that function's own docs) is
      * obtained immediately before every connect attempt. The ALREADY-
      * selected kind is then handed to a TransportOrchestrator built from a
@@ -493,15 +553,65 @@ class MainViewModel(
      * here via VpnController.rejectPreflight() before controller.connect()
      * is ever reached - no VPN permission is requested, no VPN service is
      * started.
+     *
+     * B8I8/B8I8A/B8K6A - after controller.connect(resolution) SETTLES
+     * SYNCHRONOUSLY (no VPN permission was needed), armFailoverWatch() below
+     * starts watching controller.state for THIS attempt immediately. If a
+     * permission prompt is needed instead, watching is deferred: the exact
+     * context (kind/preference/registry/orchestrator) is already retained in
+     * [pendingFailoverAttempt] by then, and onVpnPermissionResult() is what
+     * starts the watch once the user actually responds - see that function's
+     * own docs. Either way, [AwgXrayFailoverPolicy] is consulted against
+     * every state controller.state reaches for this attempt (its immediate
+     * synchronous outcome AND any later asynchronous one - e.g. a real AWG
+     * session that briefly reports Connected before an eligible terminal
+     * failure arrives - see armFailoverWatch's own docs) but ACTS on it
+     * EXACTLY ONCE per connect() request.
      */
     fun connect() {
         viewModelScope.launch {
+            // B8I8A - a NEW connect() request always supersedes/invalidates
+            // any still-pending permission/failover context (and stops
+            // watching for it) from an EARLIER, unresolved request - a later
+            // permission result or async state change for that OLD request
+            // must never reuse it.
+            clearFailoverWatch()
             when (val decision = smartConnectDecision()) {
                 is SmartConnectDecision.Selected -> {
                     val kind = decision.score.candidate.transport.kind
-                    val orchestrator = TransportOrchestrator(buildTransportRegistry())
+                    val registry = buildTransportRegistry()
+                    val orchestrator = TransportOrchestrator(registry)
                     when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind))) {
-                        is TransportOrchestrator.Resolution.Resolved -> controller.connect(resolution)
+                        is TransportOrchestrator.Resolution.Resolved -> {
+                            // B8I8A - checked BEFORE connect() (same
+                            // side-effect-free query VpnController.connect()
+                            // itself performs immediately after, on the SAME
+                            // instance, with no suspension in between - see
+                            // VpnTransport.preparePermissionIntent's own
+                            // contract) so this ViewModel knows, without
+                            // guessing, whether THIS attempt will settle
+                            // synchronously or pause for the user.
+                            val permissionPending = resolution.transport.preparePermissionIntent() != null
+                            val attempt = PendingFailoverAttempt(
+                                initialKind = kind,
+                                preference = userTransportPreference,
+                                registry = registry,
+                                orchestrator = orchestrator,
+                            )
+                            pendingFailoverAttempt = attempt
+                            controller.connect(resolution)
+                            if (!permissionPending) {
+                                // Already fully settled synchronously (or
+                                // will settle/transition asynchronously from
+                                // here on) - start watching now, exactly like
+                                // every pre-B8K6A connect() attempt started
+                                // its ONE synchronous check now.
+                                armFailoverWatch(attempt)
+                            }
+                            // else: RequestVpnPermission was just emitted -
+                            // wait for onVpnPermissionResult() to resume this
+                            // SAME attempt and start watching then.
+                        }
                         is TransportOrchestrator.Resolution.NotSelectable -> {
                             controller.rejectPreflight(
                                 VpnError.UnsupportedTransportSelected(kind.name),
@@ -517,12 +627,147 @@ class MainViewModel(
         }
     }
 
+    /**
+     * B8I8 - the ONE call site for the controlled AWG -> Xray failover logic:
+     * consults [AwgXrayFailoverPolicy] (the ONE eligibility authority - this
+     * function never re-implements or second-guesses that rule) using the
+     * CURRENT controller.state/diagnostics snapshot, which truthfully reflect
+     * THIS attempt's own outcome (see that policy's own docs on why both are
+     * required together) and the RETAINED [preference]/[registry]/[orchestrator]
+     * for the request being evaluated - never freshly recomputed, so a
+     * permission-prompt-delayed evaluation still judges the SAME request it
+     * started with. On a genuine eligible failure: the failed AWG attempt is
+     * cleanly detached first (controller.disconnect() - reusing the EXISTING
+     * active-transport teardown, never a bespoke one) so AWG and Xray can
+     * never be active concurrently, THEN the SAME production XRAY_REALITY
+     * instance is resolved from [registry]/[orchestrator] (never re-built,
+     * never a second/independent instance) and executed via the SAME
+     * per-attempt execution boundary (controller.connect(resolution)) every
+     * other attempt uses - no bespoke Xray-only code path. Called from
+     * exactly one place per connect() request (armFailoverWatch()'s own
+     * collector, which acts at most once per attempt - see its own docs) -
+     * a failed Xray fallback surfaces its own truthful terminal state and
+     * nothing more (no retry, no bounce back to AWG).
+     */
+    private suspend fun maybeFailoverToXray(
+        initialKind: TransportKind,
+        preference: UserTransportPreference,
+        registry: TransportRegistry,
+        orchestrator: TransportOrchestrator,
+    ) {
+        val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
+            initialKind = initialKind,
+            preference = preference,
+            awgState = controller.state.value,
+            awgError = diagnosticsStore.snapshot.value.lastError,
+            xrayAvailable = registry.descriptorFor(TransportKind.XRAY_REALITY)?.status == TransportStatus.AVAILABLE,
+        )
+        if (!eligible) return
+
+        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY))) {
+            is TransportOrchestrator.Resolution.Resolved -> {
+                controller.disconnect()
+                controller.connect(xrayResolution)
+            }
+            // Defensive only: xrayAvailable already guarantees the registry
+            // has a real, resolvable XRAY_REALITY descriptor at this point.
+            is TransportOrchestrator.Resolution.NotSelectable -> Unit
+        }
+    }
+
+    /**
+     * B8K6A - the ONE place [pendingFailoverAttempt] is watched and (at most
+     * once) consumed, from BOTH connect() (when no permission prompt was
+     * needed) and onVpnPermissionResult() (when one was) - a single shared
+     * path, never a duplicated copy of the failover-triggering logic.
+     *
+     * Fixes the confirmed physical-device gap: a real AWG session can report
+     * Connected (interface/handshake momentarily up) and only LATER settle
+     * into an eligible terminal failure asynchronously, via a controller.state
+     * emission that arrives after this function's caller has already
+     * returned - a single immediate check right after connect() returns (the
+     * pre-B8K6A behavior) can miss that later transition entirely. Instead,
+     * this collects controller.state - the SAME hot StateFlow every other
+     * consumer already observes, no second/competing observation mechanism -
+     * for as long as [attempt] remains THE current pending one. StateFlow
+     * replays its current value immediately on subscription, so the FIRST
+     * collected value is always this attempt's synchronous outcome (byte-
+     * for-byte the same fast path as before); every value after that is a
+     * genuine later transition, checked against the exact SAME policy and
+     * the exact SAME retained [attempt] context (never re-derived).
+     *
+     * Guarded against duplicate/stale activity two ways: (1) a no-op if a
+     * watch for this exact attempt is already running (a stale/duplicate
+     * onVpnPermissionResult() call for an attempt still being watched never
+     * starts a second collector); (2) every collected emission first checks
+     * `pendingFailoverAttempt === attempt` - once a NEWER connect() request,
+     * disconnect(), or permission denial has cleared/replaced the context
+     * (see clearFailoverWatch()), this collector sees the mismatch and stops
+     * itself, so a stale emission from an OLD/superseded request can never
+     * act. On a genuine eligible emission, the attempt is cleared (so
+     * nothing else can also act on it) BEFORE [maybeFailoverToXray] runs,
+     * and the collector stops itself only AFTER that call returns - it is
+     * never cancelled out from under its own in-flight fallback attempt.
+     */
+    private fun armFailoverWatch(attempt: PendingFailoverAttempt) {
+        if (failoverObserverJob?.isActive == true) return
+        failoverObserverJob = viewModelScope.launch {
+            controller.state.collect { state ->
+                if (pendingFailoverAttempt !== attempt) {
+                    failoverObserverJob?.cancel()
+                    failoverObserverJob = null
+                    return@collect
+                }
+                val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
+                    initialKind = attempt.initialKind,
+                    preference = attempt.preference,
+                    awgState = state,
+                    awgError = diagnosticsStore.snapshot.value.lastError,
+                    xrayAvailable = attempt.registry.descriptorFor(TransportKind.XRAY_REALITY)?.status == TransportStatus.AVAILABLE,
+                )
+                if (!eligible) return@collect
+                pendingFailoverAttempt = null
+                maybeFailoverToXray(
+                    initialKind = attempt.initialKind,
+                    preference = attempt.preference,
+                    registry = attempt.registry,
+                    orchestrator = attempt.orchestrator,
+                )
+                failoverObserverJob?.cancel()
+                failoverObserverJob = null
+            }
+        }
+    }
+
     fun disconnect() {
+        // B8I8A - a user-initiated disconnect/cancellation abandons any
+        // pending attempt this ViewModel was tracking - never resume a
+        // stale context, and never keep watching, for a request the user no
+        // longer wants acted on.
+        clearFailoverWatch()
         viewModelScope.launch { controller.disconnect() }
     }
 
+    /**
+     * B8I8A/B8K6A - resumes the SAME connect() request armFailoverWatch's
+     * synchronous path already handles when no permission prompt was needed:
+     * granted -> let controller.onVpnPermissionResult(true) finish the
+     * pending initial attempt (exactly as before B8I8A), THEN start
+     * watching the retained failover context via armFailoverWatch() - the
+     * SAME shared function connect() itself uses, never a duplicated copy of
+     * the failover logic. Denied -> permission denial must never trigger
+     * fallback (per policy/product semantics) - only discards any retained
+     * context/watch, evaluation never runs.
+     */
     fun onVpnPermissionResult(granted: Boolean) {
-        viewModelScope.launch { controller.onVpnPermissionResult(granted) }
+        viewModelScope.launch {
+            controller.onVpnPermissionResult(granted)
+            if (granted) {
+                pendingFailoverAttempt?.let { armFailoverWatch(it) }
+            } else {
+                clearFailoverWatch()
+            }
+        }
     }
 
     fun regenerateIdentity() {

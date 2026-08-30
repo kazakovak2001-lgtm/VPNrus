@@ -14,7 +14,16 @@ import org.junit.Test
 class XrayProfileProvisioningTest {
 
     private val validKey = "e2sIl+TFOY99CMiZqodvjKVS2UM1pY3H7wHfZuBChF0="
-    private val validRealityPublicKey = "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU="
+    // B8K6A - REALITY's public key is url-safe base64, UNPADDED (the exact
+    // shape the pinned `xray x25519` tool emits and the server's own
+    // config.py/gateway_config_renderer validate against - see
+    // XrayVlessRealityConfig.REALITY_PUBLIC_KEY_REGEX for the client-side
+    // config validator already using this same shape). Deliberately NOT an
+    // AWG/WireGuard-shaped standard-base64-with-padding string (a prior,
+    // now-fixed bug used exactly that wrong shape here, which happened to
+    // still satisfy ProvisioningClient's own then-incorrect regex - masking
+    // that every real server response was actually being rejected).
+    private val validRealityPublicKey = "SyAfSiFzknNPgsUS8_guGt3-N9_0DRFnUPKNuruEuEU"
     private val validUuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f"
 
     private fun validSuccessBody(): JSONObject = JSONObject()
