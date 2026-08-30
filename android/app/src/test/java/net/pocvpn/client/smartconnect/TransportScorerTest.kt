@@ -21,6 +21,12 @@ class TransportScorerTest {
     }
 
     @Test
+    fun `the realistic NOT_IMPLEMENTED pairing (both capabilities and health NOT_IMPLEMENTED) also scores lowest`() {
+        val score = TransportScorer.score(TransportKind.QUIC, TransportCapabilities.notImplemented(), health(TransportHealthState.NOT_IMPLEMENTED))
+        assertEquals(Int.MIN_VALUE, score)
+    }
+
+    @Test
     fun `a real transport with HEALTHY state outscores the same transport DEGRADED or UNREACHABLE`() {
         val caps = TransportCapabilities.amneziaWg()
         val healthy = TransportScorer.score(TransportKind.AMNEZIA_WG, caps, health(TransportHealthState.HEALTHY))
@@ -54,14 +60,25 @@ class TransportScorerTest {
     }
 
     @Test
-    fun `rank() orders by score descending, ties broken by TransportKind's own declared enum order`() {
+    fun `rank() orders by score descending, ties broken by SmartConnectDecisionEngine's OWN PREFERRED_ORDER - never a second, independent order`() {
         val entries = mapOf(
-            TransportKind.QUIC to (TransportCapabilities.notImplemented() to health(TransportHealthState.NOT_IMPLEMENTED)),
+            TransportKind.TLS_TCP to (TransportCapabilities.notImplemented() to health(TransportHealthState.NOT_IMPLEMENTED)),
             TransportKind.AMNEZIA_WG to (TransportCapabilities.amneziaWg() to health(TransportHealthState.UNKNOWN)),
             TransportKind.XRAY_REALITY to (TransportCapabilities.xrayRealityAdapterShell() to health(TransportHealthState.UNKNOWN)),
         )
-        // AMNEZIA_WG and XRAY_REALITY tie on health (UNKNOWN); AMNEZIA_WG's enum ordinal comes first.
-        assertEquals(listOf(TransportKind.AMNEZIA_WG, TransportKind.XRAY_REALITY, TransportKind.QUIC), TransportScorer.rank(entries))
+        // AMNEZIA_WG and XRAY_REALITY tie on health (UNKNOWN); AMNEZIA_WG comes first in PREFERRED_ORDER too.
+        assertEquals(listOf(TransportKind.AMNEZIA_WG, TransportKind.XRAY_REALITY, TransportKind.TLS_TCP), TransportScorer.rank(entries))
+    }
+
+    @Test
+    fun `a tie between XRAY_REALITY and QUIC resolves via PREFERRED_ORDER (QUIC first), NOT TransportKind's own enum order (which would wrongly put XRAY_REALITY first)`() {
+        val entries = mapOf(
+            TransportKind.XRAY_REALITY to (TransportCapabilities.xrayRealityAdapterShell() to health(TransportHealthState.HEALTHY)),
+            TransportKind.QUIC to (TransportCapabilities.xrayRealityAdapterShell() to health(TransportHealthState.HEALTHY)),
+        )
+        // TransportKind declares XRAY_REALITY (ordinal 1) before QUIC (ordinal 2) - an ordinal-based
+        // tie-break would get this backwards versus the real decision authority's own order.
+        assertEquals(listOf(TransportKind.QUIC, TransportKind.XRAY_REALITY), TransportScorer.rank(entries))
     }
 
     @Test

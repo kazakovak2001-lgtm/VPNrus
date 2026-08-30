@@ -35,13 +35,23 @@ object TransportScorer {
         return healthComponent(health.state) * 10 + maturityComponent(capabilities.maturity)
     }
 
-    /** Kinds ranked BEST first (highest score first); ties broken by [TransportKind]'s own declared enum order, deterministic. */
+    /**
+     * Kinds ranked BEST first (highest score first); ties broken by
+     * [SmartConnectDecisionEngine.PREFERRED_ORDER] - the SAME list the
+     * real decision authority uses, never a second, independently
+     * maintained order that could silently disagree with it. A kind absent
+     * from that list (should never happen - it enumerates every
+     * [TransportKind]) sorts last among ties, never first, so an
+     * unrecognized kind can't accidentally win a tie by omission.
+     */
     fun rank(entries: Map<TransportKind, Pair<TransportCapabilities, TransportHealth>>): List<TransportKind> =
         entries.entries
             .sortedWith(
                 compareByDescending<Map.Entry<TransportKind, Pair<TransportCapabilities, TransportHealth>>> {
                     score(it.key, it.value.first, it.value.second)
-                }.thenBy { it.key.ordinal },
+                }.thenBy {
+                    SmartConnectDecisionEngine.PREFERRED_ORDER.indexOf(it.key).let { index -> if (index < 0) Int.MAX_VALUE else index }
+                },
             )
             .map { it.key }
 
