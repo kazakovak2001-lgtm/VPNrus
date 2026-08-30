@@ -410,6 +410,133 @@ class MainViewModelTest {
         assertEquals(existingProfile, xrayRepository.getProfileOrNull())
     }
 
+    // --- B8I2: Smart Connect AWG-only preflight - connect() enforces smartConnectDecision() ---
+
+    private val USABLE_WIFI = net.pocvpn.client.network.NetworkProfile(
+        type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = true, metered = false,
+        roaming = false, captivePortal = false, ipv4Available = true, ipv6Available = false,
+        vpnActive = false, generation = 1,
+    )
+
+    private val UNUSABLE_NETWORK = net.pocvpn.client.network.NetworkProfile(
+        type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = false, metered = false,
+        roaming = false, captivePortal = false, ipv4Available = true, ipv6Available = false,
+        vpnActive = false, generation = 1,
+    )
+
+    private val CONFIGURED_GATEWAY = GatewayConfiguration.Configured(
+        endpointHost = "203.0.113.10", endpointPort = 51820,
+        serverPublicKeyBase64 = "hU7ohcV8fjAtDFISvpnfLhYFSlxY4lso0XofszDN81Y=",
+        clientTunnelIp = "10.77.0.2", gatewayTunnelIp = "10.77.0.1",
+        allowedIps = listOf("0.0.0.0/0", "::/0"), profile = AwgProfile.none(),
+    )
+
+    @Test
+    fun `usable network plus configured gateway plus AWG available - connect reaches the transport`() = runTest {
+        val transport = FakeVpnTransport()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, transport.connectCallCount)
+    }
+
+    @Test
+    fun `unusable network - connect is blocked, transport never touched`() = runTest {
+        val transport = FakeVpnTransport()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = UNUSABLE_NETWORK,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+    }
+
+    @Test
+    fun `missing gateway - connect is blocked, transport never touched`() = runTest {
+        val transport = FakeVpnTransport()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+    }
+
+    @Test
+    fun `invalid gateway - connect is blocked, transport never touched`() = runTest {
+        val transport = FakeVpnTransport()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Invalid("bad config")),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+    }
+
+    @Test
+    fun `non-AWG selected transport - connect is blocked, transport never touched, no permission requested`() = runTest {
+        // The ONLY transport this registry has available is XRAY_REALITY -
+        // SmartConnectDecisionEngine has nothing else to select.
+        val transport = FakeVpnTransport(permission = android.content.Intent(), kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        // preparePermissionIntent() is only ever called from inside
+        // controller.connect() - a non-zero permission Intent above would
+        // have made a real controller.connect() attempt emit
+        // RequestVpnPermission; asserting Error (not e.g. still Disconnected
+        // pending a permission event) proves this path was never reached.
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+    }
+
     // --- B8I1: ONE Smart Connect decision authority, reached only via MainViewModel.smartConnectDecision() ---
 
     @Test

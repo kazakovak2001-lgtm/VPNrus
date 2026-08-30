@@ -19,9 +19,15 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
 
 /** Test double for VpnTransport. `connectGate`, if set, makes connect() suspend until completed - for concurrency tests. */
-class FakeVpnTransport(private val permission: Intent? = null) : VpnTransport {
+class FakeVpnTransport(
+    private val permission: Intent? = null,
+    // B8I2 - additive, defaults to AMNEZIA_WG so every existing call site is
+    // byte-for-byte unaffected; lets a test build a TransportRegistry whose
+    // ONLY available transport is something else (e.g. XRAY_REALITY), to
+    // prove Smart Connect's AWG-only preflight blocks a non-AWG selection.
+    override val kind: TransportKind = TransportKind.AMNEZIA_WG,
+) : VpnTransport {
     override val name: String = "fake"
-    override val kind: TransportKind = TransportKind.AMNEZIA_WG
     override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
 
     private val stateFlow = MutableStateFlow<TransportState>(TransportState.Disconnected)
