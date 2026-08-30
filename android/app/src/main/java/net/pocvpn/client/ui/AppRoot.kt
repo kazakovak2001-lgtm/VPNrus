@@ -273,6 +273,12 @@ private fun buildDiagnosticsLines(
     val selectedKind = (smartConnectDecision as? SmartConnectDecision.Selected)?.score?.candidate?.transport?.kind
     val transportHealthLine = "Transport health: ${selectedKind?.let { viewModel.transportHealth()[it]?.state } ?: TransportHealthState.UNKNOWN}"
 
+    // B8N - real TransportScorer.score() output, truthfully surfaced only
+    // (see MainViewModel.transportScores()'s own docs - NOT consumed by
+    // smartConnectDecision() above, so this line can never disagree with
+    // "Current transport" by implying a different one was actually chosen).
+    val transportScoresLine = "Transport scores: ${viewModel.transportScores().entries.joinToString { "${it.key}=${it.value}" }}"
+
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
         "VPN permission: ${if (diagnostics.permissionGranted) "GRANTED" else "REQUIRED"}",
@@ -301,6 +307,7 @@ private fun buildDiagnosticsLines(
         smartConnectReasonLine,
         restrictionClassLine,
         transportHealthLine,
+        transportScoresLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",
