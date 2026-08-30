@@ -42,4 +42,7 @@ sealed class TransportConfig {
      * TransportRegistry, so nothing in production ever constructs this yet.
      */
     data class Xray(val config: net.pocvpn.client.vpn.xray.XrayVlessRealityConfig) : TransportConfig()
+
+    /** B8O2 - the TLS/TCP counterpart of [Xray], for VlessTlsTransport/NovaXrayVpnService's TLS_TCP branch. */
+    data class XrayTls(val config: net.pocvpn.client.vpn.xray.XrayVlessTlsConfig) : TransportConfig()
 }

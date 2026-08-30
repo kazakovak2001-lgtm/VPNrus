@@ -101,6 +101,16 @@ object ProvisioningClient {
         executeXrayProfile(buildXrayProfileRequest(publicKey, bearerToken))
 
     /**
+     * B8O2 - POST /v1/xray-profile with `{"transport": "tls"}`: same
+     * endpoint/credential/public-key shape as [fetchXrayProfile] above, a
+     * SECOND transport option on the SAME identity (see
+     * gateway/api/handler.py's own optional `transport` field) - never a
+     * second endpoint, never a second credential.
+     */
+    fun fetchXrayTlsProfile(publicKey: String, bearerToken: String): XrayTlsProfileResult =
+        executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken))
+
+    /**
      * B8C2 - the exact outgoing request shape (url/headers/body), built as
      * plain data with NO network I/O. `internal` so the request CONTRACT
      * (method target, exact Authorization header, exact JSON body) is
@@ -130,6 +140,13 @@ object ProvisioningClient {
             body = buildRequestBody(publicKey),
         )
 
+    internal fun buildXrayTlsProfileRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        OutgoingRequest(
+            url = XRAY_PROFILE_ENDPOINT_URL,
+            headers = authHeaders(bearerToken),
+            body = buildXrayTlsRequestBody(publicKey),
+        )
+
     private fun authHeaders(credential: String): Map<String, String> = mapOf(
         "Content-Type" to "application/json",
         "Authorization" to "Bearer $credential",
@@ -140,6 +157,9 @@ object ProvisioningClient {
 
     private fun executeXrayProfile(request: OutgoingRequest): XrayProfileResult =
         executeGeneric(request, XrayProfileResult::NetworkError, ::mapXrayProfileResponse)
+
+    private fun executeXrayTlsProfile(request: OutgoingRequest): XrayTlsProfileResult =
+        executeGeneric(request, XrayTlsProfileResult::NetworkError, ::mapXrayTlsProfileResponse)
 
     private fun <T> executeGeneric(
         request: OutgoingRequest,
@@ -186,6 +206,10 @@ object ProvisioningClient {
      */
     internal fun buildRequestBody(publicKey: String): String =
         JSONObject().put("public_key", publicKey).toString()
+
+    /** B8O2 - same shape as [buildRequestBody] plus the explicit `"transport": "tls"` field the gateway's optional-field parsing accepts. */
+    internal fun buildXrayTlsRequestBody(publicKey: String): String =
+        JSONObject().put("public_key", publicKey).put("transport", "tls").toString()
 
     /**
      * Pure status-code + body -> ProvisioningResult mapping, with no
@@ -235,6 +259,63 @@ object ProvisioningClient {
         }
         503 -> XrayProfileResult.ServiceUnavailable
         else -> XrayProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * B8O2 - POST /v1/xray-profile?transport=tls response mapping -
+     * `internal` so each status/error_code combination is unit-testable
+     * without a live HTTP connection. Mirrors [mapXrayProfileResponse]'s own
+     * shape, plus "xray_tls_not_configured" mapping to [XrayTlsProfileResult.ServiceUnavailable]
+     * (same as any other 503).
+     */
+    internal fun mapXrayTlsProfileResponse(status: Int, rawBody: String): XrayTlsProfileResult = when (status) {
+        200, 201 -> parseXrayTlsProfileSuccessBody(rawBody)
+        401 -> XrayTlsProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> XrayTlsProfileResult.Revoked
+            "device_not_bound" -> XrayTlsProfileResult.DeviceNotBound
+            else -> XrayTlsProfileResult.Unauthorized
+        }
+        503 -> XrayTlsProfileResult.ServiceUnavailable
+        else -> XrayTlsProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    private fun parseXrayTlsProfileSuccessBody(raw: String): XrayTlsProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return XrayTlsProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val uuid = json.optString("uuid", "")
+        val serverName = json.optString("server_name", "")
+        val fingerprint = json.optString("fingerprint", "")
+
+        if (serverAddress.isBlank()) {
+            return XrayTlsProfileResult.MalformedResponse("server_address missing or blank")
+        }
+        if (serverPort !in 1..65535) {
+            return XrayTlsProfileResult.MalformedResponse("server_port missing or out of range")
+        }
+        if (!UUID_REGEX.matches(uuid)) {
+            return XrayTlsProfileResult.MalformedResponse("uuid missing or not a well-formed UUID")
+        }
+        if (serverName.isBlank()) {
+            return XrayTlsProfileResult.MalformedResponse("server_name missing or blank")
+        }
+        if (fingerprint.isBlank()) {
+            return XrayTlsProfileResult.MalformedResponse("fingerprint missing or blank")
+        }
+
+        return XrayTlsProfileResult.Success(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            uuid = uuid,
+            serverName = serverName,
+            fingerprint = fingerprint,
+        )
     }
 
     private fun parseXrayProfileSuccessBody(raw: String): XrayProfileResult {

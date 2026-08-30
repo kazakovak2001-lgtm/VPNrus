@@ -19,6 +19,8 @@ import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.ClientKeyRepositoryFactory
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
+import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkProfiler
 import net.pocvpn.client.provisioning.ProvisioningClient
@@ -26,6 +28,7 @@ import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.provisioning.XrayProfileProvisioner
 import net.pocvpn.client.provisioning.XrayProfileProvisioningOutcome
+import net.pocvpn.client.provisioning.XrayTlsProfileProvisioner
 import net.pocvpn.client.smartconnect.AwgXrayFailoverPolicy
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
@@ -56,6 +59,7 @@ import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.ReconnectManager
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VlessRealityTransport
+import net.pocvpn.client.vpn.VlessTlsTransport
 import net.pocvpn.client.vpn.VpnController
 import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.BuildConfigGatewaySource
@@ -192,6 +196,14 @@ class MainViewModel(
     // Xray profile actually exists, so xrayTransport's registry-descriptor
     // availability reflects reality rather than a hardcoded true.
     private val xrayProfileRepository: XrayProfileRepository? = null,
+    // B8O2 - additive, defaults to null (same reasoning as
+    // xrayProfileProvisioner/xrayTransport/xrayProfileRepository above): the
+    // TLS/TCP counterparts of each. Wiring these does NOT change automatic
+    // Smart Connect selection/failover (see AwgXrayFailoverPolicy,
+    // deliberately untouched) - see docs/ROADMAP.md's TLS/TCP fallback row.
+    private val xrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
+    private val xrayTlsTransport: VpnTransport? = null,
+    private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
     // B8I8 - additive, defaults to Auto (byte-for-byte unchanged production
     // behavior - no product UI sets anything else yet). Threaded into every
     // smartConnectDecision() call AND consulted by the AWG -> Xray failover
@@ -212,6 +224,7 @@ class MainViewModel(
         installedPackageChecker = installedPackageChecker ?: InstalledPackageChecker.alwaysInstalled(),
         connectionOutcomeStore = connectionOutcomeStore,
         xrayProfileRepository = xrayProfileRepository,
+        xrayTlsProfileRepository = xrayTlsProfileRepository,
     )
 
     // B8I - CURRENT network facts only (see NetworkProfile's own docs for
@@ -229,6 +242,22 @@ class MainViewModel(
     // reads this synchronously (a plain StateFlow.value read) so the
     // registry it builds always reflects the CURRENT truth.
     private val xrayAvailable = MutableStateFlow(false)
+
+    // B8O2 - the TLS/TCP counterpart of [xrayAvailable] above: flips true
+    // once a real TLS profile is CONFIRMED to exist (startup check + fresh
+    // activateDevice() success), same "never polled" discipline.
+    private val xrayTlsAvailable = MutableStateFlow(false)
+
+    /**
+     * B8O3 - the kind of the transport actually running/last attempted
+     * (VpnController.currentTransportKind - set only when a resolved,
+     * supported kind is actually handed to switchActiveTransport(), cleared
+     * on disconnect()) - NEVER a fresh hypothetical smartConnectDecision()
+     * pick. Diagnostics UI must read this, not recompute a new decision, to
+     * avoid showing a transport that was never actually selected/running
+     * for this session (see docs/ROADMAP.md's own diagnostics-gap note).
+     */
+    val currentTransportKind: StateFlow<TransportKind?> = controller.currentTransportKind
 
     // B8I8A/B8K6A - the CURRENT connect() request's retained failover
     // context, non-null from the moment a resolved AWG attempt starts until
@@ -288,6 +317,23 @@ class MainViewModel(
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
                 capabilities = if (available) xray.capabilities else TransportCapabilities.notImplemented(),
                 factory = if (available) ({ xray }) else null,
+            )
+        }
+        // B8O2 - same shape as XRAY_REALITY above. Registering this as
+        // AVAILABLE does NOT make it an automatic Smart Connect pick today:
+        // SmartConnectDecisionEngine's Auto path always prefers AMNEZIA_WG
+        // (always AVAILABLE, first in PREFERRED_ORDER) and AwgXrayFailoverPolicy
+        // never names TLS_TCP - it only becomes selectable via an explicit
+        // UserTransportPreference.Manual(TLS_TCP) or a future, deliberate
+        // failover decision - see docs/ROADMAP.md's own safety-boundary note.
+        val xrayTls = xrayTlsTransport
+        if (xrayTls != null) {
+            val available = xrayTlsAvailable.value
+            descriptors += TransportDescriptor(
+                kind = xrayTls.kind,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) xrayTls.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ xrayTls }) else null,
             )
         }
         return TransportRegistry.build(descriptors)
@@ -442,6 +488,15 @@ class MainViewModel(
                 }
             }
         }
+        xrayTlsProfileRepository?.let { repository ->
+            viewModelScope.launch {
+                xrayTlsAvailable.value = try {
+                    repository.getProfileOrNull() != null
+                } catch (t: Throwable) {
+                    false
+                }
+            }
+        }
         // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
         // onCleared lifecycle (see VpnController's own reconnectManager.start
         // call and this class's onCleared below) - registered exactly once
@@ -559,6 +614,18 @@ class MainViewModel(
                             // inferred from elapsed time (see xrayAvailable's
                             // own docs).
                             xrayAvailable.value = true
+                        }
+                    }
+                    // B8O2 - same reasoning as xrayProfileProvisioner above:
+                    // runs only after the AWG activation has already fully
+                    // succeeded, reusing the SAME key/credential, and never
+                    // touches AWG's own success/state either way.
+                    xrayTlsProfileProvisioner?.let { provisioner ->
+                        val tlsOutcome = withContext(ioDispatcher) {
+                            provisioner.provision(key, trimmedCredential)
+                        }
+                        if (tlsOutcome == XrayProfileProvisioningOutcome.Saved) {
+                            xrayTlsAvailable.value = true
                         }
                     }
                     ProvisioningUiState.Success(result)
@@ -858,6 +925,11 @@ class MainViewModel(
             // xrayTransport's own pre-flight check (see each class's own
             // docs) - never a second, independently-constructed store.
             val xrayProfileRepository = XrayProfileRepositoryFactory.create(context)
+            // B8O2 - the TLS/TCP counterpart of xrayProfileRepository above -
+            // its own independent store/AndroidKeyStore alias (see
+            // XrayTlsProfileRepositoryFactory's own docs), shared by its own
+            // provisioner and xrayTlsTransport's own pre-flight check.
+            val xrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context)
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -896,6 +968,12 @@ class MainViewModel(
                 // never a second, independently-constructed one.
                 xrayTransport = VlessRealityTransport(context, xrayProfileRepository),
                 xrayProfileRepository = xrayProfileRepository,
+                // B8O2 - same reasoning as xrayTransport/xrayProfileRepository
+                // above, for TLS/TCP: the SAME real VlessTlsTransport instance
+                // is registered for BOTH Smart Connect selection and execution.
+                xrayTlsProfileProvisioner = XrayTlsProfileProvisioner(xrayTlsProfileRepository),
+                xrayTlsTransport = VlessTlsTransport(context, xrayTlsProfileRepository),
+                xrayTlsProfileRepository = xrayTlsProfileRepository,
             ) as T
         }
     }

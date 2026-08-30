@@ -3,8 +3,12 @@ package net.pocvpn.client.vpn.xray
 import kotlinx.coroutines.runBlocking
 import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.FileXrayProfileStore
+import net.pocvpn.client.identity.FileXrayTlsProfileStore
 import net.pocvpn.client.identity.SecureXrayProfileRepository
+import net.pocvpn.client.identity.SecureXrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayProfile
+import net.pocvpn.client.identity.XrayTlsProfile
+import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -38,6 +42,7 @@ class XrayCoreControllerTest {
         val coreRuntime: FakeXrayCoreRuntime = FakeXrayCoreRuntime(),
         establishedFd: Int? = 42,
         establishThrows: Throwable? = null,
+        tlsRepository: SecureXrayTlsProfileRepository? = null,
     ) {
         var ensureCoreEnvCallCount = 0
             private set
@@ -57,6 +62,7 @@ class XrayCoreControllerTest {
                 establishedFd
             },
             closeTun = { closeTunCallCount++ },
+            tlsRepository = tlsRepository,
         )
     }
 
@@ -222,5 +228,83 @@ class XrayCoreControllerTest {
         val establishFailed = establishFailureHarness.controller.requestStart() as XrayCoreStartOutcome.EstablishFailed
         assertFalse(establishFailed.reason.contains(validProfile.uuid))
         assertFalse(establishFailed.reason.contains(validProfile.realityPublicKey))
+    }
+
+    // --- B8O2: TLS_TCP branch, and REALITY's own default-arg behavior unaffected by its mere existence ---
+
+    private val validTlsProfile = XrayTlsProfile(
+        server = "152.70.43.1",
+        serverPort = 2053,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        serverName = "203.0.113.1",
+        fingerprint = "chrome",
+    )
+
+    private fun newTlsRepository(): SecureXrayTlsProfileRepository =
+        SecureXrayTlsProfileRepository(FileXrayTlsProfileStore(Files.createTempDirectory("xray-tls-controller-test").toFile()), FakeAesGcmKeyEncryptor())
+
+    @Test
+    fun `requestStart TLS_TCP with no tlsRepository wired is rejected without touching the runtime`() = runBlocking {
+        val harness = Harness(newRepository())
+
+        val outcome = harness.controller.requestStart(TransportKind.TLS_TCP)
+
+        assertEquals(XrayCoreStartOutcome.Rejected("Xray TLS profile repository not wired"), outcome)
+        assertEquals(0, harness.establishTunCallCount)
+        assertEquals(0, harness.coreRuntime.startLoopCallCount)
+    }
+
+    @Test
+    fun `requestStart TLS_TCP with an absent TLS profile is rejected without touching the runtime`() = runBlocking {
+        val harness = Harness(newRepository(), tlsRepository = newTlsRepository())
+
+        val outcome = harness.controller.requestStart(TransportKind.TLS_TCP)
+
+        assertEquals(XrayCoreStartOutcome.Rejected("no Xray TLS profile configured"), outcome)
+        assertEquals(0, harness.establishTunCallCount)
+    }
+
+    @Test
+    fun `requestStart TLS_TCP with a valid TLS profile invokes startLoop with the TLS rendered config`() = runBlocking {
+        val tlsRepository = newTlsRepository()
+        tlsRepository.saveProfile(validTlsProfile)
+        val harness = Harness(newRepository(), tlsRepository = tlsRepository, establishedFd = 9)
+
+        val outcome = harness.controller.requestStart(TransportKind.TLS_TCP)
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, harness.establishTunCallCount)
+        assertEquals(1, harness.coreRuntime.startLoopCallCount)
+        assertEquals(9, harness.coreRuntime.lastStartedTunFd)
+        assertEquals(XrayConfigRenderer.render(validTlsProfile.toXrayVlessTlsConfig()), harness.coreRuntime.lastStartedConfigContent)
+    }
+
+    @Test
+    fun `requestStart with no argument still resolves REALITY - byte-for-byte unaffected by TLS_TCP's existence`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val tlsRepository = newTlsRepository() // wired but empty - must never be consulted for a plain requestStart()
+        val harness = Harness(repository, tlsRepository = tlsRepository)
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(XrayConfigRenderer.render(validProfile.toXrayVlessRealityConfig()), harness.coreRuntime.lastStartedConfigContent)
+    }
+
+    @Test
+    fun `TLS_TCP and REALITY share the same lifecycle gate - a second start while one is running is rejected`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val tlsRepository = newTlsRepository()
+        tlsRepository.saveProfile(validTlsProfile)
+        val harness = Harness(repository, tlsRepository = tlsRepository)
+
+        val first = harness.controller.requestStart(TransportKind.XRAY_REALITY)
+        val second = harness.controller.requestStart(TransportKind.TLS_TCP)
+
+        assertEquals(XrayCoreStartOutcome.Started, first)
+        assertEquals(XrayCoreStartOutcome.AlreadyRunning, second)
+        assertEquals(1, harness.coreRuntime.startLoopCallCount)
     }
 }

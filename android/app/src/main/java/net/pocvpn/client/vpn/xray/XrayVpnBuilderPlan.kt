@@ -43,3 +43,13 @@ fun buildXrayVpnPlan(config: XrayVlessRealityConfig, novaPackageId: String): Xra
     dnsServers = config.dnsServers,
     disallowedApplications = setOf(novaPackageId),
 )
+
+/** B8O2 - the TLS/TCP counterpart of [buildXrayVpnPlan] above; identical shape, same fields, no security-mode-specific plan differences. */
+fun buildXrayVpnPlan(config: XrayVlessTlsConfig, novaPackageId: String): XrayVpnBuilderPlan = XrayVpnBuilderPlan(
+    mtu = config.mtu,
+    tunLocalAddressIpv4 = config.tunLocalAddressIpv4,
+    tunLocalPrefixLengthIpv4 = config.tunLocalPrefixLengthIpv4,
+    routesIpv4 = listOf("0.0.0.0/0"),
+    dnsServers = config.dnsServers,
+    disallowedApplications = setOf(novaPackageId),
+)

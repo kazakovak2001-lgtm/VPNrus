@@ -126,6 +126,46 @@ class RecoveryReconcileTests(XrayActivationTestBase):
         self.assertFalse(recovered.skipped)
 
 
+class TlsCandidateTests(XrayActivationTestBase):
+    """B8O2 - build_tls_config / activate_if_needed rendering BOTH inbounds
+    when TLS is configured, and REALITY-only behavior unaffected when it's
+    not (the default self.app_config from setUp has no TLS fields set)."""
+
+    def test_tls_unconfigured_build_tls_config_returns_none(self):
+        self.assertIsNone(xray_activation_module.build_tls_config(self.app_config))
+
+    def test_tls_unconfigured_staged_config_has_only_the_reality_inbound(self):
+        self._issue_bind_confirm()
+        result = xray_activation_module.activate_if_needed(self.app_config)
+        self.assertTrue(result.activated)
+        with open(self.app_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
+            staged = json.load(handle)
+        self.assertEqual(len(staged["inbounds"]), 1)
+
+    def test_tls_configured_staged_config_has_both_inbounds(self):
+        import dataclasses
+        from _fixtures import make_tls_cert_and_key_files
+        cert_file, key_file = make_tls_cert_and_key_files(self._tmp.name)
+        tls_config = dataclasses.replace(
+            self.app_config,
+            xray_tls_server_port=2053,
+            xray_tls_server_name="203.0.113.1",
+            xray_tls_fingerprint="chrome",
+            xray_tls_cert_file=cert_file,
+            xray_tls_key_file=key_file,
+        )
+
+        self._issue_bind_confirm()
+        result = xray_activation_module.activate_if_needed(tls_config)
+        self.assertTrue(result.activated)
+
+        with open(tls_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
+            staged = json.load(handle)
+        self.assertEqual(len(staged["inbounds"]), 2)
+        self.assertEqual(staged["inbounds"][1]["streamSettings"]["security"], "tls")
+        self.assertEqual(staged["inbounds"][1]["port"], 2053)
+
+
 class ConcurrencyTests(XrayActivationTestBase):
     def test_concurrent_activation_attempts_never_corrupt_the_staged_config(self):
         self._issue_bind_confirm()

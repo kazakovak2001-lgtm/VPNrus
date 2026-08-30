@@ -242,6 +242,92 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config_module.ConfigError):
             config_module.load_config(env=env)
 
+    # --- B8O2: TLS/TCP fallback's own optional completeness group ---
+
+    def _valid_tls_cert_files(self):
+        cert_file = os.path.join(self._tmp.name, "tls-cert.pem")
+        key_file = os.path.join(self._tmp.name, "tls-key.pem")
+        with open(cert_file, "w", encoding="utf-8") as handle:
+            handle.write("cert")
+        with open(key_file, "w", encoding="utf-8") as handle:
+            handle.write("key")
+        return cert_file, key_file
+
+    def _valid_tls_env(self):
+        cert_file, key_file = self._valid_tls_cert_files()
+        env = self._valid_xray_env()
+        env.update({
+            "POCVPN_API_XRAY_TLS_SERVER_PORT": "2054",
+            "POCVPN_API_XRAY_TLS_SERVER_NAME": "203.0.113.1",
+            "POCVPN_API_XRAY_TLS_FINGERPRINT": "chrome",
+            "POCVPN_API_XRAY_TLS_CERT_FILE": cert_file,
+            "POCVPN_API_XRAY_TLS_KEY_FILE": key_file,
+        })
+        return env
+
+    def test_tls_completely_unset_is_fine_alongside_configured_reality(self):
+        cfg = config_module.load_config(env=self._valid_xray_env())
+        self.assertEqual(cfg.xray_tls_server_port, 0)
+
+    def test_fully_configured_tls_settings_load(self):
+        cfg = config_module.load_config(env=self._valid_tls_env())
+        self.assertEqual(cfg.xray_tls_server_port, 2054)
+        self.assertEqual(cfg.xray_tls_server_name, "203.0.113.1")
+        self.assertEqual(cfg.xray_tls_fingerprint, "chrome")
+
+    def test_tls_partially_configured_raises(self):
+        env = self._valid_tls_env()
+        del env["POCVPN_API_XRAY_TLS_SERVER_NAME"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_tls_invalid_fingerprint_raises(self):
+        env = self._valid_tls_env()
+        env["POCVPN_API_XRAY_TLS_FINGERPRINT"] = "netscape-navigator"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_tls_cert_file_nonexistent_raises(self):
+        env = self._valid_tls_env()
+        env["POCVPN_API_XRAY_TLS_CERT_FILE"] = os.path.join(self._tmp.name, "does-not-exist.pem")
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_tls_key_file_relative_path_raises(self):
+        env = self._valid_tls_env()
+        env["POCVPN_API_XRAY_TLS_KEY_FILE"] = "relative-key.pem"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_tls_port_colliding_with_reality_port_raises(self):
+        env = self._valid_tls_env()
+        env["POCVPN_API_XRAY_TLS_SERVER_PORT"] = env["POCVPN_API_XRAY_SERVER_PORT"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_tls_without_activation_boundary_configured_raises(self):
+        cert_file, key_file = self._valid_tls_cert_files()
+        env = self._valid_env()
+        env.update({
+            "POCVPN_API_XRAY_STORE_PATH": os.path.join(self._tmp.name, "xray.json"),
+            "POCVPN_API_XRAY_SERVER_PORT": "8444",
+            "POCVPN_API_XRAY_SERVER_NAME": "example.invalid",
+            "POCVPN_API_XRAY_FINGERPRINT": "chrome",
+            "POCVPN_API_XRAY_REALITY_PUBLIC_KEY": "A" * 43,
+            "POCVPN_API_XRAY_SHORT_ID": "ab12cd34",
+            "POCVPN_API_XRAY_TLS_SERVER_PORT": "2053",
+            "POCVPN_API_XRAY_TLS_SERVER_NAME": "203.0.113.1",
+            "POCVPN_API_XRAY_TLS_FINGERPRINT": "chrome",
+            "POCVPN_API_XRAY_TLS_CERT_FILE": cert_file,
+            "POCVPN_API_XRAY_TLS_KEY_FILE": key_file,
+        })
+        # Deliberately no activation-boundary fields at all (no private key
+        # file/staging/lock/wrapper) - REALITY's own completeness group would
+        # already reject this, but this test pins the TLS-specific message
+        # path distinctly in case REALITY's own group is ever loosened.
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
 
 if __name__ == "__main__":
     unittest.main()

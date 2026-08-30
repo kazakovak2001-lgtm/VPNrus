@@ -18,6 +18,7 @@ import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
@@ -39,6 +40,7 @@ import net.pocvpn.client.vpn.policy.InstalledPackageChecker
 import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
+import net.pocvpn.client.vpn.xray.XrayTlsRuntimeResolution
 
 sealed class ControllerEvent {
     data class RequestVpnPermission(val intent: Intent) : ControllerEvent()
@@ -125,6 +127,11 @@ class VpnController(
     // EXISTING XrayRuntimeResolver - never fabricates Xray config from AWG
     // GatewayConfiguration fields.
     private val xrayProfileRepository: XrayProfileRepository? = null,
+    // B8O2 - additive, defaults to null (same reasoning as
+    // xrayProfileRepository above): with no repository, TransportKind.
+    // TLS_TCP simply never enters [supportedKinds] below - REALITY's own
+    // behavior is completely unaffected by this param's presence.
+    private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -132,18 +139,25 @@ class VpnController(
         const val HANDSHAKE_POLL_INTERVAL_MS = 500L
     }
 
-    // B8I5/B8I6 - the kinds this controller instance can actually build a
-    // TransportConfig for (see buildTransportConfig's own `when`) - AMNEZIA_WG
-    // always; XRAY_REALITY only when a real xrayProfileRepository was wired
-    // (see that param's own docs). A resolved kind outside this set is
-    // refused in connect() BEFORE the active transport is ever switched or
-    // touched - no permission request, no observer attach.
-    private val supportedKinds: Set<TransportKind> =
-        if (xrayProfileRepository != null) {
-            setOf(TransportKind.AMNEZIA_WG, TransportKind.XRAY_REALITY)
-        } else {
-            setOf(TransportKind.AMNEZIA_WG)
-        }
+    // B8I5/B8I6/B8O2 - the kinds this controller instance can actually build
+    // a TransportConfig for (see buildTransportConfig's own `when`) -
+    // AMNEZIA_WG always; XRAY_REALITY/TLS_TCP only when their own real
+    // profile repository was wired (see those params' own docs). A resolved
+    // kind outside this set is refused in connect() BEFORE the active
+    // transport is ever switched or touched - no permission request, no
+    // observer attach.
+    private val supportedKinds: Set<TransportKind> = buildSet {
+        add(TransportKind.AMNEZIA_WG)
+        if (xrayProfileRepository != null) add(TransportKind.XRAY_REALITY)
+        if (xrayTlsProfileRepository != null) add(TransportKind.TLS_TCP)
+    }
+
+    // B8O3 - the kind of the LAST attempt actually validated/passed to
+    // switchActiveTransport() below (never a hypothetical Smart Connect
+    // pick) - see [currentTransportKind]'s own docs for why the diagnostics
+    // UI must read this instead of recomputing a fresh decision.
+    private val _currentTransportKind = MutableStateFlow<TransportKind?>(null)
+    val currentTransportKind: StateFlow<TransportKind?> = _currentTransportKind.asStateFlow()
 
     private val connectMutex = Mutex()
 
@@ -314,6 +328,7 @@ class VpnController(
             }
             switchActiveTransport(resolved.transport)
             pendingConnectKind = resolved.kind
+            _currentTransportKind.value = resolved.kind
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -360,6 +375,8 @@ class VpnController(
             // doConnectAttempt), which is what actually applies a changed
             // saved policy - never an automatic mid-session rebuild.
             _appliedRoutingPolicy.value = null
+            // B8O3 - nothing is running/attempted any more.
+            _currentTransportKind.value = null
         }
     }
 
@@ -531,6 +548,17 @@ class VpnController(
                 when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                     is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
                     is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config)
+                }
+            }
+            TransportKind.TLS_TCP -> {
+                // B8O2 - same reasoning as XRAY_REALITY above, against the
+                // TLS profile repository/resolver instead. Unreachable
+                // unless xrayTlsProfileRepository != null.
+                val repository = xrayTlsProfileRepository
+                    ?: throw XrayProfileNotReadyException("Xray TLS profile repository not wired")
+                when (val resolution = XrayRuntimeResolver.resolveTls(repository)) {
+                    is XrayTlsRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
+                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config)
                 }
             }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")

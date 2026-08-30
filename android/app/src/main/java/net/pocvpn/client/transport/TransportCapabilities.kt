@@ -82,6 +82,31 @@ data class TransportCapabilities(
             maturity = TransportMaturity.EXPERIMENTAL,
         )
 
+        /**
+         * B8O2 - VlessTlsTransport/NovaXrayVpnService (TLS/TCP fallback) as
+         * an isolated adapter shell: real code exists (config validation/
+         * rendering, the SAME real VpnService/TUN/self-UID-exclusion shell
+         * REALITY already uses) but has zero physical-device evidence yet -
+         * see [xrayRealityAdapterShell]'s own docs for why this describes
+         * only what the adapter code does, never Smart Connect eligibility.
+         * Same false capabilities as REALITY's own shell for the same
+         * reasons (ALL_APPS only, no IPv6 plumbing).
+         */
+        fun xrayTlsAdapterShell(): TransportCapabilities = TransportCapabilities(
+            usesUdp = false,
+            usesTcp = true,
+            supportsPort443 = true,
+            supportsObfuscation = false,
+            suitableForRestrictiveNetworks = false,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.EXPERIMENTAL,
+        )
+
         /** A transport with no implementation at all: every capability is truthfully false/unknown. */
         fun notImplemented(): TransportCapabilities = TransportCapabilities(
             usesUdp = false,

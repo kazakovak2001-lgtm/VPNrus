@@ -241,10 +241,13 @@ private fun buildDiagnosticsLines(
     val ipv6AvailableLine = "IPv6 available: ${networkProfile.ipv6Available}"
 
     val smartConnectDecision = viewModel.smartConnectDecision()
-    val currentTransportLine = "Current transport: ${when (smartConnectDecision) {
-        is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.transport.kind
-        SmartConnectDecision.NoCandidateAvailable -> "NONE"
-    }}"
+    // B8O3 - the ACTUALLY running/last-attempted transport (VpnController's
+    // own record of what was really handed to switchActiveTransport()),
+    // never a freshly recomputed hypothetical Smart Connect pick - see
+    // MainViewModel.currentTransportKind's own docs for why this line must
+    // not reuse smartConnectDecision below (that always reflects what would
+    // be chosen RIGHT NOW, which can differ from what is actually running).
+    val currentTransportLine = "Current transport: ${viewModel.currentTransportKind.value?.toString() ?: "NONE"}"
     val smartConnectGatewayLine = "Gateway: ${when (smartConnectDecision) {
         is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.gateway.region
         SmartConnectDecision.NoCandidateAvailable -> "NONE"

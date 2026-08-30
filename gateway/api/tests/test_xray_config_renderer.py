@@ -114,6 +114,88 @@ class RenderStructureTests(RendererTestBase):
             renderer_module.render_server_config({}, {}, bad_reality)
 
 
+class TlsInboundTests(RendererTestBase):
+    """B8O2 - the SECOND inbound render_server_config appends when `tls` is
+    given, alongside (never instead of) REALITY's own."""
+
+    def setUp(self):
+        super().setUp()
+        self.tls = renderer_module.TlsServerConfig(
+            listen_port=2053,
+            cert_file="/etc/letsencrypt/live/152.70.43.1/fullchain.pem",
+            key_file="/etc/letsencrypt/live/152.70.43.1/privkey.pem",
+        )
+
+    def test_tls_none_produces_byte_identical_output_to_pre_b8o2(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality)
+        self.assertEqual(len(config["inbounds"]), 1)
+        self.assertEqual(config["inbounds"][0]["streamSettings"]["security"], "reality")
+
+    def test_tls_inbound_is_appended_alongside_reality(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, tls=self.tls)
+
+        self.assertEqual(len(config["inbounds"]), 2)
+        reality_inbound, tls_inbound = config["inbounds"]
+        self.assertEqual(reality_inbound["streamSettings"]["security"], "reality")
+        self.assertEqual(tls_inbound["streamSettings"]["security"], "tls")
+        self.assertEqual(tls_inbound["port"], 2053)
+        self.assertNotEqual(tls_inbound["port"], reality_inbound["port"])
+
+    def test_tls_inbound_carries_the_same_active_clients_without_flow(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(
+            activations_data, xray_data, self.reality, tls=self.tls, flow="xtls-rprx-vision",
+        )
+
+        reality_clients = config["inbounds"][0]["settings"]["clients"]
+        tls_clients = config["inbounds"][1]["settings"]["clients"]
+        self.assertEqual(len(tls_clients), 1)
+        self.assertEqual(tls_clients[0]["id"], self.uuid_a)
+        self.assertEqual(tls_clients[0]["id"], reality_clients[0]["id"])
+        self.assertNotIn("flow", tls_clients[0])
+        self.assertEqual(reality_clients[0]["flow"], "xtls-rprx-vision")
+
+    def test_tls_inbound_certificates_reference_the_configured_files(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, tls=self.tls)
+
+        certs = config["inbounds"][1]["streamSettings"]["tlsSettings"]["certificates"]
+        self.assertEqual(certs, [{"certificateFile": self.tls.cert_file, "keyFile": self.tls.key_file}])
+
+    def test_revoked_activation_is_excluded_from_both_inbounds(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.REVOKED)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, tls=self.tls)
+
+        self.assertEqual(config["inbounds"][0]["settings"]["clients"], [])
+        self.assertEqual(config["inbounds"][1]["settings"]["clients"], [])
+
+    def test_invalid_tls_config_is_rejected(self):
+        bad_tls = renderer_module.TlsServerConfig(listen_port=99999, cert_file="/x", key_file="/y")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, tls=bad_tls)
+
+    def test_relative_cert_path_is_rejected(self):
+        bad_tls = renderer_module.TlsServerConfig(listen_port=2053, cert_file="relative.pem", key_file="/y")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, tls=bad_tls)
+
+
 class DeterminismTests(RendererTestBase):
     def test_two_renders_of_the_same_input_are_byte_identical(self):
         digest_a, digest_b = "a" * 64, "b" * 64

@@ -19,6 +19,8 @@ import net.pocvpn.client.provisioning.XrayProfileProvisioner
 import net.pocvpn.client.provisioning.XrayProfileProvisioningOutcome
 import net.pocvpn.client.provisioning.XrayProfileResult
 import net.pocvpn.client.provisioning.toXrayProfile
+import net.pocvpn.client.provisioning.XrayTlsProfileResult
+import net.pocvpn.client.provisioning.toXrayTlsProfile
 import net.pocvpn.client.smartconnect.ConnectionScoreReason
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.SmartConnectDecision
@@ -68,6 +70,14 @@ private val SAMPLE_ACTIVATION_SUCCESS = ProvisioningResult.Success(
     gatewayTunnelIp = "10.77.0.1",
     endpointHost = "152.70.43.1",
     endpointPort = 51820,
+)
+
+private val SAMPLE_XRAY_TLS_PROFILE_SUCCESS = XrayTlsProfileResult.Success(
+    serverAddress = "152.70.43.1",
+    serverPort = 2053,
+    uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+    serverName = "203.0.113.1",
+    fingerprint = "chrome",
 )
 
 private val SAMPLE_XRAY_PROFILE_SUCCESS = XrayProfileResult.Success(
@@ -719,6 +729,102 @@ class MainViewModelTest {
 
         assertTrue(resolution is TransportOrchestrator.Resolution.Resolved)
         assertEquals(xrayTransport, (resolution as TransportOrchestrator.Resolution.Resolved).transport)
+    }
+
+    // --- B8O2: TLS/TCP fallback registration - mirrors the XRAY_REALITY tests above ---
+
+    @Test
+    fun `buildTransportRegistry registers exactly one real TLS_TCP transport once a TLS profile is available`() = runTest {
+        val transport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(SAMPLE_XRAY_TLS_PROFILE_SUCCESS.toXrayTlsProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayTlsTransport = tlsTransport,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val registry = viewModel.buildTransportRegistry()
+
+        val tlsDescriptor = registry.descriptorFor(TransportKind.TLS_TCP)
+        assertEquals(TransportStatus.AVAILABLE, tlsDescriptor?.status)
+        assertEquals(tlsTransport, registry.createTransport(TransportKind.TLS_TCP))
+        // AWG's own descriptor is completely unaffected by TLS_TCP being wired.
+        assertEquals(TransportStatus.AVAILABLE, registry.descriptorFor(TransportKind.AMNEZIA_WG)?.status)
+    }
+
+    @Test
+    fun `TLS_TCP stays NOT_IMPLEMENTED - never a hardcoded true - when no TLS profile is available`() = runTest {
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(profile = null)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayTlsTransport = tlsTransport,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val registry = viewModel.buildTransportRegistry()
+
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.TLS_TCP)?.status)
+        assertNull(registry.createTransport(TransportKind.TLS_TCP))
+    }
+
+    @Test
+    fun `TLS_TCP being AVAILABLE never becomes the automatic Auto-preference pick while AWG is available`() = runTest {
+        val transport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(SAMPLE_XRAY_TLS_PROFILE_SUCCESS.toXrayTlsProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTlsTransport = tlsTransport,
+            xrayTlsProfileRepository = tlsRepository,
+            // userTransportPreference defaults to Auto.
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val decision = viewModel.smartConnectDecision()
+
+        assertTrue(decision is SmartConnectDecision.Selected)
+        assertEquals(TransportKind.AMNEZIA_WG, (decision as SmartConnectDecision.Selected).score.candidate.transport.kind)
+    }
+
+    @Test
+    fun `Manual TLS_TCP preference selects it once available`() = runTest {
+        val transport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(SAMPLE_XRAY_TLS_PROFILE_SUCCESS.toXrayTlsProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTlsTransport = tlsTransport,
+            xrayTlsProfileRepository = tlsRepository,
+            userTransportPreference = UserTransportPreference.Manual(TransportKind.TLS_TCP),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val decision = viewModel.smartConnectDecision()
+
+        assertTrue(decision is SmartConnectDecision.Selected)
+        assertEquals(TransportKind.TLS_TCP, (decision as SmartConnectDecision.Selected).score.candidate.transport.kind)
     }
 
     @Test
