@@ -233,7 +233,45 @@ class MainViewModel(
     // this constructor param existing does not, by itself, cause any
     // network access.
     private val manifestDistributionClient: net.pocvpn.client.reachability.ManifestDistributionClient? = null,
+    // B13 - additive, defaults to a store that always reads GERMANY and
+    // ignores writes (see SelectedGatewayStore.germanyOnly()'s own docs) -
+    // every pre-B13 call site/test is byte-for-byte unaffected: the manual
+    // gateway picker simply has nothing to persist to, and
+    // gatewayConfigurationRepository is unaffected by this param entirely
+    // (it is wired to read the SAME store at the composition root - see
+    // Factory - so this field only drives the UI-facing
+    // selectedGateway/selectGateway() below, never a second, competing
+    // source of truth for the actual connect-time config).
+    private val selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = net.pocvpn.client.vpn.config.SelectedGatewayStore.germanyOnly(),
 ) : ViewModel() {
+
+    // B13 - the CURRENT manual gateway selection, for the UI (LocationCard/
+    // the gateway picker) to render and react to. Read once at construction
+    // (matches appRoutingPolicyStore's own savedAppRoutingPolicy pattern)
+    // and updated in-place by selectGateway() - the actual connect-time
+    // GatewayConfigurationRepository reads selectedGatewayStore fresh on
+    // every get() regardless of this StateFlow's value (see
+    // SelectedProductionGatewaySource's own docs), so this is purely a UI
+    // convenience, never a second authoritative copy.
+    private val _selectedGateway = MutableStateFlow(selectedGatewayStore.read())
+    val selectedGateway: StateFlow<net.pocvpn.client.vpn.config.ProductionGatewayId> = _selectedGateway.asStateFlow()
+
+    /**
+     * B13 - THE one place a manual gateway selection is made. Deterministic:
+     * always resolves to exactly the requested [id], persisted immediately
+     * so it survives an app restart (FileSelectedGatewayStore, atomic
+     * write - see its own docs), and reflected in [selectedGateway]
+     * immediately so the UI updates without waiting for a re-read. Does NOT
+     * itself reconnect/touch the tunnel - same "select now, apply on the
+     * next real connect()" contract as a saved AppRoutingPolicy change (see
+     * updateAppRoutingPolicy's own docs) - a currently active session keeps
+     * running on whichever gateway it already connected to until the user
+     * disconnects/reconnects.
+     */
+    fun selectGateway(id: net.pocvpn.client.vpn.config.ProductionGatewayId) {
+        selectedGatewayStore.write(id)
+        _selectedGateway.value = id
+    }
 
     // B8I - CURRENT network facts only (see NetworkProfile's own docs for
     // why this is deliberately separate from connectionOutcomeStore's
@@ -404,15 +442,28 @@ class MainViewModel(
      * carried through TRUTHFULLY (see ConnectionScore's own docs) but never
      * changes WHICH candidate is selected - no restriction-driven switching.
      */
-    fun smartConnectDecision(): SmartConnectDecision = SmartConnectCandidateSelector.decide(
-        networkProfile = networkProfile.value,
-        gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
-        registry = buildTransportRegistry(),
-        preference = userTransportPreference,
-        health = transportHealth(),
-        connectionHistory = recentConnectionOutcomes(),
-        restrictionClass = restrictionClass(),
-    )
+    fun smartConnectDecision(): SmartConnectDecision {
+        // B13 - the candidate's id/region must match whichever gateway
+        // gatewayStatus() actually resolved to (both read the SAME
+        // selectedGatewayStore) - never the Germany-only default, or a
+        // Stockholm selection would be truthfully connected to but
+        // mislabeled/misattributed in ConnectionOutcome/PathHistory as
+        // Germany.
+        val selected = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGateway.value)
+        return SmartConnectCandidateSelector.decide(
+            networkProfile = networkProfile.value,
+            gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(
+                gatewayStatus(),
+                id = selected.endpointId.value,
+                region = "${selected.displayCountry} / ${selected.displayCity}",
+            ),
+            registry = buildTransportRegistry(),
+            preference = userTransportPreference,
+            health = transportHealth(),
+            connectionHistory = recentConnectionOutcomes(),
+            restrictionClass = restrictionClass(),
+        )
+    }
 
     /** B8I - DEBUG diagnostics only; bounded by connectionOutcomeStore's own maxRecords. */
     fun recentConnectionOutcomes(): List<ConnectionOutcome> = connectionOutcomeStore?.recent().orEmpty()
@@ -1193,6 +1244,14 @@ class MainViewModel(
             // (called fresh by VpnController on every gatewayStatus()/connect() -
             // no caching) without VpnController itself changing at all.
             val gatewayConfigSource = MutableGatewayConfigSource(BuildConfigGatewaySource)
+            // B13 - the real product gateway-selection mechanism (see
+            // SelectedGatewayStore/SelectedProductionGatewaySource's own
+            // docs) - deliberately NOT gatewayConfigSource/BuildConfigGatewaySource
+            // above (that remains a local dev-only convenience, never the
+            // product's own selector). Same noBackupFilesDir convention as
+            // every other device-local preference store in this Factory.
+            val selectedGatewayStore = net.pocvpn.client.vpn.config.FileSelectedGatewayStore(context.noBackupFilesDir)
+            val selectedProductionGatewaySource = net.pocvpn.client.vpn.config.SelectedProductionGatewaySource(selectedGatewayStore::read)
             // B8B3C - same noBackupFilesDir as the identity store
             // (ClientKeyRepositoryFactory), different file: this data is
             // non-secret but still device/session-specific, so Auto Backup
@@ -1247,10 +1306,17 @@ class MainViewModel(
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
                 transport = AmneziaWgTransport(context),
-                gatewayConfigurationRepository = DefaultGatewayConfigurationRepository(gatewayConfigSource),
+                // B13 - the real, product gateway-selection source (see its
+                // own docs) - gatewayConfigSource/gatewayConfigOverride
+                // below is kept wired for the pre-existing activation flow's
+                // own UI-gating behavior (ProfileSource routing - see
+                // restorePersistedProfile()'s own docs) but no longer feeds
+                // the actual connect-time config.
+                gatewayConfigurationRepository = DefaultGatewayConfigurationRepository(selectedProductionGatewaySource),
                 reconnectManager = AndroidReconnectManager(context),
                 diagnosticsStore = DiagnosticsStore(),
                 gatewayConfigOverride = gatewayConfigSource,
+                selectedGatewayStore = selectedGatewayStore,
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 installedPackageChecker = AndroidInstalledPackageChecker(context),

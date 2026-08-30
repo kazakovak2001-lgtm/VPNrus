@@ -16,12 +16,14 @@
     <string name="home_status_subtitle_disconnected">Tap to connect</string>
     <string name="home_status_subtitle_connecting">Setting up a secure tunnelвЂ¦</string>
     <string name="home_status_subtitle_failed">Tap to try again</string>
-    <string name="home_location_country">Germany</string>
-    <string name="home_location_city">Frankfurt</string>
     <string name="home_location_content_description">Server location</string>
-    <string name="home_location_chevron_content_description">Change location (coming soon)</string>
+    <string name="home_location_chevron_content_description">Change location</string>
     <string name="home_diagnostics_entry">Diagnostics</string>
     <string name="home_kill_switch_notice">Internet blocked until VPN reconnects</string>
+
+    <!-- Gateway picker -->
+    <string name="gateway_picker_title">Choose a server</string>
+    <string name="gateway_picker_close">Close</string>
 
     <!-- Settings / split tunneling -->
     <string name="settings_title">Settings</string>

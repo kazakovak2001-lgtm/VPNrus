@@ -1,6 +1,7 @@
 package net.pocvpn.client.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,13 +23,17 @@ import androidx.compose.ui.unit.dp
 import net.pocvpn.client.R
 
 /**
- * B8E - static single-location card. Deliberately no click handler beyond
- * the decorative chevron's own content description - server selection is
- * explicitly out of scope for this slice (see B8E task notes).
+ * B13 - real, clickable gateway-location card: [country]/[city] reflect
+ * whichever gateway is ACTUALLY currently selected (see
+ * MainViewModel.selectedGateway/ProductionGatewayCatalog), never the
+ * static "Germany / Frankfurt" placeholder text this card used to render
+ * unconditionally (B8E's own "server selection is explicitly out of scope"
+ * note no longer applies - see [onClick]).
  */
 @Composable
-fun LocationCard(modifier: Modifier = Modifier) {
+fun LocationCard(country: String, city: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     val locationDescription = stringResource(R.string.home_location_content_description)
+    val chevronDescription = stringResource(R.string.home_location_chevron_content_description)
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -36,6 +41,7 @@ fun LocationCard(modifier: Modifier = Modifier) {
         modifier = modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(20.dp))
+            .clickable(onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 18.dp)
             .semantics { contentDescription = locationDescription },
     ) {
@@ -50,17 +56,20 @@ fun LocationCard(modifier: Modifier = Modifier) {
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = stringResource(R.string.home_location_country),
+                text = country,
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Text(
-                text = stringResource(R.string.home_location_city),
+                text = city,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
-        ChevronRightGlyph(tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        ChevronRightGlyph(
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(20.dp).semantics { contentDescription = chevronDescription },
+        )
     }
 }

@@ -15,6 +15,17 @@ interface GatewayConfigSource {
      * the full-tunnel default in that case.
      */
     fun allowedIps(): String = ""
+
+    /**
+     * B13 - the AWG obfuscation/timing profile for THIS source's gateway.
+     * Defaults to [PocAwgProfile.value] (Germany's own values, historically
+     * the only ones that existed) so every pre-B13 implementation
+     * ([BuildConfigGatewaySource], every test fake) is byte-for-byte
+     * unaffected. [SelectedProductionGatewaySource] is the one real
+     * implementation that overrides this per-gateway - see its own docs for
+     * why a single global profile was a real bug, not a simplification.
+     */
+    fun profile(): AwgProfile = PocAwgProfile.value
 }
 
 interface GatewayConfigurationRepository {
@@ -29,7 +40,6 @@ interface GatewayConfigurationRepository {
  */
 class DefaultGatewayConfigurationRepository(
     private val source: GatewayConfigSource,
-    private val profile: AwgProfile = PocAwgProfile.value,
 ) : GatewayConfigurationRepository {
 
     override fun get(): GatewayConfiguration {
@@ -72,7 +82,11 @@ class DefaultGatewayConfigurationRepository(
             // fact (see VpnDnsPolicy's own docs) - applied here so every
             // profile source converges on the same DNS servers.
             dnsServers = VpnDnsPolicy.servers,
-            profile = profile,
+            // B13 - read fresh from the source on every get() call (same
+            // "no caching" discipline as every other field here), never the
+            // constructor-level default this used to be - see
+            // GatewayConfigSource.profile()'s own docs.
+            profile = source.profile(),
         )
     }
 

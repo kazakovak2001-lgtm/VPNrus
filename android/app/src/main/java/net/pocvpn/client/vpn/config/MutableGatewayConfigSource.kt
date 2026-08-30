@@ -65,4 +65,11 @@ class MutableGatewayConfigSource(
     override fun clientTunnelIp(): String = override.get()?.clientTunnelIp ?: delegate.clientTunnelIp()
     override fun gatewayTunnelIp(): String = override.get()?.gatewayTunnelIp ?: delegate.gatewayTunnelIp()
     override fun allowedIps(): String = delegate.allowedIps()
+
+    // B13 - the override never carries a profile (PersistedProfile itself
+    // has no such field - see that type's own docs), so this always
+    // delegates. Kept explicit (not relying on the interface default) so a
+    // reader never has to check whether this class's own override shape
+    // secretly includes it.
+    override fun profile(): AwgProfile = delegate.profile()
 }

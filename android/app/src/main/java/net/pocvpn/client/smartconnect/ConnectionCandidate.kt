@@ -132,15 +132,29 @@ object SmartConnectCandidateSelector {
     }
 
     /**
-     * The actual production gateway candidate list today: the one pinned
-     * gateway (see B5's gateway/README.md - "Germany / Frankfurt"), reusing
-     * the SAME [ProductionGateway.ID] ConnectionOutcome.gatewayId is
-     * recorded under. Empty (not a fabricated candidate) whenever no
-     * gateway is actually configured - mirrors GatewayConfiguration's own
-     * Missing/Invalid fail-closed handling.
+     * The actual production gateway candidate list today: exactly one real
+     * gateway (see B5's gateway/README.md), reusing the SAME
+     * [ConnectionOutcome.gatewayId]/endpoint-scoped identifier every other
+     * B13 endpoint-aware component already keys off. Empty (not a
+     * fabricated candidate) whenever no gateway is actually configured -
+     * mirrors GatewayConfiguration's own Missing/Invalid fail-closed
+     * handling.
+     *
+     * B13 - [id]/[region] default to [ProductionGateway.ID]/[ProductionGateway.REGION_LABEL]
+     * (Germany/Frankfurt) so every pre-B13 call site is byte-for-byte
+     * unaffected. A caller that knows which real gateway is actually
+     * SELECTED (MainViewModel, via ProductionGatewayCatalog - see that
+     * class's own docs) passes its real endpointId/display label instead -
+     * this is what makes ConnectionOutcome/PathHistory/the Xray runtime
+     * resolver all correctly attribute a Stockholm attempt to Stockholm,
+     * never silently to Germany's own default.
      */
-    fun productionGatewayCandidates(gateway: GatewayConfiguration): List<GatewayCandidate> = when (gateway) {
-        is GatewayConfiguration.Configured -> listOf(GatewayCandidate(id = ProductionGateway.ID, region = ProductionGateway.REGION_LABEL))
+    fun productionGatewayCandidates(
+        gateway: GatewayConfiguration,
+        id: String = ProductionGateway.ID,
+        region: String = ProductionGateway.REGION_LABEL,
+    ): List<GatewayCandidate> = when (gateway) {
+        is GatewayConfiguration.Configured -> listOf(GatewayCandidate(id = id, region = region))
         is GatewayConfiguration.Missing, is GatewayConfiguration.Invalid -> emptyList()
     }
 }

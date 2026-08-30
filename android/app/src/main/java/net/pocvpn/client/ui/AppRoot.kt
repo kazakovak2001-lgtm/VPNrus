@@ -72,9 +72,12 @@ fun AppRoot(
     val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
+    val selectedGatewayId by viewModel.selectedGateway.collectAsStateWithLifecycle()
+    val selectedGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGatewayId)
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var showGatewayPicker by remember { mutableStateOf(false) }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
     val context = LocalContext.current
     // B8H perf fix - constructing the repository is cheap (just stores
@@ -154,9 +157,26 @@ fun AppRoot(
                     // B8H1 - the APPLIED policy's mode, never savedRoutingPolicy's -
                     // see homeConnectedSubtitle's own docs for why.
                     appliedRoutingMode = appliedRoutingPolicy?.mode ?: AppRoutingMode.ALL_APPS,
+                    // B13 - the ACTUALLY selected gateway (persisted, real) -
+                    // never the old static "Germany / Frankfurt" placeholder.
+                    locationCountry = selectedGateway.displayCountry,
+                    locationCity = selectedGateway.displayCity,
+                    onLocationClick = { showGatewayPicker = true },
                 )
             }
         }
+    }
+
+    if (showGatewayPicker) {
+        net.pocvpn.client.ui.screens.GatewayPickerDialog(
+            current = selectedGatewayId,
+            options = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+            onSelect = { id ->
+                viewModel.selectGateway(id)
+                showGatewayPicker = false
+            },
+            onDismiss = { showGatewayPicker = false },
+        )
     }
 
     if (isDebugBuild && showDiagnostics) {
