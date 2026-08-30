@@ -2,6 +2,8 @@ package net.pocvpn.client.smartconnect
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -48,9 +50,20 @@ internal fun isMeaningfulNetworkChange(previousType: NetworkType?, currentType: 
 class RestrictionMonitor(
     private val probe: GatewayReachabilityProbe,
     private val scope: CoroutineScope,
+    // B8M - additive, defaults to empty so every existing call site (real
+    // or test) is byte-for-byte unaffected: with no diverse probes,
+    // lastDiverseReachabilityResult simply never leaves null (DiverseReachabilityEvaluator's
+    // own "no probe ran yet -> null" case), the same fail-safe-to-unknown
+    // shape RestrictionClassifier already requires. Probed on the SAME
+    // trigger as [probe] (never a second polling mechanism) - see
+    // triggerProbe's own docs.
+    private val diverseProbes: List<GatewayReachabilityProbe> = emptyList(),
 ) {
     private val _lastProbeResult = MutableStateFlow<Boolean?>(null)
     val lastProbeResult: StateFlow<Boolean?> = _lastProbeResult.asStateFlow()
+
+    private val _lastDiverseReachabilityResult = MutableStateFlow<Boolean?>(null)
+    val lastDiverseReachabilityResult: StateFlow<Boolean?> = _lastDiverseReachabilityResult.asStateFlow()
 
     private var observeJob: Job? = null
     private var probeJob: Job? = null
@@ -80,7 +93,14 @@ class RestrictionMonitor(
     private fun triggerProbe() {
         probeJob?.cancel()
         probeJob = scope.launch {
-            _lastProbeResult.value = probe.isReachable()
+            // Concurrent, not sequential - a slow/timed-out diverse probe
+            // must never delay the gateway probe's own result (or vice
+            // versa); each is independently bounded by its own probe's
+            // timeout (see GatewayReachabilityProbe implementations).
+            val gatewayResult = async { probe.isReachable() }
+            val diverseResults = diverseProbes.map { async { it.isReachable() } }
+            _lastProbeResult.value = gatewayResult.await()
+            _lastDiverseReachabilityResult.value = DiverseReachabilityEvaluator.evaluate(diverseResults.awaitAll())
         }
     }
 }
