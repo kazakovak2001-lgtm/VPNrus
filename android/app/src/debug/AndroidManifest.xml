@@ -6,12 +6,23 @@
   XrayDiagnosticsActivity ONLY in debug builds - it is genuinely absent
   from a release APK's merged manifest, not merely hidden behind a
   BuildConfig.DEBUG runtime check.
+
+  B13 (2026-08-30) - exported="true": recent Android versions (confirmed
+  on a real device targeting SDK 35+) refuse `adb shell am start` against
+  a non-exported component even from the shell UID - exporting is required
+  for this activity's own stated purpose ("manually exercising... on a
+  physical device" via adb). Still harmless to export: this is a
+  DEBUG-BUILD-ONLY activity (absent from any release APK, per this file's
+  own scoping above), it performs no action without explicit Intent
+  extras a bare launch never supplies, and it saves/reads only real,
+  already-provisioned credentials - never fabricates one (see the
+  Activity's own class docs).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <activity
             android:name="net.pocvpn.client.debug.XrayDiagnosticsActivity"
-            android:exported="false"
+            android:exported="true"
             android:label="Xray Diagnostics (debug)" />
     </application>
 </manifest>
