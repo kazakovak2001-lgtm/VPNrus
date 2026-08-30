@@ -81,6 +81,7 @@ class NetworkProfiler(context: Context) {
             hasIpv4Address = linkAddresses.any { it.address is Inet4Address },
             hasIpv6Address = linkAddresses.any { it.address is Inet6Address },
             isVpnTransport = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
+            dnsServerAddresses = currentLinkProperties?.dnsServers.orEmpty().map { it.hostAddress ?: "" }.filter { it.isNotEmpty() },
         )
         _profile.value = buildNetworkProfile(signals, generationCounter.incrementAndGet())
     }
@@ -105,6 +106,7 @@ internal data class RawNetworkSignals(
     val hasIpv4Address: Boolean,
     val hasIpv6Address: Boolean,
     val isVpnTransport: Boolean,
+    val dnsServerAddresses: List<String> = emptyList(),
 )
 
 internal fun buildNetworkProfile(signals: RawNetworkSignals, generation: Long): NetworkProfile {
@@ -124,5 +126,6 @@ internal fun buildNetworkProfile(signals: RawNetworkSignals, generation: Long): 
         ipv6Available = signals.hasIpv6Address,
         vpnActive = signals.isVpnTransport,
         generation = generation,
+        dnsServerAddresses = signals.dnsServerAddresses,
     )
 }

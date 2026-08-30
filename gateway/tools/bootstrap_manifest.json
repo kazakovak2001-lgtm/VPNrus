@@ -1,0 +1,36 @@
+{
+  "manifestVersion": 1,
+  "issuedAtEpochMillis": 1788098464755,
+  "expiresAtEpochMillis": 1851170464755,
+  "signingKeyId": "bootstrap-key-1",
+  "endpoints": [
+    {
+      "id": "frankfurt",
+      "roleOrdinals": [1, 2],
+      "region": "Germany / Frankfurt",
+      "provider": "hetzner",
+      "asn": null,
+      "relayTo": null,
+      "transports": [
+        {
+          "kindOrdinal": 0,
+          "host": "152.70.43.1",
+          "port": 51820,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 1,
+          "host": "152.70.43.1",
+          "port": 2053,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 3,
+          "host": "152.70.43.1",
+          "port": 2083,
+          "metadata": {}
+        }
+      ]
+    }
+  ]
+}
