@@ -83,8 +83,28 @@ with it.
    `RestrictionClassifier`'s output is carried through as
    `ConnectionScore.restrictionClass` for truthful diagnostics (principle
    10 below), but does not yet change WHICH candidate is selected -
-   `RoutingDecisionEngine` wired into this pipeline, and gateway
+   `RoutingDecisionEngine` wired into this pipeline, and real gateway
    selection, still do not exist.
+
+   **B11 (2026-08-30)** added the substrate for that missing gateway
+   selection step as its own pipeline, deliberately observational and NOT
+   yet spliced into the line above:
+
+   ```
+   NetworkProfiler -> RestrictionClassifier -> ReachabilityEngine ->
+     PathCandidateBuilder -> PathScorer -> (future) SmartConnectDecisionEngine
+     -> TransportOrchestrator
+   ```
+
+   `ReachabilityEngine`/`PathCandidateBuilder`/`PathScorer` are real and
+   unit-tested (see the Endpoint / Path Reachability Fabric row below) and
+   ARE live-wired as a read-only diagnostics accessor
+   (`MainViewModel.reachabilityDiagnostics()`), but their output is not yet
+   consumed by `SmartConnectDecisionEngine` - promoting the winning
+   `PathCandidate` into the real decision is deliberately left to a future
+   slice (see that row's own "what remains" note), matching this same
+   "carried through truthfully, not yet decision-driving" boundary already
+   established for `RestrictionClassifier`/`TransportHealth`/`TransportScorer`.
 
 3. **Distinct failure conditions.** A connection attempt that fails must be
    attributable to one of (at minimum):
@@ -127,8 +147,13 @@ with it.
 7. **Public gateway infrastructure must span multiple providers/ASNs.**
    Relying on a single provider (e.g. Hetzner alone) for all gateways is
    not the target architecture - see Gateway Pool / multi-provider gateway
-   infrastructure below, both currently BLOCKED on having any real VPS at
-   all.
+   infrastructure below. A real, physically-verified production VPS has
+   existed since B10-1/B8O2 (2026-08-30), so this is no longer BLOCKED on
+   "zero provisioned gateways" - it is now a scope/priority choice (PLANNED),
+   the same reconciliation already applied to the B6->B10 sequencing gate
+   above. `EndpointDescriptor.provider`/`.asn` (B11) exist as typed fields
+   precisely so a real multi-provider pool can be added without a model
+   change - no second provider is actually deployed yet.
 
 8. **Signed Offline Bootstrap** must let the client retain a
    cryptographically verified last-known-good gateway/control
@@ -159,10 +184,11 @@ with it.
 | Hard Whitelist Detection | **FOUNDATION** | `DiverseReachabilityEvaluator` (B8M) is real and unit-tested: a strict-majority read over several diverse, unrelated, real HTTPS destinations (standard OS/browser connectivity-check endpoints - Google/Apple/Mozilla, each already probed for exactly this purpose by its own platform, so this is an honest reachability check, never an impersonation - architecture principle 4). Live-wired: `RestrictionMonitor` (B8J) probes them on the SAME trigger as the existing gateway probe; `RestrictionClassifier` gained a new `POSSIBLE_HARD_WHITELIST` case (validated internet, the gateway itself confirmed unreachable via BOTH HTTPS and AWG - a confirmed-reachable HTTPS control-plane is treated as positive evidence AGAINST a whitelist claim, not ignored - AND a majority of the diverse set also unreachable). Kept at FOUNDATION, not IMPLEMENTED: this is a narrow, conservative signal ("possible", same discipline as `POSSIBLE_UDP_OR_AWG_FILTERING`), not a confirmed detector, and - like `RestrictionClassifier`'s other classes - it is carried through truthfully into diagnostics only, never yet decision-driving. |
 | Adaptive Direct Routing | PLANNED | `ClientRoutingPolicy`/`RoutingDecisionEngine` (FOUNDATION) provide the static-policy substrate; the *adaptive*, classifier-driven behavior itself does not exist yet. |
 | Gateway Pool | PLANNED | No code; single hardcoded local-dev gateway only. |
-| Gateway Health / Reachability | **FOUNDATION** | `TransportHealth` (Phase 2A) is a real typed model (`UNKNOWN`/`HEALTHY`/`DEGRADED`/`UNREACHABLE`/`NOT_IMPLEMENTED`), now populated with real, transport-level evidence: `TransportHealthCalculator` (B8L1) derives it from `ConnectionOutcomeStore`'s real per-attempt history, wired into `smartConnectDecision()`'s `health` parameter and a diagnostics UI line. Kept at FOUNDATION: `SmartConnectDecisionEngine` still doesn't act on `health` for selection (same "carried through truthfully, not yet decision-driving" boundary as `RestrictionClassifier`), and gateway-level (as opposed to transport-level) reachability - the real `GatewayReachabilityProbe`/`RestrictionMonitor` (B8J) probe a fixed control-plane endpoint, not per-gateway health for a real Gateway Pool - is still separate, unmerged into this model. |
-| multi-provider gateway infrastructure | **BLOCKED** | Pending real VPS (B6). Cannot meaningfully start with zero provisioned gateways. |
+| Gateway Health / Reachability | **FOUNDATION** | `TransportHealth` (Phase 2A) is a real typed model (`UNKNOWN`/`HEALTHY`/`DEGRADED`/`UNREACHABLE`/`NOT_IMPLEMENTED`), now populated with real, transport-level evidence: `TransportHealthCalculator` (B8L1) derives it from `ConnectionOutcomeStore`'s real per-attempt history, wired into `smartConnectDecision()`'s `health` parameter and a diagnostics UI line. Kept at FOUNDATION: `SmartConnectDecisionEngine` still doesn't act on `health` for selection (same "carried through truthfully, not yet decision-driving" boundary as `RestrictionClassifier`). B11 adds the genuinely PER-ENDPOINT counterpart this row used to lack - see Endpoint / Path Reachability Fabric below, kept as its own row rather than merged into this one because `EndpointReachability` answers a materially different question than `TransportHealth` (this endpoint, this transport, this network - vs this transport in general). |
+| Endpoint / Path Reachability Fabric | **FOUNDATION** | B11 - the first real endpoint/path model. `EndpointDescriptor`/`EndpointRole`/`EndpointManifest` (typed, provider/ASN-neutral, no hardcoded commercial infrastructure) are signed (Ed25519) and verified (`Ed25519ManifestVerifier`: signature, expiry, clock-skew, monotonic-version rollback protection - `ManifestRollbackGuard`) via `EndpointManifestRepository`, which is backed by a durable last-known-good store (`FileLastKnownGoodManifestStore`) that falls back to a REAL, cryptographically signed embedded bootstrap manifest (`EmbeddedBootstrapManifest`, signed offline by `gateway/tools/manifest_signing.py` - never an unsigned fallback) whenever no valid LKG exists yet. `ReachabilityEngine` derives per-(endpoint, transport) `EndpointReachability` from evidence this codebase already collects (`TransportHealthCalculator`'s output, the pinned gateway's own HTTPS probe, `NetworkProfile.isUsable`) - deliberately distinct from `TransportHealth` (see that row's own note) and deliberately conservative (stale evidence and no-network both fall back to UNKNOWN, never a stronger claim). `PathCandidateBuilder` builds `Direct` (today's real one-gateway shape) and `Relayed` (Client->INGRESS->EXIT, modeled but NOT a working relay protocol) candidates from the manifest's own role/`relayTo` relationships. `PathScorer` ranks them with reachability as the dominant, order-of-magnitude-separated factor (transport health, this-network local history, capability maturity, then small latency/failure/diversity adjustments - see that object's own docs for why a lower-priority factor can never outrank a higher one). Network-specific local connection memory (`FilePathHistoryStore`, keyed `networkFingerprint x endpointId x transportKind`) uses an app-local, per-install AndroidKeyStore-HMAC network fingerprint (`NetworkFingerprinter`) over coarse signals (network type, resolver IPs already exposed via LinkProperties) - never SSID/BSSID/IMSI/DNS-query history, and not a globally reusable id (the HMAC key never leaves this install's Keystore). **Live-wired, OBSERVATIONAL ONLY**: `MainViewModel.reachabilityDiagnostics()` computes a real, fresh snapshot on every read (same no-caching pattern as `restrictionClass()`/`transportScores()`), but nothing in `SmartConnectDecisionEngine`/`AwgXrayFailoverPolicy`/automatic transport selection reads it yet - kept at FOUNDATION rather than IMPLEMENTED specifically because promoting a winning `PathCandidate` into the real decision boundary is left to a deliberate future promotion slice (same discipline as `TransportScorer`'s own "not yet decision-driving" boundary). Only `Direct` candidates over the single real pinned gateway exist in production data today - `Relayed`/multi-endpoint scoring is proven only by unit tests, not real traffic. |
+| multi-provider gateway infrastructure | PLANNED | A real, physically-verified production VPS has existed since B10-1/B8O2 (2026-08-30) - this is no longer BLOCKED on "zero provisioned gateways" (see architecture principle 7's own reconciliation). No second provider is deployed; `EndpointDescriptor.provider`/`.asn` (B11) exist as typed fields for when one is. |
 | Private Gateway Mode | PLANNED | No code. Architecture principle 9 applies once designed. |
-| Signed Offline Bootstrap | PLANNED | No code. |
+| Signed Offline Bootstrap | **FOUNDATION** | B11 - real, not merely designed: `EndpointManifest`/`ManifestCanonicalizer` (deterministic, dependency-free binary encoding), `Ed25519ManifestVerifier` (signature + expiry + clock-skew + rollback checks), `FileLastKnownGoodManifestStore` (durable, atomic-write LKG persistence surviving app restart), and a REAL cryptographically-signed `EmbeddedBootstrapManifest` (signed offline by `gateway/tools/manifest_signing.py`, a developer-only tool never deployed to the production VPS) all exist and are unit-tested (manifest signature/tamper/expiry/rollback/persistence cases - see B11's own test list). Kept at FOUNDATION, not IMPLEMENTED: there is no real distribution channel yet (no gateway API endpoint serves a fresh manifest for `EndpointManifestRepository.offer()` to consume) - only the embedded bootstrap and hand-offered candidates are exercised today. The embedded trust key is this slice's own placeholder (a real key generated for this PR), not yet a production key-ceremony root - see `EmbeddedBootstrapManifest`'s own docs for why rotating it later requires no interface change. |
 | Alternative Control Routing | PLANNED | No code. |
 | automatic gateway failover | PLANNED | No code; requires Gateway Pool first. |
 
@@ -170,7 +196,7 @@ with it.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Connection Memory | **FOUNDATION** | `ConnectionOutcomeStore`/`FileConnectionOutcomeStore` (B8I) are real: durable (`connection_outcomes.bin`, survives app restart), bounded, tested, and already wired into every real connect attempt (`VpnController.recordConnectionOutcome`) - "did AWG/Frankfurt tend to work, and how fast," exactly this row's own description. Kept at FOUNDATION, not IMPLEMENTED: it is pure storage - nothing yet reads it to change a Smart Connect decision (see Transport Scoring below, and `SmartConnectCandidateSelector`'s own "genuinely UNUSED for a single-candidate decision today" doc). |
+| Connection Memory | **FOUNDATION** | `ConnectionOutcomeStore`/`FileConnectionOutcomeStore` (B8I) are real: durable (`connection_outcomes.bin`, survives app restart), bounded, tested, and already wired into every real connect attempt (`VpnController.recordConnectionOutcome`) - "did AWG/Frankfurt tend to work, and how fast," exactly this row's own description. B11 adds a genuinely NETWORK-SPECIFIC counterpart: `FilePathHistoryStore`, keyed `networkFingerprint x endpointId x transportKind` (an app-local, per-install HMAC fingerprint over coarse network signals - see Endpoint / Path Reachability Fabric's own privacy note), durable and bounded the same way. Kept at FOUNDATION, not IMPLEMENTED: both stores are pure storage feeding `PathScorer`'s `history` input (itself observational-only) - nothing yet reads either to change a live Smart Connect decision (see Transport Scoring below, and `SmartConnectCandidateSelector`'s own "genuinely UNUSED for a single-candidate decision today" doc). |
 | Transport Scoring | **FOUNDATION** | `TransportScorer` (B8N) is real and unit-tested: a deterministic score combining each transport's real `TransportHealth` (B8L1, dominant signal - a NOT_IMPLEMENTED transport always scores lowest) with its declared `TransportCapabilities.maturity` (tie-break only). Live-wired: `MainViewModel.transportScores()` computes it from the real registry/health on every read and surfaces it in the diagnostics UI. Kept at FOUNDATION, not IMPLEMENTED: deliberately NOT passed into `smartConnectDecision()` - same "real evidence, truthfully surfaced, not yet decision-driving" boundary as `RestrictionClassifier`/`TransportHealth` - `SmartConnectDecisionEngine` still picks by its own fixed `PREFERRED_ORDER`, not this score. |
 | Emergency Gateway Rotation | PLANNED | No code; requires Gateway Pool first. |
 | Shadowsocks fallback | PLANNED | No code. |

@@ -34,6 +34,14 @@ data class NetworkProfile(
     val quicReachability: ProbeSignal = ProbeSignal.Unknown,
     val tcp443Reachability: ProbeSignal = ProbeSignal.Unknown,
     val restrictiveNetworkScore: ProbeSignal = ProbeSignal.Unknown,
+    /**
+     * B11 - resolver IP addresses from the current LinkProperties, already
+     * exposed to this app for routing purposes. Coarse-only input for
+     * NetworkFingerprinter's local network memory - never a destination,
+     * query, or anything traffic-related. Defaults to empty so every
+     * pre-B11 call site/test is unaffected.
+     */
+    val dnsServerAddresses: List<String> = emptyList(),
 ) {
     val isUsable: Boolean get() = type != NetworkType.NONE && validatedInternet
 

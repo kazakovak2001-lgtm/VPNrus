@@ -213,6 +213,14 @@ class MainViewModel(
     // gets exactly that transport, success or failure, never a silent
     // automatic substitute (see AwgXrayFailoverPolicy's own docs).
     private val userTransportPreference: UserTransportPreference = UserTransportPreference.Auto,
+    // B11 - additive, defaults to null (same "no wiring, no behavior" seam
+    // as every other optional dependency above). When present, ONLY powers
+    // reachabilityDiagnostics() below - a read-only snapshot. Never consulted
+    // by smartConnectDecision()/buildTransportRegistry() - see
+    // ReachabilityDiagnosticsSnapshot's own "observational only" docs.
+    private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
+    private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
+    private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -420,6 +428,85 @@ class MainViewModel(
             diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
         ),
     )
+
+    /**
+     * B11 - OBSERVATIONAL ONLY: assembles the current reachability fabric
+     * snapshot from real evidence already computed above (transportHealth(),
+     * restrictionClass(), networkProfile, buildTransportRegistry()) plus the
+     * currently trusted manifest. Returns null whenever [manifestRepository]
+     * was never wired (Factory always wires it in production - see below -
+     * but every test call site is unaffected by this addition). Nothing
+     * here is read by smartConnectDecision()/buildTransportRegistry() - see
+     * ReachabilityDiagnosticsSnapshot's own "observational only" docs.
+     */
+    fun reachabilityDiagnostics(): net.pocvpn.client.reachability.ReachabilityDiagnosticsSnapshot? {
+        val repository = manifestRepository ?: return null
+        val manifest = repository.trusted()
+        val registry = buildTransportRegistry()
+        val health = transportHealth()
+        val restriction = restrictionClass()
+        val profile = networkProfile.value
+        val now = System.currentTimeMillis()
+
+        val reachability = manifest.endpoints.flatMap { endpoint ->
+            endpoint.transports.map { binding ->
+                val endpointSpecificReachable = if (endpoint.id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) {
+                    restrictionMonitor?.lastProbeResult?.value
+                } else {
+                    null
+                }
+                net.pocvpn.client.reachability.ReachabilityEngine.assess(
+                    endpoint = endpoint,
+                    transportKind = binding.kind,
+                    networkUsable = profile.isUsable,
+                    transportHealth = health.getValue(binding.kind),
+                    endpointSpecificReachable = endpointSpecificReachable,
+                    restrictionClass = restriction,
+                    nowEpochMillis = now,
+                )
+            }
+        }
+        fun reachabilityFor(id: net.pocvpn.client.reachability.EndpointId, kind: TransportKind) =
+            reachability.first { it.endpointId == id && it.transportKind == kind }
+
+        val candidates = manifest.endpoints.flatMap { endpoint ->
+            endpoint.transports.mapNotNull { binding ->
+                net.pocvpn.client.reachability.PathCandidateBuilder.buildDirect(
+                    endpoint,
+                    binding.kind,
+                    reachabilityFor(endpoint.id, binding.kind),
+                )
+            }
+        }
+
+        val fingerprint = fingerprintKeyProvider?.let {
+            net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+                net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+                it.keyBytes(),
+            )
+        }
+        val scored = candidates.map { candidate ->
+            val gateway = (candidate as net.pocvpn.client.reachability.PathCandidate.Direct).gateway.endpoint
+            val history = fingerprint?.let { pathHistoryStore?.get(it, gateway.id, candidate.transport) }
+            val capabilities = registry.descriptorFor(candidate.transport)?.capabilities
+                ?: TransportCapabilities.notImplemented()
+            net.pocvpn.client.reachability.PathScorer.score(
+                candidate = candidate,
+                registry = registry,
+                capabilities = capabilities,
+                transportHealth = health.getValue(candidate.transport),
+                history = history,
+                diverseProviderOrAsnSeenElsewhere = false,
+            )
+        }
+
+        return net.pocvpn.client.reachability.ReachabilityDiagnostics.snapshot(
+            manifestRepository = repository,
+            reachability = reachability,
+            pathCandidates = candidates,
+            rankedPaths = net.pocvpn.client.reachability.PathScorer.rank(scored),
+        )
+    }
 
     val transportState: StateFlow<TransportState> = controller.state
     val diagnostics: StateFlow<DiagnosticsSnapshot> = diagnosticsStore.snapshot
@@ -987,6 +1074,12 @@ class MainViewModel(
                 xrayTlsProfileProvisioner = XrayTlsProfileProvisioner(xrayTlsProfileRepository),
                 xrayTlsTransport = VlessTlsTransport(context, xrayTlsProfileRepository),
                 xrayTlsProfileRepository = xrayTlsProfileRepository,
+                // B11 - real, live-wired, OBSERVATIONAL ONLY - see
+                // reachabilityDiagnostics()'s own docs for why this cannot
+                // change automatic selection in this slice.
+                manifestRepository = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createManifestRepository(context),
+                pathHistoryStore = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createPathHistoryStore(context),
+                fingerprintKeyProvider = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createFingerprintKeyProvider(context),
             ) as T
         }
     }

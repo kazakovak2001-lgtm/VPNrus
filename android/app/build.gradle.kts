@@ -123,6 +123,12 @@ dependencies {
     implementation(files(xrayAar))
     implementation("androidx.annotation:annotation:1.8.2")
     implementation("androidx.collection:collection:1.4.4")
+    // B11 - Ed25519 manifest-signature verification (EndpointManifestVerifier).
+    // Low-level (non-JCA-provider) API used deliberately: no Provider
+    // registration needed, works uniformly across minSdk 26..35 rather than
+    // depending on platform Ed25519 support that only landed in AndroidKeyStore/
+    // Conscrypt on API 33+.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")
