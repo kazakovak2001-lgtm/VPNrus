@@ -17,6 +17,7 @@ import kotlin.coroutines.coroutineContext
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.ClientKeyRepository
+import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
@@ -36,6 +37,8 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.EffectiveRoutingResult
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
 import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
+import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
+import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
 
 sealed class ControllerEvent {
     data class RequestVpnPermission(val intent: Intent) : ControllerEvent()
@@ -111,21 +114,36 @@ class VpnController(
     // below is simply a no-op. Recording never changes control flow - see
     // that function's own docs for the "real evidence only" invariant.
     private val connectionOutcomeStore: ConnectionOutcomeStore? = null,
+    // B8I6 - additive, defaults to null so every existing call site (real or
+    // test) is byte-for-byte unaffected: with no repository, TransportKind.
+    // XRAY_REALITY simply never enters [supportedKinds] below - the SAME
+    // fail-closed refusal a pre-B8I6 caller already saw for any non-AWG
+    // kind. When wired (MainViewModel's Factory passes the SAME
+    // XrayProfileRepositoryFactory-built instance NovaXrayVpnService/
+    // VlessRealityTransport already read from - one authoritative store,
+    // never a second one), buildTransportConfig() below reuses it via the
+    // EXISTING XrayRuntimeResolver - never fabricates Xray config from AWG
+    // GatewayConfiguration fields.
+    private val xrayProfileRepository: XrayProfileRepository? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
         const val HANDSHAKE_TIMEOUT_MS = 8_000L
         const val HANDSHAKE_POLL_INTERVAL_MS = 500L
-
-        // B8I5 - the ONLY kinds this controller can actually build a
-        // TransportConfig for (see buildTransportConfig's own `when`) -
-        // AMNEZIA_WG only. A resolved kind outside this set is refused in
-        // connect() BEFORE the active transport is ever switched/touched -
-        // no permission request, no observer attach. Extending this set is
-        // B8I6's job (a real TransportConfig.Xray builder), never a reason
-        // to relax this check preemptively.
-        val SUPPORTED_KINDS = setOf(TransportKind.AMNEZIA_WG)
     }
+
+    // B8I5/B8I6 - the kinds this controller instance can actually build a
+    // TransportConfig for (see buildTransportConfig's own `when`) - AMNEZIA_WG
+    // always; XRAY_REALITY only when a real xrayProfileRepository was wired
+    // (see that param's own docs). A resolved kind outside this set is
+    // refused in connect() BEFORE the active transport is ever switched or
+    // touched - no permission request, no observer attach.
+    private val supportedKinds: Set<TransportKind> =
+        if (xrayProfileRepository != null) {
+            setOf(TransportKind.AMNEZIA_WG, TransportKind.XRAY_REALITY)
+        } else {
+            setOf(TransportKind.AMNEZIA_WG)
+        }
 
     private val connectMutex = Mutex()
 
@@ -264,11 +282,12 @@ class VpnController(
      * controller's own constructor-owned transport/kind, so every EXISTING
      * caller (including every pre-B8I4 test) is byte-for-byte unaffected.
      *
-     * [resolved.kind] must be one of [SUPPORTED_KINDS] (AMNEZIA_WG only
-     * today - the only kind buildTransportConfig() can build a config for) -
-     * checked BEFORE the active transport is switched or touched at all, so
-     * an unsupported kind never requests VPN permission or attaches an
-     * observer. When [resolved.kind] IS supported, [resolved.transport]
+     * [resolved.kind] must be one of [supportedKinds] (AMNEZIA_WG always;
+     * XRAY_REALITY only when a real Xray profile repository was wired - see
+     * that param's own docs) - checked BEFORE the active transport is
+     * switched or touched at all, so an unsupported kind never requests VPN
+     * permission or attaches an observer. When [resolved.kind] IS supported,
+     * [resolved.transport]
      * becomes THE active transport for this attempt/session via
      * switchActiveTransport() - a genuinely different instance is adopted
      * (with safe detach/attach, never a silent substitute or a second
@@ -286,7 +305,7 @@ class VpnController(
             if (_state.value is TransportState.Connecting || _state.value is TransportState.Connected) {
                 return
             }
-            if (resolved.kind !in SUPPORTED_KINDS) {
+            if (resolved.kind !in supportedKinds) {
                 rejectPreflight(
                     VpnError.UnsupportedTransportSelected(resolved.kind.name),
                     "Resolved transport (${resolved.kind}) is not supported by this VpnController yet",
@@ -379,12 +398,17 @@ class VpnController(
                 // policy mid-session - see appliedRoutingPolicy's own docs.
                 val routingPolicy = appRoutingPolicyStore.read()
                 val routingResolution = resolveAppRoutingLists(routingPolicy, installedPackageChecker::isInstalled)
-                if (routingResolution is EffectiveRoutingResult.NoAppsSelected) {
+                // B8I6 - split tunneling is an AMNEZIA_WG-only concept today
+                // (NovaXrayVpnService's own plan is ALL_APPS-only - see its
+                // docs); a leftover VPN_ONLY_SELECTED-with-zero-installed-apps
+                // policy must not block an XRAY_REALITY attempt that will
+                // never even read appRoutingLists.
+                if (kind == TransportKind.AMNEZIA_WG && routingResolution is EffectiveRoutingResult.NoAppsSelected) {
                     diagnostics.recordError(VpnError.SplitTunnelingNoAppsSelected)
                     _state.value = TransportState.Error("VPN-only mode has no apps selected - select at least one app")
                     return false
                 }
-                val appRoutingLists = (routingResolution as EffectiveRoutingResult.Apply).lists
+                val appRoutingLists = (routingResolution as? EffectiveRoutingResult.Apply)?.lists ?: AppRoutingLists.AllApps
                 val transportConfig = try {
                     buildTransportConfig(kind, config, appRoutingLists)
                 } catch (e: Exception) {
@@ -408,26 +432,45 @@ class VpnController(
                     // interface was actually built, so this is set here and
                     // ONLY here, never in the catch branch.
                     _appliedRoutingPolicy.value = routingPolicy
-                    // Interface-up/TX>0 alone is deliberately NOT treated as
-                    // success here - see awaitFreshHandshake's own docs. Set
-                    // directly (not left to the background collector) for the
-                    // same reason the prior direct-set comment explained: we
-                    // know unambiguously, right here, whether THIS attempt
-                    // produced a real handshake.
-                    if (awaitFreshHandshake(attemptStartEpochMillis)) {
-                        recordCurrentStats()
-                        _state.value = TransportState.Connected
-                        recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
-                        true
+                    if (kind == TransportKind.AMNEZIA_WG) {
+                        // Interface-up/TX>0 alone is deliberately NOT treated as
+                        // success here - see awaitFreshHandshake's own docs. Set
+                        // directly (not left to the background collector) for the
+                        // same reason the prior direct-set comment explained: we
+                        // know unambiguously, right here, whether THIS attempt
+                        // produced a real handshake.
+                        if (awaitFreshHandshake(attemptStartEpochMillis)) {
+                            recordCurrentStats()
+                            _state.value = TransportState.Connected
+                            recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
+                            true
+                        } else {
+                            diagnostics.recordError(VpnError.HandshakeTimeout)
+                            // Deliberately does NOT call transport.disconnect() -
+                            // failover/kill-switch policy is out of scope for this
+                            // slice (see class docs). The interface may still be
+                            // up; only the user-visible state reflects the truth.
+                            _state.value = TransportState.HandshakeFailed
+                            recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
+                            false
+                        }
                     } else {
-                        diagnostics.recordError(VpnError.HandshakeTimeout)
-                        // Deliberately does NOT call transport.disconnect() -
-                        // failover/kill-switch policy is out of scope for this
-                        // slice (see class docs). The interface may still be
-                        // up; only the user-visible state reflects the truth.
-                        _state.value = TransportState.HandshakeFailed
-                        recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
-                        false
+                        // B8I6 - XRAY_REALITY (the only other kind reaching
+                        // here) has no proven handshake-evidence channel yet -
+                        // VlessRealityTransport's own observeState() never
+                        // reports Connected without one (see its own docs).
+                        // Never fabricate a stronger success signal than the
+                        // transport itself provides: no awaitFreshHandshake
+                        // wait, no forced Connected here - the ALREADY-
+                        // attached active-transport collector (switchActiveTransport,
+                        // called earlier in connect()) is what surfaces
+                        // whatever _state genuinely becomes. No
+                        // ConnectionOutcome recording either - that model is
+                        // AWG-handshake-specific (see recordConnectionOutcome's
+                        // own docs) and does not yet have an Xray equivalent -
+                        // see handleNetworkLost's own docs for why this also
+                        // means no automatic reconnect for this kind.
+                        true
                     }
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
@@ -440,14 +483,23 @@ class VpnController(
     }
 
     /**
-     * B8I4 - the generic per-attempt execution seam: which TransportConfig
-     * SHAPE to build is now dispatched on [kind] rather than always
-     * assuming AMNEZIA_WG. Only AMNEZIA_WG has a real builder today - any
-     * other kind throws, which doConnectAttempt's existing try/catch around
-     * this call already turns into the SAME ConfigurationMappingFailure
-     * fail-closed path every other malformed-config case uses (no new
-     * failure mode). Wiring a real non-AWG builder here is B8I5's job, not
-     * this slice's - see class docs.
+     * B8I4/B8I6 - the generic per-attempt execution seam: which TransportConfig
+     * SHAPE to build is dispatched on [kind]. AMNEZIA_WG builds from the AWG
+     * [config]/[appRoutingLists] exactly as before (unchanged). XRAY_REALITY
+     * builds from the REAL persisted/provisioned Xray profile via the
+     * EXISTING [XrayRuntimeResolver] against [xrayProfileRepository] - it
+     * never reads [config]/[appRoutingLists] (those are AWG-shaped
+     * GatewayConfiguration fields; fabricating an Xray config from them
+     * would be exactly the "fake config" this slice must not do). A missing/
+     * corrupt/invalid profile throws [XrayProfileNotReadyException] (message
+     * is the SAME non-secret reason XrayRuntimeResolver already produces -
+     * never a uuid/key/short_id), which doConnectAttempt's existing
+     * try/catch around this call already turns into the SAME
+     * ConfigurationMappingFailure fail-closed path every other malformed-
+     * config case uses (no new failure mode, no fallback to AWG). Any other
+     * kind still throws [UnsupportedOperationException] - structurally
+     * unreachable via the public API since connect() already refuses a kind
+     * outside [supportedKinds] before ever reaching here.
      */
     private suspend fun buildTransportConfig(kind: TransportKind, config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig =
         when (kind) {
@@ -469,6 +521,17 @@ class VpnController(
                     ),
                 )
                 TransportConfig.Awg(awgConfig)
+            }
+            TransportKind.XRAY_REALITY -> {
+                // Unreachable unless xrayProfileRepository != null (that's
+                // the only way XRAY_REALITY ever enters supportedKinds) -
+                // the null-check here is defensive, not a real code path.
+                val repository = xrayProfileRepository
+                    ?: throw XrayProfileNotReadyException("Xray profile repository not wired")
+                when (val resolution = XrayRuntimeResolver.resolve(repository)) {
+                    is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
+                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config)
+                }
             }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")
         }
@@ -552,15 +615,18 @@ class VpnController(
     }
 
     /**
-     * B8I5 - reconnect (this whole automatic-recovery polling mechanism)
-     * stays AWG-only for this slice, explicitly: it only ever runs after a
-     * successful doConnectAttempt(), which today only ever succeeds for
-     * AMNEZIA_WG (see SUPPORTED_KINDS/buildTransportConfig) - there is no
-     * generic "retry" invented here for a kind that doesn't support it. A
-     * future non-AWG active transport reaching Connected (B8I6+) would need
-     * its OWN deliberate decision about whether polling-for-a-fresh-
-     * handshake even makes sense for that protocol - never assumed
-     * automatically by reusing this loop as-is.
+     * B8I5/B8I6 - reconnect (this whole automatic-recovery polling
+     * mechanism) stays AWG-only, explicitly: it only ever triggers when
+     * `_state.value is Connected`, which today is set ONLY by
+     * doConnectAttempt()'s AMNEZIA_WG branch (see its own docs) -
+     * XRAY_REALITY's branch there deliberately never forces Connected
+     * (VlessRealityTransport has no proven handshake-evidence channel yet),
+     * so this can structurally never engage for it. No generic "retry" is
+     * invented here for a kind that doesn't support it - a future Xray
+     * transport that DOES earn a real Connected signal would need its own
+     * deliberate decision about whether polling-for-a-fresh-handshake even
+     * makes sense for that protocol, never assumed automatically by reusing
+     * this loop as-is.
      */
     private fun handleNetworkLost() {
         if (userInitiatedDisconnect) return
@@ -653,6 +719,15 @@ class VpnController(
         activeObserverJob?.cancel()
     }
 }
+
+/**
+ * B8I6 - the stored/provisioned Xray profile was absent, corrupted, or
+ * failed structural validation (see XrayRuntimeResolver.Rejected's own
+ * reason strings, which this message is always exactly one of) - never
+ * carries a uuid/reality-public-key/short_id, only the same non-secret
+ * reason XrayRuntimeResolver itself already produces.
+ */
+private class XrayProfileNotReadyException(reason: String) : Exception(reason)
 
 /**
  * B8B3D - pure, file-scope (not a VpnController member) specifically so it
