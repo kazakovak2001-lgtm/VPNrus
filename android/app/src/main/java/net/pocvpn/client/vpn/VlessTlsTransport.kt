@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
+import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.TransportConfig
@@ -40,7 +41,11 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class VlessTlsTransport(
     private val context: Context,
-    private val profileRepository: XrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context),
+    // B13 (audit item 5 fix) - same "resolved per-attempt, never fixed at
+    // construction" contract as VlessRealityTransport.profileRepositoryFor -
+    // see that field's own docs.
+    private val profileRepositoryFor: (EndpointId) -> XrayTlsProfileRepository =
+        { id -> XrayTlsProfileRepositoryFactory.create(context, id) },
 ) : VpnTransport {
 
     override val name: String = "xray-vless-tls"
@@ -62,6 +67,8 @@ class VlessTlsTransport(
             return
         }
 
+        // B13 - resolved for THIS attempt's real endpoint, never a fixed instance.
+        val profileRepository = profileRepositoryFor(config.endpointId)
         when (val resolution = XrayRuntimeResolver.resolveTls(profileRepository)) {
             is XrayTlsRuntimeResolution.Rejected -> {
                 state.value = TransportState.Error("Xray TLS profile not ready: ${resolution.reason}")
@@ -84,6 +91,7 @@ class VlessTlsTransport(
                 .setAction(NovaXrayVpnService.ACTION_START)
                 .putExtra(NovaXrayVpnService.EXTRA_SESSION_ID, sessionId)
                 .putExtra(NovaXrayVpnService.EXTRA_TRANSPORT_KIND, TransportKind.TLS_TCP.name)
+                .putExtra(NovaXrayVpnService.EXTRA_ENDPOINT_ID, config.endpointId.value)
             context.startService(intent)
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "connect failed", t)

@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
+import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.TransportConfig
@@ -37,8 +38,13 @@ import java.util.concurrent.atomic.AtomicLong
  * anything this class might otherwise have sent it, so validating a
  * caller-supplied config object here would prove nothing about what
  * actually starts. Instead this class runs the SAME [XrayRuntimeResolver]
- * against the SAME repository as a genuine pre-flight check - one
- * authoritative configuration source, never Intent extras.
+ * against the SAME endpoint-scoped repository (resolved via
+ * [profileRepositoryFor]) as a genuine pre-flight check - one authoritative
+ * configuration SOURCE (the repository), never the config object's own
+ * fields. B13 - `config.endpointId` IS the one field that DOES cross this
+ * boundary (both into [profileRepositoryFor] here and into the ACTION_START
+ * Intent's `EXTRA_ENDPOINT_ID`) - it identifies WHICH repository to consult,
+ * it is not itself the profile/credential data.
  *
  * B8I7 - a real, in-process, typed confirmation channel: [connect] assigns
  * a fresh [sessionId] (an app-lifetime-monotonic counter - never a secret),
@@ -54,12 +60,18 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class VlessRealityTransport(
     private val context: Context,
-    // Additive test seam, defaults to the real authoritative encrypted store -
-    // same factory/AndroidKeyStore alias NovaXrayVpnService itself reads
-    // from (see XrayProfileRepositoryFactory's own docs), so this class's
-    // pre-flight check and NovaXrayVpnService's actual startup decision can
-    // never look at two different stores.
-    private val profileRepository: XrayProfileRepository = XrayProfileRepositoryFactory.create(context),
+    // B13 (audit item 5 fix) - resolves the repository for the endpoint THIS
+    // specific attempt targets (TransportConfig.Xray.endpointId, threaded
+    // all the way from VpnController.pendingConnectEndpointId - see that
+    // field's own docs), never a single instance fixed at construction time.
+    // Defaults to the SAME factory/AndroidKeyStore-alias convention
+    // NovaXrayVpnService's own resolution uses (see its own docs) - a
+    // pre-flight check here and NovaXrayVpnService's actual startup decision
+    // always read the SAME underlying file for a given endpoint, even though
+    // (like NovaXrayVpnService already did before this fix) they may
+    // construct independent repository OBJECT instances against it.
+    private val profileRepositoryFor: (EndpointId) -> XrayProfileRepository =
+        { id -> XrayProfileRepositoryFactory.create(context, id) },
 ) : VpnTransport {
 
     override val name: String = "xray-vless-reality"
@@ -86,6 +98,8 @@ class VlessRealityTransport(
             return
         }
 
+        // B13 - resolved for THIS attempt's real endpoint, never a fixed instance.
+        val profileRepository = profileRepositoryFor(config.endpointId)
         when (val resolution = XrayRuntimeResolver.resolve(profileRepository)) {
             is XrayRuntimeResolution.Rejected -> {
                 state.value = TransportState.Error("Xray profile not ready: ${resolution.reason}")
@@ -115,6 +129,11 @@ class VlessRealityTransport(
             val intent = Intent(context, NovaXrayVpnService::class.java)
                 .setAction(NovaXrayVpnService.ACTION_START)
                 .putExtra(NovaXrayVpnService.EXTRA_SESSION_ID, sessionId)
+                // B13 - the SAME real endpointId this attempt was resolved
+                // against - NovaXrayVpnService reads this to pick its own
+                // matching repository (see that class's own docs), never
+                // defaulting silently to the production endpoint id.
+                .putExtra(NovaXrayVpnService.EXTRA_ENDPOINT_ID, config.endpointId.value)
             context.startService(intent)
             // Real confirmation arrives asynchronously via XrayRuntimeState
             // (see the observer above) - never claim Connected merely

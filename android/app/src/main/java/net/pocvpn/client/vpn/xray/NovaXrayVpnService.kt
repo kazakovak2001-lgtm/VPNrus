@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 import net.pocvpn.client.BuildConfig
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.transport.TransportKind
 
 /**
@@ -59,41 +61,67 @@ class NovaXrayVpnService : VpnService() {
     private val supervisorJob = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + supervisorJob)
 
+    // B13 (2026-08-30 audit item 5 fix) - now endpoint-aware: [EndpointId] IN,
+    // repository OUT, routed through XrayProfileRepositoryFactory (rather
+    // than constructing FileXrayProfileStore/AndroidKeystoreAesGcmEncryptor
+    // inline, as before B13) so this service reads the EXACT SAME
+    // endpoint-scoped file/alias MainViewModel.Factory's own repository
+    // writes to for that same endpoint - the "not a second, independent
+    // store" invariant this field already documented now holds structurally
+    // for EVERY endpoint, not just the one production endpoint a fixed
+    // instance could previously represent.
     /** Overridable only for tests that construct this service directly (Robolectric-style); production always uses the real default. */
-    internal var profileRepositoryFactory: (Context) -> XrayProfileRepository = { context ->
-        net.pocvpn.client.identity.SecureXrayProfileRepository(
-            store = net.pocvpn.client.identity.FileXrayProfileStore(context.noBackupFilesDir),
-            encryptor = net.pocvpn.client.identity.AndroidKeystoreAesGcmEncryptor(KEYSTORE_ALIAS),
-        )
+    internal var profileRepositoryFactory: (Context, EndpointId) -> XrayProfileRepository = { context, endpointId ->
+        net.pocvpn.client.identity.XrayProfileRepositoryFactory.create(context, endpointId)
     }
 
     /** B8O2 - the TLS/TCP counterpart of [profileRepositoryFactory] above; same test-seam contract, its own AndroidKeyStore alias/file. */
-    internal var tlsProfileRepositoryFactory: (Context) -> XrayTlsProfileRepository = { context ->
-        net.pocvpn.client.identity.SecureXrayTlsProfileRepository(
-            store = net.pocvpn.client.identity.FileXrayTlsProfileStore(context.noBackupFilesDir),
-            encryptor = net.pocvpn.client.identity.AndroidKeystoreAesGcmEncryptor(TLS_KEYSTORE_ALIAS),
-        )
+    internal var tlsProfileRepositoryFactory: (Context, EndpointId) -> XrayTlsProfileRepository = { context, endpointId ->
+        net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory.create(context, endpointId)
     }
 
-    // B8K4C - the ONE authoritative configuration source (constraint: prefer
-    // the encrypted XrayProfileRepository over Intent extras): loads the
-    // CURRENT stored profile fresh on first use, resolves/validates/renders
-    // it, and sequences the actual startLoop/stopLoop calls - see
-    // XrayCoreController's own docs for why this is a separate, plain-JVM-
-    // testable class rather than inline here. `by lazy` so
-    // profileRepositoryFactory can still be swapped before first
-    // ACTION_START (matches the field's own test-seam contract) and so
-    // applicationContext is guaranteed attached before this reads it.
-    private val controller: XrayCoreController by lazy {
-        XrayCoreController(
-            repository = profileRepositoryFactory(applicationContext),
+    // B13 - which endpoint the CURRENTLY CACHED [controller] below was built
+    // for. Read/written only from [controllerFor], always on this service's
+    // single-threaded Binder/main-thread callback path (onStartCommand is
+    // never called concurrently with itself by the platform), so no
+    // additional synchronization is needed beyond @Volatile visibility.
+    @Volatile private var controllerEndpointId: EndpointId? = null
+    @Volatile private var cachedController: XrayCoreController? = null
+
+    /**
+     * B13 (audit item 5 fix) - the ONE place [XrayCoreController] is ever
+     * constructed. Reuses the CACHED instance whenever [endpointId] matches
+     * the one it was already built for (the common, in fact ONLY, case
+     * today - preserves every pre-B13 "already running"/"start in flight"
+     * lifecycle invariant [XrayCoreController] itself owns, since those
+     * checks live on ITS OWN instance state, not recreated by calling this
+     * again for the SAME endpoint). Rebuilds - a genuinely NEW
+     * [XrayCoreController], pointed at the correct endpoint's own
+     * repositories - only when [endpointId] actually DIFFERS from the
+     * cached one, i.e. only once a real second endpoint exists and Smart
+     * Connect actually selects it. This is what makes "switching endpoint A
+     * -> B does not reuse A's Xray profile" true at the ACTUAL runtime
+     * layer, not merely at [net.pocvpn.client.vpn.VpnController]'s own
+     * config-construction layer (see that class's own [XrayProfileRepositoryResolver]
+     * docs for why that alone was not sufficient - this class independently
+     * re-resolves its own profile from Intent extras, never trusting the
+     * config object VlessRealityTransport/VlessTlsTransport already
+     * validated).
+     */
+    private fun controllerFor(endpointId: EndpointId): XrayCoreController {
+        cachedController?.let { existing -> if (controllerEndpointId == endpointId) return existing }
+        val fresh = XrayCoreController(
+            repository = profileRepositoryFactory(applicationContext, endpointId),
             coreRuntime = coreRuntime,
             novaPackageId = BuildConfig.APPLICATION_ID,
             ensureCoreEnvInitialized = { coreRuntime.ensureCoreEnvInitialized(applicationContext) },
             establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
             closeTun = { closeTunInterface() },
-            tlsRepository = tlsProfileRepositoryFactory(applicationContext),
+            tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
         )
+        cachedController = fresh
+        controllerEndpointId = endpointId
+        return fresh
     }
 
     // B8I7 - the CURRENT (or most recently started) attempt's session id -
@@ -121,7 +149,12 @@ class NovaXrayVpnService : VpnService() {
                 val kind = intent.getStringExtra(EXTRA_TRANSPORT_KIND)
                     ?.let { runCatching { TransportKind.valueOf(it) }.getOrNull() }
                     ?: TransportKind.XRAY_REALITY
-                startIfNotAlreadyRunning(sessionId, kind)
+                // B13 - the real endpoint VlessRealityTransport/VlessTlsTransport
+                // resolved this attempt against - see parseEndpointIdExtra's
+                // own docs for the fail-safe default an absent/pre-B13 extra
+                // gets.
+                val endpointId = parseEndpointIdExtra(intent.getStringExtra(EXTRA_ENDPOINT_ID))
+                startIfNotAlreadyRunning(sessionId, kind, endpointId)
                 return Service.START_NOT_STICKY
             }
 
@@ -142,9 +175,9 @@ class NovaXrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind) {
+    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind, endpointId: EndpointId) {
         scope.launch {
-            when (val outcome = controller.requestStart(kind)) {
+            when (val outcome = controllerFor(endpointId).requestStart(kind)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
@@ -197,7 +230,14 @@ class NovaXrayVpnService : VpnService() {
     }
 
     private fun teardown(reason: String) {
-        val outcome = controller.requestStop()
+        // B13 - the CURRENTLY cached controller (whichever endpoint's session
+        // is actually active, if any) - never re-resolves via controllerFor,
+        // which would require an endpointId this call site doesn't have and
+        // could otherwise construct a bogus NEW controller (with nothing
+        // running) just to tear it down. No cached controller at all (never
+        // started, or restarted this process) is the SAME "not running" case
+        // requestStop() itself already handles - didTeardown false, no-op.
+        val outcome = cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false, stopLoopFailureReason = null)
         if (!outcome.didTeardown) {
             Log.i(TAG, "teardown($reason) requested while not running - no-op")
             return
@@ -236,8 +276,25 @@ class NovaXrayVpnService : VpnService() {
         // does, so its own intents are byte-for-byte unchanged.
         const val EXTRA_TRANSPORT_KIND = "net.pocvpn.client.vpn.xray.extra.TRANSPORT_KIND"
 
+        // B13 (audit item 5 fix) - the real endpoint id VlessRealityTransport/
+        // VlessTlsTransport resolved THIS attempt against (TransportConfig.Xray/
+        // XrayTls.endpointId - see those types' own docs), non-secret, a
+        // stable technical identifier like every other EndpointId use in
+        // this codebase. Absent for any pre-B13 caller/intent - see
+        // parseEndpointIdExtra's own fail-safe default.
+        const val EXTRA_ENDPOINT_ID = "net.pocvpn.client.vpn.xray.extra.ENDPOINT_ID"
+
         private const val TAG = "NovaXrayVpnService"
-        private const val KEYSTORE_ALIAS = "nova_xray_profile_key"
-        private const val TLS_KEYSTORE_ALIAS = "nova_xray_tls_profile_key"
     }
 }
+
+/**
+ * B13 (audit item 5 fix) - pure, file-scope (same reasoning as
+ * [xrayTransportStateFor] in VlessRealityTransport.kt: directly
+ * unit-testable, independent of any Context/Intent double). A blank/absent
+ * extra (every pre-B13 caller, or a malformed intent) fails safe to the ONE
+ * real production endpoint - never a crash, never an arbitrary/empty
+ * EndpointId (EndpointId itself rejects blank - see its own validation).
+ */
+internal fun parseEndpointIdExtra(raw: String?): EndpointId =
+    raw?.takeIf { it.isNotBlank() }?.let { EndpointId(it) } ?: EndpointId(ProductionGateway.ID)

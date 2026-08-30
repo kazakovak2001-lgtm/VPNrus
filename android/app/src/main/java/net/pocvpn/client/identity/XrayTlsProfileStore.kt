@@ -5,6 +5,8 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.smartconnect.ProductionGateway
 
 sealed class XrayTlsProfileLoadResult {
     object NotFound : XrayTlsProfileLoadResult()
@@ -25,18 +27,35 @@ interface XrayTlsProfileFileStore {
     fun delete()
 }
 
+/**
+ * B13 - same endpoint-scoping/migration discipline as [FileXrayProfileStore] -
+ * see that class's own docs for [legacyFileName]'s "one designated migration
+ * target only" contract.
+ */
 class FileXrayTlsProfileStore(
     private val directory: File,
-    private val fileName: String = "xray_tls_profile.bin",
+    // B13 - see FileXrayProfileStore's own docs for this default's contract.
+    endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+    private val fileName: String = "xray_tls_profile_${sanitizeForFileName(endpointId)}.bin",
+    private val legacyFileName: String? = null,
 ) : XrayTlsProfileFileStore {
 
     private val file: File get() = File(directory, fileName)
+    private val legacyFile: File? get() = legacyFileName?.let { File(directory, it) }
 
     private companion object {
         const val FORMAT_VERSION = 1
     }
 
+    private fun migrateLegacyIfNeeded() {
+        if (file.exists()) return
+        val legacy = legacyFile ?: return
+        if (!legacy.exists()) return
+        legacy.renameTo(file)
+    }
+
     override fun read(): XrayTlsProfileLoadResult {
+        migrateLegacyIfNeeded()
         if (!file.exists()) return XrayTlsProfileLoadResult.NotFound
         return try {
             DataInputStream(file.inputStream().buffered()).use { input ->

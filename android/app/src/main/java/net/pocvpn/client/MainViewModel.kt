@@ -96,6 +96,10 @@ private class PendingFailoverAttempt(
     val preference: UserTransportPreference,
     val registry: TransportRegistry,
     val orchestrator: TransportOrchestrator,
+    // B13 - the SAME endpoint the initial (pre-failover) attempt targeted -
+    // a Xray fallback for a real second gateway must stay ON that gateway,
+    // never silently jump back to a different endpoint's default.
+    val endpointId: net.pocvpn.client.reachability.EndpointId,
 )
 
 /**
@@ -231,6 +235,37 @@ class MainViewModel(
     private val manifestDistributionClient: net.pocvpn.client.reachability.ManifestDistributionClient? = null,
 ) : ViewModel() {
 
+    // B8I - CURRENT network facts only (see NetworkProfile's own docs for
+    // why this is deliberately separate from connectionOutcomeStore's
+    // HISTORICAL outcomes). Falls back to a static "no profiler wired"
+    // unavailable value so this StateFlow is never null. Declared BEFORE
+    // [controller] (B13) so its networkProfileProvider lambda below can
+    // capture this exact StateFlow - read only lazily, at the moment of an
+    // authoritative outcome, never during construction.
+    val networkProfile: StateFlow<NetworkProfile> =
+        networkProfiler?.profile ?: MutableStateFlow(initialNetworkProfile ?: NetworkProfile.unavailable(0)).asStateFlow()
+
+    // B13 (audit item 5 fix) - the ONE authoritative endpoint -> repository
+    // lookup VpnController.buildTransportConfig actually resolves through
+    // for XRAY_REALITY/TLS_TCP - built here, at the composition root, from
+    // the SAME xrayProfileRepository/xrayTlsProfileRepository instances this
+    // ViewModel already received (never a second, independently-constructed
+    // store). Exactly one entry today (the real production endpoint) -
+    // adding a genuine second endpoint later means adding one more map
+    // entry here, never a resolver-contract change or a change inside
+    // VpnController itself. null when the underlying repository itself is
+    // null (matches every pre-B13 "not wired at all" call site).
+    private val xrayProfileRepositoryResolver: net.pocvpn.client.identity.XrayProfileRepositoryResolver? = xrayProfileRepository?.let { repo ->
+        net.pocvpn.client.identity.MapXrayProfileRepositoryResolver(
+            mapOf(net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID) to repo),
+        )
+    }
+    private val xrayTlsProfileRepositoryResolver: net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver? = xrayTlsProfileRepository?.let { repo ->
+        net.pocvpn.client.identity.MapXrayTlsProfileRepositoryResolver(
+            mapOf(net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID) to repo),
+        )
+    }
+
     private val controller = VpnController(
         transport = transport,
         clientKeyRepository = clientKeyRepository,
@@ -243,14 +278,16 @@ class MainViewModel(
         connectionOutcomeStore = connectionOutcomeStore,
         xrayProfileRepository = xrayProfileRepository,
         xrayTlsProfileRepository = xrayTlsProfileRepository,
+        xrayProfileRepositoryResolver = xrayProfileRepositoryResolver,
+        xrayTlsProfileRepositoryResolver = xrayTlsProfileRepositoryResolver,
+        // B13 - the SAME pathHistoryStore/fingerprintKeyProvider instances
+        // reachabilityDiagnostics() below already reads (never a second,
+        // independently-constructed pair) - this is the live-connect-path
+        // writer, that remains the read-only observer.
+        pathHistoryStore = pathHistoryStore,
+        fingerprintKeyProvider = fingerprintKeyProvider,
+        networkProfileProvider = { networkProfile.value },
     )
-
-    // B8I - CURRENT network facts only (see NetworkProfile's own docs for
-    // why this is deliberately separate from connectionOutcomeStore's
-    // HISTORICAL outcomes). Falls back to a static "no profiler wired"
-    // unavailable value so this StateFlow is never null.
-    val networkProfile: StateFlow<NetworkProfile> =
-        networkProfiler?.profile ?: MutableStateFlow(initialNetworkProfile ?: NetworkProfile.unavailable(0)).asStateFlow()
 
     // B8I7 - flips true the moment a real Xray profile is CONFIRMED to
     // exist: checked once at startup (init block below, for a profile
@@ -931,9 +968,15 @@ class MainViewModel(
             when (val decision = smartConnectDecision()) {
                 is SmartConnectDecision.Selected -> {
                     val kind = decision.score.candidate.transport.kind
+                    // B13 - the real SmartConnectCandidateSelector-chosen
+                    // GatewayCandidate.id (today always ProductionGateway.ID,
+                    // but derived, never hardcoded here) - the first place
+                    // this ViewModel names WHICH endpoint the attempt about
+                    // to be resolved/executed actually targets.
+                    val endpointId = net.pocvpn.client.reachability.EndpointId(decision.score.candidate.gateway.id)
                     val registry = buildTransportRegistry()
                     val orchestrator = TransportOrchestrator(registry)
-                    when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind))) {
+                    when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId)) {
                         is TransportOrchestrator.Resolution.Resolved -> {
                             // B8I8A - checked BEFORE connect() (same
                             // side-effect-free query VpnController.connect()
@@ -949,6 +992,7 @@ class MainViewModel(
                                 preference = userTransportPreference,
                                 registry = registry,
                                 orchestrator = orchestrator,
+                                endpointId = endpointId,
                             )
                             pendingFailoverAttempt = attempt
                             controller.connect(resolution)
@@ -1006,6 +1050,7 @@ class MainViewModel(
         preference: UserTransportPreference,
         registry: TransportRegistry,
         orchestrator: TransportOrchestrator,
+        endpointId: net.pocvpn.client.reachability.EndpointId,
     ) {
         val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
             initialKind = initialKind,
@@ -1016,7 +1061,7 @@ class MainViewModel(
         )
         if (!eligible) return
 
-        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY))) {
+        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY), endpointId)) {
             is TransportOrchestrator.Resolution.Resolved -> {
                 controller.disconnect()
                 controller.connect(xrayResolution)
@@ -1084,6 +1129,7 @@ class MainViewModel(
                     preference = attempt.preference,
                     registry = attempt.registry,
                     orchestrator = attempt.orchestrator,
+                    endpointId = attempt.endpointId,
                 )
                 failoverObserverJob?.cancel()
                 failoverObserverJob = null
@@ -1166,12 +1212,18 @@ class MainViewModel(
             // shared by the provisioner, VpnController's config builder, and
             // xrayTransport's own pre-flight check (see each class's own
             // docs) - never a second, independently-constructed store.
-            val xrayProfileRepository = XrayProfileRepositoryFactory.create(context)
+            // B13 (audit fix) - migrateFromLegacyUnscopedFile now defaults to
+            // true for the production endpoint id (see
+            // XrayProfileRepositoryFactory's own docs) - the explicit
+            // `= true` here is redundant with that default but kept for
+            // readability at this call site.
+            val xrayProfileRepository = XrayProfileRepositoryFactory.create(context, migrateFromLegacyUnscopedFile = true)
             // B8O2 - the TLS/TCP counterpart of xrayProfileRepository above -
             // its own independent store/AndroidKeyStore alias (see
             // XrayTlsProfileRepositoryFactory's own docs), shared by its own
             // provisioner and xrayTlsTransport's own pre-flight check.
-            val xrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context)
+            // B13 (audit fix) - same "redundant with the default, kept for readability" note as xrayProfileRepository above.
+            val xrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context, migrateFromLegacyUnscopedFile = true)
             // B12 - the ONE authoritative EndpointManifestRepository instance -
             // shared by reachabilityDiagnostics() (read-only) and
             // manifestDistributionClient below (the only real writer, via
@@ -1227,13 +1279,25 @@ class MainViewModel(
                 // (buildTransportRegistry) and execution
                 // (VpnController.connect(resolved)/TransportOrchestrator) -
                 // never a second, independently-constructed one.
-                xrayTransport = VlessRealityTransport(context, xrayProfileRepository),
+                // B13 (audit item 5 fix) - a resolver lambda, not the single
+                // xrayProfileRepository instance directly: resolves via the
+                // Factory for whatever endpoint the attempt actually names,
+                // falling back to it only for the production endpoint id
+                // (the SAME instance every other collaborator in this Factory
+                // already shares for it - never a fresh, independently
+                // constructed one for the endpoint this repository already
+                // covers).
+                xrayTransport = VlessRealityTransport(context) { id ->
+                    if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayProfileRepository else XrayProfileRepositoryFactory.create(context, id)
+                },
                 xrayProfileRepository = xrayProfileRepository,
                 // B8O2 - same reasoning as xrayTransport/xrayProfileRepository
                 // above, for TLS/TCP: the SAME real VlessTlsTransport instance
                 // is registered for BOTH Smart Connect selection and execution.
                 xrayTlsProfileProvisioner = XrayTlsProfileProvisioner(xrayTlsProfileRepository),
-                xrayTlsTransport = VlessTlsTransport(context, xrayTlsProfileRepository),
+                xrayTlsTransport = VlessTlsTransport(context) { id ->
+                    if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayTlsProfileRepository else XrayTlsProfileRepositoryFactory.create(context, id)
+                },
                 xrayTlsProfileRepository = xrayTlsProfileRepository,
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see
                 // reachabilityDiagnostics()'s own docs for why this cannot

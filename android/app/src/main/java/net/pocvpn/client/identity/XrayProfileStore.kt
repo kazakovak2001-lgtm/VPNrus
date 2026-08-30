@@ -5,6 +5,8 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.smartconnect.ProductionGateway
 
 sealed class XrayProfileLoadResult {
     object NotFound : XrayProfileLoadResult()
@@ -26,18 +28,55 @@ interface XrayProfileFileStore {
     fun delete()
 }
 
+/**
+ * B13 - endpoint-scoped file name: (endpointId, transport-credential-kind) is
+ * the conceptual key the B12 endpoint-identity audit recommended
+ * (docs/B12_ENDPOINT_IDENTITY_AUDIT.md, option (a)) - a REALITY credential
+ * for endpoint "frankfurt" must never collide with, or be silently read as,
+ * one for a future second endpoint. [legacyFileName] is non-null ONLY for
+ * the single historical endpoint that had a real profile persisted BEFORE
+ * this scoping existed (see [migrateLegacyIfNeeded]) - every other endpoint
+ * gets `null` and never touches that file, so two endpoint-scoped stores can
+ * never race over the same legacy blob.
+ */
 class FileXrayProfileStore(
     private val directory: File,
-    private val fileName: String = "xray_profile.bin",
+    // B13 - defaults to the one real production endpoint so every pre-B13
+    // call site (tests, and any construction that doesn't explicitly pass an
+    // endpoint) is unaffected in shape; production code paths that must stay
+    // consistent with XrayProfileRepositoryFactory now go through it instead
+    // of constructing this class directly (see NovaXrayVpnService/
+    // XrayDiagnosticsActivity/VlessRealityTransport).
+    endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+    private val fileName: String = "xray_profile_${sanitizeForFileName(endpointId)}.bin",
+    private val legacyFileName: String? = null,
 ) : XrayProfileFileStore {
 
     private val file: File get() = File(directory, fileName)
+    private val legacyFile: File? get() = legacyFileName?.let { File(directory, it) }
 
     private companion object {
         const val FORMAT_VERSION = 1
     }
 
+    /**
+     * B13 - one-time, best-effort migration from the pre-endpoint-scoping
+     * unscoped file into this endpoint's own scoped slot. A no-op the moment
+     * the scoped file already exists (every read after the first) or when
+     * this store was never designated the legacy migration target (see class
+     * docs). An atomic rename - if it fails (e.g. cross-filesystem), the
+     * legacy file is left untouched and this read reports NotFound rather
+     * than risking a partially-migrated/duplicated credential.
+     */
+    private fun migrateLegacyIfNeeded() {
+        if (file.exists()) return
+        val legacy = legacyFile ?: return
+        if (!legacy.exists()) return
+        legacy.renameTo(file)
+    }
+
     override fun read(): XrayProfileLoadResult {
+        migrateLegacyIfNeeded()
         if (!file.exists()) return XrayProfileLoadResult.NotFound
         return try {
             DataInputStream(file.inputStream().buffered()).use { input ->
@@ -94,6 +133,27 @@ class FileXrayProfileStore(
 }
 
 class XrayProfileCorruptedException(message: String) : Exception(message)
+
+/**
+ * B13 (audit fix) - EndpointId restricts its charset only by length (see its
+ * own validation), never by content: two DISTINCT valid values (e.g.
+ * `"a/b"` and `"a.b"`, or `"gw a"` and `"gw_a"`) sanitize to the IDENTICAL
+ * lossy prefix under a naive char-replace, which would silently collide two
+ * different endpoints' credentials onto the SAME file the moment a second
+ * real gateway exists - a real, provable bug, not merely a theoretical one
+ * (see SanitizeForFileNameTest). Fixed by appending a short SHA-256 digest of
+ * the FULL, non-lossy `endpointId.value` - the lossy prefix stays only for
+ * human-readability when browsing app-private storage; COLLISION-FREEDOM
+ * comes entirely from the hash suffix, which is deterministic (same
+ * EndpointId always produces the same filename) and depends on the whole
+ * string, not just the characters the lossy prefix preserves.
+ */
+internal fun sanitizeForFileName(endpointId: EndpointId): String {
+    val lossyPrefix = endpointId.value.map { c -> if (c.isLetterOrDigit() || c == '-' || c == '_') c else '_' }.joinToString("")
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(endpointId.value.toByteArray(Charsets.UTF_8))
+    val shortHash = digest.joinToString("") { "%02x".format(it) }.take(12)
+    return "$lossyPrefix-$shortHash"
+}
 
 /**
  * Owns the (possibly absent) Xray VLESS+REALITY profile. Unlike
