@@ -155,6 +155,40 @@ class ClientTunnelIdentityStoreTest {
     }
 
     @Test
+    fun `a persisted profile with Germany's host but a different port is not treated as Germany evidence`() {
+        // B13 consolidated review fix (finding 7) - host alone is too weak
+        // a signal; matchGatewayId requires host AND port AND key together.
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        store.migrateFromLegacyProvisionedProfile(
+            legacyProfile(clientTunnelIp = "10.77.0.5").copy(endpointPort = 51821)
+        )
+
+        assertNull(store.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
+    fun `a persisted profile with Germany's host and port but a rotated-wrong key is not treated as Germany evidence`() {
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        store.migrateFromLegacyProvisionedProfile(
+            legacyProfile(clientTunnelIp = "10.77.0.5").copy(gatewayPublicKey = "XgskJjlpQrp+75Bdnz+yDGJYnv7E6Zd60BJWWj1j5Wk=")
+        )
+
+        assertNull(store.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
+    fun `a corrupted out-of-range stored IP is never read back as a provisioned identity`() {
+        // B13 consolidated review fix (finding 7) - Ipv4Format.isValid (all
+        // octets 0..255), not a shape-only regex: a hand-edited/corrupted
+        // file with "999.999.999.999" must not make Germany appear
+        // provisioned.
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        java.io.File(tempFolder.root, "client_tunnel_identity.txt").writeText("GERMANY=999.999.999.999")
+
+        assertNull(store.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
     fun `Germany and Stockholm selection resolves correctly through SelectedProductionGatewaySource after migration`() {
         val store = FileClientTunnelIdentityStore(tempFolder.root)
         store.migrateFromLegacyProvisionedProfile(legacyProfile(clientTunnelIp = "10.77.0.5"))

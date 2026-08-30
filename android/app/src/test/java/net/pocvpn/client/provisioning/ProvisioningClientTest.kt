@@ -92,6 +92,25 @@ class ProvisioningClientTest {
     }
 
     @Test
+    fun `success body with an out-of-range IPv4 octet is rejected as malformed - not merely shape-matched`() {
+        // B13 consolidated review fix (finding 7) - "999.999.999.999" has
+        // the RIGHT shape but is not a real IPv4 address; a looser
+        // regex-only check used to admit it, which would then reach
+        // ClientTunnelIdentityStore.write()'s own strict validation and
+        // throw deep inside MainViewModel.activateDevice() instead of
+        // being rejected cleanly here.
+        val bad = JSONObject()
+            .put("client_tunnel_ip", "999.999.999.999")
+            .put("gateway_public_key", "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU=")
+            .put("gateway_tunnel_ip", "10.77.0.1")
+            .put("endpoint_host", "152.70.43.1")
+            .put("endpoint_port", 51820)
+            .toString()
+        val result = ProvisioningClient.mapHttpResponse(200, bad)
+        assertTrue(result is ProvisioningResult.MalformedResponse)
+    }
+
+    @Test
     fun `success body with out-of-range port is rejected as malformed`() {
         val bad = JSONObject()
             .put("client_tunnel_ip", "10.77.0.2")

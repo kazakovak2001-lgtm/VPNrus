@@ -142,10 +142,14 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(28.dp))
 
-        // B8I - exactly one real transport x one real gateway exists today
-        // (see SmartConnectCandidateSelector's own docs) - so this is
-        // deliberately a plain informational row, never a fake picker/toggle
-        // with choices that don't actually exist yet.
+        // B8I - Smart Connect only ever picks a TRANSPORT within whichever
+        // gateway is already manually selected (see
+        // SmartConnectCandidateSelector's own docs and the real gateway
+        // picker on Home/LocationCard for gateway choice) - automatic
+        // multi-gateway selection/failover does not exist yet (see
+        // docs/ROADMAP.md's own "automatic gateway failover" row). This is
+        // deliberately a plain informational row, never a fake toggle with
+        // choices that don't actually exist yet.
         Text(
             text = stringResource(R.string.settings_smart_connect_title),
             style = MaterialTheme.typography.titleMedium,

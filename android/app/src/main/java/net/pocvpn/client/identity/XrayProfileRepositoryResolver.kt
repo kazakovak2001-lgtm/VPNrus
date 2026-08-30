@@ -23,10 +23,13 @@ fun interface XrayTlsProfileRepositoryResolver {
 }
 
 /**
- * Map-backed resolver - the production shape today (exactly one real
- * endpoint -> one real repository), and the natural shape once a second
- * endpoint's own repository exists (one more map entry - no resolver-contract
- * change needed, and no change to any consumer of [XrayProfileRepositoryResolver]).
+ * Map-backed resolver. B13 consolidated review fix - now genuinely carries
+ * TWO real endpoint -> repository entries in production (Germany AND
+ * Stockholm, when Stockholm's own repository is wired - see
+ * MainViewModel's own docs), proving out the shape this class's docs always
+ * described: adding a real second endpoint was exactly one more map entry,
+ * no resolver-contract change and no change to any consumer of
+ * [XrayProfileRepositoryResolver].
  */
 class MapXrayProfileRepositoryResolver(private val repositories: Map<EndpointId, XrayProfileRepository>) : XrayProfileRepositoryResolver {
     override fun resolve(endpointId: EndpointId): XrayProfileRepository? = repositories[endpointId]

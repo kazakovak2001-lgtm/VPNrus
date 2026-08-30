@@ -3,6 +3,7 @@ package net.pocvpn.client.ui
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.blocksGatewaySelection
 import net.pocvpn.client.vpn.config.ProfileSource
 import net.pocvpn.client.vpn.policy.AppRoutingMode
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
@@ -161,5 +162,22 @@ class ProductFlowPresentationTest {
         // The saved policy differing doesn't change the fact above - it's
         // simply never consulted by this function.
         assertTrue(hasPendingRoutingPolicyChange(AppRoutingPolicy(appliedMode), pendingSavedPolicy))
+    }
+
+    // --- B13 consolidated review fix (finding 5): active-session gateway-selection truth ---
+
+    @Test
+    fun `Connecting, Connected, Reconnecting, and Disconnecting all block gateway selection`() {
+        assertTrue(TransportState.Connecting.blocksGatewaySelection())
+        assertTrue(TransportState.Connected.blocksGatewaySelection())
+        assertTrue(TransportState.Reconnecting(attempt = 1).blocksGatewaySelection())
+        assertTrue(TransportState.Disconnecting.blocksGatewaySelection())
+    }
+
+    @Test
+    fun `Disconnected, Error, and HandshakeFailed never block gateway selection`() {
+        assertFalse(TransportState.Disconnected.blocksGatewaySelection())
+        assertFalse(TransportState.Error("boom").blocksGatewaySelection())
+        assertFalse(TransportState.HandshakeFailed.blocksGatewaySelection())
     }
 }

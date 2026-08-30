@@ -152,4 +152,30 @@ object ProductionGatewayCatalog {
         ProductionGatewayId.GERMANY -> GERMANY
         ProductionGatewayId.STOCKHOLM -> STOCKHOLM
     }
+
+    /**
+     * B13 consolidated review fix - the ONE place a validated control-plane
+     * response (ProvisioningResult.Success) is mapped to a
+     * [ProductionGatewayId]. Matches on the FULL set of stable server facts
+     * a response carries (host AND port AND the gateway's own public key),
+     * never endpointHost alone (a shared/reused host+port with a rotated or
+     * wrong key must not be treated as a match) and never the caller's
+     * current UI gateway selection (a response is evidence about WHICH
+     * gateway actually issued it, not about whatever the user happened to
+     * have tapped in the picker).
+     *
+     * Returns null for anything that does not unambiguously match exactly
+     * ONE catalog entry - an unrecognized combination (a dev/staging
+     * server, a rotated production key not yet in this catalog, or a
+     * malformed/adversarial response) is never guessed at or forced onto
+     * the nearest entry. Callers (MainViewModel.activateDevice) MUST treat
+     * null as "reject this response", never as "fall back to whichever
+     * gateway is currently selected" - see that function's own docs.
+     */
+    fun matchGatewayId(endpointHost: String, endpointPort: Int, serverPublicKeyBase64: String): ProductionGatewayId? =
+        all.singleOrNull {
+            it.awg.endpointHost == endpointHost &&
+                it.awg.endpointPort == endpointPort &&
+                it.awg.serverPublicKeyBase64 == serverPublicKeyBase64
+        }?.id
 }

@@ -50,8 +50,6 @@ interface ClientTunnelIdentityStore {
     fun write(id: ProductionGatewayId, clientTunnelIp: String)
 }
 
-private val IPV4_REGEX = Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")
-
 class FileClientTunnelIdentityStore(
     private val directory: File,
     private val fileName: String = "client_tunnel_identity.txt",
@@ -62,7 +60,7 @@ class FileClientTunnelIdentityStore(
     override fun read(id: ProductionGatewayId): String? = readAll()[id]
 
     override fun write(id: ProductionGatewayId, clientTunnelIp: String) {
-        require(IPV4_REGEX.matches(clientTunnelIp)) {
+        require(Ipv4Format.isValid(clientTunnelIp)) {
             "not a valid IPv4 address: '$clientTunnelIp'"
         }
         val entries = readAll().toMutableMap()
@@ -86,18 +84,26 @@ class FileClientTunnelIdentityStore(
      *
      * Two extra checks beyond "a profile exists" keep this honestly
      * evidence-based rather than a rubber stamp:
-     *  - the persisted profile's own endpointHost must match Germany's
-     *    real gateway host - a profile activated against some OTHER host
-     *    (a dev/staging server, gateway-dev.properties smoke-testing,
-     *    etc.) is not evidence of a real Germany peer assignment and is
-     *    silently ignored, never mis-migrated.
+     *  - B13 consolidated review fix - the persisted profile's FULL stable
+     *    server facts (host AND port AND the gateway's own public key -
+     *    [ProductionGatewayCatalog.matchGatewayId], the SAME matcher
+     *    MainViewModel.activateDevice uses for a live response) must
+     *    resolve unambiguously to GERMANY. A profile whose host happens to
+     *    match but whose port or key does not (a rotated/wrong key) is no
+     *    longer accepted as evidence - endpointHost alone was too weak a
+     *    signal.
      *  - an endpoint that already has a stored value is NEVER overwritten
      *    (idempotent, safe to call on every startup - matches the
      *    previous migration's own idempotency contract).
      */
     fun migrateFromLegacyProvisionedProfile(legacyProfile: PersistedProfile?) {
         if (legacyProfile == null) return
-        if (legacyProfile.endpointHost != ProductionGatewayCatalog.GERMANY.awg.endpointHost) return
+        val matched = ProductionGatewayCatalog.matchGatewayId(
+            endpointHost = legacyProfile.endpointHost,
+            endpointPort = legacyProfile.endpointPort,
+            serverPublicKeyBase64 = legacyProfile.gatewayPublicKey,
+        )
+        if (matched != ProductionGatewayId.GERMANY) return
 
         val entries = readAll()
         if (entries.containsKey(ProductionGatewayId.GERMANY)) return
@@ -113,7 +119,11 @@ class FileClientTunnelIdentityStore(
                 if (parts.size != 2) return@mapNotNull null
                 val id = ProductionGatewayId.entries.firstOrNull { it.name == parts[0] } ?: return@mapNotNull null
                 val ip = parts[1].trim()
-                if (!IPV4_REGEX.matches(ip)) return@mapNotNull null
+                // B13 consolidated review fix - Ipv4Format.isValid (strict,
+                // all octets 0..255), not a shape-only regex: a corrupted or
+                // out-of-range stored value must never be treated as a real
+                // provisioned identity (see this class's own docs).
+                if (!Ipv4Format.isValid(ip)) return@mapNotNull null
                 id to ip
             }.toMap()
         } catch (e: java.io.IOException) {

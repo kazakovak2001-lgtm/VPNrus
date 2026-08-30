@@ -18,3 +18,26 @@ sealed class TransportState {
      */
     object HandshakeFailed : TransportState()
 }
+
+/**
+ * B13 consolidated review fix (finding 5) - true while a VPN session
+ * genuinely exists in a state where a gateway switch would misrepresent
+ * WHERE traffic is actually exiting: Connecting/Reconnecting (an attempt is
+ * in flight, possibly still on the previous gateway), Connected (traffic IS
+ * exiting the currently active gateway right now), and Disconnecting (the
+ * previous session has not yet fully torn down). Deliberately EXCLUDES
+ * Disconnected (no session, nothing to misrepresent) and Error/
+ * HandshakeFailed (the attempt already failed/settled - no traffic is
+ * exiting anywhere on this gateway, so a fresh selection before retrying is
+ * truthful, not misleading).
+ *
+ * THE one shared predicate for this rule - MainViewModel.selectGateway()
+ * and AppRoot's own gateway-picker-open gating both defer to this SAME
+ * function (see each call site's own docs), never two independently
+ * maintained copies of the same four-state list.
+ */
+fun TransportState.blocksGatewaySelection(): Boolean = when (this) {
+    is TransportState.Connecting, is TransportState.Connected,
+    is TransportState.Reconnecting, is TransportState.Disconnecting -> true
+    is TransportState.Disconnected, is TransportState.Error, is TransportState.HandshakeFailed -> false
+}

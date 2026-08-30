@@ -47,7 +47,6 @@ object ProvisioningClient {
     // trailing '='. Not the authoritative check - the server is - but
     // catches a malformed/truncated field before it is ever trusted here.
     private val WG_KEY_REGEX = Regex("^[A-Za-z0-9+/]{43}=$")
-    private val IPV4_REGEX = Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")
 
     // B8K6A fix - REALITY's public key is also a 32-byte X25519 key, but
     // NOT encoded the same way as an AWG key: xray-core's own `xray x25519`
@@ -391,13 +390,20 @@ object ProvisioningClient {
         val endpointHost = json.optString("endpoint_host", "")
         val endpointPort = json.optInt("endpoint_port", -1)
 
-        if (!IPV4_REGEX.matches(clientTunnelIp)) {
+        // B13 consolidated review fix (finding 7) - Ipv4Format.isValid (all
+        // octets 0..255), not a shape-only regex: this response's
+        // client_tunnel_ip flows straight into ClientTunnelIdentityStore.write()
+        // (MainViewModel.activateDevice), which now enforces the SAME strict
+        // check and would throw on anything this looser regex used to admit
+        // (e.g. "999.1.1.1") - reject it here, as a clean MalformedResponse,
+        // rather than let a structurally-wrong value reach that boundary.
+        if (!net.pocvpn.client.vpn.config.Ipv4Format.isValid(clientTunnelIp)) {
             return ProvisioningResult.MalformedResponse("client_tunnel_ip missing or not a valid IPv4 address")
         }
         if (!WG_KEY_REGEX.matches(gatewayPublicKey)) {
             return ProvisioningResult.MalformedResponse("gateway_public_key missing or not a well-formed public key")
         }
-        if (!IPV4_REGEX.matches(gatewayTunnelIp)) {
+        if (!net.pocvpn.client.vpn.config.Ipv4Format.isValid(gatewayTunnelIp)) {
             return ProvisioningResult.MalformedResponse("gateway_tunnel_ip missing or not a valid IPv4 address")
         }
         if (endpointHost.isBlank()) {

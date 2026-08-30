@@ -64,10 +64,10 @@ class DefaultGatewayConfigurationRepository(
         if (!WgKeyFormat.isValid(serverPublicKey)) {
             return GatewayConfiguration.Invalid("server public key is not a valid AmneziaWG/WireGuard key")
         }
-        if (!isValidIpv4(clientTunnelIp)) {
+        if (!Ipv4Format.isValid(clientTunnelIp)) {
             return GatewayConfiguration.Invalid("client tunnel IP is not a valid IPv4 address: '$clientTunnelIp'")
         }
-        if (!isValidIpv4(gatewayTunnelIp)) {
+        if (!Ipv4Format.isValid(gatewayTunnelIp)) {
             return GatewayConfiguration.Invalid("gateway tunnel IP is not a valid IPv4 address: '$gatewayTunnelIp'")
         }
 
@@ -94,10 +94,5 @@ class DefaultGatewayConfigurationRepository(
     private fun resolveAllowedIps(): List<String> {
         val override = source.allowedIps().split(",").map { it.trim() }.filter { it.isNotEmpty() }
         return override.ifEmpty { listOf("0.0.0.0/0", "::/0") }
-    }
-
-    private fun isValidIpv4(ip: String): Boolean {
-        val match = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$").matchEntire(ip) ?: return false
-        return match.groupValues.drop(1).all { it.toIntOrNull()?.let { n -> n in 0..255 } == true }
     }
 }

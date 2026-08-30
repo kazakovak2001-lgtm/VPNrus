@@ -36,6 +36,7 @@ import net.pocvpn.client.vpn.AlwaysOnDetectionState
 import net.pocvpn.client.vpn.AlwaysOnVpnState
 import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.blocksGatewaySelection
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.Ipv6LeakPolicy
 import net.pocvpn.client.vpn.config.ProfileSource
@@ -161,7 +162,15 @@ fun AppRoot(
                     // never the old static "Germany / Frankfurt" placeholder.
                     locationCountry = selectedGateway.displayCountry,
                     locationCity = selectedGateway.displayCity,
-                    onLocationClick = { showGatewayPicker = true },
+                    // B13 consolidated review fix (finding 5) - refuses to
+                    // even OPEN the picker while a session genuinely exists
+                    // (net.pocvpn.client.vpn.TransportState.blocksGatewaySelection -
+                    // the SAME predicate MainViewModel.selectGateway() itself
+                    // enforces as a backstop, see its own docs): Home must
+                    // never show a location the active tunnel is not
+                    // actually using, so there is nothing truthful this
+                    // dialog could offer to change right now.
+                    onLocationClick = { if (!transportState.blocksGatewaySelection()) showGatewayPicker = true },
                 )
             }
         }
@@ -173,8 +182,15 @@ fun AppRoot(
             options = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
             provisionedGatewayIds = viewModel.provisionedGatewayIds,
             onSelect = { id ->
-                viewModel.selectGateway(id)
-                showGatewayPicker = false
+                // B13 consolidated review fix (finding 5) - defense in depth:
+                // onLocationClick above already refuses to open this dialog
+                // during an active session, but a session can start WHILE
+                // this dialog happens to be open (e.g. a reconnect landed
+                // asynchronously) - never act on a tap in that window either.
+                if (!transportState.blocksGatewaySelection()) {
+                    viewModel.selectGateway(id)
+                    showGatewayPicker = false
+                }
             },
             onDismiss = { showGatewayPicker = false },
         )
