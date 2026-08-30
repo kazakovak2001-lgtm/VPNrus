@@ -63,37 +63,43 @@ class RestrictionClassifierTest {
     }
 
     @Test
-    fun `gateway HTTPS unreachable plus a diverse-majority failure yields POSSIBLE_HARD_WHITELIST, not GATEWAY_HTTPS_UNREACHABLE`() {
-        val result = RestrictionClassifier.classify(evidence(gatewayHttpsReachable = false, diverseInternetReachable = false))
+    fun `BOTH HTTPS and AWG confirmed failed plus a diverse-majority failure yields POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false),
+        )
         assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, result)
     }
 
     @Test
-    fun `AWG handshake failure plus a diverse-majority failure yields POSSIBLE_HARD_WHITELIST, not POSSIBLE_UDP_OR_AWG_FILTERING`() {
+    fun `HTTPS confirmed REACHABLE is positive evidence against a whitelist claim - AWG failure plus diverse failure still yields POSSIBLE_UDP_OR_AWG_FILTERING, never POSSIBLE_HARD_WHITELIST`() {
         val result = RestrictionClassifier.classify(
             evidence(gatewayHttpsReachable = true, awgHandshakeFresh = false, diverseInternetReachable = false),
         )
-        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, result)
+        assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, result)
     }
 
     @Test
-    fun `gateway unreachable but diverse destinations mostly DO respond yields the existing gateway-specific classes, never POSSIBLE_HARD_WHITELIST`() {
-        assertEquals(
-            RestrictionClass.GATEWAY_HTTPS_UNREACHABLE,
-            RestrictionClassifier.classify(evidence(gatewayHttpsReachable = false, diverseInternetReachable = true)),
+    fun `HTTPS confirmed unreachable but AWG status is unknown (never attempted) never claims POSSIBLE_HARD_WHITELIST from insufficient evidence`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = null, diverseInternetReachable = false),
         )
-        assertEquals(
-            RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING,
-            RestrictionClassifier.classify(evidence(gatewayHttpsReachable = true, awgHandshakeFresh = false, diverseInternetReachable = true)),
-        )
+        assertEquals(RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, result)
     }
 
     @Test
-    fun `gateway unreachable but diverse probes never ran (null) never claims POSSIBLE_HARD_WHITELIST from insufficient evidence`() {
-        assertEquals(
-            RestrictionClass.GATEWAY_HTTPS_UNREACHABLE,
-            RestrictionClassifier.classify(evidence(gatewayHttpsReachable = false, diverseInternetReachable = null)),
+    fun `gateway unreachable via both protocols but diverse destinations mostly DO respond yields GATEWAY_HTTPS_UNREACHABLE, never POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = true),
         )
+        assertEquals(RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, result)
+    }
+
+    @Test
+    fun `gateway unreachable via both protocols but diverse probes never ran (null) never claims POSSIBLE_HARD_WHITELIST from insufficient evidence`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = null),
+        )
+        assertEquals(RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, result)
     }
 
     @Test

@@ -73,15 +73,18 @@ data class RestrictionEvidence(
  *     conclusion mid-attempt (see VpnController.reconnectLoop's own docs)
  *  4. A genuinely fresh AWG handshake - the strongest possible "fine" signal
  *  5. Internet present but not validated
- *  6. Validated internet, gateway unreachable (HTTPS AND/OR AWG), AND a
- *     STRICT MAJORITY of several diverse, unrelated real destinations are
+ *  6. Validated internet, gateway unreachable via BOTH HTTPS AND AWG (never
+ *     either alone - a CONFIRMED-reachable HTTPS control-plane is positive
+ *     evidence against a narrow allowlist, even if AWG itself failed; that
+ *     specific case is rule 8's own, more precise claim, not this one), AND
+ *     a STRICT MAJORITY of several diverse, unrelated real destinations are
  *     ALSO unreachable -> the ONLY case allowed to suggest a possible fixed
  *     allowlist (architecture principle 3's HARD_WHITELIST condition), and
  *     even then only as "possible" (see POSSIBLE_HARD_WHITELIST's own
  *     docs) - MUST be checked before rules 7/8 below, since it is a more
  *     specific refinement of the same underlying gateway failure they
- *     describe, requiring strictly more (diverse, not just gateway-only)
- *     evidence
+ *     describe, requiring strictly more (diverse AND dual-protocol, not
+ *     just gateway-only) evidence
  *  7. Validated internet, but the gateway itself is HTTPS-unreachable
  *  8. Validated internet, gateway HTTPS-reachable, but AWG handshake failed
  *     -> the ONLY case allowed to suggest UDP/AWG-specific filtering, and
@@ -92,7 +95,7 @@ object RestrictionClassifier {
 
     fun classify(evidence: RestrictionEvidence): RestrictionClass {
         val profile = evidence.networkProfile
-        val gatewayUnreachable = evidence.gatewayHttpsReachable == false || evidence.awgHandshakeFresh == false
+        val gatewayUnreachable = evidence.gatewayHttpsReachable == false && evidence.awgHandshakeFresh == false
         return when {
             profile.type == NetworkType.NONE -> RestrictionClass.NO_NETWORK
             profile.captivePortal == true -> RestrictionClass.CAPTIVE_PORTAL
