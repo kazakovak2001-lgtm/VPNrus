@@ -52,6 +52,10 @@ fun AppSelectorScreen(
     onToggle: (String, Boolean) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    // B8H perf fix - true only while the (now lazy, off-main-thread) initial
+    // PackageManager scan for THIS AppRoot session is still in flight; false
+    // (default) preserves every existing call site/behavior exactly.
+    isLoading: Boolean = false,
 ) {
     var query by remember { mutableStateOf("") }
     val filtered = remember(apps, query) {
@@ -98,7 +102,14 @@ fun AppSelectorScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        if (filtered.isEmpty()) {
+        if (isLoading) {
+            Text(
+                text = stringResource(R.string.app_selector_loading),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 24.dp),
+            )
+        } else if (filtered.isEmpty()) {
             Text(
                 text = stringResource(R.string.app_selector_empty),
                 style = MaterialTheme.typography.bodyMedium,

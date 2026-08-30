@@ -14,7 +14,11 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import net.pocvpn.client.MainViewModel
+import net.pocvpn.client.apps.InstalledAppInfo
+import net.pocvpn.client.apps.InstalledAppRepository
 import net.pocvpn.client.apps.PackageManagerInstalledAppRepository
 import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
 import net.pocvpn.client.network.NetworkProfile
@@ -72,7 +76,16 @@ fun AppRoot(
     var showDiagnostics by remember { mutableStateOf(false) }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
     val context = LocalContext.current
-    val installedApps = remember { PackageManagerInstalledAppRepository(context).listLaunchableApps() }
+    // B8H perf fix - constructing the repository is cheap (just stores
+    // `context`); the actual PackageManager scan (queryIntentActivities +
+    // getApplicationInfo/Label/Icon per app + sorting) is real Binder IPC +
+    // bitmap decode work and is NOT startup-critical - only AppSelector needs
+    // it. `installedApps` stays null (never scanned) until AppSelector is
+    // actually opened, is loaded off the main thread (see loadInstalledApps),
+    // and then stays cached in this composable's remember scope for the rest
+    // of this AppRoot's lifetime - navigating away/back never rescans.
+    val installedAppRepository = remember(context) { PackageManagerInstalledAppRepository(context) }
+    var installedApps by remember { mutableStateOf<List<InstalledAppInfo>?>(null) }
 
     LaunchedEffect(provisioningState) {
         if (shouldClearCredentialInput(provisioningState)) credential = ""
@@ -82,6 +95,11 @@ fun AppRoot(
             when (event) {
                 is ControllerEvent.RequestVpnPermission -> onRequestVpnPermission(event.intent)
             }
+        }
+    }
+    LaunchedEffect(settingsRoute) {
+        if (settingsRoute == SettingsRoute.AppSelector && installedApps == null) {
+            installedApps = loadInstalledApps(installedAppRepository)
         }
     }
 
@@ -97,7 +115,8 @@ fun AppRoot(
                 )
                 // B8H - "Select apps" screen, reached only from Settings.
                 settingsRoute == SettingsRoute.AppSelector -> AppSelectorScreen(
-                    apps = installedApps,
+                    apps = installedApps ?: emptyList(),
+                    isLoading = installedApps == null,
                     selectedPackageNames = savedRoutingPolicy.selectedPackageNames,
                     onToggle = { packageName, checked ->
                         val updated = if (checked) {
@@ -282,6 +301,17 @@ private fun buildDiagnosticsLines(
         "Last error: ${diagnostics.lastError?.displayText() ?: "-"}",
     )
 }
+
+/**
+ * B8H perf fix - the ONE place PackageManagerInstalledAppRepository's
+ * synchronous scan (queryIntentActivities/getApplicationInfo/Label/Icon +
+ * sorting) is actually invoked, always off the main thread. `internal` (not
+ * private) so this exact dispatcher-switch + passthrough behavior is
+ * unit-testable with a fake InstalledAppRepository, without needing a
+ * Compose test dependency this project doesn't have.
+ */
+internal suspend fun loadInstalledApps(repository: InstalledAppRepository): List<InstalledAppInfo> =
+    withContext(Dispatchers.IO) { repository.listLaunchableApps() }
 
 private fun ipv6PolicyDisplayText(policy: Ipv6LeakPolicy): String = when (policy) {
     Ipv6LeakPolicy.TUNNELED -> "tunneled"

@@ -37,6 +37,7 @@
     <string name="app_selector_title">Select apps</string>
     <string name="app_selector_search_placeholder">Search apps</string>
     <string name="app_selector_empty">No apps found</string>
+    <string name="app_selector_loading">Loading apps…</string>
 
     <!-- B8I - Smart Connect foundation, informational only (see SettingsScreen's own docs) -->
     <string name="settings_smart_connect_title">Smart Connect</string>
