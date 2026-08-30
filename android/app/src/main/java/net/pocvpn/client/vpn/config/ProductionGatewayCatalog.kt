@@ -9,6 +9,17 @@ import net.pocvpn.client.reachability.EndpointId
  * AWS gateway (Stockholm) added for B13's multi-provider validation slice -
  * see docs/ROADMAP.md's Gateway Pool row for the full history.
  *
+ * Deliberately GATEWAY-SIDE FACTS ONLY (endpoint host/port, the gateway's
+ * OWN WireGuard/AmneziaWG public key and tunnel address, its AWG obfuscation
+ * profile). This catalog does NOT carry any per-device client tunnel IP -
+ * that is THIS DEVICE'S provisioned peer address on a given gateway (each
+ * physical device gets its own AllowedIPs assignment from that gateway's
+ * own add-peer.sh-managed peer list), never a fact about the gateway itself.
+ * See ClientTunnelIdentityStore for where that's actually resolved from -
+ * a real B13 review blocker found a single hardcoded clientTunnelIp baked in
+ * here, which is exactly the same class of bug root-caused for Germany
+ * below: a per-device value silently assumed to be a global constant.
+ *
  * Committing real public IPs/AWG public keys here is consistent with this
  * codebase's own existing practice - ProvisioningClient/GatewayReachabilityProbe
  * already hardcode the Oracle gateway's real IP, and a WireGuard/AmneziaWG
@@ -21,12 +32,16 @@ import net.pocvpn.client.reachability.EndpointId
  */
 enum class ProductionGatewayId { GERMANY, STOCKHOLM }
 
-/** The AWG-specific connection facts for one gateway - mirrors GatewayConfigSource's own field shape. */
+/**
+ * The AWG-specific connection facts for one gateway that are genuinely
+ * gateway infrastructure, not per-device identity - mirrors
+ * GatewayConfigSource's own field shape minus clientTunnelIp (see this
+ * file's own top-level docs for why that field does not belong here).
+ */
 data class AwgGatewayConnection(
     val endpointHost: String,
     val endpointPort: Int,
     val serverPublicKeyBase64: String,
-    val clientTunnelIp: String,
     val gatewayTunnelIp: String,
 )
 
@@ -37,7 +52,10 @@ data class AwgGatewayConnection(
  * PathHistoryStore, XrayProfileRepositoryResolver - see those classes' own
  * docs) - Germany's is EndpointId(ProductionGateway.ID) ("frankfurt"), the
  * exact same value every pre-B13 default already assumed, so selecting
- * Germany is byte-for-byte the historical single-gateway behavior.
+ * Germany is byte-for-byte the historical single-gateway behavior. It is
+ * also the SAME key ClientTunnelIdentityStore is looked up by (via
+ * [ProductionGatewayId] one level up) for this device's own client tunnel
+ * IP on this gateway.
  *
  * [awgProfile] is this gateway's OWN AmneziaWG obfuscation/timing profile -
  * B13's audit found `PocAwgProfile` was a single GLOBAL value silently
@@ -66,25 +84,10 @@ object ProductionGatewayCatalog {
         displayCountry = "Germany",
         displayCity = "Frankfurt",
         provider = "Oracle Cloud",
-        // B13 (2026-08-30 Germany data-plane root cause) - clientTunnelIp
-        // MUST match the gateway's OWN live peer registration for this
-        // device's public key, never an assumed/stale value: SSH diagnosis
-        // found the server's add-peer.sh-managed peer list assigns THIS
-        // device's real public key AllowedIPs = 10.77.0.5/32 (a later
-        // re-provisioning, label provision-peer-1788077883) - the app was
-        // still configured with the OLDER 10.77.0.2, which now belongs to a
-        // DIFFERENT peer entirely. WireGuard's AllowedIPs is both a route
-        // table AND a source-IP ingress filter, so packets from the wrong
-        // local address get silently dropped post-handshake (the handshake
-        // itself doesn't check AllowedIPs, which is exactly why it kept
-        // succeeding while all data traffic timed out). Zero server-side
-        // change was needed - gateway A's firewall/NAT/forwarding were
-        // already correct; this was purely a stale client-side value.
         awg = AwgGatewayConnection(
             endpointHost = "152.70.43.1",
             endpointPort = 51820,
             serverPublicKeyBase64 = "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU=",
-            clientTunnelIp = "10.77.0.5",
             gatewayTunnelIp = "10.77.0.1",
         ),
         awgProfile = AwgProfile(
@@ -109,8 +112,10 @@ object ProductionGatewayCatalog {
      * Stockholm) - B13's multi-provider/ASN validation target. AWG
      * physically handshake-verified 2026-08-30 (real device, real 8-second
      * timeout window, "Received handshake response" in 48ms, exit IP
-     * 16.170.208.231 confirmed via two independent services). REALITY/TLS
-     * are not yet deployed on this gateway - see docs/ROADMAP.md.
+     * 16.170.208.231 confirmed via two independent services). REALITY and
+     * TLS_TCP are ALSO physically validated on this gateway as of B13 Part 2
+     * (2026-08-30) - see docs/ROADMAP.md's Gateway Pool row for the full
+     * evidence trail; this gateway is no longer AWG-only.
      */
     val STOCKHOLM = ProductionGatewayDescriptor(
         id = ProductionGatewayId.STOCKHOLM,
@@ -122,7 +127,6 @@ object ProductionGatewayCatalog {
             endpointHost = "16.170.208.231",
             endpointPort = 51820,
             serverPublicKeyBase64 = "XgskJjlpQrp+75Bdnz+yDGJYnv7E6Zd60BJWWj1j5Wk=",
-            clientTunnelIp = "10.77.0.2",
             gatewayTunnelIp = "10.77.0.1",
         ),
         awgProfile = AwgProfile(

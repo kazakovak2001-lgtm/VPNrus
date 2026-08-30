@@ -1251,7 +1251,20 @@ class MainViewModel(
             // product's own selector). Same noBackupFilesDir convention as
             // every other device-local preference store in this Factory.
             val selectedGatewayStore = net.pocvpn.client.vpn.config.FileSelectedGatewayStore(context.noBackupFilesDir)
-            val selectedProductionGatewaySource = net.pocvpn.client.vpn.config.SelectedProductionGatewaySource(selectedGatewayStore::read)
+            // B13 review fix - per-device, per-endpoint client tunnel IP,
+            // deliberately separate from selectedGatewayStore above (see
+            // ClientTunnelIdentityStore's own docs for why this is
+            // provisioned device identity, never a gateway fact). The
+            // migration call seeds THIS device's already-working
+            // Germany/Stockholm assignment exactly once, on whichever
+            // startup first runs this fix - it never overwrites a value
+            // already on disk.
+            val clientTunnelIdentityStore = net.pocvpn.client.vpn.config.FileClientTunnelIdentityStore(context.noBackupFilesDir)
+            clientTunnelIdentityStore.migrateLegacyDefaultsIfMissing()
+            val selectedProductionGatewaySource = net.pocvpn.client.vpn.config.SelectedProductionGatewaySource(
+                selectedGatewayId = selectedGatewayStore::read,
+                clientTunnelIp = clientTunnelIdentityStore::read,
+            )
             // B8B3C - same noBackupFilesDir as the identity store
             // (ClientKeyRepositoryFactory), different file: this data is
             // non-secret but still device/session-specific, so Auto Backup
