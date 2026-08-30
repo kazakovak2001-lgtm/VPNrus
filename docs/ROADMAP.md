@@ -42,6 +42,22 @@ foundation) remains the only architecture work done ahead of sequence
 for the transports that are still PLANNED - see [Phase 2A's own report]
 in the project history for that boundary.
 
+**As of B10-1 (2026-08-30), the B6->B8B->B9->B10 sequence above is
+itself complete** - see the "Current verification status" table below:
+public AWG handshake, public VPS NAT behavior, external IP change, and
+DNS/IPv4/IPv6 leak protection are all now VERIFIED with real physical-
+device evidence (B6, real VPS provisioning, has been implicitly true
+throughout this document's B8I/B8K/B8L/B8M/B8N history - the gateway at
+`152.70.43.1` this evidence was gathered against is that same real VPS).
+This means the sequencing GATE itself - not merely an exception granted
+to one transport - no longer blocks QUIC/TLS/TCP-fallback/Shadowsocks
+runtime work on process grounds; any decision to start one is now a
+scope/priority choice, not a blocked one. `Real restrictive-network/
+Russia behavior` (the verification table's final row) remains
+**UNVERIFIED and separate** - B10's leak validation says nothing about
+behavior on an actually-restrictive network, and must not be conflated
+with it.
+
 ## Architecture principles this roadmap commits to
 
 1. **Routing decision and transport selection stay separate.** "Should this
@@ -183,13 +199,14 @@ in the project history for that boundary.
 | Claim | Status |
 |---|---|
 | Local Android<->WSL2 AmneziaWG handshake | **VERIFIED** (B8A) |
-| Public-network AWG handshake | **UNVERIFIED** - pending B8B |
-| Public VPS NAT behavior | **UNVERIFIED** - pending B8B |
-| External public IP change through the tunnel | **UNVERIFIED** - pending B9 |
-| DNS leak protection | **UNVERIFIED** - pending B10 |
-| IPv4/IPv6 leak protection | **UNVERIFIED** - pending B10 |
+| Public-network AWG handshake | **VERIFIED** (B10-1, 2026-08-30) - real physical Android device (ADB-connected, `net.pocvpn.client` debug build), real mobile/Wi-Fi network, real gateway `152.70.43.1:51820`; logcat: `Sending handshake initiation` -> `Received handshake response`; `dumpsys`/`ip addr` confirm `GoBackend$VpnService` running with `tun0 10.77.0.5/32`. |
+| Public VPS NAT behavior | **VERIFIED** (B10-1, 2026-08-30) - tunnel exit IP (`152.70.43.1`, the gateway's own address) confirmed via two independent third-party services (icanhazip.com, dnsleaktest.com) from a real device browser tab, differing from the device's real baseline IP. |
+| External public IP change through the tunnel | **VERIFIED** (B10-1, 2026-08-30) - baseline `86.49.236.33` (icanhazip.com, disconnected) -> connected `152.70.43.1` (icanhazip.com AND dnsleaktest.com independently agree), all via real browser traffic, not shell-UID traffic. See `docs/B10_LEAK_VALIDATION_PLAN.md`'s Results section for the full evidence. |
+| DNS leak protection | **VERIFIED** (B10-1, 2026-08-30) - dnsleaktest.com Standard Test: exactly 1 resolver found, Cloudflare (`172.71.140.49`, Frankfurt am Main), zero trace of the device's real carrier DNS (`62.141.16.181`/`.151`, confirmed present via `dumpsys connectivity` while disconnected). |
+| IPv4/IPv6 leak protection | **VERIFIED** (B10-1, 2026-08-30) - IPv4: exit IP matched the gateway only, in two independent real-browser checks, never the device's real ISP IPv4. IPv6: a real-ISP IPv6 baseline was confirmed to exist first (`2a02:8308:...`), then while connected an IPv6-only hostname failed to resolve (`ERR_NAME_NOT_RESOLVED`) AND a raw IPv6 literal (no DNS involved) timed out (`ERR_CONNECTION_TIMED_OUT`) - the device's real ISP IPv6 never reached any external destination through either path. |
 | Real restrictive-network/Russia behavior | **UNVERIFIED** - no restrictive-network probing exists (by design, see Phase 2A scope freeze) |
 
 Do not cite any UNVERIFIED row above as if it were proven. Each becomes
 VERIFIED only when its corresponding gate (B8B/B9/B10) produces real
-on-the-wire evidence, the same way B8A did for the local handshake.
+on-the-wire evidence, the same way B8A did for the local handshake and
+B10-1 did for the five rows above.

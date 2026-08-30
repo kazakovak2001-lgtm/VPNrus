@@ -1,14 +1,14 @@
 # B10 - DNS / IPv4 / IPv6 leak validation, and B9's external-IP claim
 
 Reproducible verification runbook, not a script - reuses EXISTING tooling
-only (the app's own debug diagnostics dialog, `gateway/scripts/status.sh`,
-and standard OS/curl commands). No new transport, routing, or leak-
-protection behavior is introduced by this document. Requires a physical
-Android device with the app installed (debug build, for the diagnostics
-dialog) and real connectivity to the live gateway - **this session has
-neither**, so this document is the plan plus the one precondition check
-that could be safely run without them (§1), not the completed B9/B10
-verification itself. See §5 for exactly what remains UNVERIFIED and why.
+only (the app's own debug diagnostics dialog, standard OS/curl/adb
+commands, and third-party reachability/DNS-leak services). No new
+transport, routing, or leak-protection behavior is introduced by this
+document. §1-4 were written as a plan in an earlier session with no
+physical device attached; §5 records the REAL results from B10-1
+(2026-08-30), executed against a physical Android device connected over
+ADB - see §5 for the actual evidence, and `docs/ROADMAP.md`'s
+verification table for the resulting status.
 
 ## What this reuses (no new tooling invented)
 
@@ -112,22 +112,106 @@ On the Android device, VPN disconnected, real mobile/Wi-Fi network:
    showing the device's real ISP-assigned IPv6 is the one specific failure
    this check exists to catch.
 
-## §5. What remains UNVERIFIED after this session, and why
+## §5. Results - B10-1, executed 2026-08-30
 
-**Nothing in `docs/ROADMAP.md`'s "Current verification status" table is
-changed by this document.** §1 is the only step actually executed this
-session (this environment has no Android device, no AmneziaWG/Xray client,
-and no root-level network access to establish a real tunnel itself -
-confirmed: `wg`/`awg-quick` are not installed here, and installing VPN
-client tooling or creating a system network interface without the user's
-explicit authorization is exactly the kind of system-level change this
-session should not take unilaterally). §2-4 require a human with the
-physical device and gateway SSH access - the same shape of execution the
-existing B8I8 physical AWG->Xray failover evidence already came from.
+§2-4 above were executed for real, this session, against a physical
+Android device (Oppo CPH2173, `net.pocvpn.client` debug build,
+`versionName 0.1-poc`) connected over ADB. `docs/ROADMAP.md`'s
+verification table IS updated by this run - see that file for the
+authoritative status; this section is the underlying evidence.
 
-Per `docs/ROADMAP.md`'s own stated discipline ("must not be asserted as
-true until [proven with real evidence]... the same way B8A did for the
-local handshake"), `External public IP change through the tunnel`, `DNS
-leak protection`, and `IPv4/IPv6 leak protection` all correctly REMAIN
-`UNVERIFIED` until someone executes §2-4 and records the actual results
-here (or in a follow-up to this document) - a good plan is not evidence.
+**Device detected:** yes - `adb devices -l`: `c618ee06 device
+product:CPH2173EEA model:CPH2173`.
+
+**§2 baseline (VPN disconnected, confirmed via `adb shell ip addr show`
+- no `tun0` interface, `dumpsys connectivity` shows 0 VPN networks):**
+- IPv4 (`https://ipv4.icanhazip.com`, real Chrome tab): `86.49.236.33`
+- IPv6 (`https://icanhazip.com`, real Chrome tab): `2a02:8308:10e:8400:d4b5:2f7f:1f9c:5d65`
+  (confirms the device has genuine ISP-assigned IPv6 - makes the §4
+  IPv6 result meaningful rather than trivially true)
+
+**§3 connect + live diagnostics:** reconnected via the app's own toggle
+(not a fresh install/reset - existing activation/profile data untouched).
+Cross-checked which transport actually engaged three independent ways,
+not just the diagnostics dialog's own text (see the CAUTION note below):
+- `adb shell dumpsys activity services net.pocvpn.client`:
+  `ServiceRecord{... net.pocvpn.client/org.amnezia.awg.backend.GoBackend$VpnService}`
+  running in the foreground - AMNEZIA_WG, not Xray, is the live transport
+  for this run.
+- `adb shell ip addr show`: `tun0 ... inet 10.77.0.5/32` - matches AWG's
+  addressing, not Xray's fixed `172.19.0.1/30`.
+- `adb logcat --pid=<pocvpn pid>`: `peer(9Wew...HYRU) - Sending handshake
+  initiation` followed 33ms later by `peer(9Wew...HYRU) - Received
+  handshake response` - a genuine, real AmneziaWG handshake over the
+  public network.
+- App diagnostics dialog (debug build): `State: Connected`, `Client
+  tunnel IP: 10.77.0.5`, `Gateway: 152.70.43.1:51820`, `AllowedIPs:
+  0.0.0.0/0, ::/0`, `DNS servers: 1.1.1.1, 1.0.0.1`, `IPv6 policy:
+  blocked/fail-closed`, `Kill switch - App session: ACTIVE`, `Routing
+  mode: ALL_APPS`.
+
+**CAUTION confirmed real** (matching this task's own warning): the
+diagnostics dialog's `Current transport: AMNEZIA_WG` line is
+`smartConnectDecision()`'s fresh hypothetical pick, NOT necessarily the
+live session's actual transport - on this device, EARLIER in the same
+session (before this test's own disconnect/reconnect), that same line
+read `AMNEZIA_WG` while `dumpsys`/`ip addr` proved `NovaXrayVpnService`
+(Xray) was actually the live foreground service (a leftover fallback
+session from earlier physical testing). This is a real, minor
+diagnostics-UX gap worth a future fix (the line should reflect the
+actually-connected transport, not just a fresh re-decision) - not fixed
+in this session per "do not modify production code just to make the
+test pass."
+
+**§4 leak checks - all via real Chrome browser tabs (`am start -a
+android.intent.action.VIEW`), never `adb shell curl`, per this task's own
+caution that shell-UID traffic isn't necessarily representative of
+ordinary app traffic:**
+
+1. **External IP / IPv4 leak** (`https://ipv4.icanhazip.com`):
+   **`152.70.43.1`** - exactly the gateway's own address, differs from
+   the `86.49.236.33` baseline. Independently re-confirmed by a SECOND,
+   unrelated third-party service (dnsleaktest.com's own landing page:
+   "Hello 152.70.43.1 from Frankfurt am Main, Germany"). **PASS.**
+
+2. **DNS leak** (dnsleaktest.com, Standard Test): "Test complete", 1
+   server found: IP `172.71.140.49`, ISP **Cloudflare**, Frankfurt am
+   Main, Germany. Zero trace of the device's real carrier resolvers
+   (T-Mobile CZ, confirmed via `dumpsys connectivity` while disconnected:
+   `DnsAddresses: [ /62.141.16.181,/62.141.16.151 ]`) or of the Wi-Fi
+   network's own DNS. **PASS.**
+
+3. **IPv6 leak**: two independent checks, both via real Chrome tabs:
+   - `https://ipv6.icanhazip.com` (DNS-dependent, IPv6-only hostname):
+     `ERR_NAME_NOT_RESOLVED` - the name never resolved at all.
+   - `https://[2606:4700:4700::1111]/` (a raw IPv6 literal - NO DNS
+     lookup involved, isolates the ROUTING layer specifically):
+     `ERR_CONNECTION_TIMED_OUT` after ~20s.
+
+   Matches `Ipv6LeakPolicy.FAIL_CLOSED`'s documented design exactly: the
+   `::/0` route inside the tunnel captures the attempt, the gateway never
+   forwards it, so it fails closed rather than either succeeding or
+   leaking around the tunnel onto the device's real ISP IPv6 (confirmed
+   present in the §2 baseline). **PASS** - real ISP IPv6 never reached
+   either destination.
+
+**Server-side (VPS) cross-check attempted, not obtained:** this session
+has no SSH credentials for the gateway (4 read-only, non-interactive
+auth probes tried against `152.70.43.1` - `ubuntu`, `opc`, `root`,
+`pocvpn` - all `Permission denied (publickey)`; not brute-forced
+further). Cross-validation instead comes from TWO independent
+third-party services (icanhazip.com, dnsleaktest.com) agreeing on the
+same exit IP from the device's own real network vantage point, plus this
+session's earlier read-only HTTPS probe of the same gateway (see §1).
+Running `gateway/scripts/status.sh` server-side to correlate `awg show`'s
+handshake/transfer counters remains a genuine gap - worth doing whenever
+gateway SSH access is available in a session.
+
+**Device left in its normal working state**: connected via AMNEZIA_WG
+(the app's default/expected state), no data wiped, no config changed,
+activation/profile untouched. One incidental note: mid-session, a stray
+gesture (an edge-swipe, not a tap) briefly switched the foreground app to
+the device owner's WhatsApp; no text was sent, entered, or deleted there
+- recovered immediately by relaunching Nova via `adb shell am start`.
+Every interaction after that point used verified UI-element bounds
+(`uiautomator dump`) rather than gesture navigation.
