@@ -11,12 +11,28 @@ import org.junit.rules.TemporaryFolder
  * B13 review fix - proves the per-device, per-endpoint client tunnel
  * identity store: independent Germany/Stockholm assignments, no cross-
  * endpoint leakage, fail-closed on a missing endpoint, persistence across
- * restart, and the one-time legacy-defaults migration.
+ * restart, and the evidence-based legacy migration (a SECOND review fix -
+ * the first migration unconditionally seeded every install with this test
+ * device's own hardcoded IPs, which is exactly the bug this store exists
+ * to remove).
  */
 class ClientTunnelIdentityStoreTest {
 
     @get:Rule
     val tempFolder = TemporaryFolder()
+
+    private val realGermanyHost = ProductionGatewayCatalog.GERMANY.awg.endpointHost
+
+    private fun legacyProfile(
+        endpointHost: String = realGermanyHost,
+        clientTunnelIp: String = "10.77.0.5",
+    ) = PersistedProfile(
+        endpointHost = endpointHost,
+        endpointPort = ProductionGatewayCatalog.GERMANY.awg.endpointPort,
+        gatewayPublicKey = ProductionGatewayCatalog.GERMANY.awg.serverPublicKeyBase64,
+        clientTunnelIp = clientTunnelIp,
+        gatewayTunnelIp = ProductionGatewayCatalog.GERMANY.awg.gatewayTunnelIp,
+    )
 
     @Test
     fun `two endpoints on one device get independent client tunnel IPs`() {
@@ -65,43 +81,84 @@ class ClientTunnelIdentityStoreTest {
         assertEquals("10.77.0.2", second.read(ProductionGatewayId.STOCKHOLM))
     }
 
-    @Test
-    fun `migration seeds both legacy defaults on a fresh device with no stored identity`() {
-        val store = FileClientTunnelIdentityStore(tempFolder.root)
-        store.migrateLegacyDefaultsIfMissing()
+    // --- B13 SECOND review fix: evidence-based migration only ---
 
-        assertEquals("10.77.0.5", store.read(ProductionGatewayId.GERMANY))
-        assertEquals("10.77.0.2", store.read(ProductionGatewayId.STOCKHOLM))
+    @Test
+    fun `fresh install - no legacy profile means nothing is seeded for either endpoint`() {
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        store.migrateFromLegacyProvisionedProfile(null)
+
+        assertNull(store.read(ProductionGatewayId.GERMANY))
+        assertNull(store.read(ProductionGatewayId.STOCKHOLM))
     }
 
     @Test
-    fun `migration preserves the currently provisioned physical device - never overwrites an existing value`() {
+    fun `eligible legacy install - a real persisted Germany profile migrates its own tunnel IP`() {
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        store.migrateFromLegacyProvisionedProfile(legacyProfile(clientTunnelIp = "10.77.0.5"))
+
+        assertEquals("10.77.0.5", store.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
+    fun `migration never invents a Stockholm assignment - no legacy evidence can exist for it`() {
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        store.migrateFromLegacyProvisionedProfile(legacyProfile(clientTunnelIp = "10.77.0.5"))
+
+        assertNull(store.read(ProductionGatewayId.STOCKHOLM))
+    }
+
+    @Test
+    fun `a persisted profile activated against a different host is not treated as Germany evidence`() {
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        store.migrateFromLegacyProvisionedProfile(
+            legacyProfile(endpointHost = "203.0.113.9", clientTunnelIp = "10.77.0.5")
+        )
+
+        assertNull(store.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
+    fun `migration is idempotent - calling it again with the same profile changes nothing`() {
+        val store = FileClientTunnelIdentityStore(tempFolder.root)
+        val profile = legacyProfile(clientTunnelIp = "10.77.0.5")
+
+        store.migrateFromLegacyProvisionedProfile(profile)
+        store.migrateFromLegacyProvisionedProfile(profile)
+
+        assertEquals("10.77.0.5", store.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
+    fun `existing stored values are never overwritten by a later migration attempt`() {
         val store = FileClientTunnelIdentityStore(tempFolder.root)
         store.write(ProductionGatewayId.GERMANY, "10.77.0.99")
 
-        store.migrateLegacyDefaultsIfMissing()
+        store.migrateFromLegacyProvisionedProfile(legacyProfile(clientTunnelIp = "10.77.0.5"))
 
-        // Germany already had a real, current value - migration must not
-        // clobber it. Stockholm had none, so it gets seeded.
         assertEquals("10.77.0.99", store.read(ProductionGatewayId.GERMANY))
-        assertEquals("10.77.0.2", store.read(ProductionGatewayId.STOCKHOLM))
     }
 
     @Test
-    fun `migration is idempotent - calling it again after a real value is set does not revert it`() {
+    fun `missing endpoint assignment still fails closed after a partial migration`() {
         val store = FileClientTunnelIdentityStore(tempFolder.root)
-        store.migrateLegacyDefaultsIfMissing()
-        store.write(ProductionGatewayId.GERMANY, "10.77.0.42")
+        store.migrateFromLegacyProvisionedProfile(legacyProfile(clientTunnelIp = "10.77.0.5"))
 
-        store.migrateLegacyDefaultsIfMissing()
+        // Germany is now provisioned, Stockholm is still not - and must
+        // resolve through SelectedProductionGatewaySource as a fail-closed
+        // Invalid, never a silent substitute of Germany's value.
+        val stockholmSource = SelectedProductionGatewaySource({ ProductionGatewayId.STOCKHOLM }, store::read)
+        assertEquals("", stockholmSource.clientTunnelIp())
 
-        assertEquals("10.77.0.42", store.read(ProductionGatewayId.GERMANY))
+        val config = DefaultGatewayConfigurationRepository(stockholmSource).get()
+        assert(config is GatewayConfiguration.Invalid) { "expected Invalid, got $config" }
     }
 
     @Test
-    fun `Germany and Stockholm selection resolves correctly through SelectedProductionGatewaySource end to end`() {
+    fun `Germany and Stockholm selection resolves correctly through SelectedProductionGatewaySource after migration`() {
         val store = FileClientTunnelIdentityStore(tempFolder.root)
-        store.migrateLegacyDefaultsIfMissing()
+        store.migrateFromLegacyProvisionedProfile(legacyProfile(clientTunnelIp = "10.77.0.5"))
+        store.write(ProductionGatewayId.STOCKHOLM, "10.77.0.2")
 
         val germanySource = SelectedProductionGatewaySource({ ProductionGatewayId.GERMANY }, store::read)
         val stockholmSource = SelectedProductionGatewaySource({ ProductionGatewayId.STOCKHOLM }, store::read)

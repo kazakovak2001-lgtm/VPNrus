@@ -24,27 +24,30 @@ import java.nio.file.StandardCopyOption
  * another endpoint's value or a hardcoded default: a leaked Stockholm IP
  * presented to Germany's peer (or vice versa) would silently misroute
  * packets exactly like the original bug did.
+ *
+ * A SECOND, immediately following review found the first fix's own
+ * migration was itself wrong: it unconditionally seeded EVERY install
+ * (fresh device or not) with the two IP values that used to be hardcoded
+ * in ProductionGatewayCatalog - i.e. it re-injected the exact same
+ * "one value baked into every install" bug this store exists to remove,
+ * just moved one file over. A brand-new device has no business inheriting
+ * THIS test device's own peer assignment.
+ *
+ * [migrateFromLegacyProvisionedProfile] is the real fix: it seeds ONLY
+ * from genuine, already-persisted, per-device evidence
+ * ([net.pocvpn.client.vpn.config.PersistedProfile], written exclusively
+ * from a real POST /v1/activate response or restored from a prior
+ * session's copy of one - see [ProvisionedProfileStore]'s own docs) - a
+ * fresh install has no such file, so it is left entirely unprovisioned
+ * (read() stays null for every endpoint, which
+ * DefaultGatewayConfigurationRepository.get() already fails closed to
+ * Invalid). No hardcoded IP is ever compiled into this store or a fallback
+ * path for any device.
  */
 interface ClientTunnelIdentityStore {
     /** The client tunnel IP THIS DEVICE is provisioned with on [id], or null if never set. */
     fun read(id: ProductionGatewayId): String?
     fun write(id: ProductionGatewayId, clientTunnelIp: String)
-}
-
-/**
- * The exact two values that were, until this review fix, hardcoded into
- * ProductionGatewayCatalog - i.e. this device's own already-working,
- * physically-verified peer assignment on each gateway. Consulted ONLY by
- * the one-time migration below, never by product code directly - a fresh
- * install/new device gets no seed and correctly starts unprovisioned
- * (read() returns null, DefaultGatewayConfigurationRepository.get()
- * fails closed to Invalid - see ClientTunnelIdentityStore's own docs).
- */
-internal object MigratedClientTunnelIdentityDefaults {
-    val values: Map<ProductionGatewayId, String> = mapOf(
-        ProductionGatewayId.GERMANY to "10.77.0.5",
-        ProductionGatewayId.STOCKHOLM to "10.77.0.2",
-    )
 }
 
 private val IPV4_REGEX = Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")
@@ -68,22 +71,38 @@ class FileClientTunnelIdentityStore(
     }
 
     /**
-     * Seeds THIS DEVICE'S already-provisioned identity on first run after
-     * this fix ships (no file yet) so the physical device this was
-     * validated on keeps working - never overwrites an endpoint that
-     * already has a stored (possibly different) value. Idempotent and
-     * safe to call on every startup.
+     * One-time, EVIDENCE-BASED migration for GERMANY only - the sole
+     * endpoint that could possibly have been provisioned through the
+     * legacy pre-B13 activation flow (Stockholm did not exist yet, so no
+     * legitimate local evidence for it can ever exist here - per this
+     * class's own top-level docs, that is never invented).
+     *
+     * [legacyProfile] is whatever [ProvisionedProfileStore.read] already
+     * found for this device BEFORE this call (the caller - MainViewModel's
+     * Factory - passes its own existing read result, this never re-reads
+     * anything itself). null (never activated on this device - the fresh-
+     * install case) is a no-op: nothing is seeded, [read] stays null for
+     * every endpoint.
+     *
+     * Two extra checks beyond "a profile exists" keep this honestly
+     * evidence-based rather than a rubber stamp:
+     *  - the persisted profile's own endpointHost must match Germany's
+     *    real gateway host - a profile activated against some OTHER host
+     *    (a dev/staging server, gateway-dev.properties smoke-testing,
+     *    etc.) is not evidence of a real Germany peer assignment and is
+     *    silently ignored, never mis-migrated.
+     *  - an endpoint that already has a stored value is NEVER overwritten
+     *    (idempotent, safe to call on every startup - matches the
+     *    previous migration's own idempotency contract).
      */
-    fun migrateLegacyDefaultsIfMissing() {
-        val entries = readAll().toMutableMap()
-        var changed = false
-        for ((id, ip) in MigratedClientTunnelIdentityDefaults.values) {
-            if (!entries.containsKey(id)) {
-                entries[id] = ip
-                changed = true
-            }
-        }
-        if (changed) writeAll(entries)
+    fun migrateFromLegacyProvisionedProfile(legacyProfile: PersistedProfile?) {
+        if (legacyProfile == null) return
+        if (legacyProfile.endpointHost != ProductionGatewayCatalog.GERMANY.awg.endpointHost) return
+
+        val entries = readAll()
+        if (entries.containsKey(ProductionGatewayId.GERMANY)) return
+
+        write(ProductionGatewayId.GERMANY, legacyProfile.clientTunnelIp)
     }
 
     private fun readAll(): Map<ProductionGatewayId, String> {
