@@ -12,15 +12,29 @@ import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.AwgClientKeyRepository
 import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.FileIdentityStore
+import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
+import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.xray.toXrayVlessRealityConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
+
+private val VALID_XRAY_PROFILE = XrayProfile(
+    server = "152.70.43.1",
+    serverPort = 443,
+    uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+    flow = "xtls-rprx-vision",
+    serverName = "www.microsoft.com",
+    fingerprint = "chrome",
+    realityPublicKey = "A".repeat(43),
+    shortId = "a1b2c3d4",
+)
 
 private fun configuredGateway() = GatewayConfiguration.Configured(
     endpointHost = "203.0.113.10",
@@ -418,5 +432,153 @@ class VpnControllerTest {
             "emission after shutdown leaked into controller state: ${controller.state.value}",
             controller.state.value is TransportState.Connected,
         )
+    }
+
+    // --- B8I6: real Xray executable wiring ---
+
+    @Test
+    fun `resolved XRAY_REALITY with a valid stored profile invokes the exact Xray transport with the real Xray config`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(VALID_XRAY_PROFILE)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY))
+        runCurrent()
+
+        assertEquals(1, xrayTransport.connectCallCount)
+        assertEquals(0, awgTransport.connectCallCount) // the constructor-owned AWG transport is never touched
+        val sentConfig = xrayTransport.lastConfig
+        assertTrue(sentConfig is TransportConfig.Xray)
+        // Built from the REAL persisted profile - never fabricated from AWG GatewayConfiguration fields.
+        assertEquals(VALID_XRAY_PROFILE.toXrayVlessRealityConfig(), (sentConfig as TransportConfig.Xray).config)
+    }
+
+    @Test
+    fun `a missing Xray profile fails closed before the Xray transport is ever touched`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(profile = null)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY))
+        runCurrent()
+
+        assertEquals(0, xrayTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(VpnError.ConfigurationMappingFailure("XrayProfileNotReadyException"), diagnostics.snapshot.value.lastError)
+    }
+
+    @Test
+    fun `an invalid stored Xray profile fails closed before the Xray transport is ever touched`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(VALID_XRAY_PROFILE.copy(uuid = "not-a-uuid"))
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY))
+        runCurrent()
+
+        assertEquals(0, xrayTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(VpnError.ConfigurationMappingFailure("XrayProfileNotReadyException"), diagnostics.snapshot.value.lastError)
+    }
+
+    @Test
+    fun `AWG behavior is unchanged when a VpnController is also wired with an Xray profile repository`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayRepository = FakeXrayProfileRepository(VALID_XRAY_PROFILE)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+        )
+
+        controller.connect() // default -> AWG, exactly as every pre-B8I6 test exercises
+        runCurrent()
+
+        assertEquals(1, awgTransport.connectCallCount)
+        assertTrue(awgTransport.lastConfig is TransportConfig.Awg)
+        assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Xray permission flow, permission resume, and disconnect all target the active Xray transport - never the constructor-owned AWG one`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY, permission = android.content.Intent())
+        val xrayRepository = FakeXrayProfileRepository(VALID_XRAY_PROFILE)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+        )
+
+        var requested = false
+        val collectJob = backgroundScope.launch {
+            controller.events.collect { if (it is ControllerEvent.RequestVpnPermission) requested = true }
+        }
+        runCurrent()
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY))
+        runCurrent()
+        assertTrue(requested)
+        assertEquals(0, xrayTransport.connectCallCount)
+        assertEquals(0, awgTransport.connectCallCount)
+
+        controller.onVpnPermissionResult(true)
+        runCurrent()
+        assertEquals(1, xrayTransport.connectCallCount)
+        assertEquals(0, awgTransport.connectCallCount)
+
+        controller.disconnect()
+        runCurrent()
+        assertEquals(1, xrayTransport.disconnectCallCount)
+        assertEquals(0, awgTransport.disconnectCallCount)
+        collectJob.cancel()
+    }
+
+    @Test
+    fun `no Xray profile secret field ever appears in diagnostics or controller state text`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val invalidProfile = VALID_XRAY_PROFILE.copy(uuid = "not-a-uuid")
+        val xrayRepository = FakeXrayProfileRepository(invalidProfile)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY))
+        runCurrent()
+
+        assertFalse(diagnostics.snapshot.value.toString().contains(invalidProfile.realityPublicKey))
+        assertFalse(diagnostics.snapshot.value.toString().contains(invalidProfile.shortId))
+        assertFalse(controller.state.value.toString().contains(invalidProfile.realityPublicKey))
+        assertFalse(controller.state.value.toString().contains(invalidProfile.shortId))
     }
 }
