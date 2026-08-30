@@ -471,6 +471,16 @@ class MainViewModel(
     private val _xrayProfileProvisioningState = MutableStateFlow<XrayProfileProvisioningOutcome?>(null)
     val xrayProfileProvisioningState: StateFlow<XrayProfileProvisioningOutcome?> = _xrayProfileProvisioningState.asStateFlow()
 
+    // B8O2-ops - the outcome of the LAST standalone provisionTlsProfile()
+    // call (see that function's own docs). Separate from
+    // xrayProfileProvisioningState above since this can be triggered
+    // independently of a fresh AWG activation (a device already activated
+    // in an earlier session has no reachable ActivationScreen - see
+    // screenFor's own gate - so this is the only way such a device can
+    // (re)fetch its TLS profile without a destructive reset).
+    private val _tlsProfileProvisioningState = MutableStateFlow<XrayProfileProvisioningOutcome?>(null)
+    val tlsProfileProvisioningState: StateFlow<XrayProfileProvisioningOutcome?> = _tlsProfileProvisioningState.asStateFlow()
+
     init {
         viewModelScope.launch {
             _publicKey.value = clientKeyRepository.getPublicKey()
@@ -651,6 +661,43 @@ class MainViewModel(
                 is ProvisioningResult.ServiceUnavailable -> ProvisioningUiState.Error("service temporarily unavailable")
                 is ProvisioningResult.MalformedResponse -> ProvisioningUiState.Error("malformed response: ${result.reason}")
                 is ProvisioningResult.NetworkError -> ProvisioningUiState.Error(result.message)
+            }
+        }
+    }
+
+    /**
+     * B8O2-ops - debug-only standalone TLS profile (re)fetch for a device
+     * that is ALREADY activated (see DiagnosticsDialog's own gate - this is
+     * only ever reachable from the debug diagnostics surface, never the
+     * normal onboarding flow). Reuses the EXISTING device identity/public
+     * key and the EXISTING [xrayTlsProfileProvisioner] - creates no new
+     * activation, no new identity, and never touches AWG/REALITY state.
+     * Exists specifically because a device activated in an earlier session
+     * has no reachable [net.pocvpn.client.ui.screens.ActivationScreen] (see
+     * `screenFor`'s own profileSource gate) to re-run [activateDevice]
+     * through, yet the SAME activation credential is exactly what
+     * POST /v1/xray-profile?transport=tls still requires - this is the
+     * narrowest addition that lets an already-activated device obtain a TLS
+     * profile without a destructive identity reset.
+     */
+    fun provisionTlsProfile(activationCredential: String) {
+        val trimmedCredential = activationCredential.trim()
+        val provisioner = xrayTlsProfileProvisioner
+        val key = _publicKey.value
+        if (trimmedCredential.isEmpty() || provisioner == null || key == null) {
+            _tlsProfileProvisioningState.value = XrayProfileProvisioningOutcome.Malformed("credential/public key/provisioner not ready")
+            return
+        }
+        viewModelScope.launch {
+            val outcome = withContext(ioDispatcher) { provisioner.provision(key, trimmedCredential) }
+            _tlsProfileProvisioningState.value = outcome
+            if (outcome == XrayProfileProvisioningOutcome.Saved) {
+                val repository = xrayTlsProfileRepository
+                if (repository != null) {
+                    // B8O2 fix - same single validation authority as the
+                    // startup/activateDevice paths (see their own docs).
+                    xrayTlsAvailable.value = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
+                }
             }
         }
     }

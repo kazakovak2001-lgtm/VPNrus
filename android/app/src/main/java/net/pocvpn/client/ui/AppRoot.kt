@@ -27,6 +27,7 @@ import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.transport.TransportHealthState
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
@@ -72,8 +73,17 @@ fun AppRoot(
     val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
+    val tlsProfileProvisioningState by viewModel.tlsProfileProvisioningState.collectAsStateWithLifecycle()
 
     var credential by remember { mutableStateOf("") }
+    // B8O2-ops - a SEPARATE field from `credential` above: that one is
+    // ActivationScreen's own (cleared on a successful AWG activation - see
+    // the LaunchedEffect below), while this one belongs to the diagnostics
+    // dialog's standalone TLS-profile-fetch action, reachable even when
+    // ActivationScreen itself is not (an already-activated device - see
+    // MainViewModel.provisionTlsProfile's own docs). Never persisted beyond
+    // this composable's own remember scope, same discipline as `credential`.
+    var tlsCredential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
     val context = LocalContext.current
@@ -174,6 +184,10 @@ fun AppRoot(
             },
             onRegenerateIdentity = { viewModel.regenerateIdentity() },
             onDismiss = { showDiagnostics = false },
+            tlsCredential = tlsCredential,
+            onTlsCredentialChange = { tlsCredential = it },
+            onProvisionTlsProfile = { viewModel.provisionTlsProfile(it) },
+            tlsProvisioningResultText = tlsProfileProvisioningState?.let { "TLS profile: $it" },
         )
     }
 }

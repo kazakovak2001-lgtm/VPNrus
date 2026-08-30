@@ -56,4 +56,6 @@
     <string name="diagnostics_copy_public_key">Copy public key</string>
     <string name="diagnostics_regenerate_identity">Regenerate identity (debug only)</string>
     <string name="diagnostics_public_key_copied">Public key copied</string>
+    <string name="diagnostics_tls_credential_label">Activation credential</string>
+    <string name="diagnostics_provision_tls_button">Provision TLS profile (debug only)</string>
 </resources>
