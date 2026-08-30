@@ -3,11 +3,34 @@
 package net.pocvpn.client
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import net.pocvpn.client.reachability.EndpointDescriptor
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.reachability.EndpointManifest
+import net.pocvpn.client.reachability.EndpointManifestRepository
+import net.pocvpn.client.reachability.EndpointRole
+import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.Ed25519ManifestVerifier
+import net.pocvpn.client.reachability.FileLastKnownGoodManifestStore
+import net.pocvpn.client.reachability.FixedManifestTrustAnchors
+import net.pocvpn.client.reachability.ManifestCanonicalizer
+import net.pocvpn.client.reachability.ManifestDistributionClient
+import net.pocvpn.client.reachability.ManifestFetchResult
+import net.pocvpn.client.reachability.PathCandidate
+import net.pocvpn.client.reachability.RemoteManifestFetcher
+import net.pocvpn.client.reachability.SignedManifest
+import net.pocvpn.client.reachability.TrustedKeyId
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicInteger
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
@@ -1634,5 +1657,160 @@ class MainViewModelTest {
         testDispatcher.scheduler.runCurrent()
         assertEquals(1, awgTransport.connectCallCount)
         assertEquals(1, awgTransport.disconnectCallCount)
+    }
+
+    // --- B12 (PR #24 second audit fix) - the real production trigger for
+    // manifest distribution: ViewModel init, exactly once, guarded against
+    // concurrent duplicate fetches. See MainViewModel.kt's own docs on the
+    // init{} block and refreshManifest(). ---
+
+    private val manifestSigningKey = Ed25519PrivateKeyParameters(SecureRandom())
+    private val manifestTrustAnchors = FixedManifestTrustAnchors(
+        mapOf(TrustedKeyId("key-1") to manifestSigningKey.generatePublicKey().encoded),
+    )
+
+    private fun testManifest(version: Int) = EndpointManifest(
+        manifestVersion = version,
+        issuedAtEpochMillis = 1_000L,
+        expiresAtEpochMillis = 9_000_000L,
+        signingKeyId = "key-1",
+        endpoints = listOf(
+            EndpointDescriptor(
+                EndpointId("gw"), setOf(EndpointRole.GATEWAY), "eu", "acme",
+                transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.1", 51820)),
+            ),
+        ),
+    )
+
+    private fun signTestManifest(manifest: EndpointManifest): SignedManifest {
+        val signer = Ed25519Signer()
+        signer.init(true, manifestSigningKey)
+        val bytes = ManifestCanonicalizer.canonicalBytes(manifest)
+        signer.update(bytes, 0, bytes.size)
+        return SignedManifest(manifest, signer.generateSignature())
+    }
+
+    private fun testManifestRepository() = EndpointManifestRepository(
+        verifier = Ed25519ManifestVerifier(),
+        trustAnchors = manifestTrustAnchors,
+        lkgStore = FileLastKnownGoodManifestStore(tmp.newFolder()),
+        bootstrapManifest = signTestManifest(testManifest(version = 1)),
+        nowEpochMillis = { 2_000L },
+    )
+
+    private fun buildViewModelWithManifest(
+        repository: EndpointManifestRepository,
+        distributionClient: ManifestDistributionClient?,
+    ) = MainViewModel(
+        clientKeyRepository = FakeClientKeyRepository(),
+        transport = FakeVpnTransport(),
+        gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+        reconnectManager = FakeReconnectManager(),
+        diagnosticsStore = DiagnosticsStore(),
+        manifestRepository = repository,
+        manifestDistributionClient = distributionClient,
+    )
+
+    @Test
+    fun `a configured manifestDistributionClient is triggered exactly once from ViewModel init`() = runTest {
+        val fetchCount = AtomicInteger(0)
+        val repository = testManifestRepository()
+        val fetcher = RemoteManifestFetcher {
+            fetchCount.incrementAndGet()
+            ManifestFetchResult.Fetched(signTestManifest(testManifest(version = 2)))
+        }
+        buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, fetchCount.get())
+    }
+
+    @Test
+    fun `an unconfigured manifestDistributionClient (null) performs no network work and stays on the bootstrap`() = runTest {
+        val repository = testManifestRepository()
+        val viewModel = buildViewModelWithManifest(repository, distributionClient = null)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, repository.trusted()!!.manifestVersion) // still the bootstrap - nothing fetched it forward
+        assertEquals(null, viewModel.refreshManifest()) // no client wired - inert, not an error
+    }
+
+    @Test
+    fun `concurrent repeated refresh signals never cause more than one fetch in flight at once`() = runTest {
+        val fetchCount = AtomicInteger(0)
+        val repository = testManifestRepository()
+        val fetcher = RemoteManifestFetcher {
+            fetchCount.incrementAndGet()
+            delay(50) // hold the mutex long enough for concurrent callers to collide with it
+            ManifestFetchResult.Fetched(signTestManifest(testManifest(version = 2)))
+        }
+        val viewModel = buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+
+        // Fire several more refresh signals immediately, "concurrently" with
+        // the init-triggered one and each other (all launched before any of
+        // them can complete, thanks to the fetcher's own delay above).
+        repeat(5) { launch { viewModel.refreshManifest() } }
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, fetchCount.get()) // never a fetch storm - every overlapping call but one was skipped
+        assertEquals(2, repository.trusted()!!.manifestVersion) // the one fetch that did happen still succeeded
+    }
+
+    @Test
+    fun `a failed refresh (network error) leaves the currently trusted manifest completely untouched`() = runTest {
+        val repository = testManifestRepository()
+        val fetcher = RemoteManifestFetcher { ManifestFetchResult.Failed("network error: SocketTimeoutException") }
+        buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, repository.trusted()!!.manifestVersion) // unchanged - still the bootstrap
+    }
+
+    @Test
+    fun `a successful valid newer manifest becomes the trusted manifest, reflected in reachabilityDiagnostics`() = runTest {
+        val repository = testManifestRepository()
+        val fetcher = RemoteManifestFetcher { ManifestFetchResult.Fetched(signTestManifest(testManifest(version = 5))) }
+        val viewModel = buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(5, repository.trusted()!!.manifestVersion)
+        assertEquals(5, viewModel.reachabilityDiagnostics()?.manifestVersion)
+    }
+
+    // --- B12 (PR #24 second audit fix) - PathCandidate.Relayed must never crash reachabilityDiagnostics() ---
+
+    @Test
+    fun `a manifest with an INGRESS to EXIT relayTo relationship produces a real Relayed candidate without crashing`() = runTest {
+        val ingress = EndpointDescriptor(
+            EndpointId("ingress-1"), setOf(EndpointRole.INGRESS), "eu", "acme",
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.5", 443)),
+            relayTo = EndpointId("exit-1"),
+        )
+        val exit = EndpointDescriptor(
+            EndpointId("exit-1"), setOf(EndpointRole.EXIT), "us", "acme2",
+            transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.6", 51820)),
+        )
+        val relayManifest = EndpointManifest(
+            manifestVersion = 1, issuedAtEpochMillis = 1_000L, expiresAtEpochMillis = 9_000_000L,
+            signingKeyId = "key-1", endpoints = listOf(ingress, exit),
+        )
+        val repository = EndpointManifestRepository(
+            verifier = Ed25519ManifestVerifier(),
+            trustAnchors = manifestTrustAnchors,
+            lkgStore = FileLastKnownGoodManifestStore(tmp.newFolder()),
+            bootstrapManifest = signTestManifest(relayManifest),
+            nowEpochMillis = { 2_000L },
+        )
+        val viewModel = buildViewModelWithManifest(repository, distributionClient = null)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        val snapshot = viewModel.reachabilityDiagnostics()
+        assertTrue(snapshot != null)
+        val relayed = snapshot!!.pathCandidates.filterIsInstance<PathCandidate.Relayed>()
+        assertEquals(1, relayed.size)
+        assertEquals(EndpointId("ingress-1"), relayed.first().ingress.endpoint.id)
+        assertEquals(EndpointId("exit-1"), relayed.first().exit.endpoint.id)
+        // Scoring must succeed for the Relayed candidate too - no crash, no unsafe cast.
+        assertTrue(snapshot.rankedPaths.any { it.candidate is PathCandidate.Relayed })
     }
 }

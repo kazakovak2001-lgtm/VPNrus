@@ -171,7 +171,13 @@ object ReachabilityEngine {
         val endpointEvidenceAgeMillis = endpointSpecificReachable?.let {
             endpointSpecificOutcomeEpochMillis?.let { ts -> nowEpochMillis - ts }
         }
-        val endpointEvidenceIsFresh = endpointEvidenceAgeMillis != null && endpointEvidenceAgeMillis <= endpointEvidenceStaleAfterMillis
+        // PR #24 second audit fix - a negative age (the outcome's own
+        // timestamp is AFTER `nowEpochMillis`, from a backwards clock jump
+        // or a future-dated value) must NOT count as "fresh" just because
+        // it's numerically <= the TTL. Freshness requires the evidence to
+        // be from the past, full stop - `>= 0` is the explicit lower bound.
+        val endpointEvidenceIsFresh = endpointEvidenceAgeMillis != null &&
+            endpointEvidenceAgeMillis in 0..endpointEvidenceStaleAfterMillis
         // The value STATE derivation is allowed to act on - null whenever
         // the raw evidence is missing OR has expired, even though the raw
         // observed value is still reported truthfully in [evidence] below.

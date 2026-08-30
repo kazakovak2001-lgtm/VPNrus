@@ -157,6 +157,17 @@ class ReachabilityEngineTest {
     }
 
     @Test
+    fun `a FUTURE-DATED endpoint outcome (clock skew or backwards clock jump) is never treated as fresh`() {
+        val now = 10_000_000L
+        val futureOutcomeAt = now + 1_000L // "in the future" relative to nowEpochMillis
+        val health = TransportHealth(state = TransportHealthState.DEGRADED, lastProbeEpochMillis = now - 1_000L)
+        val result = assess(health = health, endpointSpecific = true, now = now, endpointSpecificOutcomeMillis = futureOutcomeAt)
+        // Falls back to transport health (DEGRADED), NEVER trusts the
+        // future-dated "true" as if it were current evidence.
+        assertEquals(ReachabilityState.DEGRADED, result.state)
+    }
+
+    @Test
     fun `endpoint-specific evidence age is never borrowed from TransportHealth's own age`() {
         // TransportHealth was probed very recently (fresh), but the
         // endpoint-specific outcome itself is old - the two ages must be
