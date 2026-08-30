@@ -46,7 +46,7 @@ data class EndpointReachability(
 data class ReachabilityEvidenceSummary(
     val transportHealthState: TransportHealthState,
     val transportHealthAgeMillis: Long?,
-    /** True/false only when THIS endpoint's DATA-PLANE was probed specifically (e.g. a real connection attempt/handshake outcome for this exact endpoint+transport) - null when no such evidence exists. */
+    /** True/false only when THIS endpoint's DATA-PLANE was probed specifically (e.g. a real connection attempt/handshake outcome for this exact endpoint+transport) - null when no such evidence exists. This is the RAW, as-observed value (for truthful diagnostics) - see [endpointSpecificReachableAgeMillis] for its own freshness, and ReachabilityEngine.assess's own docs for why [EndpointReachability.state] does NOT trust this value once it's stale, independent of what this field still shows. */
     val endpointSpecificReachable: Boolean?,
     val networkUsable: Boolean,
     val restrictionClass: RestrictionClass,
@@ -66,6 +66,22 @@ data class ReachabilityEvidenceSummary(
      * (this codebase's convention throughout its test suites) stay correct.
      */
     val controlPlaneReachable: Boolean? = null,
+    /**
+     * B12 (PR #24 audit fix) - how old [endpointSpecificReachable] is, in
+     * the SAME real-clock units as [transportHealthAgeMillis] but tracked
+     * SEPARATELY - the age of the specific per-endpoint outcome that
+     * produced [endpointSpecificReachable], never [transportHealthAgeMillis]
+     * reused as a stand-in (a transport can stay "recently probed" in
+     * aggregate while this exact endpoint hasn't been attempted in a long
+     * time - collapsing the two ages would silently revive stale
+     * endpoint-specific evidence forever, exactly the bug this field fixes).
+     * Null whenever [endpointSpecificReachable] is null, OR when a caller
+     * supplied a reachable/unreachable value without a timestamp (treated
+     * identically to "unknown freshness", which ReachabilityEngine.assess
+     * never trusts as current - see its own docs). Appended last, after
+     * [controlPlaneReachable], so existing positional call sites stay correct.
+     */
+    val endpointSpecificReachableAgeMillis: Long? = null,
 )
 
 /**
@@ -82,12 +98,15 @@ data class ReachabilityEvidenceSummary(
  *  2. No usable network -> UNKNOWN (absence of network says nothing about
  *     the endpoint itself - never claim UNREACHABLE from a state that isn't
  *     about the endpoint).
- *  3. Stale evidence (older than [staleAfterMillis]) -> UNKNOWN, regardless
- *     of what it once said - a resolved failure must not linger forever,
- *     and a stale success must not be trusted indefinitely either.
- *  4. Endpoint-specific evidence (a real probe against THIS endpoint) is the
- *     strongest signal available and is checked before the transport-wide
- *     aggregate:
+ *  3. Stale TRANSPORT-WIDE evidence (older than [staleAfterMillis]), with no
+ *     FRESH endpoint-specific evidence either -> UNKNOWN, regardless of what
+ *     it once said - a resolved failure must not linger forever, and a
+ *     stale success must not be trusted indefinitely either.
+ *  4. FRESH endpoint-specific evidence (a real probe/attempt against THIS
+ *     endpoint, no older than [endpointEvidenceStaleAfterMillis] - see
+ *     [endpointSpecificOutcomeEpochMillis]'s own docs for exactly what
+ *     "fresh" requires) is the strongest signal available and is checked
+ *     before the transport-wide aggregate:
  *       - reachable == true -> REACHABLE
  *       - reachable == false AND transport health is HEALTHY elsewhere ->
  *         DEGRADED (conflicting evidence: the transport itself is proven to
@@ -95,9 +114,13 @@ data class ReachabilityEvidenceSummary(
  *         conservative middle state, never a full UNREACHABLE from that
  *         alone)
  *       - reachable == false otherwise -> UNREACHABLE
- *  5. No endpoint-specific evidence: fall back to the transport-wide
- *     TransportHealthState mapping (HEALTHY->REACHABLE, DEGRADED->DEGRADED,
- *     UNREACHABLE/NOT_IMPLEMENTED->UNREACHABLE, UNKNOWN->UNKNOWN).
+ *  5. STALE endpoint-specific evidence (or none at all): fall back to the
+ *     transport-wide TransportHealthState mapping (HEALTHY->REACHABLE,
+ *     DEGRADED->DEGRADED, UNREACHABLE/NOT_IMPLEMENTED->UNREACHABLE,
+ *     UNKNOWN->UNKNOWN) - a stale endpoint-specific outcome NEVER continues
+ *     to override current reachability once it has expired (PR #24 audit
+ *     fix - see [endpointSpecificOutcomeEpochMillis]'s own docs for the bug
+ *     this closes).
  */
 object ReachabilityEngine {
 
@@ -122,8 +145,38 @@ object ReachabilityEngine {
         // and data-plane reachability genuinely diverge to design that rule
         // against - see class docs' own "do not collapse" note.
         controlPlaneReachable: Boolean? = null,
+        /**
+         * B12 (PR #24 audit fix) - the REAL timestamp of the specific
+         * (endpoint, transport) outcome [endpointSpecificReachable] reports
+         * on - e.g. `ConnectionOutcome.timestampEpochMillis` for whichever
+         * outcome the caller matched. REQUIRED (no default) whenever
+         * [endpointSpecificReachable] is non-null: a caller supplying a
+         * true/false value with no timestamp gets that evidence treated as
+         * immediately stale (see below) - this deliberately forces every
+         * call site to either supply real freshness or accept the
+         * conservative fallback, rather than silently trusting an
+         * undated value forever. NEVER [transportHealth.lastProbeEpochMillis]
+         * reused as a stand-in - that measures a DIFFERENT thing (see class
+         * docs' own "not TransportHealth's age" note).
+         */
+        endpointSpecificOutcomeEpochMillis: Long? = null,
+        /** Independent TTL from [staleAfterMillis] - endpoint-specific evidence and transport-wide evidence can legitimately need different freshness windows. Defaults to the same value for now. */
+        endpointEvidenceStaleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS,
     ): EndpointReachability {
         val ageMillis = transportHealth.lastProbeEpochMillis?.let { nowEpochMillis - it }
+
+        // Age is null (never "0", never borrowed from transportHealth) when
+        // there is no timestamp - that null is exactly what makes the
+        // freshness check below fail closed for an undated value.
+        val endpointEvidenceAgeMillis = endpointSpecificReachable?.let {
+            endpointSpecificOutcomeEpochMillis?.let { ts -> nowEpochMillis - ts }
+        }
+        val endpointEvidenceIsFresh = endpointEvidenceAgeMillis != null && endpointEvidenceAgeMillis <= endpointEvidenceStaleAfterMillis
+        // The value STATE derivation is allowed to act on - null whenever
+        // the raw evidence is missing OR has expired, even though the raw
+        // observed value is still reported truthfully in [evidence] below.
+        val freshEndpointSpecificReachable = if (endpointEvidenceIsFresh) endpointSpecificReachable else null
+
         val evidence = ReachabilityEvidenceSummary(
             transportHealthState = transportHealth.state,
             transportHealthAgeMillis = ageMillis,
@@ -131,15 +184,16 @@ object ReachabilityEngine {
             networkUsable = networkUsable,
             restrictionClass = restrictionClass,
             controlPlaneReachable = controlPlaneReachable,
+            endpointSpecificReachableAgeMillis = endpointEvidenceAgeMillis,
         )
 
         val state = when {
             !endpoint.supports(transportKind) -> ReachabilityState.UNREACHABLE
             !networkUsable -> ReachabilityState.UNKNOWN
-            ageMillis != null && ageMillis > staleAfterMillis && endpointSpecificReachable == null -> ReachabilityState.UNKNOWN
-            endpointSpecificReachable == true -> ReachabilityState.REACHABLE
-            endpointSpecificReachable == false && transportHealth.state == TransportHealthState.HEALTHY -> ReachabilityState.DEGRADED
-            endpointSpecificReachable == false -> ReachabilityState.UNREACHABLE
+            ageMillis != null && ageMillis > staleAfterMillis && freshEndpointSpecificReachable == null -> ReachabilityState.UNKNOWN
+            freshEndpointSpecificReachable == true -> ReachabilityState.REACHABLE
+            freshEndpointSpecificReachable == false && transportHealth.state == TransportHealthState.HEALTHY -> ReachabilityState.DEGRADED
+            freshEndpointSpecificReachable == false -> ReachabilityState.UNREACHABLE
             else -> mapTransportHealth(transportHealth.state)
         }
 

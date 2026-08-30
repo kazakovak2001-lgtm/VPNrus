@@ -4,6 +4,7 @@ import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Base64
 
@@ -41,6 +42,86 @@ class SignedManifestCodecTest {
         val full = SignedManifestCodec.encode(SignedManifest(manifest(), byteArrayOf(1, 2, 3)))
         assertThrows(Exception::class.java) {
             SignedManifestCodec.decode(full.copyOf(full.size - 5))
+        }
+    }
+
+    // --- PR #24 audit fix: exact container consumption (no trailing bytes) ---
+
+    @Test
+    fun `an exact valid artifact is accepted`() {
+        val signed = SignedManifest(manifest(), byteArrayOf(9, 8, 7))
+        val bytes = SignedManifestCodec.encode(signed)
+        assertEquals(signed, SignedManifestCodec.decode(bytes))
+    }
+
+    @Test
+    fun `a valid artifact plus ONE trailing byte is rejected`() {
+        val bytes = SignedManifestCodec.encode(SignedManifest(manifest(), byteArrayOf(9, 8, 7)))
+        val withTrailingByte = bytes + byteArrayOf(0x42)
+        val exception = assertThrows(IllegalArgumentException::class.java) {
+            SignedManifestCodec.decode(withTrailingByte)
+        }
+        assertTrue(exception.message!!.contains("trailing"))
+    }
+
+    @Test
+    fun `a valid artifact plus many trailing bytes is rejected`() {
+        val bytes = SignedManifestCodec.encode(SignedManifest(manifest(), byteArrayOf(9, 8, 7)))
+        val withTrailingJunk = bytes + ByteArray(4096) { 0x7A }
+        assertThrows(IllegalArgumentException::class.java) {
+            SignedManifestCodec.decode(withTrailingJunk)
+        }
+    }
+
+    @Test
+    fun `a truncated signature (declared length longer than what follows) is rejected`() {
+        val bytes = SignedManifestCodec.encode(SignedManifest(manifest(), byteArrayOf(1, 2, 3, 4, 5)))
+        // Drop the last 2 bytes of the 5-byte signature - sigLen still says
+        // 5, but only 3 signature bytes actually remain.
+        val truncatedSignature = bytes.copyOf(bytes.size - 2)
+        assertThrows(Exception::class.java) {
+            SignedManifestCodec.decode(truncatedSignature)
+        }
+    }
+
+    @Test
+    fun `an implausibly large declared canonical length is still rejected (malformed lengths)`() {
+        val out = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(out).use { d ->
+            d.writeInt(1) // FORMAT_VERSION
+            d.writeInt(50_000_000) // way beyond MAX_CANONICAL_BYTES
+            d.write(ByteArray(10))
+        }
+        assertThrows(Exception::class.java) {
+            SignedManifestCodec.decode(out.toByteArray())
+        }
+    }
+
+    @Test
+    fun `an implausibly large declared signature length is still rejected (malformed lengths)`() {
+        val canonical = ManifestCanonicalizer.canonicalBytes(manifest())
+        val out = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(out).use { d ->
+            d.writeInt(1) // FORMAT_VERSION
+            d.writeInt(canonical.size)
+            d.write(canonical)
+            d.writeInt(9_999) // way beyond MAX_SIGNATURE_BYTES (256)
+            d.write(ByteArray(10))
+        }
+        assertThrows(Exception::class.java) {
+            SignedManifestCodec.decode(out.toByteArray())
+        }
+    }
+
+    @Test
+    fun `a negative declared length is rejected, not treated as zero or wrapped`() {
+        val out = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(out).use { d ->
+            d.writeInt(1)
+            d.writeInt(-1)
+        }
+        assertThrows(Exception::class.java) {
+            SignedManifestCodec.decode(out.toByteArray())
         }
     }
 

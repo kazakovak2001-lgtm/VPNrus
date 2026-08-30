@@ -96,11 +96,13 @@ class GatewayPoolIntegrationTest {
             gatewayA, TransportKind.AMNEZIA_WG, networkUsable = true,
             transportHealth = TransportHealth(state = TransportHealthState.HEALTHY),
             endpointSpecificReachable = true, restrictionClass = RestrictionClass.UNKNOWN, nowEpochMillis = now,
+            endpointSpecificOutcomeEpochMillis = now,
         )
         val reachB = ReachabilityEngine.assess(
             gatewayB, TransportKind.AMNEZIA_WG, networkUsable = true,
             transportHealth = TransportHealth(state = TransportHealthState.UNREACHABLE),
             endpointSpecificReachable = false, restrictionClass = RestrictionClass.UNKNOWN, nowEpochMillis = now,
+            endpointSpecificOutcomeEpochMillis = now,
         )
         assertEquals(ReachabilityState.REACHABLE, reachA.state)
         assertEquals(ReachabilityState.UNREACHABLE, reachB.state)
@@ -117,10 +119,12 @@ class GatewayPoolIntegrationTest {
         val reachA = ReachabilityEngine.assess(
             gatewayA, TransportKind.AMNEZIA_WG, networkUsable = true, transportHealth = sharedHealth,
             endpointSpecificReachable = true, restrictionClass = RestrictionClass.UNKNOWN, nowEpochMillis = now,
+            endpointSpecificOutcomeEpochMillis = now,
         )
         val reachB = ReachabilityEngine.assess(
             gatewayB, TransportKind.AMNEZIA_WG, networkUsable = true, transportHealth = sharedHealth,
             endpointSpecificReachable = false, restrictionClass = RestrictionClass.UNKNOWN, nowEpochMillis = now,
+            endpointSpecificOutcomeEpochMillis = now,
         )
         assertEquals(ReachabilityState.REACHABLE, reachA.state)
         assertEquals(ReachabilityState.DEGRADED, reachB.state) // conflicting evidence -> conservative middle state
@@ -133,6 +137,7 @@ class GatewayPoolIntegrationTest {
             transportHealth = TransportHealth(state = TransportHealthState.UNREACHABLE),
             endpointSpecificReachable = false, restrictionClass = RestrictionClass.UNKNOWN, nowEpochMillis = 1_000_000L,
             controlPlaneReachable = true,
+            endpointSpecificOutcomeEpochMillis = 1_000_000L,
         )
         assertEquals(ReachabilityState.UNREACHABLE, reach.state) // data-plane evidence still governs state
         assertEquals(true, reach.evidence.controlPlaneReachable)
@@ -145,6 +150,7 @@ class GatewayPoolIntegrationTest {
         fun reach(e: EndpointDescriptor, kind: TransportKind, ok: Boolean) = ReachabilityEngine.assess(
             e, kind, networkUsable = true, transportHealth = TransportHealth(state = TransportHealthState.HEALTHY),
             endpointSpecificReachable = ok, restrictionClass = RestrictionClass.UNKNOWN, nowEpochMillis = now,
+            endpointSpecificOutcomeEpochMillis = now,
         )
         val candidates = listOf(
             PathCandidateBuilder.buildDirect(gatewayA, TransportKind.AMNEZIA_WG, reach(gatewayA, TransportKind.AMNEZIA_WG, true)),

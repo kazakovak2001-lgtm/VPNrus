@@ -37,9 +37,20 @@ object SignedManifestCodec {
         return out.toByteArray()
     }
 
-    /** @throws IllegalArgumentException / java.io.IOException on any malformed input - never a partial result. */
+    /**
+     * @throws IllegalArgumentException / java.io.IOException on any
+     * malformed input - never a partial result. Requires EXACT container
+     * consumption (PR #24 audit fix): [bytes] must contain nothing beyond
+     * the signature - any trailing byte, however small, is rejected. A
+     * container is a complete, self-describing artifact, never a prefix of
+     * a longer stream; silently ignoring trailing bytes would let extra
+     * (possibly attacker- or bug-appended) data ride along undetected in
+     * whatever [bytes] came from (a downloaded HTTP response, an on-disk
+     * file) without ever being surfaced.
+     */
     fun decode(bytes: ByteArray): SignedManifest {
-        DataInputStream(bytes.inputStream()).use { input ->
+        val stream = bytes.inputStream()
+        DataInputStream(stream).use { input ->
             val version = input.readInt()
             require(version == FORMAT_VERSION) { "unsupported signed-manifest container format: $version" }
             val canonicalLen = input.readInt()
@@ -50,6 +61,7 @@ object SignedManifestCodec {
             require(sigLen in 0..MAX_SIGNATURE_BYTES) { "implausible signature length: $sigLen" }
             val signature = ByteArray(sigLen)
             input.readFully(signature)
+            require(stream.available() == 0) { "trailing bytes after signed-manifest container (expected EOF): ${stream.available()} extra byte(s)" }
             return SignedManifest(ManifestCanonicalizer.decode(canonicalBytes), signature)
         }
     }

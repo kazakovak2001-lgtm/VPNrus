@@ -474,23 +474,27 @@ class MainViewModel(
         // never requiring any change to VpnController's proven connect
         // path: the SAME outcomes already recorded for TransportHealth are
         // reused here, just re-filtered by endpoint as well as transport.
+        // (PR #24 audit fix) - the NEWEST matching outcome wins (explicit
+        // maxByOrNull on its own real timestamp, not merely "last in the
+        // list"), and its OWN timestamp is threaded through to
+        // ReachabilityEngine.assess so stale evidence can actually decay -
+        // see that function's own "never TransportHealth's age as a fake
+        // proxy" docs for why this is a real, separate timestamp.
         val outcomes = recentConnectionOutcomes()
-        val endpointSpecificReachableFor: (net.pocvpn.client.reachability.EndpointId, TransportKind) -> Boolean? = { id, kind ->
-            outcomes.lastOrNull { it.gatewayId == id.value && it.transport == kind }
-                ?.let { it.result == net.pocvpn.client.smartconnect.ConnectionOutcomeResult.SUCCESS }
-        }
 
         val reachability = manifest.endpoints.flatMap { endpoint ->
             endpoint.transports.map { binding ->
+                val matchedOutcome = net.pocvpn.client.reachability.EndpointOutcomeMatcher.latestMatching(outcomes, endpoint.id, binding.kind)
                 net.pocvpn.client.reachability.ReachabilityEngine.assess(
                     endpoint = endpoint,
                     transportKind = binding.kind,
                     networkUsable = profile.isUsable,
                     transportHealth = health.getValue(binding.kind),
-                    endpointSpecificReachable = endpointSpecificReachableFor(endpoint.id, binding.kind),
+                    endpointSpecificReachable = matchedOutcome?.let { it.result == net.pocvpn.client.smartconnect.ConnectionOutcomeResult.SUCCESS },
                     restrictionClass = restriction,
                     nowEpochMillis = now,
                     controlPlaneReachable = controlPlaneReachableByEndpoint(endpoint.id),
+                    endpointSpecificOutcomeEpochMillis = matchedOutcome?.timestampEpochMillis,
                 )
             }
         }
@@ -513,16 +517,22 @@ class MainViewModel(
                 it.keyBytes(),
             )
         }
-        // B12 - real (not hardcoded false) diversity signal: a candidate is
-        // "diverse" iff at least one OTHER candidate in this same batch
-        // names a different provider or ASN - a small, informational
-        // PathScorer tie-break input (see that class's own tiny-weight
-        // docs), never anything reachability-overriding.
-        val providerAsnOf: (net.pocvpn.client.reachability.PathCandidate.Direct) -> Pair<String, Int?> = { candidate ->
-            candidate.gateway.endpoint.let { it.provider to it.asn }
-        }
-        val distinctProviderAsnCount = candidates.filterIsInstance<net.pocvpn.client.reachability.PathCandidate.Direct>()
-            .map { providerAsnOf(it) }.distinct().size
+        // B12 (PR #24 audit fix) - DEFERRED, not implemented here: a
+        // meaningful "diversity bonus" needs a per-CANDIDATE signal (does
+        // choosing THIS candidate specifically add provider/ASN diversity
+        // relative to some reference - e.g. the currently active
+        // connection, or the rest of the ranked set), not one batch-wide
+        // Boolean computed once and handed identically to every candidate -
+        // that was reviewed and found to have literally no effect on
+        // ranking (every candidate got the same +5 or +0). This slice has
+        // no natural asymmetric reference point to diff against (nothing
+        // has been selected yet at the point this is computed), and
+        // inventing one risks an arbitrary provider preference PathScorer's
+        // own docs explicitly warn against. PathScorer.score's
+        // `diverseProviderOrAsnSeenElsewhere` parameter itself is unchanged
+        // and still real/tested (see PathScorerTest) - only THIS call site
+        // is deliberately disabled until a future slice defines a real
+        // per-candidate reference. See docs/ROADMAP.md's own note.
         val scored = candidates.map { candidate ->
             val direct = candidate as net.pocvpn.client.reachability.PathCandidate.Direct
             val gateway = direct.gateway.endpoint
@@ -535,7 +545,7 @@ class MainViewModel(
                 capabilities = capabilities,
                 transportHealth = health.getValue(candidate.transport),
                 history = history,
-                diverseProviderOrAsnSeenElsewhere = distinctProviderAsnCount > 1,
+                diverseProviderOrAsnSeenElsewhere = false,
             )
         }
 
