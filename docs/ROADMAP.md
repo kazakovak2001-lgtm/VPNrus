@@ -30,12 +30,17 @@ B9  - full-tunnel external IP validation
 B10 - DNS / IPv4 / IPv6 leak validation
 ```
 
-No runtime implementation of any new transport (XRay/REALITY, QUIC,
-TLS/TCP fallback, Shadowsocks, or any P1/P2 item) begins before B10 is
-complete on a real VPS. Phase 2A (transport architecture foundation) is
-the only architecture work done ahead of that sequence, and it is
-explicitly not wired into the live connect path - see
-[Phase 2A's own report] in the project history for that boundary.
+No runtime implementation of any new transport (QUIC, TLS/TCP fallback,
+Shadowsocks, or any other P1/P2 item) begins before B10 is complete on a
+real VPS. XRay/REALITY was the first exception to this rule: its full
+client and gateway runtime was built and live-wired ahead of B10, and its
+AWG->Xray automatic failover has since been **verified** end-to-end on a
+real VPS (see the XRay / VLESS REALITY fallback row below) - this
+document is updated to reflect that reality rather than continue
+asserting it hasn't happened. Phase 2A (transport architecture
+foundation) remains the only architecture work done ahead of sequence
+for the transports that are still PLANNED - see [Phase 2A's own report]
+in the project history for that boundary.
 
 ## Architecture principles this roadmap commits to
 
@@ -124,7 +129,7 @@ explicitly not wired into the live connect path - see
 | Capability | Status | Notes |
 |---|---|---|
 | AmneziaWG 3.1 | **IMPLEMENTED** | Client + gateway both real, pinned `v3.1.20260814`/`v3.1.20260812`. Local Android<->WSL2 handshake **VERIFIED** (B8A); public-network handshake remains UNVERIFIED until B8B. |
-| XRay / VLESS REALITY fallback | PLANNED | No code. |
+| XRay / VLESS REALITY fallback | **IMPLEMENTED** | Client and gateway both real and live-wired. Client: `XrayProfileStore`/`XrayProfileRepository` persist a provisioned profile, `VlessRealityTransport`/`NovaXrayVpnService`/`XrayCoreController` execute it through `VpnController` (B8I6-B8I7), which registers `TransportKind.XRAY_REALITY` as available whenever a real profile repository is wired - production always does. Gateway: Xray profile provisioning/activation is real (`gateway/api/xray_activation.py`, `xray_provisioning.py`, B8K1-B8K4), with its `/v1/activate`/`/v1/xray-profile` routes now exposed at the nginx edge (B8K5A, PR #10). `AwgXrayFailoverPolicy` (B8I8) automatically falls back a failed AWG attempt to Xray, and the REALITY key validation bug is fixed (same commit, PR #9). AWG->Xray automatic failover **VERIFIED** end-to-end on a real VPS (AWG peer removed, AWG failed, automatic Xray fallback executed, live Xray traffic and a matching exit IP confirmed on the server). |
 | QUIC transport/fallback | PLANNED | No code. |
 | TLS/TCP fallback | PLANNED | No code. |
 | Smart Connect | **FOUNDATION** | `SmartConnectDecisionEngine` (Phase 2A) is real, pure, and unit-tested, but NOT live-wired into `VpnController`. |
