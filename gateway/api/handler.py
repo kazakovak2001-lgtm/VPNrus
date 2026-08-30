@@ -390,12 +390,20 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         credential = self._require_bearer_token()
 
         raw_body = self.rfile.read(content_length)
-        # Same {"public_key": "..."} body shape as /v1/activate - this MUST be
-        # the same AWG public key already bound via /v1/activate; the server
-        # issues the VLESS identity, the client never sends one (see
-        # xray_provisioning.py's own eligibility gate).
-        public_key = self._parse_and_validate_body(raw_body)
+        # {"public_key": "...", "transport": "reality"|"tls"} - "transport" is
+        # OPTIONAL and defaults to "reality" (B8O2), so every existing caller
+        # of this endpoint (pre-B8O2 Android, this file's own pre-existing
+        # tests) is byte-for-byte unaffected. This MUST be the same AWG public
+        # key already bound via /v1/activate; the server issues the VLESS
+        # identity, the client never sends one (see xray_provisioning.py's
+        # own eligibility gate) - the SAME identity is reused for either
+        # transport, never a second one.
+        public_key, transport = self._parse_and_validate_xray_profile_body(raw_body)
         self._log_fields["pubkey_prefix"] = public_key[:8]
+        self._log_fields["xray_transport"] = transport
+
+        if transport == "tls" and not cfg.xray_tls_server_port:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_tls_not_configured")
 
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
@@ -456,16 +464,30 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # server-internal config, never the activation digest, never any
         # other user's/device's identity. Snake_case keys, matching the
         # existing /v1/activate and /v1/peers response convention.
-        payload = {
-            "server_address": cfg.endpoint_host,
-            "server_port": cfg.xray_server_port,
-            "uuid": identity_outcome.vless_uuid,
-            "flow": cfg.xray_flow,
-            "server_name": cfg.xray_server_name,
-            "fingerprint": cfg.xray_fingerprint,
-            "reality_public_key": cfg.xray_reality_public_key,
-            "short_id": cfg.xray_short_id,
-        }
+        if transport == "tls":
+            # B8O2 - TLS needs materially fewer fields than REALITY (no
+            # flow/reality_public_key/short_id - see
+            # docs/B8O0_TLS_TCP_FALLBACK_AUDIT.md's own "simpler credential
+            # shape" finding) - never hand out REALITY-only fields for a TLS
+            # profile, even though this same process also serves REALITY.
+            payload = {
+                "server_address": cfg.endpoint_host,
+                "server_port": cfg.xray_tls_server_port,
+                "uuid": identity_outcome.vless_uuid,
+                "server_name": cfg.xray_tls_server_name,
+                "fingerprint": cfg.xray_tls_fingerprint,
+            }
+        else:
+            payload = {
+                "server_address": cfg.endpoint_host,
+                "server_port": cfg.xray_server_port,
+                "uuid": identity_outcome.vless_uuid,
+                "flow": cfg.xray_flow,
+                "server_name": cfg.xray_server_name,
+                "fingerprint": cfg.xray_fingerprint,
+                "reality_public_key": cfg.xray_reality_public_key,
+                "short_id": cfg.xray_short_id,
+            }
         # Always 200 - a new issuance and an idempotent retry are equally
         # "success" here, same rule /v1/activate already uses for its own
         # new-bind-vs-existing-bind distinction - but ONLY once activation
@@ -522,6 +544,34 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_public_key")
 
         return public_key
+
+    def _parse_and_validate_xray_profile_body(self, raw_body):
+        """B8O2 - /v1/xray-profile's own body shape: {"public_key": "..."}
+        (required, same validation as every other endpoint) plus an OPTIONAL
+        {"transport": "reality"|"tls"} - defaulting to "reality" when absent
+        so every pre-B8O2 caller's exact request body still parses
+        identically. Returns (public_key, transport)."""
+        try:
+            parsed = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_json")
+
+        if not isinstance(parsed, dict):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+
+        allowed_keys = {"public_key", "transport"}
+        if not parsed.keys() or "public_key" not in parsed or not (set(parsed.keys()) <= allowed_keys):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+
+        public_key = parsed["public_key"]
+        if not isinstance(public_key, str) or not is_valid_wg_public_key(public_key):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_public_key")
+
+        transport = parsed.get("transport", "reality")
+        if transport not in ("reality", "tls"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+
+        return public_key, transport
 
     # --- response helpers ---
     def _write_json(self, status, payload):

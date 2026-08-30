@@ -69,10 +69,37 @@ class RealityServerConfig:
 
 
 @dataclass(frozen=True)
+class TlsServerConfig:
+    """B8O2 - operator-chosen, server-local TLS/TCP settings for a SECOND
+    Xray inbound, alongside (never instead of) REALITY's own. [cert_file]/
+    [key_file] are the ONLY fields here with any secret-adjacent handling
+    requirement, and even those are FILE PATHS, not raw key material - this
+    module never opens them; xray-core itself reads their contents at
+    process start (see docs/B8O1A_TLS_GATEWAY_INBOUND_AUDIT.md). Reuses the
+    EXISTING publicly-trusted Let's Encrypt certificate already provisioned
+    for the control-plane API (gateway/edge/nginx-pocvpn.conf) - no new ACME
+    workflow, per B8O0's own audit finding."""
+
+    listen_port: int
+    cert_file: str
+    key_file: str
+    inbound_tag: str = "nova-vless-tls-in"
+
+
+@dataclass(frozen=True)
 class RenderedClient:
     activation_id: str
     device_public_key: str
     vless_uuid: str
+
+
+def _validate_tls_server_config(tls):
+    if not (1 <= tls.listen_port <= 65535):
+        raise XrayConfigRenderError(f"invalid tls listen_port: {tls.listen_port}")
+    if not tls.cert_file or not os.path.isabs(tls.cert_file):
+        raise XrayConfigRenderError("tls cert_file must be an absolute path")
+    if not tls.key_file or not os.path.isabs(tls.key_file):
+        raise XrayConfigRenderError("tls key_file must be an absolute path")
 
 
 def _validate_reality_server_config(reality):
@@ -115,64 +142,118 @@ def _active_clients(activations_data, xray_data):
     return clients
 
 
-def render_server_config(activations_data, xray_data, reality, flow=""):
-    """Pure function: (parsed activations store, parsed xray identity
-    store, RealityServerConfig) -> the full Xray server config dict,
-    ready for json.dumps. Deterministic - same inputs always produce the
-    same output (verified by this module's own determinism test), so
-    diffing two renders is a meaningful way to review a pending change."""
-    _validate_reality_server_config(reality)
-
-    clients = _active_clients(activations_data, xray_data)
-
-    vless_clients = [
-        {
+def _vless_clients(clients, flow=None):
+    """Shared client-list builder for both inbounds - see [_active_clients].
+    `flow` is included only when explicitly given a value (REALITY); TLS
+    omits the key entirely, mirroring the Android side's own
+    renderVlessTlsOutbound, which never emits `flow` for a plain-TLS
+    outbound (a REALITY/XTLS-specific optimization - see
+    docs/B8O0_TLS_TCP_FALLBACK_AUDIT.md)."""
+    result = []
+    for client in clients:
+        entry = {
             "id": client.vless_uuid,
-            "flow": flow,
             # Not a real email - Xray's own per-client traffic-stats tag.
             # activation_id is a random 32-hex value, never sensitive.
             "email": f"{client.activation_id}-{client.device_public_key[:8]}",
         }
-        for client in clients
-    ]
+        if flow is not None:
+            entry["flow"] = flow
+        result.append(entry)
+    return result
+
+
+def _render_reality_inbound(clients, reality, flow):
+    return {
+        "tag": reality.inbound_tag,
+        "listen": "0.0.0.0",
+        "port": reality.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": _vless_clients(clients, flow=flow),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": reality.dest,
+                "serverNames": list(reality.server_names),
+                "privateKey": reality.private_key,
+                "shortIds": list(reality.short_ids),
+            },
+        },
+    }
+
+
+def _render_tls_inbound(clients, tls):
+    """B8O2 - the SAME active-client list REALITY's own inbound uses (see
+    [_active_clients]) - device identity is shared across both transports,
+    never a second/independent identity system (per this module's own
+    revocation-is-realized-entirely-here docstring, which applies equally to
+    this inbound: an identity excluded above is excluded from BOTH
+    inbounds). No `flow` key - see [_vless_clients]'s own docs."""
+    return {
+        "tag": tls.inbound_tag,
+        "listen": "0.0.0.0",
+        "port": tls.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": _vless_clients(clients, flow=None),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "tls",
+            "tlsSettings": {
+                "certificates": [
+                    {"certificateFile": tls.cert_file, "keyFile": tls.key_file},
+                ],
+            },
+        },
+    }
+
+
+def render_server_config(activations_data, xray_data, reality, tls=None, flow=""):
+    """Pure function: (parsed activations store, parsed xray identity
+    store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
+    server config dict, ready for json.dumps. Deterministic - same inputs
+    always produce the same output (verified by this module's own
+    determinism test), so diffing two renders is a meaningful way to review
+    a pending change. [tls] is None by default (REALITY-only, byte-for-byte
+    the pre-B8O2 output) - passing a real TlsServerConfig appends a SECOND,
+    independent inbound on its own port (see
+    docs/B8O1A_TLS_GATEWAY_INBOUND_AUDIT.md for why REALITY and TLS require
+    separate xray-core inbounds, never a shared one), sharing the SAME
+    active-client list [_active_clients] computes once."""
+    _validate_reality_server_config(reality)
+    if tls is not None:
+        _validate_tls_server_config(tls)
+
+    clients = _active_clients(activations_data, xray_data)
+
+    inbounds = [_render_reality_inbound(clients, reality, flow)]
+    if tls is not None:
+        inbounds.append(_render_tls_inbound(clients, tls))
 
     return {
         "log": {"loglevel": "warning"},
-        "inbounds": [
-            {
-                "tag": reality.inbound_tag,
-                "listen": "0.0.0.0",
-                "port": reality.listen_port,
-                "protocol": "vless",
-                "settings": {
-                    "clients": vless_clients,
-                    "decryption": "none",
-                },
-                "streamSettings": {
-                    "network": "tcp",
-                    "security": "reality",
-                    "realitySettings": {
-                        "show": False,
-                        "dest": reality.dest,
-                        "serverNames": list(reality.server_names),
-                        "privateKey": reality.private_key,
-                        "shortIds": list(reality.short_ids),
-                    },
-                },
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             {"tag": "direct", "protocol": "freedom"},
         ],
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, flow=""):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow=""):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
-    outside the config file itself."""
-    full = render_server_config(activations_data, xray_data, reality, flow=flow)
+    outside the config file itself. TLS's own inbound carries no secret
+    value at all (cert_file/key_file are non-secret file paths), so nothing
+    else needs redacting there."""
+    full = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow)
     full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     return full
 
@@ -209,7 +290,7 @@ def atomic_write_config(config_path, config_dict):
 def regenerate_and_write_config(
     activation_store_path, activation_lock_path,
     xray_store_path, xray_lock_path,
-    config_path, reality, flow="",
+    config_path, reality, tls=None, flow="",
     validate_config_fn=None,
 ):
     """The full pipeline this module's docstring describes, minus reload:
@@ -227,7 +308,7 @@ def regenerate_and_write_config(
     activations_data = activations.read_store_shared(activation_store_path, activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(xray_store_path, xray_lock_path)
 
-    config_dict = render_server_config(activations_data, xray_data, reality, flow=flow)
+    config_dict = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow)
     atomic_write_config(config_path, config_dict)
 
     if validate_config_fn is not None:

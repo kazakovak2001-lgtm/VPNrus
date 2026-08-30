@@ -105,6 +105,8 @@ def make_app_config(
     xray_activation_lock_path="", xray_activation_last_hash_path="",
     xray_activation_wrapper_path="", xray_activation_timeout_seconds=5.0,
     xray_dest="",
+    xray_tls_server_port=0, xray_tls_server_name="", xray_tls_fingerprint="",
+    xray_tls_cert_file="", xray_tls_key_file="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -136,6 +138,11 @@ def make_app_config(
         xray_activation_wrapper_path=xray_activation_wrapper_path,
         xray_activation_timeout_seconds=xray_activation_timeout_seconds,
         xray_dest=xray_dest,
+        xray_tls_server_port=xray_tls_server_port,
+        xray_tls_server_name=xray_tls_server_name,
+        xray_tls_fingerprint=xray_tls_fingerprint,
+        xray_tls_cert_file=xray_tls_cert_file,
+        xray_tls_key_file=xray_tls_key_file,
     )
 
 
@@ -217,6 +224,36 @@ def make_xray_app_config(tmp_dir, provision_script_path, activation_store_path, 
         xray_activation_last_hash_path=kwargs.pop("xray_activation_last_hash_path", os.path.join(tmp_dir, ".xray-last-hash")),
         xray_activation_wrapper_path=wrapper_path,
         xray_dest=kwargs.pop("xray_dest", "www.microsoft.com:443"),
+        **kwargs,
+    )
+
+
+def make_tls_cert_and_key_files(tmp_dir):
+    """Test-only stand-ins for a real cert/key pair - xray_config_renderer
+    only ever checks that these paths are absolute and validates their
+    CONTENT is never this module's concern (that's xray-core's own job at
+    process start, see build_tls_config's own docs)."""
+    cert_file = os.path.join(tmp_dir, "tls-cert.pem")
+    key_file = os.path.join(tmp_dir, "tls-key.pem")
+    with open(cert_file, "w", encoding="utf-8") as handle:
+        handle.write("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n")
+    with open(key_file, "w", encoding="utf-8") as handle:
+        handle.write("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n")
+    return cert_file, key_file
+
+
+def make_xray_tls_app_config(tmp_dir, provision_script_path, activation_store_path, activation_lock_path, **kwargs):
+    """B8O2 - convenience wrapper: a full app config with REALITY (via
+    make_xray_app_config) AND TLS/TCP both configured - representative,
+    non-secret test values throughout."""
+    cert_file, key_file = make_tls_cert_and_key_files(tmp_dir)
+    return make_xray_app_config(
+        tmp_dir, provision_script_path, activation_store_path, activation_lock_path,
+        xray_tls_server_port=kwargs.pop("xray_tls_server_port", 2053),
+        xray_tls_server_name=kwargs.pop("xray_tls_server_name", "203.0.113.1"),
+        xray_tls_fingerprint=kwargs.pop("xray_tls_fingerprint", "chrome"),
+        xray_tls_cert_file=kwargs.pop("xray_tls_cert_file", cert_file),
+        xray_tls_key_file=kwargs.pop("xray_tls_key_file", key_file),
         **kwargs,
     )
 

@@ -13,6 +13,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import net.pocvpn.client.BuildConfig
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.transport.TransportKind
 
 /**
  * B8K1B - the REAL Android integration for Xray/VLESS+REALITY. As of B8I7,
@@ -65,6 +67,14 @@ class NovaXrayVpnService : VpnService() {
         )
     }
 
+    /** B8O2 - the TLS/TCP counterpart of [profileRepositoryFactory] above; same test-seam contract, its own AndroidKeyStore alias/file. */
+    internal var tlsProfileRepositoryFactory: (Context) -> XrayTlsProfileRepository = { context ->
+        net.pocvpn.client.identity.SecureXrayTlsProfileRepository(
+            store = net.pocvpn.client.identity.FileXrayTlsProfileStore(context.noBackupFilesDir),
+            encryptor = net.pocvpn.client.identity.AndroidKeystoreAesGcmEncryptor(TLS_KEYSTORE_ALIAS),
+        )
+    }
+
     // B8K4C - the ONE authoritative configuration source (constraint: prefer
     // the encrypted XrayProfileRepository over Intent extras): loads the
     // CURRENT stored profile fresh on first use, resolves/validates/renders
@@ -82,6 +92,7 @@ class NovaXrayVpnService : VpnService() {
             ensureCoreEnvInitialized = { coreRuntime.ensureCoreEnvInitialized(applicationContext) },
             establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
             closeTun = { closeTunInterface() },
+            tlsRepository = tlsProfileRepositoryFactory(applicationContext),
         )
     }
 
@@ -103,7 +114,14 @@ class NovaXrayVpnService : VpnService() {
             ACTION_START -> {
                 val sessionId = intent.getLongExtra(EXTRA_SESSION_ID, currentSessionId)
                 currentSessionId = sessionId
-                startIfNotAlreadyRunning(sessionId)
+                // B8O2 - defaults to XRAY_REALITY so an intent built by any
+                // pre-B8O2 caller (or one that never sets this extra) is
+                // byte-for-byte unaffected - VlessRealityTransport never sets
+                // this extra at all.
+                val kind = intent.getStringExtra(EXTRA_TRANSPORT_KIND)
+                    ?.let { runCatching { TransportKind.valueOf(it) }.getOrNull() }
+                    ?: TransportKind.XRAY_REALITY
+                startIfNotAlreadyRunning(sessionId, kind)
                 return Service.START_NOT_STICKY
             }
 
@@ -124,9 +142,9 @@ class NovaXrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long) {
+    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind) {
         scope.launch {
-            when (val outcome = controller.requestStart()) {
+            when (val outcome = controller.requestStart(kind)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
@@ -211,7 +229,15 @@ class NovaXrayVpnService : VpnService() {
         // XrayRuntimeEvent's own docs.
         const val EXTRA_SESSION_ID = "net.pocvpn.client.vpn.xray.extra.SESSION_ID"
 
+        // B8O2 - the transport kind to start THIS attempt with: the
+        // TransportKind enum constant name (e.g. "TLS_TCP"), or absent for
+        // the pre-B8O2 default (XRAY_REALITY) - see onStartCommand's own
+        // parsing. VlessTlsTransport sets this; VlessRealityTransport never
+        // does, so its own intents are byte-for-byte unchanged.
+        const val EXTRA_TRANSPORT_KIND = "net.pocvpn.client.vpn.xray.extra.TRANSPORT_KIND"
+
         private const val TAG = "NovaXrayVpnService"
         private const val KEYSTORE_ALIAS = "nova_xray_profile_key"
+        private const val TLS_KEYSTORE_ALIAS = "nova_xray_tls_profile_key"
     }
 }

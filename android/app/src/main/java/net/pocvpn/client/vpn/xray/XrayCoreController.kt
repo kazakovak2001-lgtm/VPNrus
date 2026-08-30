@@ -1,6 +1,8 @@
 package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.transport.TransportKind
 
 /**
  * What one [XrayCoreController.requestStart] call actually did - the caller
@@ -58,10 +60,32 @@ class XrayCoreController(
     private val ensureCoreEnvInitialized: () -> Unit,
     private val establishTun: (XrayVpnBuilderPlan) -> Int?,
     private val closeTun: () -> Unit,
+    // B8O2 - additive, defaults to null so every existing call site (real or
+    // test) is byte-for-byte unaffected: with no TLS repository wired,
+    // requestStart(TransportKind.TLS_TCP) simply rejects (see below) rather
+    // than throwing - the same fail-closed shape as a missing REALITY
+    // profile, never a crash.
+    private val tlsRepository: XrayTlsProfileRepository? = null,
 ) {
     private val lifecycleGate = XrayServiceLifecycleGate()
 
-    suspend fun requestStart(): XrayCoreStartOutcome {
+    private class ReadyToStart(val plan: XrayVpnBuilderPlan, val renderedConfig: String)
+
+    /**
+     * [kind] defaults to [TransportKind.XRAY_REALITY] so every existing
+     * call site (real or test) that calls `requestStart()` with no argument
+     * is byte-for-byte unaffected - REALITY's own resolve/build path below
+     * is untouched. [TransportKind.TLS_TCP] resolves against [tlsRepository]
+     * instead (see [XrayRuntimeResolver.resolveTls]) - both share the SAME
+     * [lifecycleGate]/tun/coreRuntime, so REALITY and TLS_TCP can never run
+     * concurrently through this one controller instance (there is only ever
+     * one active Xray session per [net.pocvpn.client.vpn.xray.NovaXrayVpnService]).
+     * Any other [kind] is rejected before touching the tun/core at all -
+     * structurally unreachable via the public API today (only these two
+     * kinds are ever passed in), same "defensive, not a real code path"
+     * shape [XrayCoreStartOutcome.Rejected]'s other call sites already use.
+     */
+    suspend fun requestStart(kind: TransportKind = TransportKind.XRAY_REALITY): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
             XrayServiceStartDecision.IGNORE_START_IN_FLIGHT -> return XrayCoreStartOutcome.StartInFlight
@@ -70,12 +94,27 @@ class XrayCoreController(
 
         var success = false
         try {
-            val ready = when (val resolution = XrayRuntimeResolver.resolve(repository)) {
-                is XrayRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
-                is XrayRuntimeResolution.Ready -> resolution
+            val ready = when (kind) {
+                TransportKind.TLS_TCP -> {
+                    val tlsRepo = tlsRepository
+                        ?: return XrayCoreStartOutcome.Rejected("Xray TLS profile repository not wired")
+                    when (val resolution = XrayRuntimeResolver.resolveTls(tlsRepo)) {
+                        is XrayTlsRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
+                        is XrayTlsRuntimeResolution.Ready ->
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId), resolution.renderedConfig)
+                    }
+                }
+                TransportKind.XRAY_REALITY -> {
+                    when (val resolution = XrayRuntimeResolver.resolve(repository)) {
+                        is XrayRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
+                        is XrayRuntimeResolution.Ready ->
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId), resolution.renderedConfig)
+                    }
+                }
+                else -> return XrayCoreStartOutcome.Rejected("unsupported transport kind for NovaXrayVpnService: $kind")
             }
 
-            val plan = buildXrayVpnPlan(ready.config, novaPackageId)
+            val plan = ready.plan
             val fd = try {
                 establishTun(plan)
             } catch (t: Throwable) {

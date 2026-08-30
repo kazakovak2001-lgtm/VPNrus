@@ -78,6 +78,22 @@ def build_reality_config(app_config):
     )
 
 
+def build_tls_config(app_config):
+    """B8O2 - the TLS/TCP counterpart of [build_reality_config]. Unlike that
+    function, this one reads NO secret file - cert_file/key_file are file
+    paths xray-core itself opens at process start, never values this
+    process holds. Returns None (not an error) when TLS is not configured -
+    matching config.py's own optional-group convention: TLS/TCP is entirely
+    absent from the rendered config, REALITY's own inbound is unaffected."""
+    if not app_config.xray_tls_server_port:
+        return None
+    return xray_config_renderer.TlsServerConfig(
+        listen_port=app_config.xray_tls_server_port,
+        cert_file=app_config.xray_tls_cert_file,
+        key_file=app_config.xray_tls_key_file,
+    )
+
+
 def _read_last_activated_hash(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -110,9 +126,10 @@ def _render_candidate(app_config):
     module's own long-held lock) and renders. Returns (config_dict,
     canonical_json_text, sha256_hex)."""
     reality = build_reality_config(app_config)
+    tls = build_tls_config(app_config)
     activations_data = activations.read_store_shared(app_config.activation_store_path, app_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(app_config.xray_store_path, app_config.xray_lock_path)
-    config_dict = xray_config_renderer.render_server_config(activations_data, xray_data, reality, flow=app_config.xray_flow)
+    config_dict = xray_config_renderer.render_server_config(activations_data, xray_data, reality, tls=tls, flow=app_config.xray_flow)
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
     return config_dict, sha256_hex

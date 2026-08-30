@@ -13,12 +13,14 @@ import net.pocvpn.client.identity.AwgClientKeyRepository
 import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.FileIdentityStore
 import net.pocvpn.client.identity.XrayProfile
+import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.toXrayVlessRealityConfig
+import net.pocvpn.client.vpn.xray.toXrayVlessTlsConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -34,6 +36,14 @@ private val VALID_XRAY_PROFILE = XrayProfile(
     fingerprint = "chrome",
     realityPublicKey = "A".repeat(43),
     shortId = "a1b2c3d4",
+)
+
+private val VALID_XRAY_TLS_PROFILE = XrayTlsProfile(
+    server = "152.70.43.1",
+    serverPort = 2053,
+    uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+    serverName = "203.0.113.1",
+    fingerprint = "chrome",
 )
 
 private fun configuredGateway() = GatewayConfiguration.Configured(
@@ -520,6 +530,298 @@ class VpnControllerTest {
         assertEquals(1, awgTransport.connectCallCount)
         assertTrue(awgTransport.lastConfig is TransportConfig.Awg)
         assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    // --- B8O2: TLS/TCP fallback wiring, and REALITY/AWG non-regression alongside it ---
+
+    @Test
+    fun `resolved TLS_TCP with a valid stored profile invokes the exact TLS transport with the real TLS config`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = FakeXrayTlsProfileRepository(VALID_XRAY_TLS_PROFILE)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(tlsTransport, TransportKind.TLS_TCP))
+        runCurrent()
+
+        assertEquals(1, tlsTransport.connectCallCount)
+        assertEquals(0, awgTransport.connectCallCount)
+        val sentConfig = tlsTransport.lastConfig
+        assertTrue(sentConfig is TransportConfig.XrayTls)
+        assertEquals(VALID_XRAY_TLS_PROFILE.toXrayVlessTlsConfig(), (sentConfig as TransportConfig.XrayTls).config)
+    }
+
+    @Test
+    fun `TLS_TCP is refused before the transport is ever touched when no TLS repository is wired`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            // xrayTlsProfileRepository deliberately not wired.
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(tlsTransport, TransportKind.TLS_TCP))
+        runCurrent()
+
+        assertEquals(0, tlsTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `a missing TLS profile fails closed before the TLS transport is ever touched`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = FakeXrayTlsProfileRepository(profile = null)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(tlsTransport, TransportKind.TLS_TCP))
+        runCurrent()
+
+        assertEquals(0, tlsTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(VpnError.ConfigurationMappingFailure("XrayProfileNotReadyException"), diagnostics.snapshot.value.lastError)
+    }
+
+    @Test
+    fun `AWG and REALITY behavior are unchanged when a VpnController is also wired with a TLS profile repository`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(VALID_XRAY_PROFILE)
+        val tlsRepository = FakeXrayTlsProfileRepository(VALID_XRAY_TLS_PROFILE)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            xrayProfileRepository = xrayRepository,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+
+        controller.connect() // default -> AWG
+        runCurrent()
+        assertEquals(1, awgTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        controller.disconnect()
+        runCurrent()
+        controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY))
+        runCurrent()
+        assertEquals(1, xrayTransport.connectCallCount)
+        assertEquals(VALID_XRAY_PROFILE.toXrayVlessRealityConfig(), (xrayTransport.lastConfig as TransportConfig.Xray).config)
+    }
+
+    // --- B8O3: currentTransportKind reflects the actually-resolved/running attempt, never a hypothetical ---
+
+    @Test
+    fun `currentTransportKind is null before any connect and reflects the resolved kind after one`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        assertEquals(null, controller.currentTransportKind.value)
+
+        controller.connect()
+        runCurrent()
+
+        assertEquals(TransportKind.AMNEZIA_WG, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind is cleared back to null on disconnect`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+        assertEquals(TransportKind.AMNEZIA_WG, controller.currentTransportKind.value)
+
+        controller.disconnect()
+        runCurrent()
+
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout a gateway-configuration-missing failure`() = runTest {
+        // B8O2 audit fix - previously _currentTransportKind was set to the
+        // resolved kind BEFORE any of these preconditions were checked; a
+        // configuration failure never actually runs a transport, so this
+        // must never transiently (or permanently) report AMNEZIA_WG.
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(0, transport.connectCallCount)
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout an invalid-gateway-configuration failure`() = runTest {
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(GatewayConfiguration.Invalid("bad port")),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout a permission-denial failure`() = runTest {
+        val transport = FakeVpnTransport(permission = android.content.Intent())
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+        // Not yet running - permission is still pending. Must not already
+        // report AMNEZIA_WG as current merely because it was resolved/selected.
+        assertEquals(null, controller.currentTransportKind.value)
+
+        controller.onVpnPermissionResult(false)
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(0, transport.connectCallCount)
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind stays null throughout a backend runtime failure`() = runTest {
+        val transport = FakeVpnTransport()
+        transport.failConnectWith = IllegalStateException("boom")
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        // Note: intentionally not asserting on controller.state.value here -
+        // FakeVpnTransport's own stateFlow is left at "Connecting" when
+        // connect() throws (a pre-existing test-double/collector-replay
+        // detail unrelated to this fix), so the visible state can end up
+        // overwritten back to Connecting after the catch block's Error was
+        // set. currentTransportKind must be null EITHER way - see
+        // isRunningTransportState, which treats Connecting the same as
+        // Error (not running) - that is the actual invariant this test
+        // proves.
+        assertEquals(VpnError.BackendStartFailure("IllegalStateException"), diagnostics.snapshot.value.lastError)
+        assertEquals(null, controller.currentTransportKind.value)
+        assertFalse(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `currentTransportKind stays null when the split-tunneling no-apps-selected failure fires`() = runTest {
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val appRoutingPolicyStore = FakeAppRoutingPolicyStore(
+            net.pocvpn.client.vpn.policy.AppRoutingPolicy(
+                mode = net.pocvpn.client.vpn.policy.AppRoutingMode.VPN_ONLY_SELECTED,
+                selectedPackageNames = emptySet(),
+            ),
+        )
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            appRoutingPolicyStore = appRoutingPolicyStore,
+        )
+
+        controller.connect()
+        runCurrent()
+
+        assertEquals(VpnError.SplitTunnelingNoAppsSelected, diagnostics.snapshot.value.lastError)
+        assertEquals(0, transport.connectCallCount)
+        assertEquals(null, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind is not reported while merely Connecting - only once a real handshake lands`() = runTest {
+        val transport = FakeVpnTransport()
+        transport.connectGate = CompletableDeferred()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        val job = backgroundScope.launch { controller.connect() }
+        runCurrent()
+        assertEquals(1, transport.connectCallCount)
+        // connect() is still suspended inside transport.connect() (the gate
+        // hasn't been completed) - nothing is running yet.
+        assertEquals(null, controller.currentTransportKind.value)
+
+        transport.connectGate?.complete(Unit)
+        runCurrent()
+        job.join()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(TransportKind.AMNEZIA_WG, controller.currentTransportKind.value)
+    }
+
+    @Test
+    fun `currentTransportKind never flips to an unsupported kind that was refused before switching`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            // xrayTlsProfileRepository deliberately not wired - TLS_TCP is unsupported here.
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(tlsTransport, TransportKind.TLS_TCP))
+        runCurrent()
+
+        assertEquals(null, controller.currentTransportKind.value)
     }
 
     @Test

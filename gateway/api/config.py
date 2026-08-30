@@ -87,6 +87,21 @@ class AppConfig:
     xray_activation_timeout_seconds: float = 15.0
     xray_dest: str = ""
 
+    # B8O2 - TLS/TCP fallback: a SECOND Xray inbound, same activation
+    # pipeline/staging/lock/wrapper as REALITY above (see xray_activation.py's
+    # build_tls_config), sharing the SAME device identities (xray_store_path/
+    # xray_lock_path) - never a second identity system. Blank/zero (the
+    # default) means POST /v1/xray-profile never offers "tls" as a transport
+    # option, exactly like REALITY's own optional-group convention. Unlike
+    # the REALITY private key, xray_tls_cert_file/xray_tls_key_file are FILE
+    # PATHS only (xray-core itself reads their contents at process start) -
+    # this process never opens or reads them.
+    xray_tls_server_port: int = 0
+    xray_tls_server_name: str = ""
+    xray_tls_fingerprint: str = ""
+    xray_tls_cert_file: str = ""
+    xray_tls_key_file: str = ""
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -323,6 +338,75 @@ def load_config(env=None):
                 "site, never this server's own hostname/IP"
             )
 
+    # B8O2 - TLS/TCP fallback's own optional completeness group, checked
+    # independently of REALITY's above (a deployment may run REALITY without
+    # TLS, or - once B6 physical verification lands - both). Unlike REALITY's
+    # server_name (a THIRD-PARTY camouflage domain, never this gateway's own
+    # address), TLS's server_name IS this gateway's own address - see
+    # xray_activation.build_tls_config's own docs for why: it is the identity
+    # a REAL, publicly-trusted certificate (already reused from B8B2A) was
+    # issued for, not a REALITY-style camouflage target.
+    xray_tls_server_port_raw = _get(env, "XRAY_TLS_SERVER_PORT")
+    xray_tls_server_port = 0
+    if xray_tls_server_port_raw:
+        try:
+            xray_tls_server_port = int(xray_tls_server_port_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_TLS_SERVER_PORT is not an integer: {xray_tls_server_port_raw!r}")
+        if not (1 <= xray_tls_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_TLS_SERVER_PORT out of range: {xray_tls_server_port}")
+    xray_tls_server_name = _get(env, "XRAY_TLS_SERVER_NAME")
+
+    xray_tls_fingerprint = _get(env, "XRAY_TLS_FINGERPRINT")
+    if xray_tls_fingerprint and xray_tls_fingerprint not in ("chrome", "firefox", "safari", "edge"):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_TLS_FINGERPRINT is not one of chrome/firefox/safari/edge: {xray_tls_fingerprint!r}")
+
+    xray_tls_cert_file = _get(env, "XRAY_TLS_CERT_FILE")
+    xray_tls_key_file = _get(env, "XRAY_TLS_KEY_FILE")
+
+    xray_tls_partially_configured = bool(xray_tls_server_port or xray_tls_server_name or xray_tls_cert_file or xray_tls_key_file)
+    if xray_tls_partially_configured:
+        tls_missing = [
+            name for name, value in (
+                ("XRAY_TLS_SERVER_PORT", xray_tls_server_port_raw),
+                ("XRAY_TLS_SERVER_NAME", xray_tls_server_name),
+                ("XRAY_TLS_FINGERPRINT", xray_tls_fingerprint),
+                ("XRAY_TLS_CERT_FILE", xray_tls_cert_file),
+                ("XRAY_TLS_KEY_FILE", xray_tls_key_file),
+            ) if not value
+        ]
+        if tls_missing:
+            raise ConfigError(
+                "partial Xray TLS configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in tls_missing)
+                + " must all be set once any Xray TLS setting is set (or none of them, to leave TLS/TCP unconfigured)"
+            )
+        if not os.path.isabs(xray_tls_cert_file) or not os.path.isfile(xray_tls_cert_file):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_TLS_CERT_FILE must be an absolute path to an existing file")
+        if not os.path.isabs(xray_tls_key_file) or not os.path.isfile(xray_tls_key_file):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_TLS_KEY_FILE must be an absolute path to an existing file")
+        # A TLS inbound is a SEPARATE public TCP listener from REALITY's own
+        # (see docs/B8O1A_TLS_GATEWAY_INBOUND_AUDIT.md) - two inbounds on the
+        # same port is a config Xray would refuse at best, or silently
+        # misbehave at worst; fail closed here instead.
+        if xray_server_port and xray_tls_server_port == xray_server_port:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_TLS_SERVER_PORT must differ from {_ENV_PREFIX}XRAY_SERVER_PORT "
+                "- REALITY and TLS are separate xray-core inbounds and cannot share one listen port"
+            )
+        # TLS's own activation-boundary completeness (staging/lock/wrapper) is
+        # shared with REALITY's group above - both inbounds are rendered into
+        # the SAME Xray config file and activated together (see
+        # xray_activation.activate_if_needed) - so TLS being configured
+        # without that shared boundary already configured would leave it
+        # unreachable, the same "half-configured is not a safe middle ground"
+        # reasoning as REALITY's own activation_missing check above.
+        if not xray_activation_wrapper_path:
+            raise ConfigError(
+                "partial Xray TLS configuration: the shared Xray activation boundary "
+                f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before TLS can be enabled"
+            )
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -351,4 +435,9 @@ def load_config(env=None):
         xray_activation_wrapper_path=xray_activation_wrapper_path,
         xray_activation_timeout_seconds=xray_activation_timeout_seconds,
         xray_dest=xray_dest,
+        xray_tls_server_port=xray_tls_server_port,
+        xray_tls_server_name=xray_tls_server_name,
+        xray_tls_fingerprint=xray_tls_fingerprint,
+        xray_tls_cert_file=xray_tls_cert_file,
+        xray_tls_key_file=xray_tls_key_file,
     )

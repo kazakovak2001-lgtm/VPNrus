@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayTlsProfileRepository
 
 /**
  * What [XrayRuntimeResolver.resolve] decided about the currently stored
@@ -12,6 +13,12 @@ import net.pocvpn.client.identity.XrayProfileRepository
 sealed class XrayRuntimeResolution {
     data class Ready(val config: XrayVlessRealityConfig, val renderedConfig: String) : XrayRuntimeResolution()
     data class Rejected(val reason: String) : XrayRuntimeResolution()
+}
+
+/** B8O2 - the TLS/TCP counterpart of [XrayRuntimeResolution]. Never carries the uuid in [Rejected]'s reason. */
+sealed class XrayTlsRuntimeResolution {
+    data class Ready(val config: XrayVlessTlsConfig, val renderedConfig: String) : XrayTlsRuntimeResolution()
+    data class Rejected(val reason: String) : XrayTlsRuntimeResolution()
 }
 
 /**
@@ -42,6 +49,23 @@ object XrayRuntimeResolver {
                 XrayRuntimeResolution.Rejected("stored Xray profile failed validation: ${validation.errors.size} error(s)")
             is XrayConfigValidationResult.Valid ->
                 XrayRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
+        }
+    }
+
+    /** B8O2 - the TLS/TCP counterpart of [resolve], same load -> fail-closed -> map -> validate -> render chain. */
+    suspend fun resolveTls(repository: XrayTlsProfileRepository): XrayTlsRuntimeResolution {
+        val profile = try {
+            repository.getProfileOrNull()
+        } catch (t: Throwable) {
+            return XrayTlsRuntimeResolution.Rejected("failed to load Xray TLS profile: ${t.javaClass.simpleName}")
+        } ?: return XrayTlsRuntimeResolution.Rejected("no Xray TLS profile configured")
+
+        val config = profile.toXrayVlessTlsConfig()
+        return when (val validation = validateXrayVlessTlsConfig(config)) {
+            is XrayTlsConfigValidationResult.Invalid ->
+                XrayTlsRuntimeResolution.Rejected("stored Xray TLS profile failed validation: ${validation.errors.size} error(s)")
+            is XrayTlsConfigValidationResult.Valid ->
+                XrayTlsRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
         }
     }
 }
