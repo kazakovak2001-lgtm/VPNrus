@@ -1,5 +1,8 @@
 package net.pocvpn.client.vpn.config
 
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.smartconnect.ProductionGateway
+
 /** A single AmneziaWG peer (the gateway) to connect to. */
 data class AwgPeer(
     val publicKeyBase64: String,
@@ -40,9 +43,27 @@ sealed class TransportConfig {
      * B8K1B - config for the isolated VlessRealityTransport/NovaXrayVpnService
      * adapter shell. TransportKind.XRAY_REALITY stays NOT_IMPLEMENTED in
      * TransportRegistry, so nothing in production ever constructs this yet.
+     *
+     * B13 (audit item 5 fix) - [endpointId] is the REAL endpoint this exact
+     * attempt was resolved against (VpnController.buildTransportConfig sets
+     * it to `pendingConnectEndpointId`, never a hardcoded literal) - it is
+     * how VlessRealityTransport/NovaXrayVpnService know WHICH endpoint's
+     * repository to actually read the profile from, closing the gap where
+     * this config object was previously built correctly but then ignored by
+     * the real runtime (see VlessRealityTransport's own docs on why its
+     * `config` param's embedded XrayVlessRealityConfig itself is deliberately
+     * unused - endpointId is the one field that DOES need to cross this
+     * boundary). Defaults to the one real production endpoint so every
+     * pre-B13 construction (every existing test) is unaffected.
      */
-    data class Xray(val config: net.pocvpn.client.vpn.xray.XrayVlessRealityConfig) : TransportConfig()
+    data class Xray(
+        val config: net.pocvpn.client.vpn.xray.XrayVlessRealityConfig,
+        val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+    ) : TransportConfig()
 
-    /** B8O2 - the TLS/TCP counterpart of [Xray], for VlessTlsTransport/NovaXrayVpnService's TLS_TCP branch. */
-    data class XrayTls(val config: net.pocvpn.client.vpn.xray.XrayVlessTlsConfig) : TransportConfig()
+    /** B8O2/B13 - the TLS/TCP counterpart of [Xray], including the same [endpointId] threading - see that field's own docs. */
+    data class XrayTls(
+        val config: net.pocvpn.client.vpn.xray.XrayVlessTlsConfig,
+        val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+    ) : TransportConfig()
 }

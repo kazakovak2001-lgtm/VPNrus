@@ -317,7 +317,52 @@ private fun buildDiagnosticsLines(
         "RX: ${diagnostics.bytesReceived ?: "-"}",
         "TX: ${diagnostics.bytesSent ?: "-"}",
         "Last error: ${diagnostics.lastError?.displayText() ?: "-"}",
-    )
+    ) + reachabilityDiagnosticsLines(viewModel)
+}
+
+/**
+ * B13 - Section K: truthful, read-only multi-endpoint diagnostics. Renders
+ * whatever [MainViewModel.reachabilityDiagnostics] currently reports - today
+ * that is exactly ONE real production endpoint, but every line below is
+ * built by iterating the snapshot's own lists, so a future manifest naming a
+ * genuine second endpoint renders correctly with NO change to this function.
+ * Never shows a signing key, activation credential, or raw HMAC key -
+ * [net.pocvpn.client.reachability.EndpointDescriptor]/[net.pocvpn.client.reachability.EndpointReachability]/
+ * [net.pocvpn.client.reachability.PathScorer.PathScoreResult] structurally
+ * carry none of those (see each type's own docs). Empty (not a placeholder
+ * line) whenever no manifest is trusted yet - see reachabilityDiagnostics()'s
+ * own fail-closed contract.
+ */
+private fun reachabilityDiagnosticsLines(viewModel: MainViewModel): List<String> {
+    val snapshot = viewModel.reachabilityDiagnostics() ?: return listOf("Reachability fabric: no trusted manifest")
+    val lines = mutableListOf<String>()
+    lines += "Manifest version: ${snapshot.manifestVersion} (source=${snapshot.manifestSource})"
+    lines += "Manifest expires: ${snapshot.manifestExpiresAtEpochMillis}"
+
+    snapshot.endpoints.forEach { endpoint ->
+        lines += "Endpoint ${endpoint.id.value}: roles=${endpoint.roles} region=${endpoint.region} " +
+            "provider=${endpoint.provider} asn=${endpoint.asn ?: "-"} transports=${endpoint.transports.map { it.kind }}"
+    }
+
+    snapshot.reachability.forEach { r ->
+        lines += "  ${r.endpointId.value}/${r.transportKind}: reachability=${r.state} " +
+            "controlPlane=${r.evidence.controlPlaneReachable?.toString() ?: "-"} " +
+            "endpointEvidence=${r.evidence.endpointSpecificReachable?.toString() ?: "-"} " +
+            "endpointEvidenceAgeMs=${r.evidence.endpointSpecificReachableAgeMillis ?: "-"} " +
+            "transportHealthAgeMs=${r.evidence.transportHealthAgeMillis ?: "-"}"
+    }
+
+    val ranked = snapshot.rankedPaths
+    ranked.forEachIndexed { index, result ->
+        val kindLabel = when (result.candidate) {
+            is net.pocvpn.client.reachability.PathCandidate.Direct -> "direct"
+            is net.pocvpn.client.reachability.PathCandidate.Relayed -> "relayed"
+        }
+        lines += "  Path rank #${index + 1}: ${result.candidate.id} type=$kindLabel eligible=${result.eligible} " +
+            "score=${result.score} reasons=${result.reasons}"
+    }
+
+    return lines
 }
 
 /**

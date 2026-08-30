@@ -1,5 +1,7 @@
 package net.pocvpn.client.transport
 
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.vpn.VpnTransport
 
@@ -25,7 +27,19 @@ import net.pocvpn.client.vpn.VpnTransport
 class TransportOrchestrator(private val registry: TransportRegistry) {
 
     sealed class Resolution {
-        data class Resolved(val transport: VpnTransport, val kind: TransportKind) : Resolution()
+        // B13 - [endpointId] defaults to the one real production endpoint so
+        // every pre-B13 call site (every existing test, and
+        // maybeFailoverToXray's own resolve() call before this slice) is
+        // byte-for-byte unaffected. A caller that actually knows WHICH
+        // candidate endpoint this attempt targets (MainViewModel.connect(),
+        // which already has the real SmartConnectCandidateSelector-chosen
+        // GatewayCandidate.id in hand) passes it explicitly instead of
+        // relying on this default - see resolve()'s own docs.
+        data class Resolved(
+            val transport: VpnTransport,
+            val kind: TransportKind,
+            val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+        ) : Resolution()
         data class NotSelectable(val decision: TransportSelectionDecision) : Resolution()
     }
 
@@ -36,13 +50,17 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
      * second-guesses it. A decision naming a kind the registry can't
      * actually construct (e.g. stale/misconfigured registry) still fails
      * safe as NotSelectable, never silently substitutes a different kind.
+     *
+     * [endpointId] is the endpoint THIS attempt targets - see [Resolution.Resolved]'s
+     * own docs for why it defaults to the one real production endpoint
+     * rather than being invented here.
      */
-    fun resolve(decision: TransportSelectionDecision): Resolution {
+    fun resolve(decision: TransportSelectionDecision, endpointId: EndpointId = EndpointId(ProductionGateway.ID)): Resolution {
         val selected = decision as? TransportSelectionDecision.SelectTransport
             ?: return Resolution.NotSelectable(decision)
         val transport = registry.createTransport(selected.kind)
             ?: return Resolution.NotSelectable(decision)
-        return Resolution.Resolved(transport, selected.kind)
+        return Resolution.Resolved(transport, selected.kind, endpointId)
     }
 
     /** Deterministic ordering of currently-available transports, for a future failover sequence (not yet acted on). */

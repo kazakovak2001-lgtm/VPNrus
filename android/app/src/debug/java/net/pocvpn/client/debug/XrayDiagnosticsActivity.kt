@@ -8,9 +8,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
-import net.pocvpn.client.identity.AndroidKeystoreAesGcmEncryptor
-import net.pocvpn.client.identity.FileXrayProfileStore
-import net.pocvpn.client.identity.SecureXrayProfileRepository
+import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.vpn.VlessRealityTransport
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.toXrayVlessRealityConfig
@@ -49,10 +47,7 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
             isEnabled = false
             setOnClickListener {
                 lifecycleScope.launch {
-                    val repository = SecureXrayProfileRepository(
-                        store = FileXrayProfileStore(applicationContext.noBackupFilesDir),
-                        encryptor = AndroidKeystoreAesGcmEncryptor(KEYSTORE_ALIAS),
-                    )
+                    val repository = XrayProfileRepositoryFactory.create(applicationContext)
                     val profile = repository.getProfileOrNull()
                     if (profile == null) {
                         statusText.text = "No Xray profile configured - refusing to start."
@@ -79,10 +74,7 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
         setContentView(root)
 
         lifecycleScope.launch {
-            val repository = SecureXrayProfileRepository(
-                store = FileXrayProfileStore(applicationContext.noBackupFilesDir),
-                encryptor = AndroidKeystoreAesGcmEncryptor(KEYSTORE_ALIAS),
-            )
+            val repository = XrayProfileRepositoryFactory.create(applicationContext)
             val hasProfile = try {
                 repository.getProfileOrNull() != null
             } catch (t: Throwable) {
@@ -95,9 +87,5 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
             }
             startButton.isEnabled = hasProfile
         }
-    }
-
-    private companion object {
-        const val KEYSTORE_ALIAS = "nova_xray_profile_key"
     }
 }

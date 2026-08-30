@@ -60,7 +60,8 @@ class XrayRuntimeResolverTest {
     fun `a corrupted stored profile fails closed`() = runBlocking {
         val dir = Files.createTempDirectory("xray-resolver-corrupt-test").toFile()
         dir.mkdirs()
-        File(dir, "xray_profile.bin").writeBytes(byteArrayOf(0, 0, 0, 99))
+        // B13 (audit fix) - the real endpoint-scoped file name, computed the same way production does.
+        File(dir, "xray_profile_${net.pocvpn.client.identity.sanitizeForFileName(net.pocvpn.client.reachability.EndpointId("frankfurt"))}.bin").writeBytes(byteArrayOf(0, 0, 0, 99))
         val repository = newRepository(dir)
 
         val resolution = XrayRuntimeResolver.resolve(repository)
@@ -133,7 +134,8 @@ class XrayTlsRuntimeResolverTest {
     fun `a corrupted stored TLS profile fails closed`() = runBlocking {
         val dir = Files.createTempDirectory("xray-tls-resolver-corrupt-test").toFile()
         dir.mkdirs()
-        File(dir, "xray_tls_profile.bin").writeBytes(byteArrayOf(0, 0, 0, 99))
+        // B13 (audit fix) - the real endpoint-scoped file name, computed the same way production does.
+        File(dir, "xray_tls_profile_${net.pocvpn.client.identity.sanitizeForFileName(net.pocvpn.client.reachability.EndpointId("frankfurt"))}.bin").writeBytes(byteArrayOf(0, 0, 0, 99))
         val repository = newTlsRepository(dir)
 
         val resolution = XrayRuntimeResolver.resolveTls(repository)

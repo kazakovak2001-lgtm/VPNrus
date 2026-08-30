@@ -18,7 +18,15 @@ import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayProfileRepositoryResolver
 import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver
+import net.pocvpn.client.network.NetworkProfile
+import net.pocvpn.client.reachability.CoarseNetworkSignals
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
+import net.pocvpn.client.reachability.NetworkFingerprinter
+import net.pocvpn.client.reachability.PathHistoryStore
 import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
@@ -132,6 +140,42 @@ class VpnController(
     // TLS_TCP simply never enters [supportedKinds] below - REALITY's own
     // behavior is completely unaffected by this param's presence.
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
+    // B13 (2026-08-30 audit item 5 fix) - the ONE authoritative
+    // endpoint-aware lookup buildTransportConfig() below actually resolves
+    // XRAY_REALITY/TLS_TCP repositories through - see that function's own
+    // docs. Defaults to a single-entry resolver wrapping [xrayProfileRepository]/
+    // [xrayTlsProfileRepository] under the one real production endpoint id,
+    // so EVERY pre-existing call site (real or test) that only ever wired
+    // the flat repository param - which is every call site before this
+    // fix - is byte-for-byte unaffected: `pendingConnectEndpointId` also
+    // defaults to the same production endpoint id, so the default resolver
+    // always resolves correctly for them. A caller that explicitly wires
+    // [xrayProfileRepositoryResolver] (the composition root, going forward)
+    // gets genuine per-endpoint selection instead.
+    private val xrayProfileRepositoryResolver: XrayProfileRepositoryResolver? = xrayProfileRepository?.let { repo ->
+        XrayProfileRepositoryResolver { id -> if (id == EndpointId(ProductionGateway.ID)) repo else null }
+    },
+    private val xrayTlsProfileRepositoryResolver: XrayTlsProfileRepositoryResolver? = xrayTlsProfileRepository?.let { repo ->
+        XrayTlsProfileRepositoryResolver { id -> if (id == EndpointId(ProductionGateway.ID)) repo else null }
+    },
+    // B13 - additive, defaults to null (same reasoning as connectionOutcomeStore
+    // above): with any of the three below missing, recordPathHistory() is a
+    // no-op - real live-wiring is opt-in per the SAME "no wiring, no
+    // behavior" seam every other optional collaborator in this class already
+    // uses. When all three ARE wired (MainViewModel.Factory passes the SAME
+    // PathHistoryStore/NetworkFingerprintKeyProvider instances
+    // reachabilityDiagnostics() already reads - never a second, independent
+    // pair), this becomes the FIRST real writer into PathHistoryStore - see
+    // recordPathHistory's own docs for the "authoritative outcome only"
+    // discipline it follows.
+    private val pathHistoryStore: PathHistoryStore? = null,
+    private val fingerprintKeyProvider: NetworkFingerprintKeyProvider? = null,
+    // A supplier, not a StateFlow, so this controller never needs its own
+    // subscription/collector - it reads whatever the CURRENT network profile
+    // is only at the exact moment an authoritative outcome is being recorded
+    // (same "read fresh, never cached" discipline gatewayConfigurationRepository.get()
+    // already uses elsewhere in this class).
+    private val networkProfileProvider: (() -> NetworkProfile)? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -148,8 +192,12 @@ class VpnController(
     // observer attach.
     private val supportedKinds: Set<TransportKind> = buildSet {
         add(TransportKind.AMNEZIA_WG)
-        if (xrayProfileRepository != null) add(TransportKind.XRAY_REALITY)
-        if (xrayTlsProfileRepository != null) add(TransportKind.TLS_TCP)
+        // B13 - also true whenever a resolver was wired directly (a future
+        // composition root that never bothers with the legacy flat field) -
+        // "is Xray configured at all for this controller instance" must not
+        // go false just because the flat field is absent.
+        if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
+        if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -212,6 +260,16 @@ class VpnController(
     // outside connect()/onVpnPermissionResult, both always called under
     // connectMutex - see doConnectAttempt's own "caller must hold the mutex" note.
     private var pendingConnectKind: TransportKind = transport.kind
+
+    // B13 - the endpoint THIS attempt (or the most recent one) targets - the
+    // SAME "which candidate is this attempt for" tracking [pendingConnectKind]
+    // already provides, extended to the endpoint axis. Defaults to the one
+    // real production endpoint so every pre-B13 caller (including every
+    // existing test that never passes a Resolution.Resolved with an explicit
+    // endpointId) is byte-for-byte unaffected. Never hardcoded at the
+    // recording call sites below - see recordConnectionOutcome/recordPathHistory's
+    // own docs for why this field, not a literal, is what they read.
+    private var pendingConnectEndpointId: EndpointId = EndpointId(ProductionGateway.ID)
 
     // B8I5 - the ONE active transport instance every lifecycle operation
     // (state observation, connect, disconnect, permission resume, stats
@@ -358,6 +416,7 @@ class VpnController(
             // permission has not been requested yet, let alone granted, and
             // no real connect attempt has been made.
             pendingConnectKind = resolved.kind
+            pendingConnectEndpointId = resolved.endpointId
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -489,6 +548,7 @@ class VpnController(
                             recordCurrentStats()
                             setState(TransportState.Connected)
                             recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
+                            recordPathHistory(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                             true
                         } else {
                             diagnostics.recordError(VpnError.HandshakeTimeout)
@@ -498,6 +558,7 @@ class VpnController(
                             // up; only the user-visible state reflects the truth.
                             setState(TransportState.HandshakeFailed)
                             recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
+                            recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                             false
                         }
                     } else {
@@ -522,6 +583,7 @@ class VpnController(
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Backend failed to start"))
                     recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.BACKEND_START_FAILURE, attemptStartEpochMillis)
+                    recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                     false
                 }
             }
@@ -533,19 +595,26 @@ class VpnController(
      * SHAPE to build is dispatched on [kind]. AMNEZIA_WG builds from the AWG
      * [config]/[appRoutingLists] exactly as before (unchanged). XRAY_REALITY
      * builds from the REAL persisted/provisioned Xray profile via the
-     * EXISTING [XrayRuntimeResolver] against [xrayProfileRepository] - it
-     * never reads [config]/[appRoutingLists] (those are AWG-shaped
+     * EXISTING [XrayRuntimeResolver] against the repository resolved for
+     * [pendingConnectEndpointId] - the SAME endpointId this exact attempt
+     * carried all the way from `GatewayCandidate.id` (see that field's own
+     * docs) - never [xrayProfileRepository] read unconditionally. It never
+     * reads [config]/[appRoutingLists] (those are AWG-shaped
      * GatewayConfiguration fields; fabricating an Xray config from them
      * would be exactly the "fake config" this slice must not do). A missing/
-     * corrupt/invalid profile throws [XrayProfileNotReadyException] (message
-     * is the SAME non-secret reason XrayRuntimeResolver already produces -
-     * never a uuid/key/short_id), which doConnectAttempt's existing
-     * try/catch around this call already turns into the SAME
-     * ConfigurationMappingFailure fail-closed path every other malformed-
-     * config case uses (no new failure mode, no fallback to AWG). Any other
-     * kind still throws [UnsupportedOperationException] - structurally
-     * unreachable via the public API since connect() already refuses a kind
-     * outside [supportedKinds] before ever reaching here.
+     * corrupt/invalid profile, OR an endpoint the resolver has no repository
+     * for at all (B13 - never silently substituted with a different
+     * endpoint's repository, never defaulted to `ProductionGateway.ID`),
+     * throws [XrayProfileNotReadyException] (message is the SAME non-secret
+     * reason XrayRuntimeResolver already produces, plus - for the
+     * unknown-endpoint case - the endpoint id itself, which is already
+     * non-secret per EndpointId's own docs; never a uuid/key/short_id),
+     * which doConnectAttempt's existing try/catch around this call already
+     * turns into the SAME ConfigurationMappingFailure fail-closed path every
+     * other malformed-config case uses (no new failure mode, no fallback to
+     * AWG). Any other kind still throws [UnsupportedOperationException] -
+     * structurally unreachable via the public API since connect() already
+     * refuses a kind outside [supportedKinds] before ever reaching here.
      */
     private suspend fun buildTransportConfig(kind: TransportKind, config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig =
         when (kind) {
@@ -569,25 +638,35 @@ class VpnController(
                 TransportConfig.Awg(awgConfig)
             }
             TransportKind.XRAY_REALITY -> {
-                // Unreachable unless xrayProfileRepository != null (that's
-                // the only way XRAY_REALITY ever enters supportedKinds) -
-                // the null-check here is defensive, not a real code path.
-                val repository = xrayProfileRepository
+                // B13 (audit item 5 fix) - resolved by the CURRENT attempt's
+                // real endpointId, never the flat field directly. Unreachable
+                // unless xrayProfileRepositoryResolver != null (that's the
+                // only way XRAY_REALITY ever enters supportedKinds) - the
+                // null-check here is defensive, not a real code path. A
+                // resolver returning null for THIS endpoint fails closed with
+                // the endpoint id named explicitly, never a silent fallback
+                // to whatever the production endpoint's repository happens
+                // to be.
+                val resolver = xrayProfileRepositoryResolver
                     ?: throw XrayProfileNotReadyException("Xray profile repository not wired")
+                val repository = resolver.resolve(pendingConnectEndpointId)
+                    ?: throw XrayProfileNotReadyException("no Xray profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                     is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config)
+                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config, endpointId = pendingConnectEndpointId)
                 }
             }
             TransportKind.TLS_TCP -> {
-                // B8O2 - same reasoning as XRAY_REALITY above, against the
-                // TLS profile repository/resolver instead. Unreachable
-                // unless xrayTlsProfileRepository != null.
-                val repository = xrayTlsProfileRepository
+                // B8O2/B13 - same reasoning as XRAY_REALITY above, against the
+                // TLS profile repository resolver instead. Unreachable
+                // unless xrayTlsProfileRepositoryResolver != null.
+                val resolver = xrayTlsProfileRepositoryResolver
                     ?: throw XrayProfileNotReadyException("Xray TLS profile repository not wired")
+                val repository = resolver.resolve(pendingConnectEndpointId)
+                    ?: throw XrayProfileNotReadyException("no Xray TLS profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolveTls(repository)) {
                     is XrayTlsRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config)
+                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId)
                 }
             }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")
@@ -662,13 +741,48 @@ class VpnController(
         store.record(
             ConnectionOutcome(
                 transport = activeTransport.kind,
-                gatewayId = ProductionGateway.ID,
+                // B13 - the REAL endpoint this attempt targeted (see
+                // pendingConnectEndpointId's own docs), never a hardcoded
+                // literal - it merely defaults to the same production
+                // endpoint ID this constant always named before this slice,
+                // so single-gateway production behavior is unchanged.
+                gatewayId = pendingConnectEndpointId.value,
                 result = result,
                 handshakeDurationMs = nowEpochMillis - attemptStartEpochMillis,
                 errorCategory = errorCategory,
                 timestampEpochMillis = nowEpochMillis,
             ),
         )
+    }
+
+    /**
+     * B13 - the FIRST real writer into PathHistoryStore (previously
+     * write-side-unused since B11 - see docs/B12_ENDPOINT_IDENTITY_AUDIT.md's
+     * own note on why this was deliberately deferred). No-op unless all
+     * three of [pathHistoryStore]/[fingerprintKeyProvider]/[networkProfileProvider]
+     * are wired (same additive seam as every other optional collaborator in
+     * this class). Called ONLY from the exact same authoritative-outcome
+     * call sites [recordConnectionOutcome] already uses - never from a
+     * ControllerEvent, never for a merely-attempted/Connecting state, never
+     * twice for the same real attempt (see each call site's own docs for why
+     * that discipline already holds for ConnectionOutcome, reused verbatim
+     * here rather than inventing a second recording model). [kind]/[endpointId]
+     * are threaded from the caller rather than read from mutable controller
+     * state, so a reconnect-exhaustion record (recorded against the ORIGINAL
+     * attempt's kind/endpoint, per reconnectLoop()'s own "one record for the
+     * whole cycle" model) can never accidentally pick up a DIFFERENT pending
+     * attempt's kind/endpoint if one raced in in the meantime.
+     */
+    private fun recordPathHistory(success: Boolean, kind: TransportKind, endpointId: EndpointId, nowEpochMillis: Long) {
+        val store = pathHistoryStore ?: return
+        val keyProvider = fingerprintKeyProvider ?: return
+        val profileProvider = networkProfileProvider ?: return
+        val profile = profileProvider()
+        val fingerprint = NetworkFingerprinter.fingerprint(
+            CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+            keyProvider.keyBytes(),
+        )
+        store.record(fingerprint, endpointId, kind, success, nowEpochMillis)
     }
 
     /**
@@ -724,6 +838,7 @@ class VpnController(
                 // not one per backoff attempt - keeps the bounded history
                 // meaningful instead of filling up with per-attempt noise.
                 recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.RECONNECT_EXHAUSTED, reconnectionThresholdEpochMillis)
+                recordPathHistory(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                 return
             }
 
