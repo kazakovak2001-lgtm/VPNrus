@@ -39,9 +39,11 @@ import net.pocvpn.client.smartconnect.RestrictionEvidence
 import net.pocvpn.client.smartconnect.RestrictionMonitor
 import net.pocvpn.client.smartconnect.SmartConnectCandidateSelector
 import net.pocvpn.client.smartconnect.SmartConnectDecision
+import net.pocvpn.client.smartconnect.TransportHealthCalculator
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportDescriptor
+import net.pocvpn.client.transport.TransportHealth
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportRegistry
@@ -300,12 +302,30 @@ class MainViewModel(
         gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
         registry = buildTransportRegistry(),
         preference = userTransportPreference,
+        health = transportHealth(),
         connectionHistory = recentConnectionOutcomes(),
         restrictionClass = restrictionClass(),
     )
 
     /** B8I - DEBUG diagnostics only; bounded by connectionOutcomeStore's own maxRecords. */
     fun recentConnectionOutcomes(): List<ConnectionOutcome> = connectionOutcomeStore?.recent().orEmpty()
+
+    /**
+     * B8L - THE ONLY place a TransportHealth is computed for this
+     * ViewModel (see TransportHealthCalculator's own docs) - real,
+     * evidence-based per-kind health from the SAME connectionOutcomeStore
+     * history recentConnectionOutcomes()/restrictionClass() already read,
+     * never a second store. Recomputed fresh on every read, same
+     * no-caching pattern as smartConnectDecision()/restrictionClass().
+     * Carried into smartConnectDecision()'s `health` parameter, which
+     * SmartConnectDecisionEngine.decide() does not yet act on for
+     * selection - same "truthfully surfaced, not yet decision-driving"
+     * boundary restrictionClass() already established.
+     */
+    fun transportHealth(): Map<TransportKind, TransportHealth> {
+        val outcomes = recentConnectionOutcomes()
+        return TransportKind.entries.associateWith { kind -> TransportHealthCalculator.fromOutcomes(outcomes, kind) }
+    }
 
     // B8J - built ONLY when a probe was actually wired (production: always,
     // via the Factory below) - null means "no probing at all", same
