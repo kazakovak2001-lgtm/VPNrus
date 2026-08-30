@@ -80,48 +80,28 @@ class NovaXrayVpnService : VpnService() {
         net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory.create(context, endpointId)
     }
 
-    // B13 - which endpoint the CURRENTLY CACHED [controller] below was built
-    // for. Read/written only from [controllerFor], always on this service's
-    // single-threaded Binder/main-thread callback path (onStartCommand is
-    // never called concurrently with itself by the platform), so no
-    // additional synchronization is needed beyond @Volatile visibility.
-    @Volatile private var controllerEndpointId: EndpointId? = null
-    @Volatile private var cachedController: XrayCoreController? = null
-
-    /**
-     * B13 (audit item 5 fix) - the ONE place [XrayCoreController] is ever
-     * constructed. Reuses the CACHED instance whenever [endpointId] matches
-     * the one it was already built for (the common, in fact ONLY, case
-     * today - preserves every pre-B13 "already running"/"start in flight"
-     * lifecycle invariant [XrayCoreController] itself owns, since those
-     * checks live on ITS OWN instance state, not recreated by calling this
-     * again for the SAME endpoint). Rebuilds - a genuinely NEW
-     * [XrayCoreController], pointed at the correct endpoint's own
-     * repositories - only when [endpointId] actually DIFFERS from the
-     * cached one, i.e. only once a real second endpoint exists and Smart
-     * Connect actually selects it. This is what makes "switching endpoint A
-     * -> B does not reuse A's Xray profile" true at the ACTUAL runtime
-     * layer, not merely at [net.pocvpn.client.vpn.VpnController]'s own
-     * config-construction layer (see that class's own [XrayProfileRepositoryResolver]
-     * docs for why that alone was not sufficient - this class independently
-     * re-resolves its own profile from Intent extras, never trusting the
-     * config object VlessRealityTransport/VlessTlsTransport already
-     * validated).
-     */
-    private fun controllerFor(endpointId: EndpointId): XrayCoreController {
-        cachedController?.let { existing -> if (controllerEndpointId == endpointId) return existing }
-        val fresh = XrayCoreController(
-            repository = profileRepositoryFactory(applicationContext, endpointId),
-            coreRuntime = coreRuntime,
-            novaPackageId = BuildConfig.APPLICATION_ID,
-            ensureCoreEnvInitialized = { coreRuntime.ensureCoreEnvInitialized(applicationContext) },
-            establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
-            closeTun = { closeTunInterface() },
-            tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
-        )
-        cachedController = fresh
-        controllerEndpointId = endpointId
-        return fresh
+    // B13 (2026-08-30 PR #25 review fix) - the ONE place [XrayCoreController]
+    // is ever constructed, and the ONE place its per-endpoint selection AND
+    // requestStart/requestStop calls are serialized - see that class's own
+    // docs for exactly why a compound check-cached-then-build sequence
+    // cannot safely live directly on this Service (onStartCommand does NOT
+    // run on a single-threaded path once the actual work is dispatched onto
+    // `scope.launch`/Dispatchers.IO - a prior version of this file
+    // incorrectly assumed otherwise). `by lazy` only to defer construction
+    // until `applicationContext` is guaranteed attached - the coordinator
+    // itself owns all per-endpoint caching/locking from here on.
+    private val lifecycleCoordinator: NovaXrayServiceLifecycleCoordinator by lazy {
+        NovaXrayServiceLifecycleCoordinator { endpointId ->
+            XrayCoreController(
+                repository = profileRepositoryFactory(applicationContext, endpointId),
+                coreRuntime = coreRuntime,
+                novaPackageId = BuildConfig.APPLICATION_ID,
+                ensureCoreEnvInitialized = { coreRuntime.ensureCoreEnvInitialized(applicationContext) },
+                establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
+                closeTun = { closeTunInterface() },
+                tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
+            )
+        }
     }
 
     // B8I7 - the CURRENT (or most recently started) attempt's session id -
@@ -169,15 +149,23 @@ class NovaXrayVpnService : VpnService() {
         teardown("permission revoked")
     }
 
+    // B13 (PR #25 review fix) - teardown is now itself async (it must
+    // acquire lifecycleCoordinator's own suspend-based mutex, serialized
+    // against any in-flight start), so onDestroy() can no longer cancel
+    // [supervisorJob] on the very next line - that would abandon a
+    // just-launched-but-not-yet-run teardown before it ever executes.
+    // Instead the job this launches cancels [supervisorJob] itself, from
+    // its own completion handler, so cancellation only happens AFTER
+    // teardown has genuinely finished (or been safely skipped as a no-op).
     override fun onDestroy() {
-        teardown("service destroyed")
-        supervisorJob.cancel()
+        val job = scope.launch { teardownAndPublish("service destroyed") }
+        job.invokeOnCompletion { supervisorJob.cancel() }
         super.onDestroy()
     }
 
     private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind, endpointId: EndpointId) {
         scope.launch {
-            when (val outcome = controllerFor(endpointId).requestStart(kind)) {
+            when (val outcome = lifecycleCoordinator.start(endpointId, kind)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
@@ -229,15 +217,19 @@ class NovaXrayVpnService : VpnService() {
         return builder.establish()
     }
 
+    // B13 (PR #25 review fix) - dispatches onto the SAME scope/dispatcher
+    // start already uses, so a STOP and a concurrent/in-flight START are
+    // serialized against each other through lifecycleCoordinator's own
+    // mutex (see that class's own docs) - a STOP arriving while a START is
+    // still mid-flight now correctly WAITS for it rather than racing it (or
+    // silently observing "nothing running yet" and being lost).
     private fun teardown(reason: String) {
-        // B13 - the CURRENTLY cached controller (whichever endpoint's session
-        // is actually active, if any) - never re-resolves via controllerFor,
-        // which would require an endpointId this call site doesn't have and
-        // could otherwise construct a bogus NEW controller (with nothing
-        // running) just to tear it down. No cached controller at all (never
-        // started, or restarted this process) is the SAME "not running" case
-        // requestStop() itself already handles - didTeardown false, no-op.
-        val outcome = cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false, stopLoopFailureReason = null)
+        scope.launch { teardownAndPublish(reason) }
+    }
+
+    /** Caller must run this on [scope] - see [teardown]/[onDestroy], its only two call sites. */
+    private suspend fun teardownAndPublish(reason: String) {
+        val outcome = lifecycleCoordinator.stop()
         if (!outcome.didTeardown) {
             Log.i(TAG, "teardown($reason) requested while not running - no-op")
             return
