@@ -49,8 +49,6 @@ import net.pocvpn.client.identity.XrayProfileRepository
  */
 class NovaXrayVpnService : VpnService() {
 
-    private val lifecycleGate = XrayServiceLifecycleGate()
-
     private var tunInterface: ParcelFileDescriptor? = null
 
     private val coreRuntime: XrayCoreRuntime = LibXrayCoreRuntime()
@@ -63,6 +61,26 @@ class NovaXrayVpnService : VpnService() {
         net.pocvpn.client.identity.SecureXrayProfileRepository(
             store = net.pocvpn.client.identity.FileXrayProfileStore(context.noBackupFilesDir),
             encryptor = net.pocvpn.client.identity.AndroidKeystoreAesGcmEncryptor(KEYSTORE_ALIAS),
+        )
+    }
+
+    // B8K4C - the ONE authoritative configuration source (constraint: prefer
+    // the encrypted XrayProfileRepository over Intent extras): loads the
+    // CURRENT stored profile fresh on first use, resolves/validates/renders
+    // it, and sequences the actual startLoop/stopLoop calls - see
+    // XrayCoreController's own docs for why this is a separate, plain-JVM-
+    // testable class rather than inline here. `by lazy` so
+    // profileRepositoryFactory can still be swapped before first
+    // ACTION_START (matches the field's own test-seam contract) and so
+    // applicationContext is guaranteed attached before this reads it.
+    private val controller: XrayCoreController by lazy {
+        XrayCoreController(
+            repository = profileRepositoryFactory(applicationContext),
+            coreRuntime = coreRuntime,
+            novaPackageId = BuildConfig.APPLICATION_ID,
+            ensureCoreEnvInitialized = { coreRuntime.ensureCoreEnvInitialized(applicationContext) },
+            establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
+            closeTun = { closeTunInterface() },
         )
     }
 
@@ -96,75 +114,28 @@ class NovaXrayVpnService : VpnService() {
     }
 
     private fun startIfNotAlreadyRunning() {
-        when (lifecycleGate.tryBeginStart()) {
-            XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> Log.i(TAG, "start requested while already running - ignored")
-            XrayServiceStartDecision.IGNORE_START_IN_FLIGHT -> Log.i(TAG, "start requested while a start is already in flight - ignored")
-            XrayServiceStartDecision.PROCEED -> scope.launch {
-                var success = false
-                try {
-                    success = doStart()
-                } finally {
-                    lifecycleGate.endStart(success)
+        scope.launch {
+            when (val outcome = controller.requestStart()) {
+                is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
+                is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
+                is XrayCoreStartOutcome.Rejected -> {
+                    Log.w(TAG, "refusing to start: ${outcome.reason}")
+                    stopSelf()
                 }
+                is XrayCoreStartOutcome.EstablishFailed -> {
+                    Log.e(TAG, "failed to establish VPN interface: ${outcome.reason}")
+                    stopSelf()
+                }
+                is XrayCoreStartOutcome.CoreStartFailed -> {
+                    Log.e(TAG, "Xray core failed to start: ${outcome.reason}")
+                    stopSelf()
+                }
+                is XrayCoreStartOutcome.Started -> Log.i(TAG, "Xray core started")
             }
         }
     }
 
     @SuppressLint("VpnServicePolicy")
-    private suspend fun doStart(): Boolean {
-        val repository = profileRepositoryFactory(applicationContext)
-        val profile = try {
-            repository.getProfileOrNull()
-        } catch (t: Throwable) {
-            Log.e(TAG, "failed to load Xray profile: ${t.javaClass.simpleName}")
-            stopSelf()
-            return false
-        }
-        if (profile == null) {
-            Log.w(TAG, "no Xray profile configured - refusing to start")
-            stopSelf()
-            return false
-        }
-
-        val config = profile.toXrayVlessRealityConfig()
-        val validation = validateXrayVlessRealityConfig(config)
-        if (validation is XrayConfigValidationResult.Invalid) {
-            Log.e(TAG, "stored Xray profile failed validation: ${validation.errors.size} error(s)")
-            stopSelf()
-            return false
-        }
-
-        val plan = buildXrayVpnPlan(config, BuildConfig.APPLICATION_ID)
-        val establishedInterface = try {
-            establishInterface(plan)
-        } catch (t: Throwable) {
-            Log.e(TAG, "failed to establish VPN interface: ${t.javaClass.simpleName}")
-            stopSelf()
-            return false
-        }
-        if (establishedInterface == null) {
-            Log.e(TAG, "VpnService.Builder.establish() returned null")
-            stopSelf()
-            return false
-        }
-
-        tunInterface = establishedInterface
-        val renderedConfig = XrayConfigRenderer.render(config)
-
-        try {
-            coreRuntime.ensureCoreEnvInitialized(applicationContext)
-            coreRuntime.startLoop(renderedConfig, establishedInterface.fd)
-        } catch (t: Throwable) {
-            Log.e(TAG, "Xray core failed to start: ${t.javaClass.simpleName}")
-            closeTunInterface()
-            stopSelf()
-            return false
-        }
-
-        Log.i(TAG, "Xray core started")
-        return true
-    }
-
     private fun establishInterface(plan: XrayVpnBuilderPlan): ParcelFileDescriptor? {
         val builder = Builder()
         builder.setMtu(plan.mtu)
@@ -187,19 +158,13 @@ class NovaXrayVpnService : VpnService() {
     }
 
     private fun teardown(reason: String) {
-        if (!lifecycleGate.tryBeginTeardown()) {
+        val outcome = controller.requestStop()
+        if (!outcome.didTeardown) {
             Log.i(TAG, "teardown($reason) requested while not running - no-op")
             return
         }
         Log.i(TAG, "tearing down: $reason")
-
-        try {
-            coreRuntime.stopLoop()
-        } catch (t: Throwable) {
-            Log.e(TAG, "stopLoop failed: ${t.javaClass.simpleName}")
-        }
-
-        closeTunInterface()
+        outcome.stopLoopFailureReason?.let { Log.e(TAG, "stopLoop failed: $it") }
         stopSelf()
     }
 
