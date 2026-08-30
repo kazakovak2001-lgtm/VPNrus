@@ -36,8 +36,10 @@ import net.pocvpn.client.smartconnect.RestrictionEvidence
 import net.pocvpn.client.smartconnect.RestrictionMonitor
 import net.pocvpn.client.smartconnect.SmartConnectCandidateSelector
 import net.pocvpn.client.smartconnect.SmartConnectDecision
+import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.transport.TransportDescriptor
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportRegistry
 import net.pocvpn.client.transport.TransportStatus
 import net.pocvpn.client.vpn.AmneziaWgTransport
@@ -175,6 +177,13 @@ class MainViewModel(
     private val transportRegistry = TransportRegistry.build(
         listOf(TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport })),
     )
+
+    // B8I3 - the ONE execution-side resolver, built from the SAME registry
+    // smartConnectDecision() itself consults - never a second/independent
+    // registry. TransportOrchestrator does not call SmartConnectDecisionEngine
+    // itself (see its own docs) - connect() below only ever hands it a
+    // decision this ViewModel already obtained from smartConnectDecision().
+    private val transportOrchestrator = TransportOrchestrator(transportRegistry)
 
     /**
      * B8I1 - THE single call site for THE ONE Smart Connect decision
@@ -406,32 +415,52 @@ class MainViewModel(
     fun gatewayStatus(): GatewayConfiguration = controller.gatewayStatus()
 
     /**
-     * B8I2 - Smart Connect AWG-only preflight: a fresh smartConnectDecision()
-     * (THE single decision authority - see that function's own docs) is
-     * obtained immediately before every connect attempt, and controller.connect()
-     * is reached ONLY for SmartConnectDecision.Selected whose transport is
-     * TransportKind.AMNEZIA_WG - the one real, live-verified transport this
-     * slice allows to actually start. Every other outcome
-     * (NoCandidateAvailable, or a Selected transport other than AMNEZIA_WG -
-     * e.g. XRAY_REALITY, which exists and is independently live-verified but
-     * has no transport-switching wiring yet) fails closed via
-     * VpnController.rejectPreflight(): controller.connect() is never called,
-     * so transport.preparePermissionIntent()/transport.connect() are never
-     * reached either - no VPN permission is requested, no VPN service is
-     * started.
+     * B8I3 - Smart Connect preflight, now gated through resolution rather
+     * than a hard-coded kind check: a fresh smartConnectDecision() (THE
+     * single decision authority - see that function's own docs) is obtained
+     * immediately before every connect attempt. For a Selected decision, the
+     * ALREADY-selected kind is handed to transportOrchestrator.resolve() -
+     * this never re-derives a choice, it only turns an existing choice into
+     * a real VpnTransport (or a typed reason it can't - see
+     * TransportOrchestrator's own docs). controller.connect() is reached
+     * ONLY when resolution succeeds AND the resolved instance is both
+     * TransportKind.AMNEZIA_WG and the EXACT SAME `transport` instance this
+     * ViewModel's VpnController already wraps - VpnController owns one FIXED
+     * VpnTransport instance (constructor-injected) and its own
+     * doConnectAttempt() only ever builds an AWG TransportConfig, so handing
+     * it a resolved non-AWG transport (e.g. XRAY_REALITY, which exists and is
+     * independently live-verified but has no execution wiring here yet)
+     * would not "start Xray" - it would call the wrong transport with the
+     * wrong config shape. That redesign is out of scope for this slice (see
+     * B8I4) - every other outcome (NoCandidateAvailable, an unresolvable
+     * kind, or a resolved-but-not-this-controller's-transport kind) fails
+     * closed via VpnController.rejectPreflight(): controller.connect() is
+     * never called, so transport.preparePermissionIntent()/transport.connect()
+     * are never reached either - no VPN permission is requested, no VPN
+     * service is started.
      */
     fun connect() {
         viewModelScope.launch {
             when (val decision = smartConnectDecision()) {
                 is SmartConnectDecision.Selected -> {
                     val kind = decision.score.candidate.transport.kind
-                    if (kind == TransportKind.AMNEZIA_WG) {
-                        controller.connect()
-                    } else {
-                        controller.rejectPreflight(
-                            VpnError.UnsupportedTransportSelected(kind.name),
-                            "Selected transport ($kind) is not yet supported for connect",
-                        )
+                    when (val resolution = transportOrchestrator.resolve(TransportSelectionDecision.SelectTransport(kind))) {
+                        is TransportOrchestrator.Resolution.Resolved -> {
+                            if (resolution.kind == TransportKind.AMNEZIA_WG && resolution.transport === transport) {
+                                controller.connect()
+                            } else {
+                                controller.rejectPreflight(
+                                    VpnError.UnsupportedTransportSelected(resolution.kind.name),
+                                    "Resolved transport (${resolution.kind}) cannot be executed by this VpnController instance yet",
+                                )
+                            }
+                        }
+                        is TransportOrchestrator.Resolution.NotSelectable -> {
+                            controller.rejectPreflight(
+                                VpnError.UnsupportedTransportSelected(kind.name),
+                                "Selected transport ($kind) could not be resolved",
+                            )
+                        }
                     }
                 }
                 SmartConnectDecision.NoCandidateAvailable -> {

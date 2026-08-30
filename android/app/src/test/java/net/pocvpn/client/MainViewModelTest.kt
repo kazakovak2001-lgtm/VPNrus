@@ -410,7 +410,12 @@ class MainViewModelTest {
         assertEquals(existingProfile, xrayRepository.getProfileOrNull())
     }
 
-    // --- B8I2: Smart Connect AWG-only preflight - connect() enforces smartConnectDecision() ---
+    // --- B8I2/B8I3: Smart Connect preflight - connect() enforces smartConnectDecision(),
+    // now executed through TransportOrchestrator.resolve() rather than a hard-coded
+    // kind check (see MainViewModel.connect()'s own docs) - same externally observable
+    // outcomes as B8I2, now proven against the NEW resolution-based code path. See
+    // TransportOrchestratorTest for "decision never recomputed"/"no silent substitution"
+    // proofs at the orchestrator unit level - not duplicated here. ---
 
     private val USABLE_WIFI = net.pocvpn.client.network.NetworkProfile(
         type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = true, metered = false,
@@ -447,7 +452,12 @@ class MainViewModelTest {
         viewModel.connect()
         testDispatcher.scheduler.runCurrent()
 
+        // Proves resolution actually happened against THIS transport
+        // instance (not merely that "some" connect occurred): the AWG
+        // config was built and handed to the SAME FakeVpnTransport this
+        // ViewModel owns.
         assertEquals(1, transport.connectCallCount)
+        assertTrue(transport.lastConfig is net.pocvpn.client.vpn.config.TransportConfig.Awg)
     }
 
     @Test
