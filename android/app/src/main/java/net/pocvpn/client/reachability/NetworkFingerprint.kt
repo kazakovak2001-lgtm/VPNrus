@@ -40,7 +40,12 @@ object NetworkFingerprinter {
         mac.init(SecretKeySpec(hmacKeyBytes, HMAC_ALGORITHM))
         mac.update(signals.networkType.name.toByteArray(Charsets.UTF_8))
         mac.update(0)
-        signals.dnsServerAddresses.sorted().forEach {
+        // distinct() before sorted(): a resolver address reported twice by
+        // LinkProperties (observed in practice around network transitions)
+        // must not change the fingerprint versus the same network reported
+        // with that address once - same "same network, same fingerprint"
+        // stability guarantee reordering already gets from sorted() alone.
+        signals.dnsServerAddresses.distinct().sorted().forEach {
             mac.update(it.toByteArray(Charsets.UTF_8))
             mac.update(0)
         }

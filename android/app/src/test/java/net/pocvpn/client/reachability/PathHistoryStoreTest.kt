@@ -66,6 +66,38 @@ class PathHistoryStoreTest {
     }
 
     @Test
+    fun `concurrent record() and get() calls never throw or corrupt the store (PR #23 second audit - copy-on-write fix)`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder(), maxEntries = 50)
+        val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val writers = (0 until 8).map { t ->
+            Thread {
+                try {
+                    repeat(200) { i ->
+                        store.record("fp-$t", EndpointId("gw-$i"), TransportKind.AMNEZIA_WG, success = i % 2 == 0, nowEpochMillis = i.toLong())
+                    }
+                } catch (e: Throwable) {
+                    errors.add(e)
+                }
+            }
+        }
+        val readers = (0 until 8).map { t ->
+            Thread {
+                try {
+                    repeat(500) { i ->
+                        store.get("fp-$t", EndpointId("gw-${i % 200}"), TransportKind.AMNEZIA_WG)
+                    }
+                } catch (e: Throwable) {
+                    errors.add(e)
+                }
+            }
+        }
+        (writers + readers).forEach { it.start() }
+        (writers + readers).forEach { it.join(10_000) }
+
+        assertTrue("concurrent access must never throw: $errors", errors.isEmpty())
+    }
+
+    @Test
     fun `PathHistoryEntry's field set structurally cannot hold raw identifying network data`() {
         val fields = PathHistoryEntry::class.java.declaredFields.map { it.name }.toSet()
         val forbidden = setOf("ssid", "bssid", "imsi", "phoneNumber", "dnsServerAddresses", "dns", "networkType")

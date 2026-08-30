@@ -39,6 +39,27 @@ class NetworkFingerprinterTest {
     }
 
     @Test
+    fun `a duplicated resolver entry does not change the fingerprint versus the same network reported once`() {
+        val a = NetworkFingerprinter.fingerprint(CoarseNetworkSignals(NetworkType.WIFI, listOf("1.1.1.1", "1.1.1.1", "8.8.8.8")), key)
+        val b = NetworkFingerprinter.fingerprint(CoarseNetworkSignals(NetworkType.WIFI, listOf("1.1.1.1", "8.8.8.8")), key)
+        assertEquals(a, b)
+    }
+
+    @Test
+    fun `an empty resolver list still produces a stable, deterministic fingerprint`() {
+        val a = NetworkFingerprinter.fingerprint(CoarseNetworkSignals(NetworkType.CELLULAR, emptyList()), key)
+        val b = NetworkFingerprinter.fingerprint(CoarseNetworkSignals(NetworkType.CELLULAR, emptyList()), key)
+        assertEquals(a, b)
+    }
+
+    @Test
+    fun `mixed IPv4 and IPv6 resolver addresses are handled the same as any other coarse string signal`() {
+        val a = NetworkFingerprinter.fingerprint(CoarseNetworkSignals(NetworkType.WIFI, listOf("1.1.1.1", "2606:4700:4700::1111")), key)
+        val b = NetworkFingerprinter.fingerprint(CoarseNetworkSignals(NetworkType.WIFI, listOf("2606:4700:4700::1111", "1.1.1.1")), key)
+        assertEquals(a, b)
+    }
+
+    @Test
     fun `a different per-install key produces a different fingerprint for the SAME network - not a global tracking id`() {
         val signals = CoarseNetworkSignals(NetworkType.WIFI, listOf("1.1.1.1"))
         val a = NetworkFingerprinter.fingerprint(signals, key)

@@ -20,16 +20,25 @@ import net.pocvpn.client.transport.TransportStatus
  *   score = reachabilityRank * 1_000_000   (dominant - endpoint reachability)
  *         + transportHealthRank * 10_000   (transport-wide health)
  *         + historyRank * 1_000            (this network's own local memory)
- *         + maturityRank * 100             (declared capability maturity)
+ *         + maturityRank * 200             (declared capability maturity)
  *         - latencyPenalty (capped at 50)  (small - measured latency only)
- *         - recentFailurePenalty (capped at 80)
+ *         - recentFailurePenalty (capped at 80, summed across hops)
  *         + diversityBonus (capped at 5)   (smallest - provider/ASN spread)
  *
- * Each tier's weight is strictly larger than the sum of every weight below
- * it (1_000_000 > 10_000+1_000+100+80+5, and so on down the list), so e.g.
- * "unreachable never beats reachable due to latency" and "diversity never
- * overrides hard reachability evidence" hold for ANY latency/diversity
- * value within their capped range, not merely for typical ones.
+ * Each tier's weight is strictly larger than the sum of EVERY weight below
+ * it, verified per tier (not just eyeballed) against each factor's actual
+ * min/max RANGE, not just its cap:
+ *   maturity  (range width (1-(-1))*200=400) >  diversity+latency+failure max (5+50+80=135)
+ *   history   (range width (2-(-1))*1000=3000) > maturity range+lower (400+135=535)
+ *   health    (range width (3-(-1))*10000=40000) > history range+lower (3000+535=3535)
+ *   reachability (1_000_000 per rank) > health range+lower (40000+3535=43535)
+ * MATURITY_TIER=200 is deliberately NOT 100: at 100 it would be possible for
+ * MAX_LATENCY_PENALTY+MAX_FAILURE_PENALTY+MAX_DIVERSITY_BONUS (135) to
+ * outweigh a single maturity-rank step (100), letting an EXPERIMENTAL
+ * transport with zero penalties outrank a STABLE one carrying penalties -
+ * exactly the kind of lower-priority-outweighs-higher-priority bug this
+ * tiering exists to make structurally impossible. See PathScorerTest's
+ * boundary tests for the worst-case proof at each tier.
  */
 object PathScorer {
 
@@ -77,7 +86,11 @@ object PathScorer {
             ?.let { (it / 20).coerceIn(0, MAX_LATENCY_PENALTY) } ?: 0L
         if (latencyPenalty > 0) reasons += "latencyPenalty=$latencyPenalty"
 
-        val recentFailures = candidate.hops.maxOfOrNull { it.reachability.evidence.let { e -> if (e.endpointSpecificReachable == false) 1 else 0 } } ?: 0
+        // Summed, not maxOf: a Relayed candidate where BOTH hops recently
+        // failed their own probe is worse than one where only one did - see
+        // the class doc's own "capped at 80" (2 hops x 40 each), which a
+        // max-of-hops reduction could never actually reach.
+        val recentFailures: Long = candidate.hops.sumOf { hop -> if (hop.reachability.evidence.endpointSpecificReachable == false) 1L else 0L }
         val failurePenalty = (recentFailures * 40L).coerceAtMost(MAX_FAILURE_PENALTY)
         if (failurePenalty > 0) reasons += "recentFailurePenalty=$failurePenalty"
 
@@ -130,7 +143,7 @@ object PathScorer {
     private const val REACHABILITY_TIER = 1_000_000L
     private const val HEALTH_TIER = 10_000L
     private const val HISTORY_TIER = 1_000L
-    private const val MATURITY_TIER = 100L
+    private const val MATURITY_TIER = 200L
     private const val MAX_LATENCY_PENALTY = 50L
     private const val MAX_FAILURE_PENALTY = 80L
     private const val MAX_DIVERSITY_BONUS = 5L

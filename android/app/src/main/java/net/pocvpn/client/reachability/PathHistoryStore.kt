@@ -62,14 +62,25 @@ class FilePathHistoryStore(
                 lastOutcomeEpochMillis = nowEpochMillis,
                 lastOutcomeSuccess = success,
             )
-            // Re-insert to move this key to most-recently-updated for LRU eviction below.
-            cached.remove(key)
-            cached[key] = updated
-            while (cached.size > maxEntries) {
-                val oldestKey = cached.keys.firstOrNull() ?: break
-                cached.remove(oldestKey)
+            // Copy-on-write, not an in-place mutation of the shared `cached`
+            // map: [get] deliberately reads `cached` without taking [lock]
+            // (same safe-publication pattern as FileLastKnownGoodManifestStore's
+            // `current()`), which is only safe when the referenced object
+            // itself is never mutated after being made visible - mutating
+            // the SAME LinkedHashMap instance a concurrent unsynchronized
+            // get() might be iterating/reading was a real data race
+            // (ConcurrentModificationException / corrupted map internals).
+            // Rebuilding a new map and reassigning the @Volatile reference
+            // keeps every previously-published snapshot immutable.
+            val newCache = LinkedHashMap(cached)
+            newCache.remove(key)
+            newCache[key] = updated
+            while (newCache.size > maxEntries) {
+                val oldestKey = newCache.keys.firstOrNull() ?: break
+                newCache.remove(oldestKey)
             }
-            writeToDisk(cached)
+            writeToDisk(newCache)
+            cached = newCache
         }
     }
 

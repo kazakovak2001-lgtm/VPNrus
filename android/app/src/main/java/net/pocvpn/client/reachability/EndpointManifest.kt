@@ -109,10 +109,19 @@ object ManifestCanonicalizer {
         val id = readString(d)
         val roleCount = d.readInt()
         require(roleCount in 0..EndpointRoleCount) { "implausible role count: $roleCount" }
-        val roles = (0 until roleCount).map {
+        val roleList = (0 until roleCount).map {
             val ordinal = d.readInt()
             EndpointRole.entries.getOrNull(ordinal) ?: throw IllegalArgumentException("unknown EndpointRole ordinal $ordinal")
-        }.toSet()
+        }
+        val roles = roleList.toSet()
+        // A duplicate role ordinal would silently collapse here - reject
+        // rather than accept ambiguous/malformed input. Without this check,
+        // decode(bytes-with-a-duplicate) produces an object whose OWN
+        // re-canonicalization no longer equals `bytes` (the duplicate is
+        // gone), so a manifest legitimately signed over such bytes would
+        // fail Ed25519 verification for a confusing reason instead of being
+        // rejected outright here.
+        require(roles.size == roleList.size) { "duplicate EndpointRole ordinal in encoded endpoint" }
         val region = readString(d)
         val provider = readString(d)
         val hasAsn = d.readBoolean()
@@ -150,7 +159,14 @@ object ManifestCanonicalizer {
         val port = d.readInt()
         val metadataCount = d.readInt()
         require(metadataCount in 0..MAX_METADATA) { "implausible metadata count: $metadataCount" }
-        val metadata = (0 until metadataCount).associate { readString(d) to readString(d) }
+        val metadataEntries = (0 until metadataCount).map { readString(d) to readString(d) }
+        val metadata = metadataEntries.toMap()
+        // Same reasoning as the duplicate-role check above: a duplicate key
+        // silently collapses via associate()/toMap() (last write wins),
+        // which would make this object's own re-canonicalization diverge
+        // from the bytes actually signed - reject instead of accepting
+        // ambiguous input.
+        require(metadata.size == metadataEntries.size) { "duplicate metadata key in encoded transport binding" }
         return EndpointTransportBinding(kind, host, port, metadata)
     }
 
