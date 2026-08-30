@@ -12,6 +12,8 @@ import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.identity.AwgClientKeyRepository
 import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.FileIdentityStore
+import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import org.junit.Assert.assertEquals
@@ -235,5 +237,98 @@ class VpnControllerTest {
 
         assertFalse(diagnostics.snapshot.value.toString().contains(privateKey))
         assertFalse(controller.state.value.toString().contains(privateKey))
+    }
+
+    // --- B8I4: per-attempt execution boundary - connect(resolved) ---
+
+    @Test
+    fun `an explicit AWG resolution executes through the SAME per-attempt boundary as the default connect()`() = runTest {
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.AMNEZIA_WG))
+        runCurrent()
+
+        // Proves the resolved instance really is what got invoked, not merely
+        // that "some" connect happened.
+        assertEquals(1, transport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `a resolution naming a different transport instance is refused - never silently substituted`() = runTest {
+        val ownedTransport = FakeVpnTransport()
+        val otherTransport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            ownedTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(otherTransport, TransportKind.AMNEZIA_WG))
+        runCurrent()
+
+        // Neither this controller's own transport NOR the mismatched
+        // resolved one is ever touched - a mismatch fails closed, it never
+        // falls back to executing whichever instance happens to be handy.
+        assertEquals(0, ownedTransport.connectCallCount)
+        assertEquals(0, otherTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+        assertTrue(diagnostics.snapshot.value.lastError is VpnError.UnsupportedTransportSelected)
+    }
+
+    @Test
+    fun `a resolution naming a non-AWG kind is refused even for this controller's own transport instance`() = runTest {
+        val transport = FakeVpnTransport() // this instance's own .kind is AMNEZIA_WG
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        // A resolution whose kind disagrees with the kind buildTransportConfig()
+        // can actually build for - must fail closed even though the transport
+        // INSTANCE itself is the one this controller owns.
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.XRAY_REALITY))
+        runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+        assertTrue(diagnostics.snapshot.value.lastError is VpnError.UnsupportedTransportSelected)
+    }
+
+    @Test
+    fun `permission flow still works through an explicit resolution and resumes with the SAME resolved kind after grant`() = runTest {
+        val transport = FakeVpnTransport(permission = android.content.Intent())
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        var requested = false
+        val collectJob = backgroundScope.launch {
+            controller.events.collect { if (it is ControllerEvent.RequestVpnPermission) requested = true }
+        }
+        runCurrent()
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.AMNEZIA_WG))
+        runCurrent()
+        assertTrue(requested)
+        assertEquals(0, transport.connectCallCount)
+
+        controller.onVpnPermissionResult(true)
+        runCurrent()
+        assertEquals(1, transport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Connected)
+        collectJob.cancel()
     }
 }

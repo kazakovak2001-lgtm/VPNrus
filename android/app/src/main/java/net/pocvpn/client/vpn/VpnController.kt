@@ -22,6 +22,8 @@ import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.AwgConfig
 import net.pocvpn.client.vpn.config.AwgPeer
@@ -138,6 +140,15 @@ class VpnController(
     @Volatile private var userInitiatedDisconnect = true
     private var reconnectJob: Job? = null
 
+    // B8I4 - the kind of the resolution the CURRENT/most recent connect()
+    // attempt validated (see connect() below) - defaults to this
+    // controller's own constructor-owned transport, so onVpnPermissionResult
+    // resumes the SAME attempt after a permission prompt round-trip rather
+    // than silently reverting to a hardcoded assumption. Never read/written
+    // outside connect()/onVpnPermissionResult, both always called under
+    // connectMutex - see doConnectAttempt's own "caller must hold the mutex" note.
+    private var pendingConnectKind: TransportKind = transport.kind
+
     // Guards against a startup race: observeState() is a hot/replaying flow, so
     // whenever our collector coroutine actually gets scheduled to start, its
     // first emission is just a replay of the transport's CURRENT (possibly
@@ -188,7 +199,32 @@ class VpnController(
     /** Call once, early, from the UI layer to know whether a permission prompt will be needed. */
     fun permissionIntentIfNeeded(): Intent? = transport.preparePermissionIntent()
 
-    suspend fun connect() {
+    /**
+     * B8I4 - the ONE per-attempt execution boundary: [resolved] is what an
+     * upstream caller (MainViewModel, via TransportOrchestrator - the ONE
+     * decision authority remains SmartConnectCandidateSelector, never this
+     * class) already resolved for THIS attempt. Defaults to this
+     * controller's own constructor-owned transport/kind, so every EXISTING
+     * caller (including every pre-B8I4 test) is byte-for-byte unaffected.
+     *
+     * This no longer blindly assumes the constructor-owned transport is
+     * what should run: [resolved] is validated against it first. A
+     * DIFFERENT transport instance is refused, not silently substituted -
+     * this controller's background observeState() collector (see init
+     * block), disconnect(), and stats() polling are all wired to exactly
+     * ONE transport instance for its whole lifetime; safely driving a
+     * second, independent instance through the SAME lifecycle/state
+     * machine would need a real redesign (multiple collectors, per-attempt
+     * disconnect/stats routing) that is explicitly out of scope here - see
+     * class docs' "avoid parallel state machines" and B8I5's own scope note.
+     * [resolved.kind] then selects which TransportConfig shape
+     * buildTransportConfig() below builds - today only AMNEZIA_WG has one;
+     * any other kind fails closed via the EXISTING
+     * ConfigurationMappingFailure path, never a new/parallel failure mode.
+     */
+    suspend fun connect(
+        resolved: TransportOrchestrator.Resolution.Resolved = TransportOrchestrator.Resolution.Resolved(transport, transport.kind),
+    ) {
         if (!connectMutex.tryLock()) {
             diagnostics.recordError(VpnError.AlreadyInProgress)
             return
@@ -197,6 +233,24 @@ class VpnController(
             if (_state.value is TransportState.Connecting || _state.value is TransportState.Connected) {
                 return
             }
+            // B8I4 - the ONE place this controller's actual execution
+            // capability is checked: [resolved.transport] must be the exact
+            // instance this controller owns (never a silent substitute -
+            // see class docs on why a different instance can't be safely
+            // driven yet), AND [resolved.kind] must be AMNEZIA_WG - the only
+            // kind buildTransportConfig() below can actually build a config
+            // for today. A resolved instance whose OWN .kind happens to
+            // equal AMNEZIA_WG too would trivially satisfy an
+            // instance-vs-its-own-kind check, so AMNEZIA_WG is compared
+            // explicitly here, not merely resolved.kind == transport.kind.
+            if (resolved.transport !== transport || resolved.kind != TransportKind.AMNEZIA_WG) {
+                rejectPreflight(
+                    VpnError.UnsupportedTransportSelected(resolved.kind.name),
+                    "Resolved transport (${resolved.kind}) cannot be executed by this VpnController instance yet",
+                )
+                return
+            }
+            pendingConnectKind = resolved.kind
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -206,7 +260,7 @@ class VpnController(
                 return
             }
             diagnostics.updatePermission(true)
-            doConnectAttempt()
+            doConnectAttempt(resolved.kind)
         } finally {
             connectMutex.unlock()
         }
@@ -220,7 +274,7 @@ class VpnController(
             _state.value = TransportState.Error("VPN permission denied")
             return
         }
-        connectMutex.withLock { doConnectAttempt() }
+        connectMutex.withLock { doConnectAttempt(pendingConnectKind) }
     }
 
     suspend fun disconnect() {
@@ -247,7 +301,7 @@ class VpnController(
      * only updated asynchronously by the background collector and would
      * race against this same call.
      */
-    private suspend fun doConnectAttempt(): Boolean {
+    private suspend fun doConnectAttempt(kind: TransportKind): Boolean {
         when (val config = gatewayConfigurationRepository.get()) {
             is GatewayConfiguration.Missing -> {
                 diagnostics.recordError(VpnError.GatewayConfigurationMissing)
@@ -282,7 +336,7 @@ class VpnController(
                 }
                 val appRoutingLists = (routingResolution as EffectiveRoutingResult.Apply).lists
                 val transportConfig = try {
-                    buildTransportConfig(config, appRoutingLists)
+                    buildTransportConfig(kind, config, appRoutingLists)
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.ConfigurationMappingFailure(e.javaClass.simpleName))
                     _state.value = TransportState.Error("Failed to build tunnel configuration")
@@ -335,25 +389,39 @@ class VpnController(
         }
     }
 
-    private suspend fun buildTransportConfig(config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig {
-        val privateKey = clientKeyRepository.getPrivateKeyForTunnel()
-        val awgConfig = AwgConfig(
-            privateKeyBase64 = privateKey,
-            localAddresses = listOf("${config.clientTunnelIp}/32"),
-            dnsServers = config.dnsServers,
-            profile = config.profile,
-            includedApplications = appRoutingLists.includedApplications,
-            excludedApplications = appRoutingLists.excludedApplications,
-            peer = AwgPeer(
-                publicKeyBase64 = config.serverPublicKeyBase64,
-                endpointHost = config.endpointHost,
-                endpointPort = config.endpointPort,
-                allowedIps = config.allowedIps,
-                persistentKeepaliveSeconds = config.persistentKeepaliveSeconds,
-            ),
-        )
-        return TransportConfig.Awg(awgConfig)
-    }
+    /**
+     * B8I4 - the generic per-attempt execution seam: which TransportConfig
+     * SHAPE to build is now dispatched on [kind] rather than always
+     * assuming AMNEZIA_WG. Only AMNEZIA_WG has a real builder today - any
+     * other kind throws, which doConnectAttempt's existing try/catch around
+     * this call already turns into the SAME ConfigurationMappingFailure
+     * fail-closed path every other malformed-config case uses (no new
+     * failure mode). Wiring a real non-AWG builder here is B8I5's job, not
+     * this slice's - see class docs.
+     */
+    private suspend fun buildTransportConfig(kind: TransportKind, config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig =
+        when (kind) {
+            TransportKind.AMNEZIA_WG -> {
+                val privateKey = clientKeyRepository.getPrivateKeyForTunnel()
+                val awgConfig = AwgConfig(
+                    privateKeyBase64 = privateKey,
+                    localAddresses = listOf("${config.clientTunnelIp}/32"),
+                    dnsServers = config.dnsServers,
+                    profile = config.profile,
+                    includedApplications = appRoutingLists.includedApplications,
+                    excludedApplications = appRoutingLists.excludedApplications,
+                    peer = AwgPeer(
+                        publicKeyBase64 = config.serverPublicKeyBase64,
+                        endpointHost = config.endpointHost,
+                        endpointPort = config.endpointPort,
+                        allowedIps = config.allowedIps,
+                        persistentKeepaliveSeconds = config.persistentKeepaliveSeconds,
+                    ),
+                )
+                TransportConfig.Awg(awgConfig)
+            }
+            else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")
+        }
 
     /**
      * B8B3D - the authoritative startup-success signal: a REAL AWG handshake
