@@ -27,7 +27,8 @@ class RestrictionClassifierTest {
         transportState: TransportState = TransportState.Disconnected,
         awgHandshakeFresh: Boolean? = null,
         gatewayHttpsReachable: Boolean? = null,
-    ) = RestrictionEvidence(networkProfile, transportState, awgHandshakeFresh, gatewayHttpsReachable)
+        diverseInternetReachable: Boolean? = null,
+    ) = RestrictionEvidence(networkProfile, transportState, awgHandshakeFresh, gatewayHttpsReachable, diverseInternetReachable)
 
     @Test
     fun `no network yields NO_NETWORK regardless of any other evidence`() {
@@ -62,6 +63,46 @@ class RestrictionClassifierTest {
     }
 
     @Test
+    fun `BOTH HTTPS and AWG confirmed failed plus a diverse-majority failure yields POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, result)
+    }
+
+    @Test
+    fun `HTTPS confirmed REACHABLE is positive evidence against a whitelist claim - AWG failure plus diverse failure still yields POSSIBLE_UDP_OR_AWG_FILTERING, never POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = true, awgHandshakeFresh = false, diverseInternetReachable = false),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, result)
+    }
+
+    @Test
+    fun `HTTPS confirmed unreachable but AWG status is unknown (never attempted) never claims POSSIBLE_HARD_WHITELIST from insufficient evidence`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = null, diverseInternetReachable = false),
+        )
+        assertEquals(RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, result)
+    }
+
+    @Test
+    fun `gateway unreachable via both protocols but diverse destinations mostly DO respond yields GATEWAY_HTTPS_UNREACHABLE, never POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = true),
+        )
+        assertEquals(RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, result)
+    }
+
+    @Test
+    fun `gateway unreachable via both protocols but diverse probes never ran (null) never claims POSSIBLE_HARD_WHITELIST from insufficient evidence`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = null),
+        )
+        assertEquals(RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, result)
+    }
+
+    @Test
     fun `a fresh AWG handshake yields NO_RESTRICTION_OBSERVED`() {
         val result = RestrictionClassifier.classify(evidence(awgHandshakeFresh = true))
         assertEquals(RestrictionClass.NO_RESTRICTION_OBSERVED, result)
@@ -85,7 +126,7 @@ class RestrictionClassifierTest {
     @Test
     fun `the enum never contains a DPI, TSPU, or country-level block claim - those classes cannot exist here`() {
         val names = RestrictionClass.entries.map { it.name }
-        listOf("DPI_BLOCKED", "TSPU_BLOCKED", "RUSSIA_BLOCK").forEach { forbidden ->
+        listOf("DPI_BLOCKED", "TSPU_BLOCKED", "RUSSIA_BLOCK", "CONFIRMED_HARD_WHITELIST").forEach { forbidden ->
             assertTrue("RestrictionClass must never gain a $forbidden value", forbidden !in names)
         }
     }
@@ -96,7 +137,7 @@ class RestrictionClassifierTest {
             .map { it.name }
             .filterNot { it.contains('$') } // compiler-synthetic (e.g. Compose's stability marker), holds no data
             .toSet()
-        val expected = setOf("networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable")
+        val expected = setOf("networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable", "diverseInternetReachable")
         assertEquals(expected, fieldNames)
     }
 }

@@ -162,6 +162,11 @@ class MainViewModel(
     // built from it (see below) and started in init/stopped in onCleared -
     // it never itself touches VpnController/VpnTransport (see its own docs).
     restrictionProbe: GatewayReachabilityProbe? = null,
+    // B8M - additive, defaults to empty (same reasoning as restrictionProbe
+    // above) - see RestrictionMonitor's own docs for why an empty list is a
+    // safe, fully backward-compatible no-op (diverseInternetReachable stays
+    // null forever, RestrictionClassifier's existing behavior is untouched).
+    diverseReachabilityProbes: List<GatewayReachabilityProbe> = emptyList(),
     // B8K4B - additive, defaults to null (same reasoning as gatewayConfigOverride/
     // profileStore above): when non-null, activateDevice() below fetches and
     // persists an Xray VLESS+REALITY profile immediately after a successful
@@ -330,7 +335,7 @@ class MainViewModel(
     // B8J - built ONLY when a probe was actually wired (production: always,
     // via the Factory below) - null means "no probing at all", same
     // additive-seam shape as networkProfiler/connectionOutcomeStore.
-    private val restrictionMonitor = restrictionProbe?.let { RestrictionMonitor(it, viewModelScope) }
+    private val restrictionMonitor = restrictionProbe?.let { RestrictionMonitor(it, viewModelScope, diverseReachabilityProbes) }
 
     /**
      * B8J - THE ONLY place a RestrictionClass is computed for this
@@ -347,6 +352,7 @@ class MainViewModel(
             transportState = transportState.value,
             awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
             gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
+            diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
         ),
     )
 
@@ -851,6 +857,20 @@ class MainViewModel(
                 // B8J - the one pinned gateway's HTTPS probe (see its own
                 // docs) - default timeout/URL, no credentials/keys involved.
                 restrictionProbe = HttpsGatewayReachabilityProbe(),
+                // B8M - three diverse, unrelated, well-known real HTTPS
+                // destinations (different vendors/infra), reusing the SAME
+                // plain HEAD-request probe mechanism as restrictionProbe
+                // above - no credentials, no pocvpn data, never the same
+                // host as the gateway probe. Each is itself a standard
+                // OS/browser connectivity-check endpoint (Google/Apple/
+                // Mozilla each already probe their own for exactly this
+                // purpose) - an honest reachability check, never an
+                // impersonation of any of them (architecture principle 4).
+                diverseReachabilityProbes = listOf(
+                    HttpsGatewayReachabilityProbe(urlString = "https://connectivitycheck.gstatic.com/generate_204"),
+                    HttpsGatewayReachabilityProbe(urlString = "https://captive.apple.com/hotspot-detect.html"),
+                    HttpsGatewayReachabilityProbe(urlString = "https://detectportal.firefox.com/success.txt"),
+                ),
                 xrayProfileProvisioner = XrayProfileProvisioner(xrayProfileRepository),
                 // B8I7 - the SAME real VlessRealityTransport instance is
                 // registered for BOTH Smart Connect selection
