@@ -102,6 +102,16 @@ class AppConfig:
     xray_tls_cert_file: str = ""
     xray_tls_key_file: str = ""
 
+    # B12 - GET /v1/manifest: serves an ALREADY-SIGNED EndpointManifest
+    # artifact (see gateway/tools/manifest_signing.py's `sign-and-package`
+    # subcommand, run OFFLINE) verbatim, as raw bytes. Blank (the default)
+    # means the endpoint is not configured and always fails closed with 503,
+    # same convention as every other optional group above. This process
+    # NEVER signs anything and NEVER holds the manifest signing private key -
+    # it only reads and serves a file an operator placed here, exactly the
+    # "no private signing key on the production VPS if avoidable" requirement.
+    manifest_path: str = ""
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -407,6 +417,17 @@ def load_config(env=None):
                 f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before TLS can be enabled"
             )
 
+    # B12 - see AppConfig.manifest_path's own docs. When set, held to the
+    # same "absolute and actually a file" bar as every other file-path
+    # config value above (provision_script_path, xray_tls_cert_file, ...) -
+    # fail closed at startup, never at first request.
+    manifest_path = _get(env, "MANIFEST_PATH")
+    if manifest_path:
+        if not os.path.isabs(manifest_path):
+            raise ConfigError(f"{_ENV_PREFIX}MANIFEST_PATH must be an absolute path: {manifest_path!r}")
+        if not os.path.isfile(manifest_path):
+            raise ConfigError(f"{_ENV_PREFIX}MANIFEST_PATH does not exist or is not a file: {manifest_path!r}")
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -440,4 +461,5 @@ def load_config(env=None):
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        manifest_path=manifest_path,
     )

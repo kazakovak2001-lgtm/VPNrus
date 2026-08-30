@@ -1,8 +1,10 @@
 """HTTP request handling for the three POST-only endpoints this API
-serves: /v1/peers (B8B1B), /v1/activate (B8C1), and /v1/xray-profile
-(B8K2).
+serves: /v1/peers (B8B1B), /v1/activate (B8C1), /v1/xray-profile
+(B8K2) - plus ONE GET-only endpoint, /v1/manifest (B12), which serves an
+already-signed EndpointManifest artifact verbatim (see _handle_manifest's
+own docstring for why this process never signs or validates it).
 
-No GET/DELETE/admin/token-issuance routes exist in this slice. See
+No DELETE/admin/token-issuance routes exist in this slice. See
 gateway/api/__init__.py for the architectural invariant this handler is
 built around: it never touches awg0.conf, .provision.lock, or a private
 key directly - /v1/peers and /v1/activate only ever reach real gateway
@@ -40,7 +42,9 @@ logger = logging.getLogger("pocvpn.api")
 _PATH_PEERS = "/v1/peers"
 _PATH_ACTIVATE = "/v1/activate"
 _PATH_XRAY_PROFILE = "/v1/xray-profile"
+_PATH_MANIFEST = "/v1/manifest"
 _MAX_BODY_BYTES = 1024
+_MAX_MANIFEST_BYTES = 1_000_000
 _BEARER_PREFIX = "Bearer "
 _SOCKET_TIMEOUT_SECONDS = 5.0
 
@@ -139,6 +143,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_xray_profile()
+            elif self.path == _PATH_MANIFEST:
+                if method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_manifest()
             else:
                 status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
@@ -493,6 +502,59 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # new-bind-vs-existing-bind distinction - but ONLY once activation
         # is confirmed (see the check above).
         return self._success(HTTPStatus.OK, payload)
+
+    # --- GET /v1/manifest (B12) ---
+    def _handle_manifest(self):
+        try:
+            return self._handle_manifest_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_manifest_inner(self):
+        """Serves the ALREADY-SIGNED manifest artifact byte-for-byte, verbatim.
+
+        This process never signs, never parses, never validates the
+        manifest's own contents - it is exactly as trustworthy as any other
+        HTTPS response and MUST be independently verified by the client
+        (Ed25519ManifestVerifier) before ever being trusted; this endpoint's
+        only job is serving bytes an operator placed on disk offline. No
+        auth is required - a signed manifest is meant for broad
+        distribution, the same way a TLS certificate chain is public - its
+        trust comes from the signature, never from who fetched it or how.
+        """
+        if not self.server.config.manifest_path:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "manifest_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        try:
+            with open(self.server.config.manifest_path, "rb") as f:
+                body = f.read(_MAX_MANIFEST_BYTES + 1)
+        except OSError:
+            logger.error("manifest_read_error")
+            raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+        if len(body) > _MAX_MANIFEST_BYTES:
+            # An operator-placed artifact should never actually be this
+            # large (see ManifestCanonicalizer's own MAX_ENDPOINTS/
+            # MAX_TRANSPORTS caps) - refuse rather than stream something
+            # implausible, same discipline as every other size bound in
+            # this codebase.
+            logger.error("manifest_too_large")
+            raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+        self._log_fields["manifest_bytes"] = len(body)
+        return self._write_binary(HTTPStatus.OK, body)
+
+    def _write_binary(self, status, body):
+        self.send_response(int(status))
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        return int(status)
 
     def _require_bearer_token(self):
         auth_header = self.headers.get("Authorization")

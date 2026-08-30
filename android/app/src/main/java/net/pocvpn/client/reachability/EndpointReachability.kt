@@ -46,10 +46,26 @@ data class EndpointReachability(
 data class ReachabilityEvidenceSummary(
     val transportHealthState: TransportHealthState,
     val transportHealthAgeMillis: Long?,
-    /** True/false only when THIS endpoint specifically was probed (e.g. the pinned gateway's own HTTPS probe) - null when no endpoint-specific evidence exists. */
+    /** True/false only when THIS endpoint's DATA-PLANE was probed specifically (e.g. a real connection attempt/handshake outcome for this exact endpoint+transport) - null when no such evidence exists. */
     val endpointSpecificReachable: Boolean?,
     val networkUsable: Boolean,
     val restrictionClass: RestrictionClass,
+    /**
+     * B12 - a SEPARATE signal from [endpointSpecificReachable]: whether the
+     * CONTROL PLANE (the HTTPS API this endpoint's operator runs - manifest
+     * distribution, activation, provisioning) answered, independent of
+     * whether the DATA PLANE (the actual tunnel this endpoint's transports
+     * carry) is reachable. For today's single production endpoint these
+     * happen to be the same physical server, but the task's "do not
+     * collapse control-plane-reachable/endpoint-reachable/transport-healthy"
+     * requirement means this must be modeled as its own field even before a
+     * deployment exists where they genuinely differ (e.g. a control plane
+     * fronting several data-plane-only gateways). Defaults to null (never
+     * probed) so every pre-B12 call site is unaffected - appended last,
+     * never inserted mid-constructor, so existing POSITIONAL call sites
+     * (this codebase's convention throughout its test suites) stay correct.
+     */
+    val controlPlaneReachable: Boolean? = null,
 )
 
 /**
@@ -97,6 +113,15 @@ object ReachabilityEngine {
         restrictionClass: RestrictionClass,
         nowEpochMillis: Long,
         staleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS,
+        // B12 - carried through truthfully into [ReachabilityEvidenceSummary]
+        // for diagnostics ONLY - deliberately does NOT change [state] below
+        // (same "real evidence, truthfully surfaced, not yet decision-driving"
+        // boundary already established for RestrictionClassifier/TransportHealth
+        // elsewhere in this codebase). A future slice may fold it into the
+        // state derivation once there's a real deployment where control-plane
+        // and data-plane reachability genuinely diverge to design that rule
+        // against - see class docs' own "do not collapse" note.
+        controlPlaneReachable: Boolean? = null,
     ): EndpointReachability {
         val ageMillis = transportHealth.lastProbeEpochMillis?.let { nowEpochMillis - it }
         val evidence = ReachabilityEvidenceSummary(
@@ -105,6 +130,7 @@ object ReachabilityEngine {
             endpointSpecificReachable = endpointSpecificReachable,
             networkUsable = networkUsable,
             restrictionClass = restrictionClass,
+            controlPlaneReachable = controlPlaneReachable,
         )
 
         val state = when {

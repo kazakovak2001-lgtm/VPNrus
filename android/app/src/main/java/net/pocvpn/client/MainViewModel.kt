@@ -221,6 +221,13 @@ class MainViewModel(
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
+    // B12 - additive, defaults to null (same seam as every optional
+    // dependency above): with no client, refreshManifest() below is a
+    // no-op that returns null, and manifestRepository's trusted state is
+    // whatever the embedded bootstrap/previously-adopted LKG already say -
+    // this constructor param existing does not, by itself, cause any
+    // network access.
+    private val manifestDistributionClient: net.pocvpn.client.reachability.ManifestDistributionClient? = null,
 ) : ViewModel() {
 
     private val controller = VpnController(
@@ -452,21 +459,38 @@ class MainViewModel(
         val profile = networkProfile.value
         val now = System.currentTimeMillis()
 
+        // B12 - CONTROL PLANE evidence (the gateway's HTTPS API - manifest
+        // distribution/activation/provisioning) is a SEPARATE signal from
+        // DATA PLANE evidence (an actual tunnel attempt outcome for this
+        // exact endpoint+transport) - see ReachabilityEvidenceSummary's own
+        // "do not collapse" docs. Only the pinned production gateway's own
+        // control-plane probe exists today (restrictionMonitor).
+        val controlPlaneReachableByEndpoint: (net.pocvpn.client.reachability.EndpointId) -> Boolean? = { id ->
+            if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) restrictionMonitor?.lastProbeResult?.value else null
+        }
+        // B12 - real per-(endpoint, transport) DATA PLANE evidence, derived
+        // from ConnectionOutcomeStore's own real per-attempt history
+        // (ConnectionOutcome.gatewayId/.transport) - never fabricated, and
+        // never requiring any change to VpnController's proven connect
+        // path: the SAME outcomes already recorded for TransportHealth are
+        // reused here, just re-filtered by endpoint as well as transport.
+        val outcomes = recentConnectionOutcomes()
+        val endpointSpecificReachableFor: (net.pocvpn.client.reachability.EndpointId, TransportKind) -> Boolean? = { id, kind ->
+            outcomes.lastOrNull { it.gatewayId == id.value && it.transport == kind }
+                ?.let { it.result == net.pocvpn.client.smartconnect.ConnectionOutcomeResult.SUCCESS }
+        }
+
         val reachability = manifest.endpoints.flatMap { endpoint ->
             endpoint.transports.map { binding ->
-                val endpointSpecificReachable = if (endpoint.id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) {
-                    restrictionMonitor?.lastProbeResult?.value
-                } else {
-                    null
-                }
                 net.pocvpn.client.reachability.ReachabilityEngine.assess(
                     endpoint = endpoint,
                     transportKind = binding.kind,
                     networkUsable = profile.isUsable,
                     transportHealth = health.getValue(binding.kind),
-                    endpointSpecificReachable = endpointSpecificReachable,
+                    endpointSpecificReachable = endpointSpecificReachableFor(endpoint.id, binding.kind),
                     restrictionClass = restriction,
                     nowEpochMillis = now,
+                    controlPlaneReachable = controlPlaneReachableByEndpoint(endpoint.id),
                 )
             }
         }
@@ -489,8 +513,19 @@ class MainViewModel(
                 it.keyBytes(),
             )
         }
+        // B12 - real (not hardcoded false) diversity signal: a candidate is
+        // "diverse" iff at least one OTHER candidate in this same batch
+        // names a different provider or ASN - a small, informational
+        // PathScorer tie-break input (see that class's own tiny-weight
+        // docs), never anything reachability-overriding.
+        val providerAsnOf: (net.pocvpn.client.reachability.PathCandidate.Direct) -> Pair<String, Int?> = { candidate ->
+            candidate.gateway.endpoint.let { it.provider to it.asn }
+        }
+        val distinctProviderAsnCount = candidates.filterIsInstance<net.pocvpn.client.reachability.PathCandidate.Direct>()
+            .map { providerAsnOf(it) }.distinct().size
         val scored = candidates.map { candidate ->
-            val gateway = (candidate as net.pocvpn.client.reachability.PathCandidate.Direct).gateway.endpoint
+            val direct = candidate as net.pocvpn.client.reachability.PathCandidate.Direct
+            val gateway = direct.gateway.endpoint
             val history = fingerprint?.let { pathHistoryStore?.get(it, gateway.id, candidate.transport) }
             val capabilities = registry.descriptorFor(candidate.transport)?.capabilities
                 ?: TransportCapabilities.notImplemented()
@@ -500,7 +535,7 @@ class MainViewModel(
                 capabilities = capabilities,
                 transportHealth = health.getValue(candidate.transport),
                 history = history,
-                diverseProviderOrAsnSeenElsewhere = false,
+                diverseProviderOrAsnSeenElsewhere = distinctProviderAsnCount > 1,
             )
         }
 
@@ -511,6 +546,20 @@ class MainViewModel(
             rankedPaths = net.pocvpn.client.reachability.PathScorer.rank(scored),
         )
     }
+
+    /**
+     * B12 - attempts one bounded manifest download+adoption via
+     * [manifestDistributionClient] (see its own docs: fetch failure/invalid
+     * signature/expiry/rollback all reject WITHOUT touching LKG, exactly
+     * ManifestUpdateResult's own contract). Returns null when no client was
+     * wired (default) - callers must not treat null as a rejection, only as
+     * "this feature is not configured". OBSERVATIONAL in the SAME sense as
+     * reachabilityDiagnostics(): a successful adoption only changes which
+     * manifest is trusted (endpoints/candidates), never which transport
+     * Smart Connect automatically selects.
+     */
+    suspend fun refreshManifest(): net.pocvpn.client.reachability.ManifestUpdateResult? =
+        manifestDistributionClient?.refresh()
 
     val transportState: StateFlow<TransportState> = controller.state
     val diagnostics: StateFlow<DiagnosticsSnapshot> = diagnosticsStore.snapshot
@@ -1034,6 +1083,25 @@ class MainViewModel(
             // XrayTlsProfileRepositoryFactory's own docs), shared by its own
             // provisioner and xrayTlsTransport's own pre-flight check.
             val xrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context)
+            // B12 - the ONE authoritative EndpointManifestRepository instance -
+            // shared by reachabilityDiagnostics() (read-only) and
+            // manifestDistributionClient below (the only real writer, via
+            // offer()) - never a second, independently-constructed repository
+            // that could disagree with what diagnostics reports.
+            val manifestRepository = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createManifestRepository(context)
+            // B12 - blank BuildConfig.MANIFEST_URL (the default - see
+            // build.gradle.kts) means this stays null: refreshManifest()
+            // becomes a no-op, and manifestRepository is driven ONLY by its
+            // embedded bootstrap/whatever LKG already exists on disk. Never
+            // constructed against a blank URL (HttpsRemoteManifestFetcher
+            // would just fail every request, which is a worse failure mode
+            // than "clearly not configured").
+            val manifestDistributionClient = BuildConfig.MANIFEST_URL.takeIf { it.isNotBlank() }?.let { url ->
+                net.pocvpn.client.reachability.ManifestDistributionClient(
+                    net.pocvpn.client.reachability.HttpsRemoteManifestFetcher(url),
+                    manifestRepository,
+                )
+            }
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -1081,9 +1149,10 @@ class MainViewModel(
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see
                 // reachabilityDiagnostics()'s own docs for why this cannot
                 // change automatic selection in this slice.
-                manifestRepository = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createManifestRepository(context),
+                manifestRepository = manifestRepository,
                 pathHistoryStore = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createPathHistoryStore(context),
                 fingerprintKeyProvider = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createFingerprintKeyProvider(context),
+                manifestDistributionClient = manifestDistributionClient,
             ) as T
         }
     }

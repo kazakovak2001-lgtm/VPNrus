@@ -114,6 +114,22 @@ def sign(manifest: Manifest, private_key: Ed25519PrivateKey) -> bytes:
     return private_key.sign(canonical_bytes(manifest))
 
 
+def pack_signed_manifest(canonical: bytes, signature: bytes) -> bytes:
+    """B12 - the SAME binary container SignedManifestCodec.kt encodes/decodes
+    on the Android side: [formatVersion:i32BE][canonicalLen:i32BE]
+    [canonicalBytes][signatureLen:i32BE][signature]. This is the exact byte
+    sequence an operator places at AppConfig.manifest_path for GET
+    /v1/manifest to serve verbatim - see gateway/api/handler.py's own docs
+    for why that process never signs or parses this itself."""
+    buf = bytearray()
+    buf += struct.pack(">i", FORMAT_VERSION)
+    buf += struct.pack(">i", len(canonical))
+    buf += canonical
+    buf += struct.pack(">i", len(signature))
+    buf += signature
+    return bytes(buf)
+
+
 def load_manifest_json(path: str) -> Manifest:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -159,6 +175,14 @@ def main() -> int:
     sign_cmd.add_argument("--manifest", required=True, help="Path to manifest JSON")
     sign_cmd.add_argument("--private-key-b64", required=True, help="Base64 raw Ed25519 private key (32 bytes)")
 
+    package_cmd = sub.add_parser(
+        "sign-and-package",
+        help="B12 - sign a manifest JSON file AND write the binary artifact ready for AppConfig.manifest_path",
+    )
+    package_cmd.add_argument("--manifest", required=True, help="Path to manifest JSON")
+    package_cmd.add_argument("--private-key-b64", required=True, help="Base64 raw Ed25519 private key (32 bytes)")
+    package_cmd.add_argument("--out", required=True, help="Output path for the binary artifact (e.g. endpoint-manifest.bin)")
+
     args = parser.parse_args()
 
     if args.command == "generate-key":
@@ -189,6 +213,22 @@ def main() -> int:
             "manifestVersion": manifest.manifest_version,
             "signatureBase64": base64.b64encode(signature).decode("ascii"),
             "canonicalBytesBase64": base64.b64encode(canonical_bytes(manifest)).decode("ascii"),
+        }, indent=2))
+        return 0
+
+    if args.command == "sign-and-package":
+        manifest = load_manifest_json(args.manifest)
+        priv_bytes = base64.b64decode(args.private_key_b64)
+        priv = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        canonical = canonical_bytes(manifest)
+        signature = sign(manifest, priv)
+        artifact = pack_signed_manifest(canonical, signature)
+        with open(args.out, "wb") as f:
+            f.write(artifact)
+        print(json.dumps({
+            "manifestVersion": manifest.manifest_version,
+            "artifactPath": args.out,
+            "artifactBytes": len(artifact),
         }, indent=2))
         return 0
 

@@ -107,6 +107,7 @@ def make_app_config(
     xray_dest="",
     xray_tls_server_port=0, xray_tls_server_name="", xray_tls_fingerprint="",
     xray_tls_cert_file="", xray_tls_key_file="",
+    manifest_path="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -143,7 +144,20 @@ def make_app_config(
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        manifest_path=manifest_path,
     )
+
+
+def write_fake_manifest_artifact(tmp_dir, body=b"\x00\x00\x00\x01fake-manifest-bytes"):
+    """A B12 manifest artifact fixture is intentionally NOT a real signed
+    manifest - this server-side test suite only proves the endpoint serves
+    whatever bytes are on disk verbatim; signature validity is entirely the
+    CLIENT's concern (Ed25519ManifestVerifier, exercised in the Android
+    test suite - see ManifestVerifierTest/EmbeddedBootstrapManifestTest)."""
+    path = os.path.join(tmp_dir, "endpoint-manifest.bin")
+    with open(path, "wb") as handle:
+        handle.write(body)
+    return path
 
 
 _FAKE_XRAY_WRAPPER_BODY = """#!/usr/bin/env bash
