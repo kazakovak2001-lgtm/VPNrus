@@ -169,6 +169,22 @@ class VpnController(
 
     fun gatewayStatus(): GatewayConfiguration = gatewayConfigurationRepository.get()
 
+    /**
+     * B8I2 - Smart Connect preflight (MainViewModel.connect()) rejected
+     * BEFORE this controller was ever touched: transport.connect() was never
+     * called, transport.preparePermissionIntent() was never called, no VPN
+     * permission was requested, no VPN service was started. Reuses the exact
+     * same truthful-state-and-diagnostics pattern doConnectAttempt() itself
+     * already uses for its own precondition failures (e.g.
+     * GatewayConfiguration.Missing) - a fail-closed decision is surfaced
+     * exactly like every other precondition failure, never a second/silent
+     * failure mode.
+     */
+    fun rejectPreflight(error: VpnError, message: String) {
+        diagnostics.recordError(error)
+        _state.value = TransportState.Error(message)
+    }
+
     /** Call once, early, from the UI layer to know whether a permission prompt will be needed. */
     fun permissionIntentIfNeeded(): Intent? = transport.preparePermissionIntent()
 
