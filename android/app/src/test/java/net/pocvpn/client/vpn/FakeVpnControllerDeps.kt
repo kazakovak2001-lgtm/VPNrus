@@ -67,6 +67,15 @@ class FakeVpnTransport(
 
     override fun observeState(): Flow<TransportState> = stateFlow
 
+    // B8I5 - lets a test simulate a late/stale emission from THIS instance
+    // (e.g. after VpnController has switched its active transport away from
+    // it, or after shutdown()) without going through connect()/disconnect() -
+    // proving a detached/cancelled observer never lets it leak into
+    // VpnController's own state.
+    fun forceState(state: TransportState) {
+        stateFlow.value = state
+    }
+
     override suspend fun stats(): TransportStats = TransportStats.Counters(
         bytesReceived = statsBytesReceived,
         bytesSent = statsBytesSent,

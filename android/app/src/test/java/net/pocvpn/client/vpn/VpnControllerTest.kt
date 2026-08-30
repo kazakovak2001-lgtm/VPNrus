@@ -261,29 +261,6 @@ class VpnControllerTest {
     }
 
     @Test
-    fun `a resolution naming a different transport instance is refused - never silently substituted`() = runTest {
-        val ownedTransport = FakeVpnTransport()
-        val otherTransport = FakeVpnTransport()
-        val diagnostics = DiagnosticsStore()
-        val controller = VpnController(
-            ownedTransport, FakeClientKeyRepository(),
-            FakeGatewayConfigurationRepository(configuredGateway()),
-            FakeReconnectManager(), diagnostics, backgroundScope,
-        )
-
-        controller.connect(TransportOrchestrator.Resolution.Resolved(otherTransport, TransportKind.AMNEZIA_WG))
-        runCurrent()
-
-        // Neither this controller's own transport NOR the mismatched
-        // resolved one is ever touched - a mismatch fails closed, it never
-        // falls back to executing whichever instance happens to be handy.
-        assertEquals(0, ownedTransport.connectCallCount)
-        assertEquals(0, otherTransport.connectCallCount)
-        assertTrue(controller.state.value is TransportState.Error)
-        assertTrue(diagnostics.snapshot.value.lastError is VpnError.UnsupportedTransportSelected)
-    }
-
-    @Test
     fun `a resolution naming a non-AWG kind is refused even for this controller's own transport instance`() = runTest {
         val transport = FakeVpnTransport() // this instance's own .kind is AMNEZIA_WG
         val diagnostics = DiagnosticsStore()
@@ -330,5 +307,116 @@ class VpnControllerTest {
         assertEquals(1, transport.connectCallCount)
         assertTrue(controller.state.value is TransportState.Connected)
         collectJob.cancel()
+    }
+
+    // --- B8I5: active transport ownership - connect() can adopt a genuinely different resolved instance ---
+
+    @Test
+    fun `connect adopts a different resolved AWG transport instance as the active transport - never the constructor-owned one`() = runTest {
+        val constructedTransport = FakeVpnTransport()
+        val resolvedTransport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            constructedTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(resolvedTransport, TransportKind.AMNEZIA_WG))
+        runCurrent()
+
+        // The RESOLVED instance is what actually ran - the constructor-owned
+        // one (never selected for this attempt) is completely untouched.
+        assertEquals(1, resolvedTransport.connectCallCount)
+        assertEquals(0, constructedTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `switching active transport stops observing the previous one - stale emissions never leak into controller state`() = runTest {
+        val transportA = FakeVpnTransport()
+        val transportB = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transportA, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect() // default resolves to transportA
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        controller.disconnect()
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Disconnected)
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transportB, TransportKind.AMNEZIA_WG))
+        runCurrent()
+        assertEquals(1, transportB.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        // transportA's collector was detached on switch - a late/stale
+        // emission from it must never overwrite the CURRENT (transportB)
+        // state. No two collectors can ever drive _state concurrently.
+        transportA.forceState(TransportState.Error("stale from detached transport"))
+        runCurrent()
+        assertTrue(
+            "stale emission from a detached transport leaked into controller state: ${controller.state.value}",
+            controller.state.value is TransportState.Connected,
+        )
+    }
+
+    @Test
+    fun `permission grant resumes the SAME resolved non-constructor transport instance after switching`() = runTest {
+        val constructedTransport = FakeVpnTransport()
+        val resolvedTransport = FakeVpnTransport(permission = android.content.Intent())
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            constructedTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(resolvedTransport, TransportKind.AMNEZIA_WG))
+        runCurrent()
+        assertEquals(0, resolvedTransport.connectCallCount)
+        assertEquals(0, constructedTransport.connectCallCount)
+
+        controller.onVpnPermissionResult(true)
+        runCurrent()
+
+        // Both the resolved INSTANCE and its kind survived the permission
+        // round-trip - the constructor-owned transport is never touched.
+        assertEquals(1, resolvedTransport.connectCallCount)
+        assertEquals(0, constructedTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `shutdown detaches the active transport's observer - later emissions never reach controller state`() = runTest {
+        val transport = FakeVpnTransport()
+        val diagnostics = DiagnosticsStore()
+        val reconnectManager = FakeReconnectManager()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, diagnostics, backgroundScope,
+        )
+
+        controller.connect()
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        controller.shutdown()
+        runCurrent()
+        assertEquals(1, reconnectManager.stopCallCount)
+
+        transport.forceState(TransportState.Error("late emission after shutdown"))
+        runCurrent()
+        assertTrue(
+            "emission after shutdown leaked into controller state: ${controller.state.value}",
+            controller.state.value is TransportState.Connected,
+        )
     }
 }

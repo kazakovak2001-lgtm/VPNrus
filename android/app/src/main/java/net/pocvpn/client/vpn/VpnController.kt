@@ -116,6 +116,15 @@ class VpnController(
         // B8B3D - "small bounded startup window" per the task's own wording.
         const val HANDSHAKE_TIMEOUT_MS = 8_000L
         const val HANDSHAKE_POLL_INTERVAL_MS = 500L
+
+        // B8I5 - the ONLY kinds this controller can actually build a
+        // TransportConfig for (see buildTransportConfig's own `when`) -
+        // AMNEZIA_WG only. A resolved kind outside this set is refused in
+        // connect() BEFORE the active transport is ever switched/touched -
+        // no permission request, no observer attach. Extending this set is
+        // B8I6's job (a real TransportConfig.Xray builder), never a reason
+        // to relax this check preemptively.
+        val SUPPORTED_KINDS = setOf(TransportKind.AMNEZIA_WG)
     }
 
     private val connectMutex = Mutex()
@@ -149,20 +158,72 @@ class VpnController(
     // connectMutex - see doConnectAttempt's own "caller must hold the mutex" note.
     private var pendingConnectKind: TransportKind = transport.kind
 
+    // B8I5 - the ONE active transport instance every lifecycle operation
+    // (state observation, connect, disconnect, permission resume, stats
+    // polling, handshake detection, shutdown) actually targets - never the
+    // fixed constructor `transport` directly (that field now exists only to
+    // seed this and to build the no-arg connect() default). Starts as
+    // `transport`; connect() re-points it via switchActiveTransport() only
+    // when a NEW resolved instance differs from the current one. Read/written
+    // only from connect() (under connectMutex) and switchActiveTransport()
+    // (called only from connect(), same lock) - never concurrently.
+    private var activeTransport: VpnTransport = transport
+
+    // B8I5 - the background collector currently observing activeTransport's
+    // observeState(). Exactly one is ever running at a time - switching
+    // active transports cancels this before starting a new one (see
+    // switchActiveTransport) so two collectors can never mutate _state
+    // concurrently.
+    private var activeObserverJob: Job? = null
+
     // Guards against a startup race: observeState() is a hot/replaying flow, so
     // whenever our collector coroutine actually gets scheduled to start, its
     // first emission is just a replay of the transport's CURRENT (possibly
     // stale) state - not a new transition. If a permission/gateway-config
     // check set an error state directly (without ever touching the transport)
     // before that replay is collected, we must not let it clobber that error.
-    // Once we've actually invoked the transport at least once, every further
-    // emission is a genuine transition and is always forwarded.
+    // Once we've actually invoked the (active) transport at least once, every
+    // further emission is a genuine transition and is always forwarded. Reset
+    // to false whenever switchActiveTransport() attaches a genuinely NEW
+    // instance (see that function's own docs) - the exact same "ignore the
+    // replay" reasoning applies fresh to that instance's own hot flow.
     @Volatile private var hasTouchedTransport = false
 
     init {
-        scope.launch {
-            transport.observeState().collect { transportState ->
+        switchActiveTransport(transport)
+        reconnectManager.start(
+            onNetworkLost = { handleNetworkLost() },
+            onNetworkAvailable = { /* reconnect loop polls isNetworkAvailable() on its own cadence */ },
+        )
+    }
+
+    /**
+     * B8I5 - the ONE place the active transport instance changes. A no-op
+     * when [newTransport] is already the active instance AND its collector
+     * is still running (the common/default case: every existing caller that
+     * always resolves the SAME constructor-owned transport hits this branch
+     * forever after the first call, so this is byte-for-byte the pre-B8I5
+     * single-lifetime-collector behavior for that case).
+     *
+     * Otherwise: cancels the PREVIOUS active transport's collector FIRST,
+     * then starts exactly one new collector against [newTransport] - never
+     * both running at once. The collector itself ALSO checks
+     * `newTransport !== activeTransport` on every emission (not just at
+     * attach time) as a second, redundant guard against a genuinely
+     * in-flight emission from the old transport's hot flow winning a race
+     * against cancellation (cancel() takes effect at the next suspension
+     * point, not necessarily synchronously) - see class docs' "stale events
+     * must not overwrite current state" requirement.
+     */
+    private fun switchActiveTransport(newTransport: VpnTransport) {
+        if (newTransport === activeTransport && activeObserverJob?.isActive == true) return
+        activeObserverJob?.cancel()
+        activeTransport = newTransport
+        hasTouchedTransport = false
+        activeObserverJob = scope.launch {
+            newTransport.observeState().collect { transportState ->
                 if (!hasTouchedTransport) return@collect
+                if (newTransport !== activeTransport) return@collect
                 // While a reconnect cycle owns the visible state (Reconnecting/backoff),
                 // don't let a transient Disconnected from an internal retry attempt
                 // flicker the UI back to plain Disconnected.
@@ -172,10 +233,6 @@ class VpnController(
                 diagnostics.updateTransportState(_state.value)
             }
         }
-        reconnectManager.start(
-            onNetworkLost = { handleNetworkLost() },
-            onNetworkAvailable = { /* reconnect loop polls isNetworkAvailable() on its own cadence */ },
-        )
     }
 
     fun gatewayStatus(): GatewayConfiguration = gatewayConfigurationRepository.get()
@@ -200,27 +257,23 @@ class VpnController(
     fun permissionIntentIfNeeded(): Intent? = transport.preparePermissionIntent()
 
     /**
-     * B8I4 - the ONE per-attempt execution boundary: [resolved] is what an
+     * B8I5 - the ONE per-attempt execution boundary: [resolved] is what an
      * upstream caller (MainViewModel, via TransportOrchestrator - the ONE
      * decision authority remains SmartConnectCandidateSelector, never this
      * class) already resolved for THIS attempt. Defaults to this
      * controller's own constructor-owned transport/kind, so every EXISTING
      * caller (including every pre-B8I4 test) is byte-for-byte unaffected.
      *
-     * This no longer blindly assumes the constructor-owned transport is
-     * what should run: [resolved] is validated against it first. A
-     * DIFFERENT transport instance is refused, not silently substituted -
-     * this controller's background observeState() collector (see init
-     * block), disconnect(), and stats() polling are all wired to exactly
-     * ONE transport instance for its whole lifetime; safely driving a
-     * second, independent instance through the SAME lifecycle/state
-     * machine would need a real redesign (multiple collectors, per-attempt
-     * disconnect/stats routing) that is explicitly out of scope here - see
-     * class docs' "avoid parallel state machines" and B8I5's own scope note.
-     * [resolved.kind] then selects which TransportConfig shape
-     * buildTransportConfig() below builds - today only AMNEZIA_WG has one;
-     * any other kind fails closed via the EXISTING
-     * ConfigurationMappingFailure path, never a new/parallel failure mode.
+     * [resolved.kind] must be one of [SUPPORTED_KINDS] (AMNEZIA_WG only
+     * today - the only kind buildTransportConfig() can build a config for) -
+     * checked BEFORE the active transport is switched or touched at all, so
+     * an unsupported kind never requests VPN permission or attaches an
+     * observer. When [resolved.kind] IS supported, [resolved.transport]
+     * becomes THE active transport for this attempt/session via
+     * switchActiveTransport() - a genuinely different instance is adopted
+     * (with safe detach/attach, never a silent substitute or a second
+     * concurrent collector - see that function's own docs), it is never
+     * refused merely for not being the constructor-owned instance.
      */
     suspend fun connect(
         resolved: TransportOrchestrator.Resolution.Resolved = TransportOrchestrator.Resolution.Resolved(transport, transport.kind),
@@ -233,28 +286,19 @@ class VpnController(
             if (_state.value is TransportState.Connecting || _state.value is TransportState.Connected) {
                 return
             }
-            // B8I4 - the ONE place this controller's actual execution
-            // capability is checked: [resolved.transport] must be the exact
-            // instance this controller owns (never a silent substitute -
-            // see class docs on why a different instance can't be safely
-            // driven yet), AND [resolved.kind] must be AMNEZIA_WG - the only
-            // kind buildTransportConfig() below can actually build a config
-            // for today. A resolved instance whose OWN .kind happens to
-            // equal AMNEZIA_WG too would trivially satisfy an
-            // instance-vs-its-own-kind check, so AMNEZIA_WG is compared
-            // explicitly here, not merely resolved.kind == transport.kind.
-            if (resolved.transport !== transport || resolved.kind != TransportKind.AMNEZIA_WG) {
+            if (resolved.kind !in SUPPORTED_KINDS) {
                 rejectPreflight(
                     VpnError.UnsupportedTransportSelected(resolved.kind.name),
-                    "Resolved transport (${resolved.kind}) cannot be executed by this VpnController instance yet",
+                    "Resolved transport (${resolved.kind}) is not supported by this VpnController yet",
                 )
                 return
             }
+            switchActiveTransport(resolved.transport)
             pendingConnectKind = resolved.kind
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
-            val permissionIntent = transport.preparePermissionIntent()
+            val permissionIntent = activeTransport.preparePermissionIntent()
             if (permissionIntent != null) {
                 _events.tryEmit(ControllerEvent.RequestVpnPermission(permissionIntent))
                 return
@@ -266,7 +310,13 @@ class VpnController(
         }
     }
 
-    /** Call from the Activity's permission-result callback. */
+    /**
+     * Call from the Activity's permission-result callback. Resumes the SAME
+     * attempt connect() deferred: [activeTransport] was already switched (if
+     * needed) before the permission request was emitted, and [pendingConnectKind]
+     * is the SAME kind validated then - both the resolved instance AND kind
+     * are preserved across this round-trip, never re-derived here.
+     */
     suspend fun onVpnPermissionResult(granted: Boolean) {
         diagnostics.updatePermission(granted)
         if (!granted) {
@@ -285,7 +335,7 @@ class VpnController(
             userInitiatedDisconnect = true
             cancelReconnectLocked()
             hasTouchedTransport = true
-            transport.disconnect()
+            activeTransport.disconnect()
             // B8H - the interface this policy was baked into is gone; the
             // NEXT connect() re-reads appRoutingPolicyStore fresh (see
             // doConnectAttempt), which is what actually applies a changed
@@ -351,7 +401,7 @@ class VpnController(
                 val attemptStartEpochMillis = System.currentTimeMillis()
                 return try {
                     hasTouchedTransport = true
-                    transport.connect(transportConfig)
+                    activeTransport.connect(transportConfig)
                     // B8H - the VpnService interface now reflects
                     // routingPolicy (whether or not a handshake follows) -
                     // only a thrown connect() (caught below) means no
@@ -451,7 +501,7 @@ class VpnController(
     private suspend fun awaitFreshHandshake(attemptStartEpochMillis: Long): Boolean {
         val maxPolls = (HANDSHAKE_TIMEOUT_MS / HANDSHAKE_POLL_INTERVAL_MS).toInt()
         for (pollIndex in 0..maxPolls) {
-            when (val stats = transport.stats()) {
+            when (val stats = activeTransport.stats()) {
                 is TransportStats.Counters -> {
                     if (isFreshHandshake(stats.lastHandshakeEpochMillis, attemptStartEpochMillis)) {
                         return true
@@ -466,7 +516,7 @@ class VpnController(
     }
 
     private suspend fun recordCurrentStats() {
-        val stats = transport.stats()
+        val stats = activeTransport.stats()
         if (stats is TransportStats.Counters) {
             diagnostics.updateStats(stats.lastHandshakeEpochMillis, stats.bytesReceived, stats.bytesSent)
         }
@@ -491,7 +541,7 @@ class VpnController(
         val nowEpochMillis = System.currentTimeMillis()
         store.record(
             ConnectionOutcome(
-                transport = transport.kind,
+                transport = activeTransport.kind,
                 gatewayId = ProductionGateway.ID,
                 result = result,
                 handshakeDurationMs = nowEpochMillis - attemptStartEpochMillis,
@@ -501,6 +551,17 @@ class VpnController(
         )
     }
 
+    /**
+     * B8I5 - reconnect (this whole automatic-recovery polling mechanism)
+     * stays AWG-only for this slice, explicitly: it only ever runs after a
+     * successful doConnectAttempt(), which today only ever succeeds for
+     * AMNEZIA_WG (see SUPPORTED_KINDS/buildTransportConfig) - there is no
+     * generic "retry" invented here for a kind that doesn't support it. A
+     * future non-AWG active transport reaching Connected (B8I6+) would need
+     * its OWN deliberate decision about whether polling-for-a-fresh-
+     * handshake even makes sense for that protocol - never assumed
+     * automatically by reusing this loop as-is.
+     */
     private fun handleNetworkLost() {
         if (userInitiatedDisconnect) return
         if (_state.value !is TransportState.Connected) return
@@ -578,8 +639,18 @@ class VpnController(
         reconnectJob = null
     }
 
+    /**
+     * B8I5 - final teardown: stops network-loss observation AND cleans up
+     * the active transport's observer/reconnect job explicitly, rather than
+     * relying solely on `scope` being cancelled by the caller afterwards -
+     * makes cleanup deterministic and independently testable. Not called
+     * under connectMutex (this is a one-time terminal call, not a lifecycle
+     * transition to serialize against another connect()/disconnect()).
+     */
     fun shutdown() {
         reconnectManager.stop()
+        reconnectJob?.cancel()
+        activeObserverJob?.cancel()
     }
 }
 
