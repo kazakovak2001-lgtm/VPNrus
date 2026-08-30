@@ -441,7 +441,11 @@ class MainViewModel(
      */
     fun reachabilityDiagnostics(): net.pocvpn.client.reachability.ReachabilityDiagnosticsSnapshot? {
         val repository = manifestRepository ?: return null
-        val manifest = repository.trusted()
+        // Fail closed - see EndpointManifestRepository.trustedState()'s own
+        // docs: NoneTrusted means neither LKG nor the embedded bootstrap
+        // itself verified, and this accessor must not fabricate a snapshot
+        // around an unverified manifest just because one is compiled in.
+        val manifest = repository.trusted() ?: return null
         val registry = buildTransportRegistry()
         val health = transportHealth()
         val restriction = restrictionClass()

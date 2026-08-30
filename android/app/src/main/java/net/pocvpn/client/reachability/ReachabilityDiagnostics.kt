@@ -28,6 +28,10 @@ data class ReachabilityDiagnosticsSnapshot(
  * of its own - callers (e.g. MainViewModel, mirroring its existing
  * restrictionClass()/transportScores() read-only accessor pattern) supply
  * freshly computed inputs on every read.
+ *
+ * Returns null exactly when [EndpointManifestRepository.trustedState] is
+ * [TrustedManifestState.NoneTrusted] - fail closed, never a snapshot built
+ * around an unverified manifest just because one is compiled into the APK.
  */
 object ReachabilityDiagnostics {
     fun snapshot(
@@ -35,13 +39,13 @@ object ReachabilityDiagnostics {
         reachability: List<EndpointReachability>,
         pathCandidates: List<PathCandidate>,
         rankedPaths: List<PathScorer.PathScoreResult>,
-    ): ReachabilityDiagnosticsSnapshot {
-        val manifest = manifestRepository.trusted()
+    ): ReachabilityDiagnosticsSnapshot? {
+        val trusted = manifestRepository.trustedState() as? TrustedManifestState.Trusted ?: return null
         return ReachabilityDiagnosticsSnapshot(
-            manifestVersion = manifest.manifestVersion,
-            manifestSource = manifestRepository.trustedSource(),
-            manifestExpiresAtEpochMillis = manifest.expiresAtEpochMillis,
-            endpoints = manifest.endpoints,
+            manifestVersion = trusted.manifest.manifestVersion,
+            manifestSource = trusted.source,
+            manifestExpiresAtEpochMillis = trusted.manifest.expiresAtEpochMillis,
+            endpoints = trusted.manifest.endpoints,
             reachability = reachability,
             pathCandidates = pathCandidates,
             rankedPaths = rankedPaths,
