@@ -60,10 +60,15 @@ in the project history for that boundary.
      -> Gateway selection
    ```
 
-   Today, only `NetworkProfiler -> SmartConnectDecisionEngine ->
-   TransportOrchestrator` exist (Phase 2A, FOUNDATION, unwired).
-   `RestrictionClassifier`, `RoutingDecisionEngine` wired into this
-   pipeline, and gateway selection do not exist yet.
+   Today, `NetworkProfiler -> RestrictionClassifier ->
+   SmartConnectDecisionEngine -> TransportOrchestrator` all exist and are
+   live-wired into the real connect path (`MainViewModel.connect()` /
+   `smartConnectDecision()`) - not merely Phase 2A foundation code.
+   `RestrictionClassifier`'s output is carried through as
+   `ConnectionScore.restrictionClass` for truthful diagnostics (principle
+   10 below), but does not yet change WHICH candidate is selected -
+   `RoutingDecisionEngine` wired into this pipeline, and gateway
+   selection, still do not exist.
 
 3. **Distinct failure conditions.** A connection attempt that fails must be
    attributable to one of (at minimum):
@@ -132,9 +137,9 @@ in the project history for that boundary.
 | XRay / VLESS REALITY fallback | **IMPLEMENTED** | Client and gateway both real and live-wired. Client: `XrayProfileStore`/`XrayProfileRepository` persist a provisioned profile, `VlessRealityTransport`/`NovaXrayVpnService`/`XrayCoreController` execute it through `VpnController` (B8I6-B8I7), which registers `TransportKind.XRAY_REALITY` as available whenever a real profile repository is wired - production always does. Gateway: Xray profile provisioning/activation is real (`gateway/api/xray_activation.py`, `xray_provisioning.py`, B8K1-B8K4), with its `/v1/activate`/`/v1/xray-profile` routes now exposed at the nginx edge (B8K5A, PR #10). `AwgXrayFailoverPolicy` (B8I8) automatically falls back a failed AWG attempt to Xray, and the REALITY key validation bug is fixed (same commit, PR #9). AWG->Xray automatic failover **VERIFIED** end-to-end on a real VPS (AWG peer removed, AWG failed, automatic Xray fallback executed, live Xray traffic and a matching exit IP confirmed on the server). |
 | QUIC transport/fallback | PLANNED | No code. |
 | TLS/TCP fallback | PLANNED | No code. |
-| Smart Connect | **FOUNDATION** | `SmartConnectDecisionEngine` (Phase 2A) is real, pure, and unit-tested, but NOT live-wired into `VpnController`. |
-| Network Profiler | **FOUNDATION** | `NetworkProfiler` (Phase 2A) uses real `ConnectivityManager` callbacks, instrumented-test-verified; not consumed by any live flow yet. |
-| Restriction Classifier | PLANNED | No code. Target position: between `NetworkProfiler` and `RoutingDecisionEngine` (see pipeline above). |
+| Smart Connect | **FOUNDATION** | `SmartConnectDecisionEngine` (Phase 2A) is real, pure, and unit-tested, and IS live-wired as of B8I1/B8I8 - `MainViewModel.connect()` calls `smartConnectDecision()` (via `SmartConnectCandidateSelector`) for every real attempt, and `AwgXrayFailoverPolicy` consults its outcome for AWG->Xray fallback. Kept at FOUNDATION: the full target pipeline (architecture principle 2) is still incomplete - `RoutingDecisionEngine` wired into this pipeline and gateway selection do not exist yet. |
+| Network Profiler | **FOUNDATION** | `NetworkProfiler` (Phase 2A) uses real `ConnectivityManager` callbacks, instrumented-test-verified, and IS consumed by the live connect path (wired into `MainViewModel`'s `Factory`, feeds `smartConnectDecision()`/`RestrictionClassifier`). Kept at FOUNDATION: it only covers device-level connectivity facts, not the rest of architecture principle 2's target pipeline. |
+| Restriction Classifier | **FOUNDATION** | `RestrictionClassifier` (B8J) is real and unit-tested (`RestrictionClassifierTest`), classifying from real evidence (`NetworkProfiler`, `VpnController` state, connection outcomes, gateway HTTPS probes) - conservative, evidence-only classes, no DPI/TSPU/country-level claims. Live-wired: `MainViewModel.restrictionClass()` feeds it into `smartConnectDecision()` (`ConnectionScore.restrictionClass`) and the diagnostics UI. Kept at FOUNDATION, not IMPLEMENTED: it does not yet drive an adaptive decision - it never changes which candidate is selected (see Adaptive Direct Routing row). |
 | Hard Whitelist Detection | PLANNED | No code. See architecture principle 4 - detection only, never impersonation. |
 | Adaptive Direct Routing | PLANNED | `ClientRoutingPolicy`/`RoutingDecisionEngine` (FOUNDATION) provide the static-policy substrate; the *adaptive*, classifier-driven behavior itself does not exist yet. |
 | Gateway Pool | PLANNED | No code; single hardcoded local-dev gateway only. |
