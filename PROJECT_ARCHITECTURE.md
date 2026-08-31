@@ -13,14 +13,47 @@ and not for ROADMAP status-only edits.
 NetworkProfiler
   -> RestrictionClassifier
   -> ReachabilityEngine
-  -> PathCandidateBuilder / PathScorer   (PathScorer: OBSERVATIONAL ONLY)
+  -> PathCandidateBuilder / PathScorer   (live-wired for BOTH manual and auto gateway mode - B16)
   -> SmartConnectDecisionEngine           (picks a TRANSPORT, never a gateway)
   -> TransportOrchestrator
 ```
 
-- `PathScorer` never drives a live decision unless a ROADMAP slice explicitly promotes it.
-- `SmartConnectDecisionEngine`/`AwgXrayFailoverPolicy` operate WITHIN the manually
-  selected gateway only. No automatic multi-gateway selection/failover exists.
+- `SmartConnectDecisionEngine`/`AwgXrayFailoverPolicy` still operate WITHIN one
+  gateway only (transport choice/intra-gateway AWG->Xray failover) - unchanged by B16.
+- **B16 - automatic multi-GATEWAY selection/failover is now real, above that
+  boundary**: `AutoGatewaySelector` (`smartconnect/AutoGatewaySelector.kt`)
+  promotes the SAME `ReachabilityEngine`/`PathCandidateBuilder`/`PathScorer`
+  pipeline (reused verbatim, never a parallel scorer) into a ranked
+  `GatewayAttemptCandidate` list across every PROVISIONED production gateway.
+  `EndpointDescriptor`s for this ranking come from `ProductionGatewayEndpoints`
+  (built from `ProductionGatewayCatalog`), deliberately NOT the Signed Offline
+  Bootstrap manifest (which still only names "frankfurt" - extending it needs
+  the offline key ceremony, out of scope). Only engaged when
+  `MainViewModel.gatewayAutoMode` is true (persisted, default `false`/Manual -
+  every pre-B16 install/test is unaffected). Manual gateway selection
+  (`SelectedGatewayStore`/`selectGateway()`) is byte-for-byte unchanged and
+  always wins when active - selecting a gateway manually also turns Auto off.
+- **Candidate identity/execution**: `ActiveAttemptGatewaySource` is an
+  in-memory, per-attempt override `SelectedProductionGatewaySource`'s
+  `selectedGatewayId` supplier consults AHEAD of the persisted
+  `SelectedGatewayStore` (whose own `read()` is passed as a LAZY fallback, so
+  it is genuinely never invoked while an Auto override is set). MainViewModel
+  sets this override to a candidate's `gatewayId` explicitly BEFORE calling
+  `controller.connect()` and never changes it until the next attempt/candidate -
+  satisfying "never infer gateway identity after the attempt starts, never
+  reread SelectedGatewayStore during the attempt." For Manual mode the
+  override is never set, so this resolves exactly as before B16.
+- **Bounded cross-gateway failover**: on a genuine terminal failure
+  (`AutoGatewayFailoverPolicy.isEligibleForNextCandidate` - the same
+  enumerated HandshakeTimeout/BackendStartFailure categories
+  `AwgXrayFailoverPolicy` already uses for intra-gateway AWG->Xray), the
+  SAME `armFailoverWatch` collector advances to the next ranked candidate
+  (`AutoGatewaySelector.nextCandidate`), bounded by `MAX_ATTEMPTS=4` and never
+  retrying an already-attempted (gateway, transport) pair; exhausting the
+  ranked set fails closed (`VpnError.NoCandidateAvailable`). Existing
+  intra-gateway AWG->Xray failover (`AwgXrayFailoverPolicy`/
+  `maybeFailoverToXray`) is completely unchanged and still applies for Manual
+  mode (and within whichever gateway an Auto sequence is currently attempting).
 
 ## Per-device identity (hard invariant)
 
@@ -64,8 +97,13 @@ relying on this for anything user-facing - this table is a snapshot, ROADMAP is 
 | AWG client identity provisioning | real, self-service | real, self-service (B15) - physically verified: real device activation, real AWG handshake, exit IP `16.170.208.231` |
 | Public IP addressing | stable | AWS auto-assigned, NOT durable/reserved |
 
-Gateway Pool remains **FOUNDATION**. Automatic multi-gateway failover is **NOT
-implemented**.
+Gateway Pool remains **FOUNDATION** (see ROADMAP's own Gateway Pool row for
+why - Stockholm's non-durable IPv4 addressing is unrelated to and unresolved
+by B16). Automatic multi-gateway selection/failover is now **IMPLEMENTED as
+pure decision logic** (real candidate construction/ranking/bounded failover,
+unit-proven - see AutoGatewaySelectorTest/MainViewModelAutoGatewayTest) but
+has **NOT been physically validated on a real device** in this slice - see
+ROADMAP's own B16 row for the exact scope of what is/isn't proven.
 
 ## Production vs debug boundary
 
@@ -90,9 +128,10 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-08-31 (after B15 completion - real on-device Stockholm
-activation succeeded end-to-end: AWG, REALITY, and TLS all physically
-verified through the real control plane, provisioning persists across an
-app restart, Germany unaffected. See ROADMAP's Gateway Pool row).
+Last updated: 2026-08-31 (after B16 - automatic multi-gateway selection/
+failover promoted the existing reachability/PathScorer pipeline into a real
+gateway-level decision boundary, pure-logic/unit-verified; NOT yet physically
+validated on a real device. See ROADMAP's Gateway Pool / automatic gateway
+failover rows).
 If this file's "Current gateway state" table conflicts with `docs/ROADMAP.md`,
 ROADMAP wins - update this file to match rather than trusting the stale copy.

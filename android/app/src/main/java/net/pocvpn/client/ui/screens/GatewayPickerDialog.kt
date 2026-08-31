@@ -52,13 +52,24 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
  * action that requests activation for THAT gateway id specifically, leaving
  * the row's own clickable/RadioButton [onSelect] wiring (connection
  * selection) untouched.
+ *
+ * B16 - a leading "Auto" row lets the user hand gateway choice to Smart
+ * Connect (task requirement 9's minimal UI: "Auto / Smart Connect, Germany,
+ * Stockholm"). Selected when [autoMode] is true - in that state none of the
+ * manual [ProductionGatewayId] rows show as selected, even if [current]
+ * still names one (it remains the manual fallback/last pick, never
+ * fabricated). Tapping a manual row still calls [onSelect] exactly as
+ * before AND is what turns Auto back off (see MainViewModel.selectGateway's
+ * own docs) - this dialog itself has no separate "turn auto off" concept.
  */
 @Composable
 fun GatewayPickerDialog(
     current: ProductionGatewayId,
+    autoMode: Boolean,
     options: List<ProductionGatewayDescriptor>,
     provisionedGatewayIds: Set<ProductionGatewayId>,
     onSelect: (ProductionGatewayId) -> Unit,
+    onSelectAuto: () -> Unit,
     onActivate: (ProductionGatewayId) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -75,8 +86,36 @@ fun GatewayPickerDialog(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onSelectAuto)
+                        .padding(vertical = 8.dp),
+                ) {
+                    RadioButton(selected = autoMode, onClick = onSelectAuto)
+                    Column {
+                        Text(
+                            text = stringResource(R.string.gateway_picker_auto_title),
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = stringResource(R.string.gateway_picker_auto_subtitle),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
                 options.forEach { descriptor ->
-                    val selected = descriptor.id == current
+                    // B16 - while Auto is engaged, no manual row shows as
+                    // selected, even though [current] still names the last
+                    // manual pick (the fallback GatewayConfigurationRepository
+                    // would resolve to if Auto were ever turned off) - never
+                    // a false "you picked this one" claim.
+                    val selected = !autoMode && descriptor.id == current
                     val provisioned = descriptor.id in provisionedGatewayIds
                     val rowModifier = Modifier
                         .fillMaxWidth()
