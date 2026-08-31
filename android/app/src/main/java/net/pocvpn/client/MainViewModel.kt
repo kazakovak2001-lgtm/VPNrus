@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
@@ -59,6 +60,7 @@ import net.pocvpn.client.vpn.AndroidReconnectManager
 import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.ReconnectManager
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.blocksGatewaySelection
 import net.pocvpn.client.vpn.VlessRealityTransport
 import net.pocvpn.client.vpn.VlessTlsTransport
 import net.pocvpn.client.vpn.VpnController
@@ -211,6 +213,21 @@ class MainViewModel(
     private val xrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
     private val xrayTlsTransport: VpnTransport? = null,
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
+    // B13 consolidated review fix - additive, defaults to null (same "no
+    // wiring, no behavior" seam as every other optional dependency above).
+    // [xrayProfileRepository]/[xrayTlsProfileRepository] above are ALWAYS
+    // the production/Germany endpoint's own repository (see Factory) - a
+    // real bug had Stockholm's XRAY_REALITY/TLS_TCP availability silently
+    // inherit Germany's flag instead of ever consulting Stockholm's OWN
+    // repository. These two are Stockholm's own, separately-scoped
+    // repository instances (same on-disk file the debug-only
+    // XrayDiagnosticsActivity manual-save path already writes to when an
+    // operator has provisioned Stockholm credentials - never a second/
+    // fabricated store) - see xrayAvailableEndpoints/xrayTlsAvailableEndpoints
+    // and buildTransportRegistry(endpointId) below for how these make
+    // availability genuinely per-endpoint.
+    private val stockholmXrayProfileRepository: XrayProfileRepository? = null,
+    private val stockholmXrayTlsProfileRepository: XrayTlsProfileRepository? = null,
     // B8I8 - additive, defaults to Auto (byte-for-byte unchanged production
     // behavior - no product UI sets anything else yet). Threaded into every
     // smartConnectDecision() call AND consulted by the AWG -> Xray failover
@@ -233,7 +250,152 @@ class MainViewModel(
     // this constructor param existing does not, by itself, cause any
     // network access.
     private val manifestDistributionClient: net.pocvpn.client.reachability.ManifestDistributionClient? = null,
+    // B13 - additive, defaults to a store that always reads GERMANY and
+    // ignores writes (see SelectedGatewayStore.germanyOnly()'s own docs) -
+    // every pre-B13 call site/test is byte-for-byte unaffected: the manual
+    // gateway picker simply has nothing to persist to, and
+    // gatewayConfigurationRepository is unaffected by this param entirely
+    // (it is wired to read the SAME store at the composition root - see
+    // Factory - so this field only drives the UI-facing
+    // selectedGateway/selectGateway() below, never a second, competing
+    // source of truth for the actual connect-time config).
+    private val selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = net.pocvpn.client.vpn.config.SelectedGatewayStore.germanyOnly(),
+    // B13 review fix - additive, defaults to null (same "no wiring, no
+    // behavior" seam as every other optional dependency above). When
+    // non-null, this is the SAME per-device ClientTunnelIdentityStore
+    // instance the Factory's real SelectedProductionGatewaySource already
+    // resolves clientTunnelIp() from (see that class's own docs) - never a
+    // second, independently-constructed store that could disagree with
+    // what connect() actually resolves. Drives isGatewayProvisioned()/
+    // provisionedGatewayIds below AND the startup reconciliation the
+    // _selectedGateway initializer runs. With no store wired, every
+    // gateway is treated as provisioned - byte-for-byte unchanged
+    // behavior for every pre-existing call site/test.
+    private val clientTunnelIdentityStore: net.pocvpn.client.vpn.config.ClientTunnelIdentityStore? = null,
 ) : ViewModel() {
+
+    /**
+     * B13 review fix - whether THIS DEVICE has a client tunnel identity
+     * provisioned for [id] (see ClientTunnelIdentityStore's own docs) -
+     * i.e. whether [id] is actually connectable, not merely a catalog
+     * entry. With no store wired ([clientTunnelIdentityStore] null), every
+     * gateway is considered provisioned.
+     */
+    fun isGatewayProvisioned(id: net.pocvpn.client.vpn.config.ProductionGatewayId): Boolean {
+        val store = clientTunnelIdentityStore ?: return true
+        return store.read(id) != null
+    }
+
+    /**
+     * The subset of [net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all]
+     * this device can actually connect to right now - GatewayPickerDialog
+     * uses this to decide which rows to disable. The catalog itself stays
+     * fully visible regardless (see that dialog's own docs) - this is
+     * readiness, never a second, competing gateway list.
+     */
+    val provisionedGatewayIds: Set<net.pocvpn.client.vpn.config.ProductionGatewayId>
+        get() = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all
+            .map { it.id }
+            .filter(::isGatewayProvisioned)
+            .toSet()
+
+    // B13 - the CURRENT manual gateway selection, for the UI (LocationCard/
+    // the gateway picker) to render and react to. Read once at construction
+    // (matches appRoutingPolicyStore's own savedAppRoutingPolicy pattern)
+    // and updated in-place by selectGateway() - the actual connect-time
+    // GatewayConfigurationRepository reads selectedGatewayStore fresh on
+    // every get() regardless of this StateFlow's value (see
+    // SelectedProductionGatewaySource's own docs), so this is purely a UI
+    // convenience, never a second authoritative copy.
+    //
+    // B13 review fix - reconciled through reconcileSelectedGateway() below
+    // rather than the raw store read: a PERSISTED selection this device
+    // turns out not to be provisioned for (e.g. Stockholm was selected
+    // before this device's Stockholm identity was ever set, or the
+    // evidence-based migration left it unprovisioned) is deterministically
+    // switched to another provisioned gateway - and that switch is
+    // PERSISTED too, so it survives a restart rather than re-drifting back
+    // every launch. If NO gateway is provisioned, the persisted selection
+    // is left exactly as read: no identity is invented, no gateway is
+    // substituted as a guess, and the existing fail-closed connect-time
+    // validation (DefaultGatewayConfigurationRepository - blank
+    // clientTunnelIp() -> Invalid, never a silent default) is preserved
+    // untouched.
+    private val _selectedGateway = MutableStateFlow(reconcileSelectedGateway(selectedGatewayStore.read()))
+    val selectedGateway: StateFlow<net.pocvpn.client.vpn.config.ProductionGatewayId> = _selectedGateway.asStateFlow()
+
+    private fun reconcileSelectedGateway(
+        persisted: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    ): net.pocvpn.client.vpn.config.ProductionGatewayId {
+        if (isGatewayProvisioned(persisted)) return persisted
+        val fallback = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all
+            .map { it.id }
+            .firstOrNull(::isGatewayProvisioned)
+            ?: return persisted
+        selectedGatewayStore.write(fallback)
+        return fallback
+    }
+
+    /**
+     * B13 consolidated review fix (finding 2) - re-runs the SAME
+     * reconciliation [reconcileSelectedGateway] performs at construction,
+     * but callable AFTER construction, any time this device's provisioning
+     * readiness might just have changed (today: exactly once, right after
+     * activateDevice() writes a fresh ClientTunnelIdentityStore entry - see
+     * that function's own docs). Startup reconciliation alone is
+     * insufficient: a gateway that was unprovisioned when this ViewModel
+     * was constructed (so its stale persisted selection was deliberately
+     * LEFT AS-IS - see reconcileSelectedGateway's own "no gateway
+     * provisioned" branch) can become provisioned later in the SAME
+     * session, with no app restart, and [selectedGateway] must reflect that
+     * immediately rather than silently staying stuck on an unusable
+     * gateway until the next launch. No-op (and no store write) when the
+     * current selection is already provisioned, or when nothing at all is
+     * provisioned yet - same "never invent/guess a fallback" contract as
+     * the constructor-time call.
+     */
+    private fun reconcileSelectedGatewayIfNeeded() {
+        _selectedGateway.value = reconcileSelectedGateway(_selectedGateway.value)
+    }
+
+    /**
+     * B13 - THE one place a manual gateway selection is made. Deterministic:
+     * always resolves to exactly the requested [id], persisted immediately
+     * so it survives an app restart (FileSelectedGatewayStore, atomic
+     * write - see its own docs), and reflected in [selectedGateway]
+     * immediately so the UI updates without waiting for a re-read. Does NOT
+     * itself reconnect/touch the tunnel - same "select now, apply on the
+     * next real connect()" contract as a saved AppRoutingPolicy change (see
+     * updateAppRoutingPolicy's own docs) - a currently active session keeps
+     * running on whichever gateway it already connected to until the user
+     * disconnects/reconnects.
+     *
+     * B13 review fix - a no-op for an [id] this device has no client tunnel
+     * identity for (see [isGatewayProvisioned]): GatewayPickerDialog itself
+     * already disables that row's tap target/RadioButton (see its own
+     * docs), and this is the same guard enforced again at the one real
+     * selection boundary, never relying on the UI alone.
+     *
+     * B13 consolidated review fix (finding 5) - ALSO a no-op while a VPN
+     * session actually exists (transportState is Connecting/Connected/
+     * Reconnecting/Disconnecting - see [blocksGatewaySelection]): changing
+     * [selectedGateway] while traffic may still be exiting the PREVIOUS
+     * gateway would make Home render a location the active tunnel is not
+     * actually using - false "you're in Sweden now" UI while packets still
+     * exit Germany. AppRoot's own gateway picker already refuses to open at
+     * all during an active session (same predicate, see
+     * ProductFlowPresentation.blocksGatewaySelection's own docs) - this is
+     * the same guard enforced again at the one real selection boundary,
+     * never relying on the UI alone. A user must disconnect first, exactly
+     * like every other "select now, apply on the next real connect()"
+     * setting in this ViewModel.
+     */
+    fun selectGateway(id: net.pocvpn.client.vpn.config.ProductionGatewayId) {
+        if (!isGatewayProvisioned(id)) return
+        if (transportState.value.blocksGatewaySelection()) return
+        selectedGatewayStore.write(id)
+        _selectedGateway.value = id
+    }
 
     // B8I - CURRENT network facts only (see NetworkProfile's own docs for
     // why this is deliberately separate from connectionOutcomeStore's
@@ -245,26 +407,39 @@ class MainViewModel(
     val networkProfile: StateFlow<NetworkProfile> =
         networkProfiler?.profile ?: MutableStateFlow(initialNetworkProfile ?: NetworkProfile.unavailable(0)).asStateFlow()
 
+    // B13 consolidated review fix - Germany's own endpointId, used
+    // throughout this class as the ONE key the legacy activation flow (and
+    // every pre-B13 default) is ever allowed to write availability/identity
+    // under - never a raw EndpointId(ProductionGateway.ID) literal repeated
+    // at each call site.
+    private val germanyEndpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.endpointId
+    private val stockholmEndpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId
+
     // B13 (audit item 5 fix) - the ONE authoritative endpoint -> repository
     // lookup VpnController.buildTransportConfig actually resolves through
     // for XRAY_REALITY/TLS_TCP - built here, at the composition root, from
-    // the SAME xrayProfileRepository/xrayTlsProfileRepository instances this
-    // ViewModel already received (never a second, independently-constructed
-    // store). Exactly one entry today (the real production endpoint) -
-    // adding a genuine second endpoint later means adding one more map
-    // entry here, never a resolver-contract change or a change inside
-    // VpnController itself. null when the underlying repository itself is
-    // null (matches every pre-B13 "not wired at all" call site).
-    private val xrayProfileRepositoryResolver: net.pocvpn.client.identity.XrayProfileRepositoryResolver? = xrayProfileRepository?.let { repo ->
-        net.pocvpn.client.identity.MapXrayProfileRepositoryResolver(
-            mapOf(net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID) to repo),
-        )
-    }
-    private val xrayTlsProfileRepositoryResolver: net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver? = xrayTlsProfileRepository?.let { repo ->
-        net.pocvpn.client.identity.MapXrayTlsProfileRepositoryResolver(
-            mapOf(net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID) to repo),
-        )
-    }
+    // the SAME xrayProfileRepository/xrayTlsProfileRepository/
+    // stockholmXrayProfileRepository/stockholmXrayTlsProfileRepository
+    // instances this ViewModel already received (never a second,
+    // independently-constructed store).
+    //
+    // B13 consolidated review fix - now carries BOTH endpoints (when both
+    // repositories are wired), not just production/Germany: a real gap had
+    // Stockholm always resolve to null here regardless of whether it had
+    // its own real, separately-provisioned profile on disk, silently
+    // failing closed for the wrong reason (missing wiring, not missing
+    // credentials). null overall only when NEITHER repository is wired
+    // (matches every pre-B13 "not wired at all" call site).
+    private val xrayProfileRepositoryResolver: net.pocvpn.client.identity.XrayProfileRepositoryResolver? =
+        buildMap {
+            xrayProfileRepository?.let { put(germanyEndpointId, it) }
+            stockholmXrayProfileRepository?.let { put(stockholmEndpointId, it) }
+        }.takeIf { it.isNotEmpty() }?.let { net.pocvpn.client.identity.MapXrayProfileRepositoryResolver(it) }
+    private val xrayTlsProfileRepositoryResolver: net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver? =
+        buildMap {
+            xrayTlsProfileRepository?.let { put(germanyEndpointId, it) }
+            stockholmXrayTlsProfileRepository?.let { put(stockholmEndpointId, it) }
+        }.takeIf { it.isNotEmpty() }?.let { net.pocvpn.client.identity.MapXrayTlsProfileRepositoryResolver(it) }
 
     private val controller = VpnController(
         transport = transport,
@@ -289,19 +464,34 @@ class MainViewModel(
         networkProfileProvider = { networkProfile.value },
     )
 
-    // B8I7 - flips true the moment a real Xray profile is CONFIRMED to
-    // exist: checked once at startup (init block below, for a profile
+    // B8I7 - gains the endpointId of a gateway the moment a real Xray
+    // profile is CONFIRMED to exist FOR THAT ENDPOINT: checked once at
+    // startup for every wired repository (init block below, for a profile
     // persisted by a PRIOR session) and again the instant activateDevice()
-    // saves a fresh one (XrayProfileProvisioningOutcome.Saved, below) -
-    // never polled, never inferred from elapsed time. buildTransportRegistry()
-    // reads this synchronously (a plain StateFlow.value read) so the
-    // registry it builds always reflects the CURRENT truth.
-    private val xrayAvailable = MutableStateFlow(false)
+    // saves a fresh one for Germany (XrayProfileProvisioningOutcome.Saved,
+    // below) - never polled, never inferred from elapsed time.
+    // buildTransportRegistry(endpointId) reads this synchronously (a plain
+    // StateFlow.value read) so the registry it builds always reflects the
+    // CURRENT truth for the SPECIFIC endpoint it was asked about.
+    //
+    // B13 consolidated review fix - was a single global Boolean, which made
+    // Germany's own Xray profile silently make Stockholm's XRAY_REALITY
+    // appear AVAILABLE too (and vice versa) - the exact split-authority bug
+    // this Set<EndpointId> shape closes: isXrayAvailableFor(endpointId)
+    // below is the ONE place availability is actually read, and it is
+    // always asked about ONE specific endpoint, never "is Xray available
+    // anywhere".
+    private val xrayAvailableEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
 
-    // B8O2 - the TLS/TCP counterpart of [xrayAvailable] above: flips true
-    // once a real TLS profile is CONFIRMED to exist (startup check + fresh
-    // activateDevice() success), same "never polled" discipline.
-    private val xrayTlsAvailable = MutableStateFlow(false)
+    // B8O2 - the TLS/TCP counterpart of [xrayAvailableEndpoints] above,
+    // same per-endpoint shape and same reasoning.
+    private val xrayTlsAvailableEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
+
+    private fun isXrayAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
+        endpointId in xrayAvailableEndpoints.value
+
+    private fun isXrayTlsAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
+        endpointId in xrayTlsAvailableEndpoints.value
 
     /**
      * B8O3 - the kind of the transport actually running/last attempted
@@ -348,7 +538,7 @@ class MainViewModel(
     /**
      * B8I1/B8I7 - built FRESH on every call (never cached as a field) so
      * XRAY_REALITY's AVAILABLE/NOT_IMPLEMENTED status always reflects the
-     * CURRENT [xrayAvailable] signal, same "no caching" discipline
+     * CURRENT [xrayAvailableEndpoints] signal, same "no caching" discipline
      * [smartConnectDecision] itself already documents. The factory closures
      * always return the SAME already-constructed `transport`/[xrayTransport]
      * instances - rebuilding this registry object never constructs a new
@@ -356,17 +546,27 @@ class MainViewModel(
      * (connect()'s own orchestrator, built from THIS SAME function) can
      * never end up looking at two different Xray instances.
      *
+     * B13 consolidated review fix - [endpointId] is REQUIRED (defaulted only
+     * to Germany's own id, so every pre-existing call site - test or
+     * production - that never named a second gateway keeps its exact prior
+     * meaning): availability is evaluated for THIS SPECIFIC endpoint via
+     * isXrayAvailableFor/isXrayTlsAvailableFor, never a global flag. Every
+     * REAL call site below passes the endpoint the attempt actually targets
+     * (never a default) - see smartConnectDecision()/connect()'s own docs.
+     *
      * `internal` (not private) so tests can inspect the exact descriptors
      * this produces directly, without needing a real Android Context to
      * drive smartConnectDecision()/connect() end to end.
      */
-    internal fun buildTransportRegistry(): TransportRegistry {
+    internal fun buildTransportRegistry(
+        endpointId: net.pocvpn.client.reachability.EndpointId = germanyEndpointId,
+    ): TransportRegistry {
         val descriptors = mutableListOf(
             TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport }),
         )
         val xray = xrayTransport
         if (xray != null) {
-            val available = xrayAvailable.value
+            val available = isXrayAvailableFor(endpointId)
             descriptors += TransportDescriptor(
                 kind = xray.kind,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
@@ -383,7 +583,7 @@ class MainViewModel(
         // failover decision - see docs/ROADMAP.md's own safety-boundary note.
         val xrayTls = xrayTlsTransport
         if (xrayTls != null) {
-            val available = xrayTlsAvailable.value
+            val available = isXrayTlsAvailableFor(endpointId)
             descriptors += TransportDescriptor(
                 kind = xrayTls.kind,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
@@ -404,15 +604,33 @@ class MainViewModel(
      * carried through TRUTHFULLY (see ConnectionScore's own docs) but never
      * changes WHICH candidate is selected - no restriction-driven switching.
      */
-    fun smartConnectDecision(): SmartConnectDecision = SmartConnectCandidateSelector.decide(
-        networkProfile = networkProfile.value,
-        gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(gatewayStatus()),
-        registry = buildTransportRegistry(),
-        preference = userTransportPreference,
-        health = transportHealth(),
-        connectionHistory = recentConnectionOutcomes(),
-        restrictionClass = restrictionClass(),
-    )
+    fun smartConnectDecision(): SmartConnectDecision {
+        // B13 - the candidate's id/region must match whichever gateway
+        // gatewayStatus() actually resolved to (both read the SAME
+        // selectedGatewayStore) - never the Germany-only default, or a
+        // Stockholm selection would be truthfully connected to but
+        // mislabeled/misattributed in ConnectionOutcome/PathHistory as
+        // Germany.
+        val selected = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGateway.value)
+        return SmartConnectCandidateSelector.decide(
+            networkProfile = networkProfile.value,
+            gatewayCandidates = SmartConnectCandidateSelector.productionGatewayCandidates(
+                gatewayStatus(),
+                id = selected.endpointId.value,
+                region = "${selected.displayCountry} / ${selected.displayCity}",
+            ),
+            // B13 consolidated review fix - THIS candidate's own endpoint,
+            // never the default: Xray/TLS availability in the registry
+            // Smart Connect scores against must correspond to the SAME
+            // gateway the candidate itself names (selected.endpointId) -
+            // see buildTransportRegistry(endpointId)'s own docs.
+            registry = buildTransportRegistry(selected.endpointId),
+            preference = userTransportPreference,
+            health = transportHealth(),
+            connectionHistory = recentConnectionOutcomes(),
+            restrictionClass = restrictionClass(),
+        )
+    }
 
     /** B8I - DEBUG diagnostics only; bounded by connectionOutcomeStore's own maxRecords. */
     fun recentConnectionOutcomes(): List<ConnectionOutcome> = connectionOutcomeStore?.recent().orEmpty()
@@ -445,7 +663,12 @@ class MainViewModel(
      */
     fun transportScores(): Map<TransportKind, Int> {
         val health = transportHealth()
-        return buildTransportRegistry().all().associate { descriptor ->
+        // B13 consolidated review fix - the CURRENTLY selected gateway's own
+        // endpoint, never the default: this is a diagnostic view of what a
+        // connection attempt would score right now, and that attempt would
+        // target whichever gateway is actually selected.
+        val selectedEndpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGateway.value).endpointId
+        return buildTransportRegistry(selectedEndpointId).all().associate { descriptor ->
             descriptor.kind to TransportScorer.score(descriptor.kind, descriptor.capabilities, health.getValue(descriptor.kind))
         }
     }
@@ -491,7 +714,21 @@ class MainViewModel(
         // itself verified, and this accessor must not fabricate a snapshot
         // around an unverified manifest just because one is compiled in.
         val manifest = repository.trusted() ?: return null
-        val registry = buildTransportRegistry()
+        // B13 SECOND consolidated review fix - a manifest can name MULTIPLE
+        // endpoints (Germany, Stockholm, ...), and Xray/TLS availability is
+        // now genuinely per-endpoint (see buildTransportRegistry(endpointId)'s
+        // own docs) - one registry built for whichever gateway happens to be
+        // CURRENTLY SELECTED cannot truthfully describe every OTHER
+        // endpoint's own candidates too (Germany's Xray profile existing
+        // must never make a Stockholm candidate look eligible, or vice
+        // versa). One registry is built per endpoint the manifest actually
+        // names, and each candidate below is scored against ITS OWN
+        // endpoint's registry - never the selected gateway's. Still
+        // observational only: nothing here feeds back into
+        // smartConnectDecision()/PathScorer is not promoted into Smart
+        // Connect by this fix.
+        val registriesByEndpoint: Map<net.pocvpn.client.reachability.EndpointId, TransportRegistry> =
+            manifest.endpoints.associate { it.id to buildTransportRegistry(it.id) }
         val health = transportHealth()
         val restriction = restrictionClass()
         val profile = networkProfile.value
@@ -618,11 +855,24 @@ class MainViewModel(
                 // could misrepresent the OTHER hop's own history.
                 is net.pocvpn.client.reachability.PathCandidate.Relayed -> null
             }
-            val capabilities = registry.descriptorFor(candidate.transport)?.capabilities
+            // B13 SECOND consolidated review fix - THIS candidate's own
+            // endpoint (the client-facing hop it actually executes against:
+            // the gateway itself for Direct, the ingress for Relayed - the
+            // SAME hop candidate.transport describes), never the globally
+            // selected gateway. Falls back to buildTransportRegistry(id) in
+            // the (should-never-happen) case an endpoint referenced by a
+            // candidate is somehow missing from registriesByEndpoint, rather
+            // than silently reusing a different endpoint's registry.
+            val candidateEndpointId = when (candidate) {
+                is net.pocvpn.client.reachability.PathCandidate.Direct -> candidate.gateway.endpoint.id
+                is net.pocvpn.client.reachability.PathCandidate.Relayed -> candidate.ingress.endpoint.id
+            }
+            val candidateRegistry = registriesByEndpoint[candidateEndpointId] ?: buildTransportRegistry(candidateEndpointId)
+            val capabilities = candidateRegistry.descriptorFor(candidate.transport)?.capabilities
                 ?: TransportCapabilities.notImplemented()
             net.pocvpn.client.reachability.PathScorer.score(
                 candidate = candidate,
-                registry = registry,
+                registry = candidateRegistry,
                 capabilities = capabilities,
                 transportHealth = health.getValue(candidate.transport),
                 history = history,
@@ -729,16 +979,26 @@ class MainViewModel(
         restorePersistedProfile()
         // B8I7 - one-time startup check: does a real Xray profile already
         // exist from a PRIOR session? Never polled again after this - the
-        // only other place xrayAvailable changes is the real
+        // only other place xrayAvailableEndpoints changes is the real
         // XrayProfileProvisioningOutcome.Saved event in activateDevice()
         // below.
-        xrayProfileRepository?.let { repository ->
+        //
+        // B13 consolidated review fix - checked independently for EVERY
+        // wired repository/endpoint pair (Germany AND, when wired,
+        // Stockholm), each adding ONLY its own endpointId to the set on
+        // success - Germany's check failing/succeeding can never affect
+        // Stockholm's entry or vice versa.
+        listOfNotNull(
+            xrayProfileRepository?.let { germanyEndpointId to it },
+            stockholmXrayProfileRepository?.let { stockholmEndpointId to it },
+        ).forEach { (endpointId, repository) ->
             viewModelScope.launch {
-                xrayAvailable.value = try {
+                val available = try {
                     repository.getProfileOrNull() != null
                 } catch (t: Throwable) {
                     false
                 }
+                if (available) xrayAvailableEndpoints.update { it + endpointId }
             }
         }
         // B8O2 fix - a decryptable-but-invalid stored profile must NOT
@@ -746,10 +1006,15 @@ class MainViewModel(
         // validation XrayCoreController/VlessTlsTransport actually run at
         // connect time (XrayRuntimeResolver.resolveTls) - never a
         // duplicated/looser "profile exists" check that could disagree with
-        // what connect() itself will accept.
-        xrayTlsProfileRepository?.let { repository ->
+        // what connect() itself will accept. Same per-endpoint independence
+        // as the XRAY_REALITY check above.
+        listOfNotNull(
+            xrayTlsProfileRepository?.let { germanyEndpointId to it },
+            stockholmXrayTlsProfileRepository?.let { stockholmEndpointId to it },
+        ).forEach { (endpointId, repository) ->
             viewModelScope.launch {
-                xrayTlsAvailable.value = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
+                val ready = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
+                if (ready) xrayTlsAvailableEndpoints.update { it + endpointId }
             }
         }
         // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
@@ -786,19 +1051,57 @@ class MainViewModel(
     // if no profile had ever been persisted. This never throws/crashes -
     // ProfileStore.read() itself already converts every I/O/parse failure
     // into Corrupted (see FileProfileStore's own docs).
+    //
+    // B13 SECOND consolidated review fix - a STRUCTURALLY valid
+    // PersistedProfile is no longer, by itself, enough to unlock Home
+    // (ProfileSource.RESTORED_PERSISTED -> ProductFlowPresentation.screenFor
+    // -> AppScreen.HOME). A real gap: this used to accept ANY structurally
+    // well-formed profile, even one for an endpoint the CANONICAL
+    // connect-time authority (SelectedProductionGatewaySource, resolved
+    // from ProductionGatewayCatalog.matchGatewayId + ClientTunnelIdentityStore
+    // - the SAME two checks activateDevice() itself now enforces on a live
+    // response) would refuse - a dev/staging profile, a profile for a
+    // rotated-away key, or (legitimately) a profile restored on a device
+    // whose ClientTunnelIdentityStore entry was never actually provisioned/
+    // migrated could show Home while gatewayStatus() would really resolve
+    // to Invalid. RESTORED_PERSISTED now requires BOTH: (1) the profile's
+    // full stable facts unambiguously match a known catalog gateway
+    // (matchGatewayId - host+port+key+gatewayTunnelIp, never guessed), AND
+    // (2) THIS device is actually provisioned for that exact gateway
+    // (isGatewayProvisioned - the SAME per-device evidence
+    // SelectedProductionGatewaySource itself resolves clientTunnelIp()
+    // from). Anything short of both stays/falls back to DEV_FALLBACK -
+    // Activation, never a fabricated identity, never a guessed migration
+    // (ClientTunnelIdentityStore's own migration, if any, already ran in
+    // the Factory before this ViewModel was even constructed - this never
+    // re-runs or duplicates it).
     private fun restorePersistedProfile() {
         val store = profileStore ?: return
         when (val result = store.read()) {
             is ProfileLoadResult.Found -> {
                 val p = result.profile
-                gatewayConfigOverride?.apply(
+                val matched = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.matchGatewayId(
                     endpointHost = p.endpointHost,
                     endpointPort = p.endpointPort,
-                    serverPublicKey = p.gatewayPublicKey,
-                    clientTunnelIp = p.clientTunnelIp,
+                    serverPublicKeyBase64 = p.gatewayPublicKey,
                     gatewayTunnelIp = p.gatewayTunnelIp,
                 )
-                _profileSource.value = ProfileSource.RESTORED_PERSISTED
+                if (matched != null && isGatewayProvisioned(matched)) {
+                    gatewayConfigOverride?.apply(
+                        endpointHost = p.endpointHost,
+                        endpointPort = p.endpointPort,
+                        serverPublicKey = p.gatewayPublicKey,
+                        clientTunnelIp = p.clientTunnelIp,
+                        gatewayTunnelIp = p.gatewayTunnelIp,
+                    )
+                    _profileSource.value = ProfileSource.RESTORED_PERSISTED
+                }
+                // else: leave _profileSource at its DEV_FALLBACK default -
+                // this legacy profile does not correspond to a gateway the
+                // real connect path would actually accept, so it must not
+                // unlock Home. Never calls gatewayConfigOverride.apply()
+                // either, for the same reason NotFound/Corrupted below
+                // don't - no accepted-but-unusable state.
             }
             is ProfileLoadResult.NotFound -> Unit
             is ProfileLoadResult.Corrupted -> Unit
@@ -832,82 +1135,149 @@ class MainViewModel(
             }
             _provisioningState.value = when (result) {
                 is ProvisioningResult.Success -> {
-                    // B8B3B safety rule: apply() is reached ONLY inside this
-                    // branch - i.e. only for a value that has already passed
-                    // ProvisioningClient's own structural validation. Never
-                    // called against a raw/unvalidated server response. The
-                    // device private key is untouched - it is looked up
-                    // separately from clientKeyRepository at connect time
-                    // (see GatewayConfiguration's own docs) and is not part
-                    // of this GatewayConfigSource at all. AWG obfuscation
-                    // parameters (Jc/Jmin/Jmax/S1-4/H1-4) come from
-                    // PocAwgProfile.value via DefaultGatewayConfigurationRepository's
-                    // own `profile` default, untouched here.
-                    gatewayConfigOverride?.apply(
+                    // B13 consolidated review fix (finding 1/6) - THE one
+                    // place a live activation response is mapped to a real
+                    // ProductionGatewayId, from its FULL stable server facts
+                    // (host+port+key), never from whatever the user happens
+                    // to have selected in the picker right now and never
+                    // from endpointHost alone - see
+                    // ProductionGatewayCatalog.matchGatewayId's own docs.
+                    // A response that does not unambiguously match a known
+                    // catalog gateway (a rotated/wrong key, a dev/staging
+                    // host, a malformed/adversarial response) is REJECTED
+                    // outright: nothing below is applied or persisted for
+                    // it, and no gateway's existing identity is mutated by
+                    // it - this is the fix for silently "accepting" a
+                    // control-plane response while the real connect-time
+                    // config (ProductionGatewayCatalog/ClientTunnelIdentityStore)
+                    // would have gone on ignoring it.
+                    val matchedGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.matchGatewayId(
                         endpointHost = result.endpointHost,
                         endpointPort = result.endpointPort,
-                        serverPublicKey = result.gatewayPublicKey,
-                        clientTunnelIp = result.clientTunnelIp,
+                        serverPublicKeyBase64 = result.gatewayPublicKey,
                         gatewayTunnelIp = result.gatewayTunnelIp,
                     )
-                    // B8B3C - durably persist ONLY the five non-secret
-                    // gateway fields, exactly what was just applied above.
-                    // No token (never in scope here - see provisionDevice's
-                    // own token handling), no private key (ProfileStore has
-                    // no field for one at all - see its own docs).
-                    profileStore?.write(
-                        PersistedProfile(
+                    if (matchedGatewayId == null) {
+                        ProvisioningUiState.Error(
+                            "activation response does not match a known production gateway - refusing to apply it",
+                        )
+                    } else {
+                        // B8B3B safety rule: apply() is reached ONLY inside
+                        // this branch - i.e. only for a value that has
+                        // already passed ProvisioningClient's own structural
+                        // validation AND matched a known gateway above.
+                        // Never called against a raw/unvalidated server
+                        // response. The device private key is untouched - it
+                        // is looked up separately from clientKeyRepository
+                        // at connect time (see GatewayConfiguration's own
+                        // docs) and is not part of this GatewayConfigSource
+                        // at all. AWG obfuscation parameters (Jc/Jmin/Jmax/
+                        // S1-4/H1-4) come from PocAwgProfile.value via
+                        // DefaultGatewayConfigurationRepository's own
+                        // `profile` default, untouched here.
+                        //
+                        // B13 note - gatewayConfigOverride/profileStore
+                        // below are kept for the pre-existing activation
+                        // flow's own UI-gating behavior (ProfileSource
+                        // routing - see restorePersistedProfile()'s own
+                        // docs); the REAL connect-time gateway infrastructure
+                        // facts (host/port/key) always come from
+                        // ProductionGatewayCatalog via matchedGatewayId
+                        // above, which is exactly why a mismatching response
+                        // is rejected rather than silently accepted-but-
+                        // ignored.
+                        gatewayConfigOverride?.apply(
                             endpointHost = result.endpointHost,
                             endpointPort = result.endpointPort,
-                            gatewayPublicKey = result.gatewayPublicKey,
+                            serverPublicKey = result.gatewayPublicKey,
                             clientTunnelIp = result.clientTunnelIp,
                             gatewayTunnelIp = result.gatewayTunnelIp,
                         )
-                    )
-                    _profileSource.value = ProfileSource.PROVISIONED_LIVE
-                    // B8K4B - runs only after the AWG activation above has
-                    // already fully succeeded (applied + persisted). Reuses
-                    // the SAME `key`/`trimmedCredential` this activation call
-                    // used - no second identity, no new credential. Any
-                    // outcome other than Saved (network error/401/403/503/
-                    // malformed) leaves this AWG success and any previously
-                    // stored Xray profile completely untouched - see
-                    // XrayProfileProvisioner's own docs.
-                    xrayProfileProvisioner?.let { provisioner ->
-                        val outcome = withContext(ioDispatcher) {
-                            provisioner.provision(key, trimmedCredential)
-                        }
-                        _xrayProfileProvisioningState.value = outcome
-                        if (outcome == XrayProfileProvisioningOutcome.Saved) {
-                            // B8I7 - the real, event-driven moment Xray
-                            // becomes selectable - never polled, never
-                            // inferred from elapsed time (see xrayAvailable's
-                            // own docs).
-                            xrayAvailable.value = true
-                        }
-                    }
-                    // B8O2 - same reasoning as xrayProfileProvisioner above:
-                    // runs only after the AWG activation has already fully
-                    // succeeded, reusing the SAME key/credential, and never
-                    // touches AWG's own success/state either way.
-                    xrayTlsProfileProvisioner?.let { provisioner ->
-                        val tlsOutcome = withContext(ioDispatcher) {
-                            provisioner.provision(key, trimmedCredential)
-                        }
-                        // B8O2 fix - re-derive from the SAME authoritative
-                        // resolveTls() check the startup path uses (see its
-                        // own docs), rather than assuming a structurally-
-                        // valid-at-the-wire Saved outcome is automatically
-                        // connect()-ready - one validation authority, never
-                        // two rules that could silently disagree.
-                        if (tlsOutcome == XrayProfileProvisioningOutcome.Saved) {
-                            val repository = xrayTlsProfileRepository
-                            if (repository != null) {
-                                xrayTlsAvailable.value = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
+                        // B8B3C - durably persist ONLY the five non-secret
+                        // gateway fields, exactly what was just applied above.
+                        // No token (never in scope here - see provisionDevice's
+                        // own token handling), no private key (ProfileStore has
+                        // no field for one at all - see its own docs).
+                        profileStore?.write(
+                            PersistedProfile(
+                                endpointHost = result.endpointHost,
+                                endpointPort = result.endpointPort,
+                                gatewayPublicKey = result.gatewayPublicKey,
+                                clientTunnelIp = result.clientTunnelIp,
+                                gatewayTunnelIp = result.gatewayTunnelIp,
+                            )
+                        )
+                        // B13 consolidated review fix (finding 1) - THE
+                        // canonical per-device client tunnel identity write:
+                        // result.clientTunnelIp is real, per-device evidence
+                        // for EXACTLY matchedGatewayId - never any other
+                        // gateway (matchGatewayId already proved the
+                        // response is unambiguously about this one).
+                        clientTunnelIdentityStore?.write(matchedGatewayId, result.clientTunnelIp)
+                        // B13 consolidated review fix (finding 2) - a fresh
+                        // identity write can change readiness for the
+                        // CURRENTLY selected gateway (e.g. Stockholm was
+                        // selected while unprovisioned and deliberately
+                        // retained - see reconcileSelectedGateway's own
+                        // docs - and this activation just provisioned
+                        // Germany): re-evaluate and, if needed, switch to a
+                        // now-provisioned gateway immediately, with no app
+                        // restart required.
+                        reconcileSelectedGatewayIfNeeded()
+                        _profileSource.value = ProfileSource.PROVISIONED_LIVE
+                        // B8K4B - runs only after the AWG activation above has
+                        // already fully succeeded (applied + persisted). Reuses
+                        // the SAME `key`/`trimmedCredential` this activation call
+                        // used - no second identity, no new credential. Any
+                        // outcome other than Saved (network error/401/403/503/
+                        // malformed) leaves this AWG success and any previously
+                        // stored Xray profile completely untouched - see
+                        // XrayProfileProvisioner's own docs.
+                        //
+                        // B13 consolidated review fix (finding 4) - this
+                        // legacy activation flow only ever provisions the
+                        // production/Germany endpoint's Xray profile (it has
+                        // no concept of a second gateway), so the availability
+                        // signal it flips is scoped to germanyEndpointId
+                        // specifically, never a global flag Stockholm could
+                        // inherit.
+                        xrayProfileProvisioner?.let { provisioner ->
+                            val outcome = withContext(ioDispatcher) {
+                                provisioner.provision(key, trimmedCredential)
+                            }
+                            _xrayProfileProvisioningState.value = outcome
+                            if (outcome == XrayProfileProvisioningOutcome.Saved) {
+                                // B8I7 - the real, event-driven moment Xray
+                                // becomes selectable - never polled, never
+                                // inferred from elapsed time (see
+                                // xrayAvailableEndpoints' own docs).
+                                xrayAvailableEndpoints.update { it + germanyEndpointId }
                             }
                         }
+                        // B8O2 - same reasoning as xrayProfileProvisioner above:
+                        // runs only after the AWG activation has already fully
+                        // succeeded, reusing the SAME key/credential, and never
+                        // touches AWG's own success/state either way. Same
+                        // Germany-only endpoint scoping as above.
+                        xrayTlsProfileProvisioner?.let { provisioner ->
+                            val tlsOutcome = withContext(ioDispatcher) {
+                                provisioner.provision(key, trimmedCredential)
+                            }
+                            // B8O2 fix - re-derive from the SAME authoritative
+                            // resolveTls() check the startup path uses (see its
+                            // own docs), rather than assuming a structurally-
+                            // valid-at-the-wire Saved outcome is automatically
+                            // connect()-ready - one validation authority, never
+                            // two rules that could silently disagree.
+                            if (tlsOutcome == XrayProfileProvisioningOutcome.Saved) {
+                                val repository = xrayTlsProfileRepository
+                                if (repository != null && XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready) {
+                                    xrayTlsAvailableEndpoints.update { it + germanyEndpointId }
+                                }
+                            }
+                        }
+                        ProvisioningUiState.Success(result)
                     }
-                    ProvisioningUiState.Success(result)
                 }
                 is ProvisioningResult.Unauthorized -> ProvisioningUiState.Unauthorized
                 is ProvisioningResult.Revoked -> ProvisioningUiState.Revoked
@@ -974,7 +1344,14 @@ class MainViewModel(
                     // this ViewModel names WHICH endpoint the attempt about
                     // to be resolved/executed actually targets.
                     val endpointId = net.pocvpn.client.reachability.EndpointId(decision.score.candidate.gateway.id)
-                    val registry = buildTransportRegistry()
+                    // B13 consolidated review fix - THIS attempt's own
+                    // endpointId, never the default: the registry that
+                    // decides eligibility for an AWG -> Xray failover later
+                    // (armFailoverWatch/maybeFailoverToXray, both reuse THIS
+                    // exact retained registry, never rebuild it) must report
+                    // Xray/TLS availability for the SAME gateway this attempt
+                    // is actually connecting to.
+                    val registry = buildTransportRegistry(endpointId)
                     val orchestrator = TransportOrchestrator(registry)
                     when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId)) {
                         is TransportOrchestrator.Resolution.Resolved -> {
@@ -1193,11 +1570,40 @@ class MainViewModel(
             // (called fresh by VpnController on every gatewayStatus()/connect() -
             // no caching) without VpnController itself changing at all.
             val gatewayConfigSource = MutableGatewayConfigSource(BuildConfigGatewaySource)
+            // B13 - the real product gateway-selection mechanism (see
+            // SelectedGatewayStore/SelectedProductionGatewaySource's own
+            // docs) - deliberately NOT gatewayConfigSource/BuildConfigGatewaySource
+            // above (that remains a local dev-only convenience, never the
+            // product's own selector). Same noBackupFilesDir convention as
+            // every other device-local preference store in this Factory.
+            val selectedGatewayStore = net.pocvpn.client.vpn.config.FileSelectedGatewayStore(context.noBackupFilesDir)
             // B8B3C - same noBackupFilesDir as the identity store
             // (ClientKeyRepositoryFactory), different file: this data is
             // non-secret but still device/session-specific, so Auto Backup
             // restoring it onto a different device would be meaningless.
+            // Constructed BEFORE clientTunnelIdentityStore below - its
+            // read() result is the ONLY migration evidence that store's
+            // Germany seeding is allowed to use (see that call's own docs).
             val profileStore = FileProfileStore(context.noBackupFilesDir)
+            // B13 review fix - per-device, per-endpoint client tunnel IP,
+            // deliberately separate from selectedGatewayStore above (see
+            // ClientTunnelIdentityStore's own docs for why this is
+            // provisioned device identity, never a gateway fact). A SECOND
+            // review found the first fix's own migration unconditionally
+            // seeded EVERY install with this test device's hardcoded IPs -
+            // migrateFromLegacyProvisionedProfile fixes that: it seeds
+            // Germany ONLY when profileStore above already holds real,
+            // per-device evidence from a genuine pre-B13 activation (never
+            // Stockholm - no such evidence can exist for it - and never a
+            // fresh install, which has no persisted profile at all).
+            val clientTunnelIdentityStore = net.pocvpn.client.vpn.config.FileClientTunnelIdentityStore(context.noBackupFilesDir)
+            clientTunnelIdentityStore.migrateFromLegacyProvisionedProfile(
+                (profileStore.read() as? ProfileLoadResult.Found)?.profile
+            )
+            val selectedProductionGatewaySource = net.pocvpn.client.vpn.config.SelectedProductionGatewaySource(
+                selectedGatewayId = selectedGatewayStore::read,
+                clientTunnelIp = clientTunnelIdentityStore::read,
+            )
             // B8H - same noBackupFilesDir as profileStore above, different
             // file: a device-local UX preference, not something a restore
             // onto a different device should silently reapply either.
@@ -1224,6 +1630,19 @@ class MainViewModel(
             // provisioner and xrayTlsTransport's own pre-flight check.
             // B13 (audit fix) - same "redundant with the default, kept for readability" note as xrayProfileRepository above.
             val xrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context, migrateFromLegacyUnscopedFile = true)
+            // B13 consolidated review fix (finding 4) - Stockholm's OWN,
+            // separately-scoped repository instances (migrateFromLegacyUnscopedFile
+            // stays false, its own default for a non-production endpoint id -
+            // there is no legacy unscoped file that was ever Stockholm's).
+            // Reads the SAME on-disk file the debug-only
+            // XrayDiagnosticsActivity manual-save path writes real,
+            // operator-provisioned credentials to when Stockholm has been
+            // provisioned - null profile on disk simply means not yet
+            // provisioned, and MainViewModel's per-endpoint availability
+            // check (xrayAvailableEndpoints) already fails that closed to
+            // NOT_IMPLEMENTED, never a fabricated/hardcoded availability.
+            val stockholmXrayProfileRepository = XrayProfileRepositoryFactory.create(context, endpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId)
+            val stockholmXrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context, endpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId)
             // B12 - the ONE authoritative EndpointManifestRepository instance -
             // shared by reachabilityDiagnostics() (read-only) and
             // manifestDistributionClient below (the only real writer, via
@@ -1247,10 +1666,23 @@ class MainViewModel(
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
                 transport = AmneziaWgTransport(context),
-                gatewayConfigurationRepository = DefaultGatewayConfigurationRepository(gatewayConfigSource),
+                // B13 - the real, product gateway-selection source (see its
+                // own docs) - gatewayConfigSource/gatewayConfigOverride
+                // below is kept wired for the pre-existing activation flow's
+                // own UI-gating behavior (ProfileSource routing - see
+                // restorePersistedProfile()'s own docs) but no longer feeds
+                // the actual connect-time config.
+                gatewayConfigurationRepository = DefaultGatewayConfigurationRepository(selectedProductionGatewaySource),
                 reconnectManager = AndroidReconnectManager(context),
                 diagnosticsStore = DiagnosticsStore(),
                 gatewayConfigOverride = gatewayConfigSource,
+                selectedGatewayStore = selectedGatewayStore,
+                // B13 review fix - the SAME instance selectedProductionGatewaySource
+                // above already resolves clientTunnelIp() from, so
+                // isGatewayProvisioned()/provisionedGatewayIds/the startup
+                // reconciliation this feeds ALWAYS agree with what a real
+                // connect() attempt would actually resolve.
+                clientTunnelIdentityStore = clientTunnelIdentityStore,
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 installedPackageChecker = AndroidInstalledPackageChecker(context),
@@ -1299,6 +1731,13 @@ class MainViewModel(
                     if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayTlsProfileRepository else XrayTlsProfileRepositoryFactory.create(context, id)
                 },
                 xrayTlsProfileRepository = xrayTlsProfileRepository,
+                // B13 consolidated review fix (finding 4) - Stockholm's own
+                // repositories, so MainViewModel's per-endpoint availability
+                // (xrayAvailableEndpoints/xrayTlsAvailableEndpoints) can
+                // actually see Stockholm's real credentials when present,
+                // instead of only ever knowing about Germany's.
+                stockholmXrayProfileRepository = stockholmXrayProfileRepository,
+                stockholmXrayTlsProfileRepository = stockholmXrayTlsProfileRepository,
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see
                 // reachabilityDiagnostics()'s own docs for why this cannot
                 // change automatic selection in this slice.

@@ -36,6 +36,7 @@ import net.pocvpn.client.vpn.AlwaysOnDetectionState
 import net.pocvpn.client.vpn.AlwaysOnVpnState
 import net.pocvpn.client.vpn.ControllerEvent
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.blocksGatewaySelection
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.Ipv6LeakPolicy
 import net.pocvpn.client.vpn.config.ProfileSource
@@ -72,9 +73,12 @@ fun AppRoot(
     val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
+    val selectedGatewayId by viewModel.selectedGateway.collectAsStateWithLifecycle()
+    val selectedGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGatewayId)
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var showGatewayPicker by remember { mutableStateOf(false) }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
     val context = LocalContext.current
     // B8H perf fix - constructing the repository is cheap (just stores
@@ -154,9 +158,42 @@ fun AppRoot(
                     // B8H1 - the APPLIED policy's mode, never savedRoutingPolicy's -
                     // see homeConnectedSubtitle's own docs for why.
                     appliedRoutingMode = appliedRoutingPolicy?.mode ?: AppRoutingMode.ALL_APPS,
+                    // B13 - the ACTUALLY selected gateway (persisted, real) -
+                    // never the old static "Germany / Frankfurt" placeholder.
+                    locationCountry = selectedGateway.displayCountry,
+                    locationCity = selectedGateway.displayCity,
+                    // B13 consolidated review fix (finding 5) - refuses to
+                    // even OPEN the picker while a session genuinely exists
+                    // (net.pocvpn.client.vpn.TransportState.blocksGatewaySelection -
+                    // the SAME predicate MainViewModel.selectGateway() itself
+                    // enforces as a backstop, see its own docs): Home must
+                    // never show a location the active tunnel is not
+                    // actually using, so there is nothing truthful this
+                    // dialog could offer to change right now.
+                    onLocationClick = { if (!transportState.blocksGatewaySelection()) showGatewayPicker = true },
                 )
             }
         }
+    }
+
+    if (showGatewayPicker) {
+        net.pocvpn.client.ui.screens.GatewayPickerDialog(
+            current = selectedGatewayId,
+            options = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+            provisionedGatewayIds = viewModel.provisionedGatewayIds,
+            onSelect = { id ->
+                // B13 consolidated review fix (finding 5) - defense in depth:
+                // onLocationClick above already refuses to open this dialog
+                // during an active session, but a session can start WHILE
+                // this dialog happens to be open (e.g. a reconnect landed
+                // asynchronously) - never act on a tap in that window either.
+                if (!transportState.blocksGatewaySelection()) {
+                    viewModel.selectGateway(id)
+                    showGatewayPicker = false
+                }
+            },
+            onDismiss = { showGatewayPicker = false },
+        )
     }
 
     if (isDebugBuild && showDiagnostics) {
@@ -196,6 +233,12 @@ private fun buildDiagnosticsLines(
         is GatewayConfiguration.Invalid -> "Gateway: INVALID (${gateway.reason})"
         is GatewayConfiguration.Configured -> "Gateway: ${gateway.endpointHost}:${gateway.endpointPort}"
     }
+    // B13 - provider/ASN-adjacent metadata is diagnostics-only (debug build,
+    // this dialog only) - never shown in the normal picker/LocationCard/Home
+    // screen (see GatewayPickerDialog/LocationCard's own docs).
+    val selectedGatewayCatalogEntry = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(viewModel.selectedGateway.value)
+    val selectedGatewayLine = "Selected gateway: ${selectedGatewayCatalogEntry.displayCountry} / ${selectedGatewayCatalogEntry.displayCity} " +
+        "(${selectedGatewayCatalogEntry.provider}, endpointId=${selectedGatewayCatalogEntry.endpointId.value})"
     val tunnelIpLine = when (gateway) {
         is GatewayConfiguration.Configured -> "Client tunnel IP: ${gateway.clientTunnelIp}"
         else -> "Client tunnel IP: NOT CONFIGURED"
@@ -288,6 +331,7 @@ private fun buildDiagnosticsLines(
         "Client public key: ${publicKey ?: "(loading...)"}",
         tunnelIpLine,
         gatewayLine,
+        selectedGatewayLine,
         allowedIpsLine,
         dnsLine,
         ipv6PolicyLine,

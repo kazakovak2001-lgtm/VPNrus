@@ -53,6 +53,11 @@ fun HomeScreen(
     // homeConnectedSubtitle's own docs. Only read while visualState ==
     // CONNECTED; the default is otherwise unreachable/irrelevant.
     appliedRoutingMode: AppRoutingMode = AppRoutingMode.ALL_APPS,
+    // B13 - the ACTUALLY selected gateway's display text, never a static
+    // placeholder (see LocationCard's own docs).
+    locationCountry: String,
+    locationCity: String,
+    onLocationClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val statusSubtitle = when (visualState) {
@@ -122,7 +127,7 @@ fun HomeScreen(
             }
         }
 
-        LocationCard()
+        LocationCard(country = locationCountry, city = locationCity, onClick = onLocationClick)
 
         Spacer(modifier = Modifier.height(12.dp))
 

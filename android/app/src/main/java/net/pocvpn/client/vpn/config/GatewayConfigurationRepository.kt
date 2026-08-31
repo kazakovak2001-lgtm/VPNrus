@@ -15,7 +15,58 @@ interface GatewayConfigSource {
      * the full-tunnel default in that case.
      */
     fun allowedIps(): String = ""
+
+    /**
+     * B13 - the AWG obfuscation/timing profile for THIS source's gateway.
+     * Defaults to [PocAwgProfile.value] (Germany's own values, historically
+     * the only ones that existed) so every pre-B13 implementation
+     * ([BuildConfigGatewaySource], every test fake) is byte-for-byte
+     * unaffected. [SelectedProductionGatewaySource] is the one real
+     * implementation that overrides this per-gateway - see its own docs for
+     * why a single global profile was a real bug, not a simplification.
+     */
+    fun profile(): AwgProfile = PocAwgProfile.value
+
+    /**
+     * B13 THIRD consolidated review fix (finding 6) - ONE atomic snapshot of
+     * every field above, resolved TOGETHER. The default implementation here
+     * simply calls each individual getter in turn, in the SAME order
+     * DefaultGatewayConfigurationRepository.get() always has - byte-for-byte
+     * unchanged behavior for every source with no concurrent-mutation
+     * concern (BuildConfigGatewaySource's values are compile-time constants;
+     * every plain test fake returns fixed strings).
+     *
+     * A source whose underlying selection CAN change between two calls
+     * (today: [SelectedProductionGatewaySource], selection changes via
+     * MainViewModel.selectGateway() on a different coroutine/thread than
+     * whatever is mid-`get()`) MUST override this to resolve its
+     * selection/descriptor EXACTLY ONCE and derive every field from that
+     * SAME resolved value - never six independent re-reads a concurrent
+     * selection change could interleave, which could otherwise combine one
+     * gateway's host with a DIFFERENT gateway's key/clientTunnelIp/profile
+     * into one nonsensical GatewayConfiguration.Configured.
+     */
+    fun snapshot(): GatewayConfigSnapshot = GatewayConfigSnapshot(
+        endpointHost = endpointHost(),
+        endpointPort = endpointPort(),
+        serverPublicKey = serverPublicKey(),
+        clientTunnelIp = clientTunnelIp(),
+        gatewayTunnelIp = gatewayTunnelIp(),
+        allowedIps = allowedIps(),
+        profile = profile(),
+    )
 }
+
+/** B13 THIRD consolidated review fix (finding 6) - see [GatewayConfigSource.snapshot]'s own docs. */
+data class GatewayConfigSnapshot(
+    val endpointHost: String,
+    val endpointPort: String,
+    val serverPublicKey: String,
+    val clientTunnelIp: String,
+    val gatewayTunnelIp: String,
+    val allowedIps: String,
+    val profile: AwgProfile,
+)
 
 interface GatewayConfigurationRepository {
     fun get(): GatewayConfiguration
@@ -29,15 +80,20 @@ interface GatewayConfigurationRepository {
  */
 class DefaultGatewayConfigurationRepository(
     private val source: GatewayConfigSource,
-    private val profile: AwgProfile = PocAwgProfile.value,
 ) : GatewayConfigurationRepository {
 
     override fun get(): GatewayConfiguration {
-        val host = source.endpointHost().trim()
-        val portRaw = source.endpointPort().trim()
-        val serverPublicKey = source.serverPublicKey().trim()
-        val clientTunnelIp = source.clientTunnelIp().trim()
-        val gatewayTunnelIp = source.gatewayTunnelIp().trim()
+        // B13 THIRD consolidated review fix (finding 6) - ONE snapshot()
+        // call, not six independent getter calls: every field below is
+        // guaranteed to describe the SAME resolved gateway, even if the
+        // underlying selection changes concurrently the instant after this
+        // call returns - see GatewayConfigSource.snapshot()'s own docs.
+        val snapshot = source.snapshot()
+        val host = snapshot.endpointHost.trim()
+        val portRaw = snapshot.endpointPort.trim()
+        val serverPublicKey = snapshot.serverPublicKey.trim()
+        val clientTunnelIp = snapshot.clientTunnelIp.trim()
+        val gatewayTunnelIp = snapshot.gatewayTunnelIp.trim()
 
         if (host.isEmpty() && portRaw.isEmpty() && serverPublicKey.isEmpty() &&
             clientTunnelIp.isEmpty() && gatewayTunnelIp.isEmpty()
@@ -54,10 +110,10 @@ class DefaultGatewayConfigurationRepository(
         if (!WgKeyFormat.isValid(serverPublicKey)) {
             return GatewayConfiguration.Invalid("server public key is not a valid AmneziaWG/WireGuard key")
         }
-        if (!isValidIpv4(clientTunnelIp)) {
+        if (!Ipv4Format.isValid(clientTunnelIp)) {
             return GatewayConfiguration.Invalid("client tunnel IP is not a valid IPv4 address: '$clientTunnelIp'")
         }
-        if (!isValidIpv4(gatewayTunnelIp)) {
+        if (!Ipv4Format.isValid(gatewayTunnelIp)) {
             return GatewayConfiguration.Invalid("gateway tunnel IP is not a valid IPv4 address: '$gatewayTunnelIp'")
         }
 
@@ -67,23 +123,22 @@ class DefaultGatewayConfigurationRepository(
             serverPublicKeyBase64 = serverPublicKey,
             clientTunnelIp = clientTunnelIp,
             gatewayTunnelIp = gatewayTunnelIp,
-            allowedIps = resolveAllowedIps(),
+            allowedIps = resolveAllowedIps(snapshot),
             // B8F - a local client policy, not a server-issued/persisted
             // fact (see VpnDnsPolicy's own docs) - applied here so every
             // profile source converges on the same DNS servers.
             dnsServers = VpnDnsPolicy.servers,
-            profile = profile,
+            // B13 - read fresh from the SAME snapshot as every other field
+            // above (no caching across separate get() calls, but never a
+            // second, independent read within THIS one) - see
+            // GatewayConfigSource.profile()/snapshot()'s own docs.
+            profile = snapshot.profile,
         )
     }
 
     /** Full-tunnel default, unless the source overrides it (e.g. a narrow route for local testing). */
-    private fun resolveAllowedIps(): List<String> {
-        val override = source.allowedIps().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    private fun resolveAllowedIps(snapshot: GatewayConfigSnapshot): List<String> {
+        val override = snapshot.allowedIps.split(",").map { it.trim() }.filter { it.isNotEmpty() }
         return override.ifEmpty { listOf("0.0.0.0/0", "::/0") }
-    }
-
-    private fun isValidIpv4(ip: String): Boolean {
-        val match = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$").matchEntire(ip) ?: return false
-        return match.groupValues.drop(1).all { it.toIntOrNull()?.let { n -> n in 0..255 } == true }
     }
 }

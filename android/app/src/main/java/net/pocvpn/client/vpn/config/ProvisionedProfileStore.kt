@@ -139,9 +139,13 @@ class FileProfileStore(
 // Mirrors ProvisioningClient's own structural checks (IPv4 shape, AmneziaWG/
 // WireGuard public-key shape, port range) - `internal`, not private, so it
 // is directly unit-testable against hand-built corrupt/partial inputs
-// without going through file I/O.
+// without going through file I/O. IPv4 validity is Ipv4Format.isValid - the
+// SAME strict, all-octets-0..255 check GatewayConfigurationRepository/
+// ClientTunnelIdentityStore use (a B13 consolidated review fix - the old
+// regex-only check here happily accepted "999.999.999.999", which matters
+// now that a PersistedProfile is real migration evidence for
+// ClientTunnelIdentityStore - see that class's own docs).
 private val PROFILE_WG_KEY_REGEX = Regex("^[A-Za-z0-9+/]{43}=$")
-private val PROFILE_IPV4_REGEX = Regex("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")
 
 internal fun validatePersistedProfile(
     endpointHost: String,
@@ -153,8 +157,8 @@ internal fun validatePersistedProfile(
     if (endpointHost.isBlank()) return null
     if (endpointPort !in 1..65535) return null
     if (!PROFILE_WG_KEY_REGEX.matches(gatewayPublicKey)) return null
-    if (!PROFILE_IPV4_REGEX.matches(clientTunnelIp)) return null
-    if (!PROFILE_IPV4_REGEX.matches(gatewayTunnelIp)) return null
+    if (!Ipv4Format.isValid(clientTunnelIp)) return null
+    if (!Ipv4Format.isValid(gatewayTunnelIp)) return null
     return PersistedProfile(
         endpointHost = endpointHost,
         endpointPort = endpointPort,
