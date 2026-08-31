@@ -1,11 +1,87 @@
 # B12 — Endpoint Manifest trust-key procedure
 
-**Status: interfaces and tooling are real and ready; the production key
-ceremony itself has NOT been executed.** The embedded trust key shipped in
-this app (`EmbeddedBootstrapManifest`) remains the B11 placeholder — a real
-Ed25519 keypair generated for that PR, documented as such in that file's own
-docstring. Nothing in this document should be read as claiming a production
-key ceremony is complete; it is not.
+**Status (B17, 2026-09-01): the production key ceremony has been performed.**
+The embedded trust key shipped in this app (`EmbeddedBootstrapManifest`) is
+now a real production Ed25519 keypair, generated and used entirely inside one
+local, offline script invocation — the private key bytes were never printed
+to any terminal/tool output, never passed as a CLI argument, never
+committed, and are stored only in an operator-local file outside this
+repository. See "Production ceremony (B17, completed)" below for the exact
+procedure and what remains an operator step (live deployment to both VPSes).
+
+## Production ceremony (B17, completed)
+
+- **Key id**: `prod-manifest-key-2026-09-01`
+- **Public key (base64)**: `yvxGVezkV5tkkzcQVf975mSDY9xYh72eOLOMwSFy+aw=`
+- **Public key SHA-256 fingerprint**:
+  `2c39eddd256115600e3008495ee52b95865ab7a525f102f2fe45aad17b614aa1`
+  — use this fingerprint to confirm the embedded key's identity out-of-band;
+  never the private key itself.
+- **Private key**: generated with `Ed25519PrivateKey.generate()` and used to
+  sign the production manifest inside one local Python process (never
+  `gateway/tools/manifest_signing.py generate-key`'s own CLI, which prints
+  the private key to stdout — deliberately avoided here). The private key
+  bytes were written directly to an operator-local file outside this
+  repository (path recorded only in the operator's own local notes, not in
+  this document or in git) and never appeared in any command's arguments or
+  output. This document does not and must not record that path or the key
+  itself.
+- **Manifest signed**: `manifestVersion=1`, `signingKeyId=prod-manifest-key-2026-09-01`,
+  issued 2026-09-01, expires 180 days later (2027-02-27) — see "Versioning
+  and expiry policy" below for why 180 days.
+- **Endpoints named**: `frankfurt` (Germany/Oracle Cloud, `152.70.43.1`) and
+  `stockholm` (Sweden/AWS, `16.170.208.231`), each with AMNEZIA_WG (51820),
+  XRAY_REALITY (2053), and TLS_TCP (2083) transport bindings — host/port
+  only, no per-device secrets, no server public keys, no client tunnel IPs
+  (see `EmbeddedBootstrapManifest`'s own docs for the full "what must never
+  be embedded" list, unchanged from B11).
+- **Source JSON**: `gateway/tools/production_manifest_2026-09-01.json`
+  (public, safe to commit — no secret material).
+- **Signed artifact**: `gateway/tools/endpoint-manifest-2026-09-01.bin` (the
+  exact bytes to deploy at `POCVPN_API_MANIFEST_PATH` on BOTH gateways, and
+  the same bytes packed into `EmbeddedBootstrapManifest`'s embedded
+  constants).
+- **Embedded in**: `EmbeddedBootstrapManifest.kt`
+  (`BOOTSTRAP_PUBLIC_KEY_BASE64`/`CANONICAL_BYTES_BASE64`/`SIGNATURE_BASE64`).
+- **NOT yet done as of this ceremony**: live deployment of
+  `endpoint-manifest-2026-09-01.bin` to either gateway's
+  `POCVPN_API_MANIFEST_PATH`, and fronting `GET /v1/manifest` at either
+  nginx edge — both remain explicit operator deploy actions (see "What
+  remains an explicit operator step" below), never performed automatically
+  by this ceremony or by any code change in this PR.
+
+## Versioning and expiry policy
+
+- **Monotonic version**: `manifestVersion` starts at 1 for this production
+  root and must strictly increase on every re-signed manifest —
+  `ManifestRollbackGuard` already enforces this unconditionally.
+- **Creating version N+1**: edit
+  `gateway/tools/production_manifest_2026-09-01.json` (or a newly-dated
+  copy) with the new `manifestVersion`/facts, then re-run the SAME offline,
+  private-key-never-printed signing procedure this ceremony used (see
+  `ceremony` step-by-step below), against the SAME production private key
+  file. Never sign version N+1 with a different key unless this is
+  deliberately a key rotation (see "Rotation" below, unchanged from B11).
+- **Choosing expiry**: 180 days balances the manual re-signing ceremony's
+  real operational cost (an offline, human-in-the-loop action - see
+  "Procedure" below) against bounding how long a compromised-but-undetected
+  signing key could keep signing valid-looking manifests. Shorter-lived
+  production infrastructure facts (e.g. an emergency address rotation) do
+  not need to wait for the full 180 days — see "Emergency endpoint changes"
+  below.
+- **Emergency endpoint changes** (e.g. Stockholm's non-durable IP finally
+  rotates): sign a new manifest with a strictly higher `manifestVersion`,
+  the SAME production key, and a fresh `issuedAt`/`expiresAt` window — same
+  procedure as any other new version, just sooner than the normal 180-day
+  cadence. Never edit `production_manifest_2026-09-01.json` in place and
+  reuse its old signature — any change to the manifest content requires a
+  fresh signature over the new canonical bytes.
+- **Rollback rules**: unchanged from B11/B12 — `ManifestRollbackGuard`
+  rejects any candidate whose `manifestVersion` is not strictly greater than
+  whatever is currently trusted (LKG or bootstrap), and `offer()` never
+  touches the stored LKG when it rejects a candidate. There is no separate
+  "manual rollback" affordance — reverting to an older manifest's CONTENT
+  requires re-signing that content under a NEW, higher version number.
 
 ## Why this is safe to defer
 
@@ -107,11 +183,16 @@ the same thing.
 
 ## What remains an explicit operator step
 
-- Generating the real production keypair (step 1) — an intentional human
-  action with real security consequences, never automated.
-- Deploying `endpoint-manifest.bin` to the production VPS and setting
-  `POCVPN_API_MANIFEST_PATH` — an operator deploy action.
-- Fronting `GET /v1/manifest` at the public HTTPS edge (nginx, alongside the
-  existing `/v1/activate`/`/v1/xray-profile` routes per
-  `docs/B8K5A`-era deployment notes) — an operator deploy action, not
-  something this PR's code changes perform.
+- ~~Generating the real production keypair~~ — **done (B17, 2026-09-01)**,
+  see "Production ceremony" above.
+- Deploying `endpoint-manifest-2026-09-01.bin` to BOTH production VPSes
+  (Frankfurt and Stockholm) and setting `POCVPN_API_MANIFEST_PATH` on each —
+  an explicit operator deploy action, NOT performed by this PR's code
+  changes and requiring the repository owner's approval before touching
+  live infrastructure (see this repo's own merge/infra-safety rules).
+- Fronting `GET /v1/manifest` at each gateway's public HTTPS edge (nginx,
+  alongside the existing `/v1/activate`/`/v1/xray-profile` routes) — an
+  operator deploy action.
+- External verification after deployment: HTTPS success, exact byte
+  identity against `endpoint-manifest-2026-09-01.bin`, valid signature,
+  version/expiry, and that a tampered copy is rejected by the client.

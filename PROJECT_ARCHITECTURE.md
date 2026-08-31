@@ -20,19 +20,40 @@ NetworkProfiler
 
 - `SmartConnectDecisionEngine`/`AwgXrayFailoverPolicy` still operate WITHIN one
   gateway only (transport choice/intra-gateway AWG->Xray failover) - unchanged by B16.
-- **B16 - automatic multi-GATEWAY selection/failover is now real, above that
+- **B16 - automatic multi-GATEWAY selection/failover is real, above that
   boundary**: `AutoGatewaySelector` (`smartconnect/AutoGatewaySelector.kt`)
   promotes the SAME `ReachabilityEngine`/`PathCandidateBuilder`/`PathScorer`
   pipeline (reused verbatim, never a parallel scorer) into a ranked
-  `GatewayAttemptCandidate` list across every PROVISIONED production gateway.
-  `EndpointDescriptor`s for this ranking come from `ProductionGatewayEndpoints`
-  (built from `ProductionGatewayCatalog`), deliberately NOT the Signed Offline
-  Bootstrap manifest (which still only names "frankfurt" - extending it needs
-  the offline key ceremony, out of scope). Only engaged when
+  `GatewayAttemptCandidate` list. Only engaged when
   `MainViewModel.gatewayAutoMode` is true (persisted, default `false`/Manual -
   every pre-B16 install/test is unaffected). Manual gateway selection
   (`SelectedGatewayStore`/`selectGateway()`) is byte-for-byte unchanged and
   always wins when active - selecting a gateway manually also turns Auto off.
+- **B17 - runtime authority for Auto DISCOVERY moved to the signed manifest,
+  superseding B16's own shortcut**: `AutoGatewaySelector.buildCandidates`
+  now takes `manifestEndpoints: List<EndpointDescriptor>` - the caller
+  (`MainViewModel.buildAutoGatewayCandidates`) supplies
+  `manifestRepository?.trusted()?.endpoints` (empty when nothing verifies -
+  `TrustedManifestState.NoneTrusted` or `manifestRepository` unwired -
+  which always yields zero candidates, never a fallback). WHICH endpoints
+  even exist as candidates is therefore gated by the trusted manifest, never
+  `ProductionGatewayCatalog` enumerated directly. `ProductionGatewayCatalog`
+  (via `gatewayFactsFor: (EndpointId) -> ProductionGatewayDescriptor?`) is
+  consulted ONLY as a per-endpoint COMPATIBILITY lookup for an endpoint id
+  the manifest already named - it supplies the AWG connection facts (server
+  public key, gateway tunnel IP, obfuscation profile) needed to dial it,
+  which deliberately stay OUT of the public manifest. Local per-device
+  provisioning (`provisioned`/`clientTunnelIp`, plus `xrayAvailableFor`/
+  `xrayTlsAvailableFor` gating which of the manifest's declared transport
+  bindings this device can actually use) still combines with the manifest
+  facts exactly as before - a manifest naming an endpoint never implies this
+  device is provisioned for it. The embedded bootstrap
+  (`EmbeddedBootstrapManifest`) and the production trust root are now the
+  SAME real Ed25519 key (see `docs/B12_MANIFEST_KEY_CEREMONY.md`'s
+  "Production ceremony (B17)" section for the fingerprint and procedure);
+  the bootstrap names BOTH real gateways (frankfurt, stockholm). Live
+  `GET /v1/manifest` deployment to either production VPS is NOT yet done -
+  see ROADMAP's Signed Offline Bootstrap row for the exact status.
 - **Candidate identity/execution (hard invariant, consolidated review fix)**:
   each `GatewayAttemptCandidate` carries its own already-resolved
   `configSnapshot`. `AutoGatewaySelector`'s candidate is threaded verbatim -
@@ -147,15 +168,19 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-09-01 (after B16 consolidated review fix - the pinned
-`GatewayAttemptCandidate.configSnapshot` is now threaded verbatim through
-`TransportOrchestrator`/`VpnController.connect()` and actually EXECUTED for
-the whole attempt, never reconstructed from `SelectedGatewayStore`/
-`ClientTunnelIdentityStore`/`ProductionGatewayCatalog`; `ActiveAttemptGatewaySource`
-was removed as superseded; the Auto-vs-`AwgXrayFailoverPolicy` relationship
-is now documented accurately. Builds on the same-day B16 physical validation:
-real Auto failover from Germany to Stockholm, real data-plane confirmation,
-restore, normal reconnect confirmed; one diagnostics-only bug found and
-fixed. See ROADMAP's Gateway Pool / automatic gateway selection failover rows).
+Last updated: 2026-09-01 (B17 - Auto gateway/path DISCOVERY runtime authority
+moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;
+the production Ed25519 key ceremony was performed (real keypair, private key
+never printed/committed, stored offline outside the repo) and the embedded
+bootstrap now names both real gateways under that same production key. Live
+`/v1/manifest` deployment to either production VPS remains an operator step -
+see ROADMAP's Signed Offline Bootstrap row for exact status. Builds on B16's
+consolidated review fix - the pinned `GatewayAttemptCandidate.configSnapshot`
+is threaded verbatim through `TransportOrchestrator`/`VpnController.connect()`
+and actually EXECUTED for the whole attempt, never reconstructed from
+`SelectedGatewayStore`/`ClientTunnelIdentityStore`/`ProductionGatewayCatalog`;
+the Auto-vs-`AwgXrayFailoverPolicy` relationship is documented accurately; and
+same-day B16 physical validation - real Auto failover from Germany to
+Stockholm, real data-plane confirmation, restore, normal reconnect confirmed.
 If this file's "Current gateway state" table conflicts with `docs/ROADMAP.md`,
 ROADMAP wins - update this file to match rather than trusting the stale copy.

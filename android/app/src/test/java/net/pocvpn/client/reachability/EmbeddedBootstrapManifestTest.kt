@@ -21,4 +21,26 @@ class EmbeddedBootstrapManifestTest {
         val gateway = manifest.endpoints.first()
         assertTrue(gateway.supports(TransportKind.AMNEZIA_WG))
     }
+
+    /** B17 - the production bootstrap must name BOTH real production gateways, not just one. */
+    @Test
+    fun `the production embedded bootstrap names both Germany and Stockholm`() {
+        val manifest = EmbeddedBootstrapManifest.signedManifest().manifest
+        val ids = manifest.endpoints.map { it.id.value }.toSet()
+        assertEquals(setOf("frankfurt", "stockholm"), ids)
+        manifest.endpoints.forEach { endpoint ->
+            assertTrue(endpoint.supports(TransportKind.AMNEZIA_WG))
+            assertTrue(endpoint.supports(TransportKind.XRAY_REALITY))
+            assertTrue(endpoint.supports(TransportKind.TLS_TCP))
+        }
+    }
+
+    /** B17 - no per-device secret ever leaks into the embedded bootstrap's metadata. */
+    @Test
+    fun `the production embedded bootstrap carries no per-device or credential metadata`() {
+        val manifest = EmbeddedBootstrapManifest.signedManifest().manifest
+        manifest.endpoints.forEach { endpoint ->
+            endpoint.transports.forEach { binding -> assertTrue(binding.metadata.isEmpty()) }
+        }
+    }
 }

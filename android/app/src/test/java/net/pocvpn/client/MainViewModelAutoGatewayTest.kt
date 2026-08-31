@@ -11,6 +11,17 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
+import net.pocvpn.client.reachability.Ed25519ManifestVerifier
+import net.pocvpn.client.reachability.EndpointDescriptor
+import net.pocvpn.client.reachability.EndpointManifest
+import net.pocvpn.client.reachability.EndpointManifestRepository
+import net.pocvpn.client.reachability.EndpointRole
+import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.FileLastKnownGoodManifestStore
+import net.pocvpn.client.reachability.FixedManifestTrustAnchors
+import net.pocvpn.client.reachability.ManifestCanonicalizer
+import net.pocvpn.client.reachability.SignedManifest
+import net.pocvpn.client.reachability.TrustedKeyId
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.FakeClientKeyRepository
@@ -24,14 +35,20 @@ import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayAutoModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
+import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.config.TransportConfig
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.security.SecureRandom
 
 private fun configuredGateway() = GatewayConfiguration.Configured(
     endpointHost = "203.0.113.10",
@@ -123,7 +140,14 @@ private class FailNTimesThenSucceedTransport(private val failFirstNCalls: Int) :
  */
 class MainViewModelAutoGatewayTest {
 
+    @get:Rule
+    val tmp = TemporaryFolder()
+
     private val testDispatcher = StandardTestDispatcher()
+    private val manifestSigningKey = Ed25519PrivateKeyParameters(SecureRandom())
+    private val manifestTrustAnchors = FixedManifestTrustAnchors(
+        mapOf(TrustedKeyId("test-manifest-key") to manifestSigningKey.generatePublicKey().encoded),
+    )
 
     @Before
     fun setUp() {
@@ -135,11 +159,49 @@ class MainViewModelAutoGatewayTest {
         Dispatchers.resetMain()
     }
 
+    /**
+     * B17 - a trusted, signed manifest naming exactly [endpointIds] (values
+     * from `ProductionGatewayCatalog`'s own `endpointId`s, e.g. "frankfurt"/
+     * "stockholm") - the caller-supplied source of Auto discovery, per the
+     * runtime-authority change this test file now proves.
+     */
+    private fun manifestRepositoryNaming(vararg endpointIds: String): EndpointManifestRepository {
+        val manifest = EndpointManifest(
+            manifestVersion = 1,
+            issuedAtEpochMillis = 1_000L,
+            expiresAtEpochMillis = 9_000_000_000_000L,
+            signingKeyId = "test-manifest-key",
+            endpoints = endpointIds.map { id ->
+                val gateway = ProductionGatewayCatalog.all.first { it.endpointId.value == id }
+                EndpointDescriptor(
+                    id = gateway.endpointId,
+                    roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+                    region = "${gateway.displayCountry} / ${gateway.displayCity}",
+                    provider = gateway.provider,
+                    transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, gateway.awg.endpointHost, gateway.awg.endpointPort)),
+                )
+            },
+        )
+        val signer = Ed25519Signer()
+        signer.init(true, manifestSigningKey)
+        val bytes = ManifestCanonicalizer.canonicalBytes(manifest)
+        signer.update(bytes, 0, bytes.size)
+        val signed = SignedManifest(manifest, signer.generateSignature())
+        return EndpointManifestRepository(
+            verifier = Ed25519ManifestVerifier(),
+            trustAnchors = manifestTrustAnchors,
+            lkgStore = FileLastKnownGoodManifestStore(tmp.newFolder()),
+            bootstrapManifest = signed,
+            nowEpochMillis = { 2_000L },
+        )
+    }
+
     private fun newViewModel(
         transport: VpnTransport = FakeVpnTransport(),
         autoModeStore: GatewayAutoModeStore = FakeGatewayAutoModeStore(),
         identityStore: net.pocvpn.client.vpn.config.ClientTunnelIdentityStore = bothProvisioned,
         selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = FakeSelectedGatewayStore(),
+        manifestRepository: EndpointManifestRepository? = manifestRepositoryNaming("frankfurt", "stockholm"),
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -150,6 +212,7 @@ class MainViewModelAutoGatewayTest {
         clientTunnelIdentityStore = identityStore,
         gatewayAutoModeStore = autoModeStore,
         initialNetworkProfile = USABLE_WIFI,
+        manifestRepository = manifestRepository,
     )
 
     // --- candidate construction ---
@@ -166,6 +229,29 @@ class MainViewModelAutoGatewayTest {
         val viewModel = newViewModel(identityStore = FakeClientTunnelIdentityStore(mapOf(ProductionGatewayId.GERMANY to "10.77.0.5")))
         val candidates = viewModel.autoGatewayCandidates()
         assertEquals(listOf(ProductionGatewayId.GERMANY), candidates.map { it.gatewayId })
+    }
+
+    /** B17 - runtime-authority proof: the trusted manifest gates discovery even though the device is provisioned for both. */
+    @Test
+    fun `manifest naming only Germany excludes Stockholm even though this device is provisioned for both`() {
+        val viewModel = newViewModel(manifestRepository = manifestRepositoryNaming("frankfurt"))
+        val candidates = viewModel.autoGatewayCandidates()
+        assertEquals(listOf(ProductionGatewayId.GERMANY), candidates.map { it.gatewayId })
+    }
+
+    /** B17 - task requirement 9.D: no trusted manifest source at all must fail closed, never fall back to the unverified catalog. */
+    @Test
+    fun `no manifest repository wired - auto candidates are empty even though both gateways are provisioned`() {
+        val viewModel = newViewModel(manifestRepository = null)
+        assertTrue(viewModel.autoGatewayCandidates().isEmpty())
+    }
+
+    /** B17 - both real endpoints become candidates precisely when both the trusted manifest and local provisioning agree. */
+    @Test
+    fun `both Germany and Stockholm become candidates when trusted manifest and local provisioning both exist`() {
+        val viewModel = newViewModel(manifestRepository = manifestRepositoryNaming("frankfurt", "stockholm"))
+        val candidates = viewModel.autoGatewayCandidates()
+        assertEquals(setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM), candidates.map { it.gatewayId }.toSet())
     }
 
     @Test

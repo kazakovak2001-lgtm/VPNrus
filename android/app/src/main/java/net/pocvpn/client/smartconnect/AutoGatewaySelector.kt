@@ -1,5 +1,6 @@
 package net.pocvpn.client.smartconnect
 
+import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
 import net.pocvpn.client.reachability.PathCandidateBuilder
@@ -33,8 +34,8 @@ data class GatewayAttemptCandidate(
 )
 
 /**
- * B16 - promotes the EXISTING, unmodified reachability/PathScorer pipeline
- * (ReachabilityEngine -> PathCandidateBuilder -> PathScorer - see
+ * B16/B17 - promotes the EXISTING, unmodified reachability/PathScorer
+ * pipeline (ReachabilityEngine -> PathCandidateBuilder -> PathScorer - see
  * PROJECT_ARCHITECTURE.md's fixed pipeline order) into the real automatic
  * gateway-selection decision boundary. Deliberately NOT a second/parallel
  * scoring system: [PathScorer.score]/[PathScorer.rank] are called exactly
@@ -42,6 +43,20 @@ data class GatewayAttemptCandidate(
  * own (observational) purpose - this object only adds the gateway-level
  * framing (candidate identity, bounded ordering, fail-closed/fallback
  * rules) around that existing, already-tested scorer.
+ *
+ * **B17 runtime-authority change**: gateway/path DISCOVERY - which endpoint
+ * ids even exist as candidates - now comes from the caller's verified
+ * `TrustedManifestState` (via [manifestEndpoints]), never directly from
+ * `ProductionGatewayCatalog`. `ProductionGatewayCatalog` (via
+ * [gatewayFactsFor]) is consulted only as a COMPATIBILITY lookup - for an
+ * endpoint id the manifest has ALREADY named, it supplies the AWG
+ * connection facts (server public key, gateway tunnel IP, obfuscation
+ * profile) needed to actually dial it, none of which belong in the public
+ * manifest (see EmbeddedBootstrapManifest's own docs on what must never be
+ * embedded there). An endpoint present in the catalog but ABSENT from the
+ * trusted manifest can never become a candidate this way - [gatewayFactsFor]
+ * is only ever invoked with an [EndpointId] the manifest itself already
+ * named, never iterated the other way around.
  */
 object AutoGatewaySelector {
 
@@ -49,12 +64,27 @@ object AutoGatewaySelector {
     const val MAX_ATTEMPTS = 4
 
     /**
-     * Builds the full ranked candidate list across every PROVISIONED
-     * production gateway - an unprovisioned gateway (no client tunnel
-     * identity on this device) is silently excluded, the SAME readiness
-     * check MainViewModel.provisionedGatewayIds already applies to the
-     * manual picker: never a fabricated candidate for a gateway this device
-     * cannot actually authenticate to. Empty when nothing is eligible -
+     * Builds the full ranked candidate list across every manifest-named
+     * endpoint this device is ALSO locally PROVISIONED for - task
+     * requirement 7's "combine verified public endpoint facts from the
+     * trusted manifest WITH local per-device provisioned identity/profile
+     * availability". [manifestEndpoints] should be
+     * `(TrustedManifestState.Trusted.manifest.endpoints)` when something
+     * verifies, or an empty list when nothing does (`NoneTrusted`) - an
+     * empty list here always yields an empty candidate list, never a
+     * fallback to the raw catalog (task requirement 9.D: fail closed, never
+     * silently fall back to an unsigned catalog candidate).
+     *
+     * For each manifest endpoint, [gatewayFactsFor] resolves the LOCAL
+     * connection facts needed to dial it (null if this device's catalog
+     * has no such gateway at all - never a fabricated match); the endpoint
+     * is then filtered by [provisioned]/[clientTunnelIp] - the SAME
+     * readiness check MainViewModel.provisionedGatewayIds already applies
+     * to the manual picker: never a fabricated candidate for a gateway this
+     * device cannot actually authenticate to, and never a candidate merely
+     * because the manifest names it (task requirement 7's own example -
+     * "a manifest naming Stockholm does NOT imply this device is
+     * provisioned for Stockholm"). Empty when nothing is eligible -
      * callers must fail closed, never invent a fallback candidate (task
      * requirement 5's "no random gateway selection").
      *
@@ -70,7 +100,8 @@ object AutoGatewaySelector {
      * outright the way an ineligible (NOT AVAILABLE-registry) candidate is.
      */
     fun buildCandidates(
-        gateways: List<ProductionGatewayDescriptor>,
+        manifestEndpoints: List<EndpointDescriptor>,
+        gatewayFactsFor: (EndpointId) -> ProductionGatewayDescriptor?,
         provisioned: (ProductionGatewayId) -> Boolean,
         clientTunnelIp: (ProductionGatewayId) -> String?,
         registryFor: (EndpointId) -> TransportRegistry,
@@ -81,7 +112,11 @@ object AutoGatewaySelector {
         historyFor: (EndpointId, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
     ): List<GatewayAttemptCandidate> {
-        val eligibleGateways = gateways.filter { provisioned(it.id) && !clientTunnelIp(it.id).isNullOrBlank() }
+        val eligible = manifestEndpoints.mapNotNull { manifestEndpoint ->
+            val gateway = gatewayFactsFor(manifestEndpoint.id) ?: return@mapNotNull null
+            if (!provisioned(gateway.id) || clientTunnelIp(gateway.id).isNullOrBlank()) return@mapNotNull null
+            gateway to manifestEndpoint
+        }
         val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
 
         // Keyed by PathCandidate.Direct.id ("direct:<transport>:<endpointId>") -
@@ -89,12 +124,23 @@ object AutoGatewaySelector {
         // PathScorer.rank()'s reordering without relying on object identity.
         val scoredByCandidateId = LinkedHashMap<String, Pair<ProductionGatewayDescriptor, PathScorer.PathScoreResult>>()
 
-        eligibleGateways.forEach { gateway ->
-            val endpoint = ProductionGatewayEndpoints.descriptorFor(
-                gateway,
-                xrayAvailable = xrayAvailableFor(gateway.endpointId),
-                xrayTlsAvailable = xrayTlsAvailableFor(gateway.endpointId),
-            )
+        eligible.forEach { (gateway, manifestEndpoint) ->
+            // Local per-device profile availability gates WHICH of the
+            // manifest's declared transport bindings this device can
+            // actually use today (task requirement 7) - the manifest
+            // merely says the endpoint SUPPORTS a transport kind at a
+            // given host:port, never that this device has a usable
+            // credential for it yet.
+            val availableTransports = manifestEndpoint.transports.filter { binding ->
+                when (binding.kind) {
+                    TransportKind.AMNEZIA_WG -> true // already gated by provisioned()/clientTunnelIp() above
+                    TransportKind.XRAY_REALITY -> xrayAvailableFor(manifestEndpoint.id)
+                    TransportKind.TLS_TCP -> xrayTlsAvailableFor(manifestEndpoint.id)
+                    else -> false
+                }
+            }
+            if (availableTransports.isEmpty()) return@forEach
+            val endpoint = manifestEndpoint.copy(transports = availableTransports)
             val registry = registryFor(gateway.endpointId)
             endpoint.transports.map { it.kind }
                 .filter { pinnedKind == null || it == pinnedKind }

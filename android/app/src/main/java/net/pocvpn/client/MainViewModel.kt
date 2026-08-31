@@ -303,10 +303,16 @@ class MainViewModel(
     // automatic substitute (see AwgXrayFailoverPolicy's own docs).
     private val userTransportPreference: UserTransportPreference = UserTransportPreference.Auto,
     // B11 - additive, defaults to null (same "no wiring, no behavior" seam
-    // as every other optional dependency above). When present, ONLY powers
-    // reachabilityDiagnostics() below - a read-only snapshot. Never consulted
-    // by smartConnectDecision()/buildTransportRegistry() - see
-    // ReachabilityDiagnosticsSnapshot's own "observational only" docs.
+    // as every other optional dependency above). Powers
+    // reachabilityDiagnostics() below - a read-only snapshot - AND, as of
+    // B17, is the authoritative source of WHICH endpoints are eligible for
+    // automatic gateway selection (buildAutoGatewayCandidates()) - null here
+    // means Auto discovery sees zero manifest endpoints and fails closed
+    // (task requirement 9.D), never a fallback to the raw catalog. Still
+    // never consulted by smartConnectDecision()/buildTransportRegistry()
+    // (transport SELECTION within one already-chosen gateway stays
+    // unaffected - see ReachabilityDiagnosticsSnapshot's own "observational
+    // only" docs for that boundary, unchanged by B17).
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
@@ -1578,11 +1584,23 @@ class MainViewModel(
     }
 
     /**
-     * B16 - builds the real, ranked candidate list for automatic gateway
+     * B16/B17 - builds the real, ranked candidate list for automatic gateway
      * selection, reusing the SAME evidence accessors (transportHealth(),
      * restrictionClass(), recentConnectionOutcomes(), pathHistoryStore) the
      * rest of this ViewModel already computes fresh on every call - never a
      * second, independently-derived evidence source.
+     *
+     * **B17 runtime-authority change**: WHICH endpoints are even eligible
+     * now comes from [manifestRepository]'s verified [net.pocvpn.client.reachability.TrustedManifestState] -
+     * `ProductionGatewayCatalog.all` is consulted only as a per-endpoint
+     * COMPATIBILITY lookup ([gatewayFactsFor], invoked only for an endpoint
+     * id the trusted manifest already named), never iterated directly to
+     * decide what exists. Nothing trusted ([net.pocvpn.client.reachability.TrustedManifestState.NoneTrusted],
+     * or [manifestRepository] never wired at all) yields an empty manifest
+     * endpoint list, which - by construction in
+     * [net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCandidates] -
+     * always yields an empty candidate list: task requirement 9.D's
+     * fail-closed rule, never a silent fallback to the unverified catalog.
      */
     private fun buildAutoGatewayCandidates(): List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate> {
         val now = System.currentTimeMillis()
@@ -1597,8 +1615,10 @@ class MainViewModel(
             )
         }
         val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
+        val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
         return net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCandidates(
-            gateways = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+            manifestEndpoints = manifestEndpoints,
+            gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
             provisioned = ::isGatewayProvisioned,
             clientTunnelIp = { id -> clientTunnelIdentityStore?.read(id) },
             registryFor = { endpointId -> buildTransportRegistry(endpointId) },
