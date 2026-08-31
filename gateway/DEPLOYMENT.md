@@ -392,3 +392,41 @@ any script in this slice.
   install the wrapper/sudoers/unit/env file with the ownership in section
   1, and run `gateway/tools/enrollment_tokens.py init` - none of which is
   automated by this slice.
+
+## Deploying a second gateway (e.g. Stockholm)
+
+B14 (2026-08-31) - this entire codebase (`gateway/api/*.py`) is already
+gateway-agnostic: every gateway-specific fact (its own AWG public key,
+port, tunnel IP, REALITY/TLS keys, port numbers, etc.) is read from
+`POCVPN_API_*` environment variables (`gateway/api/config.py`) - there is
+no Germany-specific hardcoding anywhere in this package (audited as part
+of B14; confirmed by a full grep of `gateway/api/`). Supporting a second
+gateway - Stockholm, or any future one - therefore needs **zero code
+changes here**. It is purely a deployment action:
+
+1. Provision a second VPS (already done for Stockholm - AWS eu-north-1,
+   `16.170.208.231` - see `docs/ROADMAP.md`'s Gateway Pool row for its
+   physical AWG/REALITY/TLS_TCP validation history).
+2. Follow every step in this document exactly as for the first gateway,
+   but on that VPS, with `gateway/config/api.env.example` filled in from
+   **that gateway's own** facts (its own AWG keypair/tunnel IP, its own
+   REALITY keypair, its own TLS certificate) - never Germany's values
+   copied over, and never a shared/federated identity between the two.
+3. The Android client already has the request-side of this wired (B14):
+   `MainViewModel.activateDevice(credential, ProductionGatewayId.STOCKHOLM)`
+   posts to `ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost`'s own
+   `/v1/activate`/`/v1/xray-profile` - once step 2 is live there, a real
+   activation attempt will succeed with no further client-side change.
+
+**As of this writing, step 1 is done and step 2 has NOT been performed
+for Stockholm** - no `pocvpn-api` instance is deployed there, so a real
+Stockholm activation attempt currently fails closed with a network error
+(connection refused/timeout), never a fabricated success. This is a
+genuine operator/deployment action, deliberately not performed by any
+automated change - see `docs/ROADMAP.md`'s own `multi-provider gateway
+infrastructure` row for the current, authoritative status of this gap.
+Performing it does not require and must not trigger allocating a new
+Elastic IP or any other paid AWS resource unless that has been separately,
+deliberately approved - see the Gateway Pool row's own addressing-
+stability note for why Stockholm's current address is not yet treated as
+durable.
