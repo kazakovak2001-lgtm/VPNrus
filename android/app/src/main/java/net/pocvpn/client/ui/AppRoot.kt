@@ -75,6 +75,14 @@ fun AppRoot(
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
     val selectedGatewayId by viewModel.selectedGateway.collectAsStateWithLifecycle()
     val selectedGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGatewayId)
+    // B16 - task requirement 9: Home shows the ACTUAL active gateway, not
+    // just "Auto", once a real attempt has targeted one; while idle in Auto
+    // mode (nothing attempted yet this session) it shows "Auto / Smart
+    // Connect" instead of a location this device has not actually chosen.
+    val gatewayAutoMode by viewModel.gatewayAutoMode.collectAsStateWithLifecycle()
+    val activeGatewayId by viewModel.activeGatewayId.collectAsStateWithLifecycle()
+    val showAutoPlaceholder = gatewayAutoMode && !transportState.isConnectedOrConnecting()
+    val displayGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(if (gatewayAutoMode) activeGatewayId else selectedGatewayId)
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
@@ -182,8 +190,13 @@ fun AppRoot(
                     appliedRoutingMode = appliedRoutingPolicy?.mode ?: AppRoutingMode.ALL_APPS,
                     // B13 - the ACTUALLY selected gateway (persisted, real) -
                     // never the old static "Germany / Frankfurt" placeholder.
-                    locationCountry = selectedGateway.displayCountry,
-                    locationCity = selectedGateway.displayCity,
+                    // B16 - in Auto mode this becomes the ACTUAL active
+                    // gateway once a real attempt has targeted one, or an
+                    // explicit "Auto / Smart Connect" placeholder while idle
+                    // (see showAutoPlaceholder/displayGateway above) - never
+                    // a stale manual selection Auto mode is not honoring.
+                    locationCountry = if (showAutoPlaceholder) androidx.compose.ui.res.stringResource(net.pocvpn.client.R.string.location_auto_country) else displayGateway.displayCountry,
+                    locationCity = if (showAutoPlaceholder) androidx.compose.ui.res.stringResource(net.pocvpn.client.R.string.location_auto_city) else displayGateway.displayCity,
                     // B13 consolidated review fix (finding 5) - refuses to
                     // even OPEN the picker while a session genuinely exists
                     // (net.pocvpn.client.vpn.TransportState.blocksGatewaySelection -
@@ -201,6 +214,7 @@ fun AppRoot(
     if (showGatewayPicker) {
         net.pocvpn.client.ui.screens.GatewayPickerDialog(
             current = selectedGatewayId,
+            autoMode = gatewayAutoMode,
             options = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
             provisionedGatewayIds = viewModel.provisionedGatewayIds,
             onSelect = { id ->
@@ -211,6 +225,12 @@ fun AppRoot(
                 // asynchronously) - never act on a tap in that window either.
                 if (!transportState.blocksGatewaySelection()) {
                     viewModel.selectGateway(id)
+                    showGatewayPicker = false
+                }
+            },
+            onSelectAuto = {
+                if (!transportState.blocksGatewaySelection()) {
+                    viewModel.setGatewayAutoMode(true)
                     showGatewayPicker = false
                 }
             },
@@ -320,10 +340,27 @@ private fun buildDiagnosticsLines(
     // not reuse smartConnectDecision below (that always reflects what would
     // be chosen RIGHT NOW, which can differ from what is actually running).
     val currentTransportLine = "Current transport: ${viewModel.currentTransportKind.value?.toString() ?: "NONE"}"
-    val smartConnectGatewayLine = "Gateway: ${when (smartConnectDecision) {
-        is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.gateway.region
-        SmartConnectDecision.NoCandidateAvailable -> "NONE"
-    }}"
+    // B16 - smartConnectDecision() above is ALWAYS a manual-mode-shaped
+    // decision (SmartConnectCandidateSelector.decide() only ever knows about
+    // MainViewModel.selectedGateway, the persisted MANUAL selection - see its
+    // own docs). While gatewayAutoMode is true this line must NOT reuse it -
+    // that would show the stale manual selection/fallback even when a real
+    // Auto attempt has already targeted (and possibly connected to) a
+    // DIFFERENT gateway, violating the same "actually running, never a
+    // hypothetical recompute" discipline currentTransportLine's own comment
+    // already documents. viewModel.activeGatewayId is the truthful source in
+    // Auto mode - the same value the Home location card itself renders once
+    // an attempt has targeted a gateway (see showAutoPlaceholder above).
+    val smartConnectGatewayLine = "Gateway: ${
+        if (viewModel.gatewayAutoMode.value) {
+            net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(viewModel.activeGatewayId.value).let { "${it.displayCountry} / ${it.displayCity}" }
+        } else {
+            when (smartConnectDecision) {
+                is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.gateway.region
+                SmartConnectDecision.NoCandidateAvailable -> "NONE"
+            }
+        }
+    }"
     val smartConnectReasonLine = "Smart Connect decision reason: ${when (smartConnectDecision) {
         is SmartConnectDecision.Selected -> smartConnectDecision.score.reason
         SmartConnectDecision.NoCandidateAvailable -> "NO_CANDIDATE_AVAILABLE"
@@ -353,6 +390,27 @@ private fun buildDiagnosticsLines(
     // smartConnectDecision() above, so this line can never disagree with
     // "Current transport" by implying a different one was actually chosen).
     val transportScoresLine = "Transport scores: ${viewModel.transportScores().entries.joinToString { "${it.key}=${it.value}" }}"
+
+    // B16 - task requirement 10's compact diagnostics: mode, the ranked
+    // candidate list (region/transport/score only - no secrets), which one
+    // is currently active, the full attempt history for the LAST connect()
+    // request, and the most recent failure category if any.
+    val gatewayAutoModeLine = "Gateway mode: ${if (viewModel.gatewayAutoMode.value) "AUTO" else "MANUAL"}"
+    val autoCandidatesLine = if (viewModel.gatewayAutoMode.value) {
+        "Auto candidates (ranked): ${
+            viewModel.autoGatewayCandidates().joinToString {
+                "${it.gatewayId}/${it.transport}(score=${it.score})"
+            }.ifEmpty { "NONE" }
+        }"
+    } else {
+        "Auto candidates (ranked): N/A (manual mode)"
+    }
+    val autoAttemptLine = viewModel.autoGatewayDiagnostics.value?.let { d ->
+        "Auto attempt: current=${d.current?.let { "${it.gatewayId}/${it.transport}" } ?: "-"}, " +
+            "attempted=${d.attempted.joinToString { "${it.gatewayId}/${it.transport}" }.ifEmpty { "none" }}, " +
+            "lastFailure=${d.lastFailureReason ?: "-"}, exhausted=${d.exhausted}"
+    } ?: "Auto attempt: -"
+    val activeGatewayLine = "Active gateway: ${net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(viewModel.activeGatewayId.value).let { "${it.displayCountry} / ${it.displayCity}" }}"
 
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
@@ -384,6 +442,10 @@ private fun buildDiagnosticsLines(
         restrictionClassLine,
         transportHealthLine,
         transportScoresLine,
+        gatewayAutoModeLine,
+        autoCandidatesLine,
+        autoAttemptLine,
+        activeGatewayLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",

@@ -31,6 +31,10 @@
     <!-- B15 - lets the user request activation for a gateway not yet
          provisioned on this device (see GatewayPickerDialog's own docs). -->
     <string name="gateway_picker_activate">Activate</string>
+    <string name="gateway_picker_auto_title">Auto</string>
+    <string name="gateway_picker_auto_subtitle">Smart Connect chooses the best server</string>
+    <string name="location_auto_country">Auto</string>
+    <string name="location_auto_city">Smart Connect</string>
 
     <!-- Settings / split tunneling -->
     <string name="settings_title">Settings</string>

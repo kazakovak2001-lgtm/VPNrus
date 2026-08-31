@@ -102,6 +102,41 @@ private class PendingFailoverAttempt(
     // a Xray fallback for a real second gateway must stay ON that gateway,
     // never silently jump back to a different endpoint's default.
     val endpointId: net.pocvpn.client.reachability.EndpointId,
+    // B16 - non-null exactly when this attempt is part of an automatic
+    // gateway-selection sequence - see [PendingAutoGatewayContext]'s own
+    // docs. null (the default) means "manual gateway, existing intra-gateway
+    // AWG->Xray failover only" - byte-for-byte the pre-B16 shape.
+    val autoContext: PendingAutoGatewayContext? = null,
+)
+
+/**
+ * B16 - the retained context an automatic-gateway connect() sequence needs
+ * to advance past a failed candidate: the FULL ranked candidate list
+ * (built once, at the start of the sequence - never rebuilt mid-sequence,
+ * so a later candidate is never silently re-scored against evidence that
+ * changed because of the very failure being handled) and which
+ * (gateway, transport) pairs have already been attempted this request.
+ */
+private class PendingAutoGatewayContext(
+    val candidates: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
+    val attempted: Set<Pair<net.pocvpn.client.vpn.config.ProductionGatewayId, TransportKind>>,
+)
+
+/**
+ * B16 - compact, truthful diagnostics for the automatic gateway decision
+ * (task requirement 10): the ranked candidate list, which one is currently
+ * targeted, the full attempt history for this request, the most recent
+ * failure's category, and whether the bounded candidate set has been
+ * exhausted. Never carries a secret/credential field - every field here is
+ * already one this codebase's own diagnostics surfaces expose elsewhere
+ * (GatewayAttemptCandidate/VpnError's own types structurally carry none).
+ */
+data class AutoGatewayDiagnostics(
+    val rankedCandidates: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
+    val attempted: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
+    val current: net.pocvpn.client.smartconnect.GatewayAttemptCandidate?,
+    val lastFailureReason: String?,
+    val exhausted: Boolean,
 )
 
 /**
@@ -292,6 +327,11 @@ class MainViewModel(
     // selectedGateway/selectGateway() below, never a second, competing
     // source of truth for the actual connect-time config).
     private val selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = net.pocvpn.client.vpn.config.SelectedGatewayStore.germanyOnly(),
+    // B16 - additive, defaults to a store that always reads Manual (false)
+    // and ignores writes (byte-for-byte pre-B16 behavior for every existing
+    // call site/test: automatic gateway selection did not exist before this
+    // slice, so its absence here changes nothing).
+    private val gatewayAutoModeStore: net.pocvpn.client.vpn.config.GatewayAutoModeStore = net.pocvpn.client.vpn.config.GatewayAutoModeStore.manualOnly(),
     // B13 review fix - additive, defaults to null (same "no wiring, no
     // behavior" seam as every other optional dependency above). When
     // non-null, this is the SAME per-device ClientTunnelIdentityStore
@@ -427,7 +467,53 @@ class MainViewModel(
         if (transportState.value.blocksGatewaySelection()) return
         selectedGatewayStore.write(id)
         _selectedGateway.value = id
+        // B16 - choosing a specific gateway manually is exactly what
+        // GatewayPickerDialog's own row tap already meant pre-B16; making it
+        // ALSO exit automatic mode keeps that meaning intact rather than
+        // silently leaving Auto engaged with a manual pick the user can't
+        // see took no effect (per task requirement 2: manual selection must
+        // remain deterministic).
+        if (_gatewayAutoMode.value) {
+            gatewayAutoModeStore.write(false)
+            _gatewayAutoMode.value = false
+        }
+        _activeGatewayId.value = id
     }
+
+    // B16 - persisted automatic-gateway-selection preference (task
+    // requirement 9/UI, requirement 11's "restart preserves manual/Auto
+    // preference"). Read once at construction (same pattern as
+    // _selectedGateway above) and updated in-place by [setGatewayAutoMode].
+    private val _gatewayAutoMode = MutableStateFlow(gatewayAutoModeStore.read())
+    val gatewayAutoMode: StateFlow<Boolean> = _gatewayAutoMode.asStateFlow()
+
+    /**
+     * B16 - THE one place automatic-gateway mode is toggled. Same
+     * active-session guard [selectGateway] already enforces (task
+     * requirement 8/"select now, apply on the next real connect()" - never
+     * changes what an already-connected tunnel is doing).
+     */
+    fun setGatewayAutoMode(auto: Boolean) {
+        if (transportState.value.blocksGatewaySelection()) return
+        gatewayAutoModeStore.write(auto)
+        _gatewayAutoMode.value = auto
+    }
+
+    /**
+     * B16 - the gateway a connect() attempt is CURRENTLY targeting/using,
+     * for UI display (task requirement 9: "when connected automatically,
+     * show the actual active gateway/location, not just Auto"). For MANUAL
+     * mode this always mirrors [selectedGateway]. For AUTO mode this
+     * updates the instant each ranked candidate is actually attempted -
+     * never a stale "Auto" placeholder once a real attempt has started.
+     */
+    private val _activeGatewayId = MutableStateFlow(_selectedGateway.value)
+    val activeGatewayId: StateFlow<net.pocvpn.client.vpn.config.ProductionGatewayId> = _activeGatewayId.asStateFlow()
+
+    // B16 - task requirement 10's diagnostics surface. null until the first
+    // Auto connect() attempt of this ViewModel's lifetime.
+    private val _autoGatewayDiagnostics = MutableStateFlow<AutoGatewayDiagnostics?>(null)
+    val autoGatewayDiagnostics: StateFlow<AutoGatewayDiagnostics?> = _autoGatewayDiagnostics.asStateFlow()
 
     // B8I - CURRENT network facts only (see NetworkProfile's own docs for
     // why this is deliberately separate from connectionOutcomeStore's
@@ -1420,67 +1506,210 @@ class MainViewModel(
             // permission result or async state change for that OLD request
             // must never reuse it.
             clearFailoverWatch()
-            when (val decision = smartConnectDecision()) {
-                is SmartConnectDecision.Selected -> {
-                    val kind = decision.score.candidate.transport.kind
-                    // B13 - the real SmartConnectCandidateSelector-chosen
-                    // GatewayCandidate.id (today always ProductionGateway.ID,
-                    // but derived, never hardcoded here) - the first place
-                    // this ViewModel names WHICH endpoint the attempt about
-                    // to be resolved/executed actually targets.
-                    val endpointId = net.pocvpn.client.reachability.EndpointId(decision.score.candidate.gateway.id)
-                    // B13 consolidated review fix - THIS attempt's own
-                    // endpointId, never the default: the registry that
-                    // decides eligibility for an AWG -> Xray failover later
-                    // (armFailoverWatch/maybeFailoverToXray, both reuse THIS
-                    // exact retained registry, never rebuild it) must report
-                    // Xray/TLS availability for the SAME gateway this attempt
-                    // is actually connecting to.
-                    val registry = buildTransportRegistry(endpointId)
-                    val orchestrator = TransportOrchestrator(registry)
-                    when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId)) {
-                        is TransportOrchestrator.Resolution.Resolved -> {
-                            // B8I8A - checked BEFORE connect() (same
-                            // side-effect-free query VpnController.connect()
-                            // itself performs immediately after, on the SAME
-                            // instance, with no suspension in between - see
-                            // VpnTransport.preparePermissionIntent's own
-                            // contract) so this ViewModel knows, without
-                            // guessing, whether THIS attempt will settle
-                            // synchronously or pause for the user.
-                            val permissionPending = resolution.transport.preparePermissionIntent() != null
-                            val attempt = PendingFailoverAttempt(
-                                initialKind = kind,
-                                preference = userTransportPreference,
-                                registry = registry,
-                                orchestrator = orchestrator,
-                                endpointId = endpointId,
-                            )
-                            pendingFailoverAttempt = attempt
-                            controller.connect(resolution)
-                            if (!permissionPending) {
-                                // Already fully settled synchronously (or
-                                // will settle/transition asynchronously from
-                                // here on) - start watching now, exactly like
-                                // every pre-B8K6A connect() attempt started
-                                // its ONE synchronous check now.
-                                armFailoverWatch(attempt)
-                            }
-                            // else: RequestVpnPermission was just emitted -
-                            // wait for onVpnPermissionResult() to resume this
-                            // SAME attempt and start watching then.
+            if (_gatewayAutoMode.value) connectAuto() else connectManual()
+        }
+    }
+
+    /** B8I1 - the pre-B16 connect() body, unchanged: manual gateway, existing intra-gateway AWG->Xray failover only. */
+    private suspend fun connectManual() {
+        when (val decision = smartConnectDecision()) {
+            is SmartConnectDecision.Selected -> {
+                val kind = decision.score.candidate.transport.kind
+                // B13 - the real SmartConnectCandidateSelector-chosen
+                // GatewayCandidate.id (today always ProductionGateway.ID,
+                // but derived, never hardcoded here) - the first place
+                // this ViewModel names WHICH endpoint the attempt about
+                // to be resolved/executed actually targets.
+                val endpointId = net.pocvpn.client.reachability.EndpointId(decision.score.candidate.gateway.id)
+                _activeGatewayId.value = selectedGateway.value
+                // B13 consolidated review fix - THIS attempt's own
+                // endpointId, never the default: the registry that
+                // decides eligibility for an AWG -> Xray failover later
+                // (armFailoverWatch/maybeFailoverToXray, both reuse THIS
+                // exact retained registry, never rebuild it) must report
+                // Xray/TLS availability for the SAME gateway this attempt
+                // is actually connecting to.
+                val registry = buildTransportRegistry(endpointId)
+                val orchestrator = TransportOrchestrator(registry)
+                when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId)) {
+                    is TransportOrchestrator.Resolution.Resolved -> {
+                        // B8I8A - checked BEFORE connect() (same
+                        // side-effect-free query VpnController.connect()
+                        // itself performs immediately after, on the SAME
+                        // instance, with no suspension in between - see
+                        // VpnTransport.preparePermissionIntent's own
+                        // contract) so this ViewModel knows, without
+                        // guessing, whether THIS attempt will settle
+                        // synchronously or pause for the user.
+                        val permissionPending = resolution.transport.preparePermissionIntent() != null
+                        val attempt = PendingFailoverAttempt(
+                            initialKind = kind,
+                            preference = userTransportPreference,
+                            registry = registry,
+                            orchestrator = orchestrator,
+                            endpointId = endpointId,
+                        )
+                        pendingFailoverAttempt = attempt
+                        controller.connect(resolution)
+                        if (!permissionPending) {
+                            // Already fully settled synchronously (or
+                            // will settle/transition asynchronously from
+                            // here on) - start watching now, exactly like
+                            // every pre-B8K6A connect() attempt started
+                            // its ONE synchronous check now.
+                            armFailoverWatch(attempt)
                         }
-                        is TransportOrchestrator.Resolution.NotSelectable -> {
-                            controller.rejectPreflight(
-                                VpnError.UnsupportedTransportSelected(kind.name),
-                                "Selected transport ($kind) could not be resolved",
-                            )
-                        }
+                        // else: RequestVpnPermission was just emitted -
+                        // wait for onVpnPermissionResult() to resume this
+                        // SAME attempt and start watching then.
+                    }
+                    is TransportOrchestrator.Resolution.NotSelectable -> {
+                        controller.rejectPreflight(
+                            VpnError.UnsupportedTransportSelected(kind.name),
+                            "Selected transport ($kind) could not be resolved",
+                        )
                     }
                 }
-                SmartConnectDecision.NoCandidateAvailable -> {
-                    controller.rejectPreflight(VpnError.NoCandidateAvailable, "No connection candidate available")
-                }
+            }
+            SmartConnectDecision.NoCandidateAvailable -> {
+                controller.rejectPreflight(VpnError.NoCandidateAvailable, "No connection candidate available")
+            }
+        }
+    }
+
+    /**
+     * B16 - builds the real, ranked candidate list for automatic gateway
+     * selection, reusing the SAME evidence accessors (transportHealth(),
+     * restrictionClass(), recentConnectionOutcomes(), pathHistoryStore) the
+     * rest of this ViewModel already computes fresh on every call - never a
+     * second, independently-derived evidence source.
+     */
+    private fun buildAutoGatewayCandidates(): List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate> {
+        val now = System.currentTimeMillis()
+        val profile = networkProfile.value
+        val restriction = restrictionClass()
+        val health = transportHealth()
+        val outcomes = recentConnectionOutcomes()
+        val fingerprint = fingerprintKeyProvider?.let {
+            net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+                net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+                it.keyBytes(),
+            )
+        }
+        val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
+        return net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCandidates(
+            gateways = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+            provisioned = ::isGatewayProvisioned,
+            clientTunnelIp = { id -> clientTunnelIdentityStore?.read(id) },
+            registryFor = { endpointId -> buildTransportRegistry(endpointId) },
+            xrayAvailableFor = ::isXrayAvailableFor,
+            xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
+            reachabilityFor = { endpointId, kind ->
+                val gateway = gatewaysById.getValue(endpointId)
+                val endpoint = net.pocvpn.client.smartconnect.ProductionGatewayEndpoints.descriptorFor(
+                    gateway,
+                    xrayAvailable = isXrayAvailableFor(endpointId),
+                    xrayTlsAvailable = isXrayTlsAvailableFor(endpointId),
+                )
+                val matchedOutcome = net.pocvpn.client.reachability.EndpointOutcomeMatcher.latestMatching(outcomes, endpointId, kind)
+                net.pocvpn.client.reachability.ReachabilityEngine.assess(
+                    endpoint = endpoint,
+                    transportKind = kind,
+                    networkUsable = profile.isUsable,
+                    transportHealth = health.getValue(kind),
+                    endpointSpecificReachable = matchedOutcome?.let { it.result == ConnectionOutcomeResult.SUCCESS },
+                    restrictionClass = restriction,
+                    nowEpochMillis = now,
+                    controlPlaneReachable = if (endpointId.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) restrictionMonitor?.lastProbeResult?.value else null,
+                    endpointSpecificOutcomeEpochMillis = matchedOutcome?.timestampEpochMillis,
+                )
+            },
+            transportHealthFor = { kind -> health.getValue(kind) },
+            historyFor = { endpointId, kind -> fingerprint?.let { pathHistoryStore?.get(it, endpointId, kind) } },
+            preference = userTransportPreference,
+        )
+    }
+
+    /**
+     * B16 - OBSERVATIONAL: the CURRENT ranked automatic-gateway candidate
+     * list, recomputed fresh on every read (same no-caching discipline as
+     * smartConnectDecision()/reachabilityDiagnostics()) - for diagnostics UI
+     * and tests. Does not itself start or affect any connect() attempt.
+     */
+    fun autoGatewayCandidates(): List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate> = buildAutoGatewayCandidates()
+
+    /** B16 - the Auto counterpart of connectManual(): builds the ranked candidate list once, then attempts the first one via [attemptAutoCandidate]. */
+    private suspend fun connectAuto() {
+        val candidates = buildAutoGatewayCandidates()
+        if (candidates.isEmpty()) {
+            _autoGatewayDiagnostics.value = AutoGatewayDiagnostics(
+                rankedCandidates = emptyList(), attempted = emptyList(), current = null,
+                lastFailureReason = null, exhausted = true,
+            )
+            controller.rejectPreflight(VpnError.NoCandidateAvailable, "No automatic gateway candidate available")
+            return
+        }
+        _autoGatewayDiagnostics.value = AutoGatewayDiagnostics(
+            rankedCandidates = candidates, attempted = emptyList(), current = null,
+            lastFailureReason = null, exhausted = false,
+        )
+        attemptAutoCandidate(candidates, attempted = emptySet())
+    }
+
+    /**
+     * B16 (consolidated review fix) - attempts the next unattempted ranked
+     * candidate (task requirement 6). [_activeGatewayId] is set BEFORE
+     * calling controller.connect() for UI/diagnostics purposes only - the
+     * REAL execution-time identity guarantee comes from threading THIS
+     * candidate's own already-resolved [GatewayAttemptCandidate.configSnapshot]
+     * straight into `orchestrator.resolve(...)` below, which carries it into
+     * `TransportOrchestrator.Resolution.Resolved.gatewayConfigSnapshot` and
+     * from there into `VpnController.connect()` - see that field's own docs
+     * for why this is what actually makes the executed tunnel config
+     * immutable for this attempt (never re-derived from SelectedGatewayStore/
+     * ProductionGatewayCatalog/ClientTunnelIdentityStore once resolved here).
+     */
+    private suspend fun attemptAutoCandidate(
+        candidates: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
+        attempted: Set<Pair<net.pocvpn.client.vpn.config.ProductionGatewayId, TransportKind>>,
+    ) {
+        val candidate = net.pocvpn.client.smartconnect.AutoGatewaySelector.nextCandidate(candidates, attempted)
+        if (candidate == null) {
+            _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(exhausted = true)
+                ?: AutoGatewayDiagnostics(candidates, emptyList(), null, "candidate set exhausted", true)
+            controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
+            return
+        }
+        _activeGatewayId.value = candidate.gatewayId
+        val nextAttempted = attempted + (candidate.gatewayId to candidate.transport)
+        _autoGatewayDiagnostics.value = (_autoGatewayDiagnostics.value ?: AutoGatewayDiagnostics(candidates, emptyList(), null, null, false)).let {
+            it.copy(attempted = it.attempted + candidate, current = candidate)
+        }
+        val registry = buildTransportRegistry(candidate.endpointId)
+        val orchestrator = TransportOrchestrator(registry)
+        val decision = TransportSelectionDecision.SelectTransport(candidate.transport)
+        when (val resolution = orchestrator.resolve(decision, candidate.endpointId, candidate.configSnapshot)) {
+            is TransportOrchestrator.Resolution.Resolved -> {
+                val permissionPending = resolution.transport.preparePermissionIntent() != null
+                val attempt = PendingFailoverAttempt(
+                    initialKind = candidate.transport,
+                    preference = userTransportPreference,
+                    registry = registry,
+                    orchestrator = orchestrator,
+                    endpointId = candidate.endpointId,
+                    autoContext = PendingAutoGatewayContext(candidates, nextAttempted),
+                )
+                pendingFailoverAttempt = attempt
+                controller.connect(resolution)
+                if (!permissionPending) armFailoverWatch(attempt)
+            }
+            is TransportOrchestrator.Resolution.NotSelectable -> {
+                // This ranked candidate's own transport somehow isn't
+                // resolvable (should-never-happen - it was eligible in the
+                // registry PathScorer scored it against) - advance rather
+                // than fail the whole request on one bad candidate, still
+                // bounded by [nextAttempted].
+                attemptAutoCandidate(candidates, nextAttempted)
             }
         }
     }
@@ -1577,6 +1806,23 @@ class MainViewModel(
                     failoverObserverJob = null
                     return@collect
                 }
+                val autoContext = attempt.autoContext
+                if (autoContext != null) {
+                    // B16 - automatic-gateway sequence: advance to the next
+                    // ranked candidate rather than the intra-gateway
+                    // AWG->Xray check below.
+                    val error = diagnosticsStore.snapshot.value.lastError
+                    val eligible = net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy.isEligibleForNextCandidate(state, error)
+                    if (!eligible) return@collect
+                    pendingFailoverAttempt = null
+                    _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(
+                        lastFailureReason = error?.let { it::class.simpleName } ?: state::class.simpleName,
+                    )
+                    failoverObserverJob?.cancel()
+                    failoverObserverJob = null
+                    attemptAutoCandidate(autoContext.candidates, autoContext.attempted)
+                    return@collect
+                }
                 val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
                     initialKind = attempt.initialKind,
                     preference = attempt.preference,
@@ -1605,6 +1851,10 @@ class MainViewModel(
         // stale context, and never keep watching, for a request the user no
         // longer wants acted on.
         clearFailoverWatch()
+        // B16 - VpnController.disconnect() itself clears its own pinned
+        // pendingConnectConfig (see that field's own docs) - a completed/
+        // abandoned Auto sequence never leaves a stale candidate config
+        // behind for gatewayStatus()/the next connect() to see.
         viewModelScope.launch { controller.disconnect() }
     }
 
@@ -1626,6 +1876,10 @@ class MainViewModel(
                 pendingFailoverAttempt?.let { armFailoverWatch(it) }
             } else {
                 clearFailoverWatch()
+                // B16 - VpnController.onVpnPermissionResult(false) itself
+                // clears its own pinned pendingConnectConfig on denial (see
+                // that function's own docs) - gatewayStatus() never keeps
+                // pointing at an abandoned candidate's config.
             }
         }
     }
@@ -1685,6 +1939,17 @@ class MainViewModel(
             clientTunnelIdentityStore.migrateFromLegacyProvisionedProfile(
                 (profileStore.read() as? ProfileLoadResult.Found)?.profile
             )
+            // B16 - device-local automatic-gateway-selection preference.
+            val gatewayAutoModeStore = net.pocvpn.client.vpn.config.FileGatewayAutoModeStore(context.noBackupFilesDir)
+            // B16 (consolidated review fix) - unchanged from pre-B16: this
+            // resolves ONLY the persisted MANUAL selection. An Auto
+            // candidate's real connect-time config is now threaded straight
+            // from AutoGatewaySelector's own already-resolved
+            // GatewayAttemptCandidate.configSnapshot through
+            // TransportOrchestrator.Resolution.Resolved into
+            // VpnController.connect() - see that field's own docs - so this
+            // source is never consulted (and SelectedGatewayStore/
+            // ClientTunnelIdentityStore never re-read) during an Auto attempt.
             val selectedProductionGatewaySource = net.pocvpn.client.vpn.config.SelectedProductionGatewaySource(
                 selectedGatewayId = selectedGatewayStore::read,
                 clientTunnelIp = clientTunnelIdentityStore::read,
@@ -1762,6 +2027,7 @@ class MainViewModel(
                 diagnosticsStore = DiagnosticsStore(),
                 gatewayConfigOverride = gatewayConfigSource,
                 selectedGatewayStore = selectedGatewayStore,
+                gatewayAutoModeStore = gatewayAutoModeStore,
                 // B13 review fix - the SAME instance selectedProductionGatewaySource
                 // above already resolves clientTunnelIp() from, so
                 // isGatewayProvisioned()/provisionedGatewayIds/the startup
