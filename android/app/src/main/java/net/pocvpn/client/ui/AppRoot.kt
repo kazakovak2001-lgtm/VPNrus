@@ -340,10 +340,27 @@ private fun buildDiagnosticsLines(
     // not reuse smartConnectDecision below (that always reflects what would
     // be chosen RIGHT NOW, which can differ from what is actually running).
     val currentTransportLine = "Current transport: ${viewModel.currentTransportKind.value?.toString() ?: "NONE"}"
-    val smartConnectGatewayLine = "Gateway: ${when (smartConnectDecision) {
-        is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.gateway.region
-        SmartConnectDecision.NoCandidateAvailable -> "NONE"
-    }}"
+    // B16 - smartConnectDecision() above is ALWAYS a manual-mode-shaped
+    // decision (SmartConnectCandidateSelector.decide() only ever knows about
+    // MainViewModel.selectedGateway, the persisted MANUAL selection - see its
+    // own docs). While gatewayAutoMode is true this line must NOT reuse it -
+    // that would show the stale manual selection/fallback even when a real
+    // Auto attempt has already targeted (and possibly connected to) a
+    // DIFFERENT gateway, violating the same "actually running, never a
+    // hypothetical recompute" discipline currentTransportLine's own comment
+    // already documents. viewModel.activeGatewayId is the truthful source in
+    // Auto mode - the same value the Home location card itself renders once
+    // an attempt has targeted a gateway (see showAutoPlaceholder above).
+    val smartConnectGatewayLine = "Gateway: ${
+        if (viewModel.gatewayAutoMode.value) {
+            net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(viewModel.activeGatewayId.value).let { "${it.displayCountry} / ${it.displayCity}" }
+        } else {
+            when (smartConnectDecision) {
+                is SmartConnectDecision.Selected -> smartConnectDecision.score.candidate.gateway.region
+                SmartConnectDecision.NoCandidateAvailable -> "NONE"
+            }
+        }
+    }"
     val smartConnectReasonLine = "Smart Connect decision reason: ${when (smartConnectDecision) {
         is SmartConnectDecision.Selected -> smartConnectDecision.score.reason
         SmartConnectDecision.NoCandidateAvailable -> "NO_CANDIDATE_AVAILABLE"
