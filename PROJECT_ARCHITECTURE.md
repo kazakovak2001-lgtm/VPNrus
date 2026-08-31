@@ -60,8 +60,8 @@ relying on this for anything user-facing - this table is a snapshot, ROADMAP is 
 | Provider | Oracle Cloud | AWS eu-north-1 |
 | AWG data plane | physically validated | physically validated |
 | REALITY / TLS data plane | physically validated | physically validated (operator/debug-provisioned credentials) |
-| Self-service control-plane (`/v1/activate`) | deployed, live | deployed on the VPS (B15), but its 443 edge is NOT externally reachable - AWS security group has no inbound TCP 443 rule (80/2053/2083/51820 are open, 443 is not); confirmed both from an external vantage point and via a real physical device attempt |
-| AWG client identity provisioning | real, self-service | UI entry point now exists (B15 - GatewayPickerDialog "Activate"), blocked end-to-end by the 443 security-group gap above, not by app code - disabled in picker |
+| Self-service control-plane (`/v1/activate`) | deployed, live | deployed, live (B15) - 443 edge externally reachable (security-group fix applied by operator), real physical-device activation completed successfully |
+| AWG client identity provisioning | real, self-service | real, self-service (B15) - physically verified: real device activation, real AWG handshake, exit IP `16.170.208.231` |
 | Public IP addressing | stable | AWS auto-assigned, NOT durable/reserved |
 
 Gateway Pool remains **FOUNDATION**. Automatic multi-gateway failover is **NOT
@@ -90,10 +90,9 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-08-31 (after B15 continuation - real on-device
-activation attempted; found and fixed a missing UI entry point
-(GatewayPickerDialog "Activate" for an unprovisioned gateway), then found
-the control-plane's HTTPS edge (443) is unreachable from the internet - a
-security-group gap, not a code issue. See ROADMAP's Gateway Pool row).
+Last updated: 2026-08-31 (after B15 completion - real on-device Stockholm
+activation succeeded end-to-end: AWG, REALITY, and TLS all physically
+verified through the real control plane, provisioning persists across an
+app restart, Germany unaffected. See ROADMAP's Gateway Pool row).
 If this file's "Current gateway state" table conflicts with `docs/ROADMAP.md`,
 ROADMAP wins - update this file to match rather than trusting the stale copy.
