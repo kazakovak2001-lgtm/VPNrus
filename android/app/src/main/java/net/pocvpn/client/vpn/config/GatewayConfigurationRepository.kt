@@ -82,13 +82,28 @@ class DefaultGatewayConfigurationRepository(
     private val source: GatewayConfigSource,
 ) : GatewayConfigurationRepository {
 
-    override fun get(): GatewayConfiguration {
+    override fun get(): GatewayConfiguration =
         // B13 THIRD consolidated review fix (finding 6) - ONE snapshot()
         // call, not six independent getter calls: every field below is
         // guaranteed to describe the SAME resolved gateway, even if the
         // underlying selection changes concurrently the instant after this
         // call returns - see GatewayConfigSource.snapshot()'s own docs.
-        val snapshot = source.snapshot()
+        GatewayConfigSnapshotValidator.validate(source.snapshot())
+}
+
+/**
+ * B16 - the ONE place a raw [GatewayConfigSnapshot] is validated into a
+ * [GatewayConfiguration]. Extracted out of [DefaultGatewayConfigurationRepository.get]
+ * (which still calls this, unchanged, for a freshly re-read snapshot) so
+ * [VpnController] can ALSO validate an already-resolved, PINNED snapshot -
+ * e.g. an automatic-gateway-selection candidate's own
+ * `GatewayAttemptCandidate.configSnapshot` (see AutoGatewaySelector's own
+ * docs) - through the EXACT SAME validation rules, never a second/duplicated
+ * copy that could silently drift out of agreement with what a manual
+ * gateway's own config validation accepts or rejects.
+ */
+object GatewayConfigSnapshotValidator {
+    fun validate(snapshot: GatewayConfigSnapshot): GatewayConfiguration {
         val host = snapshot.endpointHost.trim()
         val portRaw = snapshot.endpointPort.trim()
         val serverPublicKey = snapshot.serverPublicKey.trim()

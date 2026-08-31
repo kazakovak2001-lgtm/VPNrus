@@ -332,11 +332,6 @@ class MainViewModel(
     // call site/test: automatic gateway selection did not exist before this
     // slice, so its absence here changes nothing).
     private val gatewayAutoModeStore: net.pocvpn.client.vpn.config.GatewayAutoModeStore = net.pocvpn.client.vpn.config.GatewayAutoModeStore.manualOnly(),
-    // B16 - the SAME instance the Factory's real SelectedProductionGatewaySource
-    // consults ahead of selectedGatewayStore (see its own docs) - never a
-    // second, independently-constructed one that could disagree with what a
-    // real connect() attempt actually resolves.
-    private val activeAttemptGatewaySource: net.pocvpn.client.vpn.config.ActiveAttemptGatewaySource = net.pocvpn.client.vpn.config.ActiveAttemptGatewaySource(),
     // B13 review fix - additive, defaults to null (same "no wiring, no
     // behavior" seam as every other optional dependency above). When
     // non-null, this is the SAME per-device ClientTunnelIdentityStore
@@ -1511,9 +1506,6 @@ class MainViewModel(
             // permission result or async state change for that OLD request
             // must never reuse it.
             clearFailoverWatch()
-            // B16 - a fresh request never inherits a stale per-attempt
-            // gateway override from a prior (possibly Auto) request.
-            activeAttemptGatewaySource.clear()
             if (_gatewayAutoMode.value) connectAuto() else connectManual()
         }
     }
@@ -1665,11 +1657,17 @@ class MainViewModel(
     }
 
     /**
-     * B16 - attempts the next unattempted ranked candidate (task
-     * requirement 6). Sets [activeAttemptGatewaySource] and
-     * [_activeGatewayId] BEFORE calling controller.connect() - candidate
-     * identity is resolved once here and never re-derived later (task's own
-     * "Candidate identity" invariant).
+     * B16 (consolidated review fix) - attempts the next unattempted ranked
+     * candidate (task requirement 6). [_activeGatewayId] is set BEFORE
+     * calling controller.connect() for UI/diagnostics purposes only - the
+     * REAL execution-time identity guarantee comes from threading THIS
+     * candidate's own already-resolved [GatewayAttemptCandidate.configSnapshot]
+     * straight into `orchestrator.resolve(...)` below, which carries it into
+     * `TransportOrchestrator.Resolution.Resolved.gatewayConfigSnapshot` and
+     * from there into `VpnController.connect()` - see that field's own docs
+     * for why this is what actually makes the executed tunnel config
+     * immutable for this attempt (never re-derived from SelectedGatewayStore/
+     * ProductionGatewayCatalog/ClientTunnelIdentityStore once resolved here).
      */
     private suspend fun attemptAutoCandidate(
         candidates: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
@@ -1682,7 +1680,6 @@ class MainViewModel(
             controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
             return
         }
-        activeAttemptGatewaySource.setForAttempt(candidate.gatewayId)
         _activeGatewayId.value = candidate.gatewayId
         val nextAttempted = attempted + (candidate.gatewayId to candidate.transport)
         _autoGatewayDiagnostics.value = (_autoGatewayDiagnostics.value ?: AutoGatewayDiagnostics(candidates, emptyList(), null, null, false)).let {
@@ -1690,7 +1687,8 @@ class MainViewModel(
         }
         val registry = buildTransportRegistry(candidate.endpointId)
         val orchestrator = TransportOrchestrator(registry)
-        when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(candidate.transport), candidate.endpointId)) {
+        val decision = TransportSelectionDecision.SelectTransport(candidate.transport)
+        when (val resolution = orchestrator.resolve(decision, candidate.endpointId, candidate.configSnapshot)) {
             is TransportOrchestrator.Resolution.Resolved -> {
                 val permissionPending = resolution.transport.preparePermissionIntent() != null
                 val attempt = PendingFailoverAttempt(
@@ -1853,10 +1851,10 @@ class MainViewModel(
         // stale context, and never keep watching, for a request the user no
         // longer wants acted on.
         clearFailoverWatch()
-        // B16 - a completed/abandoned Auto sequence must not leave a stale
-        // per-attempt gateway override in place for whatever connect() the
-        // user starts next (manual or a fresh Auto sequence).
-        activeAttemptGatewaySource.clear()
+        // B16 - VpnController.disconnect() itself clears its own pinned
+        // pendingConnectConfig (see that field's own docs) - a completed/
+        // abandoned Auto sequence never leaves a stale candidate config
+        // behind for gatewayStatus()/the next connect() to see.
         viewModelScope.launch { controller.disconnect() }
     }
 
@@ -1878,14 +1876,10 @@ class MainViewModel(
                 pendingFailoverAttempt?.let { armFailoverWatch(it) }
             } else {
                 clearFailoverWatch()
-                // B16 - a denied permission prompt abandons this attempt
-                // exactly like clearFailoverWatch() already does for
-                // pendingFailoverAttempt; the per-attempt gateway override
-                // must not linger and describe a candidate nothing is
-                // actually acting on any more (diagnostics/gatewayStatus()
-                // would otherwise keep pointing at it until the next
-                // connect()).
-                activeAttemptGatewaySource.clear()
+                // B16 - VpnController.onVpnPermissionResult(false) itself
+                // clears its own pinned pendingConnectConfig on denial (see
+                // that function's own docs) - gatewayStatus() never keeps
+                // pointing at an abandoned candidate's config.
             }
         }
     }
@@ -1945,20 +1939,19 @@ class MainViewModel(
             clientTunnelIdentityStore.migrateFromLegacyProvisionedProfile(
                 (profileStore.read() as? ProfileLoadResult.Found)?.profile
             )
-            // B16 - device-local automatic-gateway-selection preference and
-            // the per-attempt override consulted below - see each class's
-            // own docs.
+            // B16 - device-local automatic-gateway-selection preference.
             val gatewayAutoModeStore = net.pocvpn.client.vpn.config.FileGatewayAutoModeStore(context.noBackupFilesDir)
-            val activeAttemptGatewaySource = net.pocvpn.client.vpn.config.ActiveAttemptGatewaySource()
+            // B16 (consolidated review fix) - unchanged from pre-B16: this
+            // resolves ONLY the persisted MANUAL selection. An Auto
+            // candidate's real connect-time config is now threaded straight
+            // from AutoGatewaySelector's own already-resolved
+            // GatewayAttemptCandidate.configSnapshot through
+            // TransportOrchestrator.Resolution.Resolved into
+            // VpnController.connect() - see that field's own docs - so this
+            // source is never consulted (and SelectedGatewayStore/
+            // ClientTunnelIdentityStore never re-read) during an Auto attempt.
             val selectedProductionGatewaySource = net.pocvpn.client.vpn.config.SelectedProductionGatewaySource(
-                // B16 - consults the per-attempt override FIRST (set only
-                // during an Auto connect() attempt - see
-                // ActiveAttemptGatewaySource's own docs); selectedGatewayStore::read
-                // is passed as a lazily-evaluated fallback, so it is
-                // genuinely never invoked while an Auto override is active -
-                // for MANUAL mode (the override always null) this resolves
-                // byte-for-byte to the pre-B16 selectedGatewayStore::read.
-                selectedGatewayId = { activeAttemptGatewaySource.resolve(selectedGatewayStore::read) },
+                selectedGatewayId = selectedGatewayStore::read,
                 clientTunnelIp = clientTunnelIdentityStore::read,
             )
             // B8H - same noBackupFilesDir as profileStore above, different
@@ -2035,7 +2028,6 @@ class MainViewModel(
                 gatewayConfigOverride = gatewayConfigSource,
                 selectedGatewayStore = selectedGatewayStore,
                 gatewayAutoModeStore = gatewayAutoModeStore,
-                activeAttemptGatewaySource = activeAttemptGatewaySource,
                 // B13 review fix - the SAME instance selectedProductionGatewaySource
                 // above already resolves clientTunnelIp() from, so
                 // isGatewayProvisioned()/provisionedGatewayIds/the startup

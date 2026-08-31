@@ -4,6 +4,7 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.vpn.VpnTransport
+import net.pocvpn.client.vpn.config.GatewayConfigSnapshot
 
 /**
  * B8I1 - RECONCILED: pure EXECUTOR only. Turns an ALREADY-MADE
@@ -39,6 +40,20 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
             val transport: VpnTransport,
             val kind: TransportKind,
             val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+            // B16 - non-null exactly when this resolution came from an
+            // automatic-gateway-selection candidate (AutoGatewaySelector's
+            // own `GatewayAttemptCandidate.configSnapshot`, carried through
+            // verbatim - see that class's own "Candidate identity" docs).
+            // null (the default) for every manual-mode resolution, which
+            // byte-for-byte preserves the pre-B16 behavior of
+            // VpnController.doConnectAttempt() reading
+            // gatewayConfigurationRepository.get() fresh. When non-null,
+            // THIS is the exact, already-resolved config the attempt MUST
+            // execute - VpnController never re-derives it from
+            // SelectedGatewayStore/ProductionGatewayCatalog/
+            // ClientTunnelIdentityStore once this Resolution exists (see
+            // VpnController.resolveGatewayConfiguration's own docs).
+            val gatewayConfigSnapshot: GatewayConfigSnapshot? = null,
         ) : Resolution()
         data class NotSelectable(val decision: TransportSelectionDecision) : Resolution()
     }
@@ -53,14 +68,21 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
      *
      * [endpointId] is the endpoint THIS attempt targets - see [Resolution.Resolved]'s
      * own docs for why it defaults to the one real production endpoint
-     * rather than being invented here.
+     * rather than being invented here. [gatewayConfigSnapshot] threads an
+     * already-resolved automatic-gateway-selection candidate's own pinned
+     * config straight into the resulting [Resolution.Resolved] - see that
+     * field's own docs. null (the default) for every manual-mode caller.
      */
-    fun resolve(decision: TransportSelectionDecision, endpointId: EndpointId = EndpointId(ProductionGateway.ID)): Resolution {
+    fun resolve(
+        decision: TransportSelectionDecision,
+        endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+        gatewayConfigSnapshot: GatewayConfigSnapshot? = null,
+    ): Resolution {
         val selected = decision as? TransportSelectionDecision.SelectTransport
             ?: return Resolution.NotSelectable(decision)
         val transport = registry.createTransport(selected.kind)
             ?: return Resolution.NotSelectable(decision)
-        return Resolution.Resolved(transport, selected.kind, endpointId)
+        return Resolution.Resolved(transport, selected.kind, endpointId, gatewayConfigSnapshot)
     }
 
     /** Deterministic ordering of currently-available transports, for a future failover sequence (not yet acted on). */

@@ -21,7 +21,6 @@ import net.pocvpn.client.vpn.FakeSelectedGatewayStore
 import net.pocvpn.client.vpn.FakeVpnTransport
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
-import net.pocvpn.client.vpn.config.ActiveAttemptGatewaySource
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayAutoModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -150,7 +149,6 @@ class MainViewModelAutoGatewayTest {
         selectedGatewayStore = selectedGatewayStore,
         clientTunnelIdentityStore = identityStore,
         gatewayAutoModeStore = autoModeStore,
-        activeAttemptGatewaySource = ActiveAttemptGatewaySource(),
         initialNetworkProfile = USABLE_WIFI,
     )
 
@@ -293,5 +291,37 @@ class MainViewModelAutoGatewayTest {
         assertEquals(1, transport.connectCallCount)
         assertTrue(viewModel.transportState.value is TransportState.Connected)
         assertEquals(1, viewModel.autoGatewayDiagnostics.value?.attempted?.size)
+    }
+
+    // --- B16 consolidated review fix (Blocker 1): pinned candidate config is immutable for the attempt ---
+
+    @Test
+    fun `auto candidate config is pinned - mutating ClientTunnelIdentityStore after resolve does not change the executed tunnel`() = runTest {
+        val transport = FakeVpnTransport(permission = android.content.Intent())
+        val autoStore = FakeGatewayAutoModeStore(initial = true)
+        val identity = FakeClientTunnelIdentityStore(
+            mapOf(ProductionGatewayId.GERMANY to "10.77.0.5", ProductionGatewayId.STOCKHOLM to "10.77.0.2"),
+        )
+        val viewModel = newViewModel(transport, autoStore, identity)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        // A VPN permission prompt is pending - no real attempt executed yet.
+        assertEquals(0, transport.connectCallCount)
+
+        // Mutate the SAME identity-store instance the candidate was already
+        // ranked/pinned from, simulating this device's provisioning changing
+        // in the gap while the user is responding to the system prompt.
+        identity.write(ProductionGatewayId.GERMANY, "10.99.99.99")
+
+        viewModel.onVpnPermissionResult(true)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, transport.connectCallCount)
+        val sent = (transport.lastConfig as net.pocvpn.client.vpn.config.TransportConfig.Awg).config
+        // The pinned candidate's ORIGINAL client tunnel IP ("10.77.0.5",
+        // captured when the candidate was ranked/resolved), never the
+        // mutated value the identity store holds now.
+        assertEquals(listOf("10.77.0.5/32"), sent.localAddresses)
     }
 }

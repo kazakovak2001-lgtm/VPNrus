@@ -271,6 +271,17 @@ class VpnController(
     // own docs for why this field, not a literal, is what they read.
     private var pendingConnectEndpointId: EndpointId = EndpointId(ProductionGateway.ID)
 
+    // B16 - the PINNED GatewayConfigSnapshot for the CURRENT/most recent
+    // connect() attempt, when [connect]'s resolved value carried one (an
+    // automatic-gateway-selection candidate - see
+    // TransportOrchestrator.Resolution.Resolved's own docs). null for every
+    // manual-mode attempt (byte-for-byte pre-B16 behavior: doConnectAttempt
+    // falls back to reading [gatewayConfigurationRepository] fresh - see
+    // [resolveGatewayConfiguration]'s own docs). Read/written only from
+    // connect()/disconnect()/doConnectAttempt, all under connectMutex - same
+    // discipline as [pendingConnectKind]/[pendingConnectEndpointId].
+    private var pendingConnectConfig: net.pocvpn.client.vpn.config.GatewayConfigSnapshot? = null
+
     // B8I5 - the ONE active transport instance every lifecycle operation
     // (state observation, connect, disconnect, permission resume, stats
     // polling, handshake detection, shutdown) actually targets - never the
@@ -348,7 +359,26 @@ class VpnController(
         }
     }
 
-    fun gatewayStatus(): GatewayConfiguration = gatewayConfigurationRepository.get()
+    fun gatewayStatus(): GatewayConfiguration = resolveGatewayConfiguration()
+
+    /**
+     * B16 - THE one place a real connect attempt's [GatewayConfiguration] is
+     * resolved, for BOTH the actual tunnel-build path (doConnectAttempt) and
+     * diagnostics (gatewayStatus()) - guaranteeing they can never disagree.
+     * When [pendingConnectConfig] is set (an automatic-gateway-selection
+     * candidate's own already-resolved snapshot - see that field's own
+     * docs), it is validated via the SAME [net.pocvpn.client.vpn.config.GatewayConfigSnapshotValidator]
+     * a manual [gatewayConfigurationRepository] uses internally, but the
+     * repository itself - and therefore SelectedGatewayStore/
+     * ProductionGatewayCatalog/ClientTunnelIdentityStore - is never
+     * consulted again: this is the pinned candidate identity's "exact
+     * GatewayConfigSnapshot", not a fresh re-resolution. Manual mode
+     * (pendingConnectConfig always null) falls through to
+     * [gatewayConfigurationRepository] exactly as every pre-B16 call site did.
+     */
+    private fun resolveGatewayConfiguration(): GatewayConfiguration =
+        pendingConnectConfig?.let { net.pocvpn.client.vpn.config.GatewayConfigSnapshotValidator.validate(it) }
+            ?: gatewayConfigurationRepository.get()
 
     /**
      * B8I2 - Smart Connect preflight (MainViewModel.connect()) rejected
@@ -417,6 +447,10 @@ class VpnController(
             // no real connect attempt has been made.
             pendingConnectKind = resolved.kind
             pendingConnectEndpointId = resolved.endpointId
+            // B16 - resolved exactly once, here, before permission is even
+            // requested - never re-derived later in this same attempt (see
+            // [resolveGatewayConfiguration]'s own docs). null for manual mode.
+            pendingConnectConfig = resolved.gatewayConfigSnapshot
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -444,6 +478,10 @@ class VpnController(
         if (!granted) {
             diagnostics.recordError(VpnError.PermissionDenied)
             setState(TransportState.Error("VPN permission denied"))
+            // B16 - a denied prompt abandons this attempt; its pinned
+            // candidate config must not linger and be reported by
+            // gatewayStatus() for a request nothing is acting on any more.
+            pendingConnectConfig = null
             return
         }
         connectMutex.withLock { doConnectAttempt(pendingConnectKind) }
@@ -465,6 +503,12 @@ class VpnController(
             _appliedRoutingPolicy.value = null
             // B8O3 - nothing is running/attempted any more.
             _currentTransportKind.value = null
+            // B16 - a completed/abandoned attempt's pinned candidate config
+            // must not linger and be silently reused (or shown by
+            // gatewayStatus()) for whatever connect() request comes next -
+            // the NEXT connect() always sets this fresh (possibly null,
+            // for manual mode) before it is ever read again.
+            pendingConnectConfig = null
         }
     }
 
@@ -476,7 +520,11 @@ class VpnController(
      * race against this same call.
      */
     private suspend fun doConnectAttempt(kind: TransportKind): Boolean {
-        when (val config = gatewayConfigurationRepository.get()) {
+        // B16 - resolves the SAME pinned candidate config gatewayStatus()
+        // reports (see resolveGatewayConfiguration's own docs) - never a
+        // second, independent read of gatewayConfigurationRepository once a
+        // candidate has been pinned for this attempt.
+        when (val config = resolveGatewayConfiguration()) {
             is GatewayConfiguration.Missing -> {
                 diagnostics.recordError(VpnError.GatewayConfigurationMissing)
                 diagnostics.updateGateway(configured = false, endpointDisplay = "NOT CONFIGURED")

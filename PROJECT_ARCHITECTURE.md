@@ -33,27 +33,42 @@ NetworkProfiler
   every pre-B16 install/test is unaffected). Manual gateway selection
   (`SelectedGatewayStore`/`selectGateway()`) is byte-for-byte unchanged and
   always wins when active - selecting a gateway manually also turns Auto off.
-- **Candidate identity/execution**: `ActiveAttemptGatewaySource` is an
-  in-memory, per-attempt override `SelectedProductionGatewaySource`'s
-  `selectedGatewayId` supplier consults AHEAD of the persisted
-  `SelectedGatewayStore` (whose own `read()` is passed as a LAZY fallback, so
-  it is genuinely never invoked while an Auto override is set). MainViewModel
-  sets this override to a candidate's `gatewayId` explicitly BEFORE calling
-  `controller.connect()` and never changes it until the next attempt/candidate -
-  satisfying "never infer gateway identity after the attempt starts, never
-  reread SelectedGatewayStore during the attempt." For Manual mode the
-  override is never set, so this resolves exactly as before B16.
-- **Bounded cross-gateway failover**: on a genuine terminal failure
-  (`AutoGatewayFailoverPolicy.isEligibleForNextCandidate` - the same
+- **Candidate identity/execution (hard invariant, consolidated review fix)**:
+  each `GatewayAttemptCandidate` carries its own already-resolved
+  `configSnapshot`. `AutoGatewaySelector`'s candidate is threaded verbatim -
+  `MainViewModel.attemptAutoCandidate` passes it to
+  `TransportOrchestrator.resolve(..., gatewayConfigSnapshot = candidate.configSnapshot)`,
+  which carries it into `TransportOrchestrator.Resolution.Resolved.gatewayConfigSnapshot`.
+  `VpnController.connect()` pins that value (`pendingConnectConfig`) for the
+  WHOLE attempt, including across a VPN-permission-prompt round-trip;
+  `doConnectAttempt()` and `gatewayStatus()` both resolve through this SAME
+  pinned value (via `GatewayConfigSnapshotValidator`, the extracted validator
+  `DefaultGatewayConfigurationRepository` also uses) whenever it is set -
+  `gatewayConfigurationRepository`/`SelectedGatewayStore`/
+  `ProductionGatewayCatalog`/`ClientTunnelIdentityStore` are NEVER
+  re-consulted once a candidate is pinned. `VpnControllerPinnedGatewayConfigTest`
+  proves this directly (mutating the repository/identity store after pinning,
+  including across the permission-resume gap, cannot change what executes).
+  Manual mode never carries a snapshot, so `doConnectAttempt`/`gatewayStatus()`
+  fall through to `gatewayConfigurationRepository` exactly as before B16.
+- **Bounded cross-gateway failover, and its exact relationship to
+  `AwgXrayFailoverPolicy` (consolidated review fix)**: `armFailoverWatch()`
+  branches on whether the retained attempt carries an `autoContext` BEFORE
+  it ever reaches the `AwgXrayFailoverPolicy` check. During an Auto sequence,
+  `AwgXrayFailoverPolicy` is NOT consulted at all - on a genuine terminal
+  failure (`AutoGatewayFailoverPolicy.isEligibleForNextCandidate`, the same
   enumerated HandshakeTimeout/BackendStartFailure categories
-  `AwgXrayFailoverPolicy` already uses for intra-gateway AWG->Xray), the
-  SAME `armFailoverWatch` collector advances to the next ranked candidate
-  (`AutoGatewaySelector.nextCandidate`), bounded by `MAX_ATTEMPTS=4` and never
-  retrying an already-attempted (gateway, transport) pair; exhausting the
-  ranked set fails closed (`VpnError.NoCandidateAvailable`). Existing
-  intra-gateway AWG->Xray failover (`AwgXrayFailoverPolicy`/
-  `maybeFailoverToXray`) is completely unchanged and still applies for Manual
-  mode (and within whichever gateway an Auto sequence is currently attempting).
+  `AwgXrayFailoverPolicy` itself uses), the collector advances to the next
+  candidate in the ONE globally-ranked gateway×transport list
+  (`AutoGatewaySelector.nextCandidate`) - a failed AWG attempt on one gateway
+  can be followed by ANY higher-ranked remaining candidate (that same
+  gateway's own Xray/TLS, or the OTHER gateway's AWG), purely by rank, never
+  a hardcoded per-gateway chain. Bounded by `MAX_ATTEMPTS=4`, never retrying
+  an already-attempted (gateway, transport) pair; exhausting the ranked set
+  fails closed (`VpnError.NoCandidateAvailable`). `AwgXrayFailoverPolicy`'s
+  own intra-gateway AWG->Xray fallback (`maybeFailoverToXray`) is completely
+  unchanged and governs ONLY Manual mode (`autoContext == null`) - it does
+  NOT additionally run "within" an Auto sequence's current gateway.
 
 ## Per-device identity (hard invariant)
 
@@ -132,12 +147,15 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-09-01 (after B16 physical validation - automatic
-multi-gateway selection/failover promoted the existing reachability/
-PathScorer pipeline into a real gateway-level decision boundary, unit-
-verified AND physically validated on a real device: real Auto failover from
-Germany to Stockholm, real data-plane confirmation, restore, normal
-reconnect confirmed; one diagnostics-only bug found and fixed. See
-ROADMAP's Gateway Pool / automatic gateway selection failover rows).
+Last updated: 2026-09-01 (after B16 consolidated review fix - the pinned
+`GatewayAttemptCandidate.configSnapshot` is now threaded verbatim through
+`TransportOrchestrator`/`VpnController.connect()` and actually EXECUTED for
+the whole attempt, never reconstructed from `SelectedGatewayStore`/
+`ClientTunnelIdentityStore`/`ProductionGatewayCatalog`; `ActiveAttemptGatewaySource`
+was removed as superseded; the Auto-vs-`AwgXrayFailoverPolicy` relationship
+is now documented accurately. Builds on the same-day B16 physical validation:
+real Auto failover from Germany to Stockholm, real data-plane confirmation,
+restore, normal reconnect confirmed; one diagnostics-only bug found and
+fixed. See ROADMAP's Gateway Pool / automatic gateway selection failover rows).
 If this file's "Current gateway state" table conflicts with `docs/ROADMAP.md`,
 ROADMAP wins - update this file to match rather than trusting the stale copy.

@@ -84,7 +84,13 @@ class FakeVpnTransport(
 }
 
 class FakeGatewayConfigurationRepository(private var config: GatewayConfiguration) : GatewayConfigurationRepository {
-    override fun get(): GatewayConfiguration = config
+    var getCallCount = 0
+        private set
+
+    override fun get(): GatewayConfiguration {
+        getCallCount++
+        return config
+    }
     fun set(new: GatewayConfiguration) {
         config = new
     }
