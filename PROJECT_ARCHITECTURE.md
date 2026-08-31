@@ -29,49 +29,92 @@ NetworkProfiler
   every pre-B16 install/test is unaffected). Manual gateway selection
   (`SelectedGatewayStore`/`selectGateway()`) is byte-for-byte unchanged and
   always wins when active - selecting a gateway manually also turns Auto off.
-- **B17 - runtime authority for Auto DISCOVERY moved to the signed manifest,
-  superseding B16's own shortcut**: `AutoGatewaySelector.buildCandidates`
-  now takes `manifestEndpoints: List<EndpointDescriptor>` - the caller
-  (`MainViewModel.buildAutoGatewayCandidates`) supplies
+- **B17 - runtime authority for Auto DISCOVERY AND execution-time endpoint
+  address moved to the signed manifest, superseding B16's own shortcut**:
+  `AutoGatewaySelector.buildCandidates` takes `manifestEndpoints: List<EndpointDescriptor>`
+  - the caller (`MainViewModel.buildAutoGatewayCandidates`) supplies
   `manifestRepository?.trusted()?.endpoints` (empty when nothing verifies -
-  `TrustedManifestState.NoneTrusted` or `manifestRepository` unwired -
-  which always yields zero candidates, never a fallback). WHICH endpoints
-  even exist as candidates is therefore gated by the trusted manifest, never
-  `ProductionGatewayCatalog` enumerated directly. `ProductionGatewayCatalog`
-  (via `gatewayFactsFor: (EndpointId) -> ProductionGatewayDescriptor?`) is
-  consulted ONLY as a per-endpoint COMPATIBILITY lookup for an endpoint id
-  the manifest already named - it supplies the AWG connection facts (server
-  public key, gateway tunnel IP, obfuscation profile) needed to dial it,
-  which deliberately stay OUT of the public manifest. Local per-device
-  provisioning (`provisioned`/`clientTunnelIp`, plus `xrayAvailableFor`/
-  `xrayTlsAvailableFor` gating which of the manifest's declared transport
-  bindings this device can actually use) still combines with the manifest
-  facts exactly as before - a manifest naming an endpoint never implies this
-  device is provisioned for it. The embedded bootstrap
-  (`EmbeddedBootstrapManifest`) and the production trust root are now the
-  SAME real Ed25519 key (see `docs/B12_MANIFEST_KEY_CEREMONY.md`'s
-  "Production ceremony (B17)" section for the fingerprint and procedure);
-  the bootstrap names BOTH real gateways (frankfurt, stockholm). Live
-  `GET /v1/manifest` is deployed and externally verified (byte-identical,
-  signature-valid) on BOTH production gateways. **B17 continuation
-  (2026-09-01)**: `BuildConfig.MANIFEST_URL` now defaults to the real
-  Frankfurt endpoint in both `debug`/`release` builds (`android/app/build.gradle.kts`'s
+  `TrustedManifestState.NoneTrusted` or `manifestRepository` unwired - which
+  always yields zero candidates, never a fallback). WHICH endpoints even
+  exist as candidates is gated by the trusted manifest, never
+  `ProductionGatewayCatalog` enumerated directly.
+  **Four distinct fact tiers, never conflated (B17-2 fix)**:
+  1. **Manifest-owned public facts** - endpoint id/roles/region/provider AND,
+     critically, each transport binding's `host`/`port`. `snapshotFor()`'s
+     `endpointHost`/`endpointPort` are now read from the manifest transport
+     `binding` carried alongside each scored candidate (`Triple<ProductionGatewayDescriptor, EndpointTransportBinding, PathScoreResult>`
+     in `buildCandidates`'s internal map) - NEVER from
+     `gateway.awg.endpointHost`/`endpointPort` (the catalog). A signed
+     manifest advertising a rotated AWG address now genuinely changes what
+     the next candidate's pinned `GatewayConfigSnapshot` dials -
+     `AutoGatewaySelectorTest`/`MainViewModelAutoGatewayTest` prove this
+     with a manifest host deliberately DIFFERENT from the catalog's,
+     confirmed all the way to the executed `AwgConfig.peer.endpointHost`.
+  2. **Catalog compatibility facts** (`ProductionGatewayCatalog`, via
+     `gatewayFactsFor: (EndpointId) -> ProductionGatewayDescriptor?`,
+     invoked ONLY for an endpoint id the manifest already named) - AWG
+     server public key, gateway tunnel IP, and obfuscation profile, which
+     the manifest model does not carry today (a real, honest scope
+     boundary - `EndpointTransportBinding.metadata` deliberately never
+     holds key material, see that type's own docs).
+  3. **Local per-device identity** (`ClientTunnelIdentityStore`, via
+     `provisioned`/`clientTunnelIp`) - this device's own peer address,
+     never manifest- or catalog-owned, unchanged.
+  4. **Xray/TLS execution address - still SEPARATE, still catalog/manifest-independent**:
+     `VpnController.buildTransportConfig`'s XRAY_REALITY/TLS_TCP branches
+     resolve the connect-time server host/port from the endpoint-scoped
+     `XrayProfileRepository`/`XrayTlsProfileRepository` (populated by real
+     control-plane activation), never from `GatewayConfigSnapshot` at all -
+     `GatewayConfigSnapshot` is consumed ONLY by the AWG execution path
+     (`TransportConfig.Awg`). Every `GatewayAttemptCandidate` still carries
+     one (the "Candidate identity" invariant applies uniformly), and an
+     XRAY_REALITY/TLS_TCP candidate's snapshot is now ALSO manifest-derived
+     for consistency, but changing that snapshot has NO effect on where an
+     Xray/TLS attempt actually connects - a signed manifest does not yet
+     control Xray/TLS execution addressing, and this PR does not claim it
+     does (no unsafe migration of Xray profile ownership was performed to
+     force this scope).
+  Local per-device provisioning (`provisioned`/`clientTunnelIp`, plus
+  `xrayAvailableFor`/`xrayTlsAvailableFor` gating which of the manifest's
+  declared transport bindings this device can actually use) still combines
+  with the manifest facts exactly as before - a manifest naming an endpoint
+  never implies this device is provisioned for it.
+  The embedded bootstrap (`EmbeddedBootstrapManifest`, version 1) and the
+  production trust root are the SAME real Ed25519 key (see
+  `docs/B12_MANIFEST_KEY_CEREMONY.md`'s "Production ceremony (B17)"
+  section); the bootstrap names BOTH real gateways (frankfurt, stockholm).
+  Live `GET /v1/manifest` is deployed on BOTH production gateways and now
+  serves a REAL, strictly-newer **version 2** (same key, no rotation - see
+  `docs/B12_MANIFEST_KEY_CEREMONY.md`'s versioning section), deliberately
+  kept ahead of the embedded v1 bootstrap so a real device actually adopts
+  it into LKG rather than rejecting it as "not newer".
+  `BuildConfig.MANIFEST_URL` defaults to the real Frankfurt endpoint in
+  both `debug`/`release` builds (`android/app/build.gradle.kts`'s
   `PRODUCTION_MANIFEST_URL`, overridable via a developer's own gitignored
   `gateway-dev.properties`) - the existing `HttpsRemoteManifestFetcher`/
   `ManifestDistributionClient`/`MainViewModel.Factory` wiring is unchanged,
-  no second fetch mechanism. Physically verified on a real device: a real
-  HTTPS fetch against the live endpoint, correctly Ed25519-verified and
-  correctly rejected as "not newer" (bootstrap and the live manifest share
-  the same version by ceremony design), both endpoints/6 ranked Auto
-  candidates present, a real Auto connect reaching Protected/Germany, and -
-  under a reversible, client-side-only airplane-mode fault (no production
-  VPS touched) - the same verified embedded bootstrap and full candidate
-  list surviving a force-restart, with normal Auto connect resuming once
-  network was restored. Signed Offline Bootstrap is now **IMPLEMENTED** -
-  see ROADMAP's own row for the one honest caveat (an already-populated LKG
-  surviving restart+fetch-failure remains proven only by unit tests, not
-  physically exercised, since the live manifest and bootstrap deliberately
-  share one version).
+  no second fetch mechanism.
+  **Physically verified on a real device (B17-2, 2026-09-01)**: a clean
+  restart genuinely fetched the live v2 manifest over HTTPS, and it was
+  genuinely ACCEPTED (`Last manifest refresh: accepted version 2`,
+  `Manifest version: 2 (source=LAST_KNOWN_GOOD)`) - a REAL populated LKG,
+  not merely the embedded bootstrap; both endpoints/6 ranked Auto
+  candidates present with REACHABLE evidence; a real Auto connect reached
+  Protected/Germany. Under a reversible, client-side-only airplane-mode
+  fault (no production VPS touched, no route altered), a force-restart
+  produced `Last manifest refresh: rejected: network error: ConnectException`
+  while `Manifest version: 2 (source=LAST_KNOWN_GOOD)` and the full
+  6-candidate list SURVIVED - proving the genuinely-populated LKG persists
+  across both a restart and a subsequent remote-fetch failure, not just the
+  embedded-bootstrap fallback path. Restoring network and reconnecting in
+  Auto reached Protected/Germany again; the airplane-mode fault was
+  restored immediately. Signed Offline Bootstrap is now **IMPLEMENTED**,
+  no remaining caveat on the LKG path (see ROADMAP's own row for the full
+  evidence trail). The "no LKG, embedded v1 bootstrap accepted" migration
+  case remains proven at the unit level only (`EmbeddedBootstrapManifestTest`,
+  `EndpointManifestRepositoryTest`) - sufficient per this slice's own scope,
+  since a real device with a real v2 LKG can no longer exercise a genuinely
+  empty-LKG state without wiping real provisioning.
 - **Candidate identity/execution (hard invariant, consolidated review fix)**:
   each `GatewayAttemptCandidate` carries its own already-resolved
   `configSnapshot`. `AutoGatewaySelector`'s candidate is threaded verbatim -
@@ -191,10 +234,15 @@ moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;
 the production Ed25519 key ceremony was performed (real keypair, private key
 never printed/committed, stored offline outside the repo) and the embedded
 bootstrap now names both real gateways under that same production key. Live
-`/v1/manifest` is deployed to and verified on both production VPSes, and
-`BuildConfig.MANIFEST_URL` now wires the real fetch in both build types -
-Signed Offline Bootstrap is now IMPLEMENTED (one honest caveat; see
-ROADMAP's own row). Builds on B16's
+`/v1/manifest` serves a real, strictly-newer version 2 (same key, no
+rotation) on both production VPSes, `BuildConfig.MANIFEST_URL` wires the
+real fetch in both build types, `AutoGatewaySelector`'s pinned
+`GatewayConfigSnapshot` now sources its AWG `endpointHost`/`endpointPort`
+from the manifest's own transport binding (never the catalog) - and a real
+device fetch->accept->LKG->restart->fetch-failure->LKG-survives->reconnect
+cycle was physically proven end to end. Signed Offline Bootstrap is now
+IMPLEMENTED with no remaining LKG-path caveat (see ROADMAP's own row).
+Builds on B16's
 consolidated review fix - the pinned `GatewayAttemptCandidate.configSnapshot`
 is threaded verbatim through `TransportOrchestrator`/`VpnController.connect()`
 and actually EXECUTED for the whole attempt, never reconstructed from

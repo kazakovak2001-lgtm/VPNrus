@@ -43,12 +43,25 @@ procedure and what remains an operator step (live deployment to both VPSes).
   constants).
 - **Embedded in**: `EmbeddedBootstrapManifest.kt`
   (`BOOTSTRAP_PUBLIC_KEY_BASE64`/`CANONICAL_BYTES_BASE64`/`SIGNATURE_BASE64`).
-- **NOT yet done as of this ceremony**: live deployment of
-  `endpoint-manifest-2026-09-01.bin` to either gateway's
-  `POCVPN_API_MANIFEST_PATH`, and fronting `GET /v1/manifest` at either
-  nginx edge — both remain explicit operator deploy actions (see "What
-  remains an explicit operator step" below), never performed automatically
+- **NOT yet done as of this ceremony (superseded — see "Production version
+  log" below)**: live deployment of `endpoint-manifest-2026-09-01.bin` to
+  either gateway's `POCVPN_API_MANIFEST_PATH`, and fronting
+  `GET /v1/manifest` at either nginx edge — both remain explicit operator
+  deploy actions, never performed automatically
   by this ceremony or by any code change in this PR.
+
+## Production version log
+
+| Version | Signed | Signing key | Deployed to | Status |
+|---|---|---|---|---|
+| 1 | 2026-09-01 | `prod-manifest-key-2026-09-01` | `EmbeddedBootstrapManifest` (both build types) | Embedded bootstrap/emergency fallback only — deliberately never deployed to `/v1/manifest` (kept one version behind the live manifest, per "Versioning and expiry policy" below) |
+| 2 | 2026-09-01 | `prod-manifest-key-2026-09-01` (SAME key — no rotation) | `/v1/manifest` on BOTH Frankfurt and Stockholm | **Live, current production manifest.** Same endpoint facts as v1 (Frankfurt/Stockholm, unchanged hosts/ports); a strictly higher `manifestVersion` so a real device genuinely adopts it into LKG instead of rejecting it as "not newer" than the embedded v1 bootstrap. Source: `gateway/tools/production_manifest_2026-09-01_v2.json`. Artifact: `gateway/tools/endpoint-manifest-2026-09-01_v2.bin`. Deployed via a plain file replace at each host's existing `POCVPN_API_MANIFEST_PATH` (`/etc/pocvpn/endpoint-manifest.bin`) — no config/nginx/code change needed (the v1 deployment already established that path on both hosts); `pocvpn-api` reads the manifest file per-request, so no service restart was needed either. Externally verified on both hosts: HTTPS 200, exact sha256 byte identity, valid Ed25519 signature, `/v1/activate`/`/v1/xray-profile` unaffected. Physically verified on a real device: genuinely fetched, genuinely ACCEPTED into LKG (`Manifest version: 2 (source=LAST_KNOWN_GOOD)`), survived a force-restart AND a subsequent client-side-only remote-fetch failure (airplane mode), Auto candidates/connect worked throughout — see `docs/ROADMAP.md`'s Signed Offline Bootstrap row (B17-2) for the full evidence trail. |
+
+This is the model for every future re-sign: same key unless a real rotation
+is underway (see "Rotation" below), strictly higher version, embedded
+bootstrap intentionally kept one version behind so it always fails the
+rollback check against whatever is actually live — the embedded artifact's
+whole purpose is emergency/offline recovery, not being the "current" version.
 
 ## Versioning and expiry policy
 
@@ -185,14 +198,17 @@ the same thing.
 
 - ~~Generating the real production keypair~~ — **done (B17, 2026-09-01)**,
   see "Production ceremony" above.
-- Deploying `endpoint-manifest-2026-09-01.bin` to BOTH production VPSes
-  (Frankfurt and Stockholm) and setting `POCVPN_API_MANIFEST_PATH` on each —
-  an explicit operator deploy action, NOT performed by this PR's code
-  changes and requiring the repository owner's approval before touching
-  live infrastructure (see this repo's own merge/infra-safety rules).
-- Fronting `GET /v1/manifest` at each gateway's public HTTPS edge (nginx,
-  alongside the existing `/v1/activate`/`/v1/xray-profile` routes) — an
-  operator deploy action.
-- External verification after deployment: HTTPS success, exact byte
-  identity against `endpoint-manifest-2026-09-01.bin`, valid signature,
-  version/expiry, and that a tampered copy is rejected by the client.
+- ~~Deploying the signed manifest to BOTH production VPSes and setting
+  `POCVPN_API_MANIFEST_PATH`~~ — **done (B17 for v1's config/nginx wiring;
+  B17-2 for the current live v2 content)**, see "Production version log"
+  above.
+- ~~Fronting `GET /v1/manifest` at each gateway's public HTTPS edge~~ —
+  **done (B17)**, see `gateway/edge/nginx-pocvpn.conf`/
+  `nginx-pocvpn-stockholm.conf`.
+- ~~External verification after deployment~~ — **done (B17-2)**: HTTPS
+  success, exact byte identity, valid signature, version/expiry all
+  verified on both hosts for the current live v2 artifact.
+- **Remaining**: any FUTURE re-sign (v3+) — generate the new manifest JSON,
+  sign it offline with the SAME production key (see "Versioning and expiry
+  policy" below), and deploy the new artifact to both hosts the same way —
+  an explicit operator action each time, never automated.

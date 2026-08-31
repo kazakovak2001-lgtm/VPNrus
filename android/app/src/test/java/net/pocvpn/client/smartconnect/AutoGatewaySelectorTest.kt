@@ -147,6 +147,48 @@ class AutoGatewaySelectorTest {
         assertEquals("10.77.0.5", germany.configSnapshot.clientTunnelIp)
     }
 
+    /**
+     * B17-2 - the runtime-authority fix's core proof: the manifest's OWN
+     * transport binding host/port is what ends up in the pinned
+     * GatewayConfigSnapshot, even when the catalog compatibility lookup
+     * would return a DIFFERENT host for the same endpoint id - a signed
+     * manifest advertising a rotated host/port must actually change what
+     * gets executed, never be silently overridden by
+     * ProductionGatewayCatalog.
+     */
+    @Test
+    fun `configSnapshot host and port come from the manifest binding, not the catalog, even when they differ`() {
+        val manifestHost = "203.0.113.50"
+        val manifestPort = 44444
+        val manifestEndpoints = listOf(
+            EndpointDescriptor(
+                id = germanyId,
+                roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+                region = "Germany / Frankfurt",
+                provider = "Oracle Cloud",
+                transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, manifestHost, manifestPort)),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = manifestEndpoints,
+            gatewayFactsFor = { catalogById[it] }, // the catalog's OWN host/port differ from manifestHost/manifestPort above
+            provisioned = { it == ProductionGatewayId.GERMANY },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry() },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind -> reachable(endpointId, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        val germany = candidates.single { it.gatewayId == ProductionGatewayId.GERMANY }
+        assertEquals(manifestHost, germany.configSnapshot.endpointHost)
+        assertEquals(manifestPort.toString(), germany.configSnapshot.endpointPort)
+        // Sanity: this only proves something if the two actually differ.
+        assertTrue(manifestHost != ProductionGatewayCatalog.GERMANY.awg.endpointHost)
+        assertTrue(manifestPort != ProductionGatewayCatalog.GERMANY.awg.endpointPort)
+    }
+
     @Test
     fun `pinned manual transport preference restricts every gateway to that one transport kind`() {
         val candidates = buildDefault(preference = UserTransportPreference.Manual(TransportKind.AMNEZIA_WG))

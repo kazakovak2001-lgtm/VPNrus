@@ -196,6 +196,51 @@ class MainViewModelAutoGatewayTest {
         )
     }
 
+    /**
+     * B17-2 - a trusted, signed manifest naming both real endpoints, but
+     * with Germany's AMNEZIA_WG binding advertising [germanyHost]/[germanyPort]
+     * INSTEAD of `ProductionGatewayCatalog.GERMANY.awg.endpointHost/Port` -
+     * proves the manifest's own address, not the catalog's, is what actually
+     * gets executed.
+     */
+    private fun manifestRepositoryWithGermanyHost(germanyHost: String, germanyPort: Int): EndpointManifestRepository {
+        val stockholmGateway = ProductionGatewayCatalog.STOCKHOLM
+        val manifest = EndpointManifest(
+            manifestVersion = 1,
+            issuedAtEpochMillis = 1_000L,
+            expiresAtEpochMillis = 9_000_000_000_000L,
+            signingKeyId = "test-manifest-key",
+            endpoints = listOf(
+                EndpointDescriptor(
+                    id = ProductionGatewayCatalog.GERMANY.endpointId,
+                    roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+                    region = "Germany / Frankfurt",
+                    provider = "Oracle Cloud",
+                    transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, germanyHost, germanyPort)),
+                ),
+                EndpointDescriptor(
+                    id = stockholmGateway.endpointId,
+                    roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+                    region = "${stockholmGateway.displayCountry} / ${stockholmGateway.displayCity}",
+                    provider = stockholmGateway.provider,
+                    transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, stockholmGateway.awg.endpointHost, stockholmGateway.awg.endpointPort)),
+                ),
+            ),
+        )
+        val signer = Ed25519Signer()
+        signer.init(true, manifestSigningKey)
+        val bytes = ManifestCanonicalizer.canonicalBytes(manifest)
+        signer.update(bytes, 0, bytes.size)
+        val signed = SignedManifest(manifest, signer.generateSignature())
+        return EndpointManifestRepository(
+            verifier = Ed25519ManifestVerifier(),
+            trustAnchors = manifestTrustAnchors,
+            lkgStore = FileLastKnownGoodManifestStore(tmp.newFolder()),
+            bootstrapManifest = signed,
+            nowEpochMillis = { 2_000L },
+        )
+    }
+
     private fun newViewModel(
         transport: VpnTransport = FakeVpnTransport(),
         autoModeStore: GatewayAutoModeStore = FakeGatewayAutoModeStore(),
@@ -409,5 +454,43 @@ class MainViewModelAutoGatewayTest {
         // captured when the candidate was ranked/resolved), never the
         // mutated value the identity store holds now.
         assertEquals(listOf("10.77.0.5/32"), sent.localAddresses)
+    }
+
+    /**
+     * B17-2 runtime-authority fix - end-to-end proof that the EXECUTED AWG
+     * peer endpoint is the manifest's own host/port, never
+     * ProductionGatewayCatalog's - a signed manifest advertising a rotated
+     * Germany address must actually change what the real connect() attempt
+     * dials, not just what PathScorer ranks.
+     */
+    @Test
+    fun `auto connect to Germany dials the manifest host, not the catalog host`() = runTest {
+        val manifestHost = "203.0.113.77"
+        val manifestPort = 55555
+        val transport = FakeVpnTransport()
+        val autoStore = FakeGatewayAutoModeStore(initial = true)
+        val customViewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            selectedGatewayStore = FakeSelectedGatewayStore(),
+            clientTunnelIdentityStore = bothProvisioned,
+            gatewayAutoModeStore = autoStore,
+            initialNetworkProfile = USABLE_WIFI,
+            manifestRepository = manifestRepositoryWithGermanyHost(manifestHost, manifestPort),
+        )
+
+        customViewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, transport.connectCallCount)
+        val sent = (transport.lastConfig as net.pocvpn.client.vpn.config.TransportConfig.Awg).config
+        assertEquals(manifestHost, sent.peer.endpointHost)
+        assertEquals(manifestPort, sent.peer.endpointPort)
+        // Sanity: this only proves something if the two actually differ.
+        assertTrue(manifestHost != ProductionGatewayCatalog.GERMANY.awg.endpointHost)
+        assertTrue(manifestPort != ProductionGatewayCatalog.GERMANY.awg.endpointPort)
     }
 }
