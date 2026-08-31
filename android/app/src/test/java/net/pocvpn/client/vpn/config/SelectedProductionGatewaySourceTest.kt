@@ -193,4 +193,61 @@ class SelectedProductionGatewaySourceTest {
         current = ProductionGatewayId.STOCKHOLM
         assertEquals("10.77.0.2", source.clientTunnelIp())
     }
+
+    // --- B13 THIRD consolidated review fix (finding 6): atomic config snapshot ---
+
+    @Test
+    fun `snapshot resolves selectedGatewayId exactly once - a selection change mid-resolution never produces a mixed-endpoint config`() {
+        // Simulates a concurrent selectGateway() call landing BETWEEN what
+        // used to be six independent getter calls: the very first read
+        // returns GERMANY, every read after that returns STOCKHOLM. If
+        // snapshot() only reads selectedGatewayId() once (the fix), the
+        // whole resulting config is self-consistently Germany's. The old,
+        // six-independent-calls behavior would instead have combined
+        // Germany's host with Stockholm's key/clientTunnelIp/profile.
+        var callCount = 0
+        val flakySelector = {
+            callCount++
+            if (callCount == 1) ProductionGatewayId.GERMANY else ProductionGatewayId.STOCKHOLM
+        }
+        val identity = fakeIdentity(
+            ProductionGatewayId.GERMANY to "10.77.0.5",
+            ProductionGatewayId.STOCKHOLM to "10.77.0.2",
+        )
+        val source = SelectedProductionGatewaySource(flakySelector, identity)
+
+        val config = DefaultGatewayConfigurationRepository(source).get() as GatewayConfiguration.Configured
+
+        assertEquals(1, callCount)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointHost, config.endpointHost)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointPort, config.endpointPort)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.serverPublicKeyBase64, config.serverPublicKeyBase64)
+        assertEquals("10.77.0.5", config.clientTunnelIp)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.gatewayTunnelIp, config.gatewayTunnelIp)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awgProfile, config.profile)
+    }
+
+    @Test
+    fun `snapshot() itself never calls the individual per-field getters - proven by a selector that flips after the first read`() {
+        // Same flaky-selector setup as above, but calling source.snapshot()
+        // directly rather than through the repository - isolates the
+        // proof to SelectedProductionGatewaySource's own override, not
+        // DefaultGatewayConfigurationRepository's usage of it.
+        var callCount = 0
+        val flakySelector = {
+            callCount++
+            if (callCount == 1) ProductionGatewayId.GERMANY else ProductionGatewayId.STOCKHOLM
+        }
+        val identity = fakeIdentity(
+            ProductionGatewayId.GERMANY to "10.77.0.5",
+            ProductionGatewayId.STOCKHOLM to "10.77.0.2",
+        )
+        val source = SelectedProductionGatewaySource(flakySelector, identity)
+
+        val snapshot = source.snapshot()
+
+        assertEquals(1, callCount)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.serverPublicKeyBase64, snapshot.serverPublicKey)
+        assertEquals("10.77.0.5", snapshot.clientTunnelIp)
+    }
 }

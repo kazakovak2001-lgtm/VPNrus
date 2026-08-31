@@ -25,6 +25,21 @@ package net.pocvpn.client.vpn.config
  * (via BuildConfigGatewaySource) into the real, production
  * GatewayConfigurationRepository - that file remains a genuinely local dev
  * convenience (see its own docs), never the product's own selector.
+ *
+ * B13 THIRD consolidated review fix (finding 6) - [selectedGatewayId] can
+ * change concurrently with a resolution in progress (MainViewModel.
+ * selectGateway() runs on a different coroutine/thread than whatever is
+ * mid-`DefaultGatewayConfigurationRepository.get()`). The individual
+ * getters below still each independently call [selectedGatewayId] (kept
+ * for GatewayConfigSource interface compatibility/direct unit testing, and
+ * genuinely harmless in isolation - a single field read is never
+ * internally torn), but [snapshot] is OVERRIDDEN to resolve
+ * [selectedGatewayId] and the matching descriptor/clientTunnelIp EXACTLY
+ * ONCE and derive every field from that SAME resolved snapshot -
+ * DefaultGatewayConfigurationRepository.get() calls ONLY [snapshot], never
+ * the six individual getters, so a real config build can never combine one
+ * gateway's host with a DIFFERENT gateway's key/clientTunnelIp/profile
+ * even if selection changes the instant after [selectedGatewayId] is read.
  */
 class SelectedProductionGatewaySource(
     private val selectedGatewayId: () -> ProductionGatewayId,
@@ -39,4 +54,21 @@ class SelectedProductionGatewaySource(
     override fun clientTunnelIp(): String = clientTunnelIp(selectedGatewayId()) ?: ""
     override fun gatewayTunnelIp(): String = descriptor.awg.gatewayTunnelIp
     override fun profile(): AwgProfile = descriptor.awgProfile
+
+    override fun snapshot(): GatewayConfigSnapshot {
+        // THE one place selectedGatewayId() is read for a real config
+        // build - everything below derives from this SAME resolved id/
+        // descriptor, never a second independent read of either.
+        val id = selectedGatewayId()
+        val resolved = ProductionGatewayCatalog.byId(id)
+        return GatewayConfigSnapshot(
+            endpointHost = resolved.awg.endpointHost,
+            endpointPort = resolved.awg.endpointPort.toString(),
+            serverPublicKey = resolved.awg.serverPublicKeyBase64,
+            clientTunnelIp = clientTunnelIp(id) ?: "",
+            gatewayTunnelIp = resolved.awg.gatewayTunnelIp,
+            allowedIps = allowedIps(),
+            profile = resolved.awgProfile,
+        )
+    }
 }

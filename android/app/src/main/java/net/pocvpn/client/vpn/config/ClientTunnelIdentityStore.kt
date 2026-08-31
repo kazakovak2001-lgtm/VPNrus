@@ -85,13 +85,13 @@ class FileClientTunnelIdentityStore(
      * Two extra checks beyond "a profile exists" keep this honestly
      * evidence-based rather than a rubber stamp:
      *  - B13 consolidated review fix - the persisted profile's FULL stable
-     *    server facts (host AND port AND the gateway's own public key -
-     *    [ProductionGatewayCatalog.matchGatewayId], the SAME matcher
-     *    MainViewModel.activateDevice uses for a live response) must
-     *    resolve unambiguously to GERMANY. A profile whose host happens to
-     *    match but whose port or key does not (a rotated/wrong key) is no
-     *    longer accepted as evidence - endpointHost alone was too weak a
-     *    signal.
+     *    server facts (host AND port AND the gateway's own public key AND
+     *    gatewayTunnelIp - [ProductionGatewayCatalog.matchGatewayId], the
+     *    SAME matcher MainViewModel.activateDevice uses for a live
+     *    response) must resolve unambiguously to GERMANY. A profile whose
+     *    host happens to match but whose port, key, or gatewayTunnelIp does
+     *    not is no longer accepted as evidence - endpointHost alone was too
+     *    weak a signal.
      *  - an endpoint that already has a stored value is NEVER overwritten
      *    (idempotent, safe to call on every startup - matches the
      *    previous migration's own idempotency contract).
@@ -102,6 +102,7 @@ class FileClientTunnelIdentityStore(
             endpointHost = legacyProfile.endpointHost,
             endpointPort = legacyProfile.endpointPort,
             serverPublicKeyBase64 = legacyProfile.gatewayPublicKey,
+            gatewayTunnelIp = legacyProfile.gatewayTunnelIp,
         )
         if (matched != ProductionGatewayId.GERMANY) return
 

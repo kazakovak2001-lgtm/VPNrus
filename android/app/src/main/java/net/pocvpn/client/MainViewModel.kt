@@ -714,9 +714,21 @@ class MainViewModel(
         // itself verified, and this accessor must not fabricate a snapshot
         // around an unverified manifest just because one is compiled in.
         val manifest = repository.trusted() ?: return null
-        // B13 consolidated review fix - same "currently selected gateway's
-        // own endpoint" reasoning as transportScores() above.
-        val registry = buildTransportRegistry(net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGateway.value).endpointId)
+        // B13 SECOND consolidated review fix - a manifest can name MULTIPLE
+        // endpoints (Germany, Stockholm, ...), and Xray/TLS availability is
+        // now genuinely per-endpoint (see buildTransportRegistry(endpointId)'s
+        // own docs) - one registry built for whichever gateway happens to be
+        // CURRENTLY SELECTED cannot truthfully describe every OTHER
+        // endpoint's own candidates too (Germany's Xray profile existing
+        // must never make a Stockholm candidate look eligible, or vice
+        // versa). One registry is built per endpoint the manifest actually
+        // names, and each candidate below is scored against ITS OWN
+        // endpoint's registry - never the selected gateway's. Still
+        // observational only: nothing here feeds back into
+        // smartConnectDecision()/PathScorer is not promoted into Smart
+        // Connect by this fix.
+        val registriesByEndpoint: Map<net.pocvpn.client.reachability.EndpointId, TransportRegistry> =
+            manifest.endpoints.associate { it.id to buildTransportRegistry(it.id) }
         val health = transportHealth()
         val restriction = restrictionClass()
         val profile = networkProfile.value
@@ -843,11 +855,24 @@ class MainViewModel(
                 // could misrepresent the OTHER hop's own history.
                 is net.pocvpn.client.reachability.PathCandidate.Relayed -> null
             }
-            val capabilities = registry.descriptorFor(candidate.transport)?.capabilities
+            // B13 SECOND consolidated review fix - THIS candidate's own
+            // endpoint (the client-facing hop it actually executes against:
+            // the gateway itself for Direct, the ingress for Relayed - the
+            // SAME hop candidate.transport describes), never the globally
+            // selected gateway. Falls back to buildTransportRegistry(id) in
+            // the (should-never-happen) case an endpoint referenced by a
+            // candidate is somehow missing from registriesByEndpoint, rather
+            // than silently reusing a different endpoint's registry.
+            val candidateEndpointId = when (candidate) {
+                is net.pocvpn.client.reachability.PathCandidate.Direct -> candidate.gateway.endpoint.id
+                is net.pocvpn.client.reachability.PathCandidate.Relayed -> candidate.ingress.endpoint.id
+            }
+            val candidateRegistry = registriesByEndpoint[candidateEndpointId] ?: buildTransportRegistry(candidateEndpointId)
+            val capabilities = candidateRegistry.descriptorFor(candidate.transport)?.capabilities
                 ?: TransportCapabilities.notImplemented()
             net.pocvpn.client.reachability.PathScorer.score(
                 candidate = candidate,
-                registry = registry,
+                registry = candidateRegistry,
                 capabilities = capabilities,
                 transportHealth = health.getValue(candidate.transport),
                 history = history,
@@ -1026,19 +1051,57 @@ class MainViewModel(
     // if no profile had ever been persisted. This never throws/crashes -
     // ProfileStore.read() itself already converts every I/O/parse failure
     // into Corrupted (see FileProfileStore's own docs).
+    //
+    // B13 SECOND consolidated review fix - a STRUCTURALLY valid
+    // PersistedProfile is no longer, by itself, enough to unlock Home
+    // (ProfileSource.RESTORED_PERSISTED -> ProductFlowPresentation.screenFor
+    // -> AppScreen.HOME). A real gap: this used to accept ANY structurally
+    // well-formed profile, even one for an endpoint the CANONICAL
+    // connect-time authority (SelectedProductionGatewaySource, resolved
+    // from ProductionGatewayCatalog.matchGatewayId + ClientTunnelIdentityStore
+    // - the SAME two checks activateDevice() itself now enforces on a live
+    // response) would refuse - a dev/staging profile, a profile for a
+    // rotated-away key, or (legitimately) a profile restored on a device
+    // whose ClientTunnelIdentityStore entry was never actually provisioned/
+    // migrated could show Home while gatewayStatus() would really resolve
+    // to Invalid. RESTORED_PERSISTED now requires BOTH: (1) the profile's
+    // full stable facts unambiguously match a known catalog gateway
+    // (matchGatewayId - host+port+key+gatewayTunnelIp, never guessed), AND
+    // (2) THIS device is actually provisioned for that exact gateway
+    // (isGatewayProvisioned - the SAME per-device evidence
+    // SelectedProductionGatewaySource itself resolves clientTunnelIp()
+    // from). Anything short of both stays/falls back to DEV_FALLBACK -
+    // Activation, never a fabricated identity, never a guessed migration
+    // (ClientTunnelIdentityStore's own migration, if any, already ran in
+    // the Factory before this ViewModel was even constructed - this never
+    // re-runs or duplicates it).
     private fun restorePersistedProfile() {
         val store = profileStore ?: return
         when (val result = store.read()) {
             is ProfileLoadResult.Found -> {
                 val p = result.profile
-                gatewayConfigOverride?.apply(
+                val matched = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.matchGatewayId(
                     endpointHost = p.endpointHost,
                     endpointPort = p.endpointPort,
-                    serverPublicKey = p.gatewayPublicKey,
-                    clientTunnelIp = p.clientTunnelIp,
+                    serverPublicKeyBase64 = p.gatewayPublicKey,
                     gatewayTunnelIp = p.gatewayTunnelIp,
                 )
-                _profileSource.value = ProfileSource.RESTORED_PERSISTED
+                if (matched != null && isGatewayProvisioned(matched)) {
+                    gatewayConfigOverride?.apply(
+                        endpointHost = p.endpointHost,
+                        endpointPort = p.endpointPort,
+                        serverPublicKey = p.gatewayPublicKey,
+                        clientTunnelIp = p.clientTunnelIp,
+                        gatewayTunnelIp = p.gatewayTunnelIp,
+                    )
+                    _profileSource.value = ProfileSource.RESTORED_PERSISTED
+                }
+                // else: leave _profileSource at its DEV_FALLBACK default -
+                // this legacy profile does not correspond to a gateway the
+                // real connect path would actually accept, so it must not
+                // unlock Home. Never calls gatewayConfigOverride.apply()
+                // either, for the same reason NotFound/Corrupted below
+                // don't - no accepted-but-unusable state.
             }
             is ProfileLoadResult.NotFound -> Unit
             is ProfileLoadResult.Corrupted -> Unit
@@ -1092,6 +1155,7 @@ class MainViewModel(
                         endpointHost = result.endpointHost,
                         endpointPort = result.endpointPort,
                         serverPublicKeyBase64 = result.gatewayPublicKey,
+                        gatewayTunnelIp = result.gatewayTunnelIp,
                     )
                     if (matchedGatewayId == null) {
                         ProvisioningUiState.Error(

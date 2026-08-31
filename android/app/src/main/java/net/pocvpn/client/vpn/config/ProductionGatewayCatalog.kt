@@ -109,13 +109,28 @@ object ProductionGatewayCatalog {
 
     /**
      * The second, independently-provisioned AWS gateway (eu-north-1,
-     * Stockholm) - B13's multi-provider/ASN validation target. AWG
-     * physically handshake-verified 2026-08-30 (real device, real 8-second
-     * timeout window, "Received handshake response" in 48ms, exit IP
+     * Stockholm) - B13's multi-provider/ASN VALIDATION/FOUNDATION
+     * infrastructure, not yet a durable production endpoint. AWG physically
+     * handshake-verified 2026-08-30 (real device, real 8-second timeout
+     * window, "Received handshake response" in 48ms, exit IP
      * 16.170.208.231 confirmed via two independent services). REALITY and
      * TLS_TCP are ALSO physically validated on this gateway as of B13 Part 2
      * (2026-08-30) - see docs/ROADMAP.md's Gateway Pool row for the full
      * evidence trail; this gateway is no longer AWG-only.
+     *
+     * B13 THIRD consolidated review fix (finding 5) - `16.170.208.231` is
+     * this AWS instance's auto-assigned public IPv4, NOT an Elastic
+     * (stable/reserved) IP - a stop/start of the instance can reassign a
+     * DIFFERENT address, silently invalidating this catalog entry AND the
+     * IP-bound TLS certificate this gateway's REALITY/TLS inbounds rely on.
+     * This PR does not allocate/purchase any paid AWS resource (an Elastic
+     * IP is a billed resource) to fix that - it is a deliberate, truthful
+     * limitation of this validation slice, not an oversight. Do not treat
+     * this address as durable, and do not extend self-service Stockholm
+     * provisioning (a real control-plane/activation deployment) on top of
+     * it until stable addressing is a deliberately approved, separate
+     * change - see docs/ROADMAP.md's own "B13 validation/foundation
+     * infrastructure, not yet durable production addressing" note.
      */
     val STOCKHOLM = ProductionGatewayDescriptor(
         id = ProductionGatewayId.STOCKHOLM,
@@ -155,27 +170,48 @@ object ProductionGatewayCatalog {
 
     /**
      * B13 consolidated review fix - the ONE place a validated control-plane
-     * response (ProvisioningResult.Success) is mapped to a
-     * [ProductionGatewayId]. Matches on the FULL set of stable server facts
-     * a response carries (host AND port AND the gateway's own public key),
-     * never endpointHost alone (a shared/reused host+port with a rotated or
-     * wrong key must not be treated as a match) and never the caller's
-     * current UI gateway selection (a response is evidence about WHICH
-     * gateway actually issued it, not about whatever the user happened to
-     * have tapped in the picker).
+     * response (ProvisioningResult.Success) OR a legacy persisted profile
+     * (PersistedProfile) is mapped to a [ProductionGatewayId]. Matches on
+     * the FULL set of stable server facts either one carries - host AND
+     * port AND the gateway's own public key AND [gatewayTunnelIp] - never
+     * endpointHost alone (a shared/reused host+port with a rotated or wrong
+     * key must not be treated as a match) and never the caller's current UI
+     * gateway selection (a response/profile is evidence about WHICH gateway
+     * actually issued it, not about whatever the user happened to have
+     * tapped in the picker).
+     *
+     * B13 SECOND consolidated review fix - [gatewayTunnelIp] joined the
+     * match: a real gap had a response/profile with the right host+port+key
+     * but a WRONG or stale gatewayTunnelIp still accepted, even though the
+     * real runtime (SelectedProductionGatewaySource) always takes
+     * gatewayTunnelIp from THIS catalog, never from the accepted
+     * response/profile - i.e. a mismatching value could be silently
+     * accepted-and-ignored rather than rejected. gatewayTunnelIp is a real
+     * identity fact of the gateway (its OWN tunnel-interface address, the
+     * literal AllowedIPs peer the client's traffic must reach), not a
+     * free-floating field - so it belongs in the match, exactly like host/
+     * port/key, rather than being silently disregarded.
      *
      * Returns null for anything that does not unambiguously match exactly
      * ONE catalog entry - an unrecognized combination (a dev/staging
-     * server, a rotated production key not yet in this catalog, or a
-     * malformed/adversarial response) is never guessed at or forced onto
-     * the nearest entry. Callers (MainViewModel.activateDevice) MUST treat
-     * null as "reject this response", never as "fall back to whichever
-     * gateway is currently selected" - see that function's own docs.
+     * server, a rotated production key not yet in this catalog, a stale/
+     * wrong gatewayTunnelIp, or a malformed/adversarial response) is never
+     * guessed at or forced onto the nearest entry. Callers
+     * (MainViewModel.activateDevice, ClientTunnelIdentityStore's own
+     * migration) MUST treat null as "reject this response/profile", never
+     * as "fall back to whichever gateway is currently selected" - see each
+     * call site's own docs.
      */
-    fun matchGatewayId(endpointHost: String, endpointPort: Int, serverPublicKeyBase64: String): ProductionGatewayId? =
+    fun matchGatewayId(
+        endpointHost: String,
+        endpointPort: Int,
+        serverPublicKeyBase64: String,
+        gatewayTunnelIp: String,
+    ): ProductionGatewayId? =
         all.singleOrNull {
             it.awg.endpointHost == endpointHost &&
                 it.awg.endpointPort == endpointPort &&
-                it.awg.serverPublicKeyBase64 == serverPublicKeyBase64
+                it.awg.serverPublicKeyBase64 == serverPublicKeyBase64 &&
+                it.awg.gatewayTunnelIp == gatewayTunnelIp
         }?.id
 }

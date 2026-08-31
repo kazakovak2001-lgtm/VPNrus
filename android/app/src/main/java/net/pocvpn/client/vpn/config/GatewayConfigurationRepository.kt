@@ -26,7 +26,47 @@ interface GatewayConfigSource {
      * why a single global profile was a real bug, not a simplification.
      */
     fun profile(): AwgProfile = PocAwgProfile.value
+
+    /**
+     * B13 THIRD consolidated review fix (finding 6) - ONE atomic snapshot of
+     * every field above, resolved TOGETHER. The default implementation here
+     * simply calls each individual getter in turn, in the SAME order
+     * DefaultGatewayConfigurationRepository.get() always has - byte-for-byte
+     * unchanged behavior for every source with no concurrent-mutation
+     * concern (BuildConfigGatewaySource's values are compile-time constants;
+     * every plain test fake returns fixed strings).
+     *
+     * A source whose underlying selection CAN change between two calls
+     * (today: [SelectedProductionGatewaySource], selection changes via
+     * MainViewModel.selectGateway() on a different coroutine/thread than
+     * whatever is mid-`get()`) MUST override this to resolve its
+     * selection/descriptor EXACTLY ONCE and derive every field from that
+     * SAME resolved value - never six independent re-reads a concurrent
+     * selection change could interleave, which could otherwise combine one
+     * gateway's host with a DIFFERENT gateway's key/clientTunnelIp/profile
+     * into one nonsensical GatewayConfiguration.Configured.
+     */
+    fun snapshot(): GatewayConfigSnapshot = GatewayConfigSnapshot(
+        endpointHost = endpointHost(),
+        endpointPort = endpointPort(),
+        serverPublicKey = serverPublicKey(),
+        clientTunnelIp = clientTunnelIp(),
+        gatewayTunnelIp = gatewayTunnelIp(),
+        allowedIps = allowedIps(),
+        profile = profile(),
+    )
 }
+
+/** B13 THIRD consolidated review fix (finding 6) - see [GatewayConfigSource.snapshot]'s own docs. */
+data class GatewayConfigSnapshot(
+    val endpointHost: String,
+    val endpointPort: String,
+    val serverPublicKey: String,
+    val clientTunnelIp: String,
+    val gatewayTunnelIp: String,
+    val allowedIps: String,
+    val profile: AwgProfile,
+)
 
 interface GatewayConfigurationRepository {
     fun get(): GatewayConfiguration
@@ -43,11 +83,17 @@ class DefaultGatewayConfigurationRepository(
 ) : GatewayConfigurationRepository {
 
     override fun get(): GatewayConfiguration {
-        val host = source.endpointHost().trim()
-        val portRaw = source.endpointPort().trim()
-        val serverPublicKey = source.serverPublicKey().trim()
-        val clientTunnelIp = source.clientTunnelIp().trim()
-        val gatewayTunnelIp = source.gatewayTunnelIp().trim()
+        // B13 THIRD consolidated review fix (finding 6) - ONE snapshot()
+        // call, not six independent getter calls: every field below is
+        // guaranteed to describe the SAME resolved gateway, even if the
+        // underlying selection changes concurrently the instant after this
+        // call returns - see GatewayConfigSource.snapshot()'s own docs.
+        val snapshot = source.snapshot()
+        val host = snapshot.endpointHost.trim()
+        val portRaw = snapshot.endpointPort.trim()
+        val serverPublicKey = snapshot.serverPublicKey.trim()
+        val clientTunnelIp = snapshot.clientTunnelIp.trim()
+        val gatewayTunnelIp = snapshot.gatewayTunnelIp.trim()
 
         if (host.isEmpty() && portRaw.isEmpty() && serverPublicKey.isEmpty() &&
             clientTunnelIp.isEmpty() && gatewayTunnelIp.isEmpty()
@@ -77,22 +123,22 @@ class DefaultGatewayConfigurationRepository(
             serverPublicKeyBase64 = serverPublicKey,
             clientTunnelIp = clientTunnelIp,
             gatewayTunnelIp = gatewayTunnelIp,
-            allowedIps = resolveAllowedIps(),
+            allowedIps = resolveAllowedIps(snapshot),
             // B8F - a local client policy, not a server-issued/persisted
             // fact (see VpnDnsPolicy's own docs) - applied here so every
             // profile source converges on the same DNS servers.
             dnsServers = VpnDnsPolicy.servers,
-            // B13 - read fresh from the source on every get() call (same
-            // "no caching" discipline as every other field here), never the
-            // constructor-level default this used to be - see
-            // GatewayConfigSource.profile()'s own docs.
-            profile = source.profile(),
+            // B13 - read fresh from the SAME snapshot as every other field
+            // above (no caching across separate get() calls, but never a
+            // second, independent read within THIS one) - see
+            // GatewayConfigSource.profile()/snapshot()'s own docs.
+            profile = snapshot.profile,
         )
     }
 
     /** Full-tunnel default, unless the source overrides it (e.g. a narrow route for local testing). */
-    private fun resolveAllowedIps(): List<String> {
-        val override = source.allowedIps().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    private fun resolveAllowedIps(snapshot: GatewayConfigSnapshot): List<String> {
+        val override = snapshot.allowedIps.split(",").map { it.trim() }.filter { it.isNotEmpty() }
         return override.ifEmpty { listOf("0.0.0.0/0", "::/0") }
     }
 }
