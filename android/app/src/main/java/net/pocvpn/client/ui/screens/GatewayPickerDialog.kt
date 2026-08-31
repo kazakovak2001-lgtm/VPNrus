@@ -42,6 +42,16 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
  * `clickable` modifier nor the RadioButton's `onClick` invoke [onSelect]
  * for it. A provisioned gateway is completely unaffected - normal tap
  * target, normal label, normal onSelect.
+ *
+ * B15 - before this, an unprovisioned gateway's row was a dead end: the ONLY
+ * way to reach ActivationScreen was net.pocvpn.client.ui.screenFor, which
+ * only ever fires when NO gateway has ever been provisioned at all - so once
+ * a device had activated its first gateway, there was no UI path left to
+ * activate an ADDITIONAL one (see docs/ROADMAP.md's B15 update). [onActivate]
+ * closes that gap: an unprovisioned row now also shows a small "Activate"
+ * action that requests activation for THAT gateway id specifically, leaving
+ * the row's own clickable/RadioButton [onSelect] wiring (connection
+ * selection) untouched.
  */
 @Composable
 fun GatewayPickerDialog(
@@ -49,6 +59,7 @@ fun GatewayPickerDialog(
     options: List<ProductionGatewayDescriptor>,
     provisionedGatewayIds: Set<ProductionGatewayId>,
     onSelect: (ProductionGatewayId) -> Unit,
+    onActivate: (ProductionGatewayId) -> Unit,
     onDismiss: () -> Unit,
 ) {
     Dialog(onDismissRequest = onDismiss) {
@@ -98,6 +109,11 @@ fun GatewayPickerDialog(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                        }
+                        if (!provisioned) {
+                            TextButton(onClick = { onActivate(descriptor.id) }) {
+                                Text(stringResource(R.string.gateway_picker_activate))
+                            }
                         }
                     }
                 }

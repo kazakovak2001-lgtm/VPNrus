@@ -14,6 +14,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -24,11 +25,19 @@ import androidx.compose.ui.unit.dp
 import net.pocvpn.client.R
 
 /**
- * B8E - redesigned first-run activation screen. Only ever shown when no
- * provisioned profile exists (see AppRoot / net.pocvpn.client.ui.screenFor).
+ * B8E - redesigned first-run activation screen. Shown when no provisioned
+ * profile exists at all (see AppRoot / net.pocvpn.client.ui.screenFor), and
+ * (B15) reused, unchanged, for activating an ADDITIONAL gateway on an
+ * already-provisioned device (AppRoot's activatingGatewayId path, reached
+ * from GatewayPickerDialog's "Activate" action on an unprovisioned row).
  * credential/onCredentialChange are hoisted, not remembered here - the
  * caller (MainActivity's Compose host) owns the field's value so it can be
  * cleared from a single place on success (see MainActivity's own comment).
+ *
+ * [onCancel] is null for the mandatory first-run path (there is nothing to
+ * cancel back to) and non-null only for the B15 additional-gateway path,
+ * where the user reached this screen from a dismissible dialog and must be
+ * able to back out of it the same way.
  */
 @Composable
 fun ActivationScreen(
@@ -38,6 +47,7 @@ fun ActivationScreen(
     errorText: String?,
     isSubmitting: Boolean,
     modifier: Modifier = Modifier,
+    onCancel: (() -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -99,6 +109,17 @@ fun ActivationScreen(
                 .height(52.dp),
         ) {
             Text(stringResource(R.string.activation_button))
+        }
+
+        if (onCancel != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            TextButton(
+                onClick = onCancel,
+                enabled = !isSubmitting,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.activation_cancel_button))
+            }
         }
     }
 }

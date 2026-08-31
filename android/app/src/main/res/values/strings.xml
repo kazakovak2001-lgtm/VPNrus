@@ -28,6 +28,9 @@
          specific device has no client tunnel identity for (see
          ClientTunnelIdentityStore's own docs) - that row is disabled. -->
     <string name="gateway_picker_unavailable">Unavailable on this device</string>
+    <!-- B15 - lets the user request activation for a gateway not yet
+         provisioned on this device (see GatewayPickerDialog's own docs). -->
+    <string name="gateway_picker_activate">Activate</string>
 
     <!-- Settings / split tunneling -->
     <string name="settings_title">Settings</string>
@@ -55,6 +58,11 @@
     <string name="activation_helper_text">Enter the activation credential you received to set up this device. You\'ll only need to do this once.</string>
     <string name="activation_credential_label">Activation credential</string>
     <string name="activation_button">ACTIVATE</string>
+    <!-- B15 - only shown when this screen was reached from the gateway
+         picker's "Activate" action on an already-provisioned device
+         (see ActivationScreen's onCancel param); the mandatory first-run
+         activation path never passes onCancel, so never shows this. -->
+    <string name="activation_cancel_button">Cancel</string>
 
     <!-- Diagnostics dialog (debug builds only) -->
     <string name="diagnostics_title">Diagnostics</string>

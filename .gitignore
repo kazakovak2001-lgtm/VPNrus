@@ -7,6 +7,7 @@
 # templates (no private key material, no tokens - see their own headers).
 !gateway/edge/nginx-pocvpn-bootstrap.conf
 !gateway/edge/nginx-pocvpn.conf
+!gateway/edge/nginx-pocvpn-stockholm.conf
 .env
 .env.*
 !.env.example

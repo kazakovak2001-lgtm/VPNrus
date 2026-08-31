@@ -79,6 +79,13 @@ fun AppRoot(
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showGatewayPicker by remember { mutableStateOf(false) }
+    // B15 - non-null while the user is activating an ADDITIONAL gateway
+    // (requested from GatewayPickerDialog's "Activate" action) on a device
+    // that already has at least one provisioned gateway - see
+    // GatewayPickerDialog's own docs for why this path didn't exist before.
+    var activatingGatewayId by remember {
+        mutableStateOf<net.pocvpn.client.vpn.config.ProductionGatewayId?>(null)
+    }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
     val context = LocalContext.current
     // B8H perf fix - constructing the repository is cheap (just stores
@@ -93,7 +100,10 @@ fun AppRoot(
     var installedApps by remember { mutableStateOf<List<InstalledAppInfo>?>(null) }
 
     LaunchedEffect(provisioningState) {
-        if (shouldClearCredentialInput(provisioningState)) credential = ""
+        if (shouldClearCredentialInput(provisioningState)) {
+            credential = ""
+            activatingGatewayId = null
+        }
     }
     LaunchedEffect(viewModel) {
         viewModel.events.collect { event ->
@@ -111,6 +121,18 @@ fun AppRoot(
     Surface(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxSize()) {
             when {
+                // B15 - takes priority over screenFor()'s own HOME/ACTIVATION
+                // choice: activating an ADDITIONAL gateway is orthogonal to
+                // whether a first-run profile already exists (screenFor only
+                // ever answers "has ANY gateway ever been provisioned").
+                activatingGatewayId != null -> ActivationScreen(
+                    credential = credential,
+                    onCredentialChange = { credential = it },
+                    onActivateClick = { viewModel.activateDevice(credential, activatingGatewayId!!) },
+                    errorText = provisioningState.toActivationErrorText(),
+                    isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
+                    onCancel = { activatingGatewayId = null; credential = "" },
+                )
                 screenFor(profileSource) == AppScreen.ACTIVATION -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
@@ -191,6 +213,13 @@ fun AppRoot(
                     viewModel.selectGateway(id)
                     showGatewayPicker = false
                 }
+            },
+            // B15 - see GatewayPickerDialog's own docs: requests activation
+            // for an unprovisioned gateway id, closing the picker in favor
+            // of the activatingGatewayId ActivationScreen branch above.
+            onActivate = { id ->
+                activatingGatewayId = id
+                showGatewayPicker = false
             },
             onDismiss = { showGatewayPicker = false },
         )

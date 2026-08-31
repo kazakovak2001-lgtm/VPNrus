@@ -60,8 +60,8 @@ relying on this for anything user-facing - this table is a snapshot, ROADMAP is 
 | Provider | Oracle Cloud | AWS eu-north-1 |
 | AWG data plane | physically validated | physically validated |
 | REALITY / TLS data plane | physically validated | physically validated (operator/debug-provisioned credentials) |
-| Self-service control-plane (`/v1/activate`) | deployed, live | code path exists (B14), NOT deployed - fails closed |
-| AWG client identity provisioning | real, self-service | no path reaches a live server yet - disabled in picker |
+| Self-service control-plane (`/v1/activate`) | deployed, live | deployed, live (B15) - 443 edge externally reachable (security-group fix applied by operator), real physical-device activation completed successfully |
+| AWG client identity provisioning | real, self-service | real, self-service (B15) - physically verified: real device activation, real AWG handshake, exit IP `16.170.208.231` |
 | Public IP addressing | stable | AWS auto-assigned, NOT durable/reserved |
 
 Gateway Pool remains **FOUNDATION**. Automatic multi-gateway failover is **NOT
@@ -90,6 +90,9 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-08-31 (after B14 - Stockholm self-service provisioning code path).
+Last updated: 2026-08-31 (after B15 completion - real on-device Stockholm
+activation succeeded end-to-end: AWG, REALITY, and TLS all physically
+verified through the real control plane, provisioning persists across an
+app restart, Germany unaffected. See ROADMAP's Gateway Pool row).
 If this file's "Current gateway state" table conflicts with `docs/ROADMAP.md`,
 ROADMAP wins - update this file to match rather than trusting the stale copy.
