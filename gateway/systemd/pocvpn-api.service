@@ -59,8 +59,28 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # ReadWritePaths line below only keeps the *mount* writable for whichever
 # process has DAC permission to write there. See DEPLOYMENT.md "ProtectSystem
 # + DAC proof" for the local test proving both halves hold simultaneously.
+# B15: /var/lib/pocvpn-provision added so pocvpn-api's own process can
+# write its activation store and Xray staging config (see
+# config/api.env.example's ACTIVATION_STORE_PATH/XRAY_STAGING_CONFIG_PATH
+# comments) - unlike /etc/amnezia/amneziawg, DAC here (0700 pocvpn-api:
+# pocvpn-api subdirectories under a 0750 root:pocvpn-api parent) grants
+# this service's own process real write access, not just the mount.
+#
+# B15: /etc/nova-xray added for the SAME reason /etc/amnezia/amneziawg is
+# here - the root child sudo -n spawns for the Xray activation boundary
+# (gateway/scripts/xray-activate.sh, via gateway/privileged/
+# nova-xray-reload) inherits this unit's mount namespace and must publish
+# the live Xray config there (mv/chown/chmod on
+# /etc/nova-xray/config.json). Confirmed empirically (B15 Stockholm
+# deployment): without this exception, ProtectSystem=strict makes the
+# mount read-only even for that root child, so the wrapper's own `mv -f`
+# fails and xray_reload.activate reports XrayReloadError(kind="internal")
+# even though `xray -test` validation and everything before the publish
+# step succeeded. Unix DAC on /etc/nova-xray (root:root) still fully
+# blocks pocvpn-api's own non-root process from writing there directly -
+# only the sudo root child can, exactly like the AWG path above.
 ProtectSystem=strict
-ReadWritePaths=/etc/amnezia/amneziawg
+ReadWritePaths=/etc/amnezia/amneziawg /var/lib/pocvpn-provision /etc/nova-xray
 
 # CapabilityBoundingSet and RestrictSUIDSGID are DELIBERATELY OMITTED, not
 # forgotten. An empty CapabilityBoundingSet= would strip the capabilities
