@@ -99,11 +99,15 @@ relying on this for anything user-facing - this table is a snapshot, ROADMAP is 
 
 Gateway Pool remains **FOUNDATION** (see ROADMAP's own Gateway Pool row for
 why - Stockholm's non-durable IPv4 addressing is unrelated to and unresolved
-by B16). Automatic multi-gateway selection/failover is now **IMPLEMENTED as
-pure decision logic** (real candidate construction/ranking/bounded failover,
-unit-proven - see AutoGatewaySelectorTest/MainViewModelAutoGatewayTest) but
-has **NOT been physically validated on a real device** in this slice - see
-ROADMAP's own B16 row for the exact scope of what is/isn't proven.
+by B16). Automatic multi-gateway selection/failover is now **IMPLEMENTED**
+(real candidate construction/ranking/bounded failover, unit-proven AND
+physically validated on a real device 2026-09-01: real Auto connect to
+Germany, a real on-device fault excluding Germany, real Auto failover to
+Stockholm with a confirmed real `16.170.208.231` data-plane connection,
+restore, confirmed normal reconnect) - see ROADMAP's own B16 row for the
+exact scope, including its one honest caveat (a genuine mid-connect()
+AWG-handshake-timeout retry trigger remains unit-test-only, not physically
+reproduced - root/server access would be required).
 
 ## Production vs debug boundary
 
@@ -128,10 +132,12 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-08-31 (after B16 - automatic multi-gateway selection/
-failover promoted the existing reachability/PathScorer pipeline into a real
-gateway-level decision boundary, pure-logic/unit-verified; NOT yet physically
-validated on a real device. See ROADMAP's Gateway Pool / automatic gateway
-failover rows).
+Last updated: 2026-09-01 (after B16 physical validation - automatic
+multi-gateway selection/failover promoted the existing reachability/
+PathScorer pipeline into a real gateway-level decision boundary, unit-
+verified AND physically validated on a real device: real Auto failover from
+Germany to Stockholm, real data-plane confirmation, restore, normal
+reconnect confirmed; one diagnostics-only bug found and fixed. See
+ROADMAP's Gateway Pool / automatic gateway selection failover rows).
 If this file's "Current gateway state" table conflicts with `docs/ROADMAP.md`,
 ROADMAP wins - update this file to match rather than trusting the stale copy.
