@@ -430,3 +430,44 @@ Elastic IP or any other paid AWS resource unless that has been separately,
 deliberately approved - see the Gateway Pool row's own addressing-
 stability note for why Stockholm's current address is not yet treated as
 durable.
+
+## Deploying the signed manifest (B17, 2026-09-01)
+
+`GET /v1/manifest` is now live on BOTH production gateways, serving the
+exact production-signed artifact (`gateway/tools/endpoint-manifest-2026-09-01.bin`,
+see `docs/B12_MANIFEST_KEY_CEREMONY.md`'s "Production ceremony (B17)"
+section) byte-for-byte, verified externally (HTTPS 200, exact sha256
+match on both hosts, valid Ed25519 signature, tampered/wrong-key rejected,
+POST rejected at the nginx edge). Deployment steps performed:
+
+1. `sudo install -o root -g pocvpn-api -m 0640 endpoint-manifest-2026-09-01.bin /etc/pocvpn/endpoint-manifest.bin`
+   on each VPS (same restrictive ownership as this host's other
+   `/etc/pocvpn/*` secrets - the artifact itself is public, but there is
+   no reason to widen permissions unnecessarily).
+2. `POCVPN_API_MANIFEST_PATH=/etc/pocvpn/endpoint-manifest.bin` appended
+   to each host's `/etc/pocvpn/api.env`, then `systemctl restart pocvpn-api`.
+3. A `location = /v1/manifest { limit_except GET { deny all; } ... }`
+   block added to each host's nginx vhost (see
+   `gateway/edge/nginx-pocvpn.conf`/`nginx-pocvpn-stockholm.conf`, now
+   tracked with this route), same proxy shape as `/v1/activate`/
+   `/v1/xray-profile`, then `nginx -t && systemctl reload nginx`.
+
+**Real drift found during this deployment**: Frankfurt's deployed
+`/opt/pocvpn/gateway/api/handler.py`/`config.py` predated this repo's own
+B12 manifest support entirely (a plain file copy, not a git checkout - it
+has no `.git` directory at all) - zero mentions of "manifest" anywhere in
+the running code. Stockholm's deployed copy already had it (deployed more
+recently, B15). Rather than replace Frankfurt's entire `gateway/api/*.py`
+wholesale against a live server already handling real activation/
+xray-profile traffic - a much larger, riskier change - only the minimal
+`_PATH_MANIFEST` dispatch branch, `_handle_manifest`/`_write_binary`
+methods, and `AppConfig.manifest_path` field were hand-grafted onto
+Frankfurt's EXISTING deployed files (backed up alongside the originals as
+`handler.py.backup-b17-<timestamp>`/`config.py.backup-b17-<timestamp>` in
+place), verified with `python3 -m py_compile` before installing, and
+confirmed via `journalctl`/external curl that `/v1/activate`/
+`/v1/xray-profile` behavior was unaffected. **Frankfurt's control-plane
+code otherwise remains behind this repo's HEAD** - a full, reviewed
+redeployment of `gateway/api/*.py` to Frankfurt (bringing it byte-for-byte
+current, not just the manifest route) is a distinct, separate future
+slice, not performed here.

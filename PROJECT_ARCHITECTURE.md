@@ -52,8 +52,11 @@ NetworkProfiler
   SAME real Ed25519 key (see `docs/B12_MANIFEST_KEY_CEREMONY.md`'s
   "Production ceremony (B17)" section for the fingerprint and procedure);
   the bootstrap names BOTH real gateways (frankfurt, stockholm). Live
-  `GET /v1/manifest` deployment to either production VPS is NOT yet done -
-  see ROADMAP's Signed Offline Bootstrap row for the exact status.
+  `GET /v1/manifest` is now deployed and externally verified (byte-identical,
+  signature-valid) on BOTH production gateways - see ROADMAP's Signed
+  Offline Bootstrap row for the exact status and the two remaining reasons
+  it stays FOUNDATION (production `BuildConfig.MANIFEST_URL` still blank;
+  no physical-device fetch/LKG validation against these live endpoints yet).
 - **Candidate identity/execution (hard invariant, consolidated review fix)**:
   each `GatewayAttemptCandidate` carries its own already-resolved
   `configSnapshot`. `AutoGatewaySelector`'s candidate is threaded verbatim -
