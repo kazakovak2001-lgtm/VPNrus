@@ -52,11 +52,26 @@ NetworkProfiler
   SAME real Ed25519 key (see `docs/B12_MANIFEST_KEY_CEREMONY.md`'s
   "Production ceremony (B17)" section for the fingerprint and procedure);
   the bootstrap names BOTH real gateways (frankfurt, stockholm). Live
-  `GET /v1/manifest` is now deployed and externally verified (byte-identical,
-  signature-valid) on BOTH production gateways - see ROADMAP's Signed
-  Offline Bootstrap row for the exact status and the two remaining reasons
-  it stays FOUNDATION (production `BuildConfig.MANIFEST_URL` still blank;
-  no physical-device fetch/LKG validation against these live endpoints yet).
+  `GET /v1/manifest` is deployed and externally verified (byte-identical,
+  signature-valid) on BOTH production gateways. **B17 continuation
+  (2026-09-01)**: `BuildConfig.MANIFEST_URL` now defaults to the real
+  Frankfurt endpoint in both `debug`/`release` builds (`android/app/build.gradle.kts`'s
+  `PRODUCTION_MANIFEST_URL`, overridable via a developer's own gitignored
+  `gateway-dev.properties`) - the existing `HttpsRemoteManifestFetcher`/
+  `ManifestDistributionClient`/`MainViewModel.Factory` wiring is unchanged,
+  no second fetch mechanism. Physically verified on a real device: a real
+  HTTPS fetch against the live endpoint, correctly Ed25519-verified and
+  correctly rejected as "not newer" (bootstrap and the live manifest share
+  the same version by ceremony design), both endpoints/6 ranked Auto
+  candidates present, a real Auto connect reaching Protected/Germany, and -
+  under a reversible, client-side-only airplane-mode fault (no production
+  VPS touched) - the same verified embedded bootstrap and full candidate
+  list surviving a force-restart, with normal Auto connect resuming once
+  network was restored. Signed Offline Bootstrap is now **IMPLEMENTED** -
+  see ROADMAP's own row for the one honest caveat (an already-populated LKG
+  surviving restart+fetch-failure remains proven only by unit tests, not
+  physically exercised, since the live manifest and bootstrap deliberately
+  share one version).
 - **Candidate identity/execution (hard invariant, consolidated review fix)**:
   each `GatewayAttemptCandidate` carries its own already-resolved
   `configSnapshot`. `AutoGatewaySelector`'s candidate is threaded verbatim -
@@ -176,8 +191,10 @@ moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;
 the production Ed25519 key ceremony was performed (real keypair, private key
 never printed/committed, stored offline outside the repo) and the embedded
 bootstrap now names both real gateways under that same production key. Live
-`/v1/manifest` deployment to either production VPS remains an operator step -
-see ROADMAP's Signed Offline Bootstrap row for exact status. Builds on B16's
+`/v1/manifest` is deployed to and verified on both production VPSes, and
+`BuildConfig.MANIFEST_URL` now wires the real fetch in both build types -
+Signed Offline Bootstrap is now IMPLEMENTED (one honest caveat; see
+ROADMAP's own row). Builds on B16's
 consolidated review fix - the pinned `GatewayAttemptCandidate.configSnapshot`
 is threaded verbatim through `TransportOrchestrator`/`VpnController.connect()`
 and actually EXECUTED for the whole attempt, never reconstructed from

@@ -14,6 +14,23 @@ val gatewayDevProperties = Properties().apply {
 }
 fun gatewayDevProp(key: String): String = gatewayDevProperties.getProperty(key, "")
 
+// B17 - the real production Signed Offline Bootstrap manifest distribution
+// endpoint (see docs/B12_MANIFEST_KEY_CEREMONY.md's "Production ceremony
+// (B17)" section and docs/ROADMAP.md's Signed Offline Bootstrap row).
+// Frankfurt is the sole configured primary - Stockholm serves the
+// byte-identical artifact signed by the SAME production key (verified
+// during B17's deployment pass), but HttpsRemoteManifestFetcher/
+// ManifestDistributionClient (MainViewModel.Factory) only support ONE
+// configured URL today; multi-origin manifest fetch/failover is
+// deliberately out of scope for this slice, not an oversight - it is
+// unrelated to AutoGatewaySelector's own gateway-level failover, which
+// already spans both gateways once a manifest (from either URL) is
+// trusted. No signing/private material of any kind lives in this file -
+// this is a plain HTTPS GET endpoint for already-signed public bytes,
+// the same trust level as any other URL literal already hardcoded in this
+// codebase (e.g. ProvisioningClient's production gateway hosts).
+val PRODUCTION_MANIFEST_URL = "https://152.70.43.1/v1/manifest"
+
 android {
     namespace = "net.pocvpn.client"
     compileSdk = 35
@@ -32,16 +49,32 @@ android {
         buildConfigField("String", "GATEWAY_CLIENT_TUNNEL_IP", "\"${gatewayDevProp("clientTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_TUNNEL_IP", "\"${gatewayDevProp("gatewayTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_ALLOWED_IPS", "\"${gatewayDevProp("allowedIps")}\"")
-        // B12 - blank (the default) means ManifestDistributionClient is
-        // never wired at all (see MainViewModel.Factory) - the app relies
-        // solely on the embedded bootstrap/LKG, same "unconfigured means
-        // inert, never a behavior change" convention as every field above.
-        buildConfigField("String", "MANIFEST_URL", "\"${gatewayDevProp("manifestUrl")}\"")
+        // B12/B17 - defaults to the real PRODUCTION_MANIFEST_URL above so a
+        // normal build actually wires ManifestDistributionClient; a
+        // developer's own gitignored gateway-dev.properties
+        // (`manifestUrl=...`) can still override this for local testing
+        // against a different server, same "explicit local override wins"
+        // convention as every gatewayDevProp field above. Overridden
+        // per-buildType immediately below for full reviewability of what
+        // debug/release each actually ship with - both currently resolve to
+        // the same production endpoint, on purpose (B17 does not yet
+        // support a distinct staging manifest source).
+        buildConfigField("String", "MANIFEST_URL", "\"${gatewayDevProp("manifestUrl").ifBlank { PRODUCTION_MANIFEST_URL }}\"")
     }
 
     buildTypes {
+        debug {
+            // B17 - explicit for reviewability: debug builds (including the
+            // physical-device validation build) fetch the real production
+            // manifest by default, same value release ships with, unless a
+            // developer's local gateway-dev.properties overrides it.
+            buildConfigField("String", "MANIFEST_URL", "\"${gatewayDevProp("manifestUrl").ifBlank { PRODUCTION_MANIFEST_URL }}\"")
+        }
         release {
             isMinifyEnabled = false
+            // B17 - explicit, not derived from any gitignored developer file -
+            // a release build always points at the real production endpoint.
+            buildConfigField("String", "MANIFEST_URL", "\"$PRODUCTION_MANIFEST_URL\"")
         }
     }
 

@@ -1022,6 +1022,17 @@ class MainViewModel(
     // "fetch storm" this guard exists to prevent.
     private val manifestRefreshMutex = Mutex()
 
+    // B17 - purely observational record of the last refreshManifest() outcome,
+    // for diagnostics/physical-validation only (see AppRoot's
+    // "Last manifest refresh:" line) - never read by any decision path.
+    // Distinguishes the three states a caller/operator actually cares about:
+    // null (never attempted, e.g. MANIFEST_URL unconfigured), a fetch that
+    // ran but was rejected (including the EXPECTED "not newer than what's
+    // already trusted" case when the live artifact matches the embedded
+    // bootstrap's own version), and a fetch that was newly accepted into LKG.
+    private val _lastManifestRefreshOutcome = MutableStateFlow<String?>(null)
+    val lastManifestRefreshOutcome: StateFlow<String?> = _lastManifestRefreshOutcome.asStateFlow()
+
     /**
      * B12 - attempts one bounded manifest download+adoption via
      * [manifestDistributionClient] (see its own docs: fetch failure/invalid
@@ -1040,7 +1051,14 @@ class MainViewModel(
         val client = manifestDistributionClient ?: return null
         if (!manifestRefreshMutex.tryLock()) return null
         return try {
-            client.refresh()
+            client.refresh().also { result ->
+                _lastManifestRefreshOutcome.value = when (result) {
+                    is net.pocvpn.client.reachability.ManifestUpdateResult.Accepted ->
+                        "accepted version ${result.manifest.manifestVersion}"
+                    is net.pocvpn.client.reachability.ManifestUpdateResult.Rejected ->
+                        "rejected: ${result.reason}"
+                }
+            }
         } finally {
             manifestRefreshMutex.unlock()
         }
