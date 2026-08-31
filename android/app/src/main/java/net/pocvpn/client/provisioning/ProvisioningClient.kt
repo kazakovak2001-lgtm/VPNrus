@@ -27,18 +27,15 @@ import javax.net.ssl.HttpsURLConnection
 object ProvisioningClient {
 
     private const val ENDPOINT_URL = "https://152.70.43.1/v1/peers"
-    // B8C2 - POST /v1/activate (gateway/api/handler.py's _handle_activate):
-    // same B8B2A HTTPS edge, same {"public_key": "..."} body shape and
-    // Authorization: Bearer <credential> header shape as ENDPOINT_URL above,
-    // reused verbatim via buildRequestBody/parseSuccessBody - only the path
-    // and the error-status mapping differ.
-    private const val ACTIVATE_ENDPOINT_URL = "https://152.70.43.1/v1/activate"
-    // B8K4A - POST /v1/xray-profile: same B8B2A HTTPS edge, same
-    // {"public_key": "..."} body shape and Authorization: Bearer <credential>
-    // header shape as the endpoints above, reused verbatim via
-    // buildRequestBody - only the path, response shape, and error-status
-    // mapping differ.
-    private const val XRAY_PROFILE_ENDPOINT_URL = "https://152.70.43.1/v1/xray-profile"
+    // B14 - the production/Germany gateway's own edge host, kept as the
+    // default target for every 2-arg overload below (::activate,
+    // ::fetchXrayProfile, ::fetchXrayTlsProfile used as bare function
+    // references, which cannot bind a defaulted extra parameter) so every
+    // pre-B14 call site stays byte-for-byte unchanged. Sourced from
+    // ProductionGatewayCatalog - the SAME single fact every other
+    // Germany-targeting call site already reads, never a second, separately
+    // maintained literal that could drift from it.
+    private val GERMANY_HOST = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.endpointHost
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 10_000
 
@@ -84,30 +81,58 @@ object ProvisioningClient {
      * provision() above but against the activation endpoint and with
      * mapActivateResponse's richer error mapping. Never logs
      * activationCredential - only the structural ProvisioningResult is
-     * ever returned.
+     * ever returned. Targets Germany's own edge - see the 3-arg overload
+     * below for a live, per-endpoint activation request.
      */
     fun activate(publicKey: String, activationCredential: String): ProvisioningResult =
-        execute(buildActivateRequest(publicKey, activationCredential), ::mapActivateResponse)
+        activate(publicKey, activationCredential, GERMANY_HOST)
+
+    /**
+     * B14 - the real endpoint-aware activation request: identical
+     * request/response contract to the 2-arg [activate] above, but posted
+     * to [endpointHost]'s own `pocvpn-api` edge instead of always
+     * Germany's. The caller (MainViewModel.activateDevice) is responsible
+     * for resolving [endpointHost] from the SAME
+     * ProductionGatewayCatalog entry the client will later validate the
+     * response against (matchGatewayId) - this function performs no
+     * gateway-identity validation of its own, it only sends the request to
+     * where it was told to. A gateway with no deployed control-plane at
+     * this host simply produces a real [ProvisioningResult.NetworkError]
+     * (connection refused/TLS failure/timeout) - never a fabricated
+     * success.
+     */
+    fun activate(publicKey: String, activationCredential: String, endpointHost: String): ProvisioningResult =
+        execute(buildActivateRequest(publicKey, activationCredential, endpointHost), ::mapActivateResponse)
 
     /**
      * B8K4A - POST /v1/xray-profile: existing activation credential ->
      * existing device AWG public key -> validated VLESS+REALITY profile.
      * Same request shape as [activate], a distinct response shape and
      * [XrayProfileResult] outcome type. Does not persist the result - the
-     * caller decides whether/when to save it.
+     * caller decides whether/when to save it. Targets Germany's own edge -
+     * see the 3-arg overload below for a live, per-endpoint request.
      */
     fun fetchXrayProfile(publicKey: String, bearerToken: String): XrayProfileResult =
-        executeXrayProfile(buildXrayProfileRequest(publicKey, bearerToken))
+        fetchXrayProfile(publicKey, bearerToken, GERMANY_HOST)
+
+    /** B14 - same reasoning as the 3-arg [activate] overload above, for the REALITY profile fetch. */
+    fun fetchXrayProfile(publicKey: String, bearerToken: String, endpointHost: String): XrayProfileResult =
+        executeXrayProfile(buildXrayProfileRequest(publicKey, bearerToken, endpointHost))
 
     /**
      * B8O2 - POST /v1/xray-profile with `{"transport": "tls"}`: same
      * endpoint/credential/public-key shape as [fetchXrayProfile] above, a
      * SECOND transport option on the SAME identity (see
      * gateway/api/handler.py's own optional `transport` field) - never a
-     * second endpoint, never a second credential.
+     * second endpoint, never a second credential. Targets Germany's own
+     * edge - see the 3-arg overload below for a live, per-endpoint request.
      */
     fun fetchXrayTlsProfile(publicKey: String, bearerToken: String): XrayTlsProfileResult =
-        executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken))
+        fetchXrayTlsProfile(publicKey, bearerToken, GERMANY_HOST)
+
+    /** B14 - same reasoning as the 3-arg [activate] overload above, for the TLS profile fetch. */
+    fun fetchXrayTlsProfile(publicKey: String, bearerToken: String, endpointHost: String): XrayTlsProfileResult =
+        executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost))
 
     /**
      * B8C2 - the exact outgoing request shape (url/headers/body), built as
@@ -126,22 +151,36 @@ object ProvisioningClient {
         OutgoingRequest(url = ENDPOINT_URL, headers = authHeaders(bearerToken), body = buildRequestBody(publicKey))
 
     internal fun buildActivateRequest(publicKey: String, activationCredential: String): OutgoingRequest =
+        buildActivateRequest(publicKey, activationCredential, GERMANY_HOST)
+
+    /**
+     * B14 - same request shape as the 2-arg overload above, targeted at
+     * [endpointHost]'s own edge rather than always Germany's - see
+     * [activate]'s own 3-arg overload for why.
+     */
+    internal fun buildActivateRequest(publicKey: String, activationCredential: String, endpointHost: String): OutgoingRequest =
         OutgoingRequest(
-            url = ACTIVATE_ENDPOINT_URL,
+            url = "https://$endpointHost/v1/activate",
             headers = authHeaders(activationCredential),
             body = buildRequestBody(publicKey),
         )
 
     internal fun buildXrayProfileRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        buildXrayProfileRequest(publicKey, bearerToken, GERMANY_HOST)
+
+    internal fun buildXrayProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
         OutgoingRequest(
-            url = XRAY_PROFILE_ENDPOINT_URL,
+            url = "https://$endpointHost/v1/xray-profile",
             headers = authHeaders(bearerToken),
             body = buildRequestBody(publicKey),
         )
 
     internal fun buildXrayTlsProfileRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        buildXrayTlsProfileRequest(publicKey, bearerToken, GERMANY_HOST)
+
+    internal fun buildXrayTlsProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
         OutgoingRequest(
-            url = XRAY_PROFILE_ENDPOINT_URL,
+            url = "https://$endpointHost/v1/xray-profile",
             headers = authHeaders(bearerToken),
             body = buildXrayTlsRequestBody(publicKey),
         )

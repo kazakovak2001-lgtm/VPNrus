@@ -141,6 +141,24 @@ class MainViewModel(
     // profileStore above - an additive seam, not a network abstraction).
     private val activationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
         ProvisioningClient::activate,
+    // B14 - Stockholm's OWN activation client. Real by default (mirrors
+    // [activationClient] immediately above, never a null "not wired" seam)
+    // so production/every non-test call site genuinely attempts a request
+    // to Stockholm's own edge without needing explicit Factory wiring - see
+    // MainViewModel's own docs for why this is a SEPARATE function value
+    // rather than [activationClient] itself parameterized by a target host:
+    // [activationClient] stays exactly 2-arg so every pre-B14 test/call
+    // site (including `ProvisioningClient::activate` used as a bare
+    // function reference) stays byte-for-byte unchanged. Stockholm has no
+    // deployed control-plane today, so this genuinely fails closed with a
+    // real [ProvisioningResult.NetworkError] (connection refused/TLS
+    // failure/timeout) until an operator deploys one (see
+    // gateway/DEPLOYMENT.md's own second-gateway section) - never a
+    // fabricated success.
+    private val stockholmActivationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
+        { publicKey, activationCredential ->
+            ProvisioningClient.activate(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
+        },
     // B8C2A - additive, defaults to Dispatchers.IO (byte-for-byte unchanged
     // production behavior). Lets tests run activateDevice()'s coroutine on
     // the SAME (virtual-time) test dispatcher as the rest of the test instead
@@ -228,6 +246,20 @@ class MainViewModel(
     // availability genuinely per-endpoint.
     private val stockholmXrayProfileRepository: XrayProfileRepository? = null,
     private val stockholmXrayTlsProfileRepository: XrayTlsProfileRepository? = null,
+    // B14 - Stockholm's OWN Xray REALITY/TLS provisioners, additive/
+    // defaults to null (same "no wiring, no behavior" seam as
+    // [xrayProfileProvisioner]/[xrayTlsProfileProvisioner] themselves -
+    // Factory is the one production call site that constructs these, each
+    // wired to [stockholmXrayProfileRepository]/[stockholmXrayTlsProfileRepository]
+    // above and a fetch function targeting Stockholm's own edge - never
+    // Germany's repository or Germany's edge). A successful Stockholm
+    // activation (see activateDevice() below) runs these instead of the
+    // Germany-fixed ones, so Stockholm's REALITY/TLS profiles land in
+    // Stockholm's own endpoint-scoped storage through the REAL app
+    // provisioning flow - never XrayDiagnosticsActivity (debug-only,
+    // absent from release - see that class's own docs).
+    private val stockholmXrayProfileProvisioner: XrayProfileProvisioner? = null,
+    private val stockholmXrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
     // B8I8 - additive, defaults to Auto (byte-for-byte unchanged production
     // behavior - no product UI sets anything else yet). Threaded into every
     // smartConnectDecision() call AND consulted by the AWG -> Xray failover
@@ -1115,8 +1147,25 @@ class MainViewModel(
      * else in this ViewModel - it only ever exists as this function's
      * `activationCredential` parameter for the duration of one call, then
      * falls out of scope, exactly like provisionDevice's token before it.
+     *
+     * B14 - [targetGatewayId] is an EXPLICIT request parameter, defaulted
+     * to [selectedGateway]'s CURRENT value only so every pre-B14 call site
+     * (one argument) stays byte-for-byte unchanged - it is never re-read
+     * later if the UI selection changes mid-request, and the caller (the
+     * Activation screen) is free to pass a specific target regardless of
+     * what happens to be selected. Routes to [activationClient] (Germany)
+     * or [stockholmActivationClient] (Stockholm) accordingly, and - beyond
+     * the existing matchGatewayId check - additionally REQUIRES the
+     * response to match [targetGatewayId] specifically: a response that
+     * validly matches some OTHER known gateway (e.g. Germany's own edge
+     * somehow answering a request that was sent to Stockholm's host) is
+     * rejected exactly like an unmatched one, never silently applied to
+     * the wrong endpoint's identity.
      */
-    fun activateDevice(activationCredential: String) {
+    fun activateDevice(
+        activationCredential: String,
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value,
+    ) {
         val trimmedCredential = activationCredential.trim()
         if (trimmedCredential.isEmpty()) {
             _provisioningState.value = ProvisioningUiState.Error("activation credential is empty")
@@ -1128,10 +1177,31 @@ class MainViewModel(
             return
         }
 
+        val client = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> activationClient
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmActivationClient
+        }
+        val targetXrayProvisioner = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> xrayProfileProvisioner
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmXrayProfileProvisioner
+        }
+        val targetXrayTlsProvisioner = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> xrayTlsProfileProvisioner
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmXrayTlsProfileProvisioner
+        }
+        val targetXrayTlsRepository = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> xrayTlsProfileRepository
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmXrayTlsProfileRepository
+        }
+        val targetEndpointId = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> germanyEndpointId
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmEndpointId
+        }
+
         _provisioningState.value = ProvisioningUiState.Provisioning
         viewModelScope.launch {
             val result = withContext(ioDispatcher) {
-                activationClient(key, trimmedCredential)
+                client(key, trimmedCredential)
             }
             _provisioningState.value = when (result) {
                 is ProvisioningResult.Success -> {
@@ -1151,15 +1221,22 @@ class MainViewModel(
                     // control-plane response while the real connect-time
                     // config (ProductionGatewayCatalog/ClientTunnelIdentityStore)
                     // would have gone on ignoring it.
+                    //
+                    // B14 - ALSO required to equal [targetGatewayId]: a
+                    // response that happens to validly match a DIFFERENT
+                    // known gateway than the one this request actually
+                    // targeted is a cross-endpoint mismatch, rejected the
+                    // same way - never silently redirected to apply against
+                    // whichever gateway the facts happened to name.
                     val matchedGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.matchGatewayId(
                         endpointHost = result.endpointHost,
                         endpointPort = result.endpointPort,
                         serverPublicKeyBase64 = result.gatewayPublicKey,
                         gatewayTunnelIp = result.gatewayTunnelIp,
                     )
-                    if (matchedGatewayId == null) {
+                    if (matchedGatewayId != targetGatewayId) {
                         ProvisioningUiState.Error(
-                            "activation response does not match a known production gateway - refusing to apply it",
+                            "activation response does not match the requested production gateway ($targetGatewayId) - refusing to apply it",
                         )
                     } else {
                         // B8B3B safety rule: apply() is reached ONLY inside
@@ -1210,10 +1287,15 @@ class MainViewModel(
                         // B13 consolidated review fix (finding 1) - THE
                         // canonical per-device client tunnel identity write:
                         // result.clientTunnelIp is real, per-device evidence
-                        // for EXACTLY matchedGatewayId - never any other
+                        // for EXACTLY targetGatewayId - never any other
                         // gateway (matchGatewayId already proved the
-                        // response is unambiguously about this one).
-                        clientTunnelIdentityStore?.write(matchedGatewayId, result.clientTunnelIp)
+                        // response is unambiguously about this one, and the
+                        // B14 check above additionally proved it equals
+                        // targetGatewayId specifically - using targetGatewayId
+                        // here, not the nullable matchedGatewayId, needs no
+                        // extra null-handling and is byte-for-byte the same
+                        // value at this point).
+                        clientTunnelIdentityStore?.write(targetGatewayId, result.clientTunnelIp)
                         // B13 consolidated review fix (finding 2) - a fresh
                         // identity write can change readiness for the
                         // CURRENTLY selected gateway (e.g. Stockholm was
@@ -1234,14 +1316,17 @@ class MainViewModel(
                         // stored Xray profile completely untouched - see
                         // XrayProfileProvisioner's own docs.
                         //
-                        // B13 consolidated review fix (finding 4) - this
-                        // legacy activation flow only ever provisions the
-                        // production/Germany endpoint's Xray profile (it has
-                        // no concept of a second gateway), so the availability
-                        // signal it flips is scoped to germanyEndpointId
-                        // specifically, never a global flag Stockholm could
-                        // inherit.
-                        xrayProfileProvisioner?.let { provisioner ->
+                        // B14 - runs the provisioner/repository/availability
+                        // set for [targetGatewayId] specifically
+                        // (targetXrayProvisioner/targetXrayTlsProvisioner/
+                        // targetXrayTlsRepository/targetEndpointId, resolved
+                        // once at the top of this function) - a Stockholm
+                        // activation now provisions STOCKHOLM's own Xray
+                        // REALITY/TLS profiles into STOCKHOLM's own
+                        // endpoint-scoped storage and flips STOCKHOLM's own
+                        // availability flag, never Germany's (and vice
+                        // versa) - see each param's own constructor docs.
+                        targetXrayProvisioner?.let { provisioner ->
                             val outcome = withContext(ioDispatcher) {
                                 provisioner.provision(key, trimmedCredential)
                             }
@@ -1251,15 +1336,15 @@ class MainViewModel(
                                 // becomes selectable - never polled, never
                                 // inferred from elapsed time (see
                                 // xrayAvailableEndpoints' own docs).
-                                xrayAvailableEndpoints.update { it + germanyEndpointId }
+                                xrayAvailableEndpoints.update { it + targetEndpointId }
                             }
                         }
-                        // B8O2 - same reasoning as xrayProfileProvisioner above:
+                        // B8O2 - same reasoning as targetXrayProvisioner above:
                         // runs only after the AWG activation has already fully
                         // succeeded, reusing the SAME key/credential, and never
                         // touches AWG's own success/state either way. Same
-                        // Germany-only endpoint scoping as above.
-                        xrayTlsProfileProvisioner?.let { provisioner ->
+                        // per-endpoint scoping as above.
+                        targetXrayTlsProvisioner?.let { provisioner ->
                             val tlsOutcome = withContext(ioDispatcher) {
                                 provisioner.provision(key, trimmedCredential)
                             }
@@ -1270,9 +1355,9 @@ class MainViewModel(
                             // connect()-ready - one validation authority, never
                             // two rules that could silently disagree.
                             if (tlsOutcome == XrayProfileProvisioningOutcome.Saved) {
-                                val repository = xrayTlsProfileRepository
+                                val repository = targetXrayTlsRepository
                                 if (repository != null && XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready) {
-                                    xrayTlsAvailableEndpoints.update { it + germanyEndpointId }
+                                    xrayTlsAvailableEndpoints.update { it + targetEndpointId }
                                 }
                             }
                         }
@@ -1738,6 +1823,28 @@ class MainViewModel(
                 // instead of only ever knowing about Germany's.
                 stockholmXrayProfileRepository = stockholmXrayProfileRepository,
                 stockholmXrayTlsProfileRepository = stockholmXrayTlsProfileRepository,
+                // B14 - the real self-service Stockholm provisioning path:
+                // Stockholm's own activation client (defaults to a real
+                // request against ProductionGatewayCatalog.STOCKHOLM's own
+                // edge - see MainViewModel's own constructor docs for why
+                // this genuinely fails closed today, no control-plane
+                // deployed yet) and its own Xray REALITY/TLS provisioners,
+                // each wired to the SAME stockholmXrayProfileRepository/
+                // stockholmXrayTlsProfileRepository instances above (never
+                // a second, independently-constructed store) and each
+                // fetching from Stockholm's own edge - never Germany's.
+                stockholmXrayProfileProvisioner = XrayProfileProvisioner(
+                    repository = stockholmXrayProfileRepository,
+                    fetchXrayProfile = { publicKey, activationCredential ->
+                        ProvisioningClient.fetchXrayProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
+                    },
+                ),
+                stockholmXrayTlsProfileProvisioner = XrayTlsProfileProvisioner(
+                    repository = stockholmXrayTlsProfileRepository,
+                    fetchXrayTlsProfile = { publicKey, activationCredential ->
+                        ProvisioningClient.fetchXrayTlsProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
+                    },
+                ),
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see
                 // reachabilityDiagnostics()'s own docs for why this cannot
                 // change automatic selection in this slice.

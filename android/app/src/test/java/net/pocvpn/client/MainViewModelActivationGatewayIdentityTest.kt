@@ -36,6 +36,13 @@ import org.junit.Test
  * [MainViewModel.selectedGateway] with no app restart required, and a
  * response that does not match any known gateway is REJECTED outright -
  * nothing is written or silently accepted-but-ignored.
+ *
+ * B14 - activateDevice() now takes an explicit targetGatewayId (defaulted
+ * only to selectedGateway.value for pre-B14 1-arg call sites); a response
+ * must match THAT requested gateway specifically, not merely "some known
+ * gateway" - tests below that activate a non-default target now pass it
+ * explicitly (see MainViewModelStockholmActivationTest for the dedicated
+ * cross-endpoint-mismatch-rejection coverage this enables).
  */
 class MainViewModelActivationGatewayIdentityTest {
 
@@ -88,6 +95,13 @@ class MainViewModelActivationGatewayIdentityTest {
         clientTunnelIdentityStore = identity,
         selectedGatewayStore = selectedGatewayStore,
         activationClient = { _, _ -> result },
+        // B14 - each test here only ever activates ONE target at a time,
+        // so reusing the SAME fake `result` for Stockholm's own client is
+        // harmless and keeps this helper simple - without this, a
+        // STOCKHOLM-targeted activateDevice() call would fall through to
+        // the REAL production default (an actual HTTPS request) instead of
+        // this test's fake response.
+        stockholmActivationClient = { _, _ -> result },
         ioDispatcher = testDispatcher,
     )
 
@@ -111,7 +125,11 @@ class MainViewModelActivationGatewayIdentityTest {
         val viewModel = newViewModel(identity, result = stockholmMatchingSuccess(clientTunnelIp = "10.77.0.2"))
 
         testDispatcher.scheduler.runCurrent() // let init's getPublicKey() complete
-        viewModel.activateDevice("some-credential")
+        // B14 - activateDevice() now takes an explicit target; a Stockholm-
+        // matching response is only accepted when Stockholm was actually
+        // requested (see MainViewModelStockholmActivationTest for the
+        // dedicated cross-endpoint-rejection coverage of the OTHER case).
+        viewModel.activateDevice("some-credential", ProductionGatewayId.STOCKHOLM)
         testDispatcher.scheduler.runCurrent()
 
         assertEquals("10.77.0.2", identity.read(ProductionGatewayId.STOCKHOLM))
@@ -138,7 +156,7 @@ class MainViewModelActivationGatewayIdentityTest {
         val viewModel = newViewModel(identity, result = stockholmMatchingSuccess(clientTunnelIp = "10.77.0.2"))
 
         testDispatcher.scheduler.runCurrent() // let init's getPublicKey() complete
-        viewModel.activateDevice("some-credential")
+        viewModel.activateDevice("some-credential", ProductionGatewayId.STOCKHOLM)
         testDispatcher.scheduler.runCurrent()
 
         // Germany's pre-existing entry is completely untouched by a Stockholm activation.
@@ -159,8 +177,10 @@ class MainViewModelActivationGatewayIdentityTest {
 
         // Germany now gets provisioned via a real activation, in the SAME
         // running session - no new MainViewModel/Factory is constructed.
+        // B14 - explicit target: this device requests Germany even though
+        // Stockholm happens to be selected right now.
         testDispatcher.scheduler.runCurrent() // let init's getPublicKey() complete
-        viewModel.activateDevice("some-credential")
+        viewModel.activateDevice("some-credential", ProductionGatewayId.GERMANY)
         testDispatcher.scheduler.runCurrent()
 
         assertEquals(ProductionGatewayId.GERMANY, viewModel.selectedGateway.value)
@@ -175,8 +195,10 @@ class MainViewModelActivationGatewayIdentityTest {
 
         assertEquals(ProductionGatewayId.STOCKHOLM, viewModel.selectedGateway.value)
 
+        // B14 - explicit target: a fresh, unrelated GERMANY activation
+        // while Stockholm is already selected and usable.
         testDispatcher.scheduler.runCurrent() // let init's getPublicKey() complete
-        viewModel.activateDevice("some-credential")
+        viewModel.activateDevice("some-credential", ProductionGatewayId.GERMANY)
         testDispatcher.scheduler.runCurrent()
 
         // Stockholm was already usable - a fresh, unrelated Germany

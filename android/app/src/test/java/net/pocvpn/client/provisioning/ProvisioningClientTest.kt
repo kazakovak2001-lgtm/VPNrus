@@ -208,4 +208,31 @@ class ProvisioningClientTest {
         val result = ProvisioningClient.mapActivateResponse(500, """{"error":"internal_error"}""")
         assertTrue(result is ProvisioningResult.NetworkError)
     }
+
+    // --- B14: endpoint-aware activation/Xray-fetch requests target the requested host ---
+
+    @Test
+    fun `the 2-arg activate request still targets Germany's own edge - byte-for-byte unchanged`() {
+        val request = ProvisioningClient.buildActivateRequest(validKey, "cred")
+        assertEquals("https://152.70.43.1/v1/activate", request.url)
+    }
+
+    @Test
+    fun `the 3-arg activate request targets the given endpoint host, not Germany's`() {
+        val request = ProvisioningClient.buildActivateRequest(validKey, "cred", "16.170.208.231")
+        assertEquals("https://16.170.208.231/v1/activate", request.url)
+    }
+
+    @Test
+    fun `the 3-arg xray-profile request targets the given endpoint host`() {
+        val request = ProvisioningClient.buildXrayProfileRequest(validKey, "cred", "16.170.208.231")
+        assertEquals("https://16.170.208.231/v1/xray-profile", request.url)
+    }
+
+    @Test
+    fun `the 3-arg xray-tls-profile request targets the given endpoint host and still carries the tls transport field`() {
+        val request = ProvisioningClient.buildXrayTlsProfileRequest(validKey, "cred", "16.170.208.231")
+        assertEquals("https://16.170.208.231/v1/xray-profile", request.url)
+        assertEquals("tls", JSONObject(request.body).getString("transport"))
+    }
 }
