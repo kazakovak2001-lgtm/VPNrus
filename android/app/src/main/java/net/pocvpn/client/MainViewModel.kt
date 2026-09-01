@@ -303,10 +303,16 @@ class MainViewModel(
     // automatic substitute (see AwgXrayFailoverPolicy's own docs).
     private val userTransportPreference: UserTransportPreference = UserTransportPreference.Auto,
     // B11 - additive, defaults to null (same "no wiring, no behavior" seam
-    // as every other optional dependency above). When present, ONLY powers
-    // reachabilityDiagnostics() below - a read-only snapshot. Never consulted
-    // by smartConnectDecision()/buildTransportRegistry() - see
-    // ReachabilityDiagnosticsSnapshot's own "observational only" docs.
+    // as every other optional dependency above). Powers
+    // reachabilityDiagnostics() below - a read-only snapshot - AND, as of
+    // B17, is the authoritative source of WHICH endpoints are eligible for
+    // automatic gateway selection (buildAutoGatewayCandidates()) - null here
+    // means Auto discovery sees zero manifest endpoints and fails closed
+    // (task requirement 9.D), never a fallback to the raw catalog. Still
+    // never consulted by smartConnectDecision()/buildTransportRegistry()
+    // (transport SELECTION within one already-chosen gateway stays
+    // unaffected - see ReachabilityDiagnosticsSnapshot's own "observational
+    // only" docs for that boundary, unchanged by B17).
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
@@ -1016,6 +1022,17 @@ class MainViewModel(
     // "fetch storm" this guard exists to prevent.
     private val manifestRefreshMutex = Mutex()
 
+    // B17 - purely observational record of the last refreshManifest() outcome,
+    // for diagnostics/physical-validation only (see AppRoot's
+    // "Last manifest refresh:" line) - never read by any decision path.
+    // Distinguishes the three states a caller/operator actually cares about:
+    // null (never attempted, e.g. MANIFEST_URL unconfigured), a fetch that
+    // ran but was rejected (including the EXPECTED "not newer than what's
+    // already trusted" case when the live artifact matches the embedded
+    // bootstrap's own version), and a fetch that was newly accepted into LKG.
+    private val _lastManifestRefreshOutcome = MutableStateFlow<String?>(null)
+    val lastManifestRefreshOutcome: StateFlow<String?> = _lastManifestRefreshOutcome.asStateFlow()
+
     /**
      * B12 - attempts one bounded manifest download+adoption via
      * [manifestDistributionClient] (see its own docs: fetch failure/invalid
@@ -1034,7 +1051,14 @@ class MainViewModel(
         val client = manifestDistributionClient ?: return null
         if (!manifestRefreshMutex.tryLock()) return null
         return try {
-            client.refresh()
+            client.refresh().also { result ->
+                _lastManifestRefreshOutcome.value = when (result) {
+                    is net.pocvpn.client.reachability.ManifestUpdateResult.Accepted ->
+                        "accepted version ${result.manifest.manifestVersion}"
+                    is net.pocvpn.client.reachability.ManifestUpdateResult.Rejected ->
+                        "rejected: ${result.reason}"
+                }
+            }
         } finally {
             manifestRefreshMutex.unlock()
         }
@@ -1578,11 +1602,23 @@ class MainViewModel(
     }
 
     /**
-     * B16 - builds the real, ranked candidate list for automatic gateway
+     * B16/B17 - builds the real, ranked candidate list for automatic gateway
      * selection, reusing the SAME evidence accessors (transportHealth(),
      * restrictionClass(), recentConnectionOutcomes(), pathHistoryStore) the
      * rest of this ViewModel already computes fresh on every call - never a
      * second, independently-derived evidence source.
+     *
+     * **B17 runtime-authority change**: WHICH endpoints are even eligible
+     * now comes from [manifestRepository]'s verified [net.pocvpn.client.reachability.TrustedManifestState] -
+     * `ProductionGatewayCatalog.all` is consulted only as a per-endpoint
+     * COMPATIBILITY lookup ([gatewayFactsFor], invoked only for an endpoint
+     * id the trusted manifest already named), never iterated directly to
+     * decide what exists. Nothing trusted ([net.pocvpn.client.reachability.TrustedManifestState.NoneTrusted],
+     * or [manifestRepository] never wired at all) yields an empty manifest
+     * endpoint list, which - by construction in
+     * [net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCandidates] -
+     * always yields an empty candidate list: task requirement 9.D's
+     * fail-closed rule, never a silent fallback to the unverified catalog.
      */
     private fun buildAutoGatewayCandidates(): List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate> {
         val now = System.currentTimeMillis()
@@ -1597,8 +1633,10 @@ class MainViewModel(
             )
         }
         val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
+        val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
         return net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCandidates(
-            gateways = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+            manifestEndpoints = manifestEndpoints,
+            gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
             provisioned = ::isGatewayProvisioned,
             clientTunnelIp = { id -> clientTunnelIdentityStore?.read(id) },
             registryFor = { endpointId -> buildTransportRegistry(endpointId) },

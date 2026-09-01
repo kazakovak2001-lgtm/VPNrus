@@ -1,7 +1,9 @@
 package net.pocvpn.client.smartconnect
 
+import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
+import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.PathCandidateBuilder
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
@@ -33,8 +35,8 @@ data class GatewayAttemptCandidate(
 )
 
 /**
- * B16 - promotes the EXISTING, unmodified reachability/PathScorer pipeline
- * (ReachabilityEngine -> PathCandidateBuilder -> PathScorer - see
+ * B16/B17 - promotes the EXISTING, unmodified reachability/PathScorer
+ * pipeline (ReachabilityEngine -> PathCandidateBuilder -> PathScorer - see
  * PROJECT_ARCHITECTURE.md's fixed pipeline order) into the real automatic
  * gateway-selection decision boundary. Deliberately NOT a second/parallel
  * scoring system: [PathScorer.score]/[PathScorer.rank] are called exactly
@@ -42,6 +44,20 @@ data class GatewayAttemptCandidate(
  * own (observational) purpose - this object only adds the gateway-level
  * framing (candidate identity, bounded ordering, fail-closed/fallback
  * rules) around that existing, already-tested scorer.
+ *
+ * **B17 runtime-authority change**: gateway/path DISCOVERY - which endpoint
+ * ids even exist as candidates - now comes from the caller's verified
+ * `TrustedManifestState` (via [manifestEndpoints]), never directly from
+ * `ProductionGatewayCatalog`. `ProductionGatewayCatalog` (via
+ * [gatewayFactsFor]) is consulted only as a COMPATIBILITY lookup - for an
+ * endpoint id the manifest has ALREADY named, it supplies the AWG
+ * connection facts (server public key, gateway tunnel IP, obfuscation
+ * profile) needed to actually dial it, none of which belong in the public
+ * manifest (see EmbeddedBootstrapManifest's own docs on what must never be
+ * embedded there). An endpoint present in the catalog but ABSENT from the
+ * trusted manifest can never become a candidate this way - [gatewayFactsFor]
+ * is only ever invoked with an [EndpointId] the manifest itself already
+ * named, never iterated the other way around.
  */
 object AutoGatewaySelector {
 
@@ -49,12 +65,27 @@ object AutoGatewaySelector {
     const val MAX_ATTEMPTS = 4
 
     /**
-     * Builds the full ranked candidate list across every PROVISIONED
-     * production gateway - an unprovisioned gateway (no client tunnel
-     * identity on this device) is silently excluded, the SAME readiness
-     * check MainViewModel.provisionedGatewayIds already applies to the
-     * manual picker: never a fabricated candidate for a gateway this device
-     * cannot actually authenticate to. Empty when nothing is eligible -
+     * Builds the full ranked candidate list across every manifest-named
+     * endpoint this device is ALSO locally PROVISIONED for - task
+     * requirement 7's "combine verified public endpoint facts from the
+     * trusted manifest WITH local per-device provisioned identity/profile
+     * availability". [manifestEndpoints] should be
+     * `(TrustedManifestState.Trusted.manifest.endpoints)` when something
+     * verifies, or an empty list when nothing does (`NoneTrusted`) - an
+     * empty list here always yields an empty candidate list, never a
+     * fallback to the raw catalog (task requirement 9.D: fail closed, never
+     * silently fall back to an unsigned catalog candidate).
+     *
+     * For each manifest endpoint, [gatewayFactsFor] resolves the LOCAL
+     * connection facts needed to dial it (null if this device's catalog
+     * has no such gateway at all - never a fabricated match); the endpoint
+     * is then filtered by [provisioned]/[clientTunnelIp] - the SAME
+     * readiness check MainViewModel.provisionedGatewayIds already applies
+     * to the manual picker: never a fabricated candidate for a gateway this
+     * device cannot actually authenticate to, and never a candidate merely
+     * because the manifest names it (task requirement 7's own example -
+     * "a manifest naming Stockholm does NOT imply this device is
+     * provisioned for Stockholm"). Empty when nothing is eligible -
      * callers must fail closed, never invent a fallback candidate (task
      * requirement 5's "no random gateway selection").
      *
@@ -70,7 +101,8 @@ object AutoGatewaySelector {
      * outright the way an ineligible (NOT AVAILABLE-registry) candidate is.
      */
     fun buildCandidates(
-        gateways: List<ProductionGatewayDescriptor>,
+        manifestEndpoints: List<EndpointDescriptor>,
+        gatewayFactsFor: (EndpointId) -> ProductionGatewayDescriptor?,
         provisioned: (ProductionGatewayId) -> Boolean,
         clientTunnelIp: (ProductionGatewayId) -> String?,
         registryFor: (EndpointId) -> TransportRegistry,
@@ -81,24 +113,45 @@ object AutoGatewaySelector {
         historyFor: (EndpointId, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
     ): List<GatewayAttemptCandidate> {
-        val eligibleGateways = gateways.filter { provisioned(it.id) && !clientTunnelIp(it.id).isNullOrBlank() }
+        val eligible = manifestEndpoints.mapNotNull { manifestEndpoint ->
+            val gateway = gatewayFactsFor(manifestEndpoint.id) ?: return@mapNotNull null
+            if (!provisioned(gateway.id) || clientTunnelIp(gateway.id).isNullOrBlank()) return@mapNotNull null
+            gateway to manifestEndpoint
+        }
         val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
 
         // Keyed by PathCandidate.Direct.id ("direct:<transport>:<endpointId>") -
         // already unique per (gateway, transport) pair, so this survives
         // PathScorer.rank()'s reordering without relying on object identity.
-        val scoredByCandidateId = LinkedHashMap<String, Pair<ProductionGatewayDescriptor, PathScorer.PathScoreResult>>()
+        // [binding] is the EXACT manifest transport binding this specific
+        // candidate was built from - carried alongside the score so the
+        // eventual GatewayConfigSnapshot's endpointHost/endpointPort are
+        // resolved from THIS binding, never re-derived from the catalog
+        // (see snapshotFor's own docs - the B17-2 runtime-authority fix).
+        val scoredByCandidateId = LinkedHashMap<String, Triple<ProductionGatewayDescriptor, EndpointTransportBinding, PathScorer.PathScoreResult>>()
 
-        eligibleGateways.forEach { gateway ->
-            val endpoint = ProductionGatewayEndpoints.descriptorFor(
-                gateway,
-                xrayAvailable = xrayAvailableFor(gateway.endpointId),
-                xrayTlsAvailable = xrayTlsAvailableFor(gateway.endpointId),
-            )
+        eligible.forEach { (gateway, manifestEndpoint) ->
+            // Local per-device profile availability gates WHICH of the
+            // manifest's declared transport bindings this device can
+            // actually use today (task requirement 7) - the manifest
+            // merely says the endpoint SUPPORTS a transport kind at a
+            // given host:port, never that this device has a usable
+            // credential for it yet.
+            val availableTransports = manifestEndpoint.transports.filter { binding ->
+                when (binding.kind) {
+                    TransportKind.AMNEZIA_WG -> true // already gated by provisioned()/clientTunnelIp() above
+                    TransportKind.XRAY_REALITY -> xrayAvailableFor(manifestEndpoint.id)
+                    TransportKind.TLS_TCP -> xrayTlsAvailableFor(manifestEndpoint.id)
+                    else -> false
+                }
+            }
+            if (availableTransports.isEmpty()) return@forEach
+            val endpoint = manifestEndpoint.copy(transports = availableTransports)
             val registry = registryFor(gateway.endpointId)
-            endpoint.transports.map { it.kind }
-                .filter { pinnedKind == null || it == pinnedKind }
-                .forEach { kind ->
+            endpoint.transports
+                .filter { pinnedKind == null || it.kind == pinnedKind }
+                .forEach { binding ->
+                    val kind = binding.kind
                     val candidate = PathCandidateBuilder.buildDirect(endpoint, kind, reachabilityFor(gateway.endpointId, kind)) ?: return@forEach
                     val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
                     val result = PathScorer.score(
@@ -109,29 +162,64 @@ object AutoGatewaySelector {
                         history = historyFor(gateway.endpointId, kind),
                         diverseProviderOrAsnSeenElsewhere = false,
                     )
-                    if (result.eligible) scoredByCandidateId[candidate.id] = gateway to result
+                    if (result.eligible) scoredByCandidateId[candidate.id] = Triple(gateway, binding, result)
                 }
         }
 
-        val ranked = PathScorer.rank(scoredByCandidateId.values.map { it.second })
+        val ranked = PathScorer.rank(scoredByCandidateId.values.map { it.third })
         return ranked.mapNotNull { result ->
-            val (gateway, _) = scoredByCandidateId.getValue(result.candidate.id)
+            val (gateway, binding, _) = scoredByCandidateId.getValue(result.candidate.id)
             val tunnelIp = clientTunnelIp(gateway.id) ?: return@mapNotNull null
             GatewayAttemptCandidate(
                 gatewayId = gateway.id,
                 endpointId = gateway.endpointId,
                 transport = result.candidate.transport,
                 region = "${gateway.displayCountry} / ${gateway.displayCity}",
-                configSnapshot = snapshotFor(gateway, tunnelIp),
+                configSnapshot = snapshotFor(gateway, binding, tunnelIp),
                 score = result.score,
                 reasons = result.reasons,
             )
         }
     }
 
-    private fun snapshotFor(gateway: ProductionGatewayDescriptor, clientTunnelIp: String): GatewayConfigSnapshot = GatewayConfigSnapshot(
-        endpointHost = gateway.awg.endpointHost,
-        endpointPort = gateway.awg.endpointPort.toString(),
+    /**
+     * B17-2 runtime-authority fix: [endpointHost]/[endpointPort] come from
+     * [binding] - the EXACT manifest transport binding this candidate was
+     * built from - never from `gateway.awg.endpointHost`/`endpointPort`
+     * (the catalog). This is what makes a signed manifest's address
+     * genuinely authoritative for the executed attempt: if the trusted
+     * manifest ever advertises a rotated host/port for an endpoint, the
+     * pinned [GatewayConfigSnapshot] for a new candidate reflects it
+     * immediately, with no code change and no dependency on
+     * `ProductionGatewayCatalog` being updated to match.
+     *
+     * [serverPublicKey]/[gatewayTunnelIp]/[profile] remain sourced from
+     * [gateway] (the catalog compatibility lookup) because the current
+     * manifest model does not carry them (see `EndpointTransportBinding`'s
+     * own docs: `metadata` is generic but deliberately never holds key
+     * material) - a real, honest scope boundary, not an oversight.
+     * [clientTunnelIp] remains exclusively local per-device state, as
+     * always.
+     *
+     * NOTE - this snapshot's `endpointHost`/`endpointPort` are ONLY ever
+     * consumed by [net.pocvpn.client.vpn.VpnController]'s AWG execution
+     * path (`GatewayConfigSnapshotValidator`/`TransportConfig.Awg`) - for
+     * an XRAY_REALITY/TLS_TCP candidate this snapshot is still built (every
+     * candidate carries one, per the "Candidate identity" invariant) and is
+     * now truthfully manifest-derived too, but the ACTUAL connect-time
+     * server address for those transports comes from the endpoint-scoped
+     * `XrayProfileRepository`/`XrayTlsProfileRepository` (provisioned via
+     * real control-plane activation), never from this snapshot - see
+     * PROJECT_ARCHITECTURE.md's own note on this separate, still-unmoved
+     * Xray address-authority boundary.
+     */
+    private fun snapshotFor(
+        gateway: ProductionGatewayDescriptor,
+        binding: EndpointTransportBinding,
+        clientTunnelIp: String,
+    ): GatewayConfigSnapshot = GatewayConfigSnapshot(
+        endpointHost = binding.host,
+        endpointPort = binding.port.toString(),
         serverPublicKey = gateway.awg.serverPublicKeyBase64,
         clientTunnelIp = clientTunnelIp,
         gatewayTunnelIp = gateway.awg.gatewayTunnelIp,

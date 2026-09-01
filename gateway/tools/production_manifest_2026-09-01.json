@@ -1,0 +1,70 @@
+{
+  "manifestVersion": 1,
+  "issuedAtEpochMillis": 1788216307288,
+  "expiresAtEpochMillis": 1803768307288,
+  "signingKeyId": "prod-manifest-key-2026-09-01",
+  "endpoints": [
+    {
+      "id": "frankfurt",
+      "roleOrdinals": [
+        1,
+        2
+      ],
+      "region": "Germany / Frankfurt",
+      "provider": "Oracle Cloud",
+      "asn": null,
+      "transports": [
+        {
+          "kindOrdinal": 0,
+          "host": "152.70.43.1",
+          "port": 51820,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 1,
+          "host": "152.70.43.1",
+          "port": 2053,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 3,
+          "host": "152.70.43.1",
+          "port": 2083,
+          "metadata": {}
+        }
+      ],
+      "relayTo": null
+    },
+    {
+      "id": "stockholm",
+      "roleOrdinals": [
+        1,
+        2
+      ],
+      "region": "Sweden / Stockholm",
+      "provider": "AWS",
+      "asn": null,
+      "transports": [
+        {
+          "kindOrdinal": 0,
+          "host": "16.170.208.231",
+          "port": 51820,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 1,
+          "host": "16.170.208.231",
+          "port": 2053,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 3,
+          "host": "16.170.208.231",
+          "port": 2083,
+          "metadata": {}
+        }
+      ],
+      "relayTo": null
+    }
+  ]
+}

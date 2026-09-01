@@ -411,6 +411,11 @@ private fun buildDiagnosticsLines(
             "lastFailure=${d.lastFailureReason ?: "-"}, exhausted=${d.exhausted}"
     } ?: "Auto attempt: -"
     val activeGatewayLine = "Active gateway: ${net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(viewModel.activeGatewayId.value).let { "${it.displayCountry} / ${it.displayCity}" }}"
+    // B17 - purely observational: the outcome of the last refreshManifest()
+    // attempt (see MainViewModel.lastManifestRefreshOutcome's own docs) -
+    // "-" means never attempted (e.g. MANIFEST_URL unconfigured for this
+    // build), never a decision input.
+    val lastManifestRefreshLine = "Last manifest refresh: ${viewModel.lastManifestRefreshOutcome.value ?: "-"}"
 
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
@@ -446,6 +451,7 @@ private fun buildDiagnosticsLines(
         autoCandidatesLine,
         autoAttemptLine,
         activeGatewayLine,
+        lastManifestRefreshLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",
