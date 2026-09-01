@@ -32,6 +32,8 @@ import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.smartconnect.RestrictionClass
+import net.pocvpn.client.smartconnect.RoutingDecisionEngine
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportStats
@@ -45,6 +47,8 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.EffectiveRoutingResult
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
+import net.pocvpn.client.vpn.policy.RoutingMode
+import net.pocvpn.client.vpn.policy.RoutingModeStore
 import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
@@ -119,6 +123,22 @@ class VpnController(
     // default appRoutingPolicyStore above (always ALL_APPS, empty selection)
     // never spuriously resolves to NoAppsSelected.
     private val installedPackageChecker: InstalledPackageChecker = InstalledPackageChecker.alwaysInstalled(),
+    // B18 - additive, defaults to an in-memory store that always reads
+    // RoutingMode.FULL_VPN and ignores writes, so every pre-B18 call site is
+    // byte-for-byte unaffected (FULL_VPN's route-prefix behavior is exactly
+    // the pre-B18 default). Same "read fresh at connect time, apply for the
+    // whole session, no live rebuild" discipline as appRoutingPolicyStore -
+    // see doConnectAttempt's own docs.
+    private val routingModeStore: RoutingModeStore = RoutingModeStore.fullVpn(),
+    // B18 - additive, defaults to null so every pre-B18 call site is
+    // byte-for-byte unaffected. A supplier (same pattern as
+    // networkProfileProvider below), not a StateFlow - read fresh, once, at
+    // the exact moment a real connect() attempt builds its route set. A null
+    // provider (or a null result) is treated as RestrictionClass.UNKNOWN,
+    // which RoutingDecisionEngine.decideAdaptiveRoute never lets broaden
+    // DIRECT beyond routingMode - so an unwired caller behaves identically
+    // to one deliberately supplying UNKNOWN.
+    private val restrictionClassProvider: (() -> RestrictionClass)? = null,
     // B8I - additive, defaults to null so every existing call site (real or
     // test) is byte-for-byte unaffected: with no store, recordConnectionOutcome
     // below is simply a no-op. Recording never changes control flow - see
@@ -248,6 +268,12 @@ class VpnController(
     // recovery cycle preserves is simply whatever this already says.
     private val _appliedRoutingPolicy = MutableStateFlow<AppRoutingPolicy?>(null)
     val appliedRoutingPolicy: StateFlow<AppRoutingPolicy?> = _appliedRoutingPolicy.asStateFlow()
+
+    // B18 - the RoutingMode actually baked into the CURRENTLY ACTIVE session,
+    // same "applied, not merely saved" discipline as _appliedRoutingPolicy
+    // above (and the same non-reasons: reconnectLoop() never writes this).
+    private val _appliedRoutingMode = MutableStateFlow<RoutingMode?>(null)
+    val appliedRoutingMode: StateFlow<RoutingMode?> = _appliedRoutingMode.asStateFlow()
 
     @Volatile private var userInitiatedDisconnect = true
     private var reconnectJob: Job? = null
@@ -501,6 +527,7 @@ class VpnController(
             // doConnectAttempt), which is what actually applies a changed
             // saved policy - never an automatic mid-session rebuild.
             _appliedRoutingPolicy.value = null
+            _appliedRoutingMode.value = null
             // B8O3 - nothing is running/attempted any more.
             _currentTransportKind.value = null
             // B16 - a completed/abandoned attempt's pinned candidate config
@@ -562,8 +589,13 @@ class VpnController(
                     return false
                 }
                 val appRoutingLists = (routingResolution as? EffectiveRoutingResult.Apply)?.lists ?: AppRoutingLists.AllApps
+                // B18 - read fresh on every real connect() attempt, same
+                // discipline as routingPolicy above - see routingModeStore's
+                // own docs for why this is what makes a mode change the user
+                // saved while disconnected take effect on THIS attempt only.
+                val routingMode = routingModeStore.read()
                 val transportConfig = try {
-                    buildTransportConfig(kind, config, appRoutingLists)
+                    buildTransportConfig(kind, config, appRoutingLists, routingMode)
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.ConfigurationMappingFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Failed to build tunnel configuration"))
@@ -585,6 +617,7 @@ class VpnController(
                     // interface was actually built, so this is set here and
                     // ONLY here, never in the catch branch.
                     _appliedRoutingPolicy.value = routingPolicy
+                    _appliedRoutingMode.value = routingMode
                     if (kind == TransportKind.AMNEZIA_WG) {
                         // Interface-up/TX>0 alone is deliberately NOT treated as
                         // success here - see awaitFreshHandshake's own docs. Set
@@ -639,6 +672,30 @@ class VpnController(
     }
 
     /**
+     * B18/B18-2 - the ONE place RoutingDecisionEngine's destination-route
+     * decision becomes an actual AmneziaWG AllowedIPs list (which is BOTH
+     * the Android VpnService route table AND WireGuard's own cryptokey-
+     * routing ingress filter for this peer - see AwgConfigMapper's own
+     * docs). Delegates the actual IPv4 route-set decision to
+     * [RoutingDecisionEngine.resolveIpv4Routes] - the SAME shared resolver
+     * [net.pocvpn.client.vpn.xray.buildXrayVpnPlan] uses for XRAY_REALITY/
+     * TLS_TCP (see that function's own docs) - never a second, parallel copy
+     * of this decision. Only the IPv4 entries of [gatewayAllowedIps] are
+     * ever touched; every IPv6 entry (normally "::/0") is kept verbatim in
+     * every mode - Full VPN/IPv6-fail-closed stay exactly as before. A
+     * manifest-provided narrower [gatewayAllowedIps] IPv4 override is
+     * intentionally superseded by the standard exclusion set in ADAPTIVE
+     * mode, never combined with it.
+     */
+    private fun resolveAdaptiveAllowedIps(gatewayAllowedIps: List<String>, routingMode: RoutingMode): List<String> {
+        val ipv4Entries = gatewayAllowedIps.filterNot { it.contains(":") }
+        val ipv6Entries = gatewayAllowedIps.filter { it.contains(":") }
+        val restrictionClass = restrictionClassProvider?.invoke() ?: RestrictionClass.UNKNOWN
+        val resolvedIpv4 = RoutingDecisionEngine.resolveIpv4Routes(ipv4Entries, routingMode, restrictionClass)
+        return resolvedIpv4 + ipv6Entries
+    }
+
+    /**
      * B8I4/B8I6 - the generic per-attempt execution seam: which TransportConfig
      * SHAPE to build is dispatched on [kind]. AMNEZIA_WG builds from the AWG
      * [config]/[appRoutingLists] exactly as before (unchanged). XRAY_REALITY
@@ -663,8 +720,19 @@ class VpnController(
      * AWG). Any other kind still throws [UnsupportedOperationException] -
      * structurally unreachable via the public API since connect() already
      * refuses a kind outside [supportedKinds] before ever reaching here.
+     * B18-2 - [routingMode] is now ALSO threaded into the XRAY_REALITY/
+     * TLS_TCP branches (`TransportConfig.Xray/XrayTls.routingMode`) so
+     * NovaXrayVpnService's own route plan uses the SAME
+     * RoutingDecisionEngine.resolveIpv4Routes authority AWG's
+     * [resolveAdaptiveAllowedIps] already uses - see that shared function's
+     * own docs for why this is not a second routing engine.
      */
-    private suspend fun buildTransportConfig(kind: TransportKind, config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig =
+    private suspend fun buildTransportConfig(
+        kind: TransportKind,
+        config: GatewayConfiguration.Configured,
+        appRoutingLists: AppRoutingLists,
+        routingMode: RoutingMode,
+    ): TransportConfig =
         when (kind) {
             TransportKind.AMNEZIA_WG -> {
                 val privateKey = clientKeyRepository.getPrivateKeyForTunnel()
@@ -679,7 +747,7 @@ class VpnController(
                         publicKeyBase64 = config.serverPublicKeyBase64,
                         endpointHost = config.endpointHost,
                         endpointPort = config.endpointPort,
-                        allowedIps = config.allowedIps,
+                        allowedIps = resolveAdaptiveAllowedIps(config.allowedIps, routingMode),
                         persistentKeepaliveSeconds = config.persistentKeepaliveSeconds,
                     ),
                 )
@@ -701,7 +769,7 @@ class VpnController(
                     ?: throw XrayProfileNotReadyException("no Xray profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                     is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config, endpointId = pendingConnectEndpointId)
+                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
                 }
             }
             TransportKind.TLS_TCP -> {
@@ -714,7 +782,7 @@ class VpnController(
                     ?: throw XrayProfileNotReadyException("no Xray TLS profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolveTls(repository)) {
                     is XrayTlsRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId)
+                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
                 }
             }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")

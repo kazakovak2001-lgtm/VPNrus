@@ -17,6 +17,8 @@ import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
+import net.pocvpn.client.vpn.policy.RoutingMode
+import net.pocvpn.client.vpn.policy.RoutingModeStore
 
 /** Test double for VpnTransport. `connectGate`, if set, makes connect() suspend until completed - for concurrency tests. */
 class FakeVpnTransport(
@@ -166,6 +168,14 @@ class FakeInstalledPackageChecker(private val installedPackages: MutableSet<Stri
     }
 
     override fun isInstalled(packageName: String): Boolean = packageName in installedPackages
+}
+
+/** B18 - in-memory RoutingModeStore double. read() always reflects the LATEST write(), exactly like the real file-backed store. */
+class FakeRoutingModeStore(private var mode: RoutingMode = RoutingMode.FULL_VPN) : RoutingModeStore {
+    override fun read(): RoutingMode = mode
+    override fun write(mode: RoutingMode) {
+        this.mode = mode
+    }
 }
 
 /** B8I - in-memory ConnectionOutcomeStore double; recorded() exposes every call in order for assertions. */

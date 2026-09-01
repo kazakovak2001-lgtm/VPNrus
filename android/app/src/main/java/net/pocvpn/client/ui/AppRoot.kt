@@ -72,6 +72,7 @@ fun AppRoot(
     val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
     val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
+    val savedRoutingMode by viewModel.savedRoutingMode.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
     val selectedGatewayId by viewModel.selectedGateway.collectAsStateWithLifecycle()
     val selectedGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGatewayId)
@@ -168,6 +169,8 @@ fun AppRoot(
                 // .updateAppRoutingPolicy's own docs) - showReconnectNotice
                 // is purely informational.
                 settingsRoute == SettingsRoute.Settings -> SettingsScreen(
+                    routingMode = savedRoutingMode,
+                    onRoutingModeSelected = { viewModel.updateRoutingMode(it) },
                     mode = savedRoutingPolicy.mode,
                     selectedAppCount = savedRoutingPolicy.selectedPackageNames.size,
                     showReconnectNotice = hasPendingRoutingPolicyChange(appliedRoutingPolicy, savedRoutingPolicy),
@@ -259,6 +262,15 @@ fun AppRoot(
                 }
             },
             onRegenerateIdentity = { viewModel.regenerateIdentity() },
+            onForceXrayTest = {
+                viewModel.debugSetTransportPreference(
+                    net.pocvpn.client.transport.UserTransportPreference.Manual(net.pocvpn.client.transport.TransportKind.XRAY_REALITY),
+                )
+            },
+            onReactivateGermany = {
+                activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY
+                showDiagnostics = false
+            },
             onDismiss = { showDiagnostics = false },
         )
     }
@@ -323,6 +335,18 @@ private fun buildDiagnosticsLines(
     val appliedRoutingLine = "Applied routing policy: ${appliedRoutingPolicy?.let { "${it.mode} (${it.selectedPackageNames.size} apps)" } ?: "NONE (no active session)"}"
     val savedRoutingLine = "Saved routing policy: ${savedRoutingPolicy.mode} (${savedRoutingPolicy.selectedPackageNames.size} apps)"
     val pendingReconnectLine = "Pending reconnect: ${if (hasPendingRoutingPolicyChange(appliedRoutingPolicy, savedRoutingPolicy)) "YES" else "NO"}"
+
+    // B18/B18-2 - the top-level RoutingMode (distinct from AppRoutingPolicy's
+    // own "Routing mode"/routingModeLine above - see RoutingDecisionEngine's
+    // own precedence-rule docs for why the two are orthogonal), same
+    // saved-vs-applied distinction as appliedRoutingLine/savedRoutingLine.
+    val appliedRoutingModeTypeLine = "Applied RoutingMode: ${viewModel.appliedRoutingMode.value?.toString() ?: "NONE (no active session)"}"
+    val savedRoutingModeTypeLine = "Saved RoutingMode: ${viewModel.savedRoutingMode.value}"
+    // B18-2 - debug-only transport-preference proof (see
+    // MainViewModel.debugSetTransportPreference's own docs) - confirms
+    // whether a Manual(XRAY_REALITY) pin from the Diagnostics dialog's
+    // "Force XRAY_REALITY" button is actually saved for the next connect().
+    val transportPreferenceLine = "Transport preference: ${viewModel.transportPreference}"
 
     // B8I - CURRENT network facts (NetworkProfiler, real ConnectivityManager
     // callbacks - see that class's own docs), never inferred/estimated.
@@ -434,6 +458,9 @@ private fun buildDiagnosticsLines(
         appliedRoutingLine,
         savedRoutingLine,
         pendingReconnectLine,
+        appliedRoutingModeTypeLine,
+        savedRoutingModeTypeLine,
+        transportPreferenceLine,
         networkTypeLine,
         validatedLine,
         meteredLine,

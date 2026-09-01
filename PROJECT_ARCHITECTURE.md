@@ -152,6 +152,89 @@ NetworkProfiler
   unchanged and governs ONLY Manual mode (`autoContext == null`) - it does
   NOT additionally run "within" an Auto sequence's current gateway.
 
+## Routing decision vs transport/gateway selection (hard invariant, B18)
+
+- `RoutingDecisionEngine.decideAdaptiveRoute` (`smartconnect/RoutingDecisionEngine.kt`)
+  is the ONE live authority for DIRECT vs VPN at the destination-route level -
+  never merged with `SmartConnectDecisionEngine` (transport) or
+  `AutoGatewaySelector` (gateway). Input: a top-level, persisted, device-local
+  `RoutingMode` (`FULL_VPN`/`ADAPTIVE`/`APPS`, default `FULL_VPN`,
+  `vpn/policy/RoutingMode.kt`), a route-prefix-only `DestinationClass`
+  (`LOCAL_PRIVATE` - RFC1918/loopback/link-local, computed by the
+  provably-correct `Ipv4RouteExclusion` CIDR-subtraction utility - vs
+  `PROTECTED`, everything else; never per-packet/hostname/domain
+  inspection), and `RestrictionClass` (`RestrictionClassifier`'s output,
+  wired into a routing decision for the first time here). Conservative by
+  construction: only `RestrictionClass.NO_NETWORK` ever changes the
+  outcome (-> `Block`); every "possible filtering" class NEVER routes
+  `PROTECTED` traffic DIRECT - no hard-whitelist bypass exists or is
+  claimed.
+- Precedence rule: `AppRoutingPolicy` (B8H, unchanged) decides WHICH APPS'
+  traffic reaches the VPN interface at all; `RoutingMode`/
+  `RoutingDecisionEngine` decides, only for traffic that does, whether its
+  destination goes DIRECT or through the tunnel. `RoutingMode.APPS` is
+  byte-for-byte identical to `FULL_VPN` at the destination-route layer -
+  Adaptive mode can never broaden which apps bypass the VPN.
+  `routingModeStore` is read fresh only at the start of a real `connect()`
+  attempt (`VpnController.appliedRoutingMode`) - same "no live mid-session
+  rebuild, reconnect to apply" discipline as `AppRoutingPolicy`.
+- Live enforcement is consistent across every currently-live transport
+  (B18-2). `VpnController.resolveAdaptiveAllowedIps` (AWG) and
+  `net.pocvpn.client.vpn.xray.buildXrayVpnPlan` (XRAY_REALITY/TLS_TCP) both
+  resolve their IPv4 route list through the ONE shared
+  `RoutingDecisionEngine.resolveIpv4Routes` function - never a second CIDR
+  computation, never a parallel routing decision. `RoutingMode` reaches the
+  Xray/TLS path via `TransportConfig.Xray/XrayTls.routingMode` ->
+  `NovaXrayVpnService.EXTRA_ROUTING_MODE` (same intent-extra pattern as
+  `EXTRA_TRANSPORT_KIND`/`EXTRA_ENDPOINT_ID`), defaulting to `FULL_VPN` at
+  every hop so every pre-B18-2 call site is byte-for-byte unaffected. Only
+  the IPv4 entries are ever touched: AWG's AllowedIPs keeps its `::/0` entry
+  verbatim in every mode; `XrayVpnBuilderPlan` structurally has no IPv6
+  field at all (unchanged) - IPv6 stays fail-closed on every transport, in
+  every `RoutingMode`. `RestrictionClass` is NOT live-threaded into the
+  Xray/TLS path (defaults `UNKNOWN`) - a documented, safe simplification:
+  only `RestrictionClass.NO_NETWORK` changes `resolveIpv4Routes`'s output,
+  and `UNKNOWN` yields the identical route set AWG yields for every other
+  class, so both transports' ADAPTIVE route sets are provably identical for
+  every reachable live case. **Physically verified end to end (2026-09-01) -
+  IMPLEMENTED**: a real device's live `dumpsys connectivity` route table for
+  `tun0` was checked directly before/after switching `RoutingMode` - Full
+  VPN shows plain `0.0.0.0/0`/`::/0`; Adaptive shows the exact
+  `Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES` complement. **Xray/TLS
+  consistency is physically proven**: a genuinely minimal debug-only
+  trigger (`MainViewModel.debugSetTransportPreference`, one button in the
+  existing `isDebugBuild`-gated Diagnostics dialog) pins
+  `UserTransportPreference.Manual(XRAY_REALITY)` for the next `connect()` -
+  a real mechanism `SmartConnectDecisionEngine`/`AutoGatewaySelector`
+  already read but no product UI could reach - driving the REAL connect
+  path end to end (never a second Xray connection path). The resulting live
+  Xray `tun0` session's route table matched AWG's Adaptive session
+  entry-for-entry, with `::/0 unreachable` confirming IPv6 fail-closed at
+  the OS level for Xray specifically.
+  **Live AWG traffic/DNS - root-caused and fixed.** `tun0` RX stuck at zero
+  bytes (TX climbing normally, identically on WiFi and cellular) was
+  diagnosed via read-only SSH to the Frankfurt gateway: server-side data
+  plane (forwarding/NAT/FORWARD chain) was fully healthy throughout - the
+  defect was a stale `ClientTunnelIdentityStore[GERMANY]` value on this one
+  test device (`10.77.0.2`) that no longer matched the server's actual peer
+  registration for this device's public key (`10.77.0.5/32`, uniquely
+  assigned - `10.77.0.2` had since been reassigned to a different, active
+  peer). WireGuard's cryptokey routing silently drops decrypted packets
+  whose source doesn't match the peer's AllowedIPs, inside the kernel WG
+  module, before netfilter - exactly matching the symptom. Fixed by
+  re-provisioning through the REAL control-plane flow (a fresh activation
+  credential issued via the gateway's own operator tool, submitted through
+  the unmodified `MainViewModel.activateDevice`/`/v1/activate` path - never
+  a hand-edited store), reached via one more minimal debug-only Diagnostics
+  button ("Re-activate Germany") that opens the existing `ActivationScreen`
+  for an already-provisioned gateway (mirrors B15's own mechanism for an
+  unprovisioned one). After re-provisioning: `tun0` RX climbs normally, a
+  real request to `cdn-cgi/trace` returned `ip=152.70.43.1`/`loc=DE` in both
+  Full VPN and Adaptive modes - conclusive proof public/protected traffic
+  genuinely exits through the Frankfurt gateway in both modes, with DNS
+  validated through the tunnel (`ValidatedPrivateDnsAddresses`) and IPv6
+  unaffected. Device restored to Full VPN/Auto preference/clean afterward.
+
 ## Per-device identity (hard invariant)
 
 - Client tunnel IP is per-device, per-endpoint, PROVISIONED identity - lives only in
@@ -229,6 +312,18 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
+Last updated: 2026-09-01 (B18/B18-2 - added the "Routing decision vs transport/
+gateway selection" section above: RoutingMode/RoutingDecisionEngine
+.decideAdaptiveRoute is the real, live DIRECT-vs-VPN authority, route-prefix-
+level only, with RestrictionClassifier wired in conservatively. B18-2 extended
+live enforcement from AmneziaWG-only to ALL currently-live transports
+(AMNEZIA_WG/XRAY_REALITY/TLS_TCP) through one shared resolver
+(RoutingDecisionEngine.resolveIpv4Routes) - no second routing engine, no
+duplicated CIDR math. Physical validation completed 2026-09-01 after fixing
+an unrelated stale-client-identity issue on the test device (see this
+section's own closing paragraph) - Adaptive Direct Routing is now
+IMPLEMENTED. Everything below this line predates B18 and is unaffected by it.)
+
 Last updated: 2026-09-01 (B17 - Auto gateway/path DISCOVERY runtime authority
 moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;
 the production Ed25519 key ceremony was performed (real keypair, private key

@@ -4,6 +4,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
  * B13 (2026-08-30 PR #25 review fix) - the ONE place NovaXrayVpnService's
@@ -58,8 +59,11 @@ class NovaXrayServiceLifecycleCoordinator(
      * own `scope.launch` wrapper) - only concurrent callers of THIS class
      * now queue behind each other, never the Service's own onStartCommand.
      */
-    suspend fun start(endpointId: EndpointId, kind: TransportKind): XrayCoreStartOutcome = mutex.withLock {
-        selectControllerLocked(endpointId).requestStart(kind)
+    // B18-2 - [routingMode] defaults to FULL_VPN, same reasoning as
+    // XrayCoreController.requestStart's own default - every pre-B18-2 caller
+    // is byte-for-byte unaffected.
+    suspend fun start(endpointId: EndpointId, kind: TransportKind, routingMode: RoutingMode = RoutingMode.FULL_VPN): XrayCoreStartOutcome = mutex.withLock {
+        selectControllerLocked(endpointId).requestStart(kind, routingMode)
     }
 
     /**

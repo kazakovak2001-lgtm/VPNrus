@@ -134,6 +134,11 @@ class VlessRealityTransport(
                 // matching repository (see that class's own docs), never
                 // defaulting silently to the production endpoint id.
                 .putExtra(NovaXrayVpnService.EXTRA_ENDPOINT_ID, config.endpointId.value)
+                // B18-2 - the SAME RoutingMode VpnController resolved this
+                // attempt against (see TransportConfig.Xray.routingMode's own
+                // docs) - NovaXrayVpnService threads it into the same
+                // RoutingDecisionEngine.resolveIpv4Routes authority AWG uses.
+                .putExtra(NovaXrayVpnService.EXTRA_ROUTING_MODE, config.routingMode.name)
             context.startService(intent)
             // Real confirmation arrives asynchronously via XrayRuntimeState
             // (see the observer above) - never claim Connected merely
