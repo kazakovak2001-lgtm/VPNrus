@@ -36,5 +36,14 @@
             android:name="net.pocvpn.client.debug.XrayOutboundIsolationActivity"
             android:exported="true"
             android:label="Xray Outbound Isolation (debug)" />
+        <!--
+          B21-fix - debug-only raw UDP diagnostic (see that Activity's own
+          docs) - NOT Xray/QUIC, a plain DatagramSocket. Same exported
+          rationale as the two activities above.
+        -->
+        <activity
+            android:name="net.pocvpn.client.debug.RawUdpDiagnosticActivity"
+            android:exported="true"
+            android:label="Raw UDP Diagnostic (debug)" />
     </application>
 </manifest>
