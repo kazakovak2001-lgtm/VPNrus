@@ -267,6 +267,18 @@ fun AppRoot(
                     net.pocvpn.client.transport.UserTransportPreference.Manual(net.pocvpn.client.transport.TransportKind.XRAY_REALITY),
                 )
             },
+            onSimulateAwgFailure = {
+                viewModel.debugRecordConnectionFailure(
+                    net.pocvpn.client.transport.TransportKind.AMNEZIA_WG,
+                    net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID),
+                )
+            },
+            onSimulateAwgSuccess = {
+                viewModel.debugRecordConnectionSuccess(
+                    net.pocvpn.client.transport.TransportKind.AMNEZIA_WG,
+                    net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID),
+                )
+            },
             onReactivateGermany = {
                 activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY
                 showDiagnostics = false

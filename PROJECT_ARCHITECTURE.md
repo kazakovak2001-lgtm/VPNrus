@@ -181,6 +181,21 @@ NetworkProfiler
   history > capability maturity > small latency/failure/cooldown/diversity
   adjustments - enforced by `PathScorer`'s own order-of-magnitude tiering,
   never a flat weighted sum.
+- **Physically verified end to end (2026-09-01)**: on the real test device,
+  in real Auto mode, two real `FAILURE` outcomes for Frankfurt AWG (written
+  via a minimal debug-only Diagnostics button - `MainViewModel
+  .debugRecordConnectionFailure` - through the EXACT SAME `ConnectionOutcomeStore`/
+  `FilePathHistoryStore` a real failed attempt already writes to, no server
+  config touched) demoted Frankfurt AWG to last place
+  (`ENDPOINT_UNREACHABLE`/`TRANSPORT_UNREACHABLE`/`FAILURE_COOLDOWN`,
+  score=-1080) and promoted Frankfurt XRAY_REALITY to first
+  (score=2020000); connecting genuinely executed XRAY_REALITY and reached
+  `Protected`. A real-shaped `SUCCESS` write plus a real (non-simulated) AWG
+  connection restored AWG to first place
+  (`RECENT_SUCCESS_THIS_NETWORK`, score=3030975) and executed AWG again.
+  Transport preference stayed `Auto` throughout - the reordering came
+  entirely from ranking evidence, never from `AwgXrayFailoverPolicy` or a
+  manual override. Device left clean (Auto/Auto, no fault, `Protected`).
 
 ## Routing decision vs transport/gateway selection (hard invariant, B18)
 
@@ -345,9 +360,10 @@ exist for direct testability but must not be relied on for atomicity by new call
 Last updated: 2026-09-01 (B19 - added the "Health-aware Auto ranking" section
 above: fixed the disabled provider/ASN diversity bonus and added a bounded,
 time-decaying failure cooldown to PathScorer, both consumed only by
-AutoGatewaySelector - the single, unchanged Auto decision authority. No
-physical-device validation was available in this environment this pass;
-existing suite (878 tests) unaffected.)
+AutoGatewaySelector - the single, unchanged Auto decision authority. Physically
+validated end to end on a real device this pass (baseline, controlled
+dynamic reordering via debug-injected real evidence, restore) - see this
+section's own closing paragraph. Existing suite (878 tests) unaffected.)
 
 Last updated: 2026-09-01 (B18/B18-2 - added the "Routing decision vs transport/
 gateway selection" section above: RoutingMode/RoutingDecisionEngine
