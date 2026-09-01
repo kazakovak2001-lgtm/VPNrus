@@ -92,6 +92,25 @@ object XrayConfigRenderer {
         return root.toString()
     }
 
+    /**
+     * B21-fix - outbound-only config: NO inbounds at all (not even the tun
+     * inbound [render] above always includes). Exists ONLY for the debug-only
+     * outbound-isolation harness (see docs/B21_QUIC_TRANSPORT_AUDIT.md
+     * continuation notes) that proves/disproves whether an Xray outbound can
+     * dial successfully independent of Nova's VpnService/TUN routing path -
+     * `startLoop(config, fd)`'s fd is meaningless here since no "tun"
+     * protocol inbound ever reads it. Never used by any real connect path -
+     * [render] (with its tun inbound) is what every real
+     * REALITY/TLS_TCP/QUIC connect attempt actually uses.
+     */
+    fun renderOutboundOnly(config: XrayVlessQuicConfig): String {
+        val root = JSONObject()
+        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put("inbounds", JSONArray())
+        root.put("outbounds", JSONArray().put(renderVlessQuicOutbound(config)))
+        return root.toString()
+    }
+
     private fun renderTunInbound(mtu: Int): JSONObject {
         val settings = JSONObject()
             .put("name", TUN_INTERFACE_NAME)
