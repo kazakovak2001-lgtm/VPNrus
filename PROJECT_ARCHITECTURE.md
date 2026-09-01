@@ -108,11 +108,25 @@ NetworkProfiler
   makes "highest valid version wins" correct for free - a later origin
   returning a strictly newer valid manifest is still adopted even after an
   earlier origin's (also-valid, older) candidate was already accepted in the
-  same refresh. Per-origin outcome is classified into one of
-  `ManifestOriginOutcomeKind` (`NETWORK_ERROR`/`TLS_ERROR`/`HTTP_ERROR`/
-  `INVALID_SIGNATURE`/`EXPIRED`/`ROLLBACK_OR_NOT_NEWER`/`ACCEPTED`) purely by
-  inspecting the existing `ManifestFetchResult`/`ManifestUpdateResult`
-  reason strings - no second crypto-result vocabulary. `MainViewModel`'s one
+  same refresh. **PR #34 follow-up fix (2026-09-01) - typed classification,
+  not string parsing**: `ManifestFetchResult.Failed` carries a typed
+  `ManifestFetchFailureKind` (`NETWORK_ERROR`/`TLS_ERROR`/`HTTP_ERROR`/
+  `MALFORMED`), and `ManifestVerificationResult.Invalid`/`ManifestUpdateResult.Rejected`
+  each carry a typed `ManifestVerificationFailureKind`/`ManifestUpdateRejectionKind`
+  (`UNKNOWN_SIGNING_KEY`/`CLOCK_SKEW`/`EXPIRED`/`INVALID_SIGNATURE`, plus
+  `ROLLBACK_OR_NOT_NEWER` added by `EndpointManifestRepository.offer` itself)
+  - set at the exact point each result is produced (`Ed25519ManifestVerifier`,
+  `EndpointManifestRepository.offer`, `HttpsRemoteManifestFetcher`), never
+  inferred afterwards from `reason`/`detail` text. `ManifestOriginOutcomeKind`
+  is a presentation-layer AGGREGATION of those typed categories via two
+  small EXHAUSTIVE `when` mappings (`ManifestFetchFailureKind.toOriginOutcomeKind`/
+  `ManifestUpdateRejectionKind.toOriginOutcomeKind` in `ManifestOrigin.kt`) -
+  a compile error, not a silent misclassification, if either underlying enum
+  ever gains a category this one doesn't cover yet.
+  `MultiOriginManifestDistributionClient` never inspects a `reason`/`detail`
+  string to decide anything - genuinely one typed vocabulary reused at a
+  presentation layer, not a second independently-inferred one.
+  `MainViewModel`'s one
   logical startup refresh and `manifestRefreshMutex` bounded-concurrency
   behavior are both unchanged; `refreshManifest()`'s return type is now
   `MultiOriginRefreshResult`. Control-plane isolation is unchanged/hard: no

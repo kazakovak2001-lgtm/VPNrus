@@ -36,7 +36,11 @@ object ManifestOriginConfig {
 
     private fun isHttpsUrl(url: String): Boolean = try {
         val parsed = java.net.URL(url)
-        parsed.protocol == "https" && !parsed.host.isNullOrBlank()
+        // B20 hardening - "no credentials in URLs" enforced at the parser
+        // boundary: a URL carrying userInfo (`user:password@host`) is
+        // rejected outright, even though production defaults never contain
+        // one - never silently strip it and accept the rest.
+        parsed.protocol == "https" && !parsed.host.isNullOrBlank() && parsed.userInfo == null
     } catch (e: java.net.MalformedURLException) {
         false
     }
@@ -49,15 +53,44 @@ object ManifestOriginConfig {
     }
 }
 
-/** Typed, coarse evidence bucket for one origin's outcome this refresh - see [MultiOriginManifestDistributionClient.refresh]'s own docs for how each is derived from the existing [ManifestFetchResult]/[ManifestUpdateResult] reason strings (deliberately NOT a second crypto-result vocabulary - just a classification of the one that already exists). */
+/**
+ * B20 - a presentation-layer AGGREGATION of [ManifestFetchFailureKind] and
+ * [ManifestUpdateRejectionKind] (plus [ACCEPTED]) for diagnostics - never an
+ * independently inferred crypto vocabulary. Every value here is produced by
+ * an exhaustive `when` over one of those two typed enums (see
+ * [ManifestFetchFailureKind.toOriginOutcomeKind]/
+ * [ManifestUpdateRejectionKind.toOriginOutcomeKind] below) - a compile error,
+ * not a silent misclassification, is what happens if either underlying enum
+ * ever gains a category this one doesn't yet cover.
+ */
 enum class ManifestOriginOutcomeKind {
     NETWORK_ERROR,
     TLS_ERROR,
     HTTP_ERROR,
+    MALFORMED,
+    UNKNOWN_SIGNING_KEY,
+    CLOCK_SKEW,
     INVALID_SIGNATURE,
     EXPIRED,
     ROLLBACK_OR_NOT_NEWER,
     ACCEPTED,
+}
+
+/** Exhaustive - see [ManifestOriginOutcomeKind]'s own docs. */
+fun ManifestFetchFailureKind.toOriginOutcomeKind(): ManifestOriginOutcomeKind = when (this) {
+    ManifestFetchFailureKind.NETWORK_ERROR -> ManifestOriginOutcomeKind.NETWORK_ERROR
+    ManifestFetchFailureKind.TLS_ERROR -> ManifestOriginOutcomeKind.TLS_ERROR
+    ManifestFetchFailureKind.HTTP_ERROR -> ManifestOriginOutcomeKind.HTTP_ERROR
+    ManifestFetchFailureKind.MALFORMED -> ManifestOriginOutcomeKind.MALFORMED
+}
+
+/** Exhaustive - see [ManifestOriginOutcomeKind]'s own docs. */
+fun ManifestUpdateRejectionKind.toOriginOutcomeKind(): ManifestOriginOutcomeKind = when (this) {
+    ManifestUpdateRejectionKind.UNKNOWN_SIGNING_KEY -> ManifestOriginOutcomeKind.UNKNOWN_SIGNING_KEY
+    ManifestUpdateRejectionKind.CLOCK_SKEW -> ManifestOriginOutcomeKind.CLOCK_SKEW
+    ManifestUpdateRejectionKind.EXPIRED -> ManifestOriginOutcomeKind.EXPIRED
+    ManifestUpdateRejectionKind.INVALID_SIGNATURE -> ManifestOriginOutcomeKind.INVALID_SIGNATURE
+    ManifestUpdateRejectionKind.ROLLBACK_OR_NOT_NEWER -> ManifestOriginOutcomeKind.ROLLBACK_OR_NOT_NEWER
 }
 
 data class ManifestOriginOutcome(val kind: ManifestOriginOutcomeKind, val detail: String)
@@ -108,9 +141,14 @@ class MultiOriginManifestDistributionClient(
         var lastRejected: ManifestUpdateResult.Rejected? = null
 
         for (origin in origins) {
+            // B20 - typed classification only: every branch below reads a
+            // typed `kind` field off the underlying result, never parses
+            // `reason`/`detail` text. See ManifestFetchFailureKind/
+            // ManifestUpdateRejectionKind's own docs for where each typed
+            // value is actually produced.
             when (val fetchResult = fetcherFor(origin).fetch()) {
                 is ManifestFetchResult.Failed -> {
-                    perOrigin.add(ManifestOriginResult(origin, classifyFetchFailure(fetchResult.reason)))
+                    perOrigin.add(ManifestOriginResult(origin, ManifestOriginOutcome(fetchResult.kind.toOriginOutcomeKind(), fetchResult.reason)))
                 }
                 is ManifestFetchResult.Fetched -> {
                     when (val offerResult = repository.offer(fetchResult.signed)) {
@@ -128,7 +166,15 @@ class MultiOriginManifestDistributionClient(
                         }
                         is ManifestUpdateResult.Rejected -> {
                             lastRejected = offerResult
-                            perOrigin.add(ManifestOriginResult(origin, classifyRejection(offerResult.reason)))
+                            // repository.offer() (called directly, two lines
+                            // above) is the ONE acceptance authority and
+                            // always sets a typed kind - see
+                            // ManifestUpdateResult.Rejected's own docs for
+                            // why this path can never see the null case.
+                            val kind = requireNotNull(offerResult.kind) {
+                                "EndpointManifestRepository.offer() must always set a typed rejection kind"
+                            }
+                            perOrigin.add(ManifestOriginResult(origin, ManifestOriginOutcome(kind.toOriginOutcomeKind(), offerResult.reason)))
                         }
                     }
                 }
@@ -139,20 +185,12 @@ class MultiOriginManifestDistributionClient(
             origins.isEmpty() -> null
             lastAccepted != null -> lastAccepted
             lastRejected != null -> lastRejected
-            else -> ManifestUpdateResult.Rejected(perOrigin.lastOrNull()?.outcome?.detail ?: "no origin produced a candidate")
+            // Every origin failed at the transport level (never reached
+            // offer()/the verifier) - no ManifestUpdateRejectionKind
+            // genuinely applies, matching ManifestUpdateResult.Rejected's
+            // own documented null-kind case.
+            else -> ManifestUpdateResult.Rejected(kind = null, reason = perOrigin.lastOrNull()?.outcome?.detail ?: "no origin produced a candidate")
         }
         return MultiOriginRefreshResult(perOrigin, finalOutcome)
-    }
-
-    private fun classifyFetchFailure(reason: String): ManifestOriginOutcome = when {
-        reason.startsWith("TLS error") -> ManifestOriginOutcome(ManifestOriginOutcomeKind.TLS_ERROR, reason)
-        reason.startsWith("unexpected HTTP status") -> ManifestOriginOutcome(ManifestOriginOutcomeKind.HTTP_ERROR, reason)
-        else -> ManifestOriginOutcome(ManifestOriginOutcomeKind.NETWORK_ERROR, reason)
-    }
-
-    private fun classifyRejection(reason: String): ManifestOriginOutcome = when {
-        reason == "manifest has expired" -> ManifestOriginOutcome(ManifestOriginOutcomeKind.EXPIRED, reason)
-        reason.startsWith("candidate version") -> ManifestOriginOutcome(ManifestOriginOutcomeKind.ROLLBACK_OR_NOT_NEWER, reason)
-        else -> ManifestOriginOutcome(ManifestOriginOutcomeKind.INVALID_SIGNATURE, reason)
     }
 }

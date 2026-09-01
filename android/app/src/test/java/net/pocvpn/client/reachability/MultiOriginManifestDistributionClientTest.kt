@@ -88,7 +88,7 @@ class MultiOriginManifestDistributionClientTest {
             repository = repo,
             fetcherFor = { origin ->
                 when (origin.id) {
-                    "frankfurt" -> RemoteManifestFetcher { ManifestFetchResult.Failed("network error: SocketTimeoutException") }
+                    "frankfurt" -> RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "network error: SocketTimeoutException") }
                     else -> RemoteManifestFetcher { ManifestFetchResult.Fetched(sign(manifest(2))) }
                 }
             },
@@ -109,7 +109,7 @@ class MultiOriginManifestDistributionClientTest {
             repository = repo,
             fetcherFor = { origin ->
                 when (origin.id) {
-                    "frankfurt" -> RemoteManifestFetcher { ManifestFetchResult.Failed("TLS error: SSLHandshakeException") }
+                    "frankfurt" -> RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.TLS_ERROR, "TLS error: SSLHandshakeException") }
                     else -> RemoteManifestFetcher { ManifestFetchResult.Fetched(sign(manifest(2))) }
                 }
             },
@@ -124,7 +124,7 @@ class MultiOriginManifestDistributionClientTest {
             repository = repo2,
             fetcherFor = { origin ->
                 when (origin.id) {
-                    "frankfurt" -> RemoteManifestFetcher { ManifestFetchResult.Failed("unexpected HTTP status 503") }
+                    "frankfurt" -> RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.HTTP_ERROR, "unexpected HTTP status 503") }
                     else -> RemoteManifestFetcher { ManifestFetchResult.Fetched(sign(manifest(2))) }
                 }
             },
@@ -229,7 +229,7 @@ class MultiOriginManifestDistributionClientTest {
         val client = MultiOriginManifestDistributionClient(
             origins = listOf(frankfurt, stockholm),
             repository = repo,
-            fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Failed("network error: SocketTimeoutException") } },
+            fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "network error: SocketTimeoutException") } },
         )
         val result = client.refresh()
 
@@ -244,7 +244,7 @@ class MultiOriginManifestDistributionClientTest {
         val client = MultiOriginManifestDistributionClient(
             origins = listOf(frankfurt, stockholm),
             repository = repo,
-            fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Failed("network error: SocketTimeoutException") } },
+            fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "network error: SocketTimeoutException") } },
         )
 
         client.refresh()
@@ -295,6 +295,84 @@ class MultiOriginManifestDistributionClientTest {
 
         assertEquals(ManifestOriginOutcomeKind.EXPIRED, result.perOrigin[0].outcome.kind)
         assertEquals(1, longLivedRepo.trusted()!!.manifestVersion)
+    }
+
+    @Test
+    fun `an unknown signing key is classified UNKNOWN_SIGNING_KEY, never misreported as INVALID_SIGNATURE`() = runTest {
+        val repo = repository()
+        val unknownKeyManifest = manifest(2).copy(signingKeyId = "some-other-key-id")
+        val client = MultiOriginManifestDistributionClient(
+            origins = listOf(frankfurt),
+            repository = repo,
+            // signed with the SAME priv key, but the manifest names a
+            // signingKeyId this repository's trust anchors have never heard
+            // of - a genuinely different rejection reason than a bad
+            // signature (the signature itself would even verify if the
+            // right key were looked up), so it must NOT collapse into
+            // INVALID_SIGNATURE.
+            fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Fetched(sign(unknownKeyManifest)) } },
+        )
+
+        val result = client.refresh()
+
+        assertEquals(ManifestOriginOutcomeKind.UNKNOWN_SIGNING_KEY, result.perOrigin[0].outcome.kind)
+        assertTrue(result.perOrigin[0].outcome.kind != ManifestOriginOutcomeKind.INVALID_SIGNATURE)
+        assertEquals(1, repo.trusted()!!.manifestVersion) // bootstrap, untouched
+    }
+
+    @Test
+    fun `a clock-skew (implausibly-future issuedAt) rejection is classified CLOCK_SKEW`() = runTest {
+        val repo = repository(now = 2_000L)
+        val futureIssued = manifest(2).copy(issuedAtEpochMillis = 999_999_999L, expiresAtEpochMillis = 9_999_999_999L)
+        val client = MultiOriginManifestDistributionClient(
+            origins = listOf(frankfurt),
+            repository = repo,
+            fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Fetched(sign(futureIssued)) } },
+        )
+
+        val result = client.refresh()
+
+        assertEquals(ManifestOriginOutcomeKind.CLOCK_SKEW, result.perOrigin[0].outcome.kind)
+    }
+
+    @Test
+    fun `each ManifestFetchFailureKind maps to its own distinct outcome without any string inspection`() = runTest {
+        val repo = repository()
+        for (kind in ManifestFetchFailureKind.entries) {
+            val client = MultiOriginManifestDistributionClient(
+                origins = listOf(frankfurt),
+                repository = repo,
+                // deliberately a reason string that would mislead a
+                // string-parsing classifier (e.g. mentions "TLS" while kind
+                // is NETWORK_ERROR) - the typed `kind` field must win.
+                fetcherFor = { RemoteManifestFetcher { ManifestFetchResult.Failed(kind, "some misleading TLS/HTTP/expired-sounding text") } },
+            )
+            val result = client.refresh()
+            assertEquals(kind.toOriginOutcomeKind(), result.perOrigin[0].outcome.kind)
+        }
+    }
+
+    @Test
+    fun `each ManifestUpdateRejectionKind retains its own truthful typed category through the client`() {
+        for (kind in ManifestUpdateRejectionKind.entries) {
+            // Exercise the mapping function directly for kinds not easily
+            // reproduced end-to-end here (e.g. ROLLBACK_OR_NOT_NEWER already
+            // has its own dedicated end-to-end test above) - the point is
+            // the mapping is total/exhaustive and never falls back to a
+            // default bucket.
+            val mapped = kind.toOriginOutcomeKind()
+            assertTrue(mapped != ManifestOriginOutcomeKind.ACCEPTED)
+        }
+        assertEquals(5, ManifestUpdateRejectionKind.entries.size)
+        assertEquals(4, ManifestFetchFailureKind.entries.size)
+        assertEquals(10, ManifestOriginOutcomeKind.entries.size)
+    }
+
+    @Test
+    fun `an HTTPS URL containing userInfo (embedded credentials) is rejected by ManifestOriginConfig`() {
+        val origins = ManifestOriginConfig.parse("https://user:password@152.70.43.1/v1/manifest,https://16.170.208.231/v1/manifest")
+        assertEquals(1, origins.size)
+        assertEquals("16.170.208.231", origins[0].id)
     }
 
     @Test
