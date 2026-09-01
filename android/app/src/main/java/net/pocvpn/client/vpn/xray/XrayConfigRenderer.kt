@@ -105,7 +105,17 @@ object XrayConfigRenderer {
      */
     fun renderOutboundOnly(config: XrayVlessQuicConfig): String {
         val root = JSONObject()
-        root.put("log", JSONObject().put("loglevel", "warning"))
+        // B21-fix - "info" (not the production "warning") deliberately: the
+        // real underlying XHTTP/H3 dial error splithttp's DefaultDialerClient
+        // .OpenStream (transport/internet/splithttp/client.go) captures is
+        // only ever surfaced via errors.LogInfoInner - Info level - before
+        // being masked, everywhere else, by the generic io.ErrClosedPipe a
+        // WaitReadCloser read produces once OpenStream's own goroutine calls
+        // wrc.Close() on failure without ever setting wrc.ReadCloser. At
+        // "warning" this real cause is silently suppressed. Only this
+        // debug-only isolation config raises verbosity - render()'s real
+        // connect-path configs are untouched.
+        root.put("log", JSONObject().put("loglevel", "info"))
         root.put("inbounds", JSONArray())
         root.put("outbounds", JSONArray().put(renderVlessQuicOutbound(config)))
         return root.toString()
