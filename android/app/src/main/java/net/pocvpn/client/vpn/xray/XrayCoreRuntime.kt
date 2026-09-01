@@ -1,6 +1,9 @@
 package net.pocvpn.client.vpn.xray
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import net.pocvpn.client.BuildConfig
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -29,6 +32,21 @@ interface XrayCoreRuntime {
 
     /** Mirrors CoreController.stopLoop(). Safe to call when not running (no-op). */
     fun stopLoop()
+
+    /**
+     * B21-fix - mirrors CoreController.measureDelay(url): dials the currently
+     * running core's own outbound and returns a real round-trip latency in
+     * ms, throwing if the dial/request itself fails. This is the ONE genuine
+     * "does this outbound actually pass traffic" signal the AndroidLibXrayLite
+     * AAR exports (verified via javap against the shipped classes.jar - there
+     * is no separate socket/protect callback in this API surface) - see
+     * [XrayDataPlaneReadinessCheck], which wraps this with a bounded timeout
+     * and turns it into a typed result. Transport-agnostic: the same call
+     * works unmodified for REALITY/TLS_TCP/QUIC because each renders exactly
+     * one outbound into the running core - no per-transport branching needed.
+     */
+    @Throws(Exception::class)
+    suspend fun measureDelay(testUrl: String): Long
 }
 
 /**
@@ -43,7 +61,7 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
     private val envInitialized = AtomicBoolean(false)
 
     private val controller: libv2ray.CoreController by lazy {
-        libv2ray.Libv2ray.newCoreController(NoopCoreCallbackHandler)
+        libv2ray.Libv2ray.newCoreController(DiagnosticsCoreCallbackHandler)
     }
 
     override fun ensureCoreEnvInitialized(context: Context) {
@@ -75,15 +93,34 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
         }
     }
 
+    override suspend fun measureDelay(testUrl: String): Long =
+        withContext(Dispatchers.IO) { controller.measureDelay(testUrl) }
+
     /**
-     * This adapter shell does not yet surface core lifecycle events anywhere
-     * (no UI/notification depends on them) - a real handler that only logs
-     * would risk becoming the one place a future change accidentally logs
-     * config content. Every callback here is intentionally inert.
+     * B21-fix - root-caused the QUIC false-positive Connected report: this
+     * handler used to be a NoopCoreCallbackHandler that discarded every
+     * xray-core startup/shutdown/status event, so the ONE channel the Go
+     * runtime had for reporting a config-load or dial failure was silently
+     * thrown away client-side. Now forwards into [XrayCoreDiagnostics] -
+     * DEBUG builds only ([BuildConfig.DEBUG], compiled out of release), and
+     * even there [XrayCoreDiagnostics.record] sanitizes/bounds every message
+     * before it is kept. Return values are unchanged (0 - AndroidLibXrayLite
+     * does not currently inspect them).
      */
-    private object NoopCoreCallbackHandler : libv2ray.CoreCallbackHandler {
-        override fun startup(): Long = 0
-        override fun shutdown(): Long = 0
-        override fun onEmitStatus(l: Long, s: String?): Long = 0
+    private object DiagnosticsCoreCallbackHandler : libv2ray.CoreCallbackHandler {
+        override fun startup(): Long {
+            if (BuildConfig.DEBUG) XrayCoreDiagnostics.record("startup", null)
+            return 0
+        }
+
+        override fun shutdown(): Long {
+            if (BuildConfig.DEBUG) XrayCoreDiagnostics.record("shutdown", null)
+            return 0
+        }
+
+        override fun onEmitStatus(l: Long, s: String?): Long {
+            if (BuildConfig.DEBUG) XrayCoreDiagnostics.record("status", s)
+            return 0
+        }
     }
 }

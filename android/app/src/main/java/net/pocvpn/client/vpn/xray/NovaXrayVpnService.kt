@@ -198,6 +198,11 @@ class NovaXrayVpnService : VpnService() {
                     XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
+                is XrayCoreStartOutcome.DataPlaneNotReady -> {
+                    Log.e(TAG, "Xray core started but the data plane never became ready: ${outcome.reason}")
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    stopSelf()
+                }
                 is XrayCoreStartOutcome.Started -> {
                     Log.i(TAG, "Xray core started")
                     // B8I7 - the ONE real, positive confirmation

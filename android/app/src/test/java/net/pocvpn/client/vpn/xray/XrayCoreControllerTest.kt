@@ -3,10 +3,13 @@ package net.pocvpn.client.vpn.xray
 import kotlinx.coroutines.runBlocking
 import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.FileXrayProfileStore
+import net.pocvpn.client.identity.FileXrayQuicProfileStore
 import net.pocvpn.client.identity.FileXrayTlsProfileStore
 import net.pocvpn.client.identity.SecureXrayProfileRepository
+import net.pocvpn.client.identity.SecureXrayQuicProfileRepository
 import net.pocvpn.client.identity.SecureXrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayProfile
+import net.pocvpn.client.identity.XrayQuicProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
@@ -43,6 +46,8 @@ class XrayCoreControllerTest {
         establishedFd: Int? = 42,
         establishThrows: Throwable? = null,
         tlsRepository: SecureXrayTlsProfileRepository? = null,
+        quicRepository: SecureXrayQuicProfileRepository? = null,
+        dataPlaneReadinessTimeoutMs: Long = 1_000L,
     ) {
         var ensureCoreEnvCallCount = 0
             private set
@@ -63,6 +68,8 @@ class XrayCoreControllerTest {
             },
             closeTun = { closeTunCallCount++ },
             tlsRepository = tlsRepository,
+            quicRepository = quicRepository,
+            dataPlaneReadinessTimeoutMs = dataPlaneReadinessTimeoutMs,
         )
     }
 
@@ -306,5 +313,112 @@ class XrayCoreControllerTest {
         assertEquals(XrayCoreStartOutcome.Started, first)
         assertEquals(XrayCoreStartOutcome.AlreadyRunning, second)
         assertEquals(1, harness.coreRuntime.startLoopCallCount)
+    }
+
+    // --- B21-fix: startLoop not throwing is not enough - readiness must also succeed ---
+
+    @Test
+    fun `startLoop succeeding but the data plane never becoming ready is reported, not Started`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(
+            repository,
+            coreRuntime = FakeXrayCoreRuntime(measureDelayThrows = IllegalStateException("failed to dial")),
+        )
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("IllegalStateException"), outcome)
+        assertEquals(1, harness.coreRuntime.startLoopCallCount)
+        assertEquals(1, harness.coreRuntime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+    }
+
+    @Test
+    fun `readiness exceeding the bounded timeout is reported as a timeout, not Started`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(
+            repository,
+            coreRuntime = FakeXrayCoreRuntime(measureDelayDelayMs = 200L),
+            dataPlaneReadinessTimeoutMs = 20L,
+        )
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("timeout"), outcome)
+        assertEquals(1, harness.coreRuntime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+    }
+
+    @Test
+    fun `readiness success reports Started exactly once readiness is confirmed`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository, coreRuntime = FakeXrayCoreRuntime(measureDelayResult = 55L))
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, harness.coreRuntime.measureDelayCallCount)
+        assertEquals(0, harness.closeTunCallCount)
+    }
+
+    // --- B21: QUIC branch - same readiness gate applies, no transport-specific bypass ---
+
+    private val validQuicProfile = XrayQuicProfile(
+        server = "152.70.43.1",
+        serverPort = 2087,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        serverName = "203.0.113.1",
+        fingerprint = "chrome",
+        path = "/nova-xhttp",
+    )
+
+    private fun newQuicRepository(): SecureXrayQuicProfileRepository =
+        SecureXrayQuicProfileRepository(FileXrayQuicProfileStore(Files.createTempDirectory("xray-quic-controller-test").toFile()), FakeAesGcmKeyEncryptor())
+
+    @Test
+    fun `requestStart QUIC with no quicRepository wired is rejected without touching the runtime`() = runBlocking {
+        val harness = Harness(newRepository())
+
+        val outcome = harness.controller.requestStart(TransportKind.QUIC)
+
+        assertEquals(XrayCoreStartOutcome.Rejected("Xray QUIC profile repository not wired"), outcome)
+        assertEquals(0, harness.coreRuntime.startLoopCallCount)
+    }
+
+    @Test
+    fun `requestStart QUIC with a valid profile but zero real data plane is reported, never Connected`() = runBlocking {
+        val quicRepository = newQuicRepository()
+        quicRepository.saveProfile(validQuicProfile)
+        val harness = Harness(
+            newRepository(),
+            coreRuntime = FakeXrayCoreRuntime(measureDelayThrows = java.io.IOException("no packets reached the server")),
+            quicRepository = quicRepository,
+        )
+
+        val outcome = harness.controller.requestStart(TransportKind.QUIC)
+
+        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("IOException"), outcome)
+        assertEquals(1, harness.coreRuntime.startLoopCallCount)
+        assertEquals(1, harness.coreRuntime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+    }
+
+    @Test
+    fun `requestStart QUIC with a valid profile and a real data plane reports Started`() = runBlocking {
+        val quicRepository = newQuicRepository()
+        quicRepository.saveProfile(validQuicProfile)
+        val harness = Harness(
+            newRepository(),
+            coreRuntime = FakeXrayCoreRuntime(measureDelayResult = 80L),
+            quicRepository = quicRepository,
+        )
+
+        val outcome = harness.controller.requestStart(TransportKind.QUIC)
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(XrayConfigRenderer.render(validQuicProfile.toXrayVlessQuicConfig()), harness.coreRuntime.lastStartedConfigContent)
     }
 }

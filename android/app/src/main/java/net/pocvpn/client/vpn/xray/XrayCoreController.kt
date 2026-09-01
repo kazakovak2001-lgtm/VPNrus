@@ -30,6 +30,15 @@ sealed class XrayCoreStartOutcome {
 
     /** startLoop() itself threw - the just-established tun is closed before returning. */
     data class CoreStartFailed(val reason: String) : XrayCoreStartOutcome()
+
+    /**
+     * B21-fix - startLoop() itself returned without throwing, but
+     * [XrayDataPlaneReadinessCheck] then failed or timed out: the core is
+     * stopped and the tun closed before this is returned, so this is never
+     * reported as Connected (see [XrayDataPlaneReadiness] for why this check
+     * exists - closes the exact false-positive the physical QUIC test found).
+     */
+    data class DataPlaneNotReady(val reason: String) : XrayCoreStartOutcome()
 }
 
 /** Result of one [XrayCoreController.requestStop] call. */
@@ -73,6 +82,11 @@ class XrayCoreController(
     // simply rejects, the same fail-closed shape as a missing REALITY/TLS
     // profile, never a crash.
     private val quicRepository: XrayQuicProfileRepository? = null,
+    // B21-fix - additive, defaults to the real check's own default timeout so
+    // every existing real call site (NovaXrayVpnService) is unaffected; a
+    // test seam only (see XrayCoreControllerTest) so a readiness-timeout test
+    // does not have to actually wait out the real 8s default.
+    private val dataPlaneReadinessTimeoutMs: Long = XrayDataPlaneReadinessCheck.DEFAULT_TIMEOUT_MS,
 ) {
     private val lifecycleGate = XrayServiceLifecycleGate()
 
@@ -143,8 +157,27 @@ class XrayCoreController(
             return try {
                 ensureCoreEnvInitialized()
                 coreRuntime.startLoop(ready.renderedConfig, fd)
-                success = true
-                XrayCoreStartOutcome.Started
+                // B21-fix - startLoop() not throwing only proves the Go
+                // runtime's goroutines launched, never that a real proxied
+                // session exists (the exact false positive the physical QUIC
+                // test found) - Started is reported only once a real
+                // data-plane check succeeds.
+                when (val readiness = XrayDataPlaneReadinessCheck.check(coreRuntime, timeoutMs = dataPlaneReadinessTimeoutMs)) {
+                    is XrayDataPlaneReadiness.Ready -> {
+                        success = true
+                        XrayCoreStartOutcome.Started
+                    }
+                    is XrayDataPlaneReadiness.Timeout -> {
+                        runCatching { coreRuntime.stopLoop() }
+                        closeTun()
+                        XrayCoreStartOutcome.DataPlaneNotReady("timeout")
+                    }
+                    is XrayDataPlaneReadiness.Failed -> {
+                        runCatching { coreRuntime.stopLoop() }
+                        closeTun()
+                        XrayCoreStartOutcome.DataPlaneNotReady(readiness.reason)
+                    }
+                }
             } catch (t: Throwable) {
                 closeTun()
                 XrayCoreStartOutcome.CoreStartFailed(t.javaClass.simpleName)

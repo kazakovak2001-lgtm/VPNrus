@@ -489,6 +489,37 @@ transports, analogous to AWG's) is a real, separate future slice, not
 performed here. QUIC remains at FOUNDATION - not one real completed
 proxied session exists yet.
 
+**B21 continuation 2 - Android binary audit (rules out the AAR itself),
+false-positive Connected closed for the whole Xray family**: direct
+string/symbol inspection of the shipped `libv2ray-androidlibxraylite-
+c634d1b.aar`'s native `libgojni.so` (all four ABIs) confirms XHTTP/H3/
+quic-go ARE linked in - `"listening QUIC for XHTTP/3 on"`,
+`"XHTTP stream-one H2 & H3"`, and the full quic-go/http3 symbol set are
+present. The AAR is not the gap. `javap` against the AAR's own
+`classes.jar` shows its Java API exposes no separate socket/protect
+callback at all (`newCoreController(CoreCallbackHandler)`,
+`registerProcessFinder`, `measureDelay` - nothing protect-shaped) - the
+per-app-UID `addDisallowedApplication` bypass this shell already uses for
+REALITY/TLS_TCP is the AAR's only bypass mechanism, unchanged for QUIC, so
+it is not a differential suspect either. The two real, fixed gaps: (1)
+`XrayCoreRuntime`'s `CoreCallbackHandler` was a `NoopCoreCallbackHandler`
+that discarded every xray-core startup/shutdown/status line - the ONE
+channel the Go runtime had for reporting a config-load or dial failure was
+thrown away client-side before this fix; it is now `XrayCoreDiagnostics`
+(DEBUG-only, bounded, sanitized). (2) `XrayCoreController.requestStart`
+now requires a real `XrayDataPlaneReadinessCheck` (wraps the AAR's own
+`CoreController.measureDelay(url)` - the one genuine "outbound actually
+passes traffic" signal this AAR exports - with a bounded timeout) to
+succeed before ever reporting `Started`/`Connected`, for REALITY/TLS_TCP/
+QUIC alike; a timeout or dial failure now stops the just-started core,
+closes the tun, and reports a typed `DataPlaneNotReady` failure instead.
+QUIC's own client-side root cause (why zero packets left the device) is
+still not physically isolated - this fix makes that failure visible and
+non-Connected instead of silently false-positive; a physical Frankfurt
+retest with the new diagnostics attached is the next real step and has
+not been performed from this environment (no physical device attached
+here).
+
 ## Config resolution atomicity
 
 `SelectedProductionGatewaySource.snapshot()` resolves the selected gateway id exactly
