@@ -53,6 +53,13 @@ fun DiagnosticsDialog(
     // consistency testing - see MainViewModel.debugSetTransportPreference's
     // own docs. Never itself reconnects.
     onForceXrayTest: () -> Unit,
+    // B19 physical-validation follow-up - debug-only: writes a REAL
+    // FAILURE/SUCCESS ConnectionOutcome + PathHistory entry for Frankfurt
+    // AWG into the SAME stores the real Auto ranking pipeline reads - see
+    // MainViewModel.debugRecordConnectionFailure/Success's own docs. Never
+    // itself starts/reconnects anything.
+    onSimulateAwgFailure: () -> Unit,
+    onSimulateAwgSuccess: () -> Unit,
     // B18 physical-validation follow-up - debug-only: opens the REAL
     // ActivationScreen for an ALREADY-provisioned gateway (AppRoot's own
     // `activatingGatewayId` state - the SAME mechanism B15 built for an
@@ -110,6 +117,12 @@ fun DiagnosticsDialog(
                 }
                 TextButton(onClick = onForceXrayTest, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_force_xray_test))
+                }
+                TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.diagnostics_simulate_awg_failure))
+                }
+                TextButton(onClick = onSimulateAwgSuccess, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.diagnostics_simulate_awg_success))
                 }
                 TextButton(onClick = onReactivateGermany, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_reactivate_germany))

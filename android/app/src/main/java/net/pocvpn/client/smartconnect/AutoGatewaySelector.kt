@@ -4,11 +4,14 @@ import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.PathCandidate
 import net.pocvpn.client.reachability.PathCandidateBuilder
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
+import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportHealth
+import net.pocvpn.client.transport.TransportHealthState
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportRegistry
 import net.pocvpn.client.transport.UserTransportPreference
@@ -112,6 +115,11 @@ object AutoGatewaySelector {
         transportHealthFor: (TransportKind) -> TransportHealth,
         historyFor: (EndpointId, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
+        // B19 - threaded straight into PathScorer.score's own bounded,
+        // time-decaying cooldown penalty (see that function's own docs).
+        // Defaults to Long.MAX_VALUE - same "byte-for-byte unaffected unless
+        // a caller opts in" contract PathScorer.score itself documents.
+        nowEpochMillis: Long = Long.MAX_VALUE,
     ): List<GatewayAttemptCandidate> {
         val eligible = manifestEndpoints.mapNotNull { manifestEndpoint ->
             val gateway = gatewayFactsFor(manifestEndpoint.id) ?: return@mapNotNull null
@@ -120,16 +128,25 @@ object AutoGatewaySelector {
         }
         val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
 
-        // Keyed by PathCandidate.Direct.id ("direct:<transport>:<endpointId>") -
-        // already unique per (gateway, transport) pair, so this survives
-        // PathScorer.rank()'s reordering without relying on object identity.
-        // [binding] is the EXACT manifest transport binding this specific
-        // candidate was built from - carried alongside the score so the
-        // eventual GatewayConfigSnapshot's endpointHost/endpointPort are
-        // resolved from THIS binding, never re-derived from the catalog
-        // (see snapshotFor's own docs - the B17-2 runtime-authority fix).
-        val scoredByCandidateId = LinkedHashMap<String, Triple<ProductionGatewayDescriptor, EndpointTransportBinding, PathScorer.PathScoreResult>>()
+        // B19 - a small, private, PRE-scoring pass: everything PathScorer.score
+        // needs, gathered once per (gateway, transport) so the diversity bonus
+        // below can be computed as a genuine per-candidate signal instead of
+        // a single batch-wide Boolean (the exact bug this fixes - see
+        // PathScorer's own docs and docs/ROADMAP.md's "Endpoint / Path
+        // Reachability Fabric" row history for why the old call site was
+        // disabled).
+        data class Prepared(
+            val gateway: ProductionGatewayDescriptor,
+            val binding: EndpointTransportBinding,
+            val candidate: PathCandidate,
+            val registry: TransportRegistry,
+            val capabilities: TransportCapabilities,
+            val transportHealth: TransportHealth,
+            val history: PathHistoryEntry?,
+            val diversityKey: String,
+        )
 
+        val prepared = mutableListOf<Prepared>()
         eligible.forEach { (gateway, manifestEndpoint) ->
             // Local per-device profile availability gates WHICH of the
             // manifest's declared transport bindings this device can
@@ -148,22 +165,57 @@ object AutoGatewaySelector {
             if (availableTransports.isEmpty()) return@forEach
             val endpoint = manifestEndpoint.copy(transports = availableTransports)
             val registry = registryFor(gateway.endpointId)
+            // B19 - the manifest's OWN provider/ASN (never the catalog's,
+            // and never a fabricated preference) - prefers ASN when the
+            // manifest names one (a strictly finer-grained signal than
+            // provider name alone), falling back to provider.
+            val diversityKey = endpoint.asn?.toString() ?: endpoint.provider
             endpoint.transports
                 .filter { pinnedKind == null || it.kind == pinnedKind }
                 .forEach { binding ->
                     val kind = binding.kind
                     val candidate = PathCandidateBuilder.buildDirect(endpoint, kind, reachabilityFor(gateway.endpointId, kind)) ?: return@forEach
                     val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
-                    val result = PathScorer.score(
-                        candidate = candidate,
-                        registry = registry,
-                        capabilities = capabilities,
-                        transportHealth = transportHealthFor(kind),
-                        history = historyFor(gateway.endpointId, kind),
-                        diverseProviderOrAsnSeenElsewhere = false,
-                    )
-                    if (result.eligible) scoredByCandidateId[candidate.id] = Triple(gateway, binding, result)
+                    prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(gateway.endpointId, kind), diversityKey)
                 }
+        }
+
+        // B19 - "troubled" providers/ASNs: ones this same batch already has
+        // fresh negative evidence for (degraded/unreachable transport
+        // health, a degraded/unreachable reachability read, or an active
+        // this-network failure streak). A candidate whose OWN provider/ASN
+        // is troubled never gets its own bonus (diversifying AWAY FROM
+        // yourself makes no sense); a candidate on a clean provider/ASN gets
+        // the bonus only when a genuinely troubled alternative exists
+        // elsewhere in this batch - never an identical bonus handed to
+        // every candidate regardless of the batch's actual composition.
+        val troubledDiversityKeys = prepared.filter { p ->
+            p.transportHealth.state == TransportHealthState.DEGRADED || p.transportHealth.state == TransportHealthState.UNREACHABLE ||
+                p.candidate.hops.any { it.reachability.state == ReachabilityState.DEGRADED || it.reachability.state == ReachabilityState.UNREACHABLE } ||
+                (p.history?.consecutiveFailures ?: 0) > 0
+        }.map { it.diversityKey }.toSet()
+
+        // Keyed by PathCandidate.Direct.id ("direct:<transport>:<endpointId>") -
+        // already unique per (gateway, transport) pair, so this survives
+        // PathScorer.rank()'s reordering without relying on object identity.
+        // [binding] is the EXACT manifest transport binding this specific
+        // candidate was built from - carried alongside the score so the
+        // eventual GatewayConfigSnapshot's endpointHost/endpointPort are
+        // resolved from THIS binding, never re-derived from the catalog
+        // (see snapshotFor's own docs - the B17-2 runtime-authority fix).
+        val scoredByCandidateId = LinkedHashMap<String, Triple<ProductionGatewayDescriptor, EndpointTransportBinding, PathScorer.PathScoreResult>>()
+        prepared.forEach { p ->
+            val diverse = troubledDiversityKeys.isNotEmpty() && p.diversityKey !in troubledDiversityKeys
+            val result = PathScorer.score(
+                candidate = p.candidate,
+                registry = p.registry,
+                capabilities = p.capabilities,
+                transportHealth = p.transportHealth,
+                history = p.history,
+                diverseProviderOrAsnSeenElsewhere = diverse,
+                nowEpochMillis = nowEpochMillis,
+            )
+            if (result.eligible) scoredByCandidateId[p.candidate.id] = Triple(p.gateway, p.binding, result)
         }
 
         val ranked = PathScorer.rank(scoredByCandidateId.values.map { it.third })

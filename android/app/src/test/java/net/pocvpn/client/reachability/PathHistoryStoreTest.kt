@@ -97,6 +97,35 @@ class PathHistoryStoreTest {
         assertTrue("concurrent access must never throw: $errors", errors.isEmpty())
     }
 
+    // --- B19: consecutiveFailures (the recent streak PathScorer's cooldown penalty is keyed on) ---
+
+    @Test
+    fun `consecutiveFailures increments on each failure and resets to 0 on any success`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder())
+        val key = Triple("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)
+        store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 1L)
+        store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 2L)
+        store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 3L)
+        assertEquals(3, store.get(key.first, key.second, key.third)!!.consecutiveFailures)
+
+        store.record(key.first, key.second, key.third, success = true, nowEpochMillis = 4L)
+        assertEquals(0, store.get(key.first, key.second, key.third)!!.consecutiveFailures)
+
+        store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 5L)
+        assertEquals(1, store.get(key.first, key.second, key.third)!!.consecutiveFailures)
+    }
+
+    @Test
+    fun `consecutiveFailures survives a simulated restart`() {
+        val dir = tempFolder.newFolder()
+        val store = FilePathHistoryStore(dir)
+        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
+        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 2L)
+
+        val reopened = FilePathHistoryStore(dir)
+        assertEquals(2, reopened.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)!!.consecutiveFailures)
+    }
+
     @Test
     fun `PathHistoryEntry's field set structurally cannot hold raw identifying network data`() {
         val fields = PathHistoryEntry::class.java.declaredFields.map { it.name }.toSet()

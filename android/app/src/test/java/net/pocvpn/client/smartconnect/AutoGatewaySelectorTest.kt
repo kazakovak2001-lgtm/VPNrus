@@ -284,4 +284,219 @@ class AutoGatewaySelectorTest {
         val attempted = many.take(AutoGatewaySelector.MAX_ATTEMPTS).map { it.gatewayId to it.transport }.toSet()
         assertNull(AutoGatewaySelector.nextCandidate(many, attempted))
     }
+
+    // --- B19: health/reachability become genuinely decision-driving for Auto ranking ---
+
+    /** The task's own headline scenario, verified at the real production caller. */
+    @Test
+    fun `fresh AWG UNREACHABLE plus REALITY REACHABLE ranks REALITY first for the same gateway`() {
+        val bothTransports = EndpointDescriptor(
+            id = ProductionGatewayCatalog.GERMANY.endpointId,
+            roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+            region = "Germany / Frankfurt",
+            provider = ProductionGatewayCatalog.GERMANY.provider,
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.9", 443),
+            ),
+        )
+        val dualRegistry = TransportRegistry.build(
+            listOf(
+                TransportDescriptor(kind = TransportKind.AMNEZIA_WG, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { throw UnsupportedOperationException() }),
+                TransportDescriptor(kind = TransportKind.XRAY_REALITY, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.xrayRealityAdapterShell(), factory = { throw UnsupportedOperationException() }),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(bothTransports),
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { dualRegistry },
+            xrayAvailableFor = { true },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind ->
+                val state = if (kind == TransportKind.AMNEZIA_WG) ReachabilityState.UNREACHABLE else ReachabilityState.REACHABLE
+                EndpointReachability(
+                    endpointId, kind, state,
+                    evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, state == ReachabilityState.REACHABLE, true, RestrictionClass.UNKNOWN),
+                )
+            },
+            transportHealthFor = { kind -> TransportHealth(state = if (kind == TransportKind.AMNEZIA_WG) TransportHealthState.UNREACHABLE else TransportHealthState.HEALTHY) },
+            historyFor = { _, _ -> null },
+        )
+
+        // B19-3 - fresh UNREACHABLE now makes AWG genuinely INELIGIBLE, not
+        // merely low-ranked: it must be entirely ABSENT from the executable
+        // plan, and therefore never attempted at all - never consuming a
+        // MAX_ATTEMPTS slot or appearing from nextCandidate.
+        assertEquals(listOf(TransportKind.XRAY_REALITY), candidates.map { it.transport })
+        var attempted = emptySet<Pair<ProductionGatewayId, TransportKind>>()
+        var next = AutoGatewaySelector.nextCandidate(candidates, attempted)
+        while (next != null) {
+            assertTrue("AWG must never be attempted from a plan where it was ineligible", next.transport != TransportKind.AMNEZIA_WG)
+            attempted = attempted + (next.gatewayId to next.transport)
+            next = AutoGatewaySelector.nextCandidate(candidates, attempted)
+        }
+    }
+
+    @Test
+    fun `AWG DEGRADED plus REALITY HEALTHY - dynamic evidence reorders past the static AMNEZIA_WG preference`() {
+        val bothTransports = EndpointDescriptor(
+            id = ProductionGatewayCatalog.GERMANY.endpointId,
+            roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+            region = "Germany / Frankfurt",
+            provider = ProductionGatewayCatalog.GERMANY.provider,
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.9", 443),
+            ),
+        )
+        val dualRegistry = TransportRegistry.build(
+            listOf(
+                TransportDescriptor(kind = TransportKind.AMNEZIA_WG, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { throw UnsupportedOperationException() }),
+                TransportDescriptor(kind = TransportKind.XRAY_REALITY, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.xrayRealityAdapterShell(), factory = { throw UnsupportedOperationException() }),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(bothTransports),
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { dualRegistry },
+            xrayAvailableFor = { true },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind ->
+                val state = if (kind == TransportKind.AMNEZIA_WG) ReachabilityState.DEGRADED else ReachabilityState.REACHABLE
+                EndpointReachability(endpointId, kind, state, evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN))
+            },
+            transportHealthFor = { kind -> TransportHealth(state = if (kind == TransportKind.AMNEZIA_WG) TransportHealthState.DEGRADED else TransportHealthState.HEALTHY) },
+            historyFor = { _, _ -> null },
+        )
+
+        assertEquals(TransportKind.XRAY_REALITY, candidates.first().transport)
+    }
+
+    @Test
+    fun `when all dynamic evidence is UNKNOWN, static transport preference (AMNEZIA_WG first) determines order`() {
+        val bothTransports = EndpointDescriptor(
+            id = ProductionGatewayCatalog.GERMANY.endpointId,
+            roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+            region = "Germany / Frankfurt",
+            provider = ProductionGatewayCatalog.GERMANY.provider,
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.9", 443),
+            ),
+        )
+        val dualRegistry = TransportRegistry.build(
+            listOf(
+                TransportDescriptor(kind = TransportKind.AMNEZIA_WG, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { throw UnsupportedOperationException() }),
+                TransportDescriptor(kind = TransportKind.XRAY_REALITY, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.xrayRealityAdapterShell(), factory = { throw UnsupportedOperationException() }),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(bothTransports),
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { dualRegistry },
+            xrayAvailableFor = { true },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind ->
+                EndpointReachability(endpointId, kind, ReachabilityState.UNKNOWN, evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN))
+            },
+            transportHealthFor = { TransportHealth(state = TransportHealthState.UNKNOWN) },
+            historyFor = { _, _ -> null },
+        )
+
+        assertEquals(TransportKind.AMNEZIA_WG, candidates.first().transport)
+    }
+
+    // --- B19: diversity bonus is a real per-candidate signal, never an identical batch-wide bonus ---
+
+    @Test
+    fun `a candidate on a clean provider gets the diversity bonus only when a troubled provider exists in the batch`() {
+        // GERMANY (Oracle Cloud) is made UNREACHABLE/DEGRADED - a genuinely troubled provider;
+        // STOCKHOLM (AWS eu-north-1) is clean and should pick up the bonus.
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = bothManifestEndpoints,
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry() },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind ->
+                val degraded = endpointId == germanyId
+                val state = if (degraded) ReachabilityState.DEGRADED else ReachabilityState.REACHABLE
+                EndpointReachability(endpointId, kind, state, evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN))
+            },
+            transportHealthFor = { TransportHealth(state = TransportHealthState.HEALTHY) },
+            historyFor = { _, _ -> null },
+        )
+        val stockholm = candidates.first { it.gatewayId == ProductionGatewayId.STOCKHOLM }
+        assertTrue("expected a diversity-bonus reason for the clean provider: ${stockholm.reasons}", stockholm.reasons.any { it.startsWith("diversityBonus") })
+    }
+
+    @Test
+    fun `no diversity bonus anywhere when nothing in the batch is troubled`() {
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = bothManifestEndpoints,
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry() },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind -> reachable(endpointId, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        assertTrue(candidates.none { c -> c.reasons.any { it.startsWith("diversityBonus") } })
+    }
+
+    @Test
+    fun `a troubled provider never grants itself the diversity bonus`() {
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = bothManifestEndpoints,
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry() },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind ->
+                val degraded = endpointId == germanyId
+                val state = if (degraded) ReachabilityState.DEGRADED else ReachabilityState.REACHABLE
+                EndpointReachability(endpointId, kind, state, evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN))
+            },
+            transportHealthFor = { TransportHealth(state = TransportHealthState.HEALTHY) },
+            historyFor = { _, _ -> null },
+        )
+        val germany = candidates.first { it.gatewayId == ProductionGatewayId.GERMANY }
+        assertTrue(germany.reasons.none { it.startsWith("diversityBonus") })
+    }
+
+    // --- B19: stale UNREACHABLE evidence decays back to eligible/UNKNOWN, never a permanent exclusion ---
+
+    @Test
+    fun `stale endpoint-specific unreachable evidence decays to UNKNOWN and the candidate remains eligible`() {
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(manifestEndpointFor(ProductionGatewayCatalog.GERMANY)),
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry() },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { endpointId, kind ->
+                // A stale (old) UNKNOWN-health, no-endpoint-evidence read - exactly what
+                // ReachabilityEngine.assess produces once earlier bad evidence has expired.
+                EndpointReachability(endpointId, kind, ReachabilityState.UNKNOWN, evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN))
+            },
+            transportHealthFor = { TransportHealth(state = TransportHealthState.UNKNOWN) },
+            historyFor = { _, _ -> null },
+        )
+        assertEquals(1, candidates.size)
+    }
 }

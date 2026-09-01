@@ -152,6 +152,67 @@ NetworkProfiler
   unchanged and governs ONLY Manual mode (`autoContext == null`) - it does
   NOT additionally run "within" an Auto sequence's current gateway.
 
+## Health-aware Auto ranking (B19)
+
+- `AutoGatewaySelector`/`PathScorer` remain the SINGLE decision authority for
+  automatic gateway+transport ranking (unchanged architecture, B16) - B19 only
+  fixes/extends what feeds that one scorer, never adds a second one.
+  `SmartConnectDecisionEngine.decideAuto` (Manual-gateway-mode's own transport
+  picker) deliberately still ignores `TransportHealth` - the two authorities
+  are never merged (architecture principle 1).
+- **Diversity bonus fix**: `PathScorer.score`'s `diverseProviderOrAsnSeenElsewhere`
+  is now a genuine PER-CANDIDATE signal computed by `AutoGatewaySelector` (a
+  pre-pass identifies provider/ASN keys with fresh negative evidence in the
+  current batch; only a candidate on a different, non-troubled provider/ASN
+  gets the bonus, and only when a troubled alternative actually exists) -
+  never an identical batch-wide Boolean (the B12-era bug this replaces).
+- **Bounded failure cooldown**: `PathHistoryEntry.consecutiveFailures` (the
+  RECENT streak, distinct from the lifetime `failureCount`) drives a capped,
+  time-decaying penalty in `PathScorer.score` (`FAILURE_COOLDOWN_WINDOW_MILLIS`) -
+  resets to 0 on the next success, expires on its own after the window, never
+  a permanent blacklist, never a second persistence system (same
+  `FilePathHistoryStore` file, format version bumped 1->2).
+- **Typed reasons**: `PathScorer.Reason` (`ENDPOINT_REACHABLE`/`TRANSPORT_HEALTHY`/
+  `FAILURE_COOLDOWN`/`DIVERSITY_BONUS`/etc) are appended to `PathScoreResult
+  .reasons` alongside the pre-existing free-text summaries - never replacing
+  them, so no pre-B19 reader breaks.
+- Precedence (unchanged, B11-established, re-verified this pass): fresh
+  endpoint-specific reachability > transport-wide health > this-network
+  history > capability maturity > small latency/failure/cooldown/diversity
+  adjustments - enforced by `PathScorer`'s own order-of-magnitude tiering,
+  never a flat weighted sum.
+- **Eligibility (B19-3, a separate concern from ranking, checked first in
+  `PathScorer.isEligible`/`ineligibilityReason` - the ONE place, never a
+  second filtering layer in `AutoGatewaySelector`/`MainViewModel`/
+  `TransportOrchestrator`)**: fresh endpoint-specific `ReachabilityState
+  .UNREACHABLE` -> ineligible regardless of transport health (the strongest,
+  most specific signal); `TransportHealthState.NOT_IMPLEMENTED` ->
+  ineligible; transport-wide `TransportHealthState.UNREACHABLE` ->
+  ineligible UNLESS some hop is fresh-confirmed `REACHABLE` (fresh
+  endpoint-specific evidence is never overridden by a coarser transport-wide
+  claim); `DEGRADED`/`UNKNOWN` on either signal remain eligible, penalized
+  only by scoring. Stale evidence never needs a second freshness check here -
+  `ReachabilityEngine.assess` already decays it to `UNKNOWN` before
+  `PathScorer` ever sees it. An ineligible `PathScoreResult` (`score =
+  Long.MIN_VALUE`) never becomes an executable `GatewayAttemptCandidate` -
+  `AutoGatewaySelector` already only promotes `eligible == true` results, so
+  an ineligible candidate structurally never consumes a `MAX_ATTEMPTS` slot.
+- **Physically verified end to end (2026-09-01)**: on the real test device,
+  in real Auto mode, two real `FAILURE` outcomes for Frankfurt AWG (written
+  via a minimal debug-only Diagnostics button - `MainViewModel
+  .debugRecordConnectionFailure` - through the EXACT SAME `ConnectionOutcomeStore`/
+  `FilePathHistoryStore` a real failed attempt already writes to, no server
+  config touched) demoted Frankfurt AWG to last place
+  (`ENDPOINT_UNREACHABLE`/`TRANSPORT_UNREACHABLE`/`FAILURE_COOLDOWN`,
+  score=-1080) and promoted Frankfurt XRAY_REALITY to first
+  (score=2020000); connecting genuinely executed XRAY_REALITY and reached
+  `Protected`. A real-shaped `SUCCESS` write plus a real (non-simulated) AWG
+  connection restored AWG to first place
+  (`RECENT_SUCCESS_THIS_NETWORK`, score=3030975) and executed AWG again.
+  Transport preference stayed `Auto` throughout - the reordering came
+  entirely from ranking evidence, never from `AwgXrayFailoverPolicy` or a
+  manual override. Device left clean (Auto/Auto, no fault, `Protected`).
+
 ## Routing decision vs transport/gateway selection (hard invariant, B18)
 
 - `RoutingDecisionEngine.decideAdaptiveRoute` (`smartconnect/RoutingDecisionEngine.kt`)
@@ -312,6 +373,14 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
+Last updated: 2026-09-01 (B19 - added the "Health-aware Auto ranking" section
+above: fixed the disabled provider/ASN diversity bonus and added a bounded,
+time-decaying failure cooldown to PathScorer, both consumed only by
+AutoGatewaySelector - the single, unchanged Auto decision authority. Physically
+validated end to end on a real device this pass (baseline, controlled
+dynamic reordering via debug-injected real evidence, restore) - see this
+section's own closing paragraph. Existing suite (878 tests) unaffected.)
+
 Last updated: 2026-09-01 (B18/B18-2 - added the "Routing decision vs transport/
 gateway selection" section above: RoutingMode/RoutingDecisionEngine
 .decideAdaptiveRoute is the real, live DIRECT-vs-VPN authority, route-prefix-

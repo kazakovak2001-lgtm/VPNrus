@@ -1140,6 +1140,55 @@ class MainViewModel(
         userTransportPreference = preference
     }
 
+    /**
+     * B19 physical-validation debug-only helper - writes a REAL FAILURE
+     * [ConnectionOutcome] and a REAL failed [net.pocvpn.client.reachability
+     * .PathHistoryStore] entry into the EXACT SAME [connectionOutcomeStore]/
+     * [pathHistoryStore] the real Auto ranking pipeline reads
+     * ([buildAutoGatewayCandidates]'s own `transportHealthFor`/`historyFor`/
+     * `reachabilityFor` closures) - never a fake/parallel evidence channel,
+     * never a second store. Lets a debug build physically exercise the real
+     * health-aware reordering (fresh negative evidence -> lower
+     * `TransportHealth`/`EndpointReachability`/cooldown) for [kind] at
+     * [endpointId] without touching production server config, AWG peer
+     * config, or provisioning identity - this only ever writes to this
+     * device's own local, already-existing evidence stores, the same way a
+     * real failed connection attempt already would via
+     * `VpnController.recordConnectionOutcome`/`recordPathHistory`. See
+     * [debugRecordConnectionSuccess] for the exact reverse (restore) action.
+     * No product UI calls this.
+     */
+    fun debugRecordConnectionFailure(kind: TransportKind, endpointId: net.pocvpn.client.reachability.EndpointId) {
+        recordDebugOutcome(kind, endpointId, success = false)
+    }
+
+    /** B19 physical-validation debug-only helper - see [debugRecordConnectionFailure]'s own docs; this is the exact reverse (a real SUCCESS outcome), used to physically prove a streak clears/recovers. */
+    fun debugRecordConnectionSuccess(kind: TransportKind, endpointId: net.pocvpn.client.reachability.EndpointId) {
+        recordDebugOutcome(kind, endpointId, success = true)
+    }
+
+    private fun recordDebugOutcome(kind: TransportKind, endpointId: net.pocvpn.client.reachability.EndpointId, success: Boolean) {
+        val nowMs = System.currentTimeMillis()
+        connectionOutcomeStore?.record(
+            ConnectionOutcome(
+                transport = kind,
+                gatewayId = endpointId.value,
+                result = if (success) ConnectionOutcomeResult.SUCCESS else ConnectionOutcomeResult.FAILURE,
+                handshakeDurationMs = if (success) 500L else null,
+                errorCategory = if (success) net.pocvpn.client.smartconnect.ConnectionErrorCategory.NONE else net.pocvpn.client.smartconnect.ConnectionErrorCategory.HANDSHAKE_TIMEOUT,
+                timestampEpochMillis = nowMs,
+            ),
+        )
+        val profile = networkProfile.value
+        val fingerprint = fingerprintKeyProvider?.let {
+            net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+                net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+                it.keyBytes(),
+            )
+        }
+        fingerprint?.let { pathHistoryStore?.record(it, endpointId, kind, success = success, nowEpochMillis = nowMs) }
+    }
+
     private val _publicKey = MutableStateFlow<String?>(null)
     val publicKey: StateFlow<String?> = _publicKey.asStateFlow()
 
@@ -1718,6 +1767,7 @@ class MainViewModel(
             transportHealthFor = { kind -> health.getValue(kind) },
             historyFor = { endpointId, kind -> fingerprint?.let { pathHistoryStore?.get(it, endpointId, kind) } },
             preference = userTransportPreference,
+            nowEpochMillis = now,
         )
     }
 

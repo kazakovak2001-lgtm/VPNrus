@@ -267,6 +267,18 @@ fun AppRoot(
                     net.pocvpn.client.transport.UserTransportPreference.Manual(net.pocvpn.client.transport.TransportKind.XRAY_REALITY),
                 )
             },
+            onSimulateAwgFailure = {
+                viewModel.debugRecordConnectionFailure(
+                    net.pocvpn.client.transport.TransportKind.AMNEZIA_WG,
+                    net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID),
+                )
+            },
+            onSimulateAwgSuccess = {
+                viewModel.debugRecordConnectionSuccess(
+                    net.pocvpn.client.transport.TransportKind.AMNEZIA_WG,
+                    net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.smartconnect.ProductionGateway.ID),
+                )
+            },
             onReactivateGermany = {
                 activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY
                 showDiagnostics = false
@@ -420,10 +432,17 @@ private fun buildDiagnosticsLines(
     // is currently active, the full attempt history for the LAST connect()
     // request, and the most recent failure category if any.
     val gatewayAutoModeLine = "Gateway mode: ${if (viewModel.gatewayAutoMode.value) "AUTO" else "MANUAL"}"
+    // B19 - each candidate's typed reason tokens (PathScorer.Reason - the
+    // free-text "key=value" entries in the same list are skipped here to
+    // keep this line readable; the full mixed list remains available to
+    // anything reading GatewayAttemptCandidate.reasons directly) are
+    // appended so this diagnostic line answers "why this order", not just
+    // "what order" - never a secret, only typed evidence tokens.
     val autoCandidatesLine = if (viewModel.gatewayAutoMode.value) {
         "Auto candidates (ranked): ${
             viewModel.autoGatewayCandidates().joinToString {
-                "${it.gatewayId}/${it.transport}(score=${it.score})"
+                val typedReasons = it.reasons.filter { r -> r.all { ch -> ch.isUpperCase() || ch == '_' } }
+                "${it.gatewayId}/${it.transport}(score=${it.score}${typedReasons.ifEmpty { null }?.let { r -> ",${r.joinToString(",")}" } ?: ""})"
             }.ifEmpty { "NONE" }
         }"
     } else {
