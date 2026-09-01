@@ -267,6 +267,10 @@ fun AppRoot(
                     net.pocvpn.client.transport.UserTransportPreference.Manual(net.pocvpn.client.transport.TransportKind.XRAY_REALITY),
                 )
             },
+            onReactivateGermany = {
+                activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY
+                showDiagnostics = false
+            },
             onDismiss = { showDiagnostics = false },
         )
     }

@@ -53,6 +53,15 @@ fun DiagnosticsDialog(
     // consistency testing - see MainViewModel.debugSetTransportPreference's
     // own docs. Never itself reconnects.
     onForceXrayTest: () -> Unit,
+    // B18 physical-validation follow-up - debug-only: opens the REAL
+    // ActivationScreen for an ALREADY-provisioned gateway (AppRoot's own
+    // `activatingGatewayId` state - the SAME mechanism B15 built for an
+    // unprovisioned ADDITIONAL gateway, see GatewayPickerDialog's own docs -
+    // this just reaches it for a gateway this device already has a, possibly
+    // stale, identity for). Never a second activation path: the resulting
+    // screen calls the SAME MainViewModel.activateDevice(credential,
+    // targetGatewayId) every other activation flow uses.
+    onReactivateGermany: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
@@ -101,6 +110,9 @@ fun DiagnosticsDialog(
                 }
                 TextButton(onClick = onForceXrayTest, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_force_xray_test))
+                }
+                TextButton(onClick = onReactivateGermany, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.diagnostics_reactivate_germany))
                 }
                 TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_close))

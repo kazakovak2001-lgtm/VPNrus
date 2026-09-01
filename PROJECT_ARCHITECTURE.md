@@ -196,30 +196,44 @@ NetworkProfiler
   only `RestrictionClass.NO_NETWORK` changes `resolveIpv4Routes`'s output,
   and `UNKNOWN` yields the identical route set AWG yields for every other
   class, so both transports' ADAPTIVE route sets are provably identical for
-  every reachable live case. **Physically verified (2026-09-01)**: a real
-  device's live `dumpsys connectivity` route table for `tun0` was checked
-  directly before/after switching `RoutingMode` - Full VPN shows plain
-  `0.0.0.0/0`/`::/0`; Adaptive shows the exact
+  every reachable live case. **Physically verified end to end (2026-09-01) -
+  IMPLEMENTED**: a real device's live `dumpsys connectivity` route table for
+  `tun0` was checked directly before/after switching `RoutingMode` - Full
+  VPN shows plain `0.0.0.0/0`/`::/0`; Adaptive shows the exact
   `Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES` complement. **Xray/TLS
-  consistency is now physically proven too**: a genuinely minimal
-  debug-only trigger (`MainViewModel.debugSetTransportPreference`, one
-  button in the existing `isDebugBuild`-gated Diagnostics dialog) pins
+  consistency is physically proven**: a genuinely minimal debug-only
+  trigger (`MainViewModel.debugSetTransportPreference`, one button in the
+  existing `isDebugBuild`-gated Diagnostics dialog) pins
   `UserTransportPreference.Manual(XRAY_REALITY)` for the next `connect()` -
   a real mechanism `SmartConnectDecisionEngine`/`AutoGatewaySelector`
   already read but no product UI could reach - driving the REAL connect
   path end to end (never a second Xray connection path). The resulting live
   Xray `tun0` session's route table matched AWG's Adaptive session
   entry-for-entry, with `::/0 unreachable` confirming IPv6 fail-closed at
-  the OS level for Xray specifically. Still open: live end-to-end AWG
-  traffic/DNS-leak confirmation - `tun0` RX stays at zero bytes while TX
-  climbs normally, identically on two different client networks
-  (WiFi/cellular), ruling out a client-network cause; root cause is most
-  consistent with a server-side WireGuard forwarding/NAT condition for this
-  peer session, external to this PR's code (FULL_VPN's route table is
-  proven byte-identical to every prior successful validation) - SSH to the
-  gateway was attempted and rejected (no operator credentials in this
-  environment), so server-side confirmation isn't possible here. Adaptive
-  Direct Routing stays FOUNDATION solely for this reason.
+  the OS level for Xray specifically.
+  **Live AWG traffic/DNS - root-caused and fixed.** `tun0` RX stuck at zero
+  bytes (TX climbing normally, identically on WiFi and cellular) was
+  diagnosed via read-only SSH to the Frankfurt gateway: server-side data
+  plane (forwarding/NAT/FORWARD chain) was fully healthy throughout - the
+  defect was a stale `ClientTunnelIdentityStore[GERMANY]` value on this one
+  test device (`10.77.0.2`) that no longer matched the server's actual peer
+  registration for this device's public key (`10.77.0.5/32`, uniquely
+  assigned - `10.77.0.2` had since been reassigned to a different, active
+  peer). WireGuard's cryptokey routing silently drops decrypted packets
+  whose source doesn't match the peer's AllowedIPs, inside the kernel WG
+  module, before netfilter - exactly matching the symptom. Fixed by
+  re-provisioning through the REAL control-plane flow (a fresh activation
+  credential issued via the gateway's own operator tool, submitted through
+  the unmodified `MainViewModel.activateDevice`/`/v1/activate` path - never
+  a hand-edited store), reached via one more minimal debug-only Diagnostics
+  button ("Re-activate Germany") that opens the existing `ActivationScreen`
+  for an already-provisioned gateway (mirrors B15's own mechanism for an
+  unprovisioned one). After re-provisioning: `tun0` RX climbs normally, a
+  real request to `cdn-cgi/trace` returned `ip=152.70.43.1`/`loc=DE` in both
+  Full VPN and Adaptive modes - conclusive proof public/protected traffic
+  genuinely exits through the Frankfurt gateway in both modes, with DNS
+  validated through the tunnel (`ValidatedPrivateDnsAddresses`) and IPv6
+  unaffected. Device restored to Full VPN/Auto preference/clean afterward.
 
 ## Per-device identity (hard invariant)
 
@@ -305,8 +319,10 @@ level only, with RestrictionClassifier wired in conservatively. B18-2 extended
 live enforcement from AmneziaWG-only to ALL currently-live transports
 (AMNEZIA_WG/XRAY_REALITY/TLS_TCP) through one shared resolver
 (RoutingDecisionEngine.resolveIpv4Routes) - no second routing engine, no
-duplicated CIDR math. Everything below this line predates B18 and is
-unaffected by it.)
+duplicated CIDR math. Physical validation completed 2026-09-01 after fixing
+an unrelated stale-client-identity issue on the test device (see this
+section's own closing paragraph) - Adaptive Direct Routing is now
+IMPLEMENTED. Everything below this line predates B18 and is unaffected by it.)
 
 Last updated: 2026-09-01 (B17 - Auto gateway/path DISCOVERY runtime authority
 moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;

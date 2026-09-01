@@ -82,5 +82,6 @@
     <string name="diagnostics_copy_public_key">Copy public key</string>
     <string name="diagnostics_regenerate_identity">Regenerate identity (debug only)</string>
     <string name="diagnostics_force_xray_test">Force XRAY_REALITY on next connect (debug only)</string>
+    <string name="diagnostics_reactivate_germany">Re-activate Germany (debug only)</string>
     <string name="diagnostics_public_key_copied">Public key copied</string>
 </resources>
