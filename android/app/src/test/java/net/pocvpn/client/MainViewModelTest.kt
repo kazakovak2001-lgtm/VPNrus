@@ -21,8 +21,9 @@ import net.pocvpn.client.reachability.Ed25519ManifestVerifier
 import net.pocvpn.client.reachability.FileLastKnownGoodManifestStore
 import net.pocvpn.client.reachability.FixedManifestTrustAnchors
 import net.pocvpn.client.reachability.ManifestCanonicalizer
-import net.pocvpn.client.reachability.ManifestDistributionClient
 import net.pocvpn.client.reachability.ManifestFetchResult
+import net.pocvpn.client.reachability.ManifestOrigin
+import net.pocvpn.client.reachability.MultiOriginManifestDistributionClient
 import net.pocvpn.client.reachability.PathCandidate
 import net.pocvpn.client.reachability.RemoteManifestFetcher
 import net.pocvpn.client.reachability.SignedManifest
@@ -1743,9 +1744,20 @@ class MainViewModelTest {
         nowEpochMillis = { 2_000L },
     )
 
+    // B20 - wraps a single fake RemoteManifestFetcher as a one-origin
+    // MultiOriginManifestDistributionClient, so the pre-existing
+    // single-origin test scenarios below keep working unchanged against the
+    // now-multi-origin production type.
+    private fun singleOriginClient(fetcher: RemoteManifestFetcher, repository: EndpointManifestRepository) =
+        MultiOriginManifestDistributionClient(
+            origins = listOf(ManifestOrigin("test-origin", "https://manifest.test.invalid/v1/manifest")),
+            repository = repository,
+            fetcherFor = { fetcher },
+        )
+
     private fun buildViewModelWithManifest(
         repository: EndpointManifestRepository,
-        distributionClient: ManifestDistributionClient?,
+        distributionClient: MultiOriginManifestDistributionClient?,
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = FakeVpnTransport(),
@@ -1764,7 +1776,7 @@ class MainViewModelTest {
             fetchCount.incrementAndGet()
             ManifestFetchResult.Fetched(signTestManifest(testManifest(version = 2)))
         }
-        buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        buildViewModelWithManifest(repository, singleOriginClient(fetcher, repository))
         testDispatcher.scheduler.advanceUntilIdle()
 
         assertEquals(1, fetchCount.get())
@@ -1789,7 +1801,7 @@ class MainViewModelTest {
             delay(50) // hold the mutex long enough for concurrent callers to collide with it
             ManifestFetchResult.Fetched(signTestManifest(testManifest(version = 2)))
         }
-        val viewModel = buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        val viewModel = buildViewModelWithManifest(repository, singleOriginClient(fetcher, repository))
 
         // Fire several more refresh signals immediately, "concurrently" with
         // the init-triggered one and each other (all launched before any of
@@ -1805,7 +1817,7 @@ class MainViewModelTest {
     fun `a failed refresh (network error) leaves the currently trusted manifest completely untouched`() = runTest {
         val repository = testManifestRepository()
         val fetcher = RemoteManifestFetcher { ManifestFetchResult.Failed("network error: SocketTimeoutException") }
-        buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        buildViewModelWithManifest(repository, singleOriginClient(fetcher, repository))
         testDispatcher.scheduler.advanceUntilIdle()
 
         assertEquals(1, repository.trusted()!!.manifestVersion) // unchanged - still the bootstrap
@@ -1815,7 +1827,7 @@ class MainViewModelTest {
     fun `a successful valid newer manifest becomes the trusted manifest, reflected in reachabilityDiagnostics`() = runTest {
         val repository = testManifestRepository()
         val fetcher = RemoteManifestFetcher { ManifestFetchResult.Fetched(signTestManifest(testManifest(version = 5))) }
-        val viewModel = buildViewModelWithManifest(repository, ManifestDistributionClient(fetcher, repository))
+        val viewModel = buildViewModelWithManifest(repository, singleOriginClient(fetcher, repository))
         testDispatcher.scheduler.advanceUntilIdle()
 
         assertEquals(5, repository.trusted()!!.manifestVersion)

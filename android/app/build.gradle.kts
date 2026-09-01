@@ -14,22 +14,40 @@ val gatewayDevProperties = Properties().apply {
 }
 fun gatewayDevProp(key: String): String = gatewayDevProperties.getProperty(key, "")
 
-// B17 - the real production Signed Offline Bootstrap manifest distribution
-// endpoint (see docs/B12_MANIFEST_KEY_CEREMONY.md's "Production ceremony
-// (B17)" section and docs/ROADMAP.md's Signed Offline Bootstrap row).
-// Frankfurt is the sole configured primary - Stockholm serves the
-// byte-identical artifact signed by the SAME production key (verified
-// during B17's deployment pass), but HttpsRemoteManifestFetcher/
-// ManifestDistributionClient (MainViewModel.Factory) only support ONE
-// configured URL today; multi-origin manifest fetch/failover is
-// deliberately out of scope for this slice, not an oversight - it is
-// unrelated to AutoGatewaySelector's own gateway-level failover, which
-// already spans both gateways once a manifest (from either URL) is
-// trusted. No signing/private material of any kind lives in this file -
-// this is a plain HTTPS GET endpoint for already-signed public bytes,
-// the same trust level as any other URL literal already hardcoded in this
-// codebase (e.g. ProvisioningClient's production gateway hosts).
-val PRODUCTION_MANIFEST_URL = "https://152.70.43.1/v1/manifest"
+// B17/B20 - the real production Signed Offline Bootstrap manifest
+// distribution endpoints (see docs/B12_MANIFEST_KEY_CEREMONY.md's
+// "Production ceremony (B17)" section and docs/ROADMAP.md's Signed Offline
+// Bootstrap row). Frankfurt and Stockholm both serve the byte-identical
+// artifact signed by the SAME production key - an origin here is transport
+// availability only, never a trust authority: MultiOriginManifestDistributionClient
+// (MainViewModel.Factory) routes every origin's candidate through the SAME
+// EndpointManifestRepository signature/expiry/rollback boundary regardless
+// of which URL it came from. No signing/private material of any kind lives
+// in this file - this is a plain HTTPS GET endpoint for already-signed
+// public bytes, the same trust level as any other URL literal already
+// hardcoded in this codebase (e.g. ProvisioningClient's production gateway
+// hosts).
+val PRODUCTION_MANIFEST_ORIGIN_URLS = listOf(
+    "https://152.70.43.1/v1/manifest",
+    "https://16.170.208.231/v1/manifest",
+)
+val PRODUCTION_MANIFEST_URLS = PRODUCTION_MANIFEST_ORIGIN_URLS.joinToString(",")
+
+// B20 - resolves the comma-separated origin URL list a build actually ships
+// with: a developer's gitignored gateway-dev.properties can override with
+// `manifestUrls=url1,url2` (new, multi-origin) or the pre-existing
+// `manifestUrl=singleUrl` (legacy single-origin override, kept working so
+// existing developer configs don't silently break) - first non-blank wins,
+// same "explicit local override wins" convention as every other
+// gatewayDevProp field in this file. Falls back to the real production pair
+// above when neither is set.
+fun resolveManifestUrls(): String {
+    val multi = gatewayDevProp("manifestUrls")
+    if (multi.isNotBlank()) return multi
+    val legacy = gatewayDevProp("manifestUrl")
+    if (legacy.isNotBlank()) return legacy
+    return PRODUCTION_MANIFEST_URLS
+}
 
 android {
     namespace = "net.pocvpn.client"
@@ -49,32 +67,33 @@ android {
         buildConfigField("String", "GATEWAY_CLIENT_TUNNEL_IP", "\"${gatewayDevProp("clientTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_TUNNEL_IP", "\"${gatewayDevProp("gatewayTunnelIp")}\"")
         buildConfigField("String", "GATEWAY_ALLOWED_IPS", "\"${gatewayDevProp("allowedIps")}\"")
-        // B12/B17 - defaults to the real PRODUCTION_MANIFEST_URL above so a
-        // normal build actually wires ManifestDistributionClient; a
-        // developer's own gitignored gateway-dev.properties
-        // (`manifestUrl=...`) can still override this for local testing
-        // against a different server, same "explicit local override wins"
-        // convention as every gatewayDevProp field above. Overridden
-        // per-buildType immediately below for full reviewability of what
-        // debug/release each actually ship with - both currently resolve to
-        // the same production endpoint, on purpose (B17 does not yet
-        // support a distinct staging manifest source).
-        buildConfigField("String", "MANIFEST_URL", "\"${gatewayDevProp("manifestUrl").ifBlank { PRODUCTION_MANIFEST_URL }}\"")
+        // B12/B17/B20 - MANIFEST_URLS (plural, comma-separated) defaults to
+        // BOTH real production origins above so a normal build wires
+        // MultiOriginManifestDistributionClient with real failover; a
+        // developer's own gitignored gateway-dev.properties can still
+        // override this for local testing (see resolveManifestUrls()
+        // above). Overridden per-buildType immediately below for full
+        // reviewability of what debug/release each actually ship with -
+        // both currently resolve to the same production origin pair, on
+        // purpose (B20 does not add a distinct staging manifest source).
+        buildConfigField("String", "MANIFEST_URLS", "\"${resolveManifestUrls()}\"")
     }
 
     buildTypes {
         debug {
-            // B17 - explicit for reviewability: debug builds (including the
-            // physical-device validation build) fetch the real production
-            // manifest by default, same value release ships with, unless a
-            // developer's local gateway-dev.properties overrides it.
-            buildConfigField("String", "MANIFEST_URL", "\"${gatewayDevProp("manifestUrl").ifBlank { PRODUCTION_MANIFEST_URL }}\"")
+            // B17/B20 - explicit for reviewability: debug builds (including
+            // the physical-device validation build) fetch the real
+            // production origins by default, same value release ships
+            // with, unless a developer's local gateway-dev.properties
+            // overrides it.
+            buildConfigField("String", "MANIFEST_URLS", "\"${resolveManifestUrls()}\"")
         }
         release {
             isMinifyEnabled = false
-            // B17 - explicit, not derived from any gitignored developer file -
-            // a release build always points at the real production endpoint.
-            buildConfigField("String", "MANIFEST_URL", "\"$PRODUCTION_MANIFEST_URL\"")
+            // B17/B20 - explicit, not derived from any gitignored developer
+            // file - a release build always points at the real production
+            // origins.
+            buildConfigField("String", "MANIFEST_URLS", "\"$PRODUCTION_MANIFEST_URLS\"")
         }
     }
 
