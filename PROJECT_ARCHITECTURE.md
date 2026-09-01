@@ -196,11 +196,17 @@ NetworkProfiler
   only `RestrictionClass.NO_NETWORK` changes `resolveIpv4Routes`'s output,
   and `UNKNOWN` yields the identical route set AWG yields for every other
   class, so both transports' ADAPTIVE route sets are provably identical for
-  every reachable live case. No physical-device validation has been
-  performed for this feature (checked directly via `adb devices` - none
-  attached in this environment) - this is the one remaining item before
-  Adaptive Direct Routing can be promoted to IMPLEMENTED (see ROADMAP's own
-  row).
+  every reachable live case. **Physically verified (2026-09-01, partial)**:
+  a real device's live `dumpsys connectivity` route table for `tun0` was
+  checked directly before/after switching `RoutingMode` - Full VPN shows
+  plain `0.0.0.0/0`/`::/0`; Adaptive shows the exact
+  `Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES` complement, confirming
+  this mechanism reaches the real OS route table as designed. Still open:
+  live end-to-end traffic/DNS-leak confirmation (blocked by a real, external
+  TCP-over-tunnel condition on that network at the time) and the Xray/TLS
+  consistency check (no reachable entry point exercises `RoutingMode`
+  without a rebuild - see ROADMAP's own row for the full detail) - Adaptive
+  Direct Routing stays FOUNDATION until both are closed.
 
 ## Per-device identity (hard invariant)
 
