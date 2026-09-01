@@ -72,6 +72,16 @@ fun GatewayPickerDialog(
     onSelectAuto: () -> Unit,
     onActivate: (ProductionGatewayId) -> Unit,
     onDismiss: () -> Unit,
+    // B22 - additive, all defaulted so this dialog's one existing call site
+    // compiles/behaves unchanged unless AppRoot explicitly wires them (which
+    // it does - see that file's own docs). [privateMode] mirrors [autoMode]'s
+    // own shape: true only when GatewaySelectionMode.PRIVATE is the current
+    // selection - see that enum's own docs for why this is a THIRD,
+    // disjoint state, never overloading [current]/[autoMode].
+    privateMode: Boolean = false,
+    privateConfigured: Boolean = false,
+    onSelectPrivate: () -> Unit = {},
+    onConfigurePrivate: () -> Unit = {},
 ) {
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -154,6 +164,34 @@ fun GatewayPickerDialog(
                                 Text(stringResource(R.string.gateway_picker_activate))
                             }
                         }
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onSelectPrivate)
+                        .padding(vertical = 8.dp),
+                ) {
+                    RadioButton(selected = privateMode, onClick = onSelectPrivate)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = stringResource(R.string.gateway_picker_private_title),
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = stringResource(
+                                if (privateConfigured) R.string.gateway_picker_private_subtitle_configured else R.string.gateway_picker_private_subtitle_unconfigured,
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = onConfigurePrivate) {
+                        Text(stringResource(R.string.gateway_picker_private_configure))
                     }
                 }
 

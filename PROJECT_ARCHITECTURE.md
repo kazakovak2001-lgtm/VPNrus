@@ -418,6 +418,59 @@ exact scope, including its one honest caveat (a genuine mid-connect()
 AWG-handshake-timeout retry trigger remains unit-test-only, not physically
 reproduced - root/server access would be required).
 
+## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
+
+Architecture principle 9: a user may connect through the managed gateway
+network *or* their own compatible VPS running the same pinned AmneziaWG
+gateway (`gateway/provision.sh`). `GatewaySelectionMode`
+(`AUTO`/`MANUAL_MANAGED`/`PRIVATE`, `vpn/config/GatewaySelectionMode.kt`) is
+the one explicit authority `MainViewModel.connect()` dispatches on -
+`AUTO`/`MANUAL_MANAGED` call the exact pre-B22 `connectAuto()`/
+`connectManual()` functions unchanged; `PRIVATE` is the one new branch
+(`connectPrivate()`), AWG-only, single candidate, no `smartConnectDecision`/
+`AwgXrayFailoverPolicy` - resolving ONLY from `PrivateGatewayStore`, never
+`ProductionGatewayCatalog` or the signed manifest (`PrivateGatewayConfig` has
+no conversion function to either type - structurally incapable of entering
+them). The legacy `GatewayAutoModeStore` boolean is kept in lockstep both
+directions (`selectGatewaySelectionMode`/`setGatewayAutoMode`) so every
+pre-B22 caller/test observing that boolean is unaffected; `PRIVATE` can only
+ever come from the new store (the boolean has no way to express it).
+
+**Client private key never touches ordinary config (architecture constraint
+1)**: `PrivateGatewayConfig` has no private-key field at all - the keypair
+lives in a SEPARATE `ClientKeyRepository` instance
+(`PrivateGatewayKeyRepositoryFactory`, reusing `AwgClientKeyRepository`/
+`FileIdentityStore`/`AndroidKeystoreAesGcmEncryptor` byte-for-byte unchanged,
+only the backing file name/AndroidKeyStore alias differ from the
+managed-network `ClientKeyRepositoryFactory`) - a genuinely distinct identity
+from the managed network's, never the same keypair linking both. Threaded
+into the real connect path via one new, additive field on the EXISTING B16
+pinning mechanism: `TransportOrchestrator.Resolution.Resolved.privateKeyRepository`
+(null for every AUTO/MANUAL_MANAGED resolution) -> `VpnController`'s
+`pendingConnectPrivateKeyRepository` (mirrors `pendingConnectConfig`'s own
+lifecycle exactly) -> consulted instead of the constructor-owned
+`clientKeyRepository` only in `buildTransportConfig`'s `AMNEZIA_WG` branch.
+`PrivateGatewayConfig.toGatewayConfigSnapshot()` converges into the SAME
+`GatewayConfigSnapshot`/`GatewayConfigSnapshotValidator`/`AwgConfigMapper`/
+`AmneziaWgTransport` pipeline every other AWG gateway already uses - no
+second execution stack.
+
+Fails closed on anything malformed (`PrivateGatewayConfigValidator`, reusing
+the existing `Ipv4Format`/`WgKeyFormat` validators verbatim) - the four AWG
+magic-header obfuscation fields are required (a real handshake blocker
+against `gateway/provision.sh` if mismatched, per `PocAwgProfile`'s own
+documented distinction; junk-packet count/size fields stay optional, same as
+every other AWG gateway). `FilePrivateGatewayStore` re-validates on every
+read, never trusting a corrupted/hand-edited file as "configured".
+
+First-slice scope (unit-proven, NOT yet physically validated against a real
+user-operated VPS): exactly one private gateway, add/edit/remove UI
+(`PrivateGatewayDialog`, a real production dialog reached from
+`GatewayPickerDialog`'s new "Private Gateway" row - not debug-only), no
+Smart Connect/Auto ranking/`ReachabilityEngine`/`PathScorer` integration, no
+Xray/REALITY/TLS/QUIC. Kept at **FOUNDATION** until a real physical
+connect() against a real user-provisioned VPS is proven end to end.
+
 ## Production vs debug boundary
 
 - `XrayDiagnosticsActivity` (and any future manual/debug provisioning helper) lives in

@@ -70,6 +70,7 @@ import net.pocvpn.client.vpn.config.DefaultGatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.FileProfileStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewayConfigurationRepository
+import net.pocvpn.client.vpn.config.toGatewayConfigSnapshot
 import net.pocvpn.client.vpn.config.MutableGatewayConfigSource
 import net.pocvpn.client.vpn.config.PersistedProfile
 import net.pocvpn.client.vpn.config.ProfileLoadResult
@@ -361,6 +362,24 @@ class MainViewModel(
     // gateway is treated as provisioned - byte-for-byte unchanged
     // behavior for every pre-existing call site/test.
     private val clientTunnelIdentityStore: net.pocvpn.client.vpn.config.ClientTunnelIdentityStore? = null,
+    // B22 - additive, defaults to a store that always reads MANUAL_MANAGED
+    // and ignores writes (byte-for-byte pre-B22 behavior for every existing
+    // call site/test: Private Gateway Mode did not exist before this slice).
+    private val gatewaySelectionModeStore: net.pocvpn.client.vpn.config.GatewaySelectionModeStore =
+        net.pocvpn.client.vpn.config.GatewaySelectionModeStore.managedOnly(),
+    // B22 - additive, defaults to null (no wiring, no behavior - same seam
+    // shape as clientTunnelIdentityStore above). With no store wired,
+    // PRIVATE mode's connectPrivate() fails closed (GatewayConfigurationMissing).
+    private val privateGatewayStore: net.pocvpn.client.vpn.config.PrivateGatewayStore? = null,
+    // B22 - a GENUINELY DISTINCT ClientKeyRepository instance from the
+    // constructor-level [clientKeyRepository] above (see
+    // PrivateGatewayKeyRepositoryFactory's own docs for why) - additive,
+    // defaults to null. With no repository wired, PRIVATE mode's
+    // connectPrivate() fails closed rather than falling back to the
+    // managed-network identity (that fallback would silently register this
+    // device's managed-network public key as a peer on the user's own VPS,
+    // an identity-linkage bug, not a convenience).
+    private val privateGatewayKeyRepository: ClientKeyRepository? = null,
 ) : ViewModel() {
 
     /**
@@ -514,7 +533,123 @@ class MainViewModel(
         if (transportState.value.blocksGatewaySelection()) return
         gatewayAutoModeStore.write(auto)
         _gatewayAutoMode.value = auto
+        // B22 - kept in lockstep with the new explicit mode authority (see
+        // selectGatewaySelectionMode's own docs for the reverse direction).
+        // auto=false always resolves to MANUAL_MANAGED here, never PRIVATE -
+        // this legacy boolean setter has no way to express PRIVATE, so it
+        // must never silently downgrade an active PRIVATE selection to
+        // Manual; existing pre-B22 callers only ever pass this a boolean and
+        // never observe PRIVATE in the first place.
+        val mode = if (auto) net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO else net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED
+        if (_gatewaySelectionMode.value != mode && (auto || _gatewaySelectionMode.value != net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE)) {
+            gatewaySelectionModeStore.write(mode)
+            _gatewaySelectionMode.value = mode
+        }
     }
+
+    // B22 - the explicit three-way gateway-selection authority (architecture
+    // constraint 2). Read once at construction (same pattern as
+    // _selectedGateway/_gatewayAutoMode above). PRIVATE can ONLY ever come
+    // from [gatewaySelectionModeStore] itself (the legacy boolean has no way
+    // to express it); otherwise AUTO-vs-not is derived from the legacy
+    // [gatewayAutoModeStore] exactly as it already was pre-B22 - this keeps
+    // every existing AUTO-mode test/call site that constructs a
+    // pre-set-to-true GatewayAutoModeStore (never touching
+    // gatewaySelectionModeStore at all) byte-for-byte correct, while a
+    // genuinely new PRIVATE selection (which DOES persist through the new
+    // store) still starts up correctly on the next launch.
+    private val _gatewaySelectionMode = MutableStateFlow(
+        if (gatewaySelectionModeStore.read() == net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE) {
+            net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE
+        } else if (_gatewayAutoMode.value) {
+            net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO
+        } else {
+            net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED
+        },
+    )
+    val gatewaySelectionMode: StateFlow<net.pocvpn.client.vpn.config.GatewaySelectionMode> = _gatewaySelectionMode.asStateFlow()
+
+    /**
+     * B22 - THE one place [GatewaySelectionMode] is changed. Same
+     * active-session guard [selectGateway]/[setGatewayAutoMode] already
+     * enforce. Keeps the legacy [gatewayAutoMode] boolean in lockstep
+     * (true only for [GatewaySelectionMode.AUTO]) purely so any
+     * OTHER existing code still reading that boolean directly (none of
+     * which this slice touches) never observes a divergent value - this
+     * mode enum is the one new authority connect() itself dispatches on
+     * (see [connect]).
+     */
+    fun selectGatewaySelectionMode(mode: net.pocvpn.client.vpn.config.GatewaySelectionMode) {
+        if (transportState.value.blocksGatewaySelection()) return
+        gatewaySelectionModeStore.write(mode)
+        _gatewaySelectionMode.value = mode
+        val auto = mode == net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO
+        if (_gatewayAutoMode.value != auto) {
+            gatewayAutoModeStore.write(auto)
+            _gatewayAutoMode.value = auto
+        }
+    }
+
+    // B22 - the currently saved private gateway config, for UI display
+    // (host/port/server public key/tunnel address - NEVER the client
+    // private key, which this type structurally cannot carry - see
+    // PrivateGatewayConfig's own docs). null when unconfigured or with no
+    // store wired.
+    val privateGatewayConfig: net.pocvpn.client.vpn.config.PrivateGatewayConfig?
+        get() = privateGatewayStore?.read()
+
+    /**
+     * B22 - validates BEFORE persisting (architecture "SECURITY /
+     * VALIDATION": malformed input must never be saved, let alone connected
+     * with) - returns the typed result so the UI can show exactly which
+     * field failed, never a generic error. Only [PrivateGatewayValidationResult.Valid]
+     * is ever written to [privateGatewayStore].
+     */
+    fun savePrivateGatewayConfig(
+        host: String,
+        port: Int,
+        serverPublicKeyBase64: String,
+        clientTunnelIp: String,
+        gatewayTunnelIp: String,
+        awgProfile: net.pocvpn.client.vpn.config.AwgProfile,
+    ): net.pocvpn.client.vpn.config.PrivateGatewayValidationResult {
+        val result = net.pocvpn.client.vpn.config.PrivateGatewayConfigValidator.validate(
+            host = host,
+            port = port,
+            serverPublicKeyBase64 = serverPublicKeyBase64,
+            clientTunnelIp = clientTunnelIp,
+            gatewayTunnelIp = gatewayTunnelIp,
+            awgProfile = awgProfile,
+        )
+        if (result is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Valid) {
+            privateGatewayStore?.write(result.config)
+        }
+        return result
+    }
+
+    /**
+     * B22 - removes the saved config only. Deliberately does NOT switch
+     * [gatewaySelectionMode] away from PRIVATE (mirrors [selectGateway]'s
+     * own "select now, apply on the next real connect()" discipline) - the
+     * next PRIVATE connect() attempt fails closed with
+     * [net.pocvpn.client.diagnostics.VpnError.GatewayConfigurationMissing]
+     * exactly as if it had never been configured, never a silent fallback
+     * to a managed gateway.
+     */
+    fun removePrivateGatewayConfig() {
+        privateGatewayStore?.clear()
+    }
+
+    /**
+     * B22 - the ONLY private-gateway key material this ViewModel ever
+     * exposes: the PUBLIC key, for the user to paste into their own VPS's
+     * `add-peer.sh`-equivalent step (see architecture "FIRST SLICE UX":
+     * "expose/copy only the client PUBLIC key"). The private key itself
+     * never leaves [privateGatewayKeyRepository] except to
+     * [VpnController.buildTransportConfig] at the moment of building a real
+     * tunnel config - see that repository's own docs.
+     */
+    suspend fun privateGatewayClientPublicKey(): String? = privateGatewayKeyRepository?.getPublicKey()
 
     /**
      * B16 - the gateway a connect() attempt is CURRENTLY targeting/using,
@@ -1652,7 +1787,61 @@ class MainViewModel(
             // permission result or async state change for that OLD request
             // must never reuse it.
             clearFailoverWatch()
-            if (_gatewayAutoMode.value) connectAuto() else connectManual()
+            // B22 - dispatches on the explicit three-way authority now,
+            // instead of the plain boolean - AUTO/MANUAL_MANAGED still call
+            // the exact SAME pre-B22 functions, byte-for-byte, for every
+            // existing test/behavior; PRIVATE is the one new branch.
+            when (gatewaySelectionMode.value) {
+                net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO -> connectAuto()
+                net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED -> connectManual()
+                net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE -> connectPrivate()
+            }
+        }
+    }
+
+    /**
+     * B22 - PRIVATE gateway mode's connect path. Deliberately much simpler
+     * than [connectManual]: AWG-only (architecture constraint: no
+     * Xray/REALITY/TLS/QUIC), single candidate, no [smartConnectDecision]/
+     * [AwgXrayFailoverPolicy]/intra-gateway failover at all - there is
+     * nothing to rank or fail over between. Resolves ONLY from
+     * [privateGatewayStore] - never [net.pocvpn.client.vpn.config.ProductionGatewayCatalog],
+     * never the signed manifest (architecture constraint 2) - and fails
+     * closed (typed [VpnError], never a silent fallback to a managed
+     * gateway) on anything missing/invalid, exactly like every other
+     * malformed-config case in this ViewModel.
+     */
+    private suspend fun connectPrivate() {
+        val store = privateGatewayStore
+        val keyRepository = privateGatewayKeyRepository
+        if (store == null || keyRepository == null) {
+            controller.rejectPreflight(VpnError.GatewayConfigurationMissing, "Private gateway not configured on this build")
+            return
+        }
+        val saved = store.read()
+        if (saved == null) {
+            controller.rejectPreflight(VpnError.GatewayConfigurationMissing, "No private gateway configured")
+            return
+        }
+        when (val validation = net.pocvpn.client.vpn.config.PrivateGatewayConfigValidator.revalidate(saved)) {
+            is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Invalid -> {
+                controller.rejectPreflight(
+                    VpnError.InvalidGatewayConfiguration(validation.reason.name),
+                    "Saved private gateway configuration is invalid: ${validation.reason.name}",
+                )
+                return
+            }
+            is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Valid -> {
+                _activeGatewayId.value = selectedGateway.value
+                val resolved = TransportOrchestrator.Resolution.Resolved(
+                    transport = transport,
+                    kind = transport.kind,
+                    endpointId = net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.vpn.config.PrivateGatewayConfig.ID),
+                    gatewayConfigSnapshot = validation.config.toGatewayConfigSnapshot(),
+                    privateKeyRepository = keyRepository,
+                )
+                controller.connect(resolved)
+            }
         }
     }
 
@@ -2102,6 +2291,13 @@ class MainViewModel(
             )
             // B16 - device-local automatic-gateway-selection preference.
             val gatewayAutoModeStore = net.pocvpn.client.vpn.config.FileGatewayAutoModeStore(context.noBackupFilesDir)
+            // B22 - the explicit three-way gateway-selection authority and
+            // the private-gateway config/identity stores - see their own
+            // docs for why these are genuinely separate from every managed-
+            // gateway store above.
+            val gatewaySelectionModeStore = net.pocvpn.client.vpn.config.FileGatewaySelectionModeStore(context.noBackupFilesDir)
+            val privateGatewayStore = net.pocvpn.client.vpn.config.FilePrivateGatewayStore(context.noBackupFilesDir)
+            val privateGatewayKeyRepository = net.pocvpn.client.identity.PrivateGatewayKeyRepositoryFactory.create(context)
             // B16 (consolidated review fix) - unchanged from pre-B16: this
             // resolves ONLY the persisted MANUAL selection. An Auto
             // candidate's real connect-time config is now threaded straight
@@ -2203,6 +2399,9 @@ class MainViewModel(
                 // reconciliation this feeds ALWAYS agree with what a real
                 // connect() attempt would actually resolve.
                 clientTunnelIdentityStore = clientTunnelIdentityStore,
+                gatewaySelectionModeStore = gatewaySelectionModeStore,
+                privateGatewayStore = privateGatewayStore,
+                privateGatewayKeyRepository = privateGatewayKeyRepository,
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 routingModeStore = routingModeStore,
