@@ -81,6 +81,11 @@ class NovaXrayVpnService : VpnService() {
         net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory.create(context, endpointId)
     }
 
+    /** B21 - the QUIC counterpart of [profileRepositoryFactory] above; same test-seam contract, its own AndroidKeyStore alias/file. */
+    internal var quicProfileRepositoryFactory: (Context, EndpointId) -> net.pocvpn.client.identity.XrayQuicProfileRepository = { context, endpointId ->
+        net.pocvpn.client.identity.XrayQuicProfileRepositoryFactory.create(context, endpointId)
+    }
+
     // B13 (2026-08-30 PR #25 review fix) - the ONE place [XrayCoreController]
     // is ever constructed, and the ONE place its per-endpoint selection AND
     // requestStart/requestStop calls are serialized - see that class's own
@@ -101,6 +106,7 @@ class NovaXrayVpnService : VpnService() {
                 establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
                 closeTun = { closeTunInterface() },
                 tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
+                quicRepository = quicProfileRepositoryFactory(applicationContext, endpointId),
             )
         }
     }

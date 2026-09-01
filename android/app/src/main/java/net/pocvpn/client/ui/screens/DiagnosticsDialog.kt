@@ -76,6 +76,12 @@ fun DiagnosticsDialog(
     // own docs. Exists for deterministic physical validation without
     // force-stopping the app between fault-injection steps.
     onRefreshManifest: () -> Unit,
+    // B21 physical-validation follow-up - debug-only: pins
+    // UserTransportPreference.Manual(QUIC) for the NEXT connect() - same
+    // "saved, applied on next connect" discipline as onForceXrayTest above,
+    // reusing the SAME generic MainViewModel.debugSetTransportPreference.
+    // Never itself reconnects.
+    onForceQuicTest: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
@@ -136,6 +142,9 @@ fun DiagnosticsDialog(
                 }
                 TextButton(onClick = onRefreshManifest, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_refresh_manifest))
+                }
+                TextButton(onClick = onForceQuicTest, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.diagnostics_force_quic_test))
                 }
                 TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_close))

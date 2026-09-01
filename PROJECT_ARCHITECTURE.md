@@ -451,6 +451,44 @@ gateway (opening one is a firewall/security-group change requiring
 explicit operator approval, not performed in B21) and no physical device
 has executed a real QUIC session.
 
+**B21 continuation - production port opened on Frankfurt, real client-side
+defect found (hard invariant gap, not QUIC-specific)**: with explicit
+operator approval, `2087/udp` was opened on Frankfurt and the QUIC/XHTTP
+inbound deployed through the existing `xray_reconcile.py` stage/validate/
+publish path - `xray run -test` passed, all four listeners
+(`2053/tcp`/`2083/tcp`/`2087/udp`/`51820/udp`) confirmed live, `pocvpn-api`
+confirmed to accept `{"transport":"quic"}`. A real, previously-missed
+wiring bug was found and fixed: `NovaXrayVpnService`'s own
+`XrayCoreController(...)` construction never actually passed a
+`quicRepository` (the parameter existed with a safe null default, wired
+everywhere else, but never at the one real production call site) - fixed,
+full suite re-verified green. **After the fix, physical validation
+revealed a deeper, real architectural gap**: a real device reported
+`Protected`/`Current transport: QUIC` after a real activation and real
+connect(), but Frankfurt's own firewall packet counter for `2087/udp`
+stayed at exactly 0 across every attempt, and real browser traffic through
+the tunnel failed (`DNS_PROBE_FINISHED_NO_INTERNET`) - the client never
+sent a single UDP packet toward the server. Root cause not yet isolated
+(a build-time gap between the pinned commit's official Linux server binary,
+independently `-test`-validated for the identical config, and the
+`AndroidLibXrayLite` gomobile AAR built from the same commit, is the
+leading candidate, unverified). **The gap this exposes is real and applies
+to the whole Xray transport family, not just QUIC**: unlike
+`AmneziaWgTransport.awaitFreshHandshake` (a genuine post-connect
+handshake-freshness check before AWG reports `Connected`), no Xray-family
+transport (`XRAY_REALITY`/`TLS_TCP`/`QUIC`) verifies any data-plane
+handshake at all before reporting `Connected` -
+`XrayCoreController.requestStart` returning `Started` only means
+`coreRuntime.startLoop()` did not throw (the Go runtime's goroutines
+launched), never that a real proxied session succeeded. REALITY/TLS_TCP
+are not newly suspected of failing the same way (both have independent
+prior physical proof of real proxied traffic), but the verification gap
+itself was previously undocumented and is now a known, real limitation -
+closing it (an active data-plane liveness check for Xray-family
+transports, analogous to AWG's) is a real, separate future slice, not
+performed here. QUIC remains at FOUNDATION - not one real completed
+proxied session exists yet.
+
 ## Config resolution atomicity
 
 `SelectedProductionGatewaySource.snapshot()` resolves the selected gateway id exactly
