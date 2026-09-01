@@ -9,12 +9,24 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import net.pocvpn.client.transport.TransportKind
 
-/** Aggregated local history for one (networkFingerprint, endpointId, transportKind) key - never raw per-attempt destinations/timestamps beyond what's needed to bound recency. */
+/**
+ * Aggregated local history for one (networkFingerprint, endpointId, transportKind) key - never raw per-attempt destinations/timestamps beyond what's needed to bound recency.
+ *
+ * B19 - [consecutiveFailures] is the RECENT streak (resets to 0 on any
+ * success, increments on each failure) - deliberately distinct from
+ * [failureCount] (a lifetime cumulative total that never decreases). This is
+ * what [net.pocvpn.client.reachability.PathScorer]'s bounded cooldown
+ * penalty is keyed on: a streak naturally clears on the next success and the
+ * penalty itself additionally decays with time (see that object's own
+ * docs) - never a permanent blacklist. Defaults to 0 so every pre-B19
+ * construction (every existing test/call site) is byte-for-byte unaffected.
+ */
 data class PathHistoryEntry(
     val successCount: Int,
     val failureCount: Int,
     val lastOutcomeEpochMillis: Long,
     val lastOutcomeSuccess: Boolean,
+    val consecutiveFailures: Int = 0,
 )
 
 /**
@@ -61,6 +73,8 @@ class FilePathHistoryStore(
                 failureCount = (existing?.failureCount ?: 0) + if (success) 0 else 1,
                 lastOutcomeEpochMillis = nowEpochMillis,
                 lastOutcomeSuccess = success,
+                // B19 - the RECENT streak: cleared by any success, otherwise incremented.
+                consecutiveFailures = if (success) 0 else (existing?.consecutiveFailures ?: 0) + 1,
             )
             // Copy-on-write, not an in-place mutation of the shared `cached`
             // map: [get] deliberately reads `cached` without taking [lock]
@@ -115,8 +129,9 @@ class FilePathHistoryStore(
         val failureCount = input.readInt()
         val lastOutcomeEpochMillis = input.readLong()
         val lastOutcomeSuccess = input.readBoolean()
+        val consecutiveFailures = input.readInt()
         return Key(fingerprint, endpointId, transportOrdinal) to
-            PathHistoryEntry(successCount, failureCount, lastOutcomeEpochMillis, lastOutcomeSuccess)
+            PathHistoryEntry(successCount, failureCount, lastOutcomeEpochMillis, lastOutcomeSuccess, consecutiveFailures)
     }
 
     private fun writeToDisk(entries: Map<Key, PathHistoryEntry>) {
@@ -134,6 +149,7 @@ class FilePathHistoryStore(
                     out.writeInt(entry.failureCount)
                     out.writeLong(entry.lastOutcomeEpochMillis)
                     out.writeBoolean(entry.lastOutcomeSuccess)
+                    out.writeInt(entry.consecutiveFailures)
                 }
             }
         }.toByteArray()
@@ -161,7 +177,12 @@ class FilePathHistoryStore(
     }
 
     private companion object {
-        const val FORMAT_VERSION = 1
+        // B19 - bumped 1 -> 2 to add consecutiveFailures. A pre-B19 file
+        // fails the version check below and falls back to an empty map
+        // (the SAME fail-safe "unrecognized format -> start clean" every
+        // other store here already uses) - never a crash, never a
+        // misread field.
+        const val FORMAT_VERSION = 2
         const val MAX_STRING_LEN = 256
         const val MAX_PLAUSIBLE_COUNT = 100_000
     }

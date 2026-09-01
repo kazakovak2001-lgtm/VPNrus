@@ -1718,6 +1718,7 @@ class MainViewModel(
             transportHealthFor = { kind -> health.getValue(kind) },
             historyFor = { endpointId, kind -> fingerprint?.let { pathHistoryStore?.get(it, endpointId, kind) } },
             preference = userTransportPreference,
+            nowEpochMillis = now,
         )
     }
 

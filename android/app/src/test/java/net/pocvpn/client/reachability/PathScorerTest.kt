@@ -237,6 +237,95 @@ class PathScorerTest {
         assertTrue(oneFailure.score > twoFailures.score)
     }
 
+    // --- B19: bounded, time-decaying failure cooldown ---
+
+    @Test
+    fun `a recent failure streak within the cooldown window produces a bounded penalty`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        // Identical successCount/failureCount/lastOutcomeSuccess (so the
+        // historyRank tier is IDENTICAL for both) - only consecutiveFailures
+        // (the cooldown trigger) differs, isolating exactly what the
+        // cooldown penalty itself contributes.
+        val base = PathHistoryEntry(successCount = 5, failureCount = 3, lastOutcomeEpochMillis = 999_000L, lastOutcomeSuccess = false)
+        val noStreak = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, base, false, nowEpochMillis = 1_000_000L)
+        val withStreak = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, base.copy(consecutiveFailures = 2), false, nowEpochMillis = 1_000_000L)
+
+        assertTrue(noStreak.score > withStreak.score)
+        assertTrue(withStreak.reasons.contains(PathScorer.Reason.FAILURE_COOLDOWN.name))
+        assertFalse(noStreak.reasons.contains(PathScorer.Reason.FAILURE_COOLDOWN.name))
+    }
+
+    @Test
+    fun `the cooldown penalty is capped, not proportional to an unbounded streak`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val hugeStreak = PathHistoryEntry(successCount = 0, failureCount = 500, lastOutcomeEpochMillis = 999_000L, lastOutcomeSuccess = false, consecutiveFailures = 500)
+        val moderateStreak = PathHistoryEntry(successCount = 0, failureCount = 5, lastOutcomeEpochMillis = 999_000L, lastOutcomeSuccess = false, consecutiveFailures = 5)
+
+        val hugeScore = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, hugeStreak, false, nowEpochMillis = 1_000_000L)
+        val moderateScore = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, moderateStreak, false, nowEpochMillis = 1_000_000L)
+
+        // Both streaks are large enough to hit the same cap - the penalty must be identical, not scaled further.
+        assertEquals(moderateScore.score, hugeScore.score)
+    }
+
+    @Test
+    fun `the cooldown penalty naturally expires once the failure streak is older than the cooldown window`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val streak = PathHistoryEntry(
+            successCount = 0, failureCount = 4, lastOutcomeEpochMillis = 0L, lastOutcomeSuccess = false, consecutiveFailures = 4,
+        )
+        // SAME history entry, only "now" moves from inside to just outside the cooldown window.
+        val withinWindow = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, streak, false, nowEpochMillis = PathScorer.FAILURE_COOLDOWN_WINDOW_MILLIS)
+        val afterWindow = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, streak, false, nowEpochMillis = PathScorer.FAILURE_COOLDOWN_WINDOW_MILLIS + 1L)
+
+        assertTrue(withinWindow.reasons.contains(PathScorer.Reason.FAILURE_COOLDOWN.name))
+        assertFalse(afterWindow.reasons.contains(PathScorer.Reason.FAILURE_COOLDOWN.name))
+        assertTrue("cooldown must expire, raising the score back up (within=${withinWindow.score}, after=${afterWindow.score})", afterWindow.score > withinWindow.score)
+    }
+
+    @Test
+    fun `a successful reconnect clears the cooldown penalty - consecutiveFailures resets to 0`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val clearedByRecentSuccess = PathHistoryEntry(
+            successCount = 6, failureCount = 3, lastOutcomeEpochMillis = 999_999L, lastOutcomeSuccess = true, consecutiveFailures = 0,
+        )
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, clearedByRecentSuccess, false, nowEpochMillis = 1_000_000L)
+        val noHistory = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, null, false, nowEpochMillis = 1_000_000L)
+
+        assertFalse(result.reasons.contains(PathScorer.Reason.FAILURE_COOLDOWN.name))
+        // The historyRank tier still differs (real history vs none) - only the cooldown penalty itself is asserted absent above.
+        assertTrue(result.score >= noHistory.score)
+    }
+
+    @Test
+    fun `pre-B19 callers - no nowEpochMillis, default PathHistoryEntry - see zero cooldown penalty regardless of consecutiveFailures default`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val legacyHistory = PathHistoryEntry(successCount = 1, failureCount = 9, lastOutcomeEpochMillis = 0L, lastOutcomeSuccess = false)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), health, legacyHistory, false)
+        assertFalse(result.reasons.contains(PathScorer.Reason.FAILURE_COOLDOWN.name))
+    }
+
+    // --- B19: typed reason tokens ---
+
+    @Test
+    fun `reasons carry stable typed tokens alongside the existing free-text summaries`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
+        assertTrue(result.reasons.contains(PathScorer.Reason.ENDPOINT_REACHABLE.name))
+        assertTrue(result.reasons.contains(PathScorer.Reason.TRANSPORT_HEALTHY.name))
+    }
+
     @Test
     fun `score never overflows or underflows Long for any combination of documented ranges`() {
         val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
