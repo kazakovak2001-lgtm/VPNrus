@@ -81,7 +81,10 @@ import net.pocvpn.client.vpn.policy.AndroidInstalledPackageChecker
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.FileAppRoutingPolicyStore
+import net.pocvpn.client.vpn.policy.FileRoutingModeStore
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
+import net.pocvpn.client.vpn.policy.RoutingMode
+import net.pocvpn.client.vpn.policy.RoutingModeStore
 
 /**
  * B8I8A - everything needed to evaluate [AwgXrayFailoverPolicy] for ONE
@@ -206,6 +209,11 @@ class MainViewModel(
     // write, for the Settings UI) share - see updateAppRoutingPolicy below.
     private val appRoutingPolicyStore: AppRoutingPolicyStore? = null,
     private val installedPackageChecker: InstalledPackageChecker? = null,
+    // B18 - additive, defaults to null (same reasoning as appRoutingPolicyStore
+    // above): when non-null, this is the ONE store both VpnController
+    // (read-only, at connect time) and this ViewModel (read + write, for the
+    // Settings UI) share - see updateRoutingMode below.
+    private val routingModeStore: RoutingModeStore? = null,
     // B8I - additive, defaults to null (same reasoning as gatewayConfigOverride/
     // profileStore above). When non-null, started in init/stopped in
     // onCleared - see this class's own lifecycle block. NetworkProfiler
@@ -586,6 +594,12 @@ class MainViewModel(
         pathHistoryStore = pathHistoryStore,
         fingerprintKeyProvider = fingerprintKeyProvider,
         networkProfileProvider = { networkProfile.value },
+        routingModeStore = routingModeStore ?: RoutingModeStore.fullVpn(),
+        // B18 - RestrictionClassifier wired into RoutingDecisionEngine
+        // exactly once, through this SAME supplier pattern
+        // networkProfileProvider above already uses - restrictionClass()
+        // recomputes fresh from live evidence on every call, never cached.
+        restrictionClassProvider = { restrictionClass() },
     )
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
@@ -1085,6 +1099,20 @@ class MainViewModel(
     fun updateAppRoutingPolicy(policy: AppRoutingPolicy) {
         appRoutingPolicyStore?.write(policy)
         _savedAppRoutingPolicy.value = policy
+    }
+
+    // B18 - the saved (not necessarily yet-applied) top-level routing mode,
+    // read once at startup and kept in sync by updateRoutingMode(). See
+    // VpnController.appliedRoutingMode for what's actually live right now -
+    // same "reconnect to apply" discipline as savedAppRoutingPolicy above.
+    private val _savedRoutingMode = MutableStateFlow(routingModeStore?.read() ?: RoutingMode.FULL_VPN)
+    val savedRoutingMode: StateFlow<RoutingMode> = _savedRoutingMode.asStateFlow()
+    val appliedRoutingMode: StateFlow<RoutingMode?> = controller.appliedRoutingMode
+
+    /** B18 - saves ONLY the local mode file; deliberately does NOT touch the transport/tunnel (same reasoning as updateAppRoutingPolicy above). */
+    fun updateRoutingMode(mode: RoutingMode) {
+        routingModeStore?.write(mode)
+        _savedRoutingMode.value = mode
     }
 
     private val _publicKey = MutableStateFlow<String?>(null)
@@ -1996,6 +2024,10 @@ class MainViewModel(
             // file: a device-local UX preference, not something a restore
             // onto a different device should silently reapply either.
             val appRoutingPolicyStore = FileAppRoutingPolicyStore(context.noBackupFilesDir)
+            // B18 - same noBackupFilesDir as appRoutingPolicyStore above,
+            // different file: a device-local routing preference, not
+            // something a cross-device restore should silently reapply.
+            val routingModeStore = FileRoutingModeStore(context.noBackupFilesDir)
             // B8I - same noBackupFilesDir as the stores above, different
             // file: bounded technical connection-metadata history (see
             // ConnectionOutcomeStore's own privacy docs), still device-
@@ -2074,6 +2106,7 @@ class MainViewModel(
                 clientTunnelIdentityStore = clientTunnelIdentityStore,
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
+                routingModeStore = routingModeStore,
                 installedPackageChecker = AndroidInstalledPackageChecker(context),
                 networkProfiler = NetworkProfiler(context),
                 connectionOutcomeStore = connectionOutcomeStore,

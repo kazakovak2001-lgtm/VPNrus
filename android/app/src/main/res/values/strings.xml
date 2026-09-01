@@ -39,6 +39,14 @@
     <!-- Settings / split tunneling -->
     <string name="settings_title">Settings</string>
     <string name="settings_back_content_description">Back</string>
+    <string name="settings_routing_mode_title">Routing mode</string>
+    <string name="settings_routing_mode_helper">Choose how Nova VPN routes your traffic</string>
+    <string name="settings_routing_mode_full_vpn">Full VPN</string>
+    <string name="settings_routing_mode_full_vpn_helper">All eligible traffic goes through the VPN</string>
+    <string name="settings_routing_mode_adaptive">Adaptive</string>
+    <string name="settings_routing_mode_adaptive_helper">Local network traffic goes direct; everything else stays on the VPN</string>
+    <string name="settings_routing_mode_apps">Apps / split tunnel</string>
+    <string name="settings_routing_mode_apps_helper">Route by app below; destinations always use the VPN</string>
     <string name="settings_split_tunneling_title">Split tunneling</string>
     <string name="settings_split_tunneling_helper">Choose which apps use Nova VPN</string>
     <string name="settings_mode_all_apps">All apps</string>

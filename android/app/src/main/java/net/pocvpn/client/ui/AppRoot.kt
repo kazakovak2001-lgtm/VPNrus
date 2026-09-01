@@ -72,6 +72,7 @@ fun AppRoot(
     val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
     val savedRoutingPolicy by viewModel.savedAppRoutingPolicy.collectAsStateWithLifecycle()
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
+    val savedRoutingMode by viewModel.savedRoutingMode.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
     val selectedGatewayId by viewModel.selectedGateway.collectAsStateWithLifecycle()
     val selectedGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGatewayId)
@@ -168,6 +169,8 @@ fun AppRoot(
                 // .updateAppRoutingPolicy's own docs) - showReconnectNotice
                 // is purely informational.
                 settingsRoute == SettingsRoute.Settings -> SettingsScreen(
+                    routingMode = savedRoutingMode,
+                    onRoutingModeSelected = { viewModel.updateRoutingMode(it) },
                     mode = savedRoutingPolicy.mode,
                     selectedAppCount = savedRoutingPolicy.selectedPackageNames.size,
                     showReconnectNotice = hasPendingRoutingPolicyChange(appliedRoutingPolicy, savedRoutingPolicy),

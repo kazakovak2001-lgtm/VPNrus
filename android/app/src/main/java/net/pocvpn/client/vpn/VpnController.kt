@@ -31,7 +31,12 @@ import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
+import net.pocvpn.client.smartconnect.DestinationClass
 import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.smartconnect.RestrictionClass
+import net.pocvpn.client.smartconnect.RouteDecision
+import net.pocvpn.client.smartconnect.RoutingContext
+import net.pocvpn.client.smartconnect.RoutingDecisionEngine
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportStats
@@ -45,6 +50,9 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.EffectiveRoutingResult
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
+import net.pocvpn.client.vpn.policy.Ipv4RouteExclusion
+import net.pocvpn.client.vpn.policy.RoutingMode
+import net.pocvpn.client.vpn.policy.RoutingModeStore
 import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
@@ -119,6 +127,22 @@ class VpnController(
     // default appRoutingPolicyStore above (always ALL_APPS, empty selection)
     // never spuriously resolves to NoAppsSelected.
     private val installedPackageChecker: InstalledPackageChecker = InstalledPackageChecker.alwaysInstalled(),
+    // B18 - additive, defaults to an in-memory store that always reads
+    // RoutingMode.FULL_VPN and ignores writes, so every pre-B18 call site is
+    // byte-for-byte unaffected (FULL_VPN's route-prefix behavior is exactly
+    // the pre-B18 default). Same "read fresh at connect time, apply for the
+    // whole session, no live rebuild" discipline as appRoutingPolicyStore -
+    // see doConnectAttempt's own docs.
+    private val routingModeStore: RoutingModeStore = RoutingModeStore.fullVpn(),
+    // B18 - additive, defaults to null so every pre-B18 call site is
+    // byte-for-byte unaffected. A supplier (same pattern as
+    // networkProfileProvider below), not a StateFlow - read fresh, once, at
+    // the exact moment a real connect() attempt builds its route set. A null
+    // provider (or a null result) is treated as RestrictionClass.UNKNOWN,
+    // which RoutingDecisionEngine.decideAdaptiveRoute never lets broaden
+    // DIRECT beyond routingMode - so an unwired caller behaves identically
+    // to one deliberately supplying UNKNOWN.
+    private val restrictionClassProvider: (() -> RestrictionClass)? = null,
     // B8I - additive, defaults to null so every existing call site (real or
     // test) is byte-for-byte unaffected: with no store, recordConnectionOutcome
     // below is simply a no-op. Recording never changes control flow - see
@@ -248,6 +272,12 @@ class VpnController(
     // recovery cycle preserves is simply whatever this already says.
     private val _appliedRoutingPolicy = MutableStateFlow<AppRoutingPolicy?>(null)
     val appliedRoutingPolicy: StateFlow<AppRoutingPolicy?> = _appliedRoutingPolicy.asStateFlow()
+
+    // B18 - the RoutingMode actually baked into the CURRENTLY ACTIVE session,
+    // same "applied, not merely saved" discipline as _appliedRoutingPolicy
+    // above (and the same non-reasons: reconnectLoop() never writes this).
+    private val _appliedRoutingMode = MutableStateFlow<RoutingMode?>(null)
+    val appliedRoutingMode: StateFlow<RoutingMode?> = _appliedRoutingMode.asStateFlow()
 
     @Volatile private var userInitiatedDisconnect = true
     private var reconnectJob: Job? = null
@@ -501,6 +531,7 @@ class VpnController(
             // doConnectAttempt), which is what actually applies a changed
             // saved policy - never an automatic mid-session rebuild.
             _appliedRoutingPolicy.value = null
+            _appliedRoutingMode.value = null
             // B8O3 - nothing is running/attempted any more.
             _currentTransportKind.value = null
             // B16 - a completed/abandoned attempt's pinned candidate config
@@ -562,8 +593,13 @@ class VpnController(
                     return false
                 }
                 val appRoutingLists = (routingResolution as? EffectiveRoutingResult.Apply)?.lists ?: AppRoutingLists.AllApps
+                // B18 - read fresh on every real connect() attempt, same
+                // discipline as routingPolicy above - see routingModeStore's
+                // own docs for why this is what makes a mode change the user
+                // saved while disconnected take effect on THIS attempt only.
+                val routingMode = routingModeStore.read()
                 val transportConfig = try {
-                    buildTransportConfig(kind, config, appRoutingLists)
+                    buildTransportConfig(kind, config, appRoutingLists, routingMode)
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.ConfigurationMappingFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Failed to build tunnel configuration"))
@@ -585,6 +621,7 @@ class VpnController(
                     // interface was actually built, so this is set here and
                     // ONLY here, never in the catch branch.
                     _appliedRoutingPolicy.value = routingPolicy
+                    _appliedRoutingMode.value = routingMode
                     if (kind == TransportKind.AMNEZIA_WG) {
                         // Interface-up/TX>0 alone is deliberately NOT treated as
                         // success here - see awaitFreshHandshake's own docs. Set
@@ -664,7 +701,47 @@ class VpnController(
      * structurally unreachable via the public API since connect() already
      * refuses a kind outside [supportedKinds] before ever reaching here.
      */
-    private suspend fun buildTransportConfig(kind: TransportKind, config: GatewayConfiguration.Configured, appRoutingLists: AppRoutingLists): TransportConfig =
+    /**
+     * B18 - the ONE place RoutingDecisionEngine's destination-route decision
+     * becomes an actual AmneziaWG AllowedIPs list (which is BOTH the Android
+     * VpnService route table AND WireGuard's own cryptokey-routing ingress
+     * filter for this peer - see AwgConfigMapper's own docs). FULL_VPN/APPS
+     * pass [gatewayAllowedIps] through completely unchanged (Full VPN must
+     * remain 0.0.0.0/0 exactly as before - see class docs' IPv6 fail-closed
+     * requirement, also untouched: only IPv4 entries are ever replaced,
+     * every IPv6 entry from [gatewayAllowedIps] - normally "::/0" - is kept
+     * verbatim in every mode). ADAPTIVE replaces ONLY the IPv4 entries with
+     * [Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES] - the whole IPv4
+     * space minus RFC1918/loopback/link-local - via the SAME
+     * RoutingDecisionEngine.decideAdaptiveRoute authority this file's other
+     * callers use, never a parallel decision helper. [DestinationClass
+     * .LOCAL_PRIVATE] is the only class ever evaluated here (this decides
+     * the STATIC route set for the whole session, not a per-packet
+     * decision - see RoutingDecisionEngine's own docs for why finer-grained,
+     * per-destination adaptive routing is out of this slice's enforceable
+     * scope) - a manifest-provided narrower [gatewayAllowedIps] override is
+     * intentionally superseded by the standard exclusion set in ADAPTIVE
+     * mode, never combined with it.
+     */
+    private fun resolveAdaptiveAllowedIps(gatewayAllowedIps: List<String>, routingMode: RoutingMode): List<String> {
+        val decision = RoutingDecisionEngine.decideAdaptiveRoute(
+            RoutingContext(
+                routingMode = routingMode,
+                destinationClass = DestinationClass.LOCAL_PRIVATE,
+                restrictionClass = restrictionClassProvider?.invoke() ?: RestrictionClass.UNKNOWN,
+            ),
+        )
+        if (decision !is RouteDecision.Direct) return gatewayAllowedIps
+        val ipv6Entries = gatewayAllowedIps.filter { it.contains(":") }
+        return Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES + ipv6Entries
+    }
+
+    private suspend fun buildTransportConfig(
+        kind: TransportKind,
+        config: GatewayConfiguration.Configured,
+        appRoutingLists: AppRoutingLists,
+        routingMode: RoutingMode,
+    ): TransportConfig =
         when (kind) {
             TransportKind.AMNEZIA_WG -> {
                 val privateKey = clientKeyRepository.getPrivateKeyForTunnel()
@@ -679,7 +756,7 @@ class VpnController(
                         publicKeyBase64 = config.serverPublicKeyBase64,
                         endpointHost = config.endpointHost,
                         endpointPort = config.endpointPort,
-                        allowedIps = config.allowedIps,
+                        allowedIps = resolveAdaptiveAllowedIps(config.allowedIps, routingMode),
                         persistentKeepaliveSeconds = config.persistentKeepaliveSeconds,
                     ),
                 )

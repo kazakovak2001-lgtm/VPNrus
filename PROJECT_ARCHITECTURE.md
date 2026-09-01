@@ -152,6 +152,43 @@ NetworkProfiler
   unchanged and governs ONLY Manual mode (`autoContext == null`) - it does
   NOT additionally run "within" an Auto sequence's current gateway.
 
+## Routing decision vs transport/gateway selection (hard invariant, B18)
+
+- `RoutingDecisionEngine.decideAdaptiveRoute` (`smartconnect/RoutingDecisionEngine.kt`)
+  is the ONE live authority for DIRECT vs VPN at the destination-route level -
+  never merged with `SmartConnectDecisionEngine` (transport) or
+  `AutoGatewaySelector` (gateway). Input: a top-level, persisted, device-local
+  `RoutingMode` (`FULL_VPN`/`ADAPTIVE`/`APPS`, default `FULL_VPN`,
+  `vpn/policy/RoutingMode.kt`), a route-prefix-only `DestinationClass`
+  (`LOCAL_PRIVATE` - RFC1918/loopback/link-local, computed by the
+  provably-correct `Ipv4RouteExclusion` CIDR-subtraction utility - vs
+  `PROTECTED`, everything else; never per-packet/hostname/domain
+  inspection), and `RestrictionClass` (`RestrictionClassifier`'s output,
+  wired into a routing decision for the first time here). Conservative by
+  construction: only `RestrictionClass.NO_NETWORK` ever changes the
+  outcome (-> `Block`); every "possible filtering" class NEVER routes
+  `PROTECTED` traffic DIRECT - no hard-whitelist bypass exists or is
+  claimed.
+- Precedence rule: `AppRoutingPolicy` (B8H, unchanged) decides WHICH APPS'
+  traffic reaches the VPN interface at all; `RoutingMode`/
+  `RoutingDecisionEngine` decides, only for traffic that does, whether its
+  destination goes DIRECT or through the tunnel. `RoutingMode.APPS` is
+  byte-for-byte identical to `FULL_VPN` at the destination-route layer -
+  Adaptive mode can never broaden which apps bypass the VPN.
+  `routingModeStore` is read fresh only at the start of a real `connect()`
+  attempt (`VpnController.appliedRoutingMode`) - same "no live mid-session
+  rebuild, reconnect to apply" discipline as `AppRoutingPolicy`.
+- Live enforcement exists for the AmneziaWG transport ONLY
+  (`VpnController.resolveAdaptiveAllowedIps` replaces only the IPv4 entries
+  of the AWG peer's AllowedIPs in `ADAPTIVE` mode; the IPv6 entry - `::/0` -
+  is untouched in every mode, preserving the existing IPv6 fail-closed
+  guarantee). XRAY_REALITY/TLS_TCP route plans are UNCHANGED (always
+  `0.0.0.0/0`) - Adaptive Direct Routing does not extend to those transports
+  yet, a real gap: manual transport selection or AWG->Xray failover while in
+  Adaptive mode silently reverts to full-tunnel-equivalent routing (not a
+  leak, but an inconsistency - see ROADMAP's own Adaptive Direct Routing row).
+  No physical-device validation has been performed for this feature.
+
 ## Per-device identity (hard invariant)
 
 - Client tunnel IP is per-device, per-endpoint, PROVISIONED identity - lives only in
@@ -229,6 +266,12 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
+Last updated: 2026-09-01 (B18 - added the "Routing decision vs transport/gateway
+selection" section above: RoutingMode/RoutingDecisionEngine.decideAdaptiveRoute
+is now the real, live DIRECT-vs-VPN authority for the AmneziaWG transport,
+route-prefix-level only, with RestrictionClassifier wired in conservatively.
+Everything below this line predates B18 and is unaffected by it.)
+
 Last updated: 2026-09-01 (B17 - Auto gateway/path DISCOVERY runtime authority
 moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;
 the production Ed25519 key ceremony was performed (real keypair, private key

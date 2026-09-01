@@ -29,17 +29,24 @@ import androidx.compose.ui.unit.dp
 import net.pocvpn.client.R
 import net.pocvpn.client.ui.components.ChevronRightGlyph
 import net.pocvpn.client.vpn.policy.AppRoutingMode
+import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
- * B8H - "Settings -> Split tunneling". No raw package-name text field (see
- * this feature's own UI requirements) - app selection is always via
- * AppSelectorScreen, reached through the "Select apps" row below, never
- * typed. showReconnectNotice is purely display-only - selecting a mode here
- * ONLY saves the policy (see MainViewModel.updateAppRoutingPolicy); it never
- * itself reconnects or rebuilds the active tunnel.
+ * B8H/B18 - "Settings -> Split tunneling" plus the top-level B18 routing
+ * mode picker. No raw package-name text field (see this feature's own UI
+ * requirements) - app selection is always via AppSelectorScreen, reached
+ * through the "Select apps" row below, never typed. showReconnectNotice is
+ * purely display-only - selecting a mode here ONLY saves the policy (see
+ * MainViewModel.updateAppRoutingPolicy/updateRoutingMode); it never itself
+ * reconnects or rebuilds the active tunnel. [routingMode] and [mode] are
+ * orthogonal (see RoutingDecisionEngine's own precedence-rule docs) - the
+ * split-tunneling section below always applies, independent of which
+ * top-level routing mode is selected.
  */
 @Composable
 fun SettingsScreen(
+    routingMode: RoutingMode,
+    onRoutingModeSelected: (RoutingMode) -> Unit,
     mode: AppRoutingMode,
     selectedAppCount: Int,
     showReconnectNotice: Boolean,
@@ -70,6 +77,42 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onBackground,
             )
         }
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Text(
+            text = stringResource(R.string.settings_routing_mode_title),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_routing_mode_helper),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        RoutingModeRow(
+            label = stringResource(R.string.settings_routing_mode_full_vpn),
+            helper = stringResource(R.string.settings_routing_mode_full_vpn_helper),
+            selected = routingMode == RoutingMode.FULL_VPN,
+            onClick = { onRoutingModeSelected(RoutingMode.FULL_VPN) },
+        )
+        RoutingModeRow(
+            label = stringResource(R.string.settings_routing_mode_adaptive),
+            helper = stringResource(R.string.settings_routing_mode_adaptive_helper),
+            selected = routingMode == RoutingMode.ADAPTIVE,
+            onClick = { onRoutingModeSelected(RoutingMode.ADAPTIVE) },
+        )
+        RoutingModeRow(
+            label = stringResource(R.string.settings_routing_mode_apps),
+            helper = stringResource(R.string.settings_routing_mode_apps_helper),
+            selected = routingMode == RoutingMode.APPS,
+            onClick = { onRoutingModeSelected(RoutingMode.APPS) },
+        )
 
         Spacer(modifier = Modifier.height(28.dp))
 
@@ -172,7 +215,7 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun RoutingModeRow(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun RoutingModeRow(label: String, selected: Boolean, onClick: () -> Unit, helper: String? = null) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -182,6 +225,11 @@ private fun RoutingModeRow(label: String, selected: Boolean, onClick: () -> Unit
     ) {
         RadioButton(selected = selected, onClick = onClick)
         Spacer(modifier = Modifier.width(4.dp))
-        Text(text = label, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
+        Column {
+            Text(text = label, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
+            if (helper != null) {
+                Text(text = helper, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
