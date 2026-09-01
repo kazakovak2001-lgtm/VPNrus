@@ -46,6 +46,18 @@ import net.pocvpn.client.transport.TransportStatus
  * .reasons] alongside the existing free-text summaries (never replacing
  * them - every pre-B19 reader of a specific string is unaffected) so a
  * diagnostics UI/test can match on a stable token rather than parsing prose.
+ *
+ * B19-3 - ELIGIBILITY (a separate concern from ranking, checked first, see
+ * [isEligible]'s own docs for the exact precedence): fresh endpoint-specific
+ * [ReachabilityState.UNREACHABLE] and [net.pocvpn.client.transport
+ * .TransportHealthState.NOT_IMPLEMENTED] make a candidate ineligible
+ * (`PathScoreResult.eligible = false`, never merely low-scored) - an
+ * ineligible candidate never becomes an executable
+ * [net.pocvpn.client.smartconnect.GatewayAttemptCandidate] (see
+ * [net.pocvpn.client.smartconnect.AutoGatewaySelector], which already only
+ * ever promotes `eligible == true` results - this file remains the ONE
+ * place that decision is made). `DEGRADED`/`UNKNOWN` remain eligible,
+ * penalized only by [score]'s own tiering below.
  */
 object PathScorer {
 
@@ -66,10 +78,49 @@ object PathScorer {
         val reasons: List<String>,
     )
 
-    /** invalid/unsupported/NOT_IMPLEMENTED transports are ineligible - checked before any scoring. */
-    fun isEligible(candidate: PathCandidate, registry: TransportRegistry): Boolean {
-        val descriptor = registry.descriptorFor(candidate.transport) ?: return false
-        return descriptor.status == TransportStatus.AVAILABLE
+    /**
+     * B19-3 - the ONE place candidate eligibility is decided (this file's own
+     * single-authority contract - never a second filtering layer in
+     * `AutoGatewaySelector`/`MainViewModel`/`TransportOrchestrator`). Checked
+     * before any scoring. Explicit precedence, first match wins:
+     *
+     *  1. Transport not `AVAILABLE` in the registry, or [transportHealth] is
+     *     [TransportHealthState.NOT_IMPLEMENTED] -> ineligible (nothing can
+     *     execute this kind at all).
+     *  2. Fresh endpoint-specific [ReachabilityState.UNREACHABLE] (the worst
+     *     hop's own `reachability.state` - already the FRESH, endpoint-
+     *     specific-aware value `ReachabilityEngine.assess` produces; stale
+     *     evidence already decays to [ReachabilityState.UNKNOWN] THERE, so
+     *     this is deliberately the ONLY freshness check - never a second,
+     *     duplicate implementation here) -> ineligible, REGARDLESS of
+     *     transport-wide health - the strongest, most specific signal wins.
+     *  3. [TransportHealthState.UNREACHABLE] (transport-wide) -> ineligible
+     *     UNLESS some hop's own reachability is confirmed
+     *     [ReachabilityState.REACHABLE] - fresh, stronger, endpoint-specific
+     *     evidence is never overridden by a coarser transport-wide claim
+     *     (task's own "do not let transport-wide UNREACHABLE override
+     *     stronger fresh endpoint-specific REACHABLE evidence").
+     *  4. Everything else (`DEGRADED`/`UNKNOWN` on either signal) remains
+     *     eligible, penalized by [score]'s own tiering, never excluded.
+     */
+    fun isEligible(candidate: PathCandidate, registry: TransportRegistry, transportHealth: TransportHealth): Boolean =
+        ineligibilityReason(candidate, registry, transportHealth) == null
+
+    /** Returns the typed [Reason] this candidate is ineligible for, or null when it IS eligible - see [isEligible]'s own docs for the exact precedence. */
+    private fun ineligibilityReason(candidate: PathCandidate, registry: TransportRegistry, transportHealth: TransportHealth): Reason? {
+        val descriptor = registry.descriptorFor(candidate.transport)
+        if (descriptor == null || descriptor.status != TransportStatus.AVAILABLE) return Reason.TRANSPORT_NOT_IMPLEMENTED
+        if (transportHealth.state == TransportHealthState.NOT_IMPLEMENTED) return Reason.TRANSPORT_NOT_IMPLEMENTED
+
+        val worstHopReachability = candidate.hops.minByOrNull { reachabilityRank(it.reachability.state) }?.reachability?.state
+            ?: ReachabilityState.UNKNOWN
+        if (worstHopReachability == ReachabilityState.UNREACHABLE) return Reason.ENDPOINT_UNREACHABLE
+
+        if (transportHealth.state == TransportHealthState.UNREACHABLE) {
+            val anyHopConfirmedReachable = candidate.hops.any { it.reachability.state == ReachabilityState.REACHABLE }
+            if (!anyHopConfirmedReachable) return Reason.TRANSPORT_UNREACHABLE
+        }
+        return null
     }
 
     /**
@@ -89,8 +140,13 @@ object PathScorer {
         diverseProviderOrAsnSeenElsewhere: Boolean,
         nowEpochMillis: Long = Long.MAX_VALUE,
     ): PathScoreResult {
-        if (!isEligible(candidate, registry)) {
-            return PathScoreResult(candidate, eligible = false, score = Long.MIN_VALUE, reasons = listOf("transport ${candidate.transport} is not AVAILABLE"))
+        ineligibilityReason(candidate, registry, transportHealth)?.let { reason ->
+            return PathScoreResult(
+                candidate,
+                eligible = false,
+                score = Long.MIN_VALUE,
+                reasons = listOf("transport ${candidate.transport} is not eligible: $reason", reason.name),
+            )
         }
 
         val reasons = mutableListOf<String>()

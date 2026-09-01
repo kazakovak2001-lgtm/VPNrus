@@ -325,7 +325,18 @@ class AutoGatewaySelectorTest {
             historyFor = { _, _ -> null },
         )
 
-        assertEquals(TransportKind.XRAY_REALITY, candidates.first().transport)
+        // B19-3 - fresh UNREACHABLE now makes AWG genuinely INELIGIBLE, not
+        // merely low-ranked: it must be entirely ABSENT from the executable
+        // plan, and therefore never attempted at all - never consuming a
+        // MAX_ATTEMPTS slot or appearing from nextCandidate.
+        assertEquals(listOf(TransportKind.XRAY_REALITY), candidates.map { it.transport })
+        var attempted = emptySet<Pair<ProductionGatewayId, TransportKind>>()
+        var next = AutoGatewaySelector.nextCandidate(candidates, attempted)
+        while (next != null) {
+            assertTrue("AWG must never be attempted from a plan where it was ineligible", next.transport != TransportKind.AMNEZIA_WG)
+            attempted = attempted + (next.gatewayId to next.transport)
+            next = AutoGatewaySelector.nextCandidate(candidates, attempted)
+        }
     }
 
     @Test

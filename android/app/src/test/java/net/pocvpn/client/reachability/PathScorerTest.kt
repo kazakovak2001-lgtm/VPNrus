@@ -331,13 +331,106 @@ class PathScorerTest {
         val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
         val e = endpoint("gw", TransportKind.AMNEZIA_WG)
         val best = PathCandidateBuilder.buildDirect(e, TransportKind.AMNEZIA_WG, reachWithEvidence(e.id, TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE))!!
-        val worst = PathCandidateBuilder.buildDirect(e, TransportKind.AMNEZIA_WG, reachWithEvidence(e.id, TransportKind.AMNEZIA_WG, ReachabilityState.UNREACHABLE, latencyMillis = Long.MAX_VALUE / 2, endpointSpecificReachable = false))!!
+        // B19-3 - the worst ELIGIBLE combination: DEGRADED (not UNREACHABLE -
+        // that is now ineligible outright, see the dedicated eligibility
+        // tests below) reachability/health, every penalty at its cap, worst
+        // maturity, no diversity bonus.
+        val worstEligible = PathCandidateBuilder.buildDirect(e, TransportKind.AMNEZIA_WG, reachWithEvidence(e.id, TransportKind.AMNEZIA_WG, ReachabilityState.DEGRADED, latencyMillis = Long.MAX_VALUE / 2, endpointSpecificReachable = false))!!
         val bestScore = PathScorer.score(best, registry, TransportCapabilities.amneziaWg().copy(maturity = TransportMaturity.STABLE), TransportHealth(state = TransportHealthState.HEALTHY), PathHistoryEntry(10, 0, 0L, true), true)
-        val worstScore = PathScorer.score(worst, registry, TransportCapabilities.amneziaWg().copy(maturity = TransportMaturity.NOT_IMPLEMENTED), TransportHealth(state = TransportHealthState.NOT_IMPLEMENTED), PathHistoryEntry(0, 10, 0L, false), false)
+        val worstScore = PathScorer.score(worstEligible, registry, TransportCapabilities.amneziaWg().copy(maturity = TransportMaturity.NOT_IMPLEMENTED), TransportHealth(state = TransportHealthState.DEGRADED), PathHistoryEntry(0, 10, 0L, false), false)
+        assertTrue(worstScore.eligible)
         assertTrue(bestScore.score > 0)
         assertTrue(bestScore.score > worstScore.score)
         // No exception/NaN-equivalent - both are finite, sane Long values.
         assertTrue(bestScore.score < Long.MAX_VALUE / 2)
         assertTrue(worstScore.score > Long.MIN_VALUE / 2)
+    }
+
+    @Test
+    fun `a genuinely ineligible candidate (fresh UNREACHABLE, NOT_IMPLEMENTED health+maturity) scores the exact MIN_VALUE sentinel, never an underflow`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val e = endpoint("gw", TransportKind.AMNEZIA_WG)
+        val ineligible = PathCandidateBuilder.buildDirect(e, TransportKind.AMNEZIA_WG, reachWithEvidence(e.id, TransportKind.AMNEZIA_WG, ReachabilityState.UNREACHABLE, latencyMillis = Long.MAX_VALUE / 2, endpointSpecificReachable = false))!!
+        val result = PathScorer.score(ineligible, registry, TransportCapabilities.amneziaWg().copy(maturity = TransportMaturity.NOT_IMPLEMENTED), TransportHealth(state = TransportHealthState.NOT_IMPLEMENTED), PathHistoryEntry(0, 10, 0L, false), false)
+        assertFalse(result.eligible)
+        assertEquals(Long.MIN_VALUE, result.score)
+    }
+
+    // --- B19-3: eligibility contract - fresh UNREACHABLE/NOT_IMPLEMENTED are ineligible, never merely low-scored ---
+
+    @Test
+    fun `fresh endpoint-specific UNREACHABLE makes the candidate ineligible regardless of transport health`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.UNREACHABLE)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
+        assertFalse(result.eligible)
+        assertTrue(result.reasons.contains(PathScorer.Reason.ENDPOINT_UNREACHABLE.name))
+    }
+
+    @Test
+    fun `endpoint REACHABLE plus transport-wide UNREACHABLE - fresh endpoint-specific evidence wins, candidate stays eligible`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.UNREACHABLE), null, false)
+        assertTrue(result.eligible)
+    }
+
+    @Test
+    fun `endpoint UNKNOWN plus transport-wide UNREACHABLE - no stronger evidence to override, ineligible`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.UNKNOWN)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.UNREACHABLE), null, false)
+        assertFalse(result.eligible)
+        assertTrue(result.reasons.contains(PathScorer.Reason.TRANSPORT_UNREACHABLE.name))
+    }
+
+    @Test
+    fun `DEGRADED reachability remains eligible`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.DEGRADED)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
+        assertTrue(result.eligible)
+    }
+
+    @Test
+    fun `UNKNOWN reachability with UNKNOWN transport health remains eligible`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.UNKNOWN)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.UNKNOWN), null, false)
+        assertTrue(result.eligible)
+    }
+
+    @Test
+    fun `NOT_IMPLEMENTED transport health makes the candidate ineligible even with REACHABLE endpoint evidence`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val result = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.NOT_IMPLEMENTED), null, false)
+        assertFalse(result.eligible)
+        assertTrue(result.reasons.contains(PathScorer.Reason.TRANSPORT_NOT_IMPLEMENTED.name))
+    }
+
+    @Test
+    fun `stale-decayed UNREACHABLE evidence arrives as UNKNOWN from ReachabilityEngine and is eligible again - no second freshness check in PathScorer`() {
+        // ReachabilityEngine.assess is what actually decays stale evidence to
+        // UNKNOWN (see that object's own docs) - this proves PathScorer
+        // trusts whatever state it is handed, never re-deriving staleness.
+        val now = 10_000_000L
+        val staleEvidence = ReachabilityEngine.assess(
+            endpoint = EndpointDescriptor(EndpointId("gw1"), setOf(EndpointRole.GATEWAY), "eu", "acme", transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.1", 51820))),
+            transportKind = TransportKind.AMNEZIA_WG,
+            networkUsable = true,
+            transportHealth = TransportHealth(state = TransportHealthState.UNREACHABLE, lastProbeEpochMillis = 0L),
+            endpointSpecificReachable = false,
+            restrictionClass = RestrictionClass.UNKNOWN,
+            nowEpochMillis = now,
+            endpointSpecificOutcomeEpochMillis = 0L,
+        )
+        assertEquals(ReachabilityState.UNKNOWN, staleEvidence.state)
+
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val candidate = PathCandidateBuilder.buildDirect(endpoint("gw1", TransportKind.AMNEZIA_WG), TransportKind.AMNEZIA_WG, staleEvidence)!!
+        // A fresh transportHealth read now shows UNKNOWN too (the same stale-decay reasoning) - not the original UNREACHABLE.
+        val result = PathScorer.score(candidate, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.UNKNOWN), null, false)
+        assertTrue(result.eligible)
     }
 }

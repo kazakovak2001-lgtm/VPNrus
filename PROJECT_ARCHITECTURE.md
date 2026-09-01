@@ -181,6 +181,22 @@ NetworkProfiler
   history > capability maturity > small latency/failure/cooldown/diversity
   adjustments - enforced by `PathScorer`'s own order-of-magnitude tiering,
   never a flat weighted sum.
+- **Eligibility (B19-3, a separate concern from ranking, checked first in
+  `PathScorer.isEligible`/`ineligibilityReason` - the ONE place, never a
+  second filtering layer in `AutoGatewaySelector`/`MainViewModel`/
+  `TransportOrchestrator`)**: fresh endpoint-specific `ReachabilityState
+  .UNREACHABLE` -> ineligible regardless of transport health (the strongest,
+  most specific signal); `TransportHealthState.NOT_IMPLEMENTED` ->
+  ineligible; transport-wide `TransportHealthState.UNREACHABLE` ->
+  ineligible UNLESS some hop is fresh-confirmed `REACHABLE` (fresh
+  endpoint-specific evidence is never overridden by a coarser transport-wide
+  claim); `DEGRADED`/`UNKNOWN` on either signal remain eligible, penalized
+  only by scoring. Stale evidence never needs a second freshness check here -
+  `ReachabilityEngine.assess` already decays it to `UNKNOWN` before
+  `PathScorer` ever sees it. An ineligible `PathScoreResult` (`score =
+  Long.MIN_VALUE`) never becomes an executable `GatewayAttemptCandidate` -
+  `AutoGatewaySelector` already only promotes `eligible == true` results, so
+  an ineligible candidate structurally never consumes a `MAX_ATTEMPTS` slot.
 - **Physically verified end to end (2026-09-01)**: on the real test device,
   in real Auto mode, two real `FAILURE` outcomes for Frankfurt AWG (written
   via a minimal debug-only Diagnostics button - `MainViewModel
