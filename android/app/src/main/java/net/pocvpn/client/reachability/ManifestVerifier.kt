@@ -20,9 +20,18 @@ class FixedManifestTrustAnchors(private val keys: Map<TrustedKeyId, ByteArray>) 
     override fun publicKeyFor(keyId: TrustedKeyId): ByteArray? = keys[keyId]
 }
 
+/** B20 - the exact, small set of rejection categories this verifier actually produces (see each [Ed25519ManifestVerifier.verify] return site) - never invented beyond what the implementation checks. */
+enum class ManifestVerificationFailureKind {
+    UNKNOWN_SIGNING_KEY,
+    CLOCK_SKEW,
+    EXPIRED,
+    INVALID_SIGNATURE,
+}
+
 sealed class ManifestVerificationResult {
     object Valid : ManifestVerificationResult()
-    data class Invalid(val reason: String) : ManifestVerificationResult()
+    /** [kind] is the typed category a caller should branch on; [reason] is the human-readable detail for diagnostics only - see [ManifestVerificationFailureKind]'s own docs for why this is never inferred by parsing [reason] elsewhere. */
+    data class Invalid(val kind: ManifestVerificationFailureKind, val reason: String) : ManifestVerificationResult()
 }
 
 /**
@@ -49,13 +58,13 @@ class Ed25519ManifestVerifier(
     override fun verify(signed: SignedManifest, trustAnchors: ManifestTrustAnchors, nowEpochMillis: Long): ManifestVerificationResult {
         val manifest = signed.manifest
         val publicKeyBytes = trustAnchors.publicKeyFor(TrustedKeyId(manifest.signingKeyId))
-            ?: return ManifestVerificationResult.Invalid("unknown signing key id: ${manifest.signingKeyId}")
+            ?: return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.UNKNOWN_SIGNING_KEY, "unknown signing key id: ${manifest.signingKeyId}")
 
         if (manifest.issuedAtEpochMillis > nowEpochMillis + clockSkewToleranceMillis) {
-            return ManifestVerificationResult.Invalid("issuedAt is implausibly in the future")
+            return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.CLOCK_SKEW, "issuedAt is implausibly in the future")
         }
         if (manifest.expiresAtEpochMillis <= nowEpochMillis) {
-            return ManifestVerificationResult.Invalid("manifest has expired")
+            return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.EXPIRED, "manifest has expired")
         }
 
         val canonical = ManifestCanonicalizer.canonicalBytes(manifest)
@@ -64,7 +73,7 @@ class Ed25519ManifestVerifier(
         } catch (e: IllegalArgumentException) {
             false
         }
-        if (!signatureValid) return ManifestVerificationResult.Invalid("signature verification failed")
+        if (!signatureValid) return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.INVALID_SIGNATURE, "signature verification failed")
 
         return ManifestVerificationResult.Valid
     }

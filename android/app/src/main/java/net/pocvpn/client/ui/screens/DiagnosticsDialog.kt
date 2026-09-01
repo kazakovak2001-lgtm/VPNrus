@@ -69,6 +69,13 @@ fun DiagnosticsDialog(
     // screen calls the SAME MainViewModel.activateDevice(credential,
     // targetGatewayId) every other activation flow uses.
     onReactivateGermany: () -> Unit,
+    // B20 - debug-only: manually triggers the SAME real
+    // MainViewModel.refreshManifest() -> MultiOriginManifestDistributionClient
+    // path the ViewModel init-time startup refresh already uses (never a
+    // parallel/fake test client) - see MainViewModel.debugRefreshManifest's
+    // own docs. Exists for deterministic physical validation without
+    // force-stopping the app between fault-injection steps.
+    onRefreshManifest: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
@@ -126,6 +133,9 @@ fun DiagnosticsDialog(
                 }
                 TextButton(onClick = onReactivateGermany, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_reactivate_germany))
+                }
+                TextButton(onClick = onRefreshManifest, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.diagnostics_refresh_manifest))
                 }
                 TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_close))

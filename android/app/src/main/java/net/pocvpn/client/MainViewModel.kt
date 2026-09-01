@@ -324,13 +324,16 @@ class MainViewModel(
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
-    // B12 - additive, defaults to null (same seam as every optional
+    // B12/B20 - additive, defaults to null (same seam as every optional
     // dependency above): with no client, refreshManifest() below is a
     // no-op that returns null, and manifestRepository's trusted state is
     // whatever the embedded bootstrap/previously-adopted LKG already say -
     // this constructor param existing does not, by itself, cause any
-    // network access.
-    private val manifestDistributionClient: net.pocvpn.client.reachability.ManifestDistributionClient? = null,
+    // network access. B20 - now a MultiOriginManifestDistributionClient
+    // (was a single-origin ManifestDistributionClient) - the ONE production
+    // trigger this class calls is unchanged, only the number of HTTPS
+    // origins one logical refresh actually tries.
+    private val manifestDistributionClient: net.pocvpn.client.reachability.MultiOriginManifestDistributionClient? = null,
     // B13 - additive, defaults to a store that always reads GERMANY and
     // ignores writes (see SelectedGatewayStore.germanyOnly()'s own docs) -
     // every pre-B13 call site/test is byte-for-byte unaffected: the manual
@@ -1048,34 +1051,51 @@ class MainViewModel(
     val lastManifestRefreshOutcome: StateFlow<String?> = _lastManifestRefreshOutcome.asStateFlow()
 
     /**
-     * B12 - attempts one bounded manifest download+adoption via
-     * [manifestDistributionClient] (see its own docs: fetch failure/invalid
-     * signature/expiry/rollback all reject WITHOUT touching LKG, exactly
-     * ManifestUpdateResult's own contract). Returns null in TWO distinct,
-     * equally-benign cases a caller must treat identically - "do nothing
-     * further": no client was wired (feature not configured), OR a refresh
-     * was already in flight and this call was skipped rather than queued
-     * (see [manifestRefreshMutex]). OBSERVATIONAL in the SAME sense as
-     * reachabilityDiagnostics(): a successful adoption only changes which
-     * manifest is trusted (endpoints/candidates), never which transport
-     * Smart Connect automatically selects, and never gates or delays
-     * connect() - this function is never awaited by any connect path.
+     * B12/B20 - attempts one bounded multi-origin manifest download+adoption
+     * via [manifestDistributionClient] (see its own docs: fetch
+     * failure/invalid signature/expiry/rollback all reject WITHOUT touching
+     * LKG for every origin tried, exactly ManifestUpdateResult's own
+     * contract - control-plane origin failure never erases a good LKG).
+     * Returns null in TWO distinct, equally-benign cases a caller must treat
+     * identically - "do nothing further": no client was wired (feature not
+     * configured), OR a refresh was already in flight and this call was
+     * skipped rather than queued (see [manifestRefreshMutex]). OBSERVATIONAL
+     * in the SAME sense as reachabilityDiagnostics(): a successful adoption
+     * only changes which manifest is trusted (endpoints/candidates), never
+     * which transport Smart Connect automatically selects, and never gates
+     * or delays connect() - this function is never awaited by any connect
+     * path.
      */
-    suspend fun refreshManifest(): net.pocvpn.client.reachability.ManifestUpdateResult? {
+    suspend fun refreshManifest(): net.pocvpn.client.reachability.MultiOriginRefreshResult? {
         val client = manifestDistributionClient ?: return null
         if (!manifestRefreshMutex.tryLock()) return null
         return try {
             client.refresh().also { result ->
-                _lastManifestRefreshOutcome.value = when (result) {
-                    is net.pocvpn.client.reachability.ManifestUpdateResult.Accepted ->
-                        "accepted version ${result.manifest.manifestVersion}"
-                    is net.pocvpn.client.reachability.ManifestUpdateResult.Rejected ->
-                        "rejected: ${result.reason}"
+                val perOriginText = result.perOrigin.joinToString("; ") { "${it.origin.id}=${it.outcome.kind}" }.ifEmpty { "no origins configured" }
+                val finalText = when (val outcome = result.finalOutcome) {
+                    is net.pocvpn.client.reachability.ManifestUpdateResult.Accepted -> "accepted version ${outcome.manifest.manifestVersion}"
+                    is net.pocvpn.client.reachability.ManifestUpdateResult.Rejected -> "rejected: ${outcome.reason}"
+                    null -> "no origins configured"
                 }
+                _lastManifestRefreshOutcome.value = "$perOriginText | final: $finalText"
             }
         } finally {
             manifestRefreshMutex.unlock()
         }
+    }
+
+    /**
+     * B20 - debug-only manual trigger for physical validation (Diagnostics
+     * dialog's "Refresh manifest" button - see DiagnosticsDialog's own
+     * docs): fire-and-forget, calls the EXACT SAME [refreshManifest] the
+     * real ViewModel-init startup refresh already uses - no parallel/fake
+     * test client, no separate mutex, no separate fetch pipeline. Bounded by
+     * the SAME [manifestRefreshMutex] refreshManifest() already enforces, so
+     * a tap while a refresh is already in flight is simply skipped, never
+     * queued.
+     */
+    fun debugRefreshManifest() {
+        viewModelScope.launch { refreshManifest() }
     }
 
     val transportState: StateFlow<TransportState> = controller.state
@@ -2144,17 +2164,21 @@ class MainViewModel(
             // offer()) - never a second, independently-constructed repository
             // that could disagree with what diagnostics reports.
             val manifestRepository = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createManifestRepository(context)
-            // B12 - blank BuildConfig.MANIFEST_URL (the default - see
-            // build.gradle.kts) means this stays null: refreshManifest()
-            // becomes a no-op, and manifestRepository is driven ONLY by its
-            // embedded bootstrap/whatever LKG already exists on disk. Never
-            // constructed against a blank URL (HttpsRemoteManifestFetcher
-            // would just fail every request, which is a worse failure mode
-            // than "clearly not configured").
-            val manifestDistributionClient = BuildConfig.MANIFEST_URL.takeIf { it.isNotBlank() }?.let { url ->
-                net.pocvpn.client.reachability.ManifestDistributionClient(
-                    net.pocvpn.client.reachability.HttpsRemoteManifestFetcher(url),
-                    manifestRepository,
+            // B12/B20 - BuildConfig.MANIFEST_URLS (comma-separated, see
+            // build.gradle.kts) parsed/validated via ManifestOriginConfig:
+            // blank/malformed/duplicate entries never become a configured
+            // origin (see its own docs). An empty resulting list means this
+            // stays null: refreshManifest() becomes a no-op, and
+            // manifestRepository is driven ONLY by its embedded
+            // bootstrap/whatever LKG already exists on disk - never
+            // constructed against zero origins (every real HTTPS fetch
+            // would just fail, which is a worse failure mode than "clearly
+            // not configured").
+            val manifestOrigins = net.pocvpn.client.reachability.ManifestOriginConfig.parse(BuildConfig.MANIFEST_URLS)
+            val manifestDistributionClient = manifestOrigins.takeIf { it.isNotEmpty() }?.let { origins ->
+                net.pocvpn.client.reachability.MultiOriginManifestDistributionClient(
+                    origins = origins,
+                    repository = manifestRepository,
                 )
             }
             @Suppress("UNCHECKED_CAST")

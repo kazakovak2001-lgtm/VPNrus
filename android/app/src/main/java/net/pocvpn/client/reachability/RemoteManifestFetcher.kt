@@ -8,10 +8,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** Outcome of one bounded attempt to download the current signed manifest. Never itself a trust decision - see [ManifestDistributionClient]. */
+/** B20 - the exact, small set of transport-level failure categories [HttpsRemoteManifestFetcher] actually produces (see each [ManifestFetchResult.Failed] return site) - never invented beyond what the implementation checks. [MALFORMED] covers both an over-bound/undersized response body and a container that failed to decode - a transport-layer "these bytes were never usable" bucket, distinct from [EndpointManifestRepository]'s own verification-level rejection categories, since a malformed fetch never reaches the verifier at all. */
+enum class ManifestFetchFailureKind {
+    NETWORK_ERROR,
+    TLS_ERROR,
+    HTTP_ERROR,
+    MALFORMED,
+}
+
+/** Outcome of one bounded attempt to download the current signed manifest. Never itself a trust decision - see [ManifestDistributionClient]. [kind] is the typed category a caller should branch on; [reason] is the human-readable detail for diagnostics only. */
 sealed class ManifestFetchResult {
     data class Fetched(val signed: SignedManifest) : ManifestFetchResult()
-    data class Failed(val reason: String) : ManifestFetchResult()
+    data class Failed(val kind: ManifestFetchFailureKind, val reason: String) : ManifestFetchResult()
 }
 
 /**
@@ -42,7 +50,7 @@ class HttpsRemoteManifestFetcher(
 ) : RemoteManifestFetcher {
 
     override suspend fun fetch(): ManifestFetchResult =
-        withTimeoutOrNull(timeoutMs) { performFetch() } ?: ManifestFetchResult.Failed("timed out")
+        withTimeoutOrNull(timeoutMs) { performFetch() } ?: ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "timed out")
 
     private suspend fun performFetch(): ManifestFetchResult = withContext(Dispatchers.IO) {
         try {
@@ -53,15 +61,15 @@ class HttpsRemoteManifestFetcher(
             connection.instanceFollowRedirects = false
             try {
                 val code = connection.responseCode
-                if (code != 200) return@withContext ManifestFetchResult.Failed("unexpected HTTP status $code")
+                if (code != 200) return@withContext ManifestFetchResult.Failed(ManifestFetchFailureKind.HTTP_ERROR, "unexpected HTTP status $code")
 
                 val contentLength = connection.contentLengthLong
                 if (contentLength > MAX_RESPONSE_BYTES) {
-                    return@withContext ManifestFetchResult.Failed("declared response size exceeds bound")
+                    return@withContext ManifestFetchResult.Failed(ManifestFetchFailureKind.MALFORMED, "declared response size exceeds bound")
                 }
 
                 val bytes = connection.inputStream.use { readBounded(it, MAX_RESPONSE_BYTES) }
-                    ?: return@withContext ManifestFetchResult.Failed("response body exceeds bound")
+                    ?: return@withContext ManifestFetchResult.Failed(ManifestFetchFailureKind.MALFORMED, "response body exceeds bound")
 
                 val signed = SignedManifestCodec.decode(bytes)
                 ManifestFetchResult.Fetched(signed)
@@ -69,11 +77,11 @@ class HttpsRemoteManifestFetcher(
                 connection.disconnect()
             }
         } catch (e: SSLException) {
-            ManifestFetchResult.Failed("TLS error: ${e.javaClass.simpleName}")
+            ManifestFetchResult.Failed(ManifestFetchFailureKind.TLS_ERROR, "TLS error: ${e.javaClass.simpleName}")
         } catch (e: IOException) {
-            ManifestFetchResult.Failed("network error: ${e.javaClass.simpleName}")
+            ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "network error: ${e.javaClass.simpleName}")
         } catch (e: IllegalArgumentException) {
-            ManifestFetchResult.Failed("malformed manifest container: ${e.message}")
+            ManifestFetchResult.Failed(ManifestFetchFailureKind.MALFORMED, "malformed manifest container: ${e.message}")
         }
     }
 
@@ -116,6 +124,11 @@ class ManifestDistributionClient(
 ) {
     suspend fun refresh(): ManifestUpdateResult = when (val result = fetcher.fetch()) {
         is ManifestFetchResult.Fetched -> repository.offer(result.signed)
-        is ManifestFetchResult.Failed -> ManifestUpdateResult.Rejected(result.reason)
+        // B20 - a transport failure never reaches offer()/the verifier, so no
+        // ManifestUpdateRejectionKind genuinely applies here - kind stays
+        // null (see ManifestUpdateResult.Rejected's own docs for exactly why
+        // this is the one legitimate null case, and why
+        // MultiOriginManifestDistributionClient never hits it).
+        is ManifestFetchResult.Failed -> ManifestUpdateResult.Rejected(kind = null, reason = result.reason)
     }
 }

@@ -283,6 +283,7 @@ fun AppRoot(
                 activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY
                 showDiagnostics = false
             },
+            onRefreshManifest = { viewModel.debugRefreshManifest() },
             onDismiss = { showDiagnostics = false },
         )
     }

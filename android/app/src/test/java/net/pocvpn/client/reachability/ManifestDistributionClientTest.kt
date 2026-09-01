@@ -91,7 +91,7 @@ class ManifestDistributionClientTest {
     @Test
     fun `a network failure never calls offer - LKG and bootstrap are both untouched`() = runTest {
         val repo = repository()
-        val fetcher = RemoteManifestFetcher { ManifestFetchResult.Failed("network error: SocketTimeoutException") }
+        val fetcher = RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "network error: SocketTimeoutException") }
         val client = ManifestDistributionClient(fetcher, repo)
 
         val result = client.refresh()
@@ -107,7 +107,7 @@ class ManifestDistributionClientTest {
         ManifestDistributionClient(RemoteManifestFetcher { ManifestFetchResult.Fetched(sign(manifest(4))) }, repo).refresh()
         assertEquals(4, repo.trusted()!!.manifestVersion)
 
-        val failingClient = ManifestDistributionClient(RemoteManifestFetcher { ManifestFetchResult.Failed("timed out") }, repo)
+        val failingClient = ManifestDistributionClient(RemoteManifestFetcher { ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "timed out") }, repo)
         val result = failingClient.refresh()
 
         assertTrue(result is ManifestUpdateResult.Rejected)

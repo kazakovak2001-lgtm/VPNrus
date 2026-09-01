@@ -88,12 +88,54 @@ NetworkProfiler
   `docs/B12_MANIFEST_KEY_CEREMONY.md`'s versioning section), deliberately
   kept ahead of the embedded v1 bootstrap so a real device actually adopts
   it into LKG rather than rejecting it as "not newer".
-  `BuildConfig.MANIFEST_URL` defaults to the real Frankfurt endpoint in
-  both `debug`/`release` builds (`android/app/build.gradle.kts`'s
-  `PRODUCTION_MANIFEST_URL`, overridable via a developer's own gitignored
-  `gateway-dev.properties`) - the existing `HttpsRemoteManifestFetcher`/
-  `ManifestDistributionClient`/`MainViewModel.Factory` wiring is unchanged,
-  no second fetch mechanism.
+  **B20 - multi-origin fetch, same trust boundary**: `BuildConfig.MANIFEST_URLS`
+  (plural, comma-separated) defaults to BOTH real production origins -
+  Frankfurt `https://152.70.43.1/v1/manifest` and Stockholm
+  `https://16.170.208.231/v1/manifest` - in both `debug`/`release` builds
+  (`android/app/build.gradle.kts`'s `PRODUCTION_MANIFEST_ORIGIN_URLS`,
+  overridable via a developer's own gitignored `gateway-dev.properties`,
+  `manifestUrls=...`; the pre-existing single-URL `manifestUrl=...` override
+  still works). `ManifestOriginConfig.parse` rejects blank/malformed entries
+  and deduplicates. `MultiOriginManifestDistributionClient` (replacing the
+  single-origin wiring in `MainViewModel.Factory`) tries every configured
+  origin, in order, on EVERY refresh (never stops early on the first
+  accepted origin) - each origin's fetched bytes go through the SAME
+  `EndpointManifestRepository.offer` signature/expiry/rollback boundary
+  `ManifestDistributionClient` always used (reused internally per origin,
+  not reimplemented); an origin is transport availability only, NEVER a
+  trust authority. Because `offer()` re-checks rollback against whatever is
+  CURRENTLY trusted at each call, trying every origin every refresh is what
+  makes "highest valid version wins" correct for free - a later origin
+  returning a strictly newer valid manifest is still adopted even after an
+  earlier origin's (also-valid, older) candidate was already accepted in the
+  same refresh. **PR #34 follow-up fix (2026-09-01) - typed classification,
+  not string parsing**: `ManifestFetchResult.Failed` carries a typed
+  `ManifestFetchFailureKind` (`NETWORK_ERROR`/`TLS_ERROR`/`HTTP_ERROR`/
+  `MALFORMED`), and `ManifestVerificationResult.Invalid`/`ManifestUpdateResult.Rejected`
+  each carry a typed `ManifestVerificationFailureKind`/`ManifestUpdateRejectionKind`
+  (`UNKNOWN_SIGNING_KEY`/`CLOCK_SKEW`/`EXPIRED`/`INVALID_SIGNATURE`, plus
+  `ROLLBACK_OR_NOT_NEWER` added by `EndpointManifestRepository.offer` itself)
+  - set at the exact point each result is produced (`Ed25519ManifestVerifier`,
+  `EndpointManifestRepository.offer`, `HttpsRemoteManifestFetcher`), never
+  inferred afterwards from `reason`/`detail` text. `ManifestOriginOutcomeKind`
+  is a presentation-layer AGGREGATION of those typed categories via two
+  small EXHAUSTIVE `when` mappings (`ManifestFetchFailureKind.toOriginOutcomeKind`/
+  `ManifestUpdateRejectionKind.toOriginOutcomeKind` in `ManifestOrigin.kt`) -
+  a compile error, not a silent misclassification, if either underlying enum
+  ever gains a category this one doesn't cover yet.
+  `MultiOriginManifestDistributionClient` never inspects a `reason`/`detail`
+  string to decide anything - genuinely one typed vocabulary reused at a
+  presentation layer, not a second independently-inferred one.
+  `MainViewModel`'s one
+  logical startup refresh and `manifestRefreshMutex` bounded-concurrency
+  behavior are both unchanged; `refreshManifest()`'s return type is now
+  `MultiOriginRefreshResult`. Control-plane isolation is unchanged/hard: no
+  type in `ManifestOrigin.kt` references `EndpointReachability`/
+  `TransportHealth`/`PathScorer` - manifest-origin fetch failure can never
+  feed B19 path eligibility. A debug-only "Refresh manifest" button
+  (Diagnostics dialog, `MainViewModel.debugRefreshManifest`) calls the EXACT
+  same production `refreshManifest()` path for manual/deterministic
+  physical validation - no parallel test client.
   **Physically verified on a real device (B17-2, 2026-09-01)**: a clean
   restart genuinely fetched the live v2 manifest over HTTPS, and it was
   genuinely ACCEPTED (`Last manifest refresh: accepted version 2`,
@@ -115,6 +157,32 @@ NetworkProfiler
   `EndpointManifestRepositoryTest`) - sufficient per this slice's own scope,
   since a real device with a real v2 LKG can no longer exercise a genuinely
   empty-LKG state without wiping real provisioning.
+  **Physically verified on a real device (B20, 2026-09-01)**: baseline - both
+  configured origins (`152.70.43.1`, `16.170.208.231`) genuinely attempted on
+  every refresh (startup AND the new debug manual button), diagnostics shows
+  per-origin evidence (`Last manifest refresh: 152.70.43.1=...;
+  16.170.208.231=... | final: ...`), trusted manifest stays v2/LKG, all 6
+  Auto candidates (both gateways x 3 transports) present, Auto connect
+  reaches Protected/Frankfurt. Fault injection (reversible, client-side-only,
+  debug-build `gateway-dev.properties` override pointing ONLY the Frankfurt
+  origin slot at an unreachable `127.0.0.1:1` - no production server
+  touched, no route/DNS/airplane-mode change, so unlike B17-2's airplane-mode
+  fault this leaves the rest of the device's internet and the VPN data plane
+  completely unaffected): Frankfurt origin genuinely failed
+  (`127.0.0.1=NETWORK_ERROR`), Stockholm was genuinely still attempted and
+  its real signed artifact verified through the SAME trust boundary
+  (`16.170.208.231=ROLLBACK_OR_NOT_NEWER`, i.e. valid-but-not-newer-than-v2 -
+  proving verification succeeded), LKG/v2 remained trusted throughout, Auto
+  candidates stayed fully populated, and a real Auto connect still reached
+  Protected/Frankfurt (control-plane manifest-origin failure never touched
+  the AWG data plane). Restoring `gateway-dev.properties` and rebuilding
+  confirmed both origins reachable again. The "highest valid version wins"
+  and "bad-origin crypto candidate never poisons LKG" scenarios are proven
+  at the unit level (`MultiOriginManifestDistributionClientTest`, 13 cases)
+  rather than physically, per this slice's own scope (a safe physical
+  mechanism to make ONE production origin serve a differently-versioned or
+  tampered-but-still-HTTPS artifact would require touching a production
+  server or standing up new infrastructure, both explicitly out of scope).
 - **Candidate identity/execution (hard invariant, consolidated review fix)**:
   each `GatewayAttemptCandidate` carries its own already-resolved
   `configSnapshot`. `AutoGatewaySelector`'s candidate is threaded verbatim -
