@@ -10,13 +10,18 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
+import net.pocvpn.client.identity.XrayQuicProfile
+import net.pocvpn.client.identity.XrayQuicProfileRepositoryFactory
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.vpn.VlessQuicTransport
 import net.pocvpn.client.vpn.VlessRealityTransport
 import net.pocvpn.client.vpn.VlessTlsTransport
 import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.xray.XrayCoreDiagnostics
+import net.pocvpn.client.vpn.xray.toXrayVlessQuicConfig
 import net.pocvpn.client.vpn.xray.toXrayVlessRealityConfig
 import net.pocvpn.client.vpn.xray.toXrayVlessTlsConfig
 
@@ -71,22 +76,34 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
             isEnabled = false
             setOnClickListener {
                 lifecycleScope.launch {
-                    if (kind == "tls") {
-                        val repository = XrayTlsProfileRepositoryFactory.create(applicationContext, endpointId)
-                        val profile = repository.getProfileOrNull()
-                        if (profile == null) {
-                            statusText.text = "No Xray TLS profile configured for ${endpointId.value} - refusing to start."
-                            return@launch
+                    when (kind) {
+                        "tls" -> {
+                            val repository = XrayTlsProfileRepositoryFactory.create(applicationContext, endpointId)
+                            val profile = repository.getProfileOrNull()
+                            if (profile == null) {
+                                statusText.text = "No Xray TLS profile configured for ${endpointId.value} - refusing to start."
+                                return@launch
+                            }
+                            VlessTlsTransport(applicationContext).connect(TransportConfig.XrayTls(profile.toXrayVlessTlsConfig(), endpointId = endpointId))
                         }
-                        VlessTlsTransport(applicationContext).connect(TransportConfig.XrayTls(profile.toXrayVlessTlsConfig(), endpointId = endpointId))
-                    } else {
-                        val repository = XrayProfileRepositoryFactory.create(applicationContext, endpointId)
-                        val profile = repository.getProfileOrNull()
-                        if (profile == null) {
-                            statusText.text = "No Xray profile configured for ${endpointId.value} - refusing to start."
-                            return@launch
+                        "quic" -> {
+                            val repository = XrayQuicProfileRepositoryFactory.create(applicationContext, endpointId)
+                            val profile = repository.getProfileOrNull()
+                            if (profile == null) {
+                                statusText.text = "No Xray QUIC profile configured for ${endpointId.value} - refusing to start."
+                                return@launch
+                            }
+                            VlessQuicTransport(applicationContext).connect(TransportConfig.XrayQuic(profile.toXrayVlessQuicConfig(), endpointId = endpointId))
                         }
-                        VlessRealityTransport(applicationContext).connect(TransportConfig.Xray(profile.toXrayVlessRealityConfig(), endpointId = endpointId))
+                        else -> {
+                            val repository = XrayProfileRepositoryFactory.create(applicationContext, endpointId)
+                            val profile = repository.getProfileOrNull()
+                            if (profile == null) {
+                                statusText.text = "No Xray profile configured for ${endpointId.value} - refusing to start."
+                                return@launch
+                            }
+                            VlessRealityTransport(applicationContext).connect(TransportConfig.Xray(profile.toXrayVlessRealityConfig(), endpointId = endpointId))
+                        }
                     }
                     statusText.text = "Start requested (endpoint=${endpointId.value}, kind=$kind) - see logcat NovaXrayVpnService for real lifecycle detail."
                 }
@@ -98,12 +115,31 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
             text = "Stop Xray test tunnel"
             setOnClickListener {
                 lifecycleScope.launch {
-                    if (kind == "tls") VlessTlsTransport(applicationContext).disconnect() else VlessRealityTransport(applicationContext).disconnect()
+                    when (kind) {
+                        "tls" -> VlessTlsTransport(applicationContext).disconnect()
+                        "quic" -> VlessQuicTransport(applicationContext).disconnect()
+                        else -> VlessRealityTransport(applicationContext).disconnect()
+                    }
                     statusText.text = "Stop requested - see logcat NovaXrayVpnService for real lifecycle detail."
                 }
             }
         }
         root.addView(stopButton)
+
+        val diagnosticsText = TextView(this).apply { text = "" }
+        val showDiagnosticsButton = Button(this).apply {
+            text = "Show sanitized Xray diagnostics"
+            setOnClickListener {
+                val events = XrayCoreDiagnostics.events.value
+                diagnosticsText.text = if (events.isEmpty()) {
+                    "(no diagnostic events recorded)"
+                } else {
+                    events.joinToString("\n") { "[${it.level}] ${it.message}" }
+                }
+            }
+        }
+        root.addView(showDiagnosticsButton)
+        root.addView(diagnosticsText)
 
         setContentView(root)
 
@@ -133,6 +169,16 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
             XrayTlsProfileRepositoryFactory.create(applicationContext, endpointId).saveProfile(
                 XrayTlsProfile(server = server, serverPort = port, uuid = uuid, serverName = serverName, fingerprint = fingerprint),
             )
+        } else if (kind == "quic") {
+            val server = intent.getStringExtra("server") ?: return
+            val port = intent.getIntExtra("port", -1).takeIf { it > 0 } ?: return
+            val uuid = intent.getStringExtra("uuid") ?: return
+            val serverName = intent.getStringExtra("serverName") ?: return
+            val fingerprint = intent.getStringExtra("fingerprint") ?: return
+            val path = intent.getStringExtra("path") ?: return
+            XrayQuicProfileRepositoryFactory.create(applicationContext, endpointId).saveProfile(
+                XrayQuicProfile(server = server, serverPort = port, uuid = uuid, serverName = serverName, fingerprint = fingerprint, path = path),
+            )
         } else {
             val server = intent.getStringExtra("server") ?: return
             val port = intent.getIntExtra("port", -1).takeIf { it > 0 } ?: return
@@ -153,10 +199,10 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
 
     private suspend fun refreshStatus(kind: String, startButton: Button) {
         val hasProfile = try {
-            if (kind == "tls") {
-                XrayTlsProfileRepositoryFactory.create(applicationContext, endpointId).getProfileOrNull() != null
-            } else {
-                XrayProfileRepositoryFactory.create(applicationContext, endpointId).getProfileOrNull() != null
+            when (kind) {
+                "tls" -> XrayTlsProfileRepositoryFactory.create(applicationContext, endpointId).getProfileOrNull() != null
+                "quic" -> XrayQuicProfileRepositoryFactory.create(applicationContext, endpointId).getProfileOrNull() != null
+                else -> XrayProfileRepositoryFactory.create(applicationContext, endpointId).getProfileOrNull() != null
             }
         } catch (t: Throwable) {
             false

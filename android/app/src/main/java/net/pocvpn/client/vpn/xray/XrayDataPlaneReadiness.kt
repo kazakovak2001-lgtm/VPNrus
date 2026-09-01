@@ -53,7 +53,17 @@ object XrayDataPlaneReadinessCheck {
                 XrayDataPlaneReadiness.Ready(latency)
             }
         } catch (t: Throwable) {
-            XrayDataPlaneReadiness.Failed(t.javaClass.simpleName)
+            // B21-fix (physical validation) - gomobile boxes an untyped Go
+            // `error` as the generic `go.Universe$proxyerror` wrapper (JNI
+            // symbol Java_go_Universe_00024proxyerror_error - confirmed via
+            // AAR binary inspection), so the exception's simple class name
+            // alone (e.g. "proxyerror") carries no information about WHY the
+            // dial failed - only that one did. The message, sanitized the
+            // same way [XrayCoreDiagnostics] sanitizes any other xray-core
+            // string, is the actual classification signal.
+            val detail = XrayCoreDiagnostics.sanitize(t.message)
+            val reason = if (detail.isNotBlank()) "${t.javaClass.simpleName}: $detail" else t.javaClass.simpleName
+            XrayDataPlaneReadiness.Failed(reason)
         }
     }
 }

@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn.xray
 
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -23,12 +24,31 @@ class XrayDataPlaneReadinessCheckTest {
     }
 
     @Test
-    fun `measureDelay throwing is Failed with the exception's class name`() = runBlocking {
+    fun `measureDelay throwing is Failed with the exception's class name and sanitized message`() = runBlocking {
         val runtime = FakeXrayCoreRuntime(measureDelayThrows = IllegalStateException("dial failed"))
 
         val result = XrayDataPlaneReadinessCheck.check(runtime, timeoutMs = 1_000L)
 
+        assertEquals(XrayDataPlaneReadiness.Failed("IllegalStateException: dial failed"), result)
+    }
+
+    @Test
+    fun `measureDelay throwing with no message is Failed with just the class name`() = runBlocking {
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = IllegalStateException())
+
+        val result = XrayDataPlaneReadinessCheck.check(runtime, timeoutMs = 1_000L)
+
         assertEquals(XrayDataPlaneReadiness.Failed("IllegalStateException"), result)
+    }
+
+    @Test
+    fun `measureDelay throwing with a secret-shaped message has it redacted`() = runBlocking {
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = IllegalStateException("bad uuid 3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f"))
+
+        val result = XrayDataPlaneReadinessCheck.check(runtime, timeoutMs = 1_000L) as XrayDataPlaneReadiness.Failed
+
+        assertTrue(result.reason.contains("[redacted]"))
+        assertFalse(result.reason.contains("3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f"))
     }
 
     @Test

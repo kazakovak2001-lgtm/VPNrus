@@ -328,7 +328,7 @@ class XrayCoreControllerTest {
 
         val outcome = harness.controller.requestStart()
 
-        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("IllegalStateException"), outcome)
+        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("IllegalStateException: failed to dial"), outcome)
         assertEquals(1, harness.coreRuntime.startLoopCallCount)
         assertEquals(1, harness.coreRuntime.stopLoopCallCount)
         assertEquals(1, harness.closeTunCallCount)
@@ -400,7 +400,7 @@ class XrayCoreControllerTest {
 
         val outcome = harness.controller.requestStart(TransportKind.QUIC)
 
-        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("IOException"), outcome)
+        assertEquals(XrayCoreStartOutcome.DataPlaneNotReady("IOException: no packets reached the server"), outcome)
         assertEquals(1, harness.coreRuntime.startLoopCallCount)
         assertEquals(1, harness.coreRuntime.stopLoopCallCount)
         assertEquals(1, harness.closeTunCallCount)
