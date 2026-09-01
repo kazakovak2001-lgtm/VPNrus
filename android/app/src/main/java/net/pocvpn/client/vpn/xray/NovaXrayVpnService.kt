@@ -17,6 +17,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
  * B8K1B - the REAL Android integration for Xray/VLESS+REALITY. As of B8I7,
@@ -134,7 +135,15 @@ class NovaXrayVpnService : VpnService() {
                 // own docs for the fail-safe default an absent/pre-B13 extra
                 // gets.
                 val endpointId = parseEndpointIdExtra(intent.getStringExtra(EXTRA_ENDPOINT_ID))
-                startIfNotAlreadyRunning(sessionId, kind, endpointId)
+                // B18-2 - the RoutingMode VpnController resolved THIS attempt
+                // against (TransportConfig.Xray/XrayTls.routingMode - see
+                // those types' own docs), same "default FULL_VPN for any
+                // absent/pre-B18-2/malformed extra" fail-safe shape as `kind`
+                // above.
+                val routingMode = intent.getStringExtra(EXTRA_ROUTING_MODE)
+                    ?.let { runCatching { RoutingMode.valueOf(it) }.getOrNull() }
+                    ?: RoutingMode.FULL_VPN
+                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode)
                 return Service.START_NOT_STICKY
             }
 
@@ -163,9 +172,9 @@ class NovaXrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind, endpointId: EndpointId) {
+    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind, endpointId: EndpointId, routingMode: RoutingMode) {
         scope.launch {
-            when (val outcome = lifecycleCoordinator.start(endpointId, kind)) {
+            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
@@ -275,6 +284,12 @@ class NovaXrayVpnService : VpnService() {
         // this codebase. Absent for any pre-B13 caller/intent - see
         // parseEndpointIdExtra's own fail-safe default.
         const val EXTRA_ENDPOINT_ID = "net.pocvpn.client.vpn.xray.extra.ENDPOINT_ID"
+
+        // B18-2 - the RoutingMode enum constant name (e.g. "ADAPTIVE"), or
+        // absent for the pre-B18-2 default (FULL_VPN) - see onStartCommand's
+        // own parsing. VlessRealityTransport/VlessTlsTransport set this from
+        // TransportConfig.Xray/XrayTls.routingMode.
+        const val EXTRA_ROUTING_MODE = "net.pocvpn.client.vpn.xray.extra.ROUTING_MODE"
 
         private const val TAG = "NovaXrayVpnService"
     }

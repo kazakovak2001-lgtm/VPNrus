@@ -92,6 +92,8 @@ class VlessTlsTransport(
                 .putExtra(NovaXrayVpnService.EXTRA_SESSION_ID, sessionId)
                 .putExtra(NovaXrayVpnService.EXTRA_TRANSPORT_KIND, TransportKind.TLS_TCP.name)
                 .putExtra(NovaXrayVpnService.EXTRA_ENDPOINT_ID, config.endpointId.value)
+                // B18-2 - see VlessRealityTransport's own docs on this extra.
+                .putExtra(NovaXrayVpnService.EXTRA_ROUTING_MODE, config.routingMode.name)
             context.startService(intent)
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "connect failed", t)

@@ -31,11 +31,8 @@ import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
-import net.pocvpn.client.smartconnect.DestinationClass
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
-import net.pocvpn.client.smartconnect.RouteDecision
-import net.pocvpn.client.smartconnect.RoutingContext
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
@@ -50,7 +47,6 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
 import net.pocvpn.client.vpn.policy.EffectiveRoutingResult
 import net.pocvpn.client.vpn.policy.InstalledPackageChecker
-import net.pocvpn.client.vpn.policy.Ipv4RouteExclusion
 import net.pocvpn.client.vpn.policy.RoutingMode
 import net.pocvpn.client.vpn.policy.RoutingModeStore
 import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
@@ -676,6 +672,30 @@ class VpnController(
     }
 
     /**
+     * B18/B18-2 - the ONE place RoutingDecisionEngine's destination-route
+     * decision becomes an actual AmneziaWG AllowedIPs list (which is BOTH
+     * the Android VpnService route table AND WireGuard's own cryptokey-
+     * routing ingress filter for this peer - see AwgConfigMapper's own
+     * docs). Delegates the actual IPv4 route-set decision to
+     * [RoutingDecisionEngine.resolveIpv4Routes] - the SAME shared resolver
+     * [net.pocvpn.client.vpn.xray.buildXrayVpnPlan] uses for XRAY_REALITY/
+     * TLS_TCP (see that function's own docs) - never a second, parallel copy
+     * of this decision. Only the IPv4 entries of [gatewayAllowedIps] are
+     * ever touched; every IPv6 entry (normally "::/0") is kept verbatim in
+     * every mode - Full VPN/IPv6-fail-closed stay exactly as before. A
+     * manifest-provided narrower [gatewayAllowedIps] IPv4 override is
+     * intentionally superseded by the standard exclusion set in ADAPTIVE
+     * mode, never combined with it.
+     */
+    private fun resolveAdaptiveAllowedIps(gatewayAllowedIps: List<String>, routingMode: RoutingMode): List<String> {
+        val ipv4Entries = gatewayAllowedIps.filterNot { it.contains(":") }
+        val ipv6Entries = gatewayAllowedIps.filter { it.contains(":") }
+        val restrictionClass = restrictionClassProvider?.invoke() ?: RestrictionClass.UNKNOWN
+        val resolvedIpv4 = RoutingDecisionEngine.resolveIpv4Routes(ipv4Entries, routingMode, restrictionClass)
+        return resolvedIpv4 + ipv6Entries
+    }
+
+    /**
      * B8I4/B8I6 - the generic per-attempt execution seam: which TransportConfig
      * SHAPE to build is dispatched on [kind]. AMNEZIA_WG builds from the AWG
      * [config]/[appRoutingLists] exactly as before (unchanged). XRAY_REALITY
@@ -700,42 +720,13 @@ class VpnController(
      * AWG). Any other kind still throws [UnsupportedOperationException] -
      * structurally unreachable via the public API since connect() already
      * refuses a kind outside [supportedKinds] before ever reaching here.
+     * B18-2 - [routingMode] is now ALSO threaded into the XRAY_REALITY/
+     * TLS_TCP branches (`TransportConfig.Xray/XrayTls.routingMode`) so
+     * NovaXrayVpnService's own route plan uses the SAME
+     * RoutingDecisionEngine.resolveIpv4Routes authority AWG's
+     * [resolveAdaptiveAllowedIps] already uses - see that shared function's
+     * own docs for why this is not a second routing engine.
      */
-    /**
-     * B18 - the ONE place RoutingDecisionEngine's destination-route decision
-     * becomes an actual AmneziaWG AllowedIPs list (which is BOTH the Android
-     * VpnService route table AND WireGuard's own cryptokey-routing ingress
-     * filter for this peer - see AwgConfigMapper's own docs). FULL_VPN/APPS
-     * pass [gatewayAllowedIps] through completely unchanged (Full VPN must
-     * remain 0.0.0.0/0 exactly as before - see class docs' IPv6 fail-closed
-     * requirement, also untouched: only IPv4 entries are ever replaced,
-     * every IPv6 entry from [gatewayAllowedIps] - normally "::/0" - is kept
-     * verbatim in every mode). ADAPTIVE replaces ONLY the IPv4 entries with
-     * [Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES] - the whole IPv4
-     * space minus RFC1918/loopback/link-local - via the SAME
-     * RoutingDecisionEngine.decideAdaptiveRoute authority this file's other
-     * callers use, never a parallel decision helper. [DestinationClass
-     * .LOCAL_PRIVATE] is the only class ever evaluated here (this decides
-     * the STATIC route set for the whole session, not a per-packet
-     * decision - see RoutingDecisionEngine's own docs for why finer-grained,
-     * per-destination adaptive routing is out of this slice's enforceable
-     * scope) - a manifest-provided narrower [gatewayAllowedIps] override is
-     * intentionally superseded by the standard exclusion set in ADAPTIVE
-     * mode, never combined with it.
-     */
-    private fun resolveAdaptiveAllowedIps(gatewayAllowedIps: List<String>, routingMode: RoutingMode): List<String> {
-        val decision = RoutingDecisionEngine.decideAdaptiveRoute(
-            RoutingContext(
-                routingMode = routingMode,
-                destinationClass = DestinationClass.LOCAL_PRIVATE,
-                restrictionClass = restrictionClassProvider?.invoke() ?: RestrictionClass.UNKNOWN,
-            ),
-        )
-        if (decision !is RouteDecision.Direct) return gatewayAllowedIps
-        val ipv6Entries = gatewayAllowedIps.filter { it.contains(":") }
-        return Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES + ipv6Entries
-    }
-
     private suspend fun buildTransportConfig(
         kind: TransportKind,
         config: GatewayConfiguration.Configured,
@@ -778,7 +769,7 @@ class VpnController(
                     ?: throw XrayProfileNotReadyException("no Xray profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                     is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config, endpointId = pendingConnectEndpointId)
+                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
                 }
             }
             TransportKind.TLS_TCP -> {
@@ -791,7 +782,7 @@ class VpnController(
                     ?: throw XrayProfileNotReadyException("no Xray TLS profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolveTls(repository)) {
                     is XrayTlsRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId)
+                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
                 }
             }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")

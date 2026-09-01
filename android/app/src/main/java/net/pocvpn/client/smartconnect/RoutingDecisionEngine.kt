@@ -118,6 +118,36 @@ object RoutingDecisionEngine {
         }
     }
 
+    /**
+     * B18-2 - the ONE shared IPv4 route-list resolver every live transport's
+     * VpnService.Builder route construction goes through
+     * ([net.pocvpn.client.vpn.VpnController.resolveAdaptiveAllowedIps] for
+     * AmneziaWG, [net.pocvpn.client.vpn.xray.buildXrayVpnPlan] for
+     * XRAY_REALITY/TLS_TCP) - so ADAPTIVE mode means the EXACT SAME excluded/
+     * included IPv4 ranges on every transport, never a second, transport-
+     * specific copy of this decision or a duplicate of
+     * [net.pocvpn.client.vpn.policy.Ipv4RouteExclusion]'s CIDR math. Built on
+     * top of [decideAdaptiveRoute] (no new decision logic here, just turning
+     * its [DestinationClass.LOCAL_PRIVATE] verdict into a concrete route
+     * list): [fullTunnelRoutes] is returned UNCHANGED for FULL_VPN/APPS, and
+     * for ADAPTIVE whenever the evaluated decision is not [RouteDecision
+     * .Direct] (e.g. [RestrictionClass.NO_NETWORK] -> [RouteDecision.Block] -
+     * never a fabricated direct route). Only for a genuine
+     * [RouteDecision.Direct] is [fullTunnelRoutes] replaced with
+     * [net.pocvpn.client.vpn.policy.Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES].
+     * Callers are responsible for their own IPv6 handling (AWG keeps its
+     * "::/0" entry verbatim; Xray/TLS structurally have no IPv6 route field
+     * at all - see [net.pocvpn.client.vpn.xray.XrayVpnBuilderPlan]'s own
+     * docs) - this function only ever touches the IPv4 route set.
+     */
+    fun resolveIpv4Routes(fullTunnelRoutes: List<String>, routingMode: RoutingMode, restrictionClass: RestrictionClass): List<String> {
+        val decision = decideAdaptiveRoute(RoutingContext(routingMode, DestinationClass.LOCAL_PRIVATE, restrictionClass))
+        return if (decision is RouteDecision.Direct) Ipv4RouteExclusionRoutes else fullTunnelRoutes
+    }
+
+    private val Ipv4RouteExclusionRoutes: List<String>
+        get() = net.pocvpn.client.vpn.policy.Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES
+
     /** Route-prefix classification ONLY (see [DestinationClass]'s own docs) - never hostname/domain/country heuristics. Unparseable/non-IPv4 input is conservatively [DestinationClass.PROTECTED]. */
     fun classifyDestination(destinationIp: String?): DestinationClass {
         if (destinationIp == null) return DestinationClass.PROTECTED

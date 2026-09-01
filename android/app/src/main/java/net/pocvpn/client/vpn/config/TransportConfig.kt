@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn.config
 
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.vpn.policy.RoutingMode
 
 /** A single AmneziaWG peer (the gateway) to connect to. */
 data class AwgPeer(
@@ -59,11 +60,20 @@ sealed class TransportConfig {
     data class Xray(
         val config: net.pocvpn.client.vpn.xray.XrayVlessRealityConfig,
         val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+        // B18-2 - the RoutingMode VpnController resolved THIS attempt
+        // against, threaded through VlessRealityTransport into
+        // NovaXrayVpnService's EXTRA_ROUTING_MODE (see that class's own
+        // docs) so its route plan uses the SAME RoutingDecisionEngine
+        // authority AWG's config already does. Defaults to FULL_VPN so every
+        // pre-B18-2 construction (every existing test) is byte-for-byte
+        // unaffected.
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
     ) : TransportConfig()
 
-    /** B8O2/B13 - the TLS/TCP counterpart of [Xray], including the same [endpointId] threading - see that field's own docs. */
+    /** B8O2/B13/B18-2 - the TLS/TCP counterpart of [Xray], including the same [endpointId]/[routingMode] threading - see those fields' own docs. */
     data class XrayTls(
         val config: net.pocvpn.client.vpn.xray.XrayVlessTlsConfig,
         val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
     ) : TransportConfig()
 }

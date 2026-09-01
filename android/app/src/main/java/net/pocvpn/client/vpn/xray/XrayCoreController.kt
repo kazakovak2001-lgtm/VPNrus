@@ -3,6 +3,7 @@ package net.pocvpn.client.vpn.xray
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
  * What one [XrayCoreController.requestStart] call actually did - the caller
@@ -85,7 +86,10 @@ class XrayCoreController(
      * kinds are ever passed in), same "defensive, not a real code path"
      * shape [XrayCoreStartOutcome.Rejected]'s other call sites already use.
      */
-    suspend fun requestStart(kind: TransportKind = TransportKind.XRAY_REALITY): XrayCoreStartOutcome {
+    // B18-2 - [routingMode] defaults to FULL_VPN so every pre-B18-2 call site
+    // (real or test) is byte-for-byte unaffected - see buildXrayVpnPlan's own
+    // docs for the exact route-set contract this threads into.
+    suspend fun requestStart(kind: TransportKind = TransportKind.XRAY_REALITY, routingMode: RoutingMode = RoutingMode.FULL_VPN): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
             XrayServiceStartDecision.IGNORE_START_IN_FLIGHT -> return XrayCoreStartOutcome.StartInFlight
@@ -101,14 +105,14 @@ class XrayCoreController(
                     when (val resolution = XrayRuntimeResolver.resolveTls(tlsRepo)) {
                         is XrayTlsRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
                         is XrayTlsRuntimeResolution.Ready ->
-                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId), resolution.renderedConfig)
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
                     }
                 }
                 TransportKind.XRAY_REALITY -> {
                     when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                         is XrayRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
                         is XrayRuntimeResolution.Ready ->
-                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId), resolution.renderedConfig)
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
                     }
                 }
                 else -> return XrayCoreStartOutcome.Rejected("unsupported transport kind for NovaXrayVpnService: $kind")

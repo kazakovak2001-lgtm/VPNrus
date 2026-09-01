@@ -178,16 +178,29 @@ NetworkProfiler
   `routingModeStore` is read fresh only at the start of a real `connect()`
   attempt (`VpnController.appliedRoutingMode`) - same "no live mid-session
   rebuild, reconnect to apply" discipline as `AppRoutingPolicy`.
-- Live enforcement exists for the AmneziaWG transport ONLY
-  (`VpnController.resolveAdaptiveAllowedIps` replaces only the IPv4 entries
-  of the AWG peer's AllowedIPs in `ADAPTIVE` mode; the IPv6 entry - `::/0` -
-  is untouched in every mode, preserving the existing IPv6 fail-closed
-  guarantee). XRAY_REALITY/TLS_TCP route plans are UNCHANGED (always
-  `0.0.0.0/0`) - Adaptive Direct Routing does not extend to those transports
-  yet, a real gap: manual transport selection or AWG->Xray failover while in
-  Adaptive mode silently reverts to full-tunnel-equivalent routing (not a
-  leak, but an inconsistency - see ROADMAP's own Adaptive Direct Routing row).
-  No physical-device validation has been performed for this feature.
+- Live enforcement is consistent across every currently-live transport
+  (B18-2). `VpnController.resolveAdaptiveAllowedIps` (AWG) and
+  `net.pocvpn.client.vpn.xray.buildXrayVpnPlan` (XRAY_REALITY/TLS_TCP) both
+  resolve their IPv4 route list through the ONE shared
+  `RoutingDecisionEngine.resolveIpv4Routes` function - never a second CIDR
+  computation, never a parallel routing decision. `RoutingMode` reaches the
+  Xray/TLS path via `TransportConfig.Xray/XrayTls.routingMode` ->
+  `NovaXrayVpnService.EXTRA_ROUTING_MODE` (same intent-extra pattern as
+  `EXTRA_TRANSPORT_KIND`/`EXTRA_ENDPOINT_ID`), defaulting to `FULL_VPN` at
+  every hop so every pre-B18-2 call site is byte-for-byte unaffected. Only
+  the IPv4 entries are ever touched: AWG's AllowedIPs keeps its `::/0` entry
+  verbatim in every mode; `XrayVpnBuilderPlan` structurally has no IPv6
+  field at all (unchanged) - IPv6 stays fail-closed on every transport, in
+  every `RoutingMode`. `RestrictionClass` is NOT live-threaded into the
+  Xray/TLS path (defaults `UNKNOWN`) - a documented, safe simplification:
+  only `RestrictionClass.NO_NETWORK` changes `resolveIpv4Routes`'s output,
+  and `UNKNOWN` yields the identical route set AWG yields for every other
+  class, so both transports' ADAPTIVE route sets are provably identical for
+  every reachable live case. No physical-device validation has been
+  performed for this feature (checked directly via `adb devices` - none
+  attached in this environment) - this is the one remaining item before
+  Adaptive Direct Routing can be promoted to IMPLEMENTED (see ROADMAP's own
+  row).
 
 ## Per-device identity (hard invariant)
 
@@ -266,11 +279,15 @@ identity/profile. `GatewayConfigSource.snapshot()` is the one method
 exist for direct testability but must not be relied on for atomicity by new callers.
 
 ---
-Last updated: 2026-09-01 (B18 - added the "Routing decision vs transport/gateway
-selection" section above: RoutingMode/RoutingDecisionEngine.decideAdaptiveRoute
-is now the real, live DIRECT-vs-VPN authority for the AmneziaWG transport,
-route-prefix-level only, with RestrictionClassifier wired in conservatively.
-Everything below this line predates B18 and is unaffected by it.)
+Last updated: 2026-09-01 (B18/B18-2 - added the "Routing decision vs transport/
+gateway selection" section above: RoutingMode/RoutingDecisionEngine
+.decideAdaptiveRoute is the real, live DIRECT-vs-VPN authority, route-prefix-
+level only, with RestrictionClassifier wired in conservatively. B18-2 extended
+live enforcement from AmneziaWG-only to ALL currently-live transports
+(AMNEZIA_WG/XRAY_REALITY/TLS_TCP) through one shared resolver
+(RoutingDecisionEngine.resolveIpv4Routes) - no second routing engine, no
+duplicated CIDR math. Everything below this line predates B18 and is
+unaffected by it.)
 
 Last updated: 2026-09-01 (B17 - Auto gateway/path DISCOVERY runtime authority
 moved from `ProductionGatewayCatalog` to the verified `TrustedManifestState`;
