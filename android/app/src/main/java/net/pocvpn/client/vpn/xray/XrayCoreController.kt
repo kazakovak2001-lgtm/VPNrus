@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayQuicProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.policy.RoutingMode
@@ -67,6 +68,11 @@ class XrayCoreController(
     // than throwing - the same fail-closed shape as a missing REALITY
     // profile, never a crash.
     private val tlsRepository: XrayTlsProfileRepository? = null,
+    // B21 - additive, defaults to null (same reasoning as tlsRepository
+    // above): with no QUIC repository wired, requestStart(TransportKind.QUIC)
+    // simply rejects, the same fail-closed shape as a missing REALITY/TLS
+    // profile, never a crash.
+    private val quicRepository: XrayQuicProfileRepository? = null,
 ) {
     private val lifecycleGate = XrayServiceLifecycleGate()
 
@@ -112,6 +118,15 @@ class XrayCoreController(
                     when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                         is XrayRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
                         is XrayRuntimeResolution.Ready ->
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
+                    }
+                }
+                TransportKind.QUIC -> {
+                    val quicRepo = quicRepository
+                        ?: return XrayCoreStartOutcome.Rejected("Xray QUIC profile repository not wired")
+                    when (val resolution = XrayRuntimeResolver.resolveQuic(quicRepo)) {
+                        is XrayQuicRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
+                        is XrayQuicRuntimeResolution.Ready ->
                             ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
                     }
                 }

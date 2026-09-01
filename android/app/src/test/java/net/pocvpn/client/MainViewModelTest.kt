@@ -46,6 +46,7 @@ import net.pocvpn.client.provisioning.XrayProfileResult
 import net.pocvpn.client.provisioning.toXrayProfile
 import net.pocvpn.client.provisioning.XrayTlsProfileResult
 import net.pocvpn.client.provisioning.toXrayTlsProfile
+import net.pocvpn.client.provisioning.toXrayQuicProfile
 import net.pocvpn.client.smartconnect.ConnectionScoreReason
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.SmartConnectDecision
@@ -103,6 +104,15 @@ private val SAMPLE_XRAY_TLS_PROFILE_SUCCESS = XrayTlsProfileResult.Success(
     uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
     serverName = "203.0.113.1",
     fingerprint = "chrome",
+)
+
+private val SAMPLE_XRAY_QUIC_PROFILE_SUCCESS = net.pocvpn.client.provisioning.XrayQuicProfileResult.Success(
+    serverAddress = "152.70.43.1",
+    serverPort = 443,
+    uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+    serverName = "203.0.113.1",
+    fingerprint = "chrome",
+    path = "/nova-quic",
 )
 
 private val SAMPLE_XRAY_PROFILE_SUCCESS = XrayProfileResult.Success(
@@ -877,6 +887,100 @@ class MainViewModelTest {
 
         assertTrue(decision is SmartConnectDecision.Selected)
         assertEquals(TransportKind.TLS_TCP, (decision as SmartConnectDecision.Selected).score.candidate.transport.kind)
+    }
+
+    // --- B21: QUIC registration - mirrors the TLS_TCP tests above ---
+
+    @Test
+    fun `buildTransportRegistry registers exactly one real QUIC transport once a QUIC profile is available`() = runTest {
+        val transport = FakeVpnTransport()
+        val quicTransport = FakeVpnTransport(kind = TransportKind.QUIC)
+        val quicRepository = net.pocvpn.client.vpn.FakeXrayQuicProfileRepository(SAMPLE_XRAY_QUIC_PROFILE_SUCCESS.toXrayQuicProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayQuicTransport = quicTransport,
+            xrayQuicProfileRepository = quicRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val registry = viewModel.buildTransportRegistry()
+
+        val quicDescriptor = registry.descriptorFor(TransportKind.QUIC)
+        assertEquals(TransportStatus.AVAILABLE, quicDescriptor?.status)
+        assertEquals(quicTransport, registry.createTransport(TransportKind.QUIC))
+        assertEquals(TransportStatus.AVAILABLE, registry.descriptorFor(TransportKind.AMNEZIA_WG)?.status)
+    }
+
+    @Test
+    fun `QUIC stays NOT_IMPLEMENTED - never a hardcoded true - when no QUIC profile is available`() = runTest {
+        val quicTransport = FakeVpnTransport(kind = TransportKind.QUIC)
+        val quicRepository = net.pocvpn.client.vpn.FakeXrayQuicProfileRepository(profile = null)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayQuicTransport = quicTransport,
+            xrayQuicProfileRepository = quicRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val registry = viewModel.buildTransportRegistry()
+
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.QUIC)?.status)
+        assertNull(registry.createTransport(TransportKind.QUIC))
+    }
+
+    @Test
+    fun `Manual QUIC preference selects it once available`() = runTest {
+        val transport = FakeVpnTransport()
+        val quicTransport = FakeVpnTransport(kind = TransportKind.QUIC)
+        val quicRepository = net.pocvpn.client.vpn.FakeXrayQuicProfileRepository(SAMPLE_XRAY_QUIC_PROFILE_SUCCESS.toXrayQuicProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayQuicTransport = quicTransport,
+            xrayQuicProfileRepository = quicRepository,
+            userTransportPreference = UserTransportPreference.Manual(TransportKind.QUIC),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val decision = viewModel.smartConnectDecision()
+
+        assertTrue(decision is SmartConnectDecision.Selected)
+        assertEquals(TransportKind.QUIC, (decision as SmartConnectDecision.Selected).score.candidate.transport.kind)
+    }
+
+    @Test
+    fun `Germany QUIC profile cannot populate Stockholm availability, and vice versa`() = runTest {
+        val germanyQuicRepository = net.pocvpn.client.vpn.FakeXrayQuicProfileRepository(SAMPLE_XRAY_QUIC_PROFILE_SUCCESS.toXrayQuicProfile())
+        val stockholmQuicRepository = net.pocvpn.client.vpn.FakeXrayQuicProfileRepository(profile = null)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            xrayQuicTransport = FakeVpnTransport(kind = TransportKind.QUIC),
+            xrayQuicProfileRepository = germanyQuicRepository,
+            stockholmXrayQuicProfileRepository = stockholmQuicRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        val germanyRegistry = viewModel.buildTransportRegistry(net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.endpointId)
+        val stockholmRegistry = viewModel.buildTransportRegistry(net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId)
+
+        assertEquals(TransportStatus.AVAILABLE, germanyRegistry.descriptorFor(TransportKind.QUIC)?.status)
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, stockholmRegistry.descriptorFor(TransportKind.QUIC)?.status)
     }
 
     @Test

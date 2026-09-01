@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfile
+import net.pocvpn.client.identity.XrayQuicProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 
 /** The one place a stored [XrayProfile] becomes a renderer/service-ready [XrayVlessRealityConfig]. */
@@ -22,4 +23,14 @@ fun XrayTlsProfile.toXrayVlessTlsConfig(): XrayVlessTlsConfig = XrayVlessTlsConf
     uuid = uuid,
     serverName = serverName,
     fingerprint = fingerprint,
+)
+
+/** B21 - the QUIC counterpart: a stored [XrayQuicProfile] becomes a renderer/service-ready [XrayVlessQuicConfig]. */
+fun XrayQuicProfile.toXrayVlessQuicConfig(): XrayVlessQuicConfig = XrayVlessQuicConfig(
+    server = server,
+    serverPort = serverPort,
+    uuid = uuid,
+    serverName = serverName,
+    fingerprint = fingerprint,
+    path = path,
 )

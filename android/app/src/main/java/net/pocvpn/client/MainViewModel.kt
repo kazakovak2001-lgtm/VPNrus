@@ -274,6 +274,15 @@ class MainViewModel(
     private val xrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
     private val xrayTlsTransport: VpnTransport? = null,
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
+    // B21 - additive, defaults to null (same reasoning as the TLS_TCP trio
+    // above): the QUIC counterparts. See docs/B21_QUIC_TRANSPORT_AUDIT.md -
+    // wiring these does NOT change automatic Smart Connect selection/
+    // failover, and QUIC additionally never enters production availability
+    // until a real UDP port exists on the target gateway (see this PR's own
+    // PRODUCTION APPROVAL REQUIRED gate).
+    private val xrayQuicProfileProvisioner: net.pocvpn.client.provisioning.XrayQuicProfileProvisioner? = null,
+    private val xrayQuicTransport: VpnTransport? = null,
+    private val xrayQuicProfileRepository: net.pocvpn.client.identity.XrayQuicProfileRepository? = null,
     // B13 consolidated review fix - additive, defaults to null (same "no
     // wiring, no behavior" seam as every other optional dependency above).
     // [xrayProfileRepository]/[xrayTlsProfileRepository] above are ALWAYS
@@ -289,6 +298,7 @@ class MainViewModel(
     // availability genuinely per-endpoint.
     private val stockholmXrayProfileRepository: XrayProfileRepository? = null,
     private val stockholmXrayTlsProfileRepository: XrayTlsProfileRepository? = null,
+    private val stockholmXrayQuicProfileRepository: net.pocvpn.client.identity.XrayQuicProfileRepository? = null,
     // B14 - Stockholm's OWN Xray REALITY/TLS provisioners, additive/
     // defaults to null (same "no wiring, no behavior" seam as
     // [xrayProfileProvisioner]/[xrayTlsProfileProvisioner] themselves -
@@ -303,6 +313,7 @@ class MainViewModel(
     // absent from release - see that class's own docs).
     private val stockholmXrayProfileProvisioner: XrayProfileProvisioner? = null,
     private val stockholmXrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
+    private val stockholmXrayQuicProfileProvisioner: net.pocvpn.client.provisioning.XrayQuicProfileProvisioner? = null,
     // B8I8 - additive, defaults to Auto (byte-for-byte unchanged production
     // behavior - no product UI sets anything else yet). Threaded into every
     // smartConnectDecision() call AND consulted by the AWG -> Xray failover
@@ -575,6 +586,12 @@ class MainViewModel(
             xrayTlsProfileRepository?.let { put(germanyEndpointId, it) }
             stockholmXrayTlsProfileRepository?.let { put(stockholmEndpointId, it) }
         }.takeIf { it.isNotEmpty() }?.let { net.pocvpn.client.identity.MapXrayTlsProfileRepositoryResolver(it) }
+    // B21 - the QUIC counterpart of xrayProfileRepositoryResolver/xrayTlsProfileRepositoryResolver above.
+    private val xrayQuicProfileRepositoryResolver: net.pocvpn.client.identity.XrayQuicProfileRepositoryResolver? =
+        buildMap {
+            xrayQuicProfileRepository?.let { put(germanyEndpointId, it) }
+            stockholmXrayQuicProfileRepository?.let { put(stockholmEndpointId, it) }
+        }.takeIf { it.isNotEmpty() }?.let { net.pocvpn.client.identity.MapXrayQuicProfileRepositoryResolver(it) }
 
     private val controller = VpnController(
         transport = transport,
@@ -590,6 +607,8 @@ class MainViewModel(
         xrayTlsProfileRepository = xrayTlsProfileRepository,
         xrayProfileRepositoryResolver = xrayProfileRepositoryResolver,
         xrayTlsProfileRepositoryResolver = xrayTlsProfileRepositoryResolver,
+        xrayQuicProfileRepository = xrayQuicProfileRepository,
+        xrayQuicProfileRepositoryResolver = xrayQuicProfileRepositoryResolver,
         // B13 - the SAME pathHistoryStore/fingerprintKeyProvider instances
         // reachabilityDiagnostics() below already reads (never a second,
         // independently-constructed pair) - this is the live-connect-path
@@ -628,11 +647,17 @@ class MainViewModel(
     // same per-endpoint shape and same reasoning.
     private val xrayTlsAvailableEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
 
+    // B21 - the QUIC counterpart of [xrayAvailableEndpoints]/[xrayTlsAvailableEndpoints] above, same per-endpoint shape and same reasoning.
+    private val xrayQuicAvailableEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
+
     private fun isXrayAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
         endpointId in xrayAvailableEndpoints.value
 
     private fun isXrayTlsAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
         endpointId in xrayTlsAvailableEndpoints.value
+
+    private fun isXrayQuicAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
+        endpointId in xrayQuicAvailableEndpoints.value
 
     /**
      * B8O3 - the kind of the transport actually running/last attempted
@@ -730,6 +755,20 @@ class MainViewModel(
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
                 capabilities = if (available) xrayTls.capabilities else TransportCapabilities.notImplemented(),
                 factory = if (available) ({ xrayTls }) else null,
+            )
+        }
+        // B21 - same shape as TLS_TCP above. Never an automatic Smart
+        // Connect pick from AwgXrayFailoverPolicy/SmartConnectDecisionEngine's
+        // fixed PREFERRED_ORDER either - only Manual(QUIC) or Auto mode's own
+        // generic PathScorer ranking (see AutoGatewaySelector) can select it.
+        val xrayQuic = xrayQuicTransport
+        if (xrayQuic != null) {
+            val available = isXrayQuicAvailableFor(endpointId)
+            descriptors += TransportDescriptor(
+                kind = xrayQuic.kind,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) xrayQuic.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ xrayQuic }) else null,
             )
         }
         return TransportRegistry.build(descriptors)
@@ -1281,6 +1320,16 @@ class MainViewModel(
                 if (ready) xrayTlsAvailableEndpoints.update { it + endpointId }
             }
         }
+        // B21 - the QUIC counterpart of the TLS_TCP check above, same authoritative-validation-at-startup discipline.
+        listOfNotNull(
+            xrayQuicProfileRepository?.let { germanyEndpointId to it },
+            stockholmXrayQuicProfileRepository?.let { stockholmEndpointId to it },
+        ).forEach { (endpointId, repository) ->
+            viewModelScope.launch {
+                val ready = XrayRuntimeResolver.resolveQuic(repository) is net.pocvpn.client.vpn.xray.XrayQuicRuntimeResolution.Ready
+                if (ready) xrayQuicAvailableEndpoints.update { it + endpointId }
+            }
+        }
         // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
         // onCleared lifecycle (see VpnController's own reconnectManager.start
         // call and this class's onCleared below) - registered exactly once
@@ -1424,6 +1473,14 @@ class MainViewModel(
         val targetXrayTlsRepository = when (targetGatewayId) {
             net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> xrayTlsProfileRepository
             net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmXrayTlsProfileRepository
+        }
+        val targetXrayQuicProvisioner = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> xrayQuicProfileProvisioner
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmXrayQuicProfileProvisioner
+        }
+        val targetXrayQuicRepository = when (targetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> xrayQuicProfileRepository
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmXrayQuicProfileRepository
         }
         val targetEndpointId = when (targetGatewayId) {
             net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> germanyEndpointId
@@ -1590,6 +1647,18 @@ class MainViewModel(
                                 val repository = targetXrayTlsRepository
                                 if (repository != null && XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready) {
                                     xrayTlsAvailableEndpoints.update { it + targetEndpointId }
+                                }
+                            }
+                        }
+                        // B21 - same reasoning as targetXrayTlsProvisioner above.
+                        targetXrayQuicProvisioner?.let { provisioner ->
+                            val quicOutcome = withContext(ioDispatcher) {
+                                provisioner.provision(key, trimmedCredential)
+                            }
+                            if (quicOutcome == XrayProfileProvisioningOutcome.Saved) {
+                                val repository = targetXrayQuicRepository
+                                if (repository != null && XrayRuntimeResolver.resolveQuic(repository) is net.pocvpn.client.vpn.xray.XrayQuicRuntimeResolution.Ready) {
+                                    xrayQuicAvailableEndpoints.update { it + targetEndpointId }
                                 }
                             }
                         }
@@ -1764,6 +1833,13 @@ class MainViewModel(
             registryFor = { endpointId -> buildTransportRegistry(endpointId) },
             xrayAvailableFor = ::isXrayAvailableFor,
             xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
+            // B21 - real per-endpoint availability, same discipline as
+            // xrayAvailableFor/xrayTlsAvailableFor above. In practice this
+            // stays false everywhere in this slice - no production QUIC
+            // port exists yet (see docs/B21_QUIC_TRANSPORT_AUDIT.md's own
+            // production-port gate) - but the wiring is real and generic,
+            // never a QUIC-specific special case in AutoGatewaySelector.
+            xrayQuicAvailableFor = ::isXrayQuicAvailableFor,
             reachabilityFor = { endpointId, kind ->
                 val gateway = gatewaysById.getValue(endpointId)
                 val endpoint = net.pocvpn.client.smartconnect.ProductionGatewayEndpoints.descriptorFor(
@@ -2158,6 +2234,9 @@ class MainViewModel(
             // NOT_IMPLEMENTED, never a fabricated/hardcoded availability.
             val stockholmXrayProfileRepository = XrayProfileRepositoryFactory.create(context, endpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId)
             val stockholmXrayTlsProfileRepository = XrayTlsProfileRepositoryFactory.create(context, endpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId)
+            // B21 - the QUIC counterpart of xrayTlsProfileRepository/stockholmXrayTlsProfileRepository above - own independent store/AndroidKeyStore alias.
+            val xrayQuicProfileRepository = net.pocvpn.client.identity.XrayQuicProfileRepositoryFactory.create(context)
+            val stockholmXrayQuicProfileRepository = net.pocvpn.client.identity.XrayQuicProfileRepositoryFactory.create(context, endpointId = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.endpointId)
             // B12 - the ONE authoritative EndpointManifestRepository instance -
             // shared by reachabilityDiagnostics() (read-only) and
             // manifestDistributionClient below (the only real writer, via
@@ -2252,6 +2331,12 @@ class MainViewModel(
                     if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayTlsProfileRepository else XrayTlsProfileRepositoryFactory.create(context, id)
                 },
                 xrayTlsProfileRepository = xrayTlsProfileRepository,
+                // B21 - same reasoning as xrayTlsTransport/xrayTlsProfileRepository above, for QUIC.
+                xrayQuicProfileProvisioner = net.pocvpn.client.provisioning.XrayQuicProfileProvisioner(xrayQuicProfileRepository),
+                xrayQuicTransport = net.pocvpn.client.vpn.VlessQuicTransport(context) { id ->
+                    if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayQuicProfileRepository else net.pocvpn.client.identity.XrayQuicProfileRepositoryFactory.create(context, id)
+                },
+                xrayQuicProfileRepository = xrayQuicProfileRepository,
                 // B13 consolidated review fix (finding 4) - Stockholm's own
                 // repositories, so MainViewModel's per-endpoint availability
                 // (xrayAvailableEndpoints/xrayTlsAvailableEndpoints) can
@@ -2259,6 +2344,7 @@ class MainViewModel(
                 // instead of only ever knowing about Germany's.
                 stockholmXrayProfileRepository = stockholmXrayProfileRepository,
                 stockholmXrayTlsProfileRepository = stockholmXrayTlsProfileRepository,
+                stockholmXrayQuicProfileRepository = stockholmXrayQuicProfileRepository,
                 // B14 - the real self-service Stockholm provisioning path:
                 // Stockholm's own activation client (defaults to a real
                 // request against ProductionGatewayCatalog.STOCKHOLM's own
@@ -2279,6 +2365,12 @@ class MainViewModel(
                     repository = stockholmXrayTlsProfileRepository,
                     fetchXrayTlsProfile = { publicKey, activationCredential ->
                         ProvisioningClient.fetchXrayTlsProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
+                    },
+                ),
+                stockholmXrayQuicProfileProvisioner = net.pocvpn.client.provisioning.XrayQuicProfileProvisioner(
+                    repository = stockholmXrayQuicProfileRepository,
+                    fetchXrayQuicProfile = { publicKey, activationCredential ->
+                        ProvisioningClient.fetchXrayQuicProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
                     },
                 ),
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see

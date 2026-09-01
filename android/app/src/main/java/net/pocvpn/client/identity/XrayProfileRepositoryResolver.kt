@@ -22,6 +22,11 @@ fun interface XrayTlsProfileRepositoryResolver {
     fun resolve(endpointId: EndpointId): XrayTlsProfileRepository?
 }
 
+/** B21 - the QUIC counterpart of [XrayProfileRepositoryResolver] - same contract, same fail-closed discipline. */
+fun interface XrayQuicProfileRepositoryResolver {
+    fun resolve(endpointId: EndpointId): XrayQuicProfileRepository?
+}
+
 /**
  * Map-backed resolver. B13 consolidated review fix - now genuinely carries
  * TWO real endpoint -> repository entries in production (Germany AND
@@ -38,4 +43,9 @@ class MapXrayProfileRepositoryResolver(private val repositories: Map<EndpointId,
 /** The TLS/TCP counterpart of [MapXrayProfileRepositoryResolver]. */
 class MapXrayTlsProfileRepositoryResolver(private val repositories: Map<EndpointId, XrayTlsProfileRepository>) : XrayTlsProfileRepositoryResolver {
     override fun resolve(endpointId: EndpointId): XrayTlsProfileRepository? = repositories[endpointId]
+}
+
+/** B21 - the QUIC counterpart of [MapXrayProfileRepositoryResolver]. */
+class MapXrayQuicProfileRepositoryResolver(private val repositories: Map<EndpointId, XrayQuicProfileRepository>) : XrayQuicProfileRepositoryResolver {
+    override fun resolve(endpointId: EndpointId): XrayQuicProfileRepository? = repositories[endpointId]
 }

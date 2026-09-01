@@ -215,11 +215,104 @@ class XrayProfileEndpointTests(unittest.TestCase):
         self.assertEqual(json.loads(body_reality)["uuid"], json.loads(body_tls)["uuid"])
 
     def test_malformed_transport_value_is_bad_request(self):
+        # B21 - "quic" is now a real, supported transport value (see the
+        # dedicated QUIC transport tests below) - use a value that is still
+        # genuinely unsupported to keep proving this validation rule.
         _activation_id, credential = self._issue_and_activate()
         status, _headers, _body = post_xray_profile(
-            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "quic"},
+            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "socks5"},
         )
         self.assertEqual(status, 400)
+
+    # --- B21: transport="quic" ---
+
+    def test_quic_transport_not_configured_fails_closed_with_503(self):
+        _activation_id, credential = self._issue_and_activate()
+        status, _headers, body = post_xray_profile(
+            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "quic"},
+        )
+        self.assertEqual(status, 503)
+        self.assertIn(b"xray_quic_not_configured", body)
+
+    def test_quic_transport_returns_only_quic_fields(self):
+        import dataclasses
+        from _fixtures import make_tls_cert_and_key_files
+        cert_file, key_file = make_tls_cert_and_key_files(self._tmp.name)
+        self.server.srv.config = dataclasses.replace(
+            self.app_config,
+            xray_quic_server_port=2087,
+            xray_quic_server_name="203.0.113.1",
+            xray_quic_fingerprint="chrome",
+            xray_quic_cert_file=cert_file,
+            xray_quic_key_file=key_file,
+            xray_quic_path="/nova-quic",
+        )
+
+        _activation_id, credential = self._issue_and_activate()
+        status, _headers, body = post_xray_profile(
+            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "quic"},
+        )
+        self.assertEqual(status, 200)
+
+        payload = json.loads(body)
+        self.assertEqual(
+            set(payload.keys()),
+            {"server_address", "server_port", "uuid", "server_name", "fingerprint", "path"},
+        )
+        self.assertEqual(payload["server_port"], 2087)
+        self.assertEqual(payload["server_name"], "203.0.113.1")
+        self.assertEqual(payload["path"], "/nova-quic")
+        self.assertRegex(payload["uuid"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+    def test_quic_and_reality_transports_return_the_same_identity_uuid(self):
+        import dataclasses
+        from _fixtures import make_tls_cert_and_key_files
+        cert_file, key_file = make_tls_cert_and_key_files(self._tmp.name)
+        self.server.srv.config = dataclasses.replace(
+            self.app_config,
+            xray_quic_server_port=2087,
+            xray_quic_server_name="203.0.113.1",
+            xray_quic_fingerprint="chrome",
+            xray_quic_cert_file=cert_file,
+            xray_quic_key_file=key_file,
+            xray_quic_path="/nova-quic",
+        )
+
+        _activation_id, credential = self._issue_and_activate()
+        _s1, _h1, body_reality = post_xray_profile(
+            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "reality"},
+        )
+        _s2, _h2, body_quic = post_xray_profile(
+            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "quic"},
+        )
+        self.assertEqual(json.loads(body_reality)["uuid"], json.loads(body_quic)["uuid"])
+
+    def test_quic_private_material_never_appears_in_the_response(self):
+        # QUIC/TLS carry no secret at all in the config (cert_file/key_file
+        # are non-secret file paths) - this proves the response body still
+        # never contains the private REALITY key served by the SAME process.
+        import dataclasses
+        from _fixtures import make_tls_cert_and_key_files
+        cert_file, key_file = make_tls_cert_and_key_files(self._tmp.name)
+        self.server.srv.config = dataclasses.replace(
+            self.app_config,
+            xray_quic_server_port=2087,
+            xray_quic_server_name="203.0.113.1",
+            xray_quic_fingerprint="chrome",
+            xray_quic_cert_file=cert_file,
+            xray_quic_key_file=key_file,
+            xray_quic_path="/nova-quic",
+        )
+        _activation_id, credential = self._issue_and_activate()
+        status, _headers, body = post_xray_profile(
+            self.server.port, credential=credential, body_obj={"public_key": self.key_a, "transport": "quic"},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"privateKey", body)
+        self.assertNotIn(b"private_key", body)
+        with open(self.app_config.xray_reality_private_key_file, "rb") as handle:
+            raw_private_key = handle.read().strip()
+        self.assertNotIn(raw_private_key, body)
 
     def test_a_second_request_while_one_is_already_active_does_not_reinvoke_the_wrapper(self):
         # Proves the "skip if unchanged" optimization: after one successful

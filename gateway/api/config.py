@@ -102,6 +102,20 @@ class AppConfig:
     xray_tls_cert_file: str = ""
     xray_tls_key_file: str = ""
 
+    # B21 - QUIC (XHTTP stream-one, ALPN h3) fallback: a THIRD Xray inbound,
+    # same activation pipeline/staging/lock/wrapper as REALITY/TLS above
+    # (see xray_activation.py's build_quic_config), sharing the SAME device
+    # identities. Blank/zero (the default) means POST /v1/xray-profile
+    # never offers "quic" as a transport option - same optional-group
+    # convention as TLS_TCP. No production port is opened by this default -
+    # see docs/B21_QUIC_TRANSPORT_AUDIT.md's own production-port gate.
+    xray_quic_server_port: int = 0
+    xray_quic_server_name: str = ""
+    xray_quic_fingerprint: str = ""
+    xray_quic_cert_file: str = ""
+    xray_quic_key_file: str = ""
+    xray_quic_path: str = ""
+
     # B12 - GET /v1/manifest: serves an ALREADY-SIGNED EndpointManifest
     # artifact (see gateway/tools/manifest_signing.py's `sign-and-package`
     # subcommand, run OFFLINE) verbatim, as raw bytes. Blank (the default)
@@ -417,6 +431,63 @@ def load_config(env=None):
                 f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before TLS can be enabled"
             )
 
+    # B21 - QUIC (XHTTP stream-one, ALPN h3) fallback's own optional
+    # completeness group - same structure as TLS_TCP's above. QUIC is a UDP
+    # listener (real QUIC/HTTP-3), so it does NOT need a port-collision check
+    # against REALITY's/TLS's own TCP listen ports - TCP and UDP port spaces
+    # are independent at the OS socket level, and xray-core's own inbound
+    # config has no cross-protocol port-sharing restriction either.
+    xray_quic_server_port_raw = _get(env, "XRAY_QUIC_SERVER_PORT")
+    xray_quic_server_port = 0
+    if xray_quic_server_port_raw:
+        try:
+            xray_quic_server_port = int(xray_quic_server_port_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_QUIC_SERVER_PORT is not an integer: {xray_quic_server_port_raw!r}")
+        if not (1 <= xray_quic_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_QUIC_SERVER_PORT out of range: {xray_quic_server_port}")
+    xray_quic_server_name = _get(env, "XRAY_QUIC_SERVER_NAME")
+
+    xray_quic_fingerprint = _get(env, "XRAY_QUIC_FINGERPRINT")
+    if xray_quic_fingerprint and xray_quic_fingerprint not in ("chrome", "firefox", "safari", "edge"):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_QUIC_FINGERPRINT is not one of chrome/firefox/safari/edge: {xray_quic_fingerprint!r}")
+
+    xray_quic_cert_file = _get(env, "XRAY_QUIC_CERT_FILE")
+    xray_quic_key_file = _get(env, "XRAY_QUIC_KEY_FILE")
+    xray_quic_path = _get(env, "XRAY_QUIC_PATH")
+
+    xray_quic_partially_configured = bool(
+        xray_quic_server_port or xray_quic_server_name or xray_quic_cert_file or xray_quic_key_file or xray_quic_path
+    )
+    if xray_quic_partially_configured:
+        quic_missing = [
+            name for name, value in (
+                ("XRAY_QUIC_SERVER_PORT", xray_quic_server_port_raw),
+                ("XRAY_QUIC_SERVER_NAME", xray_quic_server_name),
+                ("XRAY_QUIC_FINGERPRINT", xray_quic_fingerprint),
+                ("XRAY_QUIC_CERT_FILE", xray_quic_cert_file),
+                ("XRAY_QUIC_KEY_FILE", xray_quic_key_file),
+                ("XRAY_QUIC_PATH", xray_quic_path),
+            ) if not value
+        ]
+        if quic_missing:
+            raise ConfigError(
+                "partial Xray QUIC configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in quic_missing)
+                + " must all be set once any Xray QUIC setting is set (or none of them, to leave QUIC unconfigured)"
+            )
+        if not os.path.isabs(xray_quic_cert_file) or not os.path.isfile(xray_quic_cert_file):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_QUIC_CERT_FILE must be an absolute path to an existing file")
+        if not os.path.isabs(xray_quic_key_file) or not os.path.isfile(xray_quic_key_file):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_QUIC_KEY_FILE must be an absolute path to an existing file")
+        if not xray_quic_path.startswith("/"):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_QUIC_PATH must be an absolute path (e.g. /nova-quic)")
+        if not xray_activation_wrapper_path:
+            raise ConfigError(
+                "partial Xray QUIC configuration: the shared Xray activation boundary "
+                f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before QUIC can be enabled"
+            )
+
     # B12 - see AppConfig.manifest_path's own docs. When set, held to the
     # same "absolute and actually a file" bar as every other file-path
     # config value above (provision_script_path, xray_tls_cert_file, ...) -
@@ -461,5 +532,11 @@ def load_config(env=None):
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        xray_quic_server_port=xray_quic_server_port,
+        xray_quic_server_name=xray_quic_server_name,
+        xray_quic_fingerprint=xray_quic_fingerprint,
+        xray_quic_cert_file=xray_quic_cert_file,
+        xray_quic_key_file=xray_quic_key_file,
+        xray_quic_path=xray_quic_path,
         manifest_path=manifest_path,
     )

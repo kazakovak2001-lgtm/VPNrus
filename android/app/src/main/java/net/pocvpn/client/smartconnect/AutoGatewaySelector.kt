@@ -111,6 +111,12 @@ object AutoGatewaySelector {
         registryFor: (EndpointId) -> TransportRegistry,
         xrayAvailableFor: (EndpointId) -> Boolean,
         xrayTlsAvailableFor: (EndpointId) -> Boolean,
+        // B21 - additive, defaults to "always unavailable" so every
+        // pre-B21 caller (real or test) is byte-for-byte unaffected - a
+        // caller that never wires QUIC availability sees the exact same
+        // "no such transport" result the existing `else -> false` branch
+        // below already produced before this parameter existed.
+        xrayQuicAvailableFor: (EndpointId) -> Boolean = { false },
         reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability,
         transportHealthFor: (TransportKind) -> TransportHealth,
         historyFor: (EndpointId, TransportKind) -> PathHistoryEntry?,
@@ -159,7 +165,7 @@ object AutoGatewaySelector {
                     TransportKind.AMNEZIA_WG -> true // already gated by provisioned()/clientTunnelIp() above
                     TransportKind.XRAY_REALITY -> xrayAvailableFor(manifestEndpoint.id)
                     TransportKind.TLS_TCP -> xrayTlsAvailableFor(manifestEndpoint.id)
-                    else -> false
+                    TransportKind.QUIC -> xrayQuicAvailableFor(manifestEndpoint.id)
                 }
             }
             if (availableTransports.isEmpty()) return@forEach

@@ -94,6 +94,24 @@ def build_tls_config(app_config):
     )
 
 
+def build_quic_config(app_config):
+    """B21 - the QUIC counterpart of [build_tls_config]: same "no secret
+    file read, cert_file/key_file are plain paths xray-core itself opens"
+    reasoning - real QUIC/HTTP-3 reuses the SAME publicly-trusted
+    certificate model TLS_TCP already uses (see
+    docs/B21_QUIC_TRANSPORT_AUDIT.md §5 for why REALITY does not apply
+    here). Returns None (not an error) when QUIC is not configured -
+    REALITY's/TLS's own inbounds are unaffected."""
+    if not app_config.xray_quic_server_port:
+        return None
+    return xray_config_renderer.QuicServerConfig(
+        listen_port=app_config.xray_quic_server_port,
+        cert_file=app_config.xray_quic_cert_file,
+        key_file=app_config.xray_quic_key_file,
+        path=app_config.xray_quic_path,
+    )
+
+
 def _read_last_activated_hash(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -127,9 +145,10 @@ def _render_candidate(app_config):
     canonical_json_text, sha256_hex)."""
     reality = build_reality_config(app_config)
     tls = build_tls_config(app_config)
+    quic = build_quic_config(app_config)
     activations_data = activations.read_store_shared(app_config.activation_store_path, app_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(app_config.xray_store_path, app_config.xray_lock_path)
-    config_dict = xray_config_renderer.render_server_config(activations_data, xray_data, reality, tls=tls, flow=app_config.xray_flow)
+    config_dict = xray_config_renderer.render_server_config(activations_data, xray_data, reality, tls=tls, quic=quic, flow=app_config.xray_flow)
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
     return config_dict, sha256_hex

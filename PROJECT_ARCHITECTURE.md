@@ -431,6 +431,26 @@ Never allocate/purchase paid cloud resources (including Elastic IPs) or make
 destructive production changes without explicit owner approval - this applies to any
 change, not just gateway-related ones.
 
+## QUIC transport (B21) - a third Xray adapter, not a new architecture
+
+`TransportKind.QUIC` is real QUIC/HTTP-3 via xray-core's XHTTP transport
+(`network: "xhttp"`, `mode: "stream-one"`, TLS ALPN `h3`) - the pinned
+xray-core `v26.7.28`'s standalone `"quic"` network value is a removed,
+hard config-load error (see `docs/B21_QUIC_TRANSPORT_AUDIT.md` for the
+pinned-source citation and local `xray run -test` empirical validation).
+It is a THIRD instance of the exact same pattern REALITY/TLS_TCP already
+established - same `NovaXrayVpnService`/`XrayCoreController`/tun-inbound
+shell, same VLESS UUID identity model (no REALITY key material - QUIC/UDP
+has no defined REALITY behavior), its own endpoint-scoped profile
+repository/listener/port. `AutoGatewaySelector`/`PathScorer`/
+`TransportHealth`/`ReachabilityEngine` needed zero QUIC-specific code -
+they already generalize over `TransportKind`. Kept at FOUNDATION: real
+client+server code, unit-tested and locally `-test`-validated against the
+real pinned binary, but no production UDP port exists yet on either
+gateway (opening one is a firewall/security-group change requiring
+explicit operator approval, not performed in B21) and no physical device
+has executed a real QUIC session.
+
 ## Config resolution atomicity
 
 `SelectedProductionGatewaySource.snapshot()` resolves the selected gateway id exactly

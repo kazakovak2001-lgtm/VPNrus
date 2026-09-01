@@ -49,6 +49,7 @@ object XrayConfigRenderer {
     private const val TUN_INBOUND_TAG = "nova-tun-in"
     private const val VLESS_OUTBOUND_TAG = "nova-vless-reality-out"
     private const val VLESS_TLS_OUTBOUND_TAG = "nova-vless-tls-out"
+    private const val VLESS_QUIC_OUTBOUND_TAG = "nova-vless-quic-out"
     private const val TUN_INTERFACE_NAME = "nova-xray-tun"
 
     fun render(config: XrayVlessRealityConfig): String {
@@ -65,6 +66,29 @@ object XrayConfigRenderer {
         root.put("log", JSONObject().put("loglevel", "warning"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessTlsOutbound(config)))
+        return root.toString()
+    }
+
+    /**
+     * B21 - real QUIC/HTTP-3 via xray-core's XHTTP transport (`network:
+     * "xhttp"`, `mode: "stream-one"`), NOT the removed standalone `"quic"`
+     * network value - see docs/B21_QUIC_TRANSPORT_AUDIT.md §2-3 for the
+     * pinned-source citation proving `"quic"` is a hard config-load error in
+     * v26.7.28 and `xhttp`/`stream-one`/ALPN `h3` is the real, currently
+     * supported replacement (empirically confirmed against the pinned
+     * `xray` binary via `-test` - see the audit's §3/§6). `tlsSettings.alpn`
+     * MUST include `"h3"` - this is literally what selects the real
+     * quic-go/http3 client path in the pinned source
+     * (transport/internet/splithttp/dialer.go's `tlsConfig.NextProtocol[0]
+     * == "h3"` check) rather than an HTTP/2 XHTTP fallback. No `flow` key -
+     * same reasoning as [renderVlessTlsOutbound] (XTLS-Vision is a
+     * REALITY-specific optimization).
+     */
+    fun render(config: XrayVlessQuicConfig): String {
+        val root = JSONObject()
+        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
+        root.put("outbounds", JSONArray().put(renderVlessQuicOutbound(config)))
         return root.toString()
     }
 
@@ -136,6 +160,42 @@ object XrayConfigRenderer {
 
         return JSONObject()
             .put("tag", VLESS_TLS_OUTBOUND_TAG)
+            .put("protocol", "vless")
+            .put("settings", settings)
+            .put("streamSettings", streamSettings)
+    }
+
+    private fun renderVlessQuicOutbound(config: XrayVlessQuicConfig): JSONObject {
+        val user = JSONObject()
+            .put("id", config.uuid)
+            .put("encryption", "none")
+
+        val vnext = JSONObject()
+            .put("address", config.server)
+            .put("port", config.serverPort)
+            .put("users", JSONArray().put(user))
+
+        val settings = JSONObject().put("vnext", JSONArray().put(vnext))
+
+        val tlsSettings = JSONObject()
+            .put("serverName", config.serverName)
+            .put("fingerprint", config.fingerprint)
+            .put("alpn", JSONArray().put("h3"))
+            .put("allowInsecure", false)
+
+        val xhttpSettings = JSONObject()
+            .put("host", config.serverName)
+            .put("path", config.path)
+            .put("mode", "stream-one")
+
+        val streamSettings = JSONObject()
+            .put("network", "xhttp")
+            .put("security", "tls")
+            .put("tlsSettings", tlsSettings)
+            .put("xhttpSettings", xhttpSettings)
+
+        return JSONObject()
+            .put("tag", VLESS_QUIC_OUTBOUND_TAG)
             .put("protocol", "vless")
             .put("settings", settings)
             .put("streamSettings", streamSettings)

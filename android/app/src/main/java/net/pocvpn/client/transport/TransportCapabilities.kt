@@ -107,6 +107,39 @@ data class TransportCapabilities(
             maturity = TransportMaturity.EXPERIMENTAL,
         )
 
+        /**
+         * B21 - VlessQuicTransport/NovaXrayVpnService (real QUIC/HTTP-3 via
+         * xray-core's XHTTP `stream-one` transport, ALPN `h3`) as an
+         * isolated adapter shell - same "real code, zero physical-device
+         * evidence yet, not registered AVAILABLE" shape as
+         * [xrayRealityAdapterShell]/[xrayTlsAdapterShell] - see those
+         * functions' own docs and docs/B21_QUIC_TRANSPORT_AUDIT.md.
+         * `usesUdp = true` (real QUIC is UDP-based, unlike REALITY/TLS_TCP);
+         * `supportsObfuscation = true` (QUIC/HTTP-3 traffic is genuinely
+         * harder to fingerprint/block at the protocol level than a bespoke
+         * VPN handshake - a property of the protocol itself, not a claim
+         * about THIS implementation's field evidence). `suitableForRestrictiveNetworks`
+         * stays false - no restrictive-network/Russia evidence exists yet
+         * (see ROADMAP's own status rules), never inferred from the
+         * protocol's general reputation. Same ALL_APPS-only/no-IPv6
+         * limitations as the other two Xray adapter shells, for the same
+         * reasons.
+         */
+        fun xrayQuicAdapterShell(): TransportCapabilities = TransportCapabilities(
+            usesUdp = true,
+            usesTcp = false,
+            supportsPort443 = true,
+            supportsObfuscation = true,
+            suitableForRestrictiveNetworks = false,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.EXPERIMENTAL,
+        )
+
         /** A transport with no implementation at all: every capability is truthfully false/unknown. */
         fun notImplemented(): TransportCapabilities = TransportCapabilities(
             usesUdp = false,

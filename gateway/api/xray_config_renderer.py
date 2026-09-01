@@ -87,6 +87,24 @@ class TlsServerConfig:
 
 
 @dataclass(frozen=True)
+class QuicServerConfig:
+    """B21 - operator-chosen, server-local QUIC (XHTTP `stream-one`, ALPN
+    `h3`) settings for a THIRD Xray inbound, alongside REALITY and TLS - see
+    docs/B21_QUIC_TRANSPORT_AUDIT.md for why this is real QUIC/HTTP-3, not
+    xray-core's removed standalone "quic" transport. Reuses the SAME
+    publicly-trusted certificate model TLS_TCP already uses (real
+    cert_file/key_file paths, never REALITY's borrowed-camouflage trick -
+    QUIC/H3 has no defined behavior for that). [path] is the XHTTP request
+    path this inbound accepts - operator-chosen, never hardcoded upstream."""
+
+    listen_port: int
+    cert_file: str
+    key_file: str
+    path: str
+    inbound_tag: str = "nova-vless-quic-in"
+
+
+@dataclass(frozen=True)
 class RenderedClient:
     activation_id: str
     device_public_key: str
@@ -100,6 +118,17 @@ def _validate_tls_server_config(tls):
         raise XrayConfigRenderError("tls cert_file must be an absolute path")
     if not tls.key_file or not os.path.isabs(tls.key_file):
         raise XrayConfigRenderError("tls key_file must be an absolute path")
+
+
+def _validate_quic_server_config(quic):
+    if not (1 <= quic.listen_port <= 65535):
+        raise XrayConfigRenderError(f"invalid quic listen_port: {quic.listen_port}")
+    if not quic.cert_file or not os.path.isabs(quic.cert_file):
+        raise XrayConfigRenderError("quic cert_file must be an absolute path")
+    if not quic.key_file or not os.path.isabs(quic.key_file):
+        raise XrayConfigRenderError("quic key_file must be an absolute path")
+    if not quic.path or not quic.path.startswith("/"):
+        raise XrayConfigRenderError("quic path must be a non-empty absolute path")
 
 
 def _validate_reality_server_config(reality):
@@ -215,7 +244,43 @@ def _render_tls_inbound(clients, tls):
     }
 
 
-def render_server_config(activations_data, xray_data, reality, tls=None, flow=""):
+def _render_quic_inbound(clients, quic):
+    """B21 - the SAME active-client list REALITY/TLS's own inbounds use (see
+    [_active_clients]) - device identity is shared across all three
+    transports, never a second/independent identity system. No `flow` key -
+    same reasoning as [_render_tls_inbound]. `network: "xhttp"` with `mode:
+    "stream-one"` and ALPN `h3` is the real, currently-supported QUIC/HTTP-3
+    transport in the pinned xray-core v26.7.28 - see
+    docs/B21_QUIC_TRANSPORT_AUDIT.md for the exact source citation; the
+    standalone `"quic"` network value is a hard config-load error in this
+    version and is never used here."""
+    return {
+        "tag": quic.inbound_tag,
+        "listen": "0.0.0.0",
+        "port": quic.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": _vless_clients(clients, flow=None),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+                "alpn": ["h3"],
+                "certificates": [
+                    {"certificateFile": quic.cert_file, "keyFile": quic.key_file},
+                ],
+            },
+            "xhttpSettings": {
+                "path": quic.path,
+                "mode": "stream-one",
+            },
+        },
+    }
+
+
+def render_server_config(activations_data, xray_data, reality, tls=None, quic=None, flow=""):
     """Pure function: (parsed activations store, parsed xray identity
     store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
     server config dict, ready for json.dumps. Deterministic - same inputs
@@ -230,12 +295,16 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     _validate_reality_server_config(reality)
     if tls is not None:
         _validate_tls_server_config(tls)
+    if quic is not None:
+        _validate_quic_server_config(quic)
 
     clients = _active_clients(activations_data, xray_data)
 
     inbounds = [_render_reality_inbound(clients, reality, flow)]
     if tls is not None:
         inbounds.append(_render_tls_inbound(clients, tls))
+    if quic is not None:
+        inbounds.append(_render_quic_inbound(clients, quic))
 
     return {
         "log": {"loglevel": "warning"},
@@ -246,14 +315,14 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow=""):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, quic=None, flow=""):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
-    outside the config file itself. TLS's own inbound carries no secret
-    value at all (cert_file/key_file are non-secret file paths), so nothing
-    else needs redacting there."""
-    full = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow)
+    outside the config file itself. TLS's/QUIC's own inbounds carry no
+    secret value at all (cert_file/key_file are non-secret file paths), so
+    nothing else needs redacting there."""
+    full = render_server_config(activations_data, xray_data, reality, tls=tls, quic=quic, flow=flow)
     full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     return full
 
@@ -290,7 +359,7 @@ def atomic_write_config(config_path, config_dict):
 def regenerate_and_write_config(
     activation_store_path, activation_lock_path,
     xray_store_path, xray_lock_path,
-    config_path, reality, tls=None, flow="",
+    config_path, reality, tls=None, quic=None, flow="",
     validate_config_fn=None,
 ):
     """The full pipeline this module's docstring describes, minus reload:
@@ -308,7 +377,7 @@ def regenerate_and_write_config(
     activations_data = activations.read_store_shared(activation_store_path, activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(xray_store_path, xray_lock_path)
 
-    config_dict = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow)
+    config_dict = render_server_config(activations_data, xray_data, reality, tls=tls, quic=quic, flow=flow)
     atomic_write_config(config_path, config_dict)
 
     if validate_config_fn is not None:
