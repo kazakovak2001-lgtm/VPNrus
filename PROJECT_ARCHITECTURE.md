@@ -196,17 +196,30 @@ NetworkProfiler
   only `RestrictionClass.NO_NETWORK` changes `resolveIpv4Routes`'s output,
   and `UNKNOWN` yields the identical route set AWG yields for every other
   class, so both transports' ADAPTIVE route sets are provably identical for
-  every reachable live case. **Physically verified (2026-09-01, partial)**:
-  a real device's live `dumpsys connectivity` route table for `tun0` was
-  checked directly before/after switching `RoutingMode` - Full VPN shows
-  plain `0.0.0.0/0`/`::/0`; Adaptive shows the exact
-  `Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES` complement, confirming
-  this mechanism reaches the real OS route table as designed. Still open:
-  live end-to-end traffic/DNS-leak confirmation (blocked by a real, external
-  TCP-over-tunnel condition on that network at the time) and the Xray/TLS
-  consistency check (no reachable entry point exercises `RoutingMode`
-  without a rebuild - see ROADMAP's own row for the full detail) - Adaptive
-  Direct Routing stays FOUNDATION until both are closed.
+  every reachable live case. **Physically verified (2026-09-01)**: a real
+  device's live `dumpsys connectivity` route table for `tun0` was checked
+  directly before/after switching `RoutingMode` - Full VPN shows plain
+  `0.0.0.0/0`/`::/0`; Adaptive shows the exact
+  `Ipv4RouteExclusion.ADAPTIVE_DIRECT_IPV4_ROUTES` complement. **Xray/TLS
+  consistency is now physically proven too**: a genuinely minimal
+  debug-only trigger (`MainViewModel.debugSetTransportPreference`, one
+  button in the existing `isDebugBuild`-gated Diagnostics dialog) pins
+  `UserTransportPreference.Manual(XRAY_REALITY)` for the next `connect()` -
+  a real mechanism `SmartConnectDecisionEngine`/`AutoGatewaySelector`
+  already read but no product UI could reach - driving the REAL connect
+  path end to end (never a second Xray connection path). The resulting live
+  Xray `tun0` session's route table matched AWG's Adaptive session
+  entry-for-entry, with `::/0 unreachable` confirming IPv6 fail-closed at
+  the OS level for Xray specifically. Still open: live end-to-end AWG
+  traffic/DNS-leak confirmation - `tun0` RX stays at zero bytes while TX
+  climbs normally, identically on two different client networks
+  (WiFi/cellular), ruling out a client-network cause; root cause is most
+  consistent with a server-side WireGuard forwarding/NAT condition for this
+  peer session, external to this PR's code (FULL_VPN's route table is
+  proven byte-identical to every prior successful validation) - SSH to the
+  gateway was attempted and rejected (no operator credentials in this
+  environment), so server-side confirmation isn't possible here. Adaptive
+  Direct Routing stays FOUNDATION solely for this reason.
 
 ## Per-device identity (hard invariant)
 

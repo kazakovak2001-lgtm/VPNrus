@@ -1074,6 +1074,51 @@ class MainViewModelTest {
         assertTrue(viewModel.transportState.value is TransportState.Connected)
     }
 
+    // --- B18-2: debugSetTransportPreference (debug-only Diagnostics dialog action) ---
+
+    @Test
+    fun `debugSetTransportPreference defaults to Auto and is reflected by the transportPreference getter`() {
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+        )
+
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
+
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.XRAY_REALITY))
+
+        assertEquals(UserTransportPreference.Manual(TransportKind.XRAY_REALITY), viewModel.transportPreference)
+    }
+
+    @Test
+    fun `debugSetTransportPreference actually drives the real connect() path - same outcome as the constructor-pinned Manual preference`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+            // Deliberately left at the default (Auto) here - debugSetTransportPreference below is what must change it.
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.XRAY_REALITY))
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, awgTransport.connectCallCount)
+        assertEquals(1, xrayTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
     @Test
     fun `AWG gateway-missing preflight failure - no fallback`() = runTest {
         val awgTransport = FakeVpnTransport()

@@ -309,7 +309,7 @@ class MainViewModel(
     // check below - a user who pins Manual(AMNEZIA_WG)/Manual(XRAY_REALITY)
     // gets exactly that transport, success or failure, never a silent
     // automatic substitute (see AwgXrayFailoverPolicy's own docs).
-    private val userTransportPreference: UserTransportPreference = UserTransportPreference.Auto,
+    private var userTransportPreference: UserTransportPreference = UserTransportPreference.Auto,
     // B11 - additive, defaults to null (same "no wiring, no behavior" seam
     // as every other optional dependency above). Powers
     // reachabilityDiagnostics() below - a read-only snapshot - AND, as of
@@ -1113,6 +1113,31 @@ class MainViewModel(
     fun updateRoutingMode(mode: RoutingMode) {
         routingModeStore?.write(mode)
         _savedRoutingMode.value = mode
+    }
+
+    /**
+     * B18-2 - the CURRENT transport preference (see [UserTransportPreference]'s
+     * own "developer/debug surface" docs) - read-only exposure for
+     * diagnostics; [debugSetTransportPreference] below is the only writer.
+     */
+    val transportPreference: UserTransportPreference get() = userTransportPreference
+
+    /**
+     * B18-2 - lets a debug-only UI action (see AppRoot's own
+     * `isDebugBuild`-gated Diagnostics dialog, the SAME pattern
+     * `regenerateIdentity()` already uses) drive the REAL connect() path
+     * (`connectAuto`/`connectManual` -> `smartConnectDecision()` ->
+     * `SmartConnectDecisionEngine.decideManual` -> `VpnController.connect`)
+     * with a manually pinned transport - never a second, parallel Xray
+     * connection path. Same "saved, applied only on the NEXT connect()"
+     * discipline as [updateRoutingMode]/[updateAppRoutingPolicy] - does not
+     * itself disconnect/reconnect. No product UI calls this; production
+     * behavior (`UserTransportPreference.Auto`, unless a caller explicitly
+     * wires something else - no call site does) is unaffected by this
+     * function merely existing.
+     */
+    fun debugSetTransportPreference(preference: UserTransportPreference) {
+        userTransportPreference = preference
     }
 
     private val _publicKey = MutableStateFlow<String?>(null)

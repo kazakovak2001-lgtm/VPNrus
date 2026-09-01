@@ -46,6 +46,13 @@ fun DiagnosticsDialog(
     lines: List<String>,
     onCopyPublicKey: () -> Unit,
     onRegenerateIdentity: () -> Unit,
+    // B18-2 - debug-only: pins UserTransportPreference.Manual(XRAY_REALITY)
+    // for the NEXT connect() (same "saved, applied on next connect"
+    // discipline as every other setting here) so the real VpnController/
+    // Smart Connect path can be exercised with Xray for adaptive-route
+    // consistency testing - see MainViewModel.debugSetTransportPreference's
+    // own docs. Never itself reconnects.
+    onForceXrayTest: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
@@ -91,6 +98,9 @@ fun DiagnosticsDialog(
                 }
                 TextButton(onClick = onRegenerateIdentity, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_regenerate_identity))
+                }
+                TextButton(onClick = onForceXrayTest, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.diagnostics_force_xray_test))
                 }
                 TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.diagnostics_close))
