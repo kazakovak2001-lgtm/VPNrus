@@ -201,6 +201,25 @@ data class CombinedAutoRankingDiagnostics(
 )
 
 /**
+ * B28 review fix (final blocker, PR #42) - the ONE consistent
+ * decision/diagnostics snapshot for one combined Auto ranking read: the
+ * exact [net.pocvpn.client.smartconnect.RestrictionClass] that drove
+ * [attempts]'s own ranking/gating, paired with [attempts] itself, computed
+ * from a SINGLE [MainViewModel.stabilizedRestrictionClass] call. Every
+ * consumer of a combined ranking - execution ([MainViewModel.connectAuto]),
+ * the public attempt list ([MainViewModel.combinedAutoAttempts]), and
+ * diagnostics ([MainViewModel.combinedAutoRankingDiagnostics]) - projects
+ * from ONE call to [MainViewModel.buildCombinedAutoRankingSnapshot], never
+ * three independent restriction reads that could each observe a different
+ * moment (and, during the ~90s [net.pocvpn.client.smartconnect
+ * .RestrictionStabilizer] hold window, a genuinely different value).
+ */
+private data class CombinedAutoRankingSnapshot(
+    val restrictionClass: net.pocvpn.client.smartconnect.RestrictionClass,
+    val attempts: List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt>,
+)
+
+/**
  * Thin state holder above VpnController - MainActivity observes this instead
  * of owning tunnel/connection state itself, so Activity recreation (rotation,
  * process death+restore of the Activity only) doesn't lose or duplicate it.
@@ -300,6 +319,16 @@ class MainViewModel(
     // safe, fully backward-compatible no-op (diverseInternetReachable stays
     // null forever, RestrictionClassifier's existing behavior is untouched).
     diverseReachabilityProbes: List<GatewayReachabilityProbe> = emptyList(),
+    // B28 review fix (final blocker) - additive test seam, defaults to the
+    // real wall clock so every existing/production call site is
+    // byte-for-byte unaffected. Used ONLY by [restrictionClass]/
+    // [stabilizedRestrictionClass] - the SAME seam pattern
+    // [net.pocvpn.client.smartconnect.RestrictionMonitor]'s own
+    // `nowProvider` already established for this exact codebase - so a test
+    // can deterministically exercise [net.pocvpn.client.smartconnect
+    // .RestrictionStabilizer]'s minimum-residence hold window without a real
+    // 90-second sleep.
+    private val nowProvider: () -> Long = System::currentTimeMillis,
     // B8K4B - additive, defaults to null (same reasoning as gatewayConfigOverride/
     // profileStore above): when non-null, activateDevice() below fetches and
     // persists an Xray VLESS+REALITY profile immediately after a successful
@@ -1083,7 +1112,7 @@ class MainViewModel(
             gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
             diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
         ),
-        nowEpochMillis = System.currentTimeMillis(),
+        nowEpochMillis = nowProvider(),
     )
 
     /** B28 review fix (blocker 2) - see [stabilizedRestrictionClass]'s own docs; the ONLY mutable field this stabilization mechanism needs. */
@@ -1099,8 +1128,8 @@ class MainViewModel(
      * immediately re-ranks DIRECT vs RELAYED (see that object's own docs
      * for the exact minimum-residence rule; NO_NETWORK/CAPTIVE_PORTAL stay
      * exempt, taking effect immediately in both directions). ONLY
-     * [buildCombinedAutoAttempts] - the one function that actually merges
-     * and ranks DIRECT and RELAYED candidates together, feeding
+     * [buildCombinedAutoRankingSnapshot] - the one function that actually
+     * merges and ranks DIRECT and RELAYED candidates together, feeding
      * [connectAuto]'s real execution - reads this value.
      * [buildAutoGatewayCandidates] (Direct-only, no relay comparison ever
      * happens there), [restrictionClass] itself, [reachabilityDiagnostics]
@@ -1110,7 +1139,7 @@ class MainViewModel(
      * ranking authority is ever delayed.
      */
     fun stabilizedRestrictionClass(): RestrictionClass {
-        val now = System.currentTimeMillis()
+        val now = nowProvider()
         val raw = restrictionClass()
         val previous = restrictionStabilizerState ?: net.pocvpn.client.smartconnect.RestrictionStabilizer.initial(now, raw)
         val next = net.pocvpn.client.smartconnect.RestrictionStabilizer.advance(previous, raw, now)
@@ -1896,14 +1925,14 @@ class MainViewModel(
     // B26 review fix (round 2, blocker) - the FULL pinned context a paused
     // relayed attempt needs to be resumed EXACTLY where it left off: the
     // same already-ranked [candidate] (never rebuilt/re-scored - a fresh
-    // [combinedAutoAttempts]/[buildCombinedAutoAttempts] call could rank
-    // differently against then-current evidence, silently substituting a
+    // [combinedAutoAttempts]/[buildCombinedAutoRankingSnapshot] call could
+    // rank differently against then-current evidence, silently substituting a
     // different ingress/exit/transport/historyPathId - the exact defect
     // this type exists to prevent) and the exact [attempts]/[attemptedKeys]
     // [attemptCombined] was mid-sequence with when this candidate's
     // resolution first came back NotProvisioned-but-fixable (attemptedKeys
     // already includes this candidate's own key - see
-    // buildCombinedAutoAttempts' dispatch site - so resuming
+    // buildCombinedAutoRankingSnapshot's dispatch site - so resuming
     // [attemptCombined] with this SAME pair can never re-select it).
     // `private` - never exposed to the UI layer, which only ever sees the
     // smaller, display-only [RelayActivationRequest] via
@@ -2327,7 +2356,7 @@ class MainViewModel(
      * start or affect any connect() attempt. This is the SAME list
      * [connectAuto] uses to pick its winner.
      */
-    fun combinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> = buildCombinedAutoAttempts()
+    fun combinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> = buildCombinedAutoRankingSnapshot().attempts
 
     /**
      * B28 (requirement 10) - sanitized diagnostics explaining why Auto
@@ -2347,12 +2376,21 @@ class MainViewModel(
      * credential, probe token, or key (see [CombinedAttemptDiagnostic]'s
      * own field list, a closed, non-secret set - same discipline as
      * [ReachabilityEvidenceSummary]).
+     *
+     * B28 review fix (final blocker) - [restrictionClass] here is read from
+     * the SAME [CombinedAutoRankingSnapshot] as [ranked] (one
+     * [buildCombinedAutoRankingSnapshot] call, one [stabilizedRestrictionClass]
+     * read) - never the separate, potentially-differing raw [restrictionClass]
+     * function. During [net.pocvpn.client.smartconnect.RestrictionStabilizer]'s
+     * hold window the raw and stabilized values CAN genuinely differ; this
+     * function must always explain the ranking it actually returns, so it
+     * can never report the raw value here.
      */
     fun combinedAutoRankingDiagnostics(): CombinedAutoRankingDiagnostics {
-        val attempts = combinedAutoAttempts()
+        val snapshot = buildCombinedAutoRankingSnapshot()
         return CombinedAutoRankingDiagnostics(
-            restrictionClass = restrictionClass(),
-            ranked = attempts.map { attempt ->
+            restrictionClass = snapshot.restrictionClass,
+            ranked = snapshot.attempts.map { attempt ->
                 val kind = when (attempt) {
                     is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt -> "DIRECT"
                     is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt ->
@@ -2378,14 +2416,29 @@ class MainViewModel(
      * (and of [autoGatewayCandidates]/[AutoGatewayDiagnostics], which stay
      * Direct-only - see [connectAuto]'s own docs) is byte-for-byte
      * unaffected.
+     *
+     * B28 review fix (final blocker) - renamed from `buildCombinedAutoAttempts`
+     * and now returns a [CombinedAutoRankingSnapshot] (restriction class +
+     * ranked attempts together, not attempts alone): [stabilizedRestrictionClass]
+     * is read EXACTLY ONCE here and the SAME value both (a) drives every hop's
+     * [net.pocvpn.client.reachability.ReachabilityEngine.assess] call feeding
+     * [PathScorer]'s ranking below AND (b) is returned alongside the ranked
+     * result, so [connectAuto], [combinedAutoAttempts], and
+     * [combinedAutoRankingDiagnostics] - every consumer of one combined
+     * ranking - always see the restriction class that ACTUALLY drove that
+     * exact ranking, never two independent reads that could straddle a
+     * [net.pocvpn.client.smartconnect.RestrictionStabilizer] promotion and
+     * silently disagree.
      */
-    private fun buildCombinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> {
+    private fun buildCombinedAutoRankingSnapshot(): CombinedAutoRankingSnapshot {
         val now = System.currentTimeMillis()
         val profile = networkProfile.value
         // B28 review fix (blocker 2) - the STABILIZED value (see
         // stabilizedRestrictionClass()'s own docs): this is the one place
         // restriction evidence actually drives a DIRECT-vs-RELAYED ranking
-        // decision, so it is the one place hysteresis applies.
+        // decision, so it is the one place hysteresis applies. Read ONCE
+        // (final blocker fix) and reused for both ranking and the returned
+        // snapshot's own restrictionClass field.
         val restriction = stabilizedRestrictionClass()
         val health = transportHealth()
         val outcomes = recentConnectionOutcomes()
@@ -2397,7 +2450,7 @@ class MainViewModel(
         }
         val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
         val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
-        return net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
+        val attempts = net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
             manifestEndpoints = manifestEndpoints,
             gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
             provisioned = ::isGatewayProvisioned,
@@ -2442,13 +2495,14 @@ class MainViewModel(
             nowEpochMillis = now,
             restrictionClass = restriction,
         )
+        return CombinedAutoRankingSnapshot(restrictionClass = restriction, attempts = attempts)
     }
 
     /**
      * B16 - the Auto counterpart of connectManual(): builds the ranked
      * combined candidate list once, then hands the winner to execution.
      *
-     * B24 - the WINNER now comes from [buildCombinedAutoAttempts] (real
+     * B24 - the WINNER now comes from [buildCombinedAutoRankingSnapshot] (real
      * Direct+Relayed ranking - task requirement 4), never from the
      * Direct-only list alone. [AutoGatewayDiagnostics] itself stays
      * Direct-only (its own existing public shape - `rankedCandidates:
@@ -2479,17 +2533,23 @@ class MainViewModel(
      * moment it is chosen, in [attemptCombined] itself - never re-chosen).
      */
     private suspend fun connectAuto() {
-        val attempts = buildCombinedAutoAttempts()
+        // B28 review fix (final blocker) - ONE snapshot, ONE stabilized
+        // restriction read, reused below for both the exhaustion check and
+        // (implicitly, via combinedAutoAttempts()/combinedAutoRankingDiagnostics()
+        // re-deriving their own snapshot on their own next read) diagnostics
+        // - never a second, independently-timed stabilizedRestrictionClass() call here.
+        val snapshot = buildCombinedAutoRankingSnapshot()
+        val attempts = snapshot.attempts
         if (attempts.isEmpty()) {
             // B28 review fix (blocker 1) - report TRUTHFULLY when this
             // empty result specifically came from restriction evidence
             // suspecting a fixed allowlist with no eligible relay to route
-            // around it (buildCombinedAutoAttempts already excluded every
-            // Direct candidate in exactly that case - see
+            // around it (buildCombinedAutoRankingSnapshot already excluded
+            // every Direct candidate in exactly that case - see
             // AutoGatewaySelector.buildCombinedAttempts's own docs), never
             // the generic NoCandidateAvailable that would also cover an
             // ordinary "nothing configured" case.
-            val restricted = net.pocvpn.client.smartconnect.AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, stabilizedRestrictionClass())
+            val restricted = net.pocvpn.client.smartconnect.AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, snapshot.restrictionClass)
             _autoGatewayDiagnostics.value = AutoGatewayDiagnostics(
                 rankedCandidates = emptyList(), attempted = emptyList(), current = null,
                 lastFailureReason = if (restricted) "RestrictedNetworkNoViableRelay" else null, exhausted = true,

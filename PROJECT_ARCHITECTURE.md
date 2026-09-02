@@ -1281,6 +1281,57 @@ decision authority (no redesign):
 - **Full re-run**: `compileDebugKotlin`/`testDebugUnitTest`/`assembleDebug`
   all green after both fixes, zero regressions across the existing suite.
 
+### B28 review fix #2 (PR #42) - one consistent ranking/diagnostics snapshot
+
+Third and final blocker: `combinedAutoRankingDiagnostics()` could report a
+DIFFERENT `RestrictionClass` than the one that actually drove the ranking it
+described - it called `combinedAutoAttempts()` (which internally reads
+`stabilizedRestrictionClass()`) and then SEPARATELY called the raw
+`restrictionClass()` for its own `restrictionClass` field. During
+`RestrictionStabilizer`'s ~90s hold window these two reads could genuinely
+disagree (e.g. raw already flipped to a new class while the established,
+decision-driving class was still pending), producing diagnostics that lied
+about why Auto made the decision it made.
+
+Fixed with ONE shared internal snapshot, never a second/independent
+recomputation: `buildCombinedAutoAttempts()` (private) is renamed
+`buildCombinedAutoRankingSnapshot()` and now returns a private
+`CombinedAutoRankingSnapshot{restrictionClass, attempts}` - `stabilizedRestrictionClass()`
+is called EXACTLY ONCE inside it, and that SAME value both drives every
+hop's `ReachabilityEngine.assess` call feeding `PathScorer`'s ranking AND is
+returned alongside the ranked `attempts`. Every consumer of one combined
+ranking now projects from this ONE call: `connectAuto()` (execution),
+`combinedAutoAttempts()` (public attempt list, `= buildCombinedAutoRankingSnapshot().attempts`),
+and `combinedAutoRankingDiagnostics()` (`= buildCombinedAutoRankingSnapshot()`'s
+two fields directly). The raw, immediate `restrictionClass()` function
+itself is unchanged and stays available separately for routing/observational
+use (requirement 3 of the review) - only the COMBINED-RANKING surfaces were
+ever at risk of disagreeing, and now cannot.
+
+To make this deterministically testable without a real 90-second sleep, a
+narrow test seam was added: `MainViewModel`'s new `nowProvider: () -> Long`
+constructor parameter (defaults to `System::currentTimeMillis`, so every
+production/existing call site is byte-for-byte unaffected - the exact same
+additive-seam pattern `RestrictionMonitor`'s own `nowProvider` already
+established in this codebase), used by both `restrictionClass()` and
+`stabilizedRestrictionClass()`. Proven by three new
+`MainViewModelAutoGatewayTest` cases, exercised through the REAL evidence
+pipeline (a real handshake failure produces real `POSSIBLE_HARD_WHITELIST`
+evidence; a second real probe round with diverse-reachability now true
+produces a genuinely differing `GATEWAY_HTTPS_UNREACHABLE` classification -
+substituting for a literal `...->UNKNOWN->...` sequence, which is
+structurally unreachable once a real probe has run since
+`RestrictionMonitor`'s probe StateFlows never revert to null; that exact
+literal sequence is already proven in isolation by `RestrictionStabilizerTest`):
+diagnostics reports the ESTABLISHED class (not the transient raw one) while
+pending; once sustained past the hold window, diagnostics reports the
+promoted class and the `RestrictedNetworkNoViableRelay` failure mode no
+longer applies; two immediate back-to-back reads of
+`combinedAutoAttempts()`/`combinedAutoRankingDiagnostics()` agree
+byte-for-byte.
+
+Full `compileDebugKotlin`/`testDebugUnitTest`/`assembleDebug` re-run green.
+
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
 Architecture principle 9: a user may connect through the managed gateway
