@@ -488,7 +488,17 @@ restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   evidence naturally makes Direct ineligible/low-scored while a proven-
   reachable ingress stays eligible, so no separate "prefer relay under
   restriction" rule was invented - the SAME reachability-first tiering
-  produces the right outcome from real evidence alone.
+  produces the right outcome from real evidence alone. **PR #37 review fix,
+  round 2**: `RelayAttemptCandidate` also carries `ingressBinding`/
+  `exitBinding` - the EXACT, immutable `EndpointTransportBinding` each hop
+  was pinned against at candidate-build time, copied straight off
+  `PathCandidate.Relayed.ingress.binding`/`.exit.binding` - never
+  re-looked-up by endpointId/TransportKind. Without this, a future execution
+  layer dialing a `RelayAttemptCandidate` would have had to re-resolve
+  host/port facts from the manifest/catalog after the fact, which a manifest
+  rotation mid-attempt could have silently redirected - the same B16
+  attempt-pinning invariant `GatewayAttemptCandidate.configSnapshot` already
+  enforces for Direct.
 - **NOT yet consumed by the live connect path** - `MainViewModel
   .connectAuto()`/`attemptAutoCandidate()` and `VpnController` do not call
   `buildRelayedCandidates` and cannot execute a `RelayAttemptCandidate`.

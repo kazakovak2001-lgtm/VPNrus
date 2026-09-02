@@ -322,6 +322,19 @@ object AutoGatewaySelector {
         val exitEndpointId: EndpointId,
         val ingressTransport: TransportKind,
         val exitTransport: TransportKind,
+        // PR #37 review fix (round 2) - the EXACT, immutable
+        // EndpointTransportBinding each hop was pinned against at
+        // candidate-BUILD time (PathCandidate.Relayed.ingress.binding /
+        // .exit.binding, copied here verbatim - never re-looked-up by
+        // endpointId/TransportKind). A future execution layer dialing this
+        // candidate must never re-resolve host/port facts from the
+        // manifest/catalog after the fact (the SAME B16 attempt-pinning
+        // invariant Direct/GatewayAttemptCandidate.configSnapshot already
+        // enforces) - without these fields here, that re-resolution would
+        // have been the only option, and a manifest rotation mid-attempt
+        // could silently redirect an in-flight relay attempt.
+        val ingressBinding: EndpointTransportBinding,
+        val exitBinding: EndpointTransportBinding,
         val ingressRegion: String,
         val exitRegion: String,
         val score: Long,
@@ -431,6 +444,11 @@ object AutoGatewaySelector {
                 exitEndpointId = candidate.exit.endpoint.id,
                 ingressTransport = candidate.transport,
                 exitTransport = candidate.exitTransport,
+                // PR #37 review fix (round 2) - copied straight off the
+                // already-built PathCandidate.Relayed's own pinned hops,
+                // never re-looked-up by endpointId/TransportKind.
+                ingressBinding = candidate.ingress.binding,
+                exitBinding = candidate.exit.binding,
                 ingressRegion = candidate.ingress.endpoint.region,
                 exitRegion = candidate.exit.endpoint.region,
                 score = result.score,

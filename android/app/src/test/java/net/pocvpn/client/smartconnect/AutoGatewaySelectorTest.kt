@@ -689,4 +689,102 @@ class AutoGatewaySelectorTest {
         assertTrue(relayed.all { it.ingressTransport == TransportKind.TLS_TCP })
         assertEquals(setOf(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP), relayed.map { it.exitTransport }.toSet())
     }
+
+    // --- B23 (PR #37 review fix, round 2): RelayAttemptCandidate pins the exact per-hop bindings ---
+
+    @Test
+    fun `RelayAttemptCandidate exposes the exact ingress binding selected at candidate-build time`() {
+        val candidate = buildRelayedDefault().single()
+        assertEquals(ingressEndpoint.transports.single(), candidate.ingressBinding)
+        assertEquals("203.0.113.50", candidate.ingressBinding.host)
+        assertEquals(443, candidate.ingressBinding.port)
+        assertEquals(TransportKind.TLS_TCP, candidate.ingressBinding.kind)
+    }
+
+    @Test
+    fun `RelayAttemptCandidate exposes the exact exit binding selected at candidate-build time`() {
+        val candidate = buildRelayedDefault().single()
+        assertEquals(exitEndpoint.transports.single(), candidate.exitBinding)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointHost, candidate.exitBinding.host)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointPort, candidate.exitBinding.port)
+        assertEquals(TransportKind.AMNEZIA_WG, candidate.exitBinding.kind)
+    }
+
+    /**
+     * B23 (PR #37 review fix, round 2) - the B16/B23 attempt-pinning
+     * invariant: an ALREADY-BUILT RelayAttemptCandidate's own binding facts
+     * must never be re-resolvable from a manifest that later rotates for the
+     * SAME endpoint ids - a caller holding the earlier candidate must keep
+     * seeing the ORIGINAL host/port, exactly the guarantee
+     * GatewayAttemptCandidate.configSnapshot already provides for Direct.
+     */
+    @Test
+    fun `mutating or replacing endpoint descriptors used elsewhere after candidate creation cannot change the pinned candidate bindings`() {
+        val original = buildRelayedDefault().single()
+        val originalIngressBinding = original.ingressBinding
+        val originalExitBinding = original.exitBinding
+
+        // A caller resolves an entirely FRESH descriptor set for the SAME
+        // endpoint ids, with different host/port on both hops - simulating a
+        // manifest refresh mid-attempt. This must never be able to reach
+        // back into `original` and change what it reports.
+        val rotatedIngress = ingressEndpoint.copy(
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "198.51.100.9", 9443).withIngressKind(IngressKind.DIRECT_IP)),
+        )
+        val rotatedExit = exitEndpoint.copy(
+            transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "198.51.100.10", 51821)),
+        )
+        val rebuilt = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(rotatedIngress, rotatedExit),
+            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        ).single()
+
+        // The original candidate's own fields are unchanged (data class vals
+        // - structurally impossible to mutate - but assert the actual values
+        // to prove the fix, not merely that the type is immutable).
+        assertEquals(originalIngressBinding, original.ingressBinding)
+        assertEquals(originalExitBinding, original.exitBinding)
+        assertEquals("203.0.113.50", original.ingressBinding.host)
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointHost, original.exitBinding.host)
+
+        // The REBUILT candidate correctly reflects the rotated facts - proving
+        // the rotation itself was real and the original genuinely didn't see it.
+        assertEquals("198.51.100.9", rebuilt.ingressBinding.host)
+        assertEquals("198.51.100.10", rebuilt.exitBinding.host)
+        assertTrue(original.ingressBinding != rebuilt.ingressBinding)
+        assertTrue(original.exitBinding != rebuilt.exitBinding)
+    }
+
+    @Test
+    fun `ingress and exit bindings remain independently pinned when their transports differ`() {
+        val exitTwoTransports = exitEndpoint.copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.77", 443),
+            ),
+        )
+        val relayed = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(ingressEndpoint, exitTwoTransports),
+            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        assertEquals(2, relayed.size)
+
+        val viaAwgExit = relayed.single { it.exitTransport == TransportKind.AMNEZIA_WG }
+        val viaTlsExit = relayed.single { it.exitTransport == TransportKind.TLS_TCP }
+
+        // Both share the SAME ingress binding (the ingress transport never changed)...
+        assertEquals(viaAwgExit.ingressBinding, viaTlsExit.ingressBinding)
+        assertEquals(TransportKind.TLS_TCP, viaAwgExit.ingressBinding.kind)
+        // ...but each pins its OWN distinct exit binding, independent of the ingress hop.
+        assertTrue(viaAwgExit.exitBinding != viaTlsExit.exitBinding)
+        assertEquals(TransportKind.AMNEZIA_WG, viaAwgExit.exitBinding.kind)
+        assertEquals(TransportKind.TLS_TCP, viaTlsExit.exitBinding.kind)
+        assertEquals("203.0.113.77", viaTlsExit.exitBinding.host)
+    }
 }
