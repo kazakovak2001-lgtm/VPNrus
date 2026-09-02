@@ -134,6 +134,14 @@ object ProvisioningClient {
     fun fetchXrayTlsProfile(publicKey: String, bearerToken: String, endpointHost: String): XrayTlsProfileResult =
         executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost))
 
+    /** B21 - POST /v1/xray-profile with `{"transport": "quic"}` - see [fetchXrayTlsProfile]'s own docs, same shape. */
+    fun fetchXrayQuicProfile(publicKey: String, bearerToken: String): XrayQuicProfileResult =
+        fetchXrayQuicProfile(publicKey, bearerToken, GERMANY_HOST)
+
+    /** B21 - same reasoning as the 3-arg [activate] overload above, for the QUIC profile fetch. */
+    fun fetchXrayQuicProfile(publicKey: String, bearerToken: String, endpointHost: String): XrayQuicProfileResult =
+        executeXrayQuicProfile(buildXrayQuicProfileRequest(publicKey, bearerToken, endpointHost))
+
     /**
      * B8C2 - the exact outgoing request shape (url/headers/body), built as
      * plain data with NO network I/O. `internal` so the request CONTRACT
@@ -185,6 +193,16 @@ object ProvisioningClient {
             body = buildXrayTlsRequestBody(publicKey),
         )
 
+    internal fun buildXrayQuicProfileRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        buildXrayQuicProfileRequest(publicKey, bearerToken, GERMANY_HOST)
+
+    internal fun buildXrayQuicProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
+        OutgoingRequest(
+            url = "https://$endpointHost/v1/xray-profile",
+            headers = authHeaders(bearerToken),
+            body = buildXrayQuicRequestBody(publicKey),
+        )
+
     private fun authHeaders(credential: String): Map<String, String> = mapOf(
         "Content-Type" to "application/json",
         "Authorization" to "Bearer $credential",
@@ -198,6 +216,9 @@ object ProvisioningClient {
 
     private fun executeXrayTlsProfile(request: OutgoingRequest): XrayTlsProfileResult =
         executeGeneric(request, XrayTlsProfileResult::NetworkError, ::mapXrayTlsProfileResponse)
+
+    private fun executeXrayQuicProfile(request: OutgoingRequest): XrayQuicProfileResult =
+        executeGeneric(request, XrayQuicProfileResult::NetworkError, ::mapXrayQuicProfileResponse)
 
     private fun <T> executeGeneric(
         request: OutgoingRequest,
@@ -248,6 +269,10 @@ object ProvisioningClient {
     /** B8O2 - same shape as [buildRequestBody] plus the explicit `"transport": "tls"` field the gateway's optional-field parsing accepts. */
     internal fun buildXrayTlsRequestBody(publicKey: String): String =
         JSONObject().put("public_key", publicKey).put("transport", "tls").toString()
+
+    /** B21 - same shape as [buildXrayTlsRequestBody] with `"transport": "quic"`. */
+    internal fun buildXrayQuicRequestBody(publicKey: String): String =
+        JSONObject().put("public_key", publicKey).put("transport", "quic").toString()
 
     /**
      * Pure status-code + body -> ProvisioningResult mapping, with no
@@ -316,6 +341,62 @@ object ProvisioningClient {
         }
         503 -> XrayTlsProfileResult.ServiceUnavailable
         else -> XrayTlsProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /** B21 - POST /v1/xray-profile?transport=quic response mapping - mirrors [mapXrayTlsProfileResponse]'s own shape. */
+    internal fun mapXrayQuicProfileResponse(status: Int, rawBody: String): XrayQuicProfileResult = when (status) {
+        200, 201 -> parseXrayQuicProfileSuccessBody(rawBody)
+        401 -> XrayQuicProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> XrayQuicProfileResult.Revoked
+            "device_not_bound" -> XrayQuicProfileResult.DeviceNotBound
+            else -> XrayQuicProfileResult.Unauthorized
+        }
+        503 -> XrayQuicProfileResult.ServiceUnavailable
+        else -> XrayQuicProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    private fun parseXrayQuicProfileSuccessBody(raw: String): XrayQuicProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return XrayQuicProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val uuid = json.optString("uuid", "")
+        val serverName = json.optString("server_name", "")
+        val fingerprint = json.optString("fingerprint", "")
+        val path = json.optString("path", "")
+
+        if (serverAddress.isBlank()) {
+            return XrayQuicProfileResult.MalformedResponse("server_address missing or blank")
+        }
+        if (serverPort !in 1..65535) {
+            return XrayQuicProfileResult.MalformedResponse("server_port missing or out of range")
+        }
+        if (!UUID_REGEX.matches(uuid)) {
+            return XrayQuicProfileResult.MalformedResponse("uuid missing or not a well-formed UUID")
+        }
+        if (serverName.isBlank()) {
+            return XrayQuicProfileResult.MalformedResponse("server_name missing or blank")
+        }
+        if (fingerprint.isBlank()) {
+            return XrayQuicProfileResult.MalformedResponse("fingerprint missing or blank")
+        }
+        if (!path.startsWith("/")) {
+            return XrayQuicProfileResult.MalformedResponse("path missing or not an absolute path")
+        }
+
+        return XrayQuicProfileResult.Success(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            uuid = uuid,
+            serverName = serverName,
+            fingerprint = fingerprint,
+            path = path,
+        )
     }
 
     private fun parseXrayTlsProfileSuccessBody(raw: String): XrayTlsProfileResult {

@@ -196,6 +196,107 @@ class TlsInboundTests(RendererTestBase):
             renderer_module.render_server_config({}, {}, self.reality, tls=bad_tls)
 
 
+class QuicInboundTests(RendererTestBase):
+    """B21 - the THIRD inbound render_server_config appends when `quic` is
+    given, alongside (never instead of) REALITY's/TLS's own - real QUIC/
+    HTTP-3 via XHTTP `stream-one`, ALPN h3 (see
+    docs/B21_QUIC_TRANSPORT_AUDIT.md), never the removed standalone "quic"
+    network value."""
+
+    def setUp(self):
+        super().setUp()
+        self.tls = renderer_module.TlsServerConfig(
+            listen_port=2053,
+            cert_file="/etc/letsencrypt/live/152.70.43.1/fullchain.pem",
+            key_file="/etc/letsencrypt/live/152.70.43.1/privkey.pem",
+        )
+        self.quic = renderer_module.QuicServerConfig(
+            listen_port=2087,
+            cert_file="/etc/letsencrypt/live/152.70.43.1/fullchain.pem",
+            key_file="/etc/letsencrypt/live/152.70.43.1/privkey.pem",
+            path="/nova-quic",
+        )
+
+    def test_quic_none_produces_output_identical_to_reality_plus_tls_only(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, tls=self.tls)
+        self.assertEqual(len(config["inbounds"]), 2)
+        self.assertEqual(config["inbounds"][0]["streamSettings"]["security"], "reality")
+        self.assertEqual(config["inbounds"][1]["streamSettings"]["security"], "tls")
+
+    def test_quic_inbound_is_appended_alongside_reality_and_tls(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, tls=self.tls, quic=self.quic)
+
+        self.assertEqual(len(config["inbounds"]), 3)
+        reality_inbound, tls_inbound, quic_inbound = config["inbounds"]
+        self.assertEqual(reality_inbound["streamSettings"]["security"], "reality")
+        self.assertEqual(tls_inbound["streamSettings"]["security"], "tls")
+        self.assertEqual(quic_inbound["streamSettings"]["security"], "tls")
+        self.assertEqual(quic_inbound["port"], 2087)
+        self.assertNotEqual(quic_inbound["port"], tls_inbound["port"])
+
+    def test_quic_uses_real_xhttp_stream_one_with_alpn_h3_never_the_removed_quic_network(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, quic=self.quic)
+
+        quic_inbound = config["inbounds"][1]
+        stream_settings = quic_inbound["streamSettings"]
+        self.assertEqual(stream_settings["network"], "xhttp")
+        self.assertNotEqual(stream_settings["network"], "quic")
+        self.assertEqual(stream_settings["tlsSettings"]["alpn"], ["h3"])
+        self.assertEqual(stream_settings["xhttpSettings"]["mode"], "stream-one")
+        self.assertEqual(stream_settings["xhttpSettings"]["path"], "/nova-quic")
+
+    def test_quic_inbound_carries_the_same_active_clients_without_flow(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(
+            activations_data, xray_data, self.reality, quic=self.quic, flow="xtls-rprx-vision",
+        )
+
+        reality_clients = config["inbounds"][0]["settings"]["clients"]
+        quic_clients = config["inbounds"][1]["settings"]["clients"]
+        self.assertEqual(len(quic_clients), 1)
+        self.assertEqual(quic_clients[0]["id"], self.uuid_a)
+        self.assertEqual(quic_clients[0]["id"], reality_clients[0]["id"])
+        self.assertNotIn("flow", quic_clients[0])
+
+    def test_revoked_activation_is_excluded_from_the_quic_inbound_too(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.REVOKED)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, quic=self.quic)
+
+        self.assertEqual(config["inbounds"][1]["settings"]["clients"], [])
+
+    def test_invalid_quic_config_is_rejected(self):
+        bad_quic = renderer_module.QuicServerConfig(listen_port=99999, cert_file="/x", key_file="/y", path="/nova-quic")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, quic=bad_quic)
+
+    def test_relative_cert_path_is_rejected(self):
+        bad_quic = renderer_module.QuicServerConfig(listen_port=2087, cert_file="relative.pem", key_file="/y", path="/nova-quic")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, quic=bad_quic)
+
+    def test_non_absolute_path_is_rejected(self):
+        bad_quic = renderer_module.QuicServerConfig(listen_port=2087, cert_file="/x", key_file="/y", path="nova-quic")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, quic=bad_quic)
+
+
 class DeterminismTests(RendererTestBase):
     def test_two_renders_of_the_same_input_are_byte_identical(self):
         digest_a, digest_b = "a" * 64, "b" * 64

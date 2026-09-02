@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayQuicProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.policy.RoutingMode
@@ -29,6 +30,15 @@ sealed class XrayCoreStartOutcome {
 
     /** startLoop() itself threw - the just-established tun is closed before returning. */
     data class CoreStartFailed(val reason: String) : XrayCoreStartOutcome()
+
+    /**
+     * B21-fix - startLoop() itself returned without throwing, but
+     * [XrayDataPlaneReadinessCheck] then failed or timed out: the core is
+     * stopped and the tun closed before this is returned, so this is never
+     * reported as Connected (see [XrayDataPlaneReadiness] for why this check
+     * exists - closes the exact false-positive the physical QUIC test found).
+     */
+    data class DataPlaneNotReady(val reason: String) : XrayCoreStartOutcome()
 }
 
 /** Result of one [XrayCoreController.requestStop] call. */
@@ -67,6 +77,16 @@ class XrayCoreController(
     // than throwing - the same fail-closed shape as a missing REALITY
     // profile, never a crash.
     private val tlsRepository: XrayTlsProfileRepository? = null,
+    // B21 - additive, defaults to null (same reasoning as tlsRepository
+    // above): with no QUIC repository wired, requestStart(TransportKind.QUIC)
+    // simply rejects, the same fail-closed shape as a missing REALITY/TLS
+    // profile, never a crash.
+    private val quicRepository: XrayQuicProfileRepository? = null,
+    // B21-fix - additive, defaults to the real check's own default timeout so
+    // every existing real call site (NovaXrayVpnService) is unaffected; a
+    // test seam only (see XrayCoreControllerTest) so a readiness-timeout test
+    // does not have to actually wait out the real 8s default.
+    private val dataPlaneReadinessTimeoutMs: Long = XrayDataPlaneReadinessCheck.DEFAULT_TIMEOUT_MS,
 ) {
     private val lifecycleGate = XrayServiceLifecycleGate()
 
@@ -115,6 +135,15 @@ class XrayCoreController(
                             ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
                     }
                 }
+                TransportKind.QUIC -> {
+                    val quicRepo = quicRepository
+                        ?: return XrayCoreStartOutcome.Rejected("Xray QUIC profile repository not wired")
+                    when (val resolution = XrayRuntimeResolver.resolveQuic(quicRepo)) {
+                        is XrayQuicRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
+                        is XrayQuicRuntimeResolution.Ready ->
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
+                    }
+                }
                 else -> return XrayCoreStartOutcome.Rejected("unsupported transport kind for NovaXrayVpnService: $kind")
             }
 
@@ -128,8 +157,27 @@ class XrayCoreController(
             return try {
                 ensureCoreEnvInitialized()
                 coreRuntime.startLoop(ready.renderedConfig, fd)
-                success = true
-                XrayCoreStartOutcome.Started
+                // B21-fix - startLoop() not throwing only proves the Go
+                // runtime's goroutines launched, never that a real proxied
+                // session exists (the exact false positive the physical QUIC
+                // test found) - Started is reported only once a real
+                // data-plane check succeeds.
+                when (val readiness = XrayDataPlaneReadinessCheck.check(coreRuntime, timeoutMs = dataPlaneReadinessTimeoutMs)) {
+                    is XrayDataPlaneReadiness.Ready -> {
+                        success = true
+                        XrayCoreStartOutcome.Started
+                    }
+                    is XrayDataPlaneReadiness.Timeout -> {
+                        runCatching { coreRuntime.stopLoop() }
+                        closeTun()
+                        XrayCoreStartOutcome.DataPlaneNotReady("timeout")
+                    }
+                    is XrayDataPlaneReadiness.Failed -> {
+                        runCatching { coreRuntime.stopLoop() }
+                        closeTun()
+                        XrayCoreStartOutcome.DataPlaneNotReady(readiness.reason)
+                    }
+                }
             } catch (t: Throwable) {
                 closeTun()
                 XrayCoreStartOutcome.CoreStartFailed(t.javaClass.simpleName)

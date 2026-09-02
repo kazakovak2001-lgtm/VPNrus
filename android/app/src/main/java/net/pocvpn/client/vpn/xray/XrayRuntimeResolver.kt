@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfileRepository
+import net.pocvpn.client.identity.XrayQuicProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 
 /**
@@ -19,6 +20,12 @@ sealed class XrayRuntimeResolution {
 sealed class XrayTlsRuntimeResolution {
     data class Ready(val config: XrayVlessTlsConfig, val renderedConfig: String) : XrayTlsRuntimeResolution()
     data class Rejected(val reason: String) : XrayTlsRuntimeResolution()
+}
+
+/** B21 - the QUIC counterpart of [XrayRuntimeResolution]. Never carries the uuid in [Rejected]'s reason. */
+sealed class XrayQuicRuntimeResolution {
+    data class Ready(val config: XrayVlessQuicConfig, val renderedConfig: String) : XrayQuicRuntimeResolution()
+    data class Rejected(val reason: String) : XrayQuicRuntimeResolution()
 }
 
 /**
@@ -66,6 +73,23 @@ object XrayRuntimeResolver {
                 XrayTlsRuntimeResolution.Rejected("stored Xray TLS profile failed validation: ${validation.errors.size} error(s)")
             is XrayTlsConfigValidationResult.Valid ->
                 XrayTlsRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
+        }
+    }
+
+    /** B21 - the QUIC counterpart of [resolve], same load -> fail-closed -> map -> validate -> render chain. */
+    suspend fun resolveQuic(repository: XrayQuicProfileRepository): XrayQuicRuntimeResolution {
+        val profile = try {
+            repository.getProfileOrNull()
+        } catch (t: Throwable) {
+            return XrayQuicRuntimeResolution.Rejected("failed to load Xray QUIC profile: ${t.javaClass.simpleName}")
+        } ?: return XrayQuicRuntimeResolution.Rejected("no Xray QUIC profile configured")
+
+        val config = profile.toXrayVlessQuicConfig()
+        return when (val validation = validateXrayVlessQuicConfig(config)) {
+            is XrayQuicConfigValidationResult.Invalid ->
+                XrayQuicRuntimeResolution.Rejected("stored Xray QUIC profile failed validation: ${validation.errors.size} error(s)")
+            is XrayQuicConfigValidationResult.Valid ->
+                XrayQuicRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
         }
     }
 }

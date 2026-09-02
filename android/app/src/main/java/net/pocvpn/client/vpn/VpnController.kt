@@ -160,6 +160,8 @@ class VpnController(
     // TLS_TCP simply never enters [supportedKinds] below - REALITY's own
     // behavior is completely unaffected by this param's presence.
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
+    // B21 - additive, defaults to null (same reasoning as xrayTlsProfileRepository above).
+    private val xrayQuicProfileRepository: net.pocvpn.client.identity.XrayQuicProfileRepository? = null,
     // B13 (2026-08-30 audit item 5 fix) - the ONE authoritative
     // endpoint-aware lookup buildTransportConfig() below actually resolves
     // XRAY_REALITY/TLS_TCP repositories through - see that function's own
@@ -177,6 +179,10 @@ class VpnController(
     },
     private val xrayTlsProfileRepositoryResolver: XrayTlsProfileRepositoryResolver? = xrayTlsProfileRepository?.let { repo ->
         XrayTlsProfileRepositoryResolver { id -> if (id == EndpointId(ProductionGateway.ID)) repo else null }
+    },
+    // B21 - QUIC counterpart of xrayProfileRepositoryResolver/xrayTlsProfileRepositoryResolver above.
+    private val xrayQuicProfileRepositoryResolver: net.pocvpn.client.identity.XrayQuicProfileRepositoryResolver? = xrayQuicProfileRepository?.let { repo ->
+        net.pocvpn.client.identity.XrayQuicProfileRepositoryResolver { id -> if (id == EndpointId(ProductionGateway.ID)) repo else null }
     },
     // B13 - additive, defaults to null (same reasoning as connectionOutcomeStore
     // above): with any of the three below missing, recordPathHistory() is a
@@ -218,6 +224,7 @@ class VpnController(
         // go false just because the flat field is absent.
         if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
         if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
+        if (xrayQuicProfileRepository != null || xrayQuicProfileRepositoryResolver != null) add(TransportKind.QUIC)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -803,7 +810,19 @@ class VpnController(
                     is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
                 }
             }
-            else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")
+            TransportKind.QUIC -> {
+                // B21 - same reasoning as XRAY_REALITY/TLS_TCP above, against
+                // the QUIC profile repository resolver instead. Unreachable
+                // unless xrayQuicProfileRepositoryResolver != null.
+                val resolver = xrayQuicProfileRepositoryResolver
+                    ?: throw XrayProfileNotReadyException("Xray QUIC profile repository not wired")
+                val repository = resolver.resolve(pendingConnectEndpointId)
+                    ?: throw XrayProfileNotReadyException("no Xray QUIC profile repository configured for endpoint ${pendingConnectEndpointId.value}")
+                when (val resolution = XrayRuntimeResolver.resolveQuic(repository)) {
+                    is net.pocvpn.client.vpn.xray.XrayQuicRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
+                    is net.pocvpn.client.vpn.xray.XrayQuicRuntimeResolution.Ready -> TransportConfig.XrayQuic(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
+                }
+            }
         }
 
     /**

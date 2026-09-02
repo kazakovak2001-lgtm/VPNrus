@@ -196,6 +196,71 @@ class AutoGatewaySelectorTest {
         assertTrue(manifestPort != ProductionGatewayCatalog.GERMANY.awg.endpointPort)
     }
 
+    /** B21 - QUIC appears as a generic candidate ONLY when the manifest declares it AND local availability says yes - no QUIC-specific branch in the ranking itself. */
+    @Test
+    fun `QUIC candidate appears when the manifest declares it and this device has a usable profile`() {
+        val manifestEndpoints = listOf(
+            manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+                transports = listOf(
+                    EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                    EndpointTransportBinding(TransportKind.QUIC, "203.0.113.9", 443),
+                ),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = manifestEndpoints,
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { it == ProductionGatewayId.GERMANY },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry(TransportKind.QUIC) },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            xrayQuicAvailableFor = { true },
+            reachabilityFor = { endpointId, kind -> reachable(endpointId, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        assertTrue(candidates.any { it.transport == TransportKind.QUIC })
+    }
+
+    /** B21 - a manifest declaring QUIC does NOT imply this device is provisioned for it - same "manifest facts vs local provisioning" rule REALITY/TLS_TCP already enforce. */
+    @Test
+    fun `QUIC binding in the manifest is ignored when this device has no usable QUIC profile`() {
+        val manifestEndpoints = listOf(
+            manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+                transports = listOf(EndpointTransportBinding(TransportKind.QUIC, "203.0.113.9", 443)),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = manifestEndpoints,
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { it == ProductionGatewayId.GERMANY },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry(TransportKind.QUIC) },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            xrayQuicAvailableFor = { false },
+            reachabilityFor = { endpointId, kind -> reachable(endpointId, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        assertTrue(candidates.isEmpty())
+    }
+
+    /** B21 - callers that never wire QUIC availability at all (every pre-B21 call site) see byte-for-byte the same behavior as before this parameter existed. */
+    @Test
+    fun `omitting xrayQuicAvailableFor entirely defaults to QUIC always unavailable`() {
+        val candidates = buildDefault(
+            manifestEndpoints = listOf(
+                manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+                    transports = listOf(EndpointTransportBinding(TransportKind.QUIC, "203.0.113.9", 443)),
+                ),
+            ),
+            provisioned = setOf(ProductionGatewayId.GERMANY),
+        )
+        assertTrue(candidates.isEmpty())
+    }
+
     @Test
     fun `pinned manual transport preference restricts every gateway to that one transport kind`() {
         val candidates = buildDefault(preference = UserTransportPreference.Manual(TransportKind.AMNEZIA_WG))

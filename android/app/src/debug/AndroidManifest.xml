@@ -24,5 +24,26 @@
             android:name="net.pocvpn.client.debug.XrayDiagnosticsActivity"
             android:exported="true"
             android:label="Xray Diagnostics (debug)" />
+        <!--
+          B21-fix - debug-only outbound-isolation harness (see that
+          Activity's own docs). Exported for the same reason
+          XrayDiagnosticsActivity is (adb am start against a non-exported
+          component is refused on recent Android versions even from the
+          shell UID) - harmless: debug-build-only, no action without
+          explicit Intent extras, no fabricated credentials.
+        -->
+        <activity
+            android:name="net.pocvpn.client.debug.XrayOutboundIsolationActivity"
+            android:exported="true"
+            android:label="Xray Outbound Isolation (debug)" />
+        <!--
+          B21-fix - debug-only raw UDP diagnostic (see that Activity's own
+          docs) - NOT Xray/QUIC, a plain DatagramSocket. Same exported
+          rationale as the two activities above.
+        -->
+        <activity
+            android:name="net.pocvpn.client.debug.RawUdpDiagnosticActivity"
+            android:exported="true"
+            android:label="Raw UDP Diagnostic (debug)" />
     </application>
 </manifest>

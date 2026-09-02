@@ -386,6 +386,11 @@ fun AppRoot(
                 showDiagnostics = false
             },
             onRefreshManifest = { viewModel.debugRefreshManifest() },
+            onForceQuicTest = {
+                viewModel.debugSetTransportPreference(
+                    net.pocvpn.client.transport.UserTransportPreference.Manual(net.pocvpn.client.transport.TransportKind.QUIC),
+                )
+            },
             onDismiss = { showDiagnostics = false },
         )
     }

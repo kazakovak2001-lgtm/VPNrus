@@ -783,6 +783,95 @@ Never allocate/purchase paid cloud resources (including Elastic IPs) or make
 destructive production changes without explicit owner approval - this applies to any
 change, not just gateway-related ones.
 
+## QUIC transport (B21) - a third Xray adapter, not a new architecture
+
+`TransportKind.QUIC` is real QUIC/HTTP-3 via xray-core's XHTTP transport
+(`network: "xhttp"`, `mode: "stream-one"`, TLS ALPN `h3`) - the pinned
+xray-core `v26.7.28`'s standalone `"quic"` network value is a removed,
+hard config-load error (see `docs/B21_QUIC_TRANSPORT_AUDIT.md` for the
+pinned-source citation and local `xray run -test` empirical validation).
+It is a THIRD instance of the exact same pattern REALITY/TLS_TCP already
+established - same `NovaXrayVpnService`/`XrayCoreController`/tun-inbound
+shell, same VLESS UUID identity model (no REALITY key material - QUIC/UDP
+has no defined REALITY behavior), its own endpoint-scoped profile
+repository/listener/port. `AutoGatewaySelector`/`PathScorer`/
+`TransportHealth`/`ReachabilityEngine` needed zero QUIC-specific code -
+they already generalize over `TransportKind`. Kept at FOUNDATION: real
+client+server code, unit-tested and locally `-test`-validated against the
+real pinned binary, but no production UDP port exists yet on either
+gateway (opening one is a firewall/security-group change requiring
+explicit operator approval, not performed in B21) and no physical device
+has executed a real QUIC session.
+
+**B21 continuation - production port opened on Frankfurt, real client-side
+defect found (hard invariant gap, not QUIC-specific)**: with explicit
+operator approval, `2087/udp` was opened on Frankfurt and the QUIC/XHTTP
+inbound deployed through the existing `xray_reconcile.py` stage/validate/
+publish path - `xray run -test` passed, all four listeners
+(`2053/tcp`/`2083/tcp`/`2087/udp`/`51820/udp`) confirmed live, `pocvpn-api`
+confirmed to accept `{"transport":"quic"}`. A real, previously-missed
+wiring bug was found and fixed: `NovaXrayVpnService`'s own
+`XrayCoreController(...)` construction never actually passed a
+`quicRepository` (the parameter existed with a safe null default, wired
+everywhere else, but never at the one real production call site) - fixed,
+full suite re-verified green. **After the fix, physical validation
+revealed a deeper, real architectural gap**: a real device reported
+`Protected`/`Current transport: QUIC` after a real activation and real
+connect(), but Frankfurt's own firewall packet counter for `2087/udp`
+stayed at exactly 0 across every attempt, and real browser traffic through
+the tunnel failed (`DNS_PROBE_FINISHED_NO_INTERNET`) - the client never
+sent a single UDP packet toward the server. Root cause not yet isolated
+(a build-time gap between the pinned commit's official Linux server binary,
+independently `-test`-validated for the identical config, and the
+`AndroidLibXrayLite` gomobile AAR built from the same commit, is the
+leading candidate, unverified). **The gap this exposes is real and applies
+to the whole Xray transport family, not just QUIC**: unlike
+`AmneziaWgTransport.awaitFreshHandshake` (a genuine post-connect
+handshake-freshness check before AWG reports `Connected`), no Xray-family
+transport (`XRAY_REALITY`/`TLS_TCP`/`QUIC`) verifies any data-plane
+handshake at all before reporting `Connected` -
+`XrayCoreController.requestStart` returning `Started` only means
+`coreRuntime.startLoop()` did not throw (the Go runtime's goroutines
+launched), never that a real proxied session succeeded. REALITY/TLS_TCP
+are not newly suspected of failing the same way (both have independent
+prior physical proof of real proxied traffic), but the verification gap
+itself was previously undocumented and is now a known, real limitation -
+closing it (an active data-plane liveness check for Xray-family
+transports, analogous to AWG's) is a real, separate future slice, not
+performed here. QUIC remains at FOUNDATION - not one real completed
+proxied session exists yet.
+
+**B21 continuation 2 - Android binary audit (rules out the AAR itself),
+false-positive Connected closed for the whole Xray family**: direct
+string/symbol inspection of the shipped `libv2ray-androidlibxraylite-
+c634d1b.aar`'s native `libgojni.so` (all four ABIs) confirms XHTTP/H3/
+quic-go ARE linked in - `"listening QUIC for XHTTP/3 on"`,
+`"XHTTP stream-one H2 & H3"`, and the full quic-go/http3 symbol set are
+present. The AAR is not the gap. `javap` against the AAR's own
+`classes.jar` shows its Java API exposes no separate socket/protect
+callback at all (`newCoreController(CoreCallbackHandler)`,
+`registerProcessFinder`, `measureDelay` - nothing protect-shaped) - the
+per-app-UID `addDisallowedApplication` bypass this shell already uses for
+REALITY/TLS_TCP is the AAR's only bypass mechanism, unchanged for QUIC, so
+it is not a differential suspect either. The two real, fixed gaps: (1)
+`XrayCoreRuntime`'s `CoreCallbackHandler` was a `NoopCoreCallbackHandler`
+that discarded every xray-core startup/shutdown/status line - the ONE
+channel the Go runtime had for reporting a config-load or dial failure was
+thrown away client-side before this fix; it is now `XrayCoreDiagnostics`
+(DEBUG-only, bounded, sanitized). (2) `XrayCoreController.requestStart`
+now requires a real `XrayDataPlaneReadinessCheck` (wraps the AAR's own
+`CoreController.measureDelay(url)` - the one genuine "outbound actually
+passes traffic" signal this AAR exports - with a bounded timeout) to
+succeed before ever reporting `Started`/`Connected`, for REALITY/TLS_TCP/
+QUIC alike; a timeout or dial failure now stops the just-started core,
+closes the tun, and reports a typed `DataPlaneNotReady` failure instead.
+QUIC's own client-side root cause (why zero packets left the device) is
+still not physically isolated - this fix makes that failure visible and
+non-Connected instead of silently false-positive; a physical Frankfurt
+retest with the new diagnostics attached is the next real step and has
+not been performed from this environment (no physical device attached
+here).
+
 ## Config resolution atomicity
 
 `SelectedProductionGatewaySource.snapshot()` resolves the selected gateway id exactly

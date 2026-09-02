@@ -76,4 +76,11 @@ sealed class TransportConfig {
         val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
         val routingMode: RoutingMode = RoutingMode.FULL_VPN,
     ) : TransportConfig()
+
+    /** B21 - the QUIC counterpart of [Xray]/[XrayTls], including the same [endpointId]/[routingMode] threading - see those fields' own docs. */
+    data class XrayQuic(
+        val config: net.pocvpn.client.vpn.xray.XrayVlessQuicConfig,
+        val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+    ) : TransportConfig()
 }

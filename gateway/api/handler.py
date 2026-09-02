@@ -413,6 +413,8 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
         if transport == "tls" and not cfg.xray_tls_server_port:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_tls_not_configured")
+        if transport == "quic" and not cfg.xray_quic_server_port:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_quic_not_configured")
 
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
@@ -485,6 +487,18 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 "uuid": identity_outcome.vless_uuid,
                 "server_name": cfg.xray_tls_server_name,
                 "fingerprint": cfg.xray_tls_fingerprint,
+            }
+        elif transport == "quic":
+            # B21 - same "materially fewer fields than REALITY" shape as
+            # TLS above, plus `path` (the XHTTP request path this gateway's
+            # QUIC inbound accepts) - see docs/B21_QUIC_TRANSPORT_AUDIT.md.
+            payload = {
+                "server_address": cfg.endpoint_host,
+                "server_port": cfg.xray_quic_server_port,
+                "uuid": identity_outcome.vless_uuid,
+                "server_name": cfg.xray_quic_server_name,
+                "fingerprint": cfg.xray_quic_fingerprint,
+                "path": cfg.xray_quic_path,
             }
         else:
             payload = {
@@ -630,7 +644,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_public_key")
 
         transport = parsed.get("transport", "reality")
-        if transport not in ("reality", "tls"):
+        if transport not in ("reality", "tls", "quic"):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
 
         return public_key, transport

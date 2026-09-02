@@ -84,3 +84,18 @@ fun buildXrayVpnPlan(
     dnsServers = config.dnsServers,
     disallowedApplications = setOf(novaPackageId),
 )
+
+/** B21 - the QUIC counterpart of [buildXrayVpnPlan] above; identical shape, same fields, same ONE RoutingDecisionEngine.resolveIpv4Routes authority AWG/REALITY/TLS_TCP already share - no duplicated CIDR math, no protocol-specific route plan. */
+fun buildXrayVpnPlan(
+    config: XrayVlessQuicConfig,
+    novaPackageId: String,
+    routingMode: RoutingMode = RoutingMode.FULL_VPN,
+    restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
+): XrayVpnBuilderPlan = XrayVpnBuilderPlan(
+    mtu = config.mtu,
+    tunLocalAddressIpv4 = config.tunLocalAddressIpv4,
+    tunLocalPrefixLengthIpv4 = config.tunLocalPrefixLengthIpv4,
+    routesIpv4 = RoutingDecisionEngine.resolveIpv4Routes(listOf("0.0.0.0/0"), routingMode, restrictionClass),
+    dnsServers = config.dnsServers,
+    disallowedApplications = setOf(novaPackageId),
+)
