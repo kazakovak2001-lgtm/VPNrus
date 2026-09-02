@@ -1859,7 +1859,36 @@ class MainViewModel(
     val ingressActivating: StateFlow<Boolean> = _ingressActivating.asStateFlow()
 
     /**
-     * B26 review fix (round 2, blocker) - the user backing out without
+     * B26 review fix (round 3, blocker) - the ONE atomic single-owner
+     * claim: reads [pendingRelayActivation] and nulls it out (together with
+     * its display projection, [_relayActivationNeeded]) in one synchronous,
+     * non-suspending call - two field writes back to back, no suspension
+     * point between the read and the clear. Whoever gets a non-null result
+     * back is the ONLY caller that may ever resume/retry that context -
+     * every other caller (including a second concurrent call racing for the
+     * same pending activation) gets null and does nothing further.
+     *
+     * This is safe under plain sequential/single-dispatcher execution
+     * (`viewModelScope`'s default `Dispatchers.Main.immediate`, the same
+     * confinement every other mutable field on this ViewModel - e.g.
+     * `pendingFailoverAttempt`, `xrayAvailableEndpoints` - already relies on
+     * without an explicit lock): [activateIngress] and
+     * [dismissRelayActivationPrompt] both call this SYNCHRONOUSLY, at the
+     * very top of the function, strictly BEFORE either one does anything
+     * suspending - so two calls arriving back to back (e.g. a rapid double
+     * tap, or a dismiss racing an in-flight activation) are necessarily
+     * processed in order on the same thread, and the second one always
+     * observes the first one's clear.
+     */
+    private fun claimPendingRelayActivation(): PendingRelayActivation? {
+        val pending = pendingRelayActivation
+        pendingRelayActivation = null
+        _relayActivationNeeded.value = null
+        return pending
+    }
+
+    /**
+     * B26 review fix (round 2/3, blocker) - the user backing out without
      * submitting anything (mirrors activatingGatewayId's own cancel path).
      * Task requirement F: never retries the paused candidate, and resumes
      * the ORIGINAL combined sequence (same attempts/attemptedKeys captured
@@ -1867,14 +1896,17 @@ class MainViewModel(
      * attemptedKeys (see [PendingRelayActivation]'s own docs), so
      * [attemptCombined] moves on to the next ranked candidate rather than
      * re-offering this same ingress.
+     *
+     * Round 3 fix: uses [claimPendingRelayActivation] - if an
+     * [activateIngress] call already claimed the pending context (its own
+     * provisioning is in flight), this call gets null and does NOTHING -
+     * it must never independently resume the same combined context a
+     * still-running activation will resume itself once it completes
+     * (task requirement 3).
      */
     fun dismissRelayActivationPrompt() {
-        val pending = pendingRelayActivation
-        pendingRelayActivation = null
-        _relayActivationNeeded.value = null
-        if (pending != null) {
-            viewModelScope.launch { attemptCombined(pending.attempts, pending.attemptedKeys) }
-        }
+        val pending = claimPendingRelayActivation() ?: return
+        viewModelScope.launch { attemptCombined(pending.attempts, pending.attemptedKeys) }
     }
 
     /**
@@ -1916,20 +1948,29 @@ class MainViewModel(
      * retry it with), and the ORIGINAL combined sequence resumes exactly
      * once via [attemptCombined], the same way [dismissRelayActivationPrompt]
      * does.
+     *
+     * Round 3 fix: [claimPendingRelayActivation] is called SYNCHRONOUSLY,
+     * before any suspension - so a second concurrent call to this function
+     * (before the first call's provisioning coroutine has even started, let
+     * alone finished) observes `null` and reports
+     * [net.pocvpn.client.relay.IngressActivationOutcome.Unavailable]
+     * without provisioning or resuming anything (task requirement 1/2) -
+     * there is only ever ONE in-flight owner of a given
+     * [PendingRelayActivation], so its captured attempts/attemptedKeys
+     * context is resumed/retried at most once no matter how this function
+     * or [dismissRelayActivationPrompt] are interleaved (task requirement 4).
      */
     fun activateIngress(activationCredential: String) {
         val trimmedCredential = activationCredential.trim()
-        val provisioner = ingressProfileProvisioner
-        val key = _publicKey.value
-        val pending = pendingRelayActivation
+        val pending = claimPendingRelayActivation()
         if (pending == null) {
             _ingressActivationState.value = net.pocvpn.client.relay.IngressActivationOutcome.Unavailable
             return
         }
+        val provisioner = ingressProfileProvisioner
+        val key = _publicKey.value
         if (provisioner == null || key == null || trimmedCredential.isEmpty()) {
             _ingressActivationState.value = net.pocvpn.client.relay.IngressActivationOutcome.Unavailable
-            pendingRelayActivation = null
-            _relayActivationNeeded.value = null
             viewModelScope.launch { attemptCombined(pending.attempts, pending.attemptedKeys) }
             return
         }
@@ -1942,8 +1983,10 @@ class MainViewModel(
             }
             _ingressActivating.value = false
             _ingressActivationState.value = outcome
-            pendingRelayActivation = null
-            _relayActivationNeeded.value = null
+            // pendingRelayActivation/_relayActivationNeeded were already
+            // cleared synchronously by claimPendingRelayActivation() above,
+            // at the moment this activation attempt claimed sole ownership -
+            // never redundantly re-cleared here.
             if (outcome is net.pocvpn.client.relay.IngressActivationOutcome.Saved) {
                 attemptRelayedAttempt(pending.candidate, pending.attempts, pending.attemptedKeys, isActivationRetry = true)
             } else {

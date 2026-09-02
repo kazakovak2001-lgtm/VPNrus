@@ -914,6 +914,25 @@ exact remaining physical-deployment sequence (human-approval-gated).
   an explicit `dismissRelayActivationPrompt()` both take the SAME resume
   path - the paused candidate is NEVER retried without a real profile, and
   the original combined list/budget resumes exactly once, never re-ranked.
+- **Review fix (PR #40, round 3) - atomic single-owner claim**: round 2's
+  `activateIngress`/`dismissRelayActivationPrompt` each read
+  `pendingRelayActivation` and only cleared it AFTER a suspending call
+  (network I/O, or nothing at all for dismiss) - a second `activateIngress`
+  call, or a `dismissRelayActivationPrompt` racing an in-flight activation,
+  could observe the SAME non-null pending context and independently
+  resume/retry it, causing duplicate/concurrent Auto progression. Fixed
+  with one atomic claim: `MainViewModel.claimPendingRelayActivation()`
+  reads `pendingRelayActivation` and nulls it out (together with its
+  display projection, `relayActivationNeeded`) in one synchronous,
+  non-suspending call. `activateIngress`/`dismissRelayActivationPrompt`
+  both call it SYNCHRONOUSLY, at the very top, strictly before either does
+  anything suspending - so two calls arriving back to back are processed
+  in order on the same thread (the same single-dispatcher/`Dispatchers
+  .Main.immediate` confinement `pendingFailoverAttempt`/`xrayAvailableEndpoints`
+  already rely on without an explicit lock elsewhere in this class), and
+  whichever call claims a non-null value is the ONLY one that may ever
+  resume/retry it - every other caller gets `null` and does nothing
+  further (never provisions, never resumes, never retries).
 - **Review fix (PR #40) - real composition-root test**: an earlier version
   built the relay/ingress dependency graph inline inside
   `MainViewModel.Factory.create`, which ALSO eagerly constructs unrelated

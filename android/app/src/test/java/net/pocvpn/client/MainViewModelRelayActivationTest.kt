@@ -381,4 +381,106 @@ class MainViewModelRelayActivationTest {
         assertNull("a mismatched response must never be persisted", store.getProfileOrNull(ingressIdA))
         assertNull(viewModel.relayActivationNeeded.value)
     }
+
+    // --- B26 review fix (round 3, blocker) - atomic single-owner claim of PendingRelayActivation ---
+
+    @Test
+    fun `two activateIngress calls before the first provisioning completes - only the first claims, provisions, and retries`() = runTest {
+        val candA = candidate()
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        var fetchCount = 0
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> fetchCount++; successResult() })
+        val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+        assertNotNull(viewModel.relayActivationNeeded.value)
+        assertEquals(1, resolver.resolvedPlans.size)
+
+        // Two calls back to back, BEFORE the first call's provisioning
+        // coroutine has run at all (StandardTestDispatcher queues work,
+        // it does not execute inline) - the synchronous claim inside
+        // activateIngress() means the second call observes the pending
+        // context already gone, strictly before either coroutine body runs.
+        viewModel.activateIngress("real-credential")
+        viewModel.activateIngress("real-credential")
+        // The prompt is already gone the instant the FIRST call claimed it -
+        // synchronously, before any suspension - never left standing for a
+        // second caller to also observe as "pending".
+        assertNull(viewModel.relayActivationNeeded.value)
+
+        testDispatcher.scheduler.runCurrent()
+
+        // Exactly ONE provisioning request (the second call's own early
+        // "nothing pending" branch never calls the provisioner at all) and
+        // exactly ONE retry of A (never two).
+        assertEquals(1, fetchCount)
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[0].historyPathId)
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[1].historyPathId)
+        assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
+    }
+
+    @Test
+    fun `dismiss while an activation is already in flight is a no-op - the in-flight activation is the sole resumer`() = runTest {
+        val candA = candidate()
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> successResult() })
+        val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(1, resolver.resolvedPlans.size)
+
+        // Claims the pending context and queues its provisioning coroutine -
+        // NOT yet run.
+        viewModel.activateIngress("real-credential")
+        // Races in before the queued coroutine runs - must observe nothing
+        // left to claim, and must NOT independently resume anything.
+        viewModel.dismissRelayActivationPrompt()
+        assertNull(viewModel.relayActivationNeeded.value)
+
+        testDispatcher.scheduler.runCurrent()
+
+        // The in-flight activation is the ONLY thing that ever resumes this
+        // candidate - exactly one retry, never a second (dismiss-triggered)
+        // resume racing it.
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[1].historyPathId)
+        assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
+    }
+
+    @Test
+    fun `activateIngress then immediate dismiss then a real connect retry never resumes the same candidate twice - even with a second, later candidate available`() = runTest {
+        val candA = candidate()
+        val candB = candidate(ingressIdB, bindingB)
+        val resolver = RelayActivationStubResolver { plan ->
+            if (plan.ingressEndpointId == ingressIdA) RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED)
+            else RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+        }
+        val store = InMemoryIngressProfileStore()
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> successResult() })
+        val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
+        val attempts = listOf(asAttempt(candA), asAttempt(candB))
+
+        viewModel.attemptRelayedAttempt(candA, attempts, setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateIngress("real-credential")
+        viewModel.dismissRelayActivationPrompt() // no-op: already claimed by the activation above
+        testDispatcher.scheduler.runCurrent()
+
+        // A was resolved exactly twice (initial + the one bounded retry,
+        // both from the SAME activation call) - dismiss contributed no
+        // resume of its own, so B is reached exactly once, as the natural
+        // next candidate in the ORIGINAL combined list after A's retry
+        // consumed its budget - never a duplicate/concurrent progression.
+        val aResolves = resolver.resolvedPlans.count { it.ingressEndpointId == ingressIdA }
+        val bResolves = resolver.resolvedPlans.count { it.ingressEndpointId == ingressIdB }
+        assertEquals(2, aResolves)
+        assertEquals(1, bResolves)
+        assertEquals(3, resolver.resolvedPlans.size)
+    }
 }
