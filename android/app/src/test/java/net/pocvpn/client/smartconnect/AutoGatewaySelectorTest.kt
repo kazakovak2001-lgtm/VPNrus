@@ -22,6 +22,7 @@ import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -904,6 +905,7 @@ class AutoGatewaySelectorTest {
         reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability,
         transportHealthFor: (TransportKind) -> TransportHealth = { healthy() },
         provisioned: Set<ProductionGatewayId> = setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
+        restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
     ) = AutoGatewaySelector.buildCombinedAttempts(
         manifestEndpoints = manifestEndpoints,
         gatewayFactsFor = { catalogById[it] },
@@ -915,6 +917,7 @@ class AutoGatewaySelectorTest {
         reachabilityFor = reachabilityFor,
         transportHealthFor = transportHealthFor,
         historyFor = { _, _ -> null },
+        restrictionClass = restrictionClass,
     )
 
     /** Task requirement A - combined ranking returns ONE immutable executable attempt type covering both shapes. */
@@ -1022,5 +1025,113 @@ class AutoGatewaySelectorTest {
         val first = AutoGatewaySelector.nextCombinedAttempt(attempts, emptySet())!!
         val second = AutoGatewaySelector.nextCombinedAttempt(attempts, setOf(first.attemptKey))
         assertTrue(second == null || second.attemptKey != first.attemptKey)
+    }
+
+    // --- B28: restriction evidence flowing through the real, end-to-end combined pipeline ---
+
+    private fun hardWhitelistReachable(id: EndpointId, kind: TransportKind) = EndpointReachability(
+        id, kind, ReachabilityState.REACHABLE,
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, 0, true, true, RestrictionClass.POSSIBLE_HARD_WHITELIST, endpointSpecificReachableAgeMillis = 0),
+    )
+
+    /** B28 requirement 3 - a genuinely HEALTHY (not merely ineligible) relay still outranks a genuinely HEALTHY direct path once POSSIBLE_HARD_WHITELIST evidence is in effect, through the SAME real buildCombinedAttempts pipeline B24 already exercises. */
+    @Test
+    fun `B28 - under POSSIBLE_HARD_WHITELIST evidence, an eligible healthy relay outranks an equally healthy direct gateway`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> hardWhitelistReachable(id, kind) },
+            restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST,
+        )
+        assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt)
+        // requirement 3 - "rank normally with relay preference" when an eligible relay exists: Direct is NOT excluded, it is merely outranked.
+        assertTrue(attempts.any { it is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt })
+    }
+
+    /** B28 requirement 1 - the SAME manifest/evidence shape, but ordinary UNKNOWN restriction evidence: healthy direct keeps winning, relay is never force-preferred merely for existing. */
+    @Test
+    fun `B28 - under UNKNOWN restriction evidence, the same manifest still ranks direct first - relay is never force-preferred merely for existing`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+            restrictionClass = RestrictionClass.UNKNOWN,
+        )
+        assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt)
+    }
+
+    /** B28 requirement 3 (blocker 1 review fix) - both DIRECT_IP and CDN_FRONTED ingress candidates participate through the SAME buildCombinedAttempts authority under hard-whitelist evidence, ranked among themselves purely by their own (identical, here) reachability/health/history - not by a hardcoded kind preference. */
+    @Test
+    fun `B28 - DIRECT_IP and CDN_FRONTED relayed attempts both outrank direct under hard-whitelist evidence, neither kind globally preferred`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, directIpIngressEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> hardWhitelistReachable(id, kind) },
+            restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST,
+        )
+        val relayed = attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>()
+        assertEquals(setOf(IngressKind.DIRECT_IP, IngressKind.CDN_FRONTED), relayed.map { it.candidate.ingressKind }.toSet())
+        assertTrue("both relay kinds must outrank the direct attempt", attempts.count { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt } == 2 && attempts.take(2).all { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt })
+        // Identical evidence for both kinds -> identical score, so the restriction bonus itself never breaks the tie in either kind's favor.
+        assertEquals(relayed[0].score, relayed[1].score)
+    }
+
+    // --- B28 review fix (blocker 1): correct no-viable-relay semantics ---
+    // Endpoint-specific reachability and restriction classification are
+    // distinct evidence layers - a Direct endpoint's own successful probe
+    // must never silently override a suspected fixed allowlist merely
+    // because no relay happens to be eligible right now.
+
+    /** Required test 1 - POSSIBLE_HARD_WHITELIST + zero eligible relay => explicit restricted exhaustion, no DirectAttempt execution. */
+    @Test
+    fun `B28 review fix - hard-whitelist evidence with no eligible relay candidate excludes Direct entirely - explicit restricted exhaustion, never a silent Direct fallback`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind ->
+                if (id == ingressEndpoint.id) relayFreshlyUnreachable(id, kind) else hardWhitelistReachable(id, kind)
+            },
+            restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST,
+        )
+        // The direct exit is itself genuinely REACHABLE here (only the
+        // relay's own ingress hop is unreachable) - yet it must never be
+        // offered: the higher-level restriction state is never silently
+        // nullified by one endpoint's own successful probe.
+        assertTrue(attempts.isEmpty())
+        assertTrue(AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, RestrictionClass.POSSIBLE_HARD_WHITELIST))
+    }
+
+    /** Required test 2 - POSSIBLE_HARD_WHITELIST + one eligible relay => relay can execute (and Direct participates too, ranked normally, per requirement 3). */
+    @Test
+    fun `B28 review fix - hard-whitelist evidence with one eligible relay allows the relay to execute`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> hardWhitelistReachable(id, kind) },
+            restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST,
+        )
+        assertTrue(attempts.isNotEmpty())
+        assertTrue(attempts.any { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt })
+        assertFalse(AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, RestrictionClass.POSSIBLE_HARD_WHITELIST))
+    }
+
+    /** Required test 3 - UNKNOWN/NO_RESTRICTION_OBSERVED + zero relay => normal Direct behavior unchanged. */
+    @Test
+    fun `B28 review fix - UNKNOWN evidence with zero relay candidates still offers Direct normally`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint),
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+            restrictionClass = RestrictionClass.UNKNOWN,
+        )
+        assertTrue(attempts.isNotEmpty())
+        assertTrue(attempts.all { it is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt })
+        assertFalse(AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, RestrictionClass.UNKNOWN))
+    }
+
+    /** Required test 4 - a reachable Direct endpoint cannot override the current hard-whitelist decision when no relay path is viable, even across every provisioned/manifest-named gateway. */
+    @Test
+    fun `B28 review fix - a reachable Direct endpoint never overrides hard-whitelist evidence when no relay path is viable, even with multiple healthy direct gateways`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = bothManifestEndpoints, // Germany + Stockholm, no ingress/relay named at all
+            reachabilityFor = { id, kind -> hardWhitelistReachable(id, kind) },
+            restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST,
+        )
+        assertTrue(attempts.isEmpty())
+        assertTrue(AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, RestrictionClass.POSSIBLE_HARD_WHITELIST))
     }
 }

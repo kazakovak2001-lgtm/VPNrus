@@ -186,4 +186,49 @@ class RestrictionMonitorTest {
 
         assertEquals(0, fakeProbe.callCount)
     }
+
+    // --- B28: probe-result timestamps (the hysteresis mechanism RestrictionClassifier's staleAfterMillis relies on) ---
+
+    @Test
+    fun `B28 - a real probe stamps lastProbeEpochMillis and lastDiverseReachabilityEpochMillis from the injected clock`() = runTest {
+        val fakeProbe = FakeGatewayReachabilityProbe(result = true)
+        val diverseProbes = fakeDiverseProbes(true, true)
+        var now = 5_000_000L
+        val monitor = RestrictionMonitor(fakeProbe, backgroundScope, diverseProbes, nowProvider = { now })
+        val transportState = MutableStateFlow<TransportState>(TransportState.Disconnected)
+        val networkProfile = MutableStateFlow(profile(NetworkType.WIFI, 1))
+
+        assertNull(monitor.lastProbeEpochMillis.value)
+        assertNull(monitor.lastDiverseReachabilityEpochMillis.value)
+
+        monitor.start(transportState, networkProfile)
+        runCurrent()
+        transportState.value = TransportState.HandshakeFailed
+        runCurrent()
+
+        assertEquals(now, monitor.lastProbeEpochMillis.value)
+        assertEquals(now, monitor.lastDiverseReachabilityEpochMillis.value)
+    }
+
+    @Test
+    fun `B28 - a second probe overwrites the timestamp with the clock's current value at that later trigger`() = runTest {
+        val fakeProbe = FakeGatewayReachabilityProbe(result = true)
+        var now = 1_000L
+        val monitor = RestrictionMonitor(fakeProbe, backgroundScope, nowProvider = { now })
+        val transportState = MutableStateFlow<TransportState>(TransportState.Disconnected)
+        val networkProfile = MutableStateFlow(profile(NetworkType.WIFI, 1))
+
+        monitor.start(transportState, networkProfile)
+        runCurrent()
+        transportState.value = TransportState.HandshakeFailed
+        runCurrent()
+        assertEquals(1_000L, monitor.lastProbeEpochMillis.value)
+
+        now = 2_000L
+        transportState.value = TransportState.Connecting
+        runCurrent()
+        transportState.value = TransportState.HandshakeFailed
+        runCurrent()
+        assertEquals(2_000L, monitor.lastProbeEpochMillis.value)
+    }
 }

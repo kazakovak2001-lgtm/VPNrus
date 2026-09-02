@@ -57,6 +57,22 @@ data class RestrictionEvidence(
      * majority-not-any/all reasoning). Null if never probed.
      */
     val diverseInternetReachable: Boolean? = null,
+    // B28 - real wall-clock timestamps of the probes behind
+    // [gatewayHttpsReachable]/[diverseInternetReachable] (see
+    // RestrictionMonitor.lastProbeEpochMillis/lastDiverseReachabilityEpochMillis's
+    // own docs) - null means "no timestamp supplied", which [classify]
+    // treats as legacy behavior (staleness check skipped entirely, the
+    // raw value trusted as-is) rather than "immediately stale", so every
+    // pre-B28 caller/test constructing this type without these two fields
+    // is byte-for-byte unaffected. [awgHandshakeFresh]'s own freshness is
+    // deliberately NOT re-modeled here - it already comes from a real,
+    // recency-ordered ConnectionOutcome lookup (see MainViewModel
+    // .restrictionClass's own "recentConnectionOutcomes().lastOrNull()")
+    // which is a narrower, already-real freshness signal; only the
+    // RestrictionMonitor-sourced probes had NO staleness handling at all
+    // before this field existed.
+    val gatewayProbeEpochMillis: Long? = null,
+    val diverseProbeEpochMillis: Long? = null,
 )
 
 /**
@@ -93,19 +109,57 @@ data class RestrictionEvidence(
  */
 object RestrictionClassifier {
 
-    fun classify(evidence: RestrictionEvidence): RestrictionClass {
+    /** B28 - same 30-minute window ReachabilityEngine.DEFAULT_STALE_AFTER_MILLIS already uses - not a shared constant (this object stays self-contained/pure with no cross-module dependency), but a deliberately identical value so the two staleness disciplines feel like ONE consistent policy, not two independently-tuned ones. */
+    const val DEFAULT_STALE_AFTER_MILLIS: Long = 30 * 60 * 1000L
+
+    /**
+     * B28 - [nowEpochMillis]/[staleAfterMillis] add explicit, time-bound
+     * hysteresis to the two RestrictionMonitor-sourced signals
+     * ([RestrictionEvidence.gatewayHttpsReachable]/[RestrictionEvidence
+     * .diverseInternetReachable]): once their own probe is older than
+     * [staleAfterMillis], [classify] treats them as unknown (null) rather
+     * than trusting a possibly-hours-old snapshot forever - the SAME
+     * "an expired signal is never trusted indefinitely" discipline
+     * ReachabilityEngine.assess already applies to endpoint-specific
+     * reachability (see that function's own docs), reused here rather than
+     * a second, independently-invented staleness model. [nowEpochMillis]
+     * defaults to [Long.MAX_VALUE] (mirrors PathScorer.score's own
+     * additive-seam default) so every pre-B28 caller - which never
+     * supplied a probe timestamp either - computes byte-for-byte the same
+     * classification as before this parameter existed.
+     */
+    fun classify(evidence: RestrictionEvidence, nowEpochMillis: Long = Long.MAX_VALUE, staleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS): RestrictionClass {
         val profile = evidence.networkProfile
-        val gatewayUnreachable = evidence.gatewayHttpsReachable == false && evidence.awgHandshakeFresh == false
+        val gatewayHttpsReachable = freshOrTrusted(evidence.gatewayHttpsReachable, evidence.gatewayProbeEpochMillis, nowEpochMillis, staleAfterMillis)
+        val diverseInternetReachable = freshOrTrusted(evidence.diverseInternetReachable, evidence.diverseProbeEpochMillis, nowEpochMillis, staleAfterMillis)
+        val gatewayUnreachable = gatewayHttpsReachable == false && evidence.awgHandshakeFresh == false
         return when {
             profile.type == NetworkType.NONE -> RestrictionClass.NO_NETWORK
             profile.captivePortal == true -> RestrictionClass.CAPTIVE_PORTAL
             evidence.transportState is TransportState.Reconnecting -> RestrictionClass.NETWORK_RECOVERING
             evidence.awgHandshakeFresh == true -> RestrictionClass.NO_RESTRICTION_OBSERVED
             !profile.validatedInternet -> RestrictionClass.INTERNET_NOT_VALIDATED
-            gatewayUnreachable && evidence.diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST
-            evidence.gatewayHttpsReachable == false -> RestrictionClass.GATEWAY_HTTPS_UNREACHABLE
-            evidence.gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING
+            gatewayUnreachable && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST
+            gatewayHttpsReachable == false -> RestrictionClass.GATEWAY_HTTPS_UNREACHABLE
+            gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING
             else -> RestrictionClass.UNKNOWN
         }
+    }
+
+    /**
+     * Returns [value] unchanged when no timestamp was supplied (legacy
+     * trust - see [RestrictionEvidence.gatewayProbeEpochMillis]'s own
+     * docs), or when the timestamp is genuinely fresh (non-negative age,
+     * no older than [staleAfterMillis] - the same negative-age clock-skew
+     * guard ReachabilityEngine.assess already uses). Returns null (never
+     * trusted) once stale or future-dated - a stale/expired probe result
+     * loses its influence on classification entirely, falling back to
+     * whatever a genuinely fresher or absent signal would produce.
+     */
+    private fun freshOrTrusted(value: Boolean?, epochMillis: Long?, nowEpochMillis: Long, staleAfterMillis: Long): Boolean? {
+        if (value == null || epochMillis == null) return value
+        val age = nowEpochMillis - epochMillis
+        if (age < 0 || age > staleAfterMillis) return null
+        return value
     }
 }

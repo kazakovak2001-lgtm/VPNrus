@@ -28,7 +28,12 @@ class RestrictionClassifierTest {
         awgHandshakeFresh: Boolean? = null,
         gatewayHttpsReachable: Boolean? = null,
         diverseInternetReachable: Boolean? = null,
-    ) = RestrictionEvidence(networkProfile, transportState, awgHandshakeFresh, gatewayHttpsReachable, diverseInternetReachable)
+        gatewayProbeEpochMillis: Long? = null,
+        diverseProbeEpochMillis: Long? = null,
+    ) = RestrictionEvidence(
+        networkProfile, transportState, awgHandshakeFresh, gatewayHttpsReachable, diverseInternetReachable,
+        gatewayProbeEpochMillis, diverseProbeEpochMillis,
+    )
 
     @Test
     fun `no network yields NO_NETWORK regardless of any other evidence`() {
@@ -132,12 +137,60 @@ class RestrictionClassifierTest {
     }
 
     @Test
+    fun `B28 - a stale gateway probe result (older than staleAfterMillis) loses its influence, falling back to UNKNOWN rather than a stale POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false,
+                gatewayProbeEpochMillis = 0L, diverseProbeEpochMillis = 0L,
+            ),
+            nowEpochMillis = RestrictionClassifier.DEFAULT_STALE_AFTER_MILLIS + 1L,
+        )
+        assertEquals(RestrictionClass.UNKNOWN, result)
+    }
+
+    @Test
+    fun `B28 - a fresh (within staleAfterMillis) gateway probe result still yields POSSIBLE_HARD_WHITELIST`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false,
+                gatewayProbeEpochMillis = 0L, diverseProbeEpochMillis = 0L,
+            ),
+            nowEpochMillis = RestrictionClassifier.DEFAULT_STALE_AFTER_MILLIS,
+        )
+        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, result)
+    }
+
+    @Test
+    fun `B28 - an undated probe result (legacy caller, no timestamp) is trusted as-is regardless of now`() {
+        val result = RestrictionClassifier.classify(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false),
+            nowEpochMillis = RestrictionClassifier.DEFAULT_STALE_AFTER_MILLIS * 100,
+        )
+        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, result)
+    }
+
+    @Test
+    fun `B28 - a future-dated probe (negative age, clock skew) is never trusted`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false,
+                gatewayProbeEpochMillis = 1000L, diverseProbeEpochMillis = 1000L,
+            ),
+            nowEpochMillis = 0L,
+        )
+        assertEquals(RestrictionClass.UNKNOWN, result)
+    }
+
+    @Test
     fun `RestrictionEvidence carries only the closed, non-sensitive field set - no IP, SSID, destination, or credential field exists`() {
         val fieldNames = RestrictionEvidence::class.java.declaredFields
             .map { it.name }
             .filterNot { it.contains('$') } // compiler-synthetic (e.g. Compose's stability marker), holds no data
             .toSet()
-        val expected = setOf("networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable", "diverseInternetReachable")
+        val expected = setOf(
+            "networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable", "diverseInternetReachable",
+            "gatewayProbeEpochMillis", "diverseProbeEpochMillis",
+        )
         assertEquals(expected, fieldNames)
     }
 }

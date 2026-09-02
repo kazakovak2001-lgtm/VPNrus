@@ -526,6 +526,24 @@ object AutoGatewaySelector {
      * the resulting winner - whichever type it is - directly to execution
      * (`attemptAutoCandidate`/a relayed counterpart), so the candidate
      * scoring picked is provably the SAME one execution receives.
+     *
+     * B28 review fix (blocker 1) - [restrictionClass] gates whether ANY
+     * [AutoConnectAttempt.DirectAttempt] is even offered: under
+     * [RestrictionClass.POSSIBLE_HARD_WHITELIST], a Direct attempt is
+     * excluded ENTIRELY unless at least one ELIGIBLE relayed candidate also
+     * exists. Endpoint-specific reachability (what makes a Direct candidate
+     * exist and score well) and restriction classification are distinct
+     * evidence layers (task requirement 5) - a Direct endpoint's own
+     * successful probe must never silently override the higher-level
+     * "possible fixed allowlist" state merely because it happens to be
+     * reachable right now. This is still the ONE existing decision
+     * authority (no second selector): the gate is a single boolean applied
+     * inline, right where Direct and Relayed are already merged, never a
+     * parallel ranking pass. When an eligible relay DOES exist, Direct is
+     * NOT excluded - it re-enters the SAME ranked list PathScorer's own
+     * `RESTRICTION_TIER` already biases toward relay (task requirement 3 -
+     * "rank normally with relay preference"), so this gate only ever
+     * removes Direct, never artificially promotes it.
      */
     fun buildCombinedAttempts(
         manifestEndpoints: List<EndpointDescriptor>,
@@ -540,6 +558,7 @@ object AutoGatewaySelector {
         historyFor: (String, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
         nowEpochMillis: Long = Long.MAX_VALUE,
+        restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
     ): List<AutoConnectAttempt> {
         val direct = buildCandidates(
             manifestEndpoints, gatewayFactsFor, provisioned, clientTunnelIp, registryFor,
@@ -550,10 +569,27 @@ object AutoGatewaySelector {
             manifestEndpoints, registryFor, reachabilityFor, transportHealthFor, historyFor,
             preference, nowEpochMillis,
         )
+        val directAllowed = restrictionClass != RestrictionClass.POSSIBLE_HARD_WHITELIST || relayed.isNotEmpty()
         val combined: List<AutoConnectAttempt> =
-            direct.map { AutoConnectAttempt.DirectAttempt(it) } + relayed.map { AutoConnectAttempt.RelayedAttempt(it) }
+            (if (directAllowed) direct.map { AutoConnectAttempt.DirectAttempt(it) } else emptyList()) +
+                relayed.map { AutoConnectAttempt.RelayedAttempt(it) }
         return combined.sortedWith(compareByDescending<AutoConnectAttempt> { it.score }.thenBy { it.attemptKey })
     }
+
+    /**
+     * B28 review fix (blocker 1) - true exactly when [buildCombinedAttempts]
+     * would produce (or did produce) an EMPTY combined list SPECIFICALLY
+     * because restriction evidence suspected a fixed allowlist and no
+     * eligible relay existed to route around it - as opposed to an
+     * ordinary "nothing configured/reachable at all" exhaustion. Used ONLY
+     * for truthful diagnostics/error labeling (`MainViewModel.connectAuto`)
+     * - never consulted for ranking/eligibility, which remain entirely
+     * [buildCombinedAttempts]'s/[PathScorer]'s own concern.
+     */
+    fun isRestrictedNetworkExhaustion(
+        attempts: List<AutoConnectAttempt>,
+        restrictionClass: RestrictionClass,
+    ): Boolean = attempts.isEmpty() && restrictionClass == RestrictionClass.POSSIBLE_HARD_WHITELIST
 
     /**
      * B24 - the combined-attempt counterpart of [nextCandidate]: advances

@@ -42,6 +42,8 @@ import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -492,5 +494,276 @@ class MainViewModelAutoGatewayTest {
         // Sanity: this only proves something if the two actually differ.
         assertTrue(manifestHost != ProductionGatewayCatalog.GERMANY.awg.endpointHost)
         assertTrue(manifestPort != ProductionGatewayCatalog.GERMANY.awg.endpointPort)
+    }
+
+    // --- B28 review fix (blocker 1) - restricted-network exhaustion, real end-to-end through MainViewModel.connectAuto() ---
+
+    /**
+     * A real manual attempt fails its handshake with restrictionProbe/diverse
+     * probes all reporting unreachable - real evidence that classifies as
+     * POSSIBLE_HARD_WHITELIST (validated internet, AWG handshake failed,
+     * gateway HTTPS unreachable, diverse destinations also unreachable).
+     * This is the FIRST time this ViewModel instance ever calls
+     * `stabilizedRestrictionClass()` (never invoked by the manual attempt
+     * itself, only by Auto's own candidate building) - so B28's
+     * "first observation is trusted immediately" rule applies, and no
+     * hysteresis delay is needed to observe the effect deterministically.
+     * The manifest names ONLY Germany/Stockholm (no ingress/relay at all),
+     * so switching to Auto afterward must find zero eligible relay
+     * candidates - the exact no-viable-relay scenario blocker 1 fixed.
+     */
+    @Test
+    fun `B28 review fix - connectAuto reports RestrictedNetworkNoViableRelay, never a silent Direct fallback, once real evidence indicates a possible hard whitelist and no relay exists`() = runTest {
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val diagnosticsStore = DiagnosticsStore()
+        val autoStore = FakeGatewayAutoModeStore(initial = false)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = diagnosticsStore,
+            selectedGatewayStore = FakeSelectedGatewayStore(),
+            clientTunnelIdentityStore = bothProvisioned,
+            gatewayAutoModeStore = autoStore,
+            initialNetworkProfile = USABLE_WIFI,
+            manifestRepository = manifestRepositoryNaming("frankfurt", "stockholm"),
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+            diverseReachabilityProbes = listOf(
+                net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+                net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+                net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        // Manual attempt - fails closed via the ordinary handshake-timeout path (same real mechanism MainViewModelTest's own B8J test uses).
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, viewModel.restrictionClass())
+
+        // Now switch to Auto - the first-ever stabilizedRestrictionClass() call for this instance, trusted immediately.
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(
+            "the manual attempt above is the ONLY dial - Auto must never silently fall back to an ordinary Direct gateway",
+            1, transport.connectCallCount,
+        )
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+    }
+
+    // --- B28: combinedAutoRankingDiagnostics - sanitized, kind-labeled, no-secret diagnostics ---
+
+    @Test
+    fun `B28 - combinedAutoRankingDiagnostics carries the current restriction class and one entry per ranked attempt, labeled DIRECT under normal evidence`() {
+        val viewModel = newViewModel()
+        val diagnostics = viewModel.combinedAutoRankingDiagnostics()
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN, diagnostics.restrictionClass)
+        assertTrue(diagnostics.ranked.isNotEmpty())
+        assertTrue(diagnostics.ranked.all { it.kind == "DIRECT" })
+    }
+
+    /** B28 requirement 10 - no UUID/host/credential/token/key string ever leaks through this surface - only the closed {kind, score, typed-reason-token} shape. */
+    @Test
+    fun `B28 - combinedAutoRankingDiagnostics never leaks an endpoint host, credential, or key - only kind, score, and typed reason tokens`() {
+        val viewModel = newViewModel()
+        val diagnostics = viewModel.combinedAutoRankingDiagnostics()
+        val sensitiveSubstrings = listOf(
+            ProductionGatewayCatalog.GERMANY.awg.endpointHost,
+            ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost,
+        )
+        diagnostics.ranked.forEach { entry ->
+            assertTrue(entry.kind in setOf("DIRECT", "CHAIN_DIRECT", "CHAIN_CDN"))
+            entry.reasons.forEach { reason ->
+                // Reason tokens are the closed PathScorer.Reason vocabulary - all-caps/underscore, never free text carrying a host/id/secret.
+                assertTrue("reason token '$reason' must be a stable typed token, not free text", reason.all { it.isUpperCase() || it == '_' })
+                sensitiveSubstrings.forEach { host -> assertTrue(host !in reason) }
+            }
+        }
+    }
+
+    // --- B28 review fix (final blocker) - combinedAutoRankingDiagnostics()
+    // must report the EXACT decision-driving restriction class used for the
+    // SAME ranking it describes, never a separately-timed read that could
+    // straddle a RestrictionStabilizer pending/promotion boundary. Uses the
+    // new `nowProvider` test seam (same pattern as RestrictionMonitor's own)
+    // to exercise the real 90-second hold window deterministically, without
+    // a real sleep. Evidence is genuinely sticky once a real probe has run
+    // (RestrictionMonitor's StateFlows never revert to null), so a literal
+    // raw HARD_WHITELIST->UNKNOWN->HARD_WHITELIST sequence cannot occur
+    // AFTER a probe already ran in this real pipeline (that exact literal
+    // case is already proven, in isolation, by RestrictionStabilizerTest) -
+    // these tests instead drive a real, differing SECOND classification
+    // (GATEWAY_HTTPS_UNREACHABLE, via a second real probe round reporting
+    // diverse reachability true) to prove the SAME pending/promotion
+    // mechanics end-to-end through MainViewModel's real snapshot wiring.
+
+    private class MutableProbe(@Volatile var result: Boolean) : net.pocvpn.client.smartconnect.GatewayReachabilityProbe {
+        override suspend fun isReachable(): Boolean = result
+    }
+
+    private fun newHardWhitelistCapableViewModel(
+        transport: FakeVpnTransport,
+        diagnosticsStore: DiagnosticsStore,
+        autoStore: FakeGatewayAutoModeStore,
+        gatewayProbe: MutableProbe,
+        diverseProbe: MutableProbe,
+        nowProvider: () -> Long,
+    ) = MainViewModel(
+        clientKeyRepository = FakeClientKeyRepository(),
+        transport = transport,
+        gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
+        reconnectManager = FakeReconnectManager(),
+        diagnosticsStore = diagnosticsStore,
+        selectedGatewayStore = FakeSelectedGatewayStore(),
+        clientTunnelIdentityStore = bothProvisioned,
+        gatewayAutoModeStore = autoStore,
+        initialNetworkProfile = USABLE_WIFI,
+        manifestRepository = manifestRepositoryNaming("frankfurt", "stockholm"), // no ingress/relay at all
+        connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+        restrictionProbe = gatewayProbe,
+        diverseReachabilityProbes = listOf(diverseProbe),
+        nowProvider = nowProvider,
+    )
+
+    private fun MainViewModel.triggerHandshakeFailureAndProbe() {
+        setGatewayAutoMode(false)
+        connect()
+        testDispatcher.scheduler.runCurrent()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(transportState.value is TransportState.HandshakeFailed)
+    }
+
+    @Test
+    fun `B28 review fix - diagnostics reports the ESTABLISHED restriction class during a pending window, matching the actual ranking, never the raw transient value`() = runTest {
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val diagnosticsStore = DiagnosticsStore()
+        val autoStore = FakeGatewayAutoModeStore(initial = false)
+        val gatewayProbe = MutableProbe(false)
+        val diverseProbe = MutableProbe(false)
+        // Tracks the REAL wall clock plus a controllable forward offset - never
+        // frozen at a fixed past instant, so it always stays at or after
+        // RestrictionMonitor's own real probe timestamps (avoiding a
+        // spurious "future-dated probe" staleness rejection) while still
+        // letting the test deterministically jump forward past the hold
+        // window without a real sleep.
+        var offsetMillis = 0L
+        val viewModel = newHardWhitelistCapableViewModel(transport, diagnosticsStore, autoStore, gatewayProbe, diverseProbe) { System.currentTimeMillis() + offsetMillis }
+        testDispatcher.scheduler.runCurrent()
+
+        // Round 1 - real handshake failure with both probes false: classifies as POSSIBLE_HARD_WHITELIST.
+        viewModel.triggerHandshakeFailureAndProbe()
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, viewModel.restrictionClass())
+
+        // First-ever combined-ranking read for this instance - established immediately (no relay in this manifest -> exhaustion).
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+        // The one dial so far is the manual round-1 attempt itself (which failed its handshake) - Auto added zero further dials.
+        val dialsAfterRound1 = transport.connectCallCount
+        assertEquals(1, dialsAfterRound1)
+
+        // Round 2 - a SECOND real handshake failure, now with diverse reachability TRUE - a genuinely different raw classification (GATEWAY_HTTPS_UNREACHABLE).
+        diverseProbe.result = true
+        viewModel.triggerHandshakeFailureAndProbe()
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, viewModel.restrictionClass())
+        val dialsAfterRound2ManualAttempt = transport.connectCallCount
+
+        // Still well inside the 90s hold window - the established class must NOT have flipped yet.
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        val diagnostics = viewModel.combinedAutoRankingDiagnostics()
+        assertEquals(
+            "diagnostics must report the ESTABLISHED (still POSSIBLE_HARD_WHITELIST) class, never the transient raw GATEWAY_HTTPS_UNREACHABLE reading",
+            net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, diagnostics.restrictionClass,
+        )
+        // The ranking diagnostics describes must match: still restricted-network exhaustion (no relay exists), never a Direct entry.
+        assertTrue(diagnostics.ranked.isEmpty())
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+        assertEquals("Auto must never add a dial of its own in either round", dialsAfterRound2ManualAttempt, transport.connectCallCount)
+    }
+
+    @Test
+    fun `B28 review fix - once the differing evidence is sustained past the hold window, diagnostics reports the promoted class and ranking reflects it`() = runTest {
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val diagnosticsStore = DiagnosticsStore()
+        val autoStore = FakeGatewayAutoModeStore(initial = false)
+        val gatewayProbe = MutableProbe(false)
+        val diverseProbe = MutableProbe(false)
+        var offsetMillis = 0L
+        val viewModel = newHardWhitelistCapableViewModel(transport, diagnosticsStore, autoStore, gatewayProbe, diverseProbe) { System.currentTimeMillis() + offsetMillis }
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.triggerHandshakeFailureAndProbe()
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect() // establishes POSSIBLE_HARD_WHITELIST immediately (first-ever read)
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+
+        diverseProbe.result = true
+        viewModel.triggerHandshakeFailureAndProbe() // real GATEWAY_HTTPS_UNREACHABLE evidence now
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect() // still pending - established stays POSSIBLE_HARD_WHITELIST
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, viewModel.combinedAutoRankingDiagnostics().restrictionClass)
+        // Still gated - the specific "restricted, no viable relay" failure mode is still in effect while pending.
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+
+        // Advance PAST the hold window with the SAME (already sustained) GATEWAY_HTTPS_UNREACHABLE evidence - no new probe needed, evidence hasn't changed.
+        offsetMillis = net.pocvpn.client.smartconnect.RestrictionStabilizer.DEFAULT_MIN_RESIDENCE_MILLIS
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        val diagnostics = viewModel.combinedAutoRankingDiagnostics()
+        assertEquals(
+            "sustained differing evidence past the hold window must be promoted - diagnostics now reports the NEW established class",
+            net.pocvpn.client.smartconnect.RestrictionClass.GATEWAY_HTTPS_UNREACHABLE, diagnostics.restrictionClass,
+        )
+        // GATEWAY_HTTPS_UNREACHABLE never gates Direct (only POSSIBLE_HARD_WHITELIST does) - the ranking this diagnostics
+        // snapshot describes is no longer flagged as restricted-network exhaustion, whatever ELSE it may or may not
+        // contain (two real consecutive AWG handshake failures above also, separately, degrade transport-wide AMNEZIA_WG
+        // health - an unrelated, real architectural effect this test does not need to fight to make its point).
+        assertFalse(
+            net.pocvpn.client.smartconnect.AutoGatewaySelector.isRestrictedNetworkExhaustion(
+                viewModel.combinedAutoAttempts(), diagnostics.restrictionClass,
+            ),
+        )
+        assertNotEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+    }
+
+    @Test
+    fun `B28 review fix - reading diagnostics does not itself create a decision state different from the ranking it describes - two immediate reads agree`() = runTest {
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val diagnosticsStore = DiagnosticsStore()
+        val autoStore = FakeGatewayAutoModeStore(initial = false)
+        val gatewayProbe = MutableProbe(false)
+        val diverseProbe = MutableProbe(false)
+        val viewModel = newHardWhitelistCapableViewModel(transport, diagnosticsStore, autoStore, gatewayProbe, diverseProbe) { System.currentTimeMillis() }
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.triggerHandshakeFailureAndProbe()
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, viewModel.restrictionClass())
+
+        // Two independent, back-to-back reads with an unchanged clock/evidence - both the attempt list AND the diagnostics view of it must agree, byte-for-byte.
+        val attemptsA = viewModel.combinedAutoAttempts()
+        val diagnosticsA = viewModel.combinedAutoRankingDiagnostics()
+        val attemptsB = viewModel.combinedAutoAttempts()
+        val diagnosticsB = viewModel.combinedAutoRankingDiagnostics()
+
+        assertEquals(diagnosticsA.restrictionClass, diagnosticsB.restrictionClass)
+        assertEquals(attemptsA.map { it.attemptKey }, attemptsB.map { it.attemptKey })
+        assertEquals(attemptsA.size, diagnosticsA.ranked.size)
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, diagnosticsA.restrictionClass)
     }
 }
