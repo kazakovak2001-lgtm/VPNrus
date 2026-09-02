@@ -108,6 +108,59 @@ class PrivateGatewayConfigValidatorTest {
         assertTrue(result is PrivateGatewayValidationResult.Valid)
     }
 
+    // B22 physical-validation follow-up - the junk packet count/size fields
+    // (Jc/Jmin/Jmax/S1-S4) are now exposed in PrivateGatewayDialog (a real
+    // physical connect against a Stockholm-profile server proved matching
+    // only H1-H4 was NOT sufficient - see docs/ROADMAP.md's B22 history).
+    // They remain optional (see the class-level doc above), but a NEGATIVE
+    // value or an inverted min/max pair is never legal input and must fail
+    // closed, never silently accepted or clamped.
+    @Test
+    fun `a full valid junk-packet profile matching the real physical Stockholm values is accepted`() {
+        val result = validate(
+            awgProfile = validHeaders.copy(
+                junkPacketCount = 6,
+                junkPacketMinSize = 40,
+                junkPacketMaxSize = 100,
+                initPacketJunkSize = 113,
+                responsePacketJunkSize = 159,
+                cookieReplyPacketJunkSize = 0,
+                transportPacketJunkSize = 0,
+            ),
+        )
+        assertTrue(result is PrivateGatewayValidationResult.Valid)
+    }
+
+    @Test
+    fun `a negative junk packet count is rejected`() {
+        val result = validate(awgProfile = validHeaders.copy(junkPacketCount = -1))
+        assertEquals(PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS, (result as PrivateGatewayValidationResult.Invalid).reason)
+    }
+
+    @Test
+    fun `a negative init packet junk size (S1) is rejected`() {
+        val result = validate(awgProfile = validHeaders.copy(initPacketJunkSize = -5))
+        assertEquals(PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS, (result as PrivateGatewayValidationResult.Invalid).reason)
+    }
+
+    @Test
+    fun `a negative cookie-reply packet junk size (S3) is rejected`() {
+        val result = validate(awgProfile = validHeaders.copy(cookieReplyPacketJunkSize = -1))
+        assertEquals(PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS, (result as PrivateGatewayValidationResult.Invalid).reason)
+    }
+
+    @Test
+    fun `junk packet min size greater than max size is rejected as an inverted range`() {
+        val result = validate(awgProfile = validHeaders.copy(junkPacketMinSize = 100, junkPacketMaxSize = 40))
+        assertEquals(PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS, (result as PrivateGatewayValidationResult.Invalid).reason)
+    }
+
+    @Test
+    fun `junk packet min size equal to max size is accepted, not treated as inverted`() {
+        val result = validate(awgProfile = validHeaders.copy(junkPacketMinSize = 40, junkPacketMaxSize = 40))
+        assertTrue(result is PrivateGatewayValidationResult.Valid)
+    }
+
     @Test
     fun `a valid config maps to a GatewayConfigSnapshot the existing GatewayConfigSnapshotValidator accepts identically`() {
         val config = (validate() as PrivateGatewayValidationResult.Valid).config

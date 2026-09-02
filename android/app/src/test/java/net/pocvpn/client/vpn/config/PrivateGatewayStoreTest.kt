@@ -48,6 +48,69 @@ class PrivateGatewayStoreTest {
         assertEquals(validConfig, read)
     }
 
+    // B22 physical-validation follow-up - the full junk-packet profile
+    // (Jc/Jmin/Jmax/S1-S4) that physically fixed the private-gateway
+    // handshake blocker must round-trip exactly, same as every other field.
+    @Test
+    fun `write then read round-trips the full junk-packet profile (Jc-Jmin-Jmax-S1-S4) exactly`() {
+        val store = newStore()
+        val fullProfileConfig = validConfig.copy(
+            awgProfile = validConfig.awgProfile.copy(
+                junkPacketMinSize = 40,
+                junkPacketMaxSize = 100,
+                initPacketJunkSize = 113,
+                responsePacketJunkSize = 159,
+                cookieReplyPacketJunkSize = 0,
+                transportPacketJunkSize = 0,
+            ),
+        )
+
+        store.write(fullProfileConfig)
+        val read = store.read()
+
+        assertEquals(fullProfileConfig, read)
+    }
+
+    // Backward compatibility (B22 physical-validation follow-up requirement):
+    // a file written by the PRE-fix code never had S1-S4 keys at all. Reading
+    // it must behave exactly like those fields were never configured (null),
+    // never invent a value and never treat their absence as corruption -
+    // every OTHER field (including the headers this legacy file already had)
+    // still round-trips and the config is still usable.
+    @Test
+    fun `a legacy file written before S1-S4 existed still reads correctly with those fields null`() {
+        val dir = Files.createTempDirectory("private-gateway-store-legacy-test").toFile()
+        val store = FilePrivateGatewayStore(dir)
+        val legacyJson = org.json.JSONObject()
+            .put("id", PrivateGatewayConfig.ID)
+            .put("host", "203.0.113.5")
+            .put("port", 51820)
+            .put("serverPublicKey", "hU7ohcV8fjAtDFISvpnfLhYFSlxY4lso0XofszDN81Y=")
+            .put("clientTunnelIp", "10.13.13.2")
+            .put("gatewayTunnelIp", "10.13.13.1")
+            .put(
+                "awgProfile",
+                org.json.JSONObject()
+                    .put("junkPacketCount", 6)
+                    .put("initPacketMagicHeader", "1106684696")
+                    .put("responsePacketMagicHeader", "3677857287")
+                    .put("underloadPacketMagicHeader", "353316806")
+                    .put("transportPacketMagicHeader", "2068198996"),
+                // no junkPacketMinSize/MaxSize, no S1-S4 keys at all - exactly
+                // what the pre-fix write() produced.
+            )
+        java.io.File(dir, "private_gateway_config.json").writeText(legacyJson.toString(), Charsets.UTF_8)
+
+        val read = store.read()
+
+        assertEquals("203.0.113.5", read?.host)
+        assertEquals(6, read?.awgProfile?.junkPacketCount)
+        assertNull(read?.awgProfile?.junkPacketMinSize)
+        assertNull(read?.awgProfile?.initPacketJunkSize)
+        assertNull(read?.awgProfile?.cookieReplyPacketJunkSize)
+        assertNull(read?.awgProfile?.transportPacketJunkSize)
+    }
+
     @Test
     fun `clear removes the stored config - reverts to null`() {
         val store = newStore()

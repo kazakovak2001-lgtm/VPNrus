@@ -52,6 +52,17 @@ class FilePrivateGatewayStore(
                     junkPacketCount = profileJson.optIntOrNull(KEY_JUNK_PACKET_COUNT),
                     junkPacketMinSize = profileJson.optIntOrNull(KEY_JUNK_PACKET_MIN_SIZE),
                     junkPacketMaxSize = profileJson.optIntOrNull(KEY_JUNK_PACKET_MAX_SIZE),
+                    // B22 physical-validation follow-up - absent in any file
+                    // written before this fix (legacy configs never had these
+                    // keys at all); optIntOrNull returns null exactly like a
+                    // never-configured field, never a guessed/invented value -
+                    // read() below re-runs full validation regardless, so a
+                    // legacy file missing something ELSE required still fails
+                    // closed the same way it always did.
+                    initPacketJunkSize = profileJson.optIntOrNull(KEY_INIT_JUNK_SIZE),
+                    responsePacketJunkSize = profileJson.optIntOrNull(KEY_RESPONSE_JUNK_SIZE),
+                    cookieReplyPacketJunkSize = profileJson.optIntOrNull(KEY_COOKIE_REPLY_JUNK_SIZE),
+                    transportPacketJunkSize = profileJson.optIntOrNull(KEY_TRANSPORT_JUNK_SIZE),
                     initPacketMagicHeader = profileJson.optStringOrNull(KEY_INIT_HEADER),
                     responsePacketMagicHeader = profileJson.optStringOrNull(KEY_RESPONSE_HEADER),
                     underloadPacketMagicHeader = profileJson.optStringOrNull(KEY_UNDERLOAD_HEADER),
@@ -78,6 +89,10 @@ class FilePrivateGatewayStore(
             .putOpt(KEY_JUNK_PACKET_COUNT, config.awgProfile.junkPacketCount)
             .putOpt(KEY_JUNK_PACKET_MIN_SIZE, config.awgProfile.junkPacketMinSize)
             .putOpt(KEY_JUNK_PACKET_MAX_SIZE, config.awgProfile.junkPacketMaxSize)
+            .putOpt(KEY_INIT_JUNK_SIZE, config.awgProfile.initPacketJunkSize)
+            .putOpt(KEY_RESPONSE_JUNK_SIZE, config.awgProfile.responsePacketJunkSize)
+            .putOpt(KEY_COOKIE_REPLY_JUNK_SIZE, config.awgProfile.cookieReplyPacketJunkSize)
+            .putOpt(KEY_TRANSPORT_JUNK_SIZE, config.awgProfile.transportPacketJunkSize)
             .putOpt(KEY_INIT_HEADER, config.awgProfile.initPacketMagicHeader)
             .putOpt(KEY_RESPONSE_HEADER, config.awgProfile.responsePacketMagicHeader)
             .putOpt(KEY_UNDERLOAD_HEADER, config.awgProfile.underloadPacketMagicHeader)
@@ -117,6 +132,10 @@ class FilePrivateGatewayStore(
         const val KEY_JUNK_PACKET_COUNT = "junkPacketCount"
         const val KEY_JUNK_PACKET_MIN_SIZE = "junkPacketMinSize"
         const val KEY_JUNK_PACKET_MAX_SIZE = "junkPacketMaxSize"
+        const val KEY_INIT_JUNK_SIZE = "initPacketJunkSize"
+        const val KEY_RESPONSE_JUNK_SIZE = "responsePacketJunkSize"
+        const val KEY_COOKIE_REPLY_JUNK_SIZE = "cookieReplyPacketJunkSize"
+        const val KEY_TRANSPORT_JUNK_SIZE = "transportPacketJunkSize"
         const val KEY_INIT_HEADER = "initPacketMagicHeader"
         const val KEY_RESPONSE_HEADER = "responsePacketMagicHeader"
         const val KEY_UNDERLOAD_HEADER = "underloadPacketMagicHeader"

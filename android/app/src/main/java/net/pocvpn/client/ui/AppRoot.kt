@@ -279,11 +279,33 @@ fun AppRoot(
                     privateGatewayClipboard.setText(androidx.compose.ui.text.AnnotatedString(it))
                 }
             },
-            onSave = { host, port, serverKey, clientIp, gatewayIp, h1, h2, h3, h4 ->
+            onSave = { host, port, serverKey, clientIp, gatewayIp, h1, h2, h3, h4, jc, jmin, jmax, s1, s2, s3, s4 ->
                 val portInt = port.toIntOrNull()
+                // B22 physical-validation follow-up - every junk field is
+                // OPTIONAL (blank -> null, exactly like a never-typed field),
+                // but a NON-blank value that fails to parse as an integer is
+                // a real input mistake and must fail closed, never silently
+                // become null as if the operator had left it blank - a
+                // sentinel that is never a legal parsed value marks that case.
+                val unparseableSentinel = Int.MIN_VALUE
+                fun parseJunkField(raw: String): Int? {
+                    val trimmed = raw.trim()
+                    if (trimmed.isEmpty()) return null
+                    return trimmed.toIntOrNull() ?: unparseableSentinel
+                }
+                val parsedJunk = listOf(jc, jmin, jmax, s1, s2, s3, s4).map(::parseJunkField)
                 if (portInt == null) {
                     privateGatewayValidationError = net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason.INVALID_PORT
+                } else if (parsedJunk.any { it == unparseableSentinel }) {
+                    privateGatewayValidationError = net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS
                 } else {
+                    val jcInt = parsedJunk[0]
+                    val jminInt = parsedJunk[1]
+                    val jmaxInt = parsedJunk[2]
+                    val s1Int = parsedJunk[3]
+                    val s2Int = parsedJunk[4]
+                    val s3Int = parsedJunk[5]
+                    val s4Int = parsedJunk[6]
                     val result = viewModel.savePrivateGatewayConfig(
                         host = host,
                         port = portInt,
@@ -295,6 +317,13 @@ fun AppRoot(
                             responsePacketMagicHeader = h2,
                             underloadPacketMagicHeader = h3,
                             transportPacketMagicHeader = h4,
+                            junkPacketCount = jcInt,
+                            junkPacketMinSize = jminInt,
+                            junkPacketMaxSize = jmaxInt,
+                            initPacketJunkSize = s1Int,
+                            responsePacketJunkSize = s2Int,
+                            cookieReplyPacketJunkSize = s3Int,
+                            transportPacketJunkSize = s4Int,
                         ),
                     )
                     when (result) {

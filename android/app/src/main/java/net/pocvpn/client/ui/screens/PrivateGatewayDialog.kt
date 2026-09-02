@@ -58,6 +58,13 @@ fun PrivateGatewayDialog(
         responseHeader: String,
         underloadHeader: String,
         transportHeader: String,
+        junkPacketCount: String,
+        junkPacketMinSize: String,
+        junkPacketMaxSize: String,
+        initPacketJunkSize: String,
+        responsePacketJunkSize: String,
+        cookieReplyPacketJunkSize: String,
+        transportPacketJunkSize: String,
     ) -> Unit,
     validationError: PrivateGatewayConfigFailureReason?,
     onRemove: () -> Unit,
@@ -72,6 +79,13 @@ fun PrivateGatewayDialog(
     var responseHeader by remember { mutableStateOf(existing?.awgProfile?.responsePacketMagicHeader.orEmpty()) }
     var underloadHeader by remember { mutableStateOf(existing?.awgProfile?.underloadPacketMagicHeader.orEmpty()) }
     var transportHeader by remember { mutableStateOf(existing?.awgProfile?.transportPacketMagicHeader.orEmpty()) }
+    var junkPacketCount by remember { mutableStateOf(existing?.awgProfile?.junkPacketCount?.toString().orEmpty()) }
+    var junkPacketMinSize by remember { mutableStateOf(existing?.awgProfile?.junkPacketMinSize?.toString().orEmpty()) }
+    var junkPacketMaxSize by remember { mutableStateOf(existing?.awgProfile?.junkPacketMaxSize?.toString().orEmpty()) }
+    var initPacketJunkSize by remember { mutableStateOf(existing?.awgProfile?.initPacketJunkSize?.toString().orEmpty()) }
+    var responsePacketJunkSize by remember { mutableStateOf(existing?.awgProfile?.responsePacketJunkSize?.toString().orEmpty()) }
+    var cookieReplyPacketJunkSize by remember { mutableStateOf(existing?.awgProfile?.cookieReplyPacketJunkSize?.toString().orEmpty()) }
+    var transportPacketJunkSize by remember { mutableStateOf(existing?.awgProfile?.transportPacketJunkSize?.toString().orEmpty()) }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surface) {
@@ -111,6 +125,20 @@ fun PrivateGatewayDialog(
                 Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_h3), underloadHeader, KeyboardType.Number) { underloadHeader = it }
                 Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_h4), transportHeader, KeyboardType.Number) { transportHeader = it }
 
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = androidx.compose.ui.res.stringResource(R.string.private_gateway_junk_title),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_jc), junkPacketCount, KeyboardType.Number) { junkPacketCount = it }
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_jmin), junkPacketMinSize, KeyboardType.Number) { junkPacketMinSize = it }
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_jmax), junkPacketMaxSize, KeyboardType.Number) { junkPacketMaxSize = it }
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_s1), initPacketJunkSize, KeyboardType.Number) { initPacketJunkSize = it }
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_s2), responsePacketJunkSize, KeyboardType.Number) { responsePacketJunkSize = it }
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_s3), cookieReplyPacketJunkSize, KeyboardType.Number) { cookieReplyPacketJunkSize = it }
+                Field(androidx.compose.ui.res.stringResource(R.string.private_gateway_field_s4), transportPacketJunkSize, KeyboardType.Number) { transportPacketJunkSize = it }
+
                 if (validationError != null) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
@@ -149,7 +177,12 @@ fun PrivateGatewayDialog(
                     }
                     TextButton(
                         onClick = {
-                            onSave(host, port, serverPublicKey, clientTunnelIp, gatewayTunnelIp, initHeader, responseHeader, underloadHeader, transportHeader)
+                            onSave(
+                                host, port, serverPublicKey, clientTunnelIp, gatewayTunnelIp,
+                                initHeader, responseHeader, underloadHeader, transportHeader,
+                                junkPacketCount, junkPacketMinSize, junkPacketMaxSize,
+                                initPacketJunkSize, responsePacketJunkSize, cookieReplyPacketJunkSize, transportPacketJunkSize,
+                            )
                         },
                     ) {
                         Text(androidx.compose.ui.res.stringResource(R.string.private_gateway_save))

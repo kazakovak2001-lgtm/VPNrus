@@ -459,17 +459,29 @@ Fails closed on anything malformed (`PrivateGatewayConfigValidator`, reusing
 the existing `Ipv4Format`/`WgKeyFormat` validators verbatim) - the four AWG
 magic-header obfuscation fields are required (a real handshake blocker
 against `gateway/provision.sh` if mismatched, per `PocAwgProfile`'s own
-documented distinction; junk-packet count/size fields stay optional, same as
-every other AWG gateway). `FilePrivateGatewayStore` re-validates on every
-read, never trusting a corrupted/hand-edited file as "configured".
+documented distinction). `PrivateGatewayDialog` also exposes `AwgProfile`'s
+full junk-packet profile (`Jc`/`Jmin`/`Jmax`/`S1`-`S4`) - added after physical
+validation against a real Stockholm peer proved matching only the four
+headers was NOT sufficient against this exact `gateway/provision.sh` build
+(see `docs/ROADMAP.md`'s B22 physical-validation history). These seven remain
+optional (blank -> `null`, never a hardcoded/invented value - a different
+user's own VPS may need different values or none), validated when present
+(non-negative, min/max not inverted) via a dedicated
+`INVALID_JUNK_PACKET_PARAMETERS` reason, and persisted by
+`FilePrivateGatewayStore` exactly like every other field (a legacy file from
+before they existed reads back with them correctly `null`, never invented).
+`FilePrivateGatewayStore` re-validates on every read, never trusting a
+corrupted/hand-edited file as "configured".
 
-First-slice scope (unit-proven, NOT yet physically validated against a real
-user-operated VPS): exactly one private gateway, add/edit/remove UI
+First-slice scope: exactly one private gateway, add/edit/remove UI
 (`PrivateGatewayDialog`, a real production dialog reached from
 `GatewayPickerDialog`'s new "Private Gateway" row - not debug-only), no
 Smart Connect/Auto ranking/`ReachabilityEngine`/`PathScorer` integration, no
-Xray/REALITY/TLS/QUIC. Kept at **FOUNDATION** until a real physical
-connect() against a real user-provisioned VPS is proven end to end.
+Xray/REALITY/TLS/QUIC. **IMPLEMENTED** - physically validated end to end
+against a real, independently-provisioned isolated peer on the Stockholm
+gateway (real handshake, real bidirectional data plane, distinct exit IP,
+DNS/IPv6 invariants held, managed identity/state completely unaffected - see
+`docs/ROADMAP.md`'s B22 row for the full evidence).
 
 ## Production vs debug boundary
 

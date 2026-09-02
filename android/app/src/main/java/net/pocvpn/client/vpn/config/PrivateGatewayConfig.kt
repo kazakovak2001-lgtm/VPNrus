@@ -48,6 +48,7 @@ enum class PrivateGatewayConfigFailureReason {
     INVALID_CLIENT_TUNNEL_IP,
     INVALID_GATEWAY_TUNNEL_IP,
     MISSING_REQUIRED_OBFUSCATION_HEADER,
+    INVALID_JUNK_PACKET_PARAMETERS,
 }
 
 sealed class PrivateGatewayValidationResult {
@@ -67,8 +68,24 @@ sealed class PrivateGatewayValidationResult {
  * [AwgProfile.transportPacketMagicHeader]) are required (non-blank) - per
  * [PocAwgProfile]'s own documented distinction, a mismatch on these four is a
  * REAL handshake blocker against `gateway/provision.sh`'s AmneziaWG server,
- * not a cosmetic difference (junk packet count/size fields remain optional -
- * client-side-only tuning, see [AwgProfile.none]'s own docs).
+ * not a cosmetic difference.
+ *
+ * B22 physical-validation follow-up: the junk packet count/size fields
+ * ([AwgProfile.junkPacketCount]/[AwgProfile.junkPacketMinSize]/
+ * [AwgProfile.junkPacketMaxSize]/[AwgProfile.initPacketJunkSize]/
+ * [AwgProfile.responsePacketJunkSize]/[AwgProfile.cookieReplyPacketJunkSize]/
+ * [AwgProfile.transportPacketJunkSize]) remain OPTIONAL here (null is valid -
+ * a real physical connect against a Stockholm-profile server succeeded with
+ * only the four magic headers set once those headers were themselves
+ * corrected to match the live server - see docs/ROADMAP.md's B22 physical
+ * validation history). They are exposed in [PrivateGatewayDialog] because a
+ * DIFFERENT user-operated server MAY still require them to match (the
+ * general "any compatible AmneziaWG VPS" case this feature targets is wider
+ * than the one physically tested profile) - never hardcoded/invented here,
+ * only ever the operator's own typed values. When present, each must be a
+ * non-negative integer, and a min/max pair must not be inverted - malformed
+ * input fails closed with [PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS],
+ * never silently dropped or replaced with a guessed default.
  */
 object PrivateGatewayConfigValidator {
     private val HOSTNAME = Regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
@@ -109,6 +126,23 @@ object PrivateGatewayConfigValidator {
             awgProfile.transportPacketMagicHeader.isNullOrBlank()
         ) {
             return PrivateGatewayValidationResult.Invalid(PrivateGatewayConfigFailureReason.MISSING_REQUIRED_OBFUSCATION_HEADER)
+        }
+        val junkFields = listOf(
+            awgProfile.junkPacketCount,
+            awgProfile.junkPacketMinSize,
+            awgProfile.junkPacketMaxSize,
+            awgProfile.initPacketJunkSize,
+            awgProfile.responsePacketJunkSize,
+            awgProfile.cookieReplyPacketJunkSize,
+            awgProfile.transportPacketJunkSize,
+        )
+        if (junkFields.any { it != null && it < 0 }) {
+            return PrivateGatewayValidationResult.Invalid(PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS)
+        }
+        val jmin = awgProfile.junkPacketMinSize
+        val jmax = awgProfile.junkPacketMaxSize
+        if (jmin != null && jmax != null && jmin > jmax) {
+            return PrivateGatewayValidationResult.Invalid(PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS)
         }
 
         return PrivateGatewayValidationResult.Valid(
