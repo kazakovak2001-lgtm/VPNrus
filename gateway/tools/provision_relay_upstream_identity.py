@@ -24,7 +24,16 @@ owner approval"). It only:
      file too (it must, for the EXIT operator to actually apply it), so
      BOTH output files must be treated as secrets: transferred to their
      respective hosts out-of-band (e.g. scp over an already-authenticated
-     channel), never committed, never pasted into a PR/issue/chat.
+     channel), never committed, never pasted into a PR/issue/chat;
+  4. (B26, task B/C) generates a fresh probe HMAC secret and writes it to a
+     THIRD local file at the path the INGRESS host's own
+     NOVA_INGRESS_PROBE_HMAC_SECRET_FILE env var must point at - the SAME
+     bytes must ALSO end up on the pinned EXIT host's own
+     POCVPN_API_RELAY_PROBE_HMAC_SECRET_FILE (its hex form is included in
+     the exit-fragment file below purely so the operator has exactly one
+     thing to copy - see relay_probe_token.py's own docs for what this
+     secret is used for and why a stolen probe token alone cannot grant
+     VPN access).
 
 Applying the exit-fragment file to a live EXIT (adding it to that
 deployment's own xray_activation.py wiring so render_server_config
@@ -35,11 +44,13 @@ own "never mutate production without approval" rule.
     provision_relay_upstream_identity.py \\
         --ingress-endpoint-id ru-ingress-1 \\
         --upstream-uuid-file /etc/pocvpn/ingress/upstream-relay-uuid.txt \\
-        --exit-fragment-file /tmp/ru-ingress-1-exit-fragment.json
+        --exit-fragment-file /tmp/ru-ingress-1-exit-fragment.json \\
+        --probe-hmac-secret-file /etc/pocvpn/ingress/probe-hmac-secret.txt
 """
 import argparse
 import json
 import os
+import secrets
 import stat
 import sys
 import uuid
@@ -72,13 +83,22 @@ def main(argv=None):
     parser.add_argument("--ingress-endpoint-id", required=True, help="the ingress endpoint id this identity is FOR (label only, non-secret)")
     parser.add_argument("--upstream-uuid-file", required=True, help="output path for the ingress host's NOVA_INGRESS_UPSTREAM_UUID_FILE")
     parser.add_argument("--exit-fragment-file", required=True, help="output path for the EXIT-side static-client fragment (JSON)")
+    parser.add_argument(
+        "--probe-hmac-secret-file", required=True,
+        help="output path for the INGRESS host's own NOVA_INGRESS_PROBE_HMAC_SECRET_FILE (B26 task B/C)",
+    )
     args = parser.parse_args(argv)
 
     relay_uuid = str(uuid.uuid4())
+    probe_hmac_secret_hex = secrets.token_hex(32)
 
     _write_secret_file(args.upstream_uuid_file, relay_uuid + "\n")
     mode = stat.filemode(os.stat(args.upstream_uuid_file).st_mode)
     print(f"provision_relay_upstream_identity: wrote {args.upstream_uuid_file} (mode {mode}) - transfer to the INGRESS host, never commit it")
+
+    _write_secret_file(args.probe_hmac_secret_file, probe_hmac_secret_hex + "\n")
+    probe_mode = stat.filemode(os.stat(args.probe_hmac_secret_file).st_mode)
+    print(f"provision_relay_upstream_identity: wrote {args.probe_hmac_secret_file} (mode {probe_mode}) - transfer to the INGRESS host, never commit it")
 
     fragment = {
         "comment": (
@@ -91,10 +111,16 @@ def main(argv=None):
         "activation_id": f"relay-{args.ingress_endpoint_id}",
         "device_public_key": f"relay:{args.ingress_endpoint_id}",
         "vless_uuid": relay_uuid,
+        "relay_probe_hmac_secret_hex": probe_hmac_secret_hex,
+        "relay_probe_hmac_secret_apply_note": (
+            "Write this EXACT hex string (as raw text, e.g. `echo -n '<hex>' > path`) to a file on the "
+            "EXIT host and point that host's POCVPN_API_RELAY_PROBE_HMAC_SECRET_FILE at it - it must be "
+            "byte-for-byte identical to the ingress host's own NOVA_INGRESS_PROBE_HMAC_SECRET_FILE contents."
+        ),
     }
     _write_secret_file(args.exit_fragment_file, json.dumps(fragment, indent=2) + "\n")
     print(f"provision_relay_upstream_identity: wrote {args.exit_fragment_file} - transfer to the EXIT operator, never commit it")
-    print("provision_relay_upstream_identity: done. Neither file was printed to stdout/logs.")
+    print("provision_relay_upstream_identity: done. No secret was printed to stdout/logs.")
 
 
 if __name__ == "__main__":

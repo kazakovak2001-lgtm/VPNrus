@@ -17,6 +17,10 @@ local.properties
 *.keystore
 !debug.keystore
 
+# Python bytecode cache (never intentional - regenerated on any test run)
+__pycache__/
+*.pyc
+
 # Android / Gradle
 *.iml
 .gradle/

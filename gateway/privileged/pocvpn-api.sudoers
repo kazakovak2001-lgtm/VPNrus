@@ -27,6 +27,12 @@ Cmnd_Alias POCVPN_PROVISION = /usr/local/libexec/pocvpn-provision-peer
 # argument shape the way POCVPN_PROVISION's public-key argument does.
 Cmnd_Alias NOVA_XRAY_RELOAD = /usr/local/libexec/nova-xray-reload
 
+# B26 (task F) - the ingress role's own counterpart, same zero-argument
+# shape as NOVA_XRAY_RELOAD above - see nova-xray-ingress-reload's own
+# docstring. Present ONLY on a host actually running the ingress role; an
+# ordinary gateway host's sudoers drop-in simply omits this alias/grant.
+Cmnd_Alias NOVA_XRAY_INGRESS_RELOAD = /usr/local/libexec/nova-xray-ingress-reload
+
 # Force env_reset and an empty env_keep for THIS command specifically,
 # regardless of the box's global Defaults. env_reset is what actually
 # strips BASH_ENV/ENV/LD_PRELOAD/LD_LIBRARY_PATH/PYTHONPATH/PATH from the
@@ -44,6 +50,10 @@ Defaults!NOVA_XRAY_RELOAD env_reset
 Defaults!NOVA_XRAY_RELOAD !env_keep
 Defaults!NOVA_XRAY_RELOAD secure_path="/usr/local/bin:/usr/bin:/bin"
 
+Defaults!NOVA_XRAY_INGRESS_RELOAD env_reset
+Defaults!NOVA_XRAY_INGRESS_RELOAD !env_keep
+Defaults!NOVA_XRAY_INGRESS_RELOAD secure_path="/usr/local/bin:/usr/bin:/bin"
+
 # No ALL=(ALL) ALL. No NOPASSWD: ALL. No SETENV. No general systemctl, no
 # general cp/mv/chown, no shell access - exactly the two fixed command
 # paths below, nothing else. No wildcard argument pattern (sudoers cannot
@@ -55,3 +65,4 @@ Defaults!NOVA_XRAY_RELOAD secure_path="/usr/local/bin:/usr/bin:/bin"
 # validates those arguments (nova-xray-reload accepts none at all).
 pocvpn-api ALL=(root) NOPASSWD: POCVPN_PROVISION
 pocvpn-api ALL=(root) NOPASSWD: NOVA_XRAY_RELOAD
+pocvpn-api ALL=(root) NOPASSWD: NOVA_XRAY_INGRESS_RELOAD

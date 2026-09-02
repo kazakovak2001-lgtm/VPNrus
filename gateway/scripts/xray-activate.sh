@@ -7,10 +7,22 @@
 #
 #   xray-activate.sh
 #
-# Takes NO arguments - every path is fixed, sourced from config/xray.env
+# Takes NO arguments - every path is fixed, sourced from an env file
 # (mirrors gateway/lib/common.sh's load_config for the AWG side). This is
 # deliberate: nothing about which files this script touches is ever
-# influenced by a caller-supplied argument.
+# influenced by a caller-supplied ARGUMENT.
+#
+# B26 (task F) - which env file is sourced IS configurable, but only via
+# XRAY_ACTIVATE_ENV_FILE, an ENVIRONMENT VARIABLE the privileged wrapper
+# sets explicitly (never a CLI argument, never inherited from an arbitrary
+# caller - gateway/privileged/nova-xray-reload and its ingress-role
+# counterpart nova-xray-ingress-reload each `env -i` a fixed, hardcoded
+# value before exec'ing this script - see each wrapper's own docstring).
+# Defaults to config/xray.env - the ORIGINAL fixed path - so every
+# pre-B26 gateway deployment is byte-for-byte unaffected; an ingress
+# deployment's wrapper points this at config/xray-ingress.env instead,
+# letting the two roles share this ONE validate/stage/publish/rollback
+# implementation rather than maintaining a near-duplicate copy.
 #
 # --- IMPORTANT, VERIFIED FINDING (not assumed) ---
 # `xray run -test -c <file>` was tested against the actual pinned v26.7.28
@@ -44,7 +56,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck disable=SC1090
-source "$SCRIPT_DIR/config/xray.env"
+source "${XRAY_ACTIVATE_ENV_FILE:-$SCRIPT_DIR/config/xray.env}"
 
 [ $# -eq 0 ] || { echo "usage: xray-activate.sh (no arguments)" >&2; exit 20; }
 

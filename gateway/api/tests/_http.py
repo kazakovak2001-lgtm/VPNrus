@@ -176,3 +176,13 @@ def get_manifest(port, method="GET", extra_headers=None):
     """GET /v1/manifest (B12) - no body, no auth. `method` lets tests
     exercise the 405 path with e.g. "POST" without a second helper."""
     return raw_request(port, method, "/v1/manifest", extra_headers or {}, b"")
+
+
+def get_relay_health(port, token=None, method="GET", extra_headers=None):
+    """B26 - GET /v1/relay-health: bearer probe token, no body."""
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, method, "/v1/relay-health", headers, b"")

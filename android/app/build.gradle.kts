@@ -206,6 +206,16 @@ dependencies {
     // not real behavior) - this is the standard real implementation used to
     // get actual JSON behavior in JVM-only unit tests.
     testImplementation("org.json:json:20240303")
+    // B26 review fix (blocker 2) - RelayCompositionFactoryTest is the real
+    // composition-root test: it needs a real android.content.Context (the
+    // plain JVM stub-jar every other unit test class uses cannot provide
+    // one - see testOptions.unitTests.isReturnDefaultValues above), but
+    // deliberately never touches AndroidKeyStore/crypto (see
+    // RelayCompositionFactory's own docs on why building this graph never
+    // does) - scoped to that ONE test class via its own @RunWith, every
+    // other test class in this module is completely unaffected.
+    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

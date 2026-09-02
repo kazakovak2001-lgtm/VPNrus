@@ -78,6 +78,12 @@ fun AppRoot(
     val appliedRoutingPolicy by viewModel.appliedAppRoutingPolicy.collectAsStateWithLifecycle()
     val savedRoutingMode by viewModel.savedRoutingMode.collectAsStateWithLifecycle()
     val networkProfile by viewModel.networkProfile.collectAsStateWithLifecycle()
+    // B26 review fix (blocker 1) - the real, product-reachable ingress
+    // activation prompt (see MainViewModel.relayActivationNeeded's own
+    // docs) - null whenever no relayed attempt has hit a fixable failure.
+    val relayActivationNeeded by viewModel.relayActivationNeeded.collectAsStateWithLifecycle()
+    val ingressActivationState by viewModel.ingressActivationState.collectAsStateWithLifecycle()
+    val ingressActivating by viewModel.ingressActivating.collectAsStateWithLifecycle()
     val selectedGatewayId by viewModel.selectedGateway.collectAsStateWithLifecycle()
     val selectedGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(selectedGatewayId)
     // B16 - task requirement 9: Home shows the ACTUAL active gateway, not
@@ -103,6 +109,11 @@ fun AppRoot(
     var activatingGatewayId by remember {
         mutableStateOf<net.pocvpn.client.vpn.config.ProductionGatewayId?>(null)
     }
+    // B26 review fix (blocker 1) - hoisted the SAME way `credential` above
+    // is for the AWG activation screens; a SEPARATE field so an in-flight
+    // ingress activation attempt never clobbers/is clobbered by an
+    // unrelated AWG gateway activation attempt's own text.
+    var ingressCredential by remember { mutableStateOf("") }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
     val context = LocalContext.current
     // B8H perf fix - constructing the repository is cheap (just stores
@@ -122,6 +133,11 @@ fun AppRoot(
             activatingGatewayId = null
         }
     }
+    LaunchedEffect(ingressActivationState) {
+        if (shouldClearIngressCredentialInput(ingressActivationState)) {
+            ingressCredential = ""
+        }
+    }
     LaunchedEffect(viewModel) {
         viewModel.events.collect { event ->
             when (event) {
@@ -138,6 +154,25 @@ fun AppRoot(
     Surface(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxSize()) {
             when {
+                // B26 review fix (blocker 1) - takes priority over every
+                // other branch below, same reasoning as activatingGatewayId's
+                // own priority comment: a relayed Auto attempt can surface
+                // this prompt regardless of which other screen the user
+                // happens to be looking at. Reuses the EXISTING
+                // ActivationScreen composable verbatim - the SAME single
+                // "activation credential" text field every other endpoint's
+                // activation already uses, never a UUID/REALITY-key/probe-
+                // token paste field (this codebase's own explicit
+                // prohibition - IngressClientProfile's private fields are
+                // never exposed to any UI layer at all).
+                relayActivationNeeded != null -> ActivationScreen(
+                    credential = ingressCredential,
+                    onCredentialChange = { ingressCredential = it },
+                    onActivateClick = { viewModel.activateIngress(ingressCredential) },
+                    errorText = ingressActivationState.toIngressActivationErrorText(),
+                    isSubmitting = ingressActivating,
+                    onCancel = { viewModel.dismissRelayActivationPrompt(); ingressCredential = "" },
+                )
                 // B15 - takes priority over screenFor()'s own HOME/ACTIVATION
                 // choice: activating an ADDITIONAL gateway is orthogonal to
                 // whether a first-run profile already exists (screenFor only
