@@ -2,6 +2,7 @@ package net.pocvpn.client.relay
 
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.transport.TransportKind
 
 /**
@@ -26,6 +27,12 @@ data class RelayActivationRequest(
     val ingressEndpointId: EndpointId,
     val ingressBinding: EndpointTransportBinding,
     val ingressTransport: TransportKind,
+    // B27 - carried through so a real UI can show/label which ingress
+    // strategy this activation is for (never inferred from host/provider -
+    // see IngressKind's own docs); [IngressProfileProvisioner.provision]
+    // pins it as part of the request it cross-checks the server's response
+    // against.
+    val ingressKind: IngressKind,
 ) {
     companion object {
         /** The ONLY [RelayFailureCategory] values a fresh activation can fix - see this type's own docs. */
@@ -39,6 +46,7 @@ data class RelayActivationRequest(
             ingressEndpointId = plan.ingressEndpointId,
             ingressBinding = plan.ingressBinding,
             ingressTransport = plan.ingressTransport,
+            ingressKind = plan.ingressKind,
         )
     }
 }

@@ -197,6 +197,18 @@ object ProvisioningClient {
         val expiresAt = if (json.has("expires_at") && !json.isNull("expires_at")) json.optLong("expires_at", -1L) else null
         val probeUrl = if (json.has("probe_url") && !json.isNull("probe_url")) json.optString("probe_url", "") else null
         val probeToken = if (json.has("probe_token") && !json.isNull("probe_token")) json.optString("probe_token", "") else null
+        // B27 - absent means DIRECT_IP (every pre-B27 gateway's own
+        // response shape, byte-for-byte unaffected by this field's
+        // existence); PRESENT-but-unrecognized fails closed as malformed -
+        // never silently defaulted, which could otherwise let a server
+        // claim an ingress kind this client has no typed name for.
+        val ingressKindRaw = if (json.has("ingress_kind") && !json.isNull("ingress_kind")) json.optString("ingress_kind", "") else null
+        val ingressKind = if (ingressKindRaw == null) {
+            net.pocvpn.client.reachability.IngressKind.DIRECT_IP
+        } else {
+            net.pocvpn.client.reachability.IngressKind.entries.firstOrNull { it.name == ingressKindRaw }
+                ?: return IngressProfileResult.MalformedResponse("ingress_kind not recognized: $ingressKindRaw")
+        }
 
         if (ingressEndpointId.isBlank()) {
             return IngressProfileResult.MalformedResponse("ingress_endpoint_id missing or blank")
@@ -249,6 +261,7 @@ object ProvisioningClient {
 
         return IngressProfileResult.Success(
             ingressEndpointId = ingressEndpointId,
+            ingressKind = ingressKind,
             serverAddress = serverAddress,
             serverPort = serverPort,
             uuid = uuid,

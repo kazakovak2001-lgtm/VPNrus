@@ -11,6 +11,7 @@ import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.transport.TransportKind
 import org.json.JSONObject
 
@@ -40,6 +41,19 @@ data class IngressClientProfile(
     val ingressEndpointId: EndpointId,
     val ingressBinding: EndpointTransportBinding,
     val transport: TransportKind,
+    // B27 - the VALIDATED [IngressKind] the provisioning transaction itself
+    // cross-checked (see [IngressProfileProvisioner.provision]'s own
+    // docs) - an explicit stored field, deliberately NOT derived from
+    // [ingressBinding]'s own metadata (EndpointTransportBinding.ingressKind()
+    // exists and could, in principle, be used instead, but a derived value
+    // here would silently read back whatever the binding happens to carry
+    // rather than what was actually validated at activation time - two
+    // different things whenever a caller's binding fixture/manifest entry
+    // doesn't carry the metadata the validation logic already confirmed).
+    // Defaults to DIRECT_IP for every profile persisted before this field
+    // existed (matches [EndpointTransportBinding.ingressKind]'s own
+    // "no declared kind means DIRECT_IP" convention).
+    val ingressKind: IngressKind = IngressKind.DIRECT_IP,
     val realityProfile: XrayProfile? = null,
     val tlsProfile: XrayTlsProfile? = null,
     val profileVersion: Int,
@@ -68,13 +82,18 @@ data class IngressClientProfile(
     /**
      * Task requirement F.3 - the exact match [RelayIngressResolverImpl]
      * requires before ever using this profile: the SAME ingress endpoint,
-     * binding, and transport the pinned [RelayedExecutionPlan] carries -
-     * never merely "some profile exists for this endpoint id".
+     * binding, transport, AND ingress kind the pinned [RelayedExecutionPlan]
+     * carries - never merely "some profile exists for this endpoint id".
+     * [ingressKind] is checked explicitly (B27) even though it is already
+     * implied by [ingressBinding] equality above - naming every pinned fact
+     * explicitly is what makes this the one place a future field added to
+     * either side can't silently stop being compared.
      */
     fun matches(plan: RelayedExecutionPlan): Boolean =
         ingressEndpointId == plan.ingressEndpointId &&
             ingressBinding == plan.ingressBinding &&
-            transport == plan.ingressTransport
+            transport == plan.ingressTransport &&
+            ingressKind == plan.ingressKind
 
     fun isExpired(nowEpochMillis: Long): Boolean {
         val expiry = expiresAtEpochMillis ?: return false
@@ -92,6 +111,7 @@ data class IngressClientProfile(
         val obj = JSONObject()
             .put(KEY_INGRESS_ENDPOINT_ID, ingressEndpointId.value)
             .put(KEY_TRANSPORT, transport.name)
+            .put(KEY_INGRESS_KIND, ingressKind.name)
             .put(KEY_PROFILE_VERSION, profileVersion)
             .put(KEY_ISSUED_AT, issuedAtEpochMillis)
             .put(KEY_EXPIRES_AT, expiresAtEpochMillis ?: JSONObject.NULL)
@@ -106,6 +126,7 @@ data class IngressClientProfile(
     companion object {
         private const val KEY_INGRESS_ENDPOINT_ID = "ingressEndpointId"
         private const val KEY_TRANSPORT = "transport"
+        private const val KEY_INGRESS_KIND = "ingressKind"
         private const val KEY_PROFILE_VERSION = "profileVersion"
         private const val KEY_ISSUED_AT = "issuedAt"
         private const val KEY_EXPIRES_AT = "expiresAt"
@@ -123,6 +144,20 @@ data class IngressClientProfile(
                 ingressEndpointId = EndpointId(obj.getString(KEY_INGRESS_ENDPOINT_ID)),
                 ingressBinding = EndpointTransportBindingJson.fromJson(obj.getJSONObject(KEY_BINDING)),
                 transport = transport,
+                // B27 - absent (a profile persisted before this field
+                // existed) means DIRECT_IP - the only kind any such profile
+                // could ever have been. A present-but-unrecognized value
+                // fails closed via IngressProfileCorruptedException, never
+                // silently defaulted (a corrupted/hand-edited store must
+                // never be trusted - same discipline every other field on
+                // this store already follows).
+                ingressKind = if (obj.has(KEY_INGRESS_KIND) && !obj.isNull(KEY_INGRESS_KIND)) {
+                    val raw = obj.getString(KEY_INGRESS_KIND)
+                    IngressKind.entries.firstOrNull { it.name == raw }
+                        ?: throw IngressProfileCorruptedException("unrecognized ingressKind: $raw")
+                } else {
+                    IngressKind.DIRECT_IP
+                },
                 realityProfile = if (obj.has(KEY_REALITY_PROFILE) && !obj.isNull(KEY_REALITY_PROFILE)) {
                     XrayProfile.fromJson(obj.getJSONObject(KEY_REALITY_PROFILE).toString())
                 } else {

@@ -5,6 +5,7 @@ import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,6 +19,7 @@ private fun realityPlan(ingressId: String = "ru-ingress-1") = RelayedExecutionPl
     ingressEndpointId = EndpointId(ingressId),
     ingressBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 443),
     ingressTransport = TransportKind.XRAY_REALITY,
+    ingressKind = IngressKind.DIRECT_IP,
     exitEndpointId = EndpointId("germany"),
     exitBinding = EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.60", 51820),
     exitTransport = TransportKind.AMNEZIA_WG,
@@ -41,6 +43,12 @@ class IngressClientProfileTest {
 
         val differentTransport = plan.copy(ingressTransport = TransportKind.TLS_TCP)
         assertFalse(profile.matches(differentTransport))
+
+        // B27 - a plan pinning a DIFFERENT ingress kind (e.g. CDN_FRONTED)
+        // never matches a profile validated against DIRECT_IP, even with
+        // every other field identical.
+        val differentKind = plan.copy(ingressKind = IngressKind.CDN_FRONTED)
+        assertFalse(profile.matches(differentKind))
     }
 
     @Test
@@ -67,6 +75,16 @@ class IngressClientProfileTest {
             endToEndProbeToken = "secret-token",
         )
         val restored = IngressClientProfile.fromJson(profile.toJson())
+        assertEquals(profile, restored)
+    }
+
+    @Test
+    fun `toJson-fromJson round-trips a CDN_FRONTED profile's ingressKind exactly`() {
+        val plan = realityPlan().copy(ingressKind = IngressKind.CDN_FRONTED)
+        val profile = fakeIngressClientProfile(plan)
+        assertEquals(IngressKind.CDN_FRONTED, profile.ingressKind)
+        val restored = IngressClientProfile.fromJson(profile.toJson())
+        assertEquals(IngressKind.CDN_FRONTED, restored.ingressKind)
         assertEquals(profile, restored)
     }
 

@@ -20,7 +20,7 @@ before deciding whether to fold it into a real signed manifest entry.
 |---|---|---|
 | `ingress_id` | string | Matches `NOVA_INGRESS_ENDPOINT_ID` / `ingress_endpoint_id` |
 | `role` | string | Always `"INGRESS"` |
-| `ingress_kind` | string | `"DIRECT_IP"` (the only kind with a real runtime path - see PROJECT_ARCHITECTURE.md's B24 section) |
+| `ingress_kind` | string | `"DIRECT_IP"` or `"CDN_FRONTED"` (both have a real software-side runtime path as of B27 - see PROJECT_ARCHITECTURE.md's B24/B27 sections; CDN_FRONTED is still FOUNDATION - no legitimate operator-controlled CDN has been validated against this slice) |
 | `region` | string | Free-text, e.g. `"eu-central"` |
 | `provider` | string | Free-text, e.g. `"Hetzner"` |
 | `asn` | string | e.g. `"AS24940"` - diagnostics/operator use only |

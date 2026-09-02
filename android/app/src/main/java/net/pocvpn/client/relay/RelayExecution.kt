@@ -2,6 +2,7 @@ package net.pocvpn.client.relay
 
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.VpnTransport
@@ -26,6 +27,19 @@ data class RelayedExecutionPlan(
     val ingressEndpointId: EndpointId,
     val ingressBinding: EndpointTransportBinding,
     val ingressTransport: TransportKind,
+    // B27 - the ingress's own pinned [IngressKind] (DIRECT_IP/CDN_FRONTED),
+    // copied verbatim off [AutoGatewaySelector.RelayAttemptCandidate.ingressKind] -
+    // never re-derived from [ingressBinding] here (even though it could be,
+    // via EndpointTransportBinding.ingressKind() - storing it explicitly
+    // keeps this type's own "every pinned fact is an explicit field" shape
+    // consistent with every other field in this class). Execution itself
+    // (which real Xray/TLS transport gets dialed) is IDENTICAL regardless
+    // of this value - a CDN-fronted ingress is still just a REALITY/TLS_TCP
+    // endpoint from the client's own socket-level point of view (task
+    // requirement D's "no second VPN service or second transport core") -
+    // this field exists purely so provisioning/persistence/UI can validate
+    // and label which kind of ingress this attempt is pinned against.
+    val ingressKind: IngressKind,
     val exitEndpointId: EndpointId,
     val exitBinding: EndpointTransportBinding,
     val exitTransport: TransportKind,
@@ -36,6 +50,7 @@ data class RelayedExecutionPlan(
             ingressEndpointId = candidate.ingressEndpointId,
             ingressBinding = candidate.ingressBinding,
             ingressTransport = candidate.ingressTransport,
+            ingressKind = candidate.ingressKind,
             exitEndpointId = candidate.exitEndpointId,
             exitBinding = candidate.exitBinding,
             exitTransport = candidate.exitTransport,

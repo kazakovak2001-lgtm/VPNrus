@@ -11,6 +11,7 @@ import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.provisioning.IngressProfileResult
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.IngressProfileProvisioner
@@ -115,6 +116,7 @@ class MainViewModelRelayActivationTest {
     private fun candidate(
         ingressId: EndpointId = ingressIdA,
         ingressBinding: EndpointTransportBinding = bindingA,
+        ingressKind: IngressKind = IngressKind.DIRECT_IP,
     ) = AutoGatewaySelector.RelayAttemptCandidate(
         ingressEndpointId = ingressId,
         exitEndpointId = exitId,
@@ -122,11 +124,15 @@ class MainViewModelRelayActivationTest {
         exitTransport = TransportKind.XRAY_REALITY,
         ingressBinding = ingressBinding,
         exitBinding = exitBinding,
+        ingressKind = ingressKind,
         ingressRegion = "ru",
         exitRegion = "de",
         score = 1_000L,
         reasons = listOf("test"),
-        historyPathId = "${ingressId.value}:XRAY_REALITY->frankfurt:XRAY_REALITY",
+        // B27 review fix - kind-aware, matching PathCandidate.Relayed
+        // .historyPathId's own real format exactly (never a stand-in that
+        // could hide a kind-conflation bug in these tests).
+        historyPathId = "${ingressId.value}:$ingressKind:XRAY_REALITY->frankfurt:XRAY_REALITY",
     )
 
     private fun asAttempt(c: AutoGatewaySelector.RelayAttemptCandidate) = AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt(c)
@@ -151,8 +157,14 @@ class MainViewModelRelayActivationTest {
         ioDispatcher = testDispatcher,
     )
 
-    private fun successResult(serverAddress: String = bindingA.host, serverPort: Int = bindingA.port, ingressEndpointId: String = ingressIdA.value) = IngressProfileResult.Success(
+    private fun successResult(
+        serverAddress: String = bindingA.host,
+        serverPort: Int = bindingA.port,
+        ingressEndpointId: String = ingressIdA.value,
+        ingressKind: IngressKind = IngressKind.DIRECT_IP,
+    ) = IngressProfileResult.Success(
         ingressEndpointId = ingressEndpointId,
+        ingressKind = ingressKind,
         serverAddress = serverAddress,
         serverPort = serverPort,
         uuid = "11111111-1111-1111-1111-111111111111",
@@ -252,6 +264,37 @@ class MainViewModelRelayActivationTest {
         // B/C: the retry resolved the EXACT SAME plan (same historyPathId,
         // same bindings/transport) - never rebuilt/re-ranked.
         assertEquals(resolver.resolvedPlans[0], resolver.resolvedPlans[1])
+    }
+
+    @Test
+    fun `activation retry preserves the exact pinned CDN_FRONTED candidate - never silently downgraded to DIRECT_IP or re-ranked`() = runTest {
+        val candA = candidate(ingressKind = IngressKind.CDN_FRONTED)
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> successResult(ingressKind = IngressKind.CDN_FRONTED) })
+        val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+        val request = viewModel.relayActivationNeeded.value
+        assertNotNull(request)
+        assertEquals(IngressKind.CDN_FRONTED, request!!.ingressKind)
+
+        viewModel.activateIngress("real-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
+        val saved = store.getProfileOrNull(ingressIdA)
+        assertEquals("the persisted profile must keep the pinned CDN_FRONTED kind", IngressKind.CDN_FRONTED, saved?.ingressKind)
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(IngressKind.CDN_FRONTED, resolver.resolvedPlans[0].ingressKind)
+        // Requirement 4: the retry keeps the IDENTICAL kind-aware
+        // historyPathId - never re-ranked into a different (endpoint,
+        // kind, transport) identity.
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[0].historyPathId)
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[1].historyPathId)
+        assertTrue(candA.historyPathId.contains(":CDN_FRONTED:"))
+        assertEquals(IngressKind.CDN_FRONTED, resolver.resolvedPlans[1].ingressKind)
     }
 
     @Test

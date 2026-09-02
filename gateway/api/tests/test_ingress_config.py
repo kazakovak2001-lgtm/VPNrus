@@ -73,6 +73,32 @@ class IngressConfigTests(unittest.TestCase):
             self.assertEqual(cfg.ingress_profile_ttl_seconds, 0)
             self.assertEqual(cfg.ingress_exit_endpoint_id, "frankfurt")
             self.assertEqual(cfg.ingress_probe_ttl_seconds, 300)
+            self.assertEqual(cfg.ingress_kind, "direct_ip")
+
+    def test_ingress_kind_defaults_to_direct_ip_when_unset(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir)
+            self.assertNotIn("NOVA_INGRESS_KIND", env)
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(cfg.ingress_kind, "direct_ip")
+
+    def test_ingress_kind_cdn_fronted_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir, NOVA_INGRESS_KIND="cdn_fronted")
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(cfg.ingress_kind, "cdn_fronted")
+
+    def test_ingress_kind_is_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir, NOVA_INGRESS_KIND="CDN_FRONTED")
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(cfg.ingress_kind, "cdn_fronted")
+
+    def test_unsupported_ingress_kind_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir, NOVA_INGRESS_KIND="satellite")
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
 
     def test_probe_hmac_secret_file_must_exist(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

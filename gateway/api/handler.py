@@ -641,6 +641,13 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         payload["profile_version"] = 1
         payload["issued_at"] = issued_at_epoch_seconds
         payload["expires_at"] = expires_at_epoch_seconds
+        # B27 - echoes this deployment's own configured ingress_kind, upper-
+        # cased to match net.pocvpn.client.reachability.IngressKind's exact
+        # enum constant names (task E - the client cross-checks this
+        # against its own pinned expectation before ever persisting
+        # anything; a mismatch here is exactly the "frontend/origin/
+        # backend confusion" that must fail closed).
+        payload["ingress_kind"] = ingress_cfg.ingress_kind.upper()
 
         # B26 (task B/C) - mint the real end-to-end proof coordinates this
         # device's IngressClientProfile.endToEndProbeUrl/endToEndProbeToken
