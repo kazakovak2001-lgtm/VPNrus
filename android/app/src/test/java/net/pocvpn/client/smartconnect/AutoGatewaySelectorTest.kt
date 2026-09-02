@@ -5,7 +5,9 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
 import net.pocvpn.client.reachability.EndpointRole
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.reachability.PathHistoryEntry
+import net.pocvpn.client.reachability.withIngressKind
 import net.pocvpn.client.reachability.ReachabilityEvidenceSummary
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.transport.TransportCapabilities
@@ -77,7 +79,7 @@ class AutoGatewaySelectorTest {
         manifestEndpoints: List<EndpointDescriptor> = bothManifestEndpoints,
         provisioned: Set<ProductionGatewayId> = setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
         preference: UserTransportPreference = UserTransportPreference.Auto,
-        historyFor: (EndpointId, TransportKind) -> PathHistoryEntry? = { _, _ -> null },
+        historyFor: (String, TransportKind) -> PathHistoryEntry? = { _, _ -> null },
     ) = AutoGatewaySelector.buildCandidates(
         manifestEndpoints = manifestEndpoints,
         gatewayFactsFor = { catalogById[it] },
@@ -199,7 +201,7 @@ class AutoGatewaySelectorTest {
     fun `richer PathHistory success ratio ranks a candidate higher - real PathScorer reuse, not a parallel scorer`() {
         val richHistory = PathHistoryEntry(successCount = 10, failureCount = 0, lastOutcomeEpochMillis = 1L, lastOutcomeSuccess = true)
         val candidates = buildDefault(
-            historyFor = { endpointId, _ -> if (endpointId == stockholmId) richHistory else null },
+            historyFor = { pathId, _ -> if (pathId == stockholmId.value) richHistory else null },
         )
         assertEquals(ProductionGatewayId.STOCKHOLM, candidates.first().gatewayId)
     }
@@ -498,5 +500,138 @@ class AutoGatewaySelectorTest {
             historyFor = { _, _ -> null },
         )
         assertEquals(1, candidates.size)
+    }
+
+    // --- B23: buildRelayedCandidates - real, evidence-driven relay ranking ---
+
+    private val ingressEndpoint = EndpointDescriptor(
+        id = EndpointId("ru-ingress-1"),
+        roles = setOf(EndpointRole.INGRESS),
+        region = "ru",
+        provider = "operator-a",
+        transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.50", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+        relayTo = germanyId,
+    )
+
+    private val exitEndpoint = manifestEndpointFor(ProductionGatewayCatalog.GERMANY)
+
+    private fun relayReachable(id: EndpointId, kind: TransportKind) = EndpointReachability(
+        id, kind, ReachabilityState.REACHABLE,
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, 0, true, true, RestrictionClass.POSSIBLE_HARD_WHITELIST, endpointSpecificReachableAgeMillis = 0),
+    )
+
+    private fun relayUnknown(id: EndpointId, kind: TransportKind) = EndpointReachability(
+        id, kind, ReachabilityState.UNKNOWN,
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN),
+    )
+
+    private fun relayFreshlyUnreachable(id: EndpointId, kind: TransportKind) = EndpointReachability(
+        id, kind, ReachabilityState.UNREACHABLE,
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, 0, false, true, RestrictionClass.POSSIBLE_HARD_WHITELIST, endpointSpecificReachableAgeMillis = 0),
+    )
+
+    private fun buildRelayedDefault(
+        manifestEndpoints: List<EndpointDescriptor> = listOf(ingressEndpoint, exitEndpoint),
+        reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability = { id, kind -> relayReachable(id, kind) },
+        transportHealthFor: (TransportKind) -> TransportHealth = { healthy() },
+    ) = AutoGatewaySelector.buildRelayedCandidates(
+        manifestEndpoints = manifestEndpoints,
+        registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+        reachabilityFor = reachabilityFor,
+        transportHealthFor = transportHealthFor,
+        historyFor = { _, _ -> null },
+    )
+
+    @Test
+    fun `a manifest naming an INGRESS with relayTo an EXIT produces a real Relayed candidate`() {
+        val candidates = buildRelayedDefault()
+        assertEquals(1, candidates.size)
+        assertEquals(ingressEndpoint.id, candidates.first().ingressEndpointId)
+        assertEquals(exitEndpoint.id, candidates.first().exitEndpointId)
+        assertEquals(TransportKind.TLS_TCP, candidates.first().transport)
+    }
+
+    @Test
+    fun `an ingress absent a relayTo target never produces a candidate`() {
+        val orphanIngress = ingressEndpoint.copy(relayTo = null)
+        assertTrue(buildRelayedDefault(manifestEndpoints = listOf(orphanIngress, exitEndpoint)).isEmpty())
+    }
+
+    @Test
+    fun `an endpoint with no INGRESS role is never treated as a relay entrypoint`() {
+        assertTrue(buildRelayedDefault(manifestEndpoints = listOf(exitEndpoint)).isEmpty())
+    }
+
+    @Test
+    fun `UNKNOWN ingress reachability does not outrank a healthy Direct candidate by default`() {
+        val direct = buildDefault(manifestEndpoints = listOf(exitEndpoint))
+        val relayed = buildRelayedDefault(reachabilityFor = { id, kind -> relayUnknown(id, kind) })
+
+        assertTrue(direct.isNotEmpty())
+        assertTrue(relayed.isNotEmpty())
+        assertTrue("a healthy Direct candidate must outscore an UNKNOWN relay", direct.first().score > relayed.first().score)
+    }
+
+    @Test
+    fun `a fresh, proven-reachable ingress under hard-whitelist evidence is eligible even when Direct has no path`() {
+        // Direct's own exit reachability is fresh UNREACHABLE - the exact
+        // shape a real hard-whitelist network produces for the foreign exit.
+        val direct = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(exitEndpoint),
+            gatewayFactsFor = { catalogById[it] },
+            provisioned = { true },
+            clientTunnelIp = { "10.77.0.5" },
+            registryFor = { healthyRegistry() },
+            xrayAvailableFor = { false },
+            xrayTlsAvailableFor = { false },
+            reachabilityFor = { id, kind -> relayFreshlyUnreachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        val relayed = buildRelayedDefault()
+
+        assertTrue("no eligible Direct path under hard whitelist", direct.isEmpty())
+        assertEquals(1, relayed.size)
+    }
+
+    @Test
+    fun `a fresh ingress failure excludes the relay - never merely low-scored`() {
+        val relayed = buildRelayedDefault(reachabilityFor = { id, kind -> relayFreshlyUnreachable(id, kind) })
+        assertTrue(relayed.isEmpty())
+    }
+
+    @Test
+    fun `a stale ingress failure decays back to UNKNOWN and no longer excludes the relay`() {
+        // Same shape as relayFreshlyUnreachable but with NO age (null) -
+        // ReachabilityEngine.assess's own freshness gate never trusts an
+        // undated outcome, so this is exactly what a once-fresh failure
+        // looks like once it has expired - reused verbatim, not a second
+        // staleness rule invented here.
+        val staleFailure = { id: EndpointId, kind: TransportKind ->
+            EndpointReachability(
+                id, kind, ReachabilityState.UNKNOWN,
+                evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, false, true, RestrictionClass.UNKNOWN),
+            )
+        }
+        val relayed = buildRelayedDefault(reachabilityFor = staleFailure)
+        assertEquals(1, relayed.size)
+    }
+
+    @Test
+    fun `pinning a MANUAL transport preference filters relay candidates the same way it filters Direct ones`() {
+        val relayed = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(ingressEndpoint, exitEndpoint),
+            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+            preference = UserTransportPreference.Manual(TransportKind.AMNEZIA_WG),
+        )
+        assertTrue(relayed.isEmpty())
+    }
+
+    @Test
+    fun `no ingress endpoints in the manifest yields no relay candidates - fail closed, never a fabricated one`() {
+        assertTrue(buildRelayedDefault(manifestEndpoints = listOf(exitEndpoint)).isEmpty())
     }
 }

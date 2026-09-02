@@ -92,4 +92,32 @@ class EndpointTest {
             EndpointDescriptor(EndpointId("e1"), setOf(EndpointRole.GATEWAY), "eu", "acme", asn = 0, transports = listOf(binding()))
         }
     }
+
+    // --- B23: IngressKind ---
+
+    @Test
+    fun `a binding with no ingressKind metadata reports null`() {
+        assertEquals(null, binding().ingressKind())
+    }
+
+    @Test
+    fun `withIngressKind round-trips through the reserved metadata key`() {
+        val direct = binding().withIngressKind(IngressKind.DIRECT_IP)
+        val fronted = binding().withIngressKind(IngressKind.CDN_FRONTED)
+        assertEquals(IngressKind.DIRECT_IP, direct.ingressKind())
+        assertEquals(IngressKind.CDN_FRONTED, fronted.ingressKind())
+    }
+
+    @Test
+    fun `withIngressKind never touches other metadata entries`() {
+        val b = binding().copy(metadata = mapOf("sni" to "example.test")).withIngressKind(IngressKind.CDN_FRONTED)
+        assertEquals("example.test", b.metadata["sni"])
+        assertEquals(IngressKind.CDN_FRONTED, b.ingressKind())
+    }
+
+    @Test
+    fun `an unrecognized ingressKind metadata value is reported as null, never a crash`() {
+        val b = binding().copy(metadata = mapOf("ingressKind" to "SOMETHING_FROM_A_NEWER_CLIENT"))
+        assertEquals(null, b.ingressKind())
+    }
 }

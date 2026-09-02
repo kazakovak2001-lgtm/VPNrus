@@ -80,7 +80,7 @@ class NetworkFingerprinterTest {
 
         val dir = java.nio.file.Files.createTempDirectory("path-history-privacy-test").toFile()
         val store = FilePathHistoryStore(dir)
-        store.record(fingerprint, EndpointId("gw"), net.pocvpn.client.transport.TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
+        store.record(fingerprint, "gw", net.pocvpn.client.transport.TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
 
         val bytesOnDisk = java.io.File(dir, "path_history.bin").readBytes()
         val onDiskText = String(bytesOnDisk, Charsets.ISO_8859_1)

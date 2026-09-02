@@ -19,12 +19,28 @@ sealed class PathCandidate {
     abstract val transport: TransportKind
     abstract val hops: List<PathHop>
 
+    /**
+     * B23 - the key [PathHistoryStore] local connection memory is recorded/
+     * read under for THIS candidate, network-fingerprint-scoped by the
+     * caller (see PathHistoryStore's own docs) - a single endpoint id for
+     * [Direct] (unchanged from B11/B19), or a composite "ingress->exit" id
+     * for [Relayed] so a relay's own local success/failure history is never
+     * confused with either hop's Direct history, and two relays sharing the
+     * same ingress but different exits are never conflated. Deliberately
+     * NOT [id] itself (which also encodes [transport] - the SAME transport
+     * pinned to a different, unrelated history entry per PathHistoryStore's
+     * own (fingerprint x pathId x transport) key shape would double-encode
+     * it).
+     */
+    abstract val historyPathId: String
+
     data class Direct(
         val gateway: PathHop,
         override val transport: TransportKind,
     ) : PathCandidate() {
         override val hops: List<PathHop> = listOf(gateway)
         override val id: String = "direct:${transport}:${gateway.endpoint.id.value}"
+        override val historyPathId: String = gateway.endpoint.id.value
     }
 
     data class Relayed(
@@ -34,6 +50,7 @@ sealed class PathCandidate {
     ) : PathCandidate() {
         override val hops: List<PathHop> = listOf(ingress, exit)
         override val id: String = "relayed:${transport}:${ingress.endpoint.id.value}->${exit.endpoint.id.value}"
+        override val historyPathId: String = "${ingress.endpoint.id.value}->${exit.endpoint.id.value}"
     }
 }
 

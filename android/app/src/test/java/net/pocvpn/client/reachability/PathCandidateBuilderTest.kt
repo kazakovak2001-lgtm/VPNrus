@@ -6,6 +6,7 @@ import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PathCandidateBuilderTest {
@@ -92,5 +93,56 @@ class PathCandidateBuilderTest {
         val b = PathCandidateBuilder.buildDirect(gateway, TransportKind.AMNEZIA_WG, reach(gateway.id, TransportKind.AMNEZIA_WG))
         assertEquals(a, b)
         assertEquals(a!!.id, b!!.id)
+    }
+
+    // --- B23: historyPathId / pinning ---
+
+    @Test
+    fun `Direct historyPathId is exactly the gateway endpoint id - unchanged from pre-B23 PathHistoryStore keys`() {
+        val candidate = PathCandidateBuilder.buildDirect(gateway, TransportKind.AMNEZIA_WG, reach(gateway.id, TransportKind.AMNEZIA_WG))!!
+        assertEquals("gw", candidate.historyPathId)
+    }
+
+    @Test
+    fun `Relayed historyPathId is a composite ingress-then-exit id, distinct from either hop's own Direct id`() {
+        val candidate = PathCandidateBuilder.buildRelayed(
+            ingress, exit, TransportKind.TLS_TCP,
+            reach(ingress.id, TransportKind.TLS_TCP),
+            reach(exit.id, TransportKind.AMNEZIA_WG),
+        )!!
+        assertEquals("in1->exit1", candidate.historyPathId)
+        assertTrue(candidate.historyPathId != ingress.id.value)
+        assertTrue(candidate.historyPathId != exit.id.value)
+    }
+
+    @Test
+    fun `two relays sharing the same ingress but different exits never share a historyPathId`() {
+        val exit2 = exit.copy(id = EndpointId("exit2"))
+        val ingressToExit2 = ingress.copy(relayTo = exit2.id)
+        val a = PathCandidateBuilder.buildRelayed(ingress, exit, TransportKind.TLS_TCP, reach(ingress.id, TransportKind.TLS_TCP), reach(exit.id, TransportKind.AMNEZIA_WG))!!
+        val b = PathCandidateBuilder.buildRelayed(ingressToExit2, exit2, TransportKind.TLS_TCP, reach(ingress.id, TransportKind.TLS_TCP), reach(exit2.id, TransportKind.AMNEZIA_WG))!!
+        assertTrue(a.historyPathId != b.historyPathId)
+    }
+
+    /**
+     * B23 - task requirement H10: a Relayed candidate's own pinned identity
+     * (the exact endpoint snapshot each hop was built from) cannot mutate
+     * mid-attempt just because a caller later resolves a DIFFERENT
+     * descriptor for the same endpoint id (e.g. a manifest refresh mid-way
+     * through one connection attempt) - same B16 pinning discipline already
+     * proven for Direct/GatewayAttemptCandidate.
+     */
+    @Test
+    fun `a built Relayed candidate keeps its own pinned endpoint snapshot even after a caller resolves a rotated descriptor for the same id`() {
+        val candidate = PathCandidateBuilder.buildRelayed(
+            ingress, exit, TransportKind.TLS_TCP,
+            reach(ingress.id, TransportKind.TLS_TCP),
+            reach(exit.id, TransportKind.AMNEZIA_WG),
+        )!!
+        val rotatedIngress = ingress.copy(transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.99", 8443)))
+
+        assertEquals("203.0.113.2", candidate.ingress.endpoint.bindingFor(TransportKind.TLS_TCP)!!.host)
+        assertEquals("203.0.113.99", rotatedIngress.bindingFor(TransportKind.TLS_TCP)!!.host)
+        assertEquals(candidate.id, PathCandidateBuilder.buildRelayed(ingress, exit, TransportKind.TLS_TCP, reach(ingress.id, TransportKind.TLS_TCP), reach(exit.id, TransportKind.AMNEZIA_WG))!!.id)
     }
 }

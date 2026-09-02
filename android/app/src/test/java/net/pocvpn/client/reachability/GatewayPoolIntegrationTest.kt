@@ -200,8 +200,8 @@ class GatewayPoolIntegrationTest {
     @Test
     fun `per-endpoint local network history is kept separate - success on A never credits B`() {
         val store = FilePathHistoryStore(java.nio.file.Files.createTempDirectory("gwpool").toFile())
-        store.record("fp-1", gatewayA.id, TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
-        assertTrue(store.get("fp-1", gatewayA.id, TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
-        assertEquals(null, store.get("fp-1", gatewayB.id, TransportKind.AMNEZIA_WG))
+        store.record("fp-1", gatewayA.id.value, TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
+        assertTrue(store.get("fp-1", gatewayA.id.value, TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
+        assertEquals(null, store.get("fp-1", gatewayB.id.value, TransportKind.AMNEZIA_WG))
     }
 }

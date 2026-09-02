@@ -1111,26 +1111,15 @@ class MainViewModel(
         // is deliberately disabled until a future slice defines a real
         // per-candidate reference. See docs/ROADMAP.md's own note.
         val scored = candidates.map { candidate ->
-            // B12 (PR #24 second audit fix) - exhaustive `when` over the
-            // sealed PathCandidate type, never an unchecked cast: PathScorer.score
-            // itself already accepts PathCandidate generically (it doesn't
-            // need hop-shape-specific data), so the ONLY reason to
-            // distinguish Direct/Relayed at all here is the history lookup
-            // below, which IS genuinely hop-shape-specific.
-            val history = when (candidate) {
-                is net.pocvpn.client.reachability.PathCandidate.Direct ->
-                    fingerprint?.let { pathHistoryStore?.get(it, candidate.gateway.endpoint.id, candidate.transport) }
-                // Deferred, not invented: FilePathHistoryStore is keyed
-                // networkFingerprint x endpointId x transportKind - a
-                // single endpoint id, which has no well-defined meaning yet
-                // for a multi-hop chain (the ingress? the exit? a
-                // synthetic composite key?). Rather than guess, a Relayed
-                // candidate simply carries no local history credit until a
-                // future slice deliberately designs that key - explicitly
-                // null, never a fabricated lookup against one hop that
-                // could misrepresent the OTHER hop's own history.
-                is net.pocvpn.client.reachability.PathCandidate.Relayed -> null
-            }
+            // B23 - PathHistoryStore is now keyed networkFingerprint x
+            // pathId x transportKind (pathId = PathCandidate.historyPathId -
+            // see that property's own docs), so a Relayed candidate gets its
+            // OWN composite "ingress->exit" history entry, never conflated
+            // with either hop's Direct history and never a fabricated
+            // single-hop lookup - the exact gap this call site previously
+            // deferred (see git history for the prior "deliberately null
+            // until a future slice designs that key" note this replaces).
+            val history = fingerprint?.let { pathHistoryStore?.get(it, candidate.historyPathId, candidate.transport) }
             // B13 SECOND consolidated review fix - THIS candidate's own
             // endpoint (the client-facing hop it actually executes against:
             // the gateway itself for Direct, the ingress for Relayed - the
@@ -1341,7 +1330,7 @@ class MainViewModel(
                 it.keyBytes(),
             )
         }
-        fingerprint?.let { pathHistoryStore?.record(it, endpointId, kind, success = success, nowEpochMillis = nowMs) }
+        fingerprint?.let { pathHistoryStore?.record(it, endpointId.value, kind, success = success, nowEpochMillis = nowMs) }
     }
 
     private val _publicKey = MutableStateFlow<String?>(null)

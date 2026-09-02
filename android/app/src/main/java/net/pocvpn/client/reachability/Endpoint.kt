@@ -37,6 +37,20 @@ enum class EndpointRole {
 }
 
 /**
+ * B23 - how the client actually reaches an INGRESS binding at the network
+ * level. A DIRECT_IP ingress is dialed by its own IP/host directly; a
+ * CDN_FRONTED ingress is an operator-controlled backend legitimately
+ * reachable through a CDN/origin architecture (never a spoof/impersonation
+ * of a named third-party service - architecture principle 3's own "do not
+ * impersonate" requirement). Deliberately only meaningful for INGRESS
+ * bindings - a GATEWAY/EXIT-only binding has no ingress-kind classification.
+ */
+enum class IngressKind { DIRECT_IP, CDN_FRONTED }
+
+/** B23 - the reserved [EndpointTransportBinding.metadata] key [ingressKind]/[withIngressKind] read/write - never touched directly by callers. */
+private const val INGRESS_KIND_METADATA_KEY = "ingressKind"
+
+/**
  * One transport this endpoint can be reached over, and the connection
  * metadata specific to that transport/endpoint pairing. [metadata] is a
  * generic, transport-specific string map (e.g. SNI, ALPN) - never key
@@ -55,6 +69,23 @@ data class EndpointTransportBinding(
         require(port in 1..65535) { "EndpointTransportBinding port out of range: $port" }
     }
 }
+
+/**
+ * B23 - the typed [IngressKind] this binding declares, or null when none was
+ * set (a GATEWAY/EXIT binding, or an INGRESS binding from before this field
+ * existed). Stored through [EndpointTransportBinding.metadata] rather than a
+ * new EndpointDescriptor/binary-schema field so every already-signed manifest
+ * (including the embedded production bootstrap - see EmbeddedBootstrapManifest)
+ * keeps verifying byte-for-byte against ManifestCanonicalizer with zero
+ * re-signing ceremony - metadata is already part of the signed wire format
+ * and already round-trips arbitrary string pairs.
+ */
+fun EndpointTransportBinding.ingressKind(): IngressKind? =
+    metadata[INGRESS_KIND_METADATA_KEY]?.let { raw -> IngressKind.entries.firstOrNull { it.name == raw } }
+
+/** B23 - returns a copy of this binding with [kind] recorded as its [IngressKind] (see [ingressKind]'s own docs). */
+fun EndpointTransportBinding.withIngressKind(kind: IngressKind): EndpointTransportBinding =
+    copy(metadata = metadata + (INGRESS_KIND_METADATA_KEY to kind.name))
 
 /**
  * Everything the reachability fabric can know about one endpoint. Deliberately

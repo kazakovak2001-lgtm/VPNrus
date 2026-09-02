@@ -916,7 +916,7 @@ class VpnController(
             CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
             keyProvider.keyBytes(),
         )
-        store.record(fingerprint, endpointId, kind, success, nowEpochMillis)
+        store.record(fingerprint, endpointId.value, kind, success, nowEpochMillis)
     }
 
     /**

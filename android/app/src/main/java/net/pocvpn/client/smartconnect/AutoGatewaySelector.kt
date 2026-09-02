@@ -3,6 +3,7 @@ package net.pocvpn.client.smartconnect
 import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
+import net.pocvpn.client.reachability.EndpointRole
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.PathCandidate
 import net.pocvpn.client.reachability.PathCandidateBuilder
@@ -113,7 +114,12 @@ object AutoGatewaySelector {
         xrayTlsAvailableFor: (EndpointId) -> Boolean,
         reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability,
         transportHealthFor: (TransportKind) -> TransportHealth,
-        historyFor: (EndpointId, TransportKind) -> PathHistoryEntry?,
+        // B23 - widened from (EndpointId, TransportKind) to (String, TransportKind):
+        // keyed by PathCandidate.historyPathId now, never a raw EndpointId directly -
+        // see that property's own docs. For every Direct candidate this call site
+        // still passes exactly `endpoint.id.value`, byte-for-byte the same key as
+        // before this change.
+        historyFor: (String, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
         // B19 - threaded straight into PathScorer.score's own bounded,
         // time-decaying cooldown penalty (see that function's own docs).
@@ -176,7 +182,7 @@ object AutoGatewaySelector {
                     val kind = binding.kind
                     val candidate = PathCandidateBuilder.buildDirect(endpoint, kind, reachabilityFor(gateway.endpointId, kind)) ?: return@forEach
                     val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
-                    prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(gateway.endpointId, kind), diversityKey)
+                    prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(candidate.historyPathId, kind), diversityKey)
                 }
         }
 
@@ -295,5 +301,122 @@ object AutoGatewaySelector {
     ): GatewayAttemptCandidate? {
         if (attempted.size >= MAX_ATTEMPTS) return null
         return candidates.firstOrNull { (it.gatewayId to it.transport) !in attempted }
+    }
+
+    /**
+     * B23 - one ranked, real candidate to attempt a RELAYED path (client ->
+     * [ingressEndpointId] -> [exitEndpointId]) through, over [transport].
+     * Deliberately has NO [ProductionGatewayId]/[GatewayConfigSnapshot] -
+     * unlike [GatewayAttemptCandidate], which is pinned against this
+     * codebase's real, provisioned AWG gateway catalog, a relayed candidate
+     * requires no such per-device provisioning (task's own "no RU ingress
+     * provisioning in this slice" - an ingress named only in the trusted
+     * manifest is exactly what this models). [score]/[reasons] come straight
+     * from [PathScorer.score], never a second/parallel scoring rule.
+     */
+    data class RelayAttemptCandidate(
+        val ingressEndpointId: EndpointId,
+        val exitEndpointId: EndpointId,
+        val transport: TransportKind,
+        val ingressRegion: String,
+        val exitRegion: String,
+        val score: Long,
+        val reasons: List<String>,
+    )
+
+    /**
+     * B23 - the real relayed-path counterpart of [buildCandidates], promoting
+     * [PathCandidateBuilder.buildRelayed]/[PathScorer] (the SAME reachability/
+     * scoring pipeline every Direct candidate already goes through - never a
+     * parallel engine) into a genuine, callable decision surface on THIS
+     * object - the one [buildCandidates] itself already documents as "the
+     * real Auto decision path".
+     *
+     * Discovery is manifest-only (task requirement 9.D's own fail-closed
+     * discipline, same as [buildCandidates]): an INGRESS endpoint not also
+     * present in [manifestEndpoints] with a valid `relayTo` EXIT/GATEWAY
+     * target never becomes a candidate - [PathCandidateBuilder.buildRelayed]
+     * itself is the sole authority on what counts as a legitimate chain (see
+     * that function's own docs). Unlike [buildCandidates], this never
+     * consults [ProductionGatewayCatalog]/per-device provisioning: an ingress
+     * has no such catalog entry to look up (no real RU ingress is deployed by
+     * this slice), so eligibility here rests entirely on the manifest's own
+     * facts plus real reachability/health/history evidence - never a
+     * fabricated "reachable because it's named" default (UNKNOWN reachability
+     * is never treated as UNREACHABLE, same discipline as [buildCandidates]:
+     * [PathScorer]'s reachability tier already ranks UNKNOWN strictly below
+     * REACHABLE, so a healthy proven Direct/relay candidate elsewhere in the
+     * same ranked set is never displaced by an unproven one just because it
+     * is relayed - task requirement E's own "must not beat a healthy Direct
+     * candidate simply because it is relayed").
+     *
+     * Execution of a winning [RelayAttemptCandidate] (actually dialing
+     * client->ingress->exit) is intentionally NOT wired into
+     * MainViewModel/VpnController by this slice - see PROJECT_ARCHITECTURE.md's
+     * "Restricted-Network / Whitelist Bridge Runtime Foundation (B23)"
+     * section for why: with no real ingress deployed, wiring an execution
+     * path here would be dead code no physical test could exercise (task's
+     * own "do not simulate a successful relay" / "keep the final data-plane
+     * portion FOUNDATION").
+     */
+    fun buildRelayedCandidates(
+        manifestEndpoints: List<EndpointDescriptor>,
+        registryFor: (EndpointId) -> TransportRegistry,
+        reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability,
+        transportHealthFor: (TransportKind) -> TransportHealth,
+        historyFor: (String, TransportKind) -> PathHistoryEntry?,
+        preference: UserTransportPreference = UserTransportPreference.Auto,
+        nowEpochMillis: Long = Long.MAX_VALUE,
+    ): List<RelayAttemptCandidate> {
+        val byId = manifestEndpoints.associateBy { it.id }
+        val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
+
+        val scored = mutableListOf<Pair<PathScorer.PathScoreResult, PathCandidate.Relayed>>()
+        manifestEndpoints.forEach { ingress ->
+            if (EndpointRole.INGRESS !in ingress.roles) return@forEach
+            val exit = ingress.relayTo?.let { byId[it] } ?: return@forEach
+            val registry = registryFor(ingress.id)
+            ingress.transports
+                .filter { pinnedKind == null || it.kind == pinnedKind }
+                .forEach { binding ->
+                    val kind = binding.kind
+                    val candidate = PathCandidateBuilder.buildRelayed(
+                        ingress = ingress,
+                        exit = exit,
+                        transport = kind,
+                        ingressReachability = reachabilityFor(ingress.id, kind),
+                        exitReachability = reachabilityFor(exit.id, kind),
+                    ) ?: return@forEach
+                    val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
+                    val result = PathScorer.score(
+                        candidate = candidate,
+                        registry = registry,
+                        capabilities = capabilities,
+                        transportHealth = transportHealthFor(kind),
+                        history = historyFor(candidate.historyPathId, kind),
+                        // B23 - no per-candidate diversity reference exists here either,
+                        // same deliberate omission [MainViewModel.reachabilityDiagnostics]
+                        // already documents for the identical reason (PathScorer's own
+                        // parameter stays real/tested - see PathScorerTest - only this
+                        // call site has nothing meaningful to diff against yet).
+                        diverseProviderOrAsnSeenElsewhere = false,
+                        nowEpochMillis = nowEpochMillis,
+                    )
+                    if (result.eligible) scored += result to candidate
+                }
+        }
+
+        return PathScorer.rank(scored.map { it.first }).mapNotNull { result ->
+            val (_, candidate) = scored.first { it.first === result }
+            RelayAttemptCandidate(
+                ingressEndpointId = candidate.ingress.endpoint.id,
+                exitEndpointId = candidate.exit.endpoint.id,
+                transport = result.candidate.transport,
+                ingressRegion = candidate.ingress.endpoint.region,
+                exitRegion = candidate.exit.endpoint.region,
+                score = result.score,
+                reasons = result.reasons,
+            )
+        }
     }
 }
