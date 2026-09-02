@@ -42,6 +42,7 @@ from . import xray_provisioning
 # Android side exactly (Android's own regex is also case-insensitive).
 _SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
 _REALITY_PRIVATE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 class XrayConfigRenderError(Exception):
@@ -215,7 +216,13 @@ def _render_tls_inbound(clients, tls):
     }
 
 
-def render_server_config(activations_data, xray_data, reality, tls=None, flow=""):
+def _validate_static_clients(static_clients):
+    for client in static_clients:
+        if not _UUID_RE.match(client.vless_uuid):
+            raise XrayConfigRenderError(f"static client has a malformed vless_uuid: {client.vless_uuid!r}")
+
+
+def render_server_config(activations_data, xray_data, reality, tls=None, flow="", static_clients=()):
     """Pure function: (parsed activations store, parsed xray identity
     store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
     server config dict, ready for json.dumps. Deterministic - same inputs
@@ -226,12 +233,27 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     independent inbound on its own port (see
     docs/B8O1A_TLS_GATEWAY_INBOUND_AUDIT.md for why REALITY and TLS require
     separate xray-core inbounds, never a shared one), sharing the SAME
-    active-client list [_active_clients] computes once."""
+    active-client list [_active_clients] computes once.
+
+    B25 (task H) - [static_clients] is an ADDITIVE, empty-by-default tuple
+    of [RenderedClient] entries authorized on THIS EXIT unconditionally -
+    i.e. NEVER cross-referenced against activations_data/revocation, unlike
+    every other client (see [_active_clients]'s own docs). This is the
+    genuinely infra-level trust an ingress->exit relay identity needs
+    (task requirement H's own "dedicated ingress->exit identity,
+    authenticated on EXIT, never source-IP-only trust"): a relay's right to
+    forward traffic is an operator-provisioned INFRASTRUCTURE relationship
+    between two deployed hosts, not a per-user entitlement activations.py
+    tracks - so it is deliberately never revoked by a USER'S activation
+    expiring/being revoked. Every pre-B25 caller passes nothing here and
+    is byte-for-byte unaffected (empty tuple -> no static clients appended,
+    identical output to before this parameter existed)."""
     _validate_reality_server_config(reality)
     if tls is not None:
         _validate_tls_server_config(tls)
+    _validate_static_clients(static_clients)
 
-    clients = _active_clients(activations_data, xray_data)
+    clients = _active_clients(activations_data, xray_data) + list(static_clients)
 
     inbounds = [_render_reality_inbound(clients, reality, flow)]
     if tls is not None:
@@ -246,15 +268,26 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow=""):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow="", static_clients=()):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
     outside the config file itself. TLS's own inbound carries no secret
     value at all (cert_file/key_file are non-secret file paths), so nothing
-    else needs redacting there."""
-    full = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow)
+    else needs redacting there.
+
+    B25 (task H/M) - every [static_clients] uuid is ALSO redacted in every
+    inbound's client list (an infra-level relay identity is exactly as
+    secret as an ordinary device's vless uuid - never distinguishable in a
+    log/diagnostic dump)."""
+    full = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow, static_clients=static_clients)
     full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
+    static_uuids = {client.vless_uuid for client in static_clients}
+    if static_uuids:
+        for inbound in full["inbounds"]:
+            for entry in inbound["settings"]["clients"]:
+                if entry["id"] in static_uuids:
+                    entry["id"] = "<redacted-relay-identity>"
     return full
 
 

@@ -34,7 +34,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, provision, tokens, xray_activation, xray_provisioning
+from . import activations, ingress_activation, provision, tokens, xray_activation, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -42,6 +42,7 @@ logger = logging.getLogger("pocvpn.api")
 _PATH_PEERS = "/v1/peers"
 _PATH_ACTIVATE = "/v1/activate"
 _PATH_XRAY_PROFILE = "/v1/xray-profile"
+_PATH_INGRESS_PROFILE = "/v1/ingress-profile"
 _PATH_MANIFEST = "/v1/manifest"
 _MAX_BODY_BYTES = 1024
 _MAX_MANIFEST_BYTES = 1_000_000
@@ -143,6 +144,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_xray_profile()
+            elif self.path == _PATH_INGRESS_PROFILE:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_ingress_profile()
             elif self.path == _PATH_MANIFEST:
                 if method != "GET":
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
@@ -501,6 +507,126 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # "success" here, same rule /v1/activate already uses for its own
         # new-bind-vs-existing-bind distinction - but ONLY once activation
         # is confirmed (see the check above).
+        return self._success(HTTPStatus.OK, payload)
+
+    # --- POST /v1/ingress-profile (B25 task G) ---
+    def _handle_ingress_profile(self):
+        try:
+            return self._handle_ingress_profile_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_ingress_profile_inner(self):
+        """B25 (task G) - the ingress-role counterpart of
+        _handle_xray_profile_inner: SAME activation credential/device
+        public key, SAME activations.py entitlement decision, SAME
+        xray_provisioning.py identity store (task G's own "reuse existing
+        activation authentication, revocation and quota discipline" - no
+        second identity system for an ingress). Reachable ONLY on a
+        deployment instance whose ingress_config is configured (see
+        ingress_config.load_ingress_config's own docs) - every ordinary
+        gateway deployment (self.server.ingress_config is None) gets 503,
+        exactly like every other not-configured endpoint.
+
+        The response is CLIENT-SAFE ONLY: ingress host/port, this device's
+        own vless uuid, the client-facing REALITY/TLS public connection
+        facts, and a profile_version/issued_at/expires_at window - NEVER
+        the ingress's own REALITY private key, NEVER the ingress->exit
+        upstream relay uuid, NEVER another device's credential (task
+        requirement G/M's own exclusion list).
+        """
+        ingress_cfg = self.server.ingress_config
+        if ingress_cfg is None:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        credential = self._require_bearer_token()
+
+        raw_body = self.rfile.read(content_length)
+        public_key, transport = self._parse_and_validate_xray_profile_body(raw_body)
+        self._log_fields["pubkey_prefix"] = public_key[:8]
+        self._log_fields["ingress_transport"] = transport
+        self._log_fields["ingress_endpoint_id"] = ingress_cfg.ingress_endpoint_id
+
+        if transport == "tls" and not ingress_cfg.ingress_tls_server_port:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_tls_not_configured")
+
+        credential_digest = activations.credential_digest(credential)
+        self._log_fields["activation_digest"] = credential_digest[:8]
+
+        if not self.server.per_token_limiter.allow(credential_digest):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        try:
+            result = ingress_activation.provision_and_activate(credential, public_key, ingress_cfg)
+        except xray_provisioning.XrayStoreError:
+            logger.error("ingress_store_error")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_store_unavailable")
+        except ingress_activation.IngressActivationNotConfigured:
+            logger.error("ingress_activation_not_configured")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_not_configured")
+
+        identity_outcome = result.identity_outcome
+        self._log_fields["ingress_outcome"] = identity_outcome.outcome
+
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_UNKNOWN:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_REVOKED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_EXPIRED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_not_bound")
+
+        self._log_fields["ingress_activated"] = bool(result.activated)
+        if not result.activated:
+            error = result.activation_error
+            kind = getattr(error, "kind", "internal")
+            logger.error("ingress_activation_failed kind=%s", kind)
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_activation_failed")
+
+        issued_at_epoch_seconds = int(time.time())
+        expires_at_epoch_seconds = (
+            issued_at_epoch_seconds + ingress_cfg.ingress_profile_ttl_seconds
+            if ingress_cfg.ingress_profile_ttl_seconds
+            else None
+        )
+
+        if transport == "tls":
+            payload = {
+                "ingress_endpoint_id": ingress_cfg.ingress_endpoint_id,
+                "server_address": ingress_cfg.ingress_endpoint_host,
+                "server_port": ingress_cfg.ingress_tls_server_port,
+                "uuid": identity_outcome.vless_uuid,
+                "server_name": ingress_cfg.ingress_tls_server_name,
+                "fingerprint": ingress_cfg.ingress_tls_fingerprint,
+            }
+        else:
+            payload = {
+                "ingress_endpoint_id": ingress_cfg.ingress_endpoint_id,
+                "server_address": ingress_cfg.ingress_endpoint_host,
+                "server_port": ingress_cfg.ingress_server_port,
+                "uuid": identity_outcome.vless_uuid,
+                "flow": ingress_cfg.ingress_flow,
+                "server_name": ingress_cfg.ingress_server_name,
+                "fingerprint": ingress_cfg.ingress_fingerprint,
+                "reality_public_key": ingress_cfg.ingress_reality_public_key,
+                "short_id": ingress_cfg.ingress_short_id,
+            }
+        payload["profile_version"] = 1
+        payload["issued_at"] = issued_at_epoch_seconds
+        payload["expires_at"] = expires_at_epoch_seconds
         return self._success(HTTPStatus.OK, payload)
 
     # --- GET /v1/manifest (B12) ---

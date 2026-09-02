@@ -123,9 +123,11 @@ class RelayExecutionTest {
     // --- B24 review fix (PR #38, round 3) - RelayIngressResolver is a preparation boundary only ---
 
     @Test
-    fun `RelayIngressResolution carries no state of its own - Resolved is only a transport and a kind, never an outcome`() {
+    fun `RelayIngressResolution carries no state of its own - Resolved is only a transport, a kind, and the matched profile, never an outcome`() {
+        val p = plan(ingressTransport = TransportKind.TLS_TCP)
         val transport = net.pocvpn.client.vpn.FakeVpnTransport(kind = TransportKind.TLS_TCP)
-        val resolution = RelayIngressResolution.Resolved(transport, TransportKind.TLS_TCP)
+        val profile = fakeIngressClientProfile(p)
+        val resolution = RelayIngressResolution.Resolved(transport, TransportKind.TLS_TCP, profile)
         // Structurally: Resolved has no `outcome`/`isHealthy`/`state` field
         // to read - the only way to learn what happened is to actually
         // dial `resolution.transport` through the real
@@ -133,5 +135,50 @@ class RelayExecutionTest {
         // controller.state, exactly like a Direct candidate.
         assertEquals(transport, resolution.transport)
         assertEquals(TransportKind.TLS_TCP, resolution.kind)
+        assertEquals(profile, resolution.profile)
     }
 }
+
+/** Shared test fixture - a structurally-valid [IngressClientProfile] matching [plan]. */
+internal fun fakeIngressClientProfile(
+    plan: RelayedExecutionPlan,
+    profileVersion: Int = 1,
+    issuedAtEpochMillis: Long = 0L,
+    expiresAtEpochMillis: Long? = null,
+    endToEndProbeUrl: String? = "https://exit.example/v1/relay-health",
+    endToEndProbeToken: String? = "test-token",
+): IngressClientProfile = IngressClientProfile(
+    ingressEndpointId = plan.ingressEndpointId,
+    ingressBinding = plan.ingressBinding,
+    transport = plan.ingressTransport,
+    realityProfile = if (plan.ingressTransport == TransportKind.XRAY_REALITY) {
+        net.pocvpn.client.identity.XrayProfile(
+            server = plan.ingressBinding.host,
+            serverPort = plan.ingressBinding.port,
+            uuid = "11111111-1111-1111-1111-111111111111",
+            flow = "",
+            serverName = "example.com",
+            fingerprint = "chrome",
+            realityPublicKey = "A".repeat(43),
+            shortId = "ab",
+        )
+    } else {
+        null
+    },
+    tlsProfile = if (plan.ingressTransport == TransportKind.TLS_TCP) {
+        net.pocvpn.client.identity.XrayTlsProfile(
+            server = plan.ingressBinding.host,
+            serverPort = plan.ingressBinding.port,
+            uuid = "22222222-2222-2222-2222-222222222222",
+            serverName = "example.com",
+            fingerprint = "chrome",
+        )
+    } else {
+        null
+    },
+    profileVersion = profileVersion,
+    issuedAtEpochMillis = issuedAtEpochMillis,
+    expiresAtEpochMillis = expiresAtEpochMillis,
+    endToEndProbeUrl = endToEndProbeUrl,
+    endToEndProbeToken = endToEndProbeToken,
+)

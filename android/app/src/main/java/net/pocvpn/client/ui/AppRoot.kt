@@ -66,6 +66,10 @@ fun AppRoot(
 ) {
     val profileSource by viewModel.profileSource.collectAsStateWithLifecycle()
     val transportState by viewModel.transportState.collectAsStateWithLifecycle()
+    // B25 (task B) - the Protected-gating-aware signal Home should render
+    // from - see VpnSessionHealth's own docs for why this is not merely a
+    // second, possibly-diverging copy of transportState for Direct sessions.
+    val sessionHealth by viewModel.sessionHealth.collectAsStateWithLifecycle()
     val provisioningState by viewModel.provisioningState.collectAsStateWithLifecycle()
     val publicKey by viewModel.publicKey.collectAsStateWithLifecycle()
     val diagnosticsSnapshot by viewModel.diagnostics.collectAsStateWithLifecycle()
@@ -183,8 +187,8 @@ fun AppRoot(
                     onBack = { settingsRoute = null },
                 )
                 else -> HomeScreen(
-                    visualState = transportState.toHomeVisualState(),
-                    statusHeadline = transportState.toHomeStatusText(),
+                    visualState = sessionHealth.toHomeVisualState(),
+                    statusHeadline = sessionHealth.toHomeStatusText(),
                     onPowerButtonClick = {
                         if (transportState.isConnectedOrConnecting()) viewModel.disconnect() else viewModel.connect()
                     },

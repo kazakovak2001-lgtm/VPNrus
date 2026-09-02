@@ -294,9 +294,9 @@ class RunningServer:
     """A real ProvisioningServer bound to 127.0.0.1:<ephemeral>, serving in
     a background thread for the duration of a test."""
 
-    def __init__(self, app_config):
+    def __init__(self, app_config, ingress_config=None):
         self.app_config = app_config
-        self.srv = server_module.build_server(app_config)
+        self.srv = server_module.build_server(app_config, ingress_config)
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
 
@@ -312,3 +312,73 @@ class RunningServer:
         self.srv.shutdown()
         self.srv.server_close()
         self.thread.join(timeout=5)
+
+
+def make_ingress_config(tmp_dir, **overrides):
+    """B25 (task G/I) - a fully-valid IngressAppConfig for tests, mirroring
+    make_xray_app_config's own "representative, non-secret-real values"
+    convention. Initializes its OWN independent activation/xray-identity
+    stores and activation lock (never shares a gateway's own stores)."""
+    from api import activations as activations_module
+    from api import ingress_config as ingress_config_module
+    from api import xray_activation as xray_activation_module
+    from api import xray_provisioning as xray_provisioning_module
+
+    activation_store_path = overrides.pop("activation_store_path", os.path.join(tmp_dir, "ingress-activations.json"))
+    activation_lock_path = overrides.pop("activation_lock_path", os.path.join(tmp_dir, ".ingress-activations.lock"))
+    activations_module.init_store(activation_store_path, activation_lock_path)
+
+    xray_store_path = overrides.pop("xray_store_path", os.path.join(tmp_dir, "ingress-identities.json"))
+    xray_lock_path = overrides.pop("xray_lock_path", os.path.join(tmp_dir, ".ingress-identities.lock"))
+    xray_provisioning_module.init_store(xray_store_path, xray_lock_path)
+
+    ingress_activation_lock_path = overrides.pop(
+        "ingress_activation_lock_path", os.path.join(tmp_dir, ".ingress-activation-global.lock"),
+    )
+    xray_activation_module.init_activation_lock(ingress_activation_lock_path)
+
+    reality_key_file = overrides.pop("ingress_reality_private_key_file", None)
+    if reality_key_file is None:
+        reality_key_file = os.path.join(tmp_dir, "ingress-reality-private-key.txt")
+        with open(reality_key_file, "w", encoding="utf-8") as handle:
+            handle.write("C" * 43)
+
+    upstream_uuid_file = overrides.pop("ingress_upstream_uuid_file", None)
+    if upstream_uuid_file is None:
+        upstream_uuid_file = os.path.join(tmp_dir, "upstream-relay-uuid.txt")
+        with open(upstream_uuid_file, "w", encoding="utf-8") as handle:
+            handle.write("22222222-2222-2222-2222-222222222222")
+
+    wrapper_path = overrides.pop("ingress_activation_wrapper_path", None)
+    if wrapper_path is None:
+        wrapper_path = write_fake_xray_wrapper(tmp_dir)
+
+    defaults = dict(
+        ingress_endpoint_id="ru-ingress-1",
+        ingress_endpoint_host="203.0.113.50",
+        ingress_reality_private_key_file=reality_key_file,
+        ingress_server_port=8444,
+        ingress_server_name="www.microsoft.com",
+        ingress_dest="www.microsoft.com:443",
+        ingress_short_id="ab12cd34",
+        ingress_fingerprint="chrome",
+        ingress_reality_public_key="A" * 43,
+        ingress_flow="xtls-rprx-vision",
+        ingress_upstream_host="203.0.113.60",
+        ingress_upstream_port=8444,
+        ingress_upstream_transport="reality",
+        ingress_upstream_uuid_file=upstream_uuid_file,
+        ingress_upstream_server_name="www.apple.com",
+        ingress_upstream_public_key="B" * 43,
+        ingress_upstream_short_id="ef56ab78",
+        activation_store_path=activation_store_path,
+        activation_lock_path=activation_lock_path,
+        xray_store_path=xray_store_path,
+        xray_lock_path=xray_lock_path,
+        ingress_activation_wrapper_path=wrapper_path,
+        ingress_staging_config_path=os.path.join(tmp_dir, "ingress-candidate-config.json"),
+        ingress_activation_lock_path=ingress_activation_lock_path,
+        ingress_activation_last_hash_path=os.path.join(tmp_dir, ".ingress-last-hash"),
+    )
+    defaults.update(overrides)
+    return ingress_config_module.IngressAppConfig(**defaults)

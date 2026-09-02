@@ -27,6 +27,8 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
 import net.pocvpn.client.reachability.NetworkFingerprinter
 import net.pocvpn.client.reachability.PathHistoryStore
+import net.pocvpn.client.relay.RelayReadinessStage
+import net.pocvpn.client.relay.VpnAttemptContext
 import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
@@ -178,6 +180,25 @@ class VpnController(
     private val xrayTlsProfileRepositoryResolver: XrayTlsProfileRepositoryResolver? = xrayTlsProfileRepository?.let { repo ->
         XrayTlsProfileRepositoryResolver { id -> if (id == EndpointId(ProductionGateway.ID)) repo else null }
     },
+    // B25 (task A/F) - a SEPARATE, additive resolver consulted ONLY when
+    // [pendingAttemptContext] is [VpnAttemptContext.Relayed] (see
+    // buildTransportConfig's own docs) - never consulted for a Direct
+    // attempt, so [xrayProfileRepositoryResolver]/[xrayTlsProfileRepositoryResolver]'s
+    // existing germany/stockholm-only behavior is completely unaffected by
+    // this param's presence. Defaults to null (every pre-B25 caller, and
+    // every caller that never wires real ingress provisioning, is
+    // byte-for-byte unaffected - a relayed attempt simply fails closed with
+    // [net.pocvpn.client.diagnostics.VpnError.ConfigurationMappingFailure],
+    // same as an unresolvable Direct endpoint already does). When wired
+    // (MainViewModel's Factory), this resolves ANY endpoint id via the SAME
+    // [net.pocvpn.client.identity.XrayProfileRepositoryFactory] convention
+    // [net.pocvpn.client.vpn.VlessRealityTransport]'s own default already
+    // uses - the exact per-endpoint file
+    // [net.pocvpn.client.relay.RelayIngressResolverImpl] already wrote the
+    // matched ingress profile into for THIS SAME attempt, never a second/
+    // independent lookup.
+    private val relayXrayProfileRepositoryResolver: XrayProfileRepositoryResolver? = null,
+    private val relayXrayTlsProfileRepositoryResolver: XrayTlsProfileRepositoryResolver? = null,
     // B13 - additive, defaults to null (same reasoning as connectionOutcomeStore
     // above): with any of the three below missing, recordPathHistory() is a
     // no-op - real live-wiring is opt-in per the SAME "no wiring, no
@@ -216,8 +237,14 @@ class VpnController(
         // composition root that never bothers with the legacy flat field) -
         // "is Xray configured at all for this controller instance" must not
         // go false just because the flat field is absent.
-        if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
-        if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
+        // B25 (task A/F) - also true whenever ONLY the relay-specific
+        // resolver was wired (a relay-only composition root that never
+        // wires the Direct-mode germany/stockholm map at all) - a resolved
+        // relayed XRAY_REALITY/TLS_TCP candidate must not be refused here
+        // before buildTransportConfig ever gets a chance to consult
+        // [relayXrayProfileRepositoryResolver]/[relayXrayTlsProfileRepositoryResolver].
+        if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null || relayXrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
+        if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null || relayXrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -232,6 +259,53 @@ class VpnController(
 
     private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
     val state: StateFlow<TransportState> = _state.asStateFlow()
+
+    // B25 (task A) - the real, typed session identity THIS attempt (or the
+    // most recent one) carries - see [VpnAttemptContext]'s own docs. Same
+    // "pinned once at connect(), reset on disconnect()" lifecycle as
+    // [pendingConnectEndpointId]/[pendingConnectKind]. @Volatile because
+    // [sessionHealth]'s recomputation (triggered from [setState]/
+    // [reportRelayStage]) may run on the SAME thread that just wrote this
+    // under [connectMutex] in the common case, but must never observe a
+    // torn/stale value if it doesn't.
+    @Volatile private var pendingAttemptContext: VpnAttemptContext = VpnAttemptContext.Direct
+
+    // B25 (task B/C) - the highest real [RelayReadinessStage] confirmed for
+    // the CURRENT relayed attempt, reported ONLY by the caller that owns
+    // relay-specific policy (MainViewModel.armFailoverWatch - see that
+    // function's own docs) via [reportRelayStage]. null for every Direct
+    // attempt and before any relay evidence exists - [computeSessionHealth]
+    // treats null the same as [RelayReadinessStage.INGRESS_HANDSHAKE_OK]
+    // once [TransportState.Connected] is real (see that function's own
+    // docs), so a relayed session can never read as Protected merely
+    // because this hasn't been reported yet.
+    private val _relayStage = MutableStateFlow<RelayReadinessStage?>(null)
+
+    // B25 (task B) - the ONE authoritative Protected-gating signal UI code
+    // must read instead of deriving "Protected" directly from [state] (see
+    // this type's own docs). Recomputed, from [state]/[pendingAttemptContext]/
+    // [_relayStage] together, every time any of those three can change -
+    // never partially stale.
+    private val _sessionHealth = MutableStateFlow<VpnSessionHealth>(VpnSessionHealth.Idle)
+    val sessionHealth: StateFlow<VpnSessionHealth> = _sessionHealth.asStateFlow()
+
+    private fun recomputeSessionHealth() {
+        _sessionHealth.value = computeSessionHealth(_state.value, pendingAttemptContext, _relayStage.value)
+    }
+
+    /**
+     * B25 (task B/C) - the ONE place [_relayStage] is ever written, called
+     * ONLY by the real relay-policy owner (MainViewModel.armFailoverWatch)
+     * from real evidence (a genuine [TransportState.Connected] observation
+     * for the ingress hop, or a real [net.pocvpn.client.relay.RelayEndToEndProbe]
+     * result) - never speculatively, never to represent a merely-attempted
+     * stage. A no-op call with the SAME stage the current attempt already
+     * reported is harmless (StateFlow itself dedupes equal values).
+     */
+    fun reportRelayStage(stage: RelayReadinessStage?) {
+        _relayStage.value = stage
+        recomputeSessionHealth()
+    }
 
     /**
      * B8O3 - the ONE place [_state] is ever assigned (every direct
@@ -253,6 +327,7 @@ class VpnController(
     private fun setState(newState: TransportState) {
         _state.value = newState
         _currentTransportKind.value = if (isRunningTransportState(newState)) pendingConnectKind else null
+        recomputeSessionHealth()
     }
 
     private val _events = MutableSharedFlow<ControllerEvent>(extraBufferCapacity = 1)
@@ -487,6 +562,14 @@ class VpnController(
             // [resolveGatewayConfiguration]'s own docs). null for manual mode.
             pendingConnectConfig = resolved.gatewayConfigSnapshot
             pendingConnectPrivateKeyRepository = resolved.privateKeyRepository
+            // B25 (task A/B) - pinned exactly once, here, before permission
+            // is even requested - never re-derived later in this same
+            // attempt (same discipline as pendingConnectConfig above).
+            // _relayStage is reset so a PRIOR relayed attempt's stage can
+            // never leak into this one's sessionHealth computation.
+            pendingAttemptContext = resolved.attemptContext
+            _relayStage.value = null
+            recomputeSessionHealth()
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -548,6 +631,13 @@ class VpnController(
             // for manual mode) before it is ever read again.
             pendingConnectConfig = null
             pendingConnectPrivateKeyRepository = null
+            // B25 - the session that owned this context/stage is gone; the
+            // NEXT connect() always pins these fresh (see connect()'s own
+            // docs) - never left to linger and be read by sessionHealth for
+            // a request nothing is acting on any more.
+            pendingAttemptContext = VpnAttemptContext.Direct
+            _relayStage.value = null
+            recomputeSessionHealth()
         }
     }
 
@@ -675,8 +765,20 @@ class VpnController(
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Backend failed to start"))
-                    recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.BACKEND_START_FAILURE, attemptStartEpochMillis)
-                    recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                    // B25 (task D fix) - a relayed attempt's outcome is
+                    // recorded EXCLUSIVELY by MainViewModel.recordRelayOutcome
+                    // under the FULL historyPathId (see that function's own
+                    // docs) - this generic per-kind/per-endpoint recording
+                    // must never ALSO fire for one, which would otherwise
+                    // write a separate, single-hop record keyed by the bare
+                    // ingress endpoint id (the exact B24-documented gap this
+                    // fixes - see PROJECT_ARCHITECTURE.md's B24 section).
+                    // Unaffected for every Direct/manual/private-gateway
+                    // attempt (pendingAttemptContext is always Direct there).
+                    if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
+                        recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.BACKEND_START_FAILURE, attemptStartEpochMillis)
+                        recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                    }
                     false
                 }
             }
@@ -781,7 +883,11 @@ class VpnController(
                 // the endpoint id named explicitly, never a silent fallback
                 // to whatever the production endpoint's repository happens
                 // to be.
-                val resolver = xrayProfileRepositoryResolver
+                // B25 (task A/F) - a relayed attempt resolves through the
+                // SEPARATE [relayXrayProfileRepositoryResolver] (never the
+                // Direct-only germany/stockholm map) - see that field's own
+                // docs.
+                val resolver = (if (pendingAttemptContext is VpnAttemptContext.Relayed) relayXrayProfileRepositoryResolver else xrayProfileRepositoryResolver)
                     ?: throw XrayProfileNotReadyException("Xray profile repository not wired")
                 val repository = resolver.resolve(pendingConnectEndpointId)
                     ?: throw XrayProfileNotReadyException("no Xray profile repository configured for endpoint ${pendingConnectEndpointId.value}")
@@ -794,7 +900,7 @@ class VpnController(
                 // B8O2/B13 - same reasoning as XRAY_REALITY above, against the
                 // TLS profile repository resolver instead. Unreachable
                 // unless xrayTlsProfileRepositoryResolver != null.
-                val resolver = xrayTlsProfileRepositoryResolver
+                val resolver = (if (pendingAttemptContext is VpnAttemptContext.Relayed) relayXrayTlsProfileRepositoryResolver else xrayTlsProfileRepositoryResolver)
                     ?: throw XrayProfileNotReadyException("Xray TLS profile repository not wired")
                 val repository = resolver.resolve(pendingConnectEndpointId)
                     ?: throw XrayProfileNotReadyException("no Xray TLS profile repository configured for endpoint ${pendingConnectEndpointId.value}")

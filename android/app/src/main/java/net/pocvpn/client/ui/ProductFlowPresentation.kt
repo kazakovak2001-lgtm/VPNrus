@@ -2,6 +2,7 @@ package net.pocvpn.client.ui
 
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.VpnSessionHealth
 import net.pocvpn.client.vpn.config.ProfileSource
 import net.pocvpn.client.vpn.policy.AppRoutingMode
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
@@ -47,6 +48,36 @@ fun TransportState.toHomeStatusText(): String = when (this) {
     is TransportState.Reconnecting -> "Reconnecting…"
     is TransportState.Error -> "Connection failed"
     is TransportState.HandshakeFailed -> "Connection failed"
+}
+
+/**
+ * B25 (task B) - the Protected-gating-aware counterpart of
+ * [TransportState.toHomeStatusText]: dispatches on [VpnSessionHealth]
+ * instead of a raw [TransportState], so a relayed session mid-handshake
+ * (real [TransportState.Connected] for the ingress hop, but no real
+ * end-to-end proof yet - see that type's own docs) never reads "Protected".
+ * For every Direct/manual/private-gateway attempt this produces the
+ * IDENTICAL text [TransportState.toHomeStatusText] always has - [VpnSessionHealth
+ * .DirectProtected] is reached under EXACTLY the same condition
+ * [TransportState.Connected] already was, so this is not a second, possibly-
+ * diverging wording surface, only a widened INPUT to the same decision.
+ */
+fun VpnSessionHealth.toHomeStatusText(): String = when (this) {
+    is VpnSessionHealth.Idle -> "Disconnected"
+    is VpnSessionHealth.InProgress -> "Connecting…"
+    is VpnSessionHealth.DirectProtected -> "Protected"
+    is VpnSessionHealth.RelayHandshake -> "Connecting…"
+    is VpnSessionHealth.RelayProtected -> "Protected"
+    is VpnSessionHealth.Reconnecting -> "Reconnecting…"
+    is VpnSessionHealth.Failed -> "Connection failed"
+}
+
+/** [VpnSessionHealth] counterpart of [TransportState.toHomeVisualState] - see that function's own docs for the grouping rationale, unchanged here. */
+fun VpnSessionHealth.toHomeVisualState(): HomeVisualState = when (this) {
+    is VpnSessionHealth.Idle -> HomeVisualState.DISCONNECTED
+    is VpnSessionHealth.InProgress, is VpnSessionHealth.RelayHandshake, is VpnSessionHealth.Reconnecting -> HomeVisualState.IN_PROGRESS
+    is VpnSessionHealth.DirectProtected, is VpnSessionHealth.RelayProtected -> HomeVisualState.CONNECTED
+    is VpnSessionHealth.Failed -> HomeVisualState.FAILED
 }
 
 /**
