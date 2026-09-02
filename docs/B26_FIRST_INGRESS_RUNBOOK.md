@@ -117,18 +117,28 @@ Do NOT fold it into the signed production manifest yet - only after steps
 
 ## 9. Activate the physical Android device
 
-Using this slice's real `MainViewModel.activateIngress(...)` (wired at the
-production composition root - see `MainViewModel.Factory`), with an
-activation credential issued the same way any gateway's is
+Issue an activation credential the same way any gateway's is
 (`gateway/tools/activation_tokens.py issue` against THIS ingress's own
-store).
+store), then, ON THE DEVICE, attempt a real Auto connect toward this
+ingress (e.g. by making it the only/best-ranked relayed candidate once
+step 8's descriptor is folded into a real manifest entry - see step 11).
+The app itself surfaces the activation prompt automatically: the first
+relayed Auto attempt against an unprovisioned ingress fails closed with
+`PROFILE_NOT_PROVISIONED`, which `MainViewModel` turns into a real,
+product-visible `ActivationScreen` (the SAME screen every other gateway's
+activation already uses - only the ordinary activation credential is ever
+entered, never a UUID/REALITY-key/probe-token). Enter the credential and
+submit - no manual profile/UUID/key paste exists or is needed.
 
 ## 10. Fetch/store ingress profile
 
-`activateIngress` calls `POST /v1/ingress-profile` and, on success, persists
-the returned `IngressClientProfile` via `FileIngressProfileStore` -
-confirm via the (currently debug-only observable) `MainViewModel
-.ingressActivationState` that the outcome is `Saved`.
+Submitting the credential runs `MainViewModel.activateIngress`, which calls
+`POST /v1/ingress-profile` and, on success, persists the returned
+`IngressClientProfile` via `FileIngressProfileStore`, then automatically
+retries the connect flow once - confirm via `MainViewModel
+.ingressActivationState` (or just watch the app: the activation screen
+dismisses itself and a fresh connect attempt starts) that the outcome was
+`Saved`.
 
 ## 11. Auto builds a relayed candidate
 

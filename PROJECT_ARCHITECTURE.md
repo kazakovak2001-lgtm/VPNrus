@@ -876,11 +876,48 @@ exact remaining physical-deployment sequence (human-approval-gated).
 - **Deployment descriptor**: `docs/ingress_deployment_descriptor.example.json`
   - secret-free, explicitly NOT folded into the signed production manifest
   by this slice (see `docs/B26_INGRESS_DEPLOYMENT_DESCRIPTOR.md`).
-- **Not done this slice**: no product UI to trigger `activateIngress`; no
-  Robolectric-backed composition-root test; the Frankfurt/Stockholm
-  read-only SSH suitability audit could not be completed (no working
-  credential available in this session for either host - see this PR's own
-  report, no SAFE/NOT_SAFE verdict asserted).
+- **Review fix (PR #40) - real product activation entry point**: an
+  earlier version of this slice wired `activateIngress` as a callable
+  function with no product UI ever invoking it - fixed before merge.
+  `attemptRelayedAttempt`'s `NotProvisioned` branch now surfaces a real,
+  bounded, UI-observable `MainViewModel.relayActivationNeeded`
+  (`net.pocvpn.client.relay.RelayActivationRequest`) for exactly the
+  `RelayFailureCategory` values an activation can fix
+  (`PROFILE_NOT_PROVISIONED`/`PROFILE_EXPIRED`/`PROFILE_MISMATCH` - see
+  that type's own `ACTIVATION_FIXABLE_CATEGORIES`) - every other category
+  still fails closed with no prompt. `AppRoot` reuses the EXISTING
+  `ActivationScreen` composable verbatim (the same single "activation
+  credential" text field every other endpoint's activation already uses -
+  never a UUID/REALITY-key/probe-token paste field; `IngressClientProfile`'s
+  fields are never exposed to any UI layer). On success,
+  `MainViewModel.activateIngress` runs the real
+  `IngressProfileProvisioner.ensureFreshProfile` (bounded: reuse a
+  still-valid profile, otherwise exactly one network attempt), persists the
+  validated profile, clears the prompt, and retries `connect()` EXACTLY
+  once - bounded by construction (this function is reached only via one
+  explicit human credential submission per failure; it never re-invokes
+  itself).
+- **Review fix (PR #40) - real composition-root test**: an earlier version
+  built the relay/ingress dependency graph inline inside
+  `MainViewModel.Factory.create`, which ALSO eagerly constructs unrelated
+  `AndroidKeyStore`-backed repositories at construction time - incompatible
+  with this project's Robolectric version (a real, pre-existing
+  incompatibility, confirmed by testing it directly: `KeyStoreException`/
+  `NoSuchAlgorithmException`). Fixed by extracting
+  `net.pocvpn.client.relay.RelayCompositionFactory.build(context,
+  ingressProfileStore)` - the ONE function `Factory.create` now delegates
+  relay composition to, which never touches `AndroidKeyStore`/crypto at
+  all (every object it builds either takes an already-constructed store as
+  input or defers Keystore-backed work into a lambda that only runs
+  later, inside a real `resolve()`/`provision()` call).
+  `RelayCompositionFactoryTest` (Robolectric, a real `Context`) proves this
+  function selects `RelayIngressResolverImpl`/`HttpRelayEndToEndProbe`/a
+  real `IngressProfileProvisioner`, never the `NotProvisionedRelayIngressResolver`/
+  `NotConfiguredRelayEndToEndProbe` stand-ins.
+- **Not done this slice**: the Frankfurt/Stockholm read-only SSH
+  suitability audit could not be completed (no working credential
+  available in this session for either host - see this PR's own report,
+  no SAFE/NOT_SAFE verdict asserted).
 
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
@@ -1033,6 +1070,11 @@ real Android ingress activation client, EXIT relay identity apply/revoke
 tooling, ingress deploy/preflight tooling, and a deployment descriptor.
 Repository/software side is DEPLOYMENT READY per ROADMAP's own B26 row;
 still no real ingress deployed, Russia hard-whitelist bypass remains
-UNVERIFIED. Named remaining gaps: no product UI for activateIngress, no
-Robolectric composition-root test, Frankfurt/Stockholm SSH audit
+UNVERIFIED. PR #40 review fix (same day): closed the two blockers this
+section originally left open - activateIngress is now reached through a
+real, bounded, product-visible activation prompt (never a UI-less
+function or a manual UUID/key paste), and the relay/ingress composition
+graph was extracted into RelayCompositionFactory with a real,
+Robolectric-backed composition-root test proving production selects the
+real implementations. Remaining gap: Frankfurt/Stockholm SSH audit
 incomplete (no working credential this session).)
