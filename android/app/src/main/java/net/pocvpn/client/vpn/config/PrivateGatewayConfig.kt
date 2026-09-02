@@ -74,18 +74,34 @@ sealed class PrivateGatewayValidationResult {
  * ([AwgProfile.junkPacketCount]/[AwgProfile.junkPacketMinSize]/
  * [AwgProfile.junkPacketMaxSize]/[AwgProfile.initPacketJunkSize]/
  * [AwgProfile.responsePacketJunkSize]/[AwgProfile.cookieReplyPacketJunkSize]/
- * [AwgProfile.transportPacketJunkSize]) remain OPTIONAL here (null is valid -
- * a real physical connect against a Stockholm-profile server succeeded with
- * only the four magic headers set once those headers were themselves
- * corrected to match the live server - see docs/ROADMAP.md's B22 physical
- * validation history). They are exposed in [PrivateGatewayDialog] because a
- * DIFFERENT user-operated server MAY still require them to match (the
- * general "any compatible AmneziaWG VPS" case this feature targets is wider
- * than the one physically tested profile) - never hardcoded/invented here,
- * only ever the operator's own typed values. When present, each must be a
- * non-negative integer, and a min/max pair must not be inverted - malformed
- * input fails closed with [PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS],
- * never silently dropped or replaced with a guessed default.
+ * [AwgProfile.transportPacketJunkSize]) remain OPTIONAL here (null is a
+ * legal value the validator accepts) - but null is NOT proven sufficient
+ * against `gateway/provision.sh`. The actual physical record (see
+ * docs/ROADMAP.md's B22 history for the full evidence): with H1-H4 matching
+ * the live Stockholm server exactly, but these seven left null, real UDP
+ * packets reached the server (confirmed via `tcpdump`) yet no AWG handshake
+ * ever completed - `null` produced a real, reproducible connection failure
+ * against that exact server, not a working baseline. The physical
+ * re-validation that actually succeeded (real handshake, real RX/TX, real
+ * distinct exit IP) only happened once the client was configured with the
+ * live Stockholm server's FULL profile, these seven fields included
+ * (`Jc=6/Jmin=40/Jmax=100/S1=113/S2=159/S3=0/S4=0`).
+ *
+ * They stay optional here anyway, at the GENERAL-model level, because a
+ * DIFFERENT user-operated AmneziaWG VPS is a separate deployment that may
+ * genuinely use different values, or a build/config where they are not
+ * required at all - this validator has no way to know another operator's
+ * server-side profile, so it cannot correctly demand these be non-blank the
+ * way it does for H1-H4. `null` here means "the operator did not supply a
+ * value" - it must never be read as "these are known unnecessary for a
+ * successful connection" for any given server, `gateway/provision.sh`
+ * included. [PrivateGatewayDialog] exposes them, unset by default, so the
+ * operator can supply their own server's real values - never
+ * hardcoded/invented here, only ever the operator's own typed input. When
+ * present, each must be a non-negative integer, and a min/max pair must not
+ * be inverted - malformed input fails closed with
+ * [PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS], never
+ * silently dropped or replaced with a guessed default.
  */
 object PrivateGatewayConfigValidator {
     private val HOSTNAME = Regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
