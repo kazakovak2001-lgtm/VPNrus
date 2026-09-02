@@ -114,16 +114,31 @@ private class PendingFailoverAttempt(
 )
 
 /**
- * B16 - the retained context an automatic-gateway connect() sequence needs
- * to advance past a failed candidate: the FULL ranked candidate list
- * (built once, at the start of the sequence - never rebuilt mid-sequence,
- * so a later candidate is never silently re-scored against evidence that
- * changed because of the very failure being handled) and which
- * (gateway, transport) pairs have already been attempted this request.
+ * B16/B24 - the retained context an automatic-gateway connect() sequence
+ * needs to advance past a failed candidate: the FULL COMBINED (Direct +
+ * Relayed) ranked attempt list (built once, at the start of the sequence -
+ * never rebuilt mid-sequence, so a later candidate is never silently
+ * re-scored against evidence that changed because of the very failure being
+ * handled) and which [net.pocvpn.client.smartconnect.AutoGatewaySelector
+ * .AutoConnectAttempt.attemptKey]s have already been attempted this
+ * request.
+ *
+ * B24 review fix (PR #38) - this used to carry a DIRECT-ONLY candidate list/
+ * attempted-set, which made [attemptAutoCandidate] "own" the rest of the
+ * Direct sequence on its own terminal failure (`NotSelectable`, or a real
+ * async failure observed by [armFailoverWatch]) - silently skipping any
+ * higher-ranked Relayed candidate in between and defeating the shared
+ * [net.pocvpn.client.smartconnect.AutoGatewaySelector.MAX_ATTEMPTS] budget
+ * this class's own docs already claimed. Now carries the SAME combined
+ * `(attempts, attemptedKeys)` shape [attemptCombined] itself operates on, so
+ * EVERY terminal-failure path (this class's synchronous `NotSelectable`
+ * branch and [armFailoverWatch]'s asynchronous one) reports back into
+ * [attemptCombined] - the ONE bounded progression authority for the whole
+ * request, regardless of candidate shape.
  */
 private class PendingAutoGatewayContext(
-    val candidates: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
-    val attempted: Set<Pair<net.pocvpn.client.vpn.config.ProductionGatewayId, TransportKind>>,
+    val combinedAttempts: List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt>,
+    val combinedAttemptedKeys: Set<String>,
 )
 
 /**
@@ -2084,22 +2099,25 @@ class MainViewModel(
      * else to show it as `current` yet without widening that public type,
      * left to a future slice once relay diagnostics UI is actually wanted).
      * A DIRECT winner is executed through the COMPLETELY UNCHANGED
-     * [attemptAutoCandidate]/[PendingFailoverAttempt] machinery - reordered
-     * so IT is first, everything else in its original relative order after
-     * it (this is what makes "the winner from scoring is the same candidate
-     * execution receives" true even though [PathScorer.rank]'s own tiebreak
-     * and [AutoGatewaySelector.buildCombinedAttempts]'s tiebreak are not
-     * byte-for-byte identical - reordering, not re-ranking, removes any
-     * dependency on the two agreeing on tie order). Once inside that Direct
-     * sub-sequence, Direct's own bounded failover runs to exhaustion exactly
-     * as it always has - it never reaches back out to try a Relayed
-     * candidate (task's own "Direct behavior must stay unchanged": Direct's
-     * failover chain is not made aware Relayed candidates exist at all). A
-     * RELAYED winner is executed through [attemptRelayedAttempt] - on
-     * failure that DOES advance through the shared combined ranking
-     * (possibly reaching a Direct candidate next), still bounded by the
-     * SAME [AutoGatewaySelector.MAX_ATTEMPTS] budget shared across both
-     * types.
+     * [TransportOrchestrator]/[VpnController]/[PendingFailoverAttempt]
+     * dial path inside [attemptAutoCandidate] - the SAME pinned
+     * `GatewayAttemptCandidate.configSnapshot`, the SAME AWG->Xray
+     * intra-gateway failover, byte-for-byte (task requirement 7/8: do not
+     * duplicate Direct transport execution logic, do not build a second
+     * connection controller). What changed (B24 review fix, PR #38) is
+     * WHAT HAPPENS ON ITS OWN TERMINAL FAILURE: [attemptAutoCandidate] no
+     * longer owns a Direct-only remainder list to fall back through on its
+     * own - it reports back into [attemptCombined] with the SAME combined
+     * `(attempts, attemptedKeys)` this function started with, so the VERY
+     * NEXT globally-ranked unattempted candidate is chosen regardless of
+     * shape (a Relayed candidate ranked between two Direct ones is never
+     * silently skipped). A RELAYED winner is executed through
+     * [attemptRelayedAttempt], which reports back into [attemptCombined]
+     * the same way on failure. Either way, ONE shared
+     * [AutoGatewaySelector.MAX_ATTEMPTS] budget bounds the WHOLE request
+     * across both shapes, and one candidate consumes exactly one combined
+     * attempt slot (its `attemptKey` is added to `attemptedKeys` the
+     * moment it is chosen, in [attemptCombined] itself - never re-chosen).
      */
     private suspend fun connectAuto() {
         val attempts = buildCombinedAutoAttempts()
@@ -2134,15 +2152,13 @@ class MainViewModel(
             controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
             return
         }
+        val advancedKeys = attemptedKeys + next.attemptKey
         when (next) {
             is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt -> {
-                val directList = attempts.filterIsInstance<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt>().map { it.candidate }
-                val winner = next.candidate
-                val reordered = listOf(winner) + directList.filter { it.gatewayId != winner.gatewayId || it.transport != winner.transport }
-                attemptAutoCandidate(reordered, attempted = emptySet())
+                attemptAutoCandidate(next.candidate, PendingAutoGatewayContext(attempts, advancedKeys))
             }
             is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt -> {
-                attemptRelayedAttempt(next.candidate, attempts, attemptedKeys + next.attemptKey)
+                attemptRelayedAttempt(next.candidate, attempts, advancedKeys)
             }
         }
     }
@@ -2219,10 +2235,11 @@ class MainViewModel(
     }
 
     /**
-     * B16 (consolidated review fix) - attempts the next unattempted ranked
-     * candidate (task requirement 6). [_activeGatewayId] is set BEFORE
-     * calling controller.connect() for UI/diagnostics purposes only - the
-     * REAL execution-time identity guarantee comes from threading THIS
+     * B16 (consolidated review fix) - dials exactly ONE candidate, already
+     * chosen by [attemptCombined] as the next globally-ranked unattempted
+     * combined attempt (task requirement 6/1). [_activeGatewayId] is set
+     * BEFORE calling controller.connect() for UI/diagnostics purposes only -
+     * the REAL execution-time identity guarantee comes from threading THIS
      * candidate's own already-resolved [GatewayAttemptCandidate.configSnapshot]
      * straight into `orchestrator.resolve(...)` below, which carries it into
      * `TransportOrchestrator.Resolution.Resolved.gatewayConfigSnapshot` and
@@ -2230,21 +2247,30 @@ class MainViewModel(
      * for why this is what actually makes the executed tunnel config
      * immutable for this attempt (never re-derived from SelectedGatewayStore/
      * ProductionGatewayCatalog/ClientTunnelIdentityStore once resolved here).
+     * This dial path itself is BYTE-FOR-BYTE unchanged from pre-B24 (same
+     * `TransportOrchestrator`/`PendingFailoverAttempt`/`armFailoverWatch`
+     * machinery - task requirement 7/8's own "do not duplicate Direct
+     * transport execution logic").
+     *
+     * B24 review fix (PR #38) - previously took the FULL Direct-only
+     * candidate list and picked "the next one" itself on every terminal
+     * failure (`NotSelectable` below, or a real async failure observed by
+     * [armFailoverWatch]), which silently skipped any higher-ranked Relayed
+     * candidate ranked in between and defeated the shared combined
+     * [AutoGatewaySelector.MAX_ATTEMPTS] budget. Now takes exactly the ONE
+     * [candidate] to dial plus [autoContext] (the combined
+     * `(attempts, attemptedKeys)` [attemptCombined] already advanced past
+     * this candidate for) - on EITHER terminal-failure path, control
+     * returns to [attemptCombined] with that SAME context, so the next
+     * candidate chosen is always the next globally-ranked one, regardless
+     * of shape.
      */
     private suspend fun attemptAutoCandidate(
-        candidates: List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate>,
-        attempted: Set<Pair<net.pocvpn.client.vpn.config.ProductionGatewayId, TransportKind>>,
+        candidate: net.pocvpn.client.smartconnect.GatewayAttemptCandidate,
+        autoContext: PendingAutoGatewayContext,
     ) {
-        val candidate = net.pocvpn.client.smartconnect.AutoGatewaySelector.nextCandidate(candidates, attempted)
-        if (candidate == null) {
-            _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(exhausted = true)
-                ?: AutoGatewayDiagnostics(candidates, emptyList(), null, "candidate set exhausted", true)
-            controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
-            return
-        }
         _activeGatewayId.value = candidate.gatewayId
-        val nextAttempted = attempted + (candidate.gatewayId to candidate.transport)
-        _autoGatewayDiagnostics.value = (_autoGatewayDiagnostics.value ?: AutoGatewayDiagnostics(candidates, emptyList(), null, null, false)).let {
+        _autoGatewayDiagnostics.value = (_autoGatewayDiagnostics.value ?: AutoGatewayDiagnostics(emptyList(), emptyList(), null, null, false)).let {
             it.copy(attempted = it.attempted + candidate, current = candidate)
         }
         val registry = buildTransportRegistry(candidate.endpointId)
@@ -2259,7 +2285,7 @@ class MainViewModel(
                     registry = registry,
                     orchestrator = orchestrator,
                     endpointId = candidate.endpointId,
-                    autoContext = PendingAutoGatewayContext(candidates, nextAttempted),
+                    autoContext = autoContext,
                 )
                 pendingFailoverAttempt = attempt
                 controller.connect(resolution)
@@ -2268,10 +2294,15 @@ class MainViewModel(
             is TransportOrchestrator.Resolution.NotSelectable -> {
                 // This ranked candidate's own transport somehow isn't
                 // resolvable (should-never-happen - it was eligible in the
-                // registry PathScorer scored it against) - advance rather
-                // than fail the whole request on one bad candidate, still
-                // bounded by [nextAttempted].
-                attemptAutoCandidate(candidates, nextAttempted)
+                // registry PathScorer scored it against) - a terminal
+                // failure for THIS candidate specifically. B24 review fix:
+                // report back to the combined coordinator (which already
+                // has this candidate marked attempted in [autoContext])
+                // rather than re-deriving "the next Direct candidate"
+                // locally - the next globally-ranked candidate may be
+                // Relayed.
+                _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(lastFailureReason = "NotSelectable")
+                attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
             }
         }
     }
@@ -2382,7 +2413,11 @@ class MainViewModel(
                     )
                     failoverObserverJob?.cancel()
                     failoverObserverJob = null
-                    attemptAutoCandidate(autoContext.candidates, autoContext.attempted)
+                    // B24 review fix (PR #38) - resumes the SHARED combined
+                    // coordinator, never a Direct-only remainder list, so
+                    // the next candidate chosen here can genuinely be
+                    // Relayed.
+                    attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
                     return@collect
                 }
                 val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(

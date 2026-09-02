@@ -499,21 +499,18 @@ restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   rotation mid-attempt could have silently redirected - the same B16
   attempt-pinning invariant `GatewayAttemptCandidate.configSnapshot` already
   enforces for Direct.
-- **NOT yet consumed by the live connect path** - `MainViewModel
-  .connectAuto()`/`attemptAutoCandidate()` and `VpnController` do not call
-  `buildRelayedCandidates` and cannot execute a `RelayAttemptCandidate`.
-  `buildRelayedCandidates` is callable and unit-tested in isolation only -
-  no real connection attempt reaches it today. Wiring it into the real
-  attempt loop now would be dead code no physical test could exercise (no
-  ingress to dial) - final promotion into the real Auto selection/execution
-  decision is deferred to the slice that deploys a real ingress runtime,
-  matching this codebase's own established "carried through truthfully, not
-  yet decision-driving, later promoted" lifecycle already used for
-  `RestrictionClassifier`/`TransportHealth`/`ReachabilityEngine` itself.
-  Preferred eventual topology: Android -> encrypted transport to INGRESS ->
-  ingress-controlled encrypted upstream to EXIT -> Internet, through the
-  SAME single Android VPN ownership path (`VpnController`) - never a nested
-  VpnService stack.
+- **Superseded by B24 below** - this bullet originally said
+  `buildRelayedCandidates` was not yet consumed by the live connect path.
+  B24's "Real Ingress Runtime / Server-Side Relay Execution Foundation"
+  section (immediately below) wires it into `connectAuto()`/
+  `attemptCombined()` for real - a `RelayAttemptCandidate` CAN now be the
+  winner of a real Auto connect() request, though it still only ever
+  reaches `RelayIngressDialer.dial()`, which has no production
+  implementation that could actually establish a tunnel (see that section's
+  own docs). Preferred eventual topology remains: Android -> encrypted
+  transport to INGRESS -> ingress-controlled encrypted upstream to EXIT ->
+  Internet, through the SAME single Android VPN ownership path
+  (`VpnController`) - never a nested VpnService stack.
 - Existing Direct gateway behavior (`buildCandidates`, `GatewayAttemptCandidate`,
   `connectAuto()`/`attemptAutoCandidate()`) is unchanged - only the
   `historyFor` callback's parameter type widened (`EndpointId` -> `String`),
@@ -569,25 +566,35 @@ ingress<->exit are INDEPENDENT (never collapsed to one shared
   combined, real, ranked attempt list built from `buildCandidates` +
   `buildRelayedCandidates` together (task requirement 4), sharing ONE
   `MAX_ATTEMPTS` budget across both types. `MainViewModel.connectAuto()`
-  picks its winner from this combined list: a **Direct** winner is executed
-  through the COMPLETELY UNCHANGED `attemptAutoCandidate`/
-  `PendingFailoverAttempt` machinery (reordered so the winner is tried
-  first, never re-scored - this is what makes "the winner from scoring is
-  the candidate execution receives" true even though the two ranking
-  functions' tie-break rules are not byte-for-byte identical); once inside
-  that Direct sub-sequence, Direct's own existing bounded failover runs to
-  exhaustion exactly as it always has (task's own "Direct behavior must
-  stay unchanged" - Direct's failover chain is never made aware Relayed
-  candidates exist). A **Relayed** winner is executed through
-  `attemptRelayedAttempt`, which dials `relayIngressDialer` and records the
-  outcome under the FULL `historyPathId` (task requirement 11 - never
-  poisons either hop's own Direct history); on failure it advances the
-  SAME shared combined budget, possibly reaching a Direct candidate next -
-  never retries the same candidate, never substitutes a different exit
-  while keeping that candidate's own identity (task requirement 13).
-  `AutoGatewayDiagnostics` itself stays Direct-only (its existing public
-  shape is unchanged - every pre-B24 reader is unaffected); a Relayed
-  attempt is currently reflected there only via `lastFailureReason` once it
+  picks its winner from this combined list via `attemptCombined` - the ONE
+  bounded-progression authority for the whole request. A **Direct** winner
+  is DIALED through the completely unchanged `TransportOrchestrator`/
+  `VpnController`/`PendingFailoverAttempt` machinery - the same pinned
+  `GatewayAttemptCandidate.configSnapshot`, the same AWG->Xray intra-gateway
+  failover, byte-for-byte (task requirement 7/8: no duplicated Direct
+  execution logic, no second connection controller). A **Relayed** winner is
+  DIALED through `attemptRelayedAttempt`/`relayIngressDialer`, its outcome
+  recorded under the FULL `historyPathId` (task requirement 11 - never
+  poisons either hop's own Direct history). **PR #38 review fix**: on EITHER
+  shape's terminal failure - `attemptAutoCandidate`'s own `NotSelectable`
+  branch, `armFailoverWatch`'s async observation of a real Direct failure,
+  or `attemptRelayedAttempt`'s dialer `Failure` branch - control returns to
+  `attemptCombined` with the SAME `(attempts, attemptedKeys)` state, so the
+  VERY NEXT globally-ranked unattempted candidate is chosen regardless of
+  shape. An earlier version of this row wrongly had a Direct winner
+  delegate to a REORDERED DIRECT-ONLY LIST that then owned the rest of the
+  Direct sub-sequence on its own - silently skipping any higher-ranked
+  Relayed candidate ranked in between, and defeating the shared
+  `MAX_ATTEMPTS` budget the row already (incorrectly) claimed. Fixed before
+  merge, never shipped to `main`: `PendingAutoGatewayContext` now carries
+  the combined `(attempts, attemptedKeys)` shape instead of a Direct-only
+  one, and `attemptAutoCandidate` takes exactly ONE candidate to dial (never
+  a list to "own"). One candidate consumes exactly one combined attempt
+  slot, added to `attemptedKeys` the moment `attemptCombined` chooses it -
+  never re-chosen. `AutoGatewayDiagnostics` itself stays Direct-only (its
+  existing public shape is unchanged - every pre-B24 reader is unaffected);
+  a Relayed attempt is currently reflected there only via
+  `lastFailureReason` once it
   fails.
 
 **Server-side ingress runtime** (`gateway/api/xray_ingress_config_renderer.py`)
