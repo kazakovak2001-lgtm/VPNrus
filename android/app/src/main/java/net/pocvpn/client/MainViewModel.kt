@@ -325,6 +325,13 @@ class MainViewModel(
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
+    // B24 - the real client<->ingress execution boundary a relayed Auto
+    // winner is handed to (see RelayIngressDialer's own docs). Defaults to
+    // NotProvisionedRelayIngressDialer - the ONLY implementation wired into
+    // production today - which fails closed for every plan (no real ingress
+    // is deployed/activated against this slice). Additive seam, same
+    // pattern as every optional collaborator above.
+    private val relayIngressDialer: net.pocvpn.client.relay.RelayIngressDialer = net.pocvpn.client.relay.NotProvisionedRelayIngressDialer,
     // B12/B20 - additive, defaults to null (same seam as every optional
     // dependency above): with no client, refreshManifest() below is a
     // no-op that returns null, and manifestRepository's trusted state is
@@ -1982,10 +1989,121 @@ class MainViewModel(
      */
     fun autoGatewayCandidates(): List<net.pocvpn.client.smartconnect.GatewayAttemptCandidate> = buildAutoGatewayCandidates()
 
-    /** B16 - the Auto counterpart of connectManual(): builds the ranked candidate list once, then attempts the first one via [attemptAutoCandidate]. */
+    /**
+     * B24 - OBSERVATIONAL: the CURRENT combined Direct+Relayed ranked
+     * attempt list, recomputed fresh on every read (same discipline as
+     * [autoGatewayCandidates]) - for diagnostics/tests. Does not itself
+     * start or affect any connect() attempt. This is the SAME list
+     * [connectAuto] uses to pick its winner.
+     */
+    fun combinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> = buildCombinedAutoAttempts()
+
+    /**
+     * B24 - the combined Direct+Relayed counterpart of
+     * [buildAutoGatewayCandidates]: identical evidence accessors, but calls
+     * [net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts]
+     * instead of `buildCandidates` alone (task requirement 4 - "build ONE
+     * combined executable attempt plan... do not maintain separate ranking/
+     * execution loops that can disagree"). [buildAutoGatewayCandidates]
+     * itself is intentionally left untouched - every pre-B24 caller of it
+     * (and of [autoGatewayCandidates]/[AutoGatewayDiagnostics], which stay
+     * Direct-only - see [connectAuto]'s own docs) is byte-for-byte
+     * unaffected.
+     */
+    private fun buildCombinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> {
+        val now = System.currentTimeMillis()
+        val profile = networkProfile.value
+        val restriction = restrictionClass()
+        val health = transportHealth()
+        val outcomes = recentConnectionOutcomes()
+        val fingerprint = fingerprintKeyProvider?.let {
+            net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+                net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+                it.keyBytes(),
+            )
+        }
+        val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
+        val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
+        return net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
+            manifestEndpoints = manifestEndpoints,
+            gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
+            provisioned = ::isGatewayProvisioned,
+            clientTunnelIp = { id -> clientTunnelIdentityStore?.read(id) },
+            registryFor = { endpointId -> buildTransportRegistry(endpointId) },
+            xrayAvailableFor = ::isXrayAvailableFor,
+            xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
+            reachabilityFor = { endpointId, kind ->
+                // B24 - relay endpoint ids (an INGRESS/EXIT the manifest
+                // names but that has no ProductionGatewayCatalog entry -
+                // exactly the "no RU ingress provisioning in this slice"
+                // case) fall back to a manifest-only descriptor, mirroring
+                // reachabilityDiagnostics()'s own catalog-optional path -
+                // gatewaysById.getValue(...) (used by buildAutoGatewayCandidates)
+                // would throw for such an id.
+                val gateway = gatewaysById[endpointId]
+                val endpoint = if (gateway != null) {
+                    net.pocvpn.client.smartconnect.ProductionGatewayEndpoints.descriptorFor(
+                        gateway,
+                        xrayAvailable = isXrayAvailableFor(endpointId),
+                        xrayTlsAvailable = isXrayTlsAvailableFor(endpointId),
+                    )
+                } else {
+                    manifestEndpoints.first { it.id == endpointId }
+                }
+                val matchedOutcome = net.pocvpn.client.reachability.EndpointOutcomeMatcher.latestMatching(outcomes, endpointId, kind)
+                net.pocvpn.client.reachability.ReachabilityEngine.assess(
+                    endpoint = endpoint,
+                    transportKind = kind,
+                    networkUsable = profile.isUsable,
+                    transportHealth = health.getValue(kind),
+                    endpointSpecificReachable = matchedOutcome?.let { it.result == ConnectionOutcomeResult.SUCCESS },
+                    restrictionClass = restriction,
+                    nowEpochMillis = now,
+                    controlPlaneReachable = if (endpointId.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) restrictionMonitor?.lastProbeResult?.value else null,
+                    endpointSpecificOutcomeEpochMillis = matchedOutcome?.timestampEpochMillis,
+                )
+            },
+            transportHealthFor = { kind -> health.getValue(kind) },
+            historyFor = { pathId, kind -> fingerprint?.let { pathHistoryStore?.get(it, pathId, kind) } },
+            preference = userTransportPreference,
+            nowEpochMillis = now,
+        )
+    }
+
+    /**
+     * B16 - the Auto counterpart of connectManual(): builds the ranked
+     * combined candidate list once, then hands the winner to execution.
+     *
+     * B24 - the WINNER now comes from [buildCombinedAutoAttempts] (real
+     * Direct+Relayed ranking - task requirement 4), never from the
+     * Direct-only list alone. [AutoGatewayDiagnostics] itself stays
+     * Direct-only (its own existing public shape - `rankedCandidates:
+     * List<GatewayAttemptCandidate>` - is unchanged, so every pre-B24
+     * diagnostics reader is unaffected); a Relayed winner is reflected
+     * there only via `lastFailureReason` once it fails (there is nothing
+     * else to show it as `current` yet without widening that public type,
+     * left to a future slice once relay diagnostics UI is actually wanted).
+     * A DIRECT winner is executed through the COMPLETELY UNCHANGED
+     * [attemptAutoCandidate]/[PendingFailoverAttempt] machinery - reordered
+     * so IT is first, everything else in its original relative order after
+     * it (this is what makes "the winner from scoring is the same candidate
+     * execution receives" true even though [PathScorer.rank]'s own tiebreak
+     * and [AutoGatewaySelector.buildCombinedAttempts]'s tiebreak are not
+     * byte-for-byte identical - reordering, not re-ranking, removes any
+     * dependency on the two agreeing on tie order). Once inside that Direct
+     * sub-sequence, Direct's own bounded failover runs to exhaustion exactly
+     * as it always has - it never reaches back out to try a Relayed
+     * candidate (task's own "Direct behavior must stay unchanged": Direct's
+     * failover chain is not made aware Relayed candidates exist at all). A
+     * RELAYED winner is executed through [attemptRelayedAttempt] - on
+     * failure that DOES advance through the shared combined ranking
+     * (possibly reaching a Direct candidate next), still bounded by the
+     * SAME [AutoGatewaySelector.MAX_ATTEMPTS] budget shared across both
+     * types.
+     */
     private suspend fun connectAuto() {
-        val candidates = buildAutoGatewayCandidates()
-        if (candidates.isEmpty()) {
+        val attempts = buildCombinedAutoAttempts()
+        if (attempts.isEmpty()) {
             _autoGatewayDiagnostics.value = AutoGatewayDiagnostics(
                 rankedCandidates = emptyList(), attempted = emptyList(), current = null,
                 lastFailureReason = null, exhausted = true,
@@ -1993,11 +2111,111 @@ class MainViewModel(
             controller.rejectPreflight(VpnError.NoCandidateAvailable, "No automatic gateway candidate available")
             return
         }
+        val directOnly = attempts.filterIsInstance<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt>().map { it.candidate }
         _autoGatewayDiagnostics.value = AutoGatewayDiagnostics(
-            rankedCandidates = candidates, attempted = emptyList(), current = null,
+            rankedCandidates = directOnly, attempted = emptyList(), current = null,
             lastFailureReason = null, exhausted = false,
         )
-        attemptAutoCandidate(candidates, attempted = emptySet())
+        attemptCombined(attempts, attemptedKeys = emptySet())
+    }
+
+    /**
+     * B24 - advances the shared combined attempt budget and dispatches by
+     * winner type - see [connectAuto]'s own docs for the full rationale.
+     */
+    private suspend fun attemptCombined(
+        attempts: List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt>,
+        attemptedKeys: Set<String>,
+    ) {
+        val next = net.pocvpn.client.smartconnect.AutoGatewaySelector.nextCombinedAttempt(attempts, attemptedKeys)
+        if (next == null) {
+            _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(exhausted = true)
+                ?: AutoGatewayDiagnostics(emptyList(), emptyList(), null, "candidate set exhausted", true)
+            controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
+            return
+        }
+        when (next) {
+            is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt -> {
+                val directList = attempts.filterIsInstance<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt>().map { it.candidate }
+                val winner = next.candidate
+                val reordered = listOf(winner) + directList.filter { it.gatewayId != winner.gatewayId || it.transport != winner.transport }
+                attemptAutoCandidate(reordered, attempted = emptySet())
+            }
+            is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt -> {
+                attemptRelayedAttempt(next.candidate, attempts, attemptedKeys + next.attemptKey)
+            }
+        }
+    }
+
+    /**
+     * B24 - executes ONE relayed attempt via [relayIngressDialer] (task
+     * requirement 3/13). Builds a [net.pocvpn.client.relay.RelayedExecutionPlan]
+     * straight off [candidate]'s own already-pinned fields (never a
+     * manifest/catalog re-resolution - task requirement 2), dials it, and
+     * records the real outcome under the FULL relayed `historyPathId` (task
+     * requirement 11/G - never poisons either hop's own Direct history).
+     * [relayIngressDialer] defaults to [net.pocvpn.client.relay
+     * .NotProvisionedRelayIngressDialer] in production, which fails closed
+     * for every plan (task requirement "no fake relay success" - see that
+     * object's own docs for exactly why) - a failure here advances the
+     * SHARED combined budget via [attemptCombined], never retries the SAME
+     * candidate, and never substitutes a different exit while keeping this
+     * candidate's own identity (task requirement 13's own "no relayed
+     * attempt may silently fall back to a different exit while keeping the
+     * same candidate identity").
+     */
+    private suspend fun attemptRelayedAttempt(
+        candidate: net.pocvpn.client.smartconnect.AutoGatewaySelector.RelayAttemptCandidate,
+        attempts: List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt>,
+        attemptedKeys: Set<String>,
+    ) {
+        val plan = net.pocvpn.client.relay.RelayedExecutionPlan.from(candidate)
+        val outcome = relayIngressDialer.dial(plan)
+        recordRelayOutcome(plan, outcome)
+        when (outcome) {
+            is net.pocvpn.client.relay.RelayAttemptOutcome.Success -> {
+                // B24 - not reachable in production today: NotProvisionedRelayIngressDialer
+                // never returns Success (see its own docs). Kept as a real branch
+                // rather than a TODO so a future real RelayIngressDialer's Success
+                // is genuinely wired through without this call site needing a
+                // rewrite. State-transition ownership (actually driving the tunnel
+                // to Connected/Protected) belongs to the RelayIngressDialer
+                // implementation itself - by the time dial() returns Success, a
+                // real dialer has ALREADY reached END_TO_END_DATA_PLANE_OK, so
+                // there is nothing to fake here. _activeGatewayId is
+                // deliberately left untouched - it is a ProductionGatewayId
+                // (Direct-gateway-shaped), which has no meaning for a relay.
+                _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(lastFailureReason = null)
+            }
+            is net.pocvpn.client.relay.RelayAttemptOutcome.Failure -> {
+                _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(
+                    lastFailureReason = "${outcome.category}" + (outcome.detail?.let { ": $it" } ?: ""),
+                )
+                attemptCombined(attempts, attemptedKeys)
+            }
+        }
+    }
+
+    /**
+     * B24 - task requirement 11/G: recorded ONLY under [RelayedExecutionPlan
+     * .historyPathId] (the FULL relayed path identity), never under
+     * [RelayedExecutionPlan.ingressEndpointId]/[RelayedExecutionPlan
+     * .exitEndpointId] alone - either of those would poison that endpoint's
+     * own Direct-mode local history with relay-specific evidence. No-op
+     * without a wired [fingerprintKeyProvider]/[pathHistoryStore] - the SAME
+     * additive-seam discipline every other real writer into
+     * [net.pocvpn.client.reachability.PathHistoryStore] in this codebase
+     * already follows.
+     */
+    private fun recordRelayOutcome(plan: net.pocvpn.client.relay.RelayedExecutionPlan, outcome: net.pocvpn.client.relay.RelayAttemptOutcome) {
+        val store = pathHistoryStore ?: return
+        val keyProvider = fingerprintKeyProvider ?: return
+        val profile = networkProfile.value
+        val fingerprint = net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+            net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+            keyProvider.keyBytes(),
+        )
+        store.record(fingerprint, plan.historyPathId, plan.ingressTransport, success = outcome.isHealthy, nowEpochMillis = System.currentTimeMillis())
     }
 
     /**

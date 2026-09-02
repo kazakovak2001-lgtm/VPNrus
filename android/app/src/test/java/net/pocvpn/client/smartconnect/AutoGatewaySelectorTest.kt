@@ -60,6 +60,11 @@ class AutoGatewaySelectorTest {
         ),
     )
 
+    /** B24 - a registry with EVERY kind AVAILABLE, for combined-attempt tests that need both AMNEZIA_WG (Direct/exit) and TLS_TCP (ingress) resolvable at once. */
+    private fun multiTransportRegistry(vararg kinds: TransportKind): TransportRegistry = TransportRegistry.build(
+        kinds.map { kind -> TransportDescriptor(kind = kind, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { throw UnsupportedOperationException() }) },
+    )
+
     private fun reachable(endpointId: EndpointId, kind: TransportKind) = EndpointReachability(
         endpointId = endpointId,
         transportKind = kind,
@@ -786,5 +791,132 @@ class AutoGatewaySelectorTest {
         assertEquals(TransportKind.AMNEZIA_WG, viaAwgExit.exitBinding.kind)
         assertEquals(TransportKind.TLS_TCP, viaTlsExit.exitBinding.kind)
         assertEquals("203.0.113.77", viaTlsExit.exitBinding.host)
+    }
+
+    // --- B24: buildCombinedAttempts - ONE combined executable attempt plan ---
+
+    private fun buildCombinedDefault(
+        manifestEndpoints: List<EndpointDescriptor>,
+        reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability,
+        transportHealthFor: (TransportKind) -> TransportHealth = { healthy() },
+        provisioned: Set<ProductionGatewayId> = setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
+    ) = AutoGatewaySelector.buildCombinedAttempts(
+        manifestEndpoints = manifestEndpoints,
+        gatewayFactsFor = { catalogById[it] },
+        provisioned = { it in provisioned },
+        clientTunnelIp = { if (it in provisioned) "10.77.0.5" else null },
+        registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP) },
+        xrayAvailableFor = { false },
+        xrayTlsAvailableFor = { false },
+        reachabilityFor = reachabilityFor,
+        transportHealthFor = transportHealthFor,
+        historyFor = { _, _ -> null },
+    )
+
+    /** Task requirement A - combined ranking returns ONE immutable executable attempt type covering both shapes. */
+    @Test
+    fun `combined attempts contain both DirectAttempt and RelayedAttempt when both exist`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+        )
+        assertTrue(attempts.any { it is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt })
+        assertTrue(attempts.any { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt })
+    }
+
+    /** Task requirement B - exact pinned ingress/exit bindings survive ranking -> execution unchanged. */
+    @Test
+    fun `the RelayedAttempt winner carries the exact same pinned bindings buildRelayedCandidates produced`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(ingressEndpoint, exitEndpoint),
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+        )
+        val relayedWinner = attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>().first().candidate
+        val relayedOnly = buildRelayedDefault(manifestEndpoints = listOf(ingressEndpoint, exitEndpoint)).single()
+        assertEquals(relayedOnly.ingressBinding, relayedWinner.ingressBinding)
+        assertEquals(relayedOnly.exitBinding, relayedWinner.exitBinding)
+        assertEquals(relayedOnly.historyPathId, relayedWinner.historyPathId)
+    }
+
+    /** Task requirement C - Direct path behavior is unchanged when no ingress exists. */
+    @Test
+    fun `combined attempts equal the Direct-only list, wrapped, when no ingress endpoint exists`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = bothManifestEndpoints,
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+        )
+        assertTrue(attempts.all { it is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt })
+        val direct = buildDefault(manifestEndpoints = bothManifestEndpoints)
+        assertEquals(direct.map { it.gatewayId }.toSet(), attempts.map { (it as AutoGatewaySelector.AutoConnectAttempt.DirectAttempt).candidate.gatewayId }.toSet())
+    }
+
+    /** Task requirement D - under normal network evidence, healthy Direct wins over UNKNOWN relay. */
+    @Test
+    fun `a healthy Direct attempt outranks an UNKNOWN relay attempt under normal evidence`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> if (id == ingressEndpoint.id) relayUnknown(id, kind) else reachable(id, kind) },
+        )
+        assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt)
+    }
+
+    /** Task requirement E - under hard-whitelist evidence, a proven relay can win over a failed Direct. */
+    @Test
+    fun `a proven relay attempt outranks a fresh-unreachable Direct attempt under hard-whitelist evidence`() {
+        // The exit gets a SECOND transport (TLS_TCP) so its own AMNEZIA_WG
+        // dial (what Direct uses) can genuinely differ from its TLS_TCP
+        // dial (what the relay's exit hop uses) - the real architecture
+        // keys reachability by (endpointId, transportKind), so a hard
+        // whitelist that blocks ONE transport to the exit but not another
+        // is exactly what makes a relay meaningfully different from Direct
+        // here, never a fabricated distinction.
+        val exitTwoTransports = exitEndpoint.copy(
+            transports = exitEndpoint.transports + EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.77", 443),
+        )
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitTwoTransports, ingressEndpoint),
+            reachabilityFor = { id, kind ->
+                if (id == exitTwoTransports.id && kind == TransportKind.AMNEZIA_WG) relayFreshlyUnreachable(id, kind) else relayReachable(id, kind)
+            },
+        )
+        assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt)
+    }
+
+    /** Task requirement F - no eligible path (Direct or relay) fails closed: an empty combined list. */
+    @Test
+    fun `no eligible Direct or relay path yields an empty combined attempt list - fail closed`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> relayFreshlyUnreachable(id, kind) },
+        )
+        assertTrue(attempts.isEmpty())
+    }
+
+    /** Task requirement K (selector level) - the shared MAX_ATTEMPTS budget bounds combined retries across BOTH types. */
+    @Test
+    fun `nextCombinedAttempt is bounded by the shared MAX_ATTEMPTS budget across Direct and Relayed together`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+        )
+        var attemptedKeys = emptySet<String>()
+        var iterations = 0
+        while (true) {
+            val next = AutoGatewaySelector.nextCombinedAttempt(attempts, attemptedKeys) ?: break
+            attemptedKeys = attemptedKeys + next.attemptKey
+            iterations++
+        }
+        assertTrue(iterations <= AutoGatewaySelector.MAX_ATTEMPTS)
+    }
+
+    @Test
+    fun `nextCombinedAttempt never returns the same attemptKey twice`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+        )
+        val first = AutoGatewaySelector.nextCombinedAttempt(attempts, emptySet())!!
+        val second = AutoGatewaySelector.nextCombinedAttempt(attempts, setOf(first.attemptKey))
+        assertTrue(second == null || second.attemptKey != first.attemptKey)
     }
 }

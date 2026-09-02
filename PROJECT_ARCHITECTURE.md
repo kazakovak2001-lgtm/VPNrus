@@ -519,6 +519,129 @@ restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   `historyFor` callback's parameter type widened (`EndpointId` -> `String`),
   every call site still passes the identical value for a Direct candidate.
 
+## Real Ingress Runtime / Server-Side Relay Execution Foundation (B24) - FOUNDATION
+
+Turns B23's relay CANDIDATE model into a real execution contract on both
+sides - client execution wiring AND a real server-side ingress runtime -
+still **FOUNDATION**, not IMPLEMENTED: no real RU ingress is deployed, so
+none of this has been physically exercised end to end. **Russia
+hard-whitelist bypass remains UNVERIFIED** until tested on an actually
+restricted Russian network.
+
+**Real supported relay transport matrix** - client<->ingress and
+ingress<->exit are INDEPENDENT (never collapsed to one shared
+`TransportKind` - B23's own PR #37 fix, reused verbatim here):
+
+| Client -> INGRESS | INGRESS -> EXIT | Status |
+|---|---|---|
+| XRAY_REALITY | XRAY_REALITY or TLS_TCP | server config real (`xray_ingress_config_renderer`), client dial not provisioned |
+| TLS_TCP | XRAY_REALITY or TLS_TCP | server config real, client dial not provisioned |
+| AMNEZIA_WG (client<->ingress) | any | capability-not-implemented this slice - AWG upstream chaining was not attempted (task's own "if AWG upstream is significantly harder to implement safely, do not fake it") |
+
+**Client execution wiring** (`android/.../relay/RelayExecution.kt`,
+`smartconnect/AutoGatewaySelector.kt`, `MainViewModel.kt`):
+
+- `RelayedExecutionPlan` - the real, immutable per-attempt contract, built
+  ONLY via `.from(RelayAttemptCandidate)` - copies `ingressEndpointId`/
+  `ingressBinding`/`ingressTransport`/`exitEndpointId`/`exitBinding`/
+  `exitTransport`/`historyPathId` straight off the already-ranked
+  candidate, never re-resolving from the manifest/catalog mid-attempt (task
+  requirement 2).
+- `RelayReadinessStage` (`INGRESS_REACHABLE`/`INGRESS_HANDSHAKE_OK`/
+  `UPSTREAM_EXIT_HANDSHAKE_OK`/`END_TO_END_DATA_PLANE_OK`) and
+  `RelayFailureCategory` (`INGRESS_UNREACHABLE`/`INGRESS_HANDSHAKE_FAILED`/
+  `UPSTREAM_EXIT_UNREACHABLE`/`UPSTREAM_EXIT_HANDSHAKE_FAILED`/
+  `RELAY_AUTH_FAILED`/`END_TO_END_DATA_PLANE_FAILED`/
+  `EXECUTION_NOT_IMPLEMENTED`) are the typed vocabulary task requirements
+  10/12 asked for. `RelayAttemptOutcome.Success` is constructible ONLY at
+  `END_TO_END_DATA_PLANE_OK` - fail-closed by TYPE CONSTRUCTION (a `Failure`
+  literally cannot claim that stage - `init{}` enforces it), not by
+  convention.
+- `RelayIngressDialer` - the real client<->ingress execution boundary a
+  future transport implementation fulfills. `NotProvisionedRelayIngressDialer`
+  is the ONLY implementation wired into production: it fails closed
+  (`EXECUTION_NOT_IMPLEMENTED`) for every plan, honestly, because dialing an
+  ingress over XRAY_REALITY/TLS_TCP needs a real per-ingress-provisioned
+  Xray client profile that cannot exist without a real ingress and a real
+  per-device activation against it (out of scope - "no new infrastructure").
+- `AutoGatewaySelector.AutoConnectAttempt` (sealed `DirectAttempt`/
+  `RelayedAttempt`) + `buildCombinedAttempts`/`nextCombinedAttempt` - ONE
+  combined, real, ranked attempt list built from `buildCandidates` +
+  `buildRelayedCandidates` together (task requirement 4), sharing ONE
+  `MAX_ATTEMPTS` budget across both types. `MainViewModel.connectAuto()`
+  picks its winner from this combined list: a **Direct** winner is executed
+  through the COMPLETELY UNCHANGED `attemptAutoCandidate`/
+  `PendingFailoverAttempt` machinery (reordered so the winner is tried
+  first, never re-scored - this is what makes "the winner from scoring is
+  the candidate execution receives" true even though the two ranking
+  functions' tie-break rules are not byte-for-byte identical); once inside
+  that Direct sub-sequence, Direct's own existing bounded failover runs to
+  exhaustion exactly as it always has (task's own "Direct behavior must
+  stay unchanged" - Direct's failover chain is never made aware Relayed
+  candidates exist). A **Relayed** winner is executed through
+  `attemptRelayedAttempt`, which dials `relayIngressDialer` and records the
+  outcome under the FULL `historyPathId` (task requirement 11 - never
+  poisons either hop's own Direct history); on failure it advances the
+  SAME shared combined budget, possibly reaching a Direct candidate next -
+  never retries the same candidate, never substitutes a different exit
+  while keeping that candidate's own identity (task requirement 13).
+  `AutoGatewayDiagnostics` itself stays Direct-only (its existing public
+  shape is unchanged - every pre-B24 reader is unaffected); a Relayed
+  attempt is currently reflected there only via `lastFailureReason` once it
+  fails.
+
+**Server-side ingress runtime** (`gateway/api/xray_ingress_config_renderer.py`)
+- reuses the EXISTING Xray server machinery (task requirement 7 - no new
+daemon, no sing-box/Hysteria):
+
+- Client-facing inbound rendering (REALITY/TLS) and client authorization
+  are the SAME functions `xray_config_renderer` already uses for a real
+  gateway (`_active_clients`/`_render_reality_inbound`/`_render_tls_inbound`,
+  imported and called verbatim, never duplicated) - an ingress has NO
+  second/parallel identity system (task requirement 8); a revoked/expired
+  activation is excluded here exactly as it already is for a real gateway.
+- The genuinely NEW piece is the OUTBOUND: instead of `freedom` (what every
+  existing gateway config renders - direct to the open Internet), the
+  ingress's outbound is a real, authenticated VLESS connection
+  (`UpstreamExitConfig` - REALITY or TLS, independently chosen from the
+  client-facing inbound's own transport) to the pinned EXIT, carrying its
+  own dedicated relay UUID credential (task requirement 9 - "do not assume
+  source IP == trusted ingress"; never a shared/global plaintext
+  credential, never committed to this repository - always caller-supplied
+  at render time). Routing rules bind EVERY client-facing inbound
+  EXCLUSIVELY to that one upstream outbound, and no `direct`/`freedom`
+  outbound exists in the rendered config AT ALL - an ingress rendered this
+  way is structurally incapable of becoming an open relay or the public
+  Internet exit by accident (task requirement 6/L), not merely by
+  convention. `render_ingress_server_config_redacted` never serializes the
+  ingress's own REALITY private key or the upstream relay UUID (task
+  requirement 9/M).
+- Malformed upstream inputs (bad UUID, blank host, unsupported transport,
+  malformed REALITY key/short-id) fail closed with `IngressConfigRenderError`
+  rather than rendering a config that would silently misroute.
+- **Not done this slice**: no systemd unit/deployment script for an ingress
+  role (`gateway/systemd/nova-xray.service` is EXIT-shaped only), no
+  ingress-specific provisioning/activation HTTP endpoint, no reload
+  wiring. These are genuinely deployment/control-plane concerns that
+  require an actual ingress host to design against meaningfully - adding
+  them now, untested against a real host, would risk exactly the kind of
+  premature/undemonstrated infrastructure this task explicitly warns
+  against.
+
+**Ingress role**: `IngressKind.DIRECT_IP` has the real runtime path above
+(a plain host:port the client dials directly). `IngressKind.CDN_FRONTED`
+remains typed-but-FOUNDATION - no legitimate operator-controlled CDN was
+available to validate against this slice, and this codebase's own
+principle 3 forbids ever impersonating a named third-party service to fake
+one.
+
+**Remaining condition to exercise any of this physically**: a real ingress
+host (DIRECT_IP first) running `xray_ingress_config_renderer`'s output,
+plus a real per-device activation against that ingress issuing a real Xray
+client profile, plus a real `RelayIngressDialer` implementation dialing it
+- none of which exist yet (task's own "no new infrastructure without
+approval").
+
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
 Architecture principle 9: a user may connect through the managed gateway
