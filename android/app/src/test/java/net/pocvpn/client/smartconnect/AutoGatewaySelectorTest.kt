@@ -1023,4 +1023,59 @@ class AutoGatewaySelectorTest {
         val second = AutoGatewaySelector.nextCombinedAttempt(attempts, setOf(first.attemptKey))
         assertTrue(second == null || second.attemptKey != first.attemptKey)
     }
+
+    // --- B28: restriction evidence flowing through the real, end-to-end combined pipeline ---
+
+    private fun hardWhitelistReachable(id: EndpointId, kind: TransportKind) = EndpointReachability(
+        id, kind, ReachabilityState.REACHABLE,
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, 0, true, true, RestrictionClass.POSSIBLE_HARD_WHITELIST, endpointSpecificReachableAgeMillis = 0),
+    )
+
+    /** B28 requirement 3 - a genuinely HEALTHY (not merely ineligible) relay still outranks a genuinely HEALTHY direct path once POSSIBLE_HARD_WHITELIST evidence is in effect, through the SAME real buildCombinedAttempts pipeline B24 already exercises. */
+    @Test
+    fun `B28 - under POSSIBLE_HARD_WHITELIST evidence, an eligible healthy relay outranks an equally healthy direct gateway`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> hardWhitelistReachable(id, kind) },
+        )
+        assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt)
+    }
+
+    /** B28 requirement 1 - the SAME manifest/evidence shape, but ordinary UNKNOWN restriction evidence: healthy direct keeps winning, relay is never force-preferred merely for existing. */
+    @Test
+    fun `B28 - under UNKNOWN restriction evidence, the same manifest still ranks direct first - relay is never force-preferred merely for existing`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+        )
+        assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt)
+    }
+
+    /** B28 requirement 3 - both DIRECT_IP and CDN_FRONTED ingress candidates participate through the SAME buildCombinedAttempts authority under hard-whitelist evidence, ranked among themselves purely by their own (identical, here) reachability/health/history - not by a hardcoded kind preference. */
+    @Test
+    fun `B28 - DIRECT_IP and CDN_FRONTED relayed attempts both outrank direct under hard-whitelist evidence, neither kind globally preferred`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, directIpIngressEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind -> hardWhitelistReachable(id, kind) },
+        )
+        val relayed = attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>()
+        assertEquals(setOf(IngressKind.DIRECT_IP, IngressKind.CDN_FRONTED), relayed.map { it.candidate.ingressKind }.toSet())
+        assertTrue("both relay kinds must outrank the direct attempt", attempts.count { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt } == 2 && attempts.take(2).all { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt })
+        // Identical evidence for both kinds -> identical score, so the restriction bonus itself never breaks the tie in either kind's favor.
+        assertEquals(relayed[0].score, relayed[1].score)
+    }
+
+    /** B28 requirement 4 - hard-whitelist evidence suspected, but the only candidate relay is fresh-UNREACHABLE (ineligible): fails closed, never fabricates a healthy relay or a healthy direct path just to preserve connectivity. */
+    @Test
+    fun `B28 - hard-whitelist evidence with no eligible relay candidate fails closed rather than fabricating connectivity`() {
+        val attempts = buildCombinedDefault(
+            manifestEndpoints = listOf(exitEndpoint, ingressEndpoint),
+            reachabilityFor = { id, kind ->
+                if (id == ingressEndpoint.id) relayFreshlyUnreachable(id, kind) else hardWhitelistReachable(id, kind)
+            },
+        )
+        // The direct exit is itself genuinely reachable here (only the relay's own ingress hop is unreachable) - direct must still be offered truthfully, never suppressed just because whitelist evidence looks bad, and the ineligible relay must never appear at all.
+        assertTrue(attempts.none { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt })
+        assertTrue(attempts.any { it is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt })
+    }
 }

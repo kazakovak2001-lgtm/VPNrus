@@ -493,4 +493,34 @@ class MainViewModelAutoGatewayTest {
         assertTrue(manifestHost != ProductionGatewayCatalog.GERMANY.awg.endpointHost)
         assertTrue(manifestPort != ProductionGatewayCatalog.GERMANY.awg.endpointPort)
     }
+
+    // --- B28: combinedAutoRankingDiagnostics - sanitized, kind-labeled, no-secret diagnostics ---
+
+    @Test
+    fun `B28 - combinedAutoRankingDiagnostics carries the current restriction class and one entry per ranked attempt, labeled DIRECT under normal evidence`() {
+        val viewModel = newViewModel()
+        val diagnostics = viewModel.combinedAutoRankingDiagnostics()
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN, diagnostics.restrictionClass)
+        assertTrue(diagnostics.ranked.isNotEmpty())
+        assertTrue(diagnostics.ranked.all { it.kind == "DIRECT" })
+    }
+
+    /** B28 requirement 10 - no UUID/host/credential/token/key string ever leaks through this surface - only the closed {kind, score, typed-reason-token} shape. */
+    @Test
+    fun `B28 - combinedAutoRankingDiagnostics never leaks an endpoint host, credential, or key - only kind, score, and typed reason tokens`() {
+        val viewModel = newViewModel()
+        val diagnostics = viewModel.combinedAutoRankingDiagnostics()
+        val sensitiveSubstrings = listOf(
+            ProductionGatewayCatalog.GERMANY.awg.endpointHost,
+            ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost,
+        )
+        diagnostics.ranked.forEach { entry ->
+            assertTrue(entry.kind in setOf("DIRECT", "CHAIN_DIRECT", "CHAIN_CDN"))
+            entry.reasons.forEach { reason ->
+                // Reason tokens are the closed PathScorer.Reason vocabulary - all-caps/underscore, never free text carrying a host/id/secret.
+                assertTrue("reason token '$reason' must be a stable typed token, not free text", reason.all { it.isUpperCase() || it == '_' })
+                sensitiveSubstrings.forEach { host -> assertTrue(host !in reason) }
+            }
+        }
+    }
 }

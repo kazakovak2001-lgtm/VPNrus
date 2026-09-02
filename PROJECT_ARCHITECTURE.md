@@ -1085,6 +1085,123 @@ guarantee of whitelist reachability, and this slice claims neither.
   sequence - a real CDN account/configuration would be needed to design
   that meaningfully, and none is available.
 
+## Restricted-Network Decision Authority (B28) - FOUNDATION
+
+Architecture principle: `RestrictionClass` (B18/B23) becomes decision-driving
+for the first time - real restriction evidence now influences automatic
+DIRECT vs RELAY path ranking, without a second decision authority, without
+country/provider hardcoding, and without physically validating a real
+restrictive network. No deployment, no device dependency. **Russia
+hard-whitelist bypass remains UNVERIFIED** - nothing in this slice proves a
+real fixed-allowlist network actually gets bypassed; it proves the scoring
+fabric would PREFER a reachable relay over a direct path once such evidence
+exists.
+
+- **Where the decision is made (single authority, requirement 7)**:
+  `PathScorer.score` (`reachability/PathScorer.kt`) gains ONE new tier,
+  `RESTRICTION_TIER = 700`, sandwiched strictly between `HISTORY_TIER=1000`
+  and `MATURITY_TIER=200` (tier-algebra re-verified in the class doc comment
+  for all five tiers). `AutoGatewaySelector` and `MainViewModel` are
+  UNCHANGED - the restriction value is read directly off data ALREADY
+  present on `candidate.hops[0].reachability.evidence.restrictionClass`
+  (every hop of one candidate carries the SAME class, since
+  `MainViewModel.restrictionClass()` computes it once per read and threads
+  it into every `ReachabilityEngine.assess` call for that read). No second
+  selector, no new parameter threading through `AutoGatewaySelector`.
+- **The exact rule (requirements 1-3)**: `restrictionRank(candidate,
+  restrictionClass)` is nonzero ONLY for `RestrictionClass
+  .POSSIBLE_HARD_WHITELIST` - every other class (`UNKNOWN`,
+  `NO_RESTRICTION_OBSERVED`, `POSSIBLE_UDP_OR_AWG_FILTERING`, etc.)
+  contributes exactly 0, so ordinary healthy-direct behavior under
+  NORMAL/UNKNOWN evidence is byte-for-byte unaffected (requirement 1).
+  Under `POSSIBLE_HARD_WHITELIST`: `+1` (bonus) for `PathCandidate.Relayed`,
+  `-1` (penalty) for `PathCandidate.Direct` - symmetric, so the same
+  tier-width proof covers both directions. The bonus depends only on
+  candidate TYPE, never on `IngressKind` - `DIRECT_IP` and `CDN_FRONTED`
+  relayed candidates get the IDENTICAL +1, so neither ingress kind is ever
+  globally preferred; their relative order among themselves is still
+  decided entirely by the higher `REACHABILITY_TIER`/`HEALTH_TIER`/
+  `HISTORY_TIER` (requirement 3). `POSSIBLE_UDP_OR_AWG_FILTERING` gets NO
+  dedicated branch (requirement 2) - it is itself derived from a real
+  `awgHandshakeFresh == false` `ConnectionOutcome`, which already penalizes
+  `AMNEZIA_WG` via the pre-existing `HEALTH_TIER`
+  (`TransportHealthCalculator`); a second protocol-specific branch here
+  would be exactly the redundant nested if/else the task asked not to add.
+- **Eligibility is untouched (requirement 4)**: `PathScorer.isEligible`/
+  `ineligibilityReason` gained ZERO new logic. Restriction only affects
+  SCORE among already-eligible candidates - a relay candidate that is
+  ineligible (fresh `ReachabilityState.UNREACHABLE`, no valid
+  `IngressClientProfile`, transport not implemented) can never be promoted
+  by the restriction bonus, structurally, not by a runtime check. When
+  `POSSIBLE_HARD_WHITELIST` is suspected and the only candidate relay is
+  ineligible, `buildCombinedAttempts` yields it no `RelayedAttempt` entry at
+  all, and a genuinely reachable Direct path is still offered truthfully
+  (never suppressed, never fabricated) - proven by
+  `AutoGatewaySelectorTest`'s "hard-whitelist evidence with no eligible
+  relay candidate fails closed rather than fabricating connectivity".
+- **Evidence stays distinct (requirement 5)**: endpoint reachability
+  (`ReachabilityEngine`/`ReachabilityState`), transport handshake/health
+  (`TransportHealth`/`TransportHealthCalculator`), real end-to-end proof
+  (B25/B26's `RelayReadinessStage`/`END_TO_END_DATA_PLANE_OK`), and
+  restriction classification (`RestrictionClass`) remain four SEPARATE
+  fields feeding four SEPARATE `PathScorer` tiers - never collapsed into one
+  boolean. `RestrictionClassifier.classify` itself is unchanged in its own
+  evidence-only discipline (still conservative, still never infers a
+  country/operator claim - see the enum's own doc comment, unchanged since
+  B18).
+- **Hysteresis/TTL (requirement 8)**: `RestrictionMonitor` now stamps
+  `lastProbeEpochMillis`/`lastDiverseReachabilityEpochMillis` (real wall
+  clock via an injectable `nowProvider`, defaulting to
+  `System::currentTimeMillis`) alongside its existing
+  `lastProbeResult`/`lastDiverseReachabilityResult` StateFlows - still
+  triggered ONLY by a real transport-state/network-type transition, never a
+  timer (unchanged B8J discipline). `RestrictionEvidence` gained two
+  matching optional fields, `gatewayProbeEpochMillis`/
+  `diverseProbeEpochMillis` (both default `null`). `RestrictionClassifier
+  .classify` gained `nowEpochMillis`/`staleAfterMillis` parameters (default
+  `Long.MAX_VALUE`/`DEFAULT_STALE_AFTER_MILLIS = 30 * 60 * 1000L`, the SAME
+  window `ReachabilityEngine` already uses) and a private `freshOrTrusted`
+  helper: once a probe's own timestamp is older than `staleAfterMillis` (or
+  future-dated - the same clock-skew guard `ReachabilityEngine.assess`
+  already applies), that probe's value is treated as unknown (null) rather
+  than trusted indefinitely, decaying `POSSIBLE_HARD_WHITELIST`/
+  `POSSIBLE_UDP_OR_AWG_FILTERING` back toward `UNKNOWN`/
+  `GATEWAY_HTTPS_UNREACHABLE` once its own evidence has expired. Backward
+  compatible by design: an UNDATED value (no timestamp supplied - every
+  pre-B28 caller) is legacy-trusted as-is, never treated as immediately
+  stale, so no existing call site's classification changed.
+  `MainViewModel.restrictionClass()` now passes the real `now` and both
+  probe timestamps into `classify()` in production.
+- **B26/B27 guarantees preserved (requirement 9)**: `AutoGatewaySelector`,
+  `PathCandidate`, `RelayIngressResolverImpl`, `IngressProfileProvisioner`,
+  and every activation/pause/resume/atomic-claim mechanism in
+  `MainViewModel` are UNTOUCHED by this slice - restriction scoring is
+  orthogonal to (runs strictly before) candidate ranking and pinning; once a
+  candidate is selected and activated, restriction evidence has no further
+  effect on it. Full `testDebugUnitTest`/`assembleDebug` re-run confirms no
+  regression.
+- **Diagnostics (requirement 10)**: `MainViewModel.combinedAutoRankingDiagnostics()`
+  (new, `CombinedAutoRankingDiagnostics{restrictionClass, ranked:
+  List<CombinedAttemptDiagnostic{kind, score, reasons}>}`) maps the
+  ALREADY-public, already-ranked `combinedAutoAttempts()` output - never a
+  second ranking pass. `kind` is one of `"DIRECT"`/`"CHAIN_DIRECT"`/
+  `"CHAIN_CDN"` (derived from `RelayedAttempt.candidate.ingressKind`).
+  `reasons` is filtered to the stable `PathScorer.Reason` token vocabulary
+  only (`RESTRICTION_FAVORS_RELAY`/`RESTRICTION_PENALIZES_DIRECT` are the
+  two new tokens) - no endpoint host/IP, UUID, activation credential, probe
+  token, or key ever appears (closed field set, proven by
+  `MainViewModelAutoGatewayTest`'s dedicated no-leak test). Deliberately a
+  NEW surface, not a change to the existing Direct-only
+  `AutoGatewayDiagnostics` (B16), which stays untouched.
+- **Not done this slice**: no physical validation on any real restrictive
+  network (this remains FOUNDATION-only, exactly like B23/B24/B25's own
+  caveats); `RestrictionClass` is still never inferred from country/ASN/
+  provider identity anywhere in this codebase; no new UI surface renders
+  `combinedAutoRankingDiagnostics()` (diagnostics-only, same boundary as
+  every prior diagnostics addition); the gateway/Python control plane is
+  completely untouched (this slice is Android/Kotlin reachability-decision
+  logic only).
+
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
 Architecture principle 9: a user may connect through the managed gateway

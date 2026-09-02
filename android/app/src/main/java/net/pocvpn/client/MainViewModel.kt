@@ -174,6 +174,33 @@ data class AutoGatewayDiagnostics(
 )
 
 /**
+ * B28 (requirement 10) - one ranked entry from [MainViewModel
+ * .combinedAutoRankingDiagnostics]. [kind] is one of "DIRECT", "CHAIN_DIRECT",
+ * "CHAIN_CDN" - never an endpoint id/host. [reasons] is filtered to the
+ * stable [net.pocvpn.client.reachability.PathScorer.Reason] token names only
+ * (the free-text entries [PathScorer] also appends, e.g. "reachability=...",
+ * are deliberately dropped here even though they carry no secret either -
+ * this surface stays token-only so it never needs re-auditing if a future
+ * free-text entry starts embedding something sensitive).
+ */
+data class CombinedAttemptDiagnostic(
+    val kind: String,
+    val score: Long,
+    val reasons: List<String>,
+)
+
+/**
+ * B28 (requirement 10) - the restriction evidence in effect for this read,
+ * plus the ranked attempt list it influenced - see
+ * [MainViewModel.combinedAutoRankingDiagnostics]'s own docs for the
+ * no-secrets contract.
+ */
+data class CombinedAutoRankingDiagnostics(
+    val restrictionClass: net.pocvpn.client.smartconnect.RestrictionClass,
+    val ranked: List<CombinedAttemptDiagnostic>,
+)
+
+/**
  * Thin state holder above VpnController - MainActivity observes this instead
  * of owning tunnel/connection state itself, so Activity recreation (rotation,
  * process death+restore of the Activity only) doesn't lose or duplicate it.
@@ -1028,6 +1055,15 @@ class MainViewModel(
      * ConnectionOutcome, and the MOST RECENT bounded probe result - never a
      * fresh probe run synchronously here). Recomputed fresh on every read,
      * same no-caching pattern as gatewayStatus()/smartConnectDecision().
+     *
+     * B28 - also passes the REAL wall-clock now plus each probe's own
+     * timestamp (restrictionMonitor.lastProbeEpochMillis/
+     * lastDiverseReachabilityEpochMillis) so RestrictionClassifier.classify
+     * can time-box POSSIBLE_HARD_WHITELIST/POSSIBLE_UDP_OR_AWG_FILTERING to
+     * genuinely fresh evidence (see that function's own staleness docs) -
+     * this is the hysteresis mechanism requirement 8 asked for, reusing
+     * RestrictionMonitor's existing single-flight probe trigger rather than
+     * a second polling/expiry mechanism.
      */
     fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(
         RestrictionEvidence(
@@ -1036,7 +1072,10 @@ class MainViewModel(
             awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
             gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
             diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
+            gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
+            diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
         ),
+        nowEpochMillis = System.currentTimeMillis(),
     )
 
     /**
@@ -2249,6 +2288,44 @@ class MainViewModel(
      * [connectAuto] uses to pick its winner.
      */
     fun combinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> = buildCombinedAutoAttempts()
+
+    /**
+     * B28 (requirement 10) - sanitized diagnostics explaining why Auto
+     * ranked DIRECT / CHAIN_DIRECT / CHAIN_CDN the way it did, including
+     * which [net.pocvpn.client.smartconnect.RestrictionClass] was in effect
+     * for this read. Built purely by MAPPING the already-public,
+     * already-ranked [combinedAutoAttempts] output (never a second ranking
+     * pass, never a second decision authority - requirement 7) plus the
+     * SAME [restrictionClass] evidence read fresh above. Deliberately a
+     * NEW, separate surface rather than a change to the existing
+     * Direct-only [AutoGatewayDiagnostics] shape, which B24 already
+     * documented as staying Direct-only - existing consumers of that type
+     * are unaffected.
+     *
+     * Only [PathScorer.Reason] token names, a "kind" label, and the numeric
+     * score are exposed - never a UUID, endpoint host/IP, activation
+     * credential, probe token, or key (see [CombinedAttemptDiagnostic]'s
+     * own field list, a closed, non-secret set - same discipline as
+     * [ReachabilityEvidenceSummary]).
+     */
+    fun combinedAutoRankingDiagnostics(): CombinedAutoRankingDiagnostics {
+        val attempts = combinedAutoAttempts()
+        return CombinedAutoRankingDiagnostics(
+            restrictionClass = restrictionClass(),
+            ranked = attempts.map { attempt ->
+                val kind = when (attempt) {
+                    is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt -> "DIRECT"
+                    is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt ->
+                        if (attempt.candidate.ingressKind == net.pocvpn.client.reachability.IngressKind.CDN_FRONTED) "CHAIN_CDN" else "CHAIN_DIRECT"
+                }
+                CombinedAttemptDiagnostic(
+                    kind = kind,
+                    score = attempt.score,
+                    reasons = attempt.reasons.filter { reason -> reason.all { it.isUpperCase() || it == '_' } },
+                )
+            },
+        )
+    }
 
     /**
      * B24 - the combined Direct+Relayed counterpart of

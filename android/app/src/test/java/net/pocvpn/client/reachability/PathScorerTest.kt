@@ -38,10 +38,39 @@ class PathScorerTest {
         state: ReachabilityState,
         latencyMillis: Long? = null,
         endpointSpecificReachable: Boolean? = null,
+        restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
     ) = EndpointReachability(
         id, kind, state, latencyMillis = latencyMillis,
-        evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, null, endpointSpecificReachable, true, RestrictionClass.UNKNOWN),
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, null, endpointSpecificReachable, true, restrictionClass),
     )
+
+    private fun directCandidate(id: String, kind: TransportKind, restrictionClass: RestrictionClass): PathCandidate.Direct {
+        val e = endpoint(id, kind)
+        return PathCandidateBuilder.buildDirect(e, kind, reachWithEvidence(e.id, kind, ReachabilityState.REACHABLE, restrictionClass = restrictionClass))!!
+    }
+
+    private fun relayedCandidate(
+        ingressId: String,
+        exitId: String,
+        kind: TransportKind,
+        restrictionClass: RestrictionClass,
+        ingressKind: IngressKind = IngressKind.DIRECT_IP,
+    ): PathCandidate.Relayed {
+        val ingressEndpoint = EndpointDescriptor(
+            EndpointId(ingressId), setOf(EndpointRole.INGRESS), "eu", "acme",
+            transports = listOf(EndpointTransportBinding(kind, "203.0.113.10", 443).withIngressKind(ingressKind)),
+            relayTo = EndpointId(exitId),
+        )
+        val exitEndpoint = EndpointDescriptor(
+            EndpointId(exitId), setOf(EndpointRole.EXIT), "us", "acme2",
+            transports = listOf(EndpointTransportBinding(kind, "203.0.113.11", 443)),
+        )
+        return PathCandidateBuilder.buildRelayed(
+            ingressEndpoint, exitEndpoint, kind, kind,
+            reachWithEvidence(ingressEndpoint.id, kind, ReachabilityState.REACHABLE, restrictionClass = restrictionClass),
+            reachWithEvidence(exitEndpoint.id, kind, ReachabilityState.REACHABLE, restrictionClass = restrictionClass),
+        )!!
+    }
 
     private fun registryWith(kind: TransportKind, status: TransportStatus): TransportRegistry = TransportRegistry.build(
         listOf(
@@ -432,5 +461,133 @@ class PathScorerTest {
         // A fresh transportHealth read now shows UNKNOWN too (the same stale-decay reasoning) - not the original UNREACHABLE.
         val result = PathScorer.score(candidate, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.UNKNOWN), null, false)
         assertTrue(result.eligible)
+    }
+
+    // --- B28: restriction-evidence path-type preference ---
+
+    @Test
+    fun `NORMAL (UNKNOWN) restriction evidence never forces relay over an equally-healthy direct candidate`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.UNKNOWN)
+        val relayed = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.UNKNOWN)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val directScore = PathScorer.score(direct, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        val relayedScore = PathScorer.score(relayed, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertTrue(directScore.eligible && relayedScore.eligible)
+        assertEquals(directScore.score, relayedScore.score)
+        assertFalse(directScore.reasons.contains(PathScorer.Reason.RESTRICTION_PENALIZES_DIRECT.name))
+        assertFalse(relayedScore.reasons.contains(PathScorer.Reason.RESTRICTION_FAVORS_RELAY.name))
+    }
+
+    @Test
+    fun `NO_RESTRICTION_OBSERVED also never forces relay - only POSSIBLE_HARD_WHITELIST does`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.NO_RESTRICTION_OBSERVED)
+        val relayed = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.NO_RESTRICTION_OBSERVED)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val directScore = PathScorer.score(direct, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        val relayedScore = PathScorer.score(relayed, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertEquals(directScore.score, relayedScore.score)
+    }
+
+    @Test
+    fun `POSSIBLE_HARD_WHITELIST evidence makes an equally-reachable relay outrank direct`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val relayed = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val directScore = PathScorer.score(direct, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        val relayedScore = PathScorer.score(relayed, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertTrue(relayedScore.score > directScore.score)
+        assertTrue(directScore.reasons.contains(PathScorer.Reason.RESTRICTION_PENALIZES_DIRECT.name))
+        assertTrue(relayedScore.reasons.contains(PathScorer.Reason.RESTRICTION_FAVORS_RELAY.name))
+    }
+
+    @Test
+    fun `both DIRECT_IP and CDN_FRONTED relayed candidates get the identical POSSIBLE_HARD_WHITELIST bonus - neither kind is globally preferred`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val directIpRelay = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST, ingressKind = IngressKind.DIRECT_IP)
+        val cdnRelay = relayedCandidate("in2", "exit1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST, ingressKind = IngressKind.CDN_FRONTED)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val directIpScore = PathScorer.score(directIpRelay, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        val cdnScore = PathScorer.score(cdnRelay, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertEquals(directIpScore.score, cdnScore.score)
+    }
+
+    @Test
+    fun `an unhealthy - unreachable relay is not selected just because POSSIBLE_HARD_WHITELIST is suspected - the bonus never overrides fresh UNREACHABLE ineligibility`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val e = EndpointDescriptor(
+            EndpointId("in-bad"), setOf(EndpointRole.INGRESS), "eu", "acme",
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.20", 443).withIngressKind(IngressKind.DIRECT_IP)),
+            relayTo = EndpointId("exit1"),
+        )
+        val exitEndpoint = EndpointDescriptor(
+            EndpointId("exit1"), setOf(EndpointRole.EXIT), "us", "acme2",
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.21", 443)),
+        )
+        val unreachableRelay = PathCandidateBuilder.buildRelayed(
+            e, exitEndpoint, TransportKind.TLS_TCP, TransportKind.TLS_TCP,
+            reachWithEvidence(e.id, TransportKind.TLS_TCP, ReachabilityState.UNREACHABLE, restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST),
+            reachWithEvidence(exitEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE, restrictionClass = RestrictionClass.POSSIBLE_HARD_WHITELIST),
+        )!!
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val relayedScore = PathScorer.score(unreachableRelay, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertFalse("a fresh-UNREACHABLE relay hop must stay ineligible regardless of restriction evidence", relayedScore.eligible)
+        // The direct candidate, still eligible, ranks ahead - never fabricating a healthy relay to preserve connectivity.
+        val directScore = PathScorer.score(direct, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertTrue(directScore.eligible)
+        assertTrue(directScore.score > relayedScore.score)
+    }
+
+    @Test
+    fun `POSSIBLE_UDP_OR_AWG_FILTERING carries no dedicated restriction-tier branch - AMNEZIA_WG is penalized only via the existing HEALTH_TIER`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
+        val healthyNoFiltering = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
+        val filteredAwg = EndpointReachability(
+            EndpointId("gw1"), TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE,
+            evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, null, null, true, RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING),
+        )
+        val cFiltered = PathCandidateBuilder.buildDirect(endpoint("gw1", TransportKind.AMNEZIA_WG), TransportKind.AMNEZIA_WG, filteredAwg)!!
+        val filteredScore = PathScorer.score(cFiltered, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
+        // Same (healthy) transport health -> POSSIBLE_UDP_OR_AWG_FILTERING alone contributes exactly 0 restriction score - the real penalty only shows up once TransportHealth itself reflects the failed handshake (a separate, already-existing HEALTH_TIER path, not exercised here).
+        assertEquals(healthyNoFiltering.score, filteredScore.score)
+        assertFalse(filteredScore.reasons.contains(PathScorer.Reason.RESTRICTION_FAVORS_RELAY.name))
+        assertFalse(filteredScore.reasons.contains(PathScorer.Reason.RESTRICTION_PENALIZES_DIRECT.name))
+    }
+
+    @Test
+    fun `restriction preference is strong enough to survive a worst-case combined maturity+latency+failure+diversity swing but never outweighs history`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val relayed = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        // Worst case for direct: give the RELAY zero bonuses (no maturity, no diversity) and the DIRECT candidate the maximum possible maturity+diversity swing.
+        val directScore = PathScorer.score(
+            direct, registry, TransportCapabilities.amneziaWg().copy(maturity = net.pocvpn.client.transport.TransportMaturity.STABLE),
+            health, null, diverseProviderOrAsnSeenElsewhere = true,
+        )
+        val relayedScore = PathScorer.score(
+            relayed, registry, TransportCapabilities.amneziaWg().copy(maturity = net.pocvpn.client.transport.TransportMaturity.NOT_IMPLEMENTED),
+            health, null, diverseProviderOrAsnSeenElsewhere = false,
+        )
+        assertTrue(
+            "restriction dominance over maturity/diversity must hold even under worst-case swing (direct=${directScore.score}, relayed=${relayedScore.score})",
+            relayedScore.score > directScore.score,
+        )
+    }
+
+    @Test
+    fun `a real local history advantage on this network still outranks a mere POSSIBLE_HARD_WHITELIST-only relay preference`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val relayed = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_HARD_WHITELIST)
+        val bestHistory = PathHistoryEntry(successCount = 10, failureCount = 0, lastOutcomeEpochMillis = 0L, lastOutcomeSuccess = true)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val directScoreWithHistory = PathScorer.score(direct, registry, TransportCapabilities.amneziaWg(), health, bestHistory, false)
+        val relayedScoreNoHistory = PathScorer.score(relayed, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertTrue(directScoreWithHistory.score > relayedScoreNoHistory.score)
     }
 }
