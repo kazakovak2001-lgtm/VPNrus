@@ -1132,13 +1132,7 @@ exists.
   SCORE among already-eligible candidates - a relay candidate that is
   ineligible (fresh `ReachabilityState.UNREACHABLE`, no valid
   `IngressClientProfile`, transport not implemented) can never be promoted
-  by the restriction bonus, structurally, not by a runtime check. When
-  `POSSIBLE_HARD_WHITELIST` is suspected and the only candidate relay is
-  ineligible, `buildCombinedAttempts` yields it no `RelayedAttempt` entry at
-  all, and a genuinely reachable Direct path is still offered truthfully
-  (never suppressed, never fabricated) - proven by
-  `AutoGatewaySelectorTest`'s "hard-whitelist evidence with no eligible
-  relay candidate fails closed rather than fabricating connectivity".
+  by the restriction bonus, structurally, not by a runtime check.
 - **Evidence stays distinct (requirement 5)**: endpoint reachability
   (`ReachabilityEngine`/`ReachabilityState`), transport handshake/health
   (`TransportHealth`/`TransportHealthCalculator`), real end-to-end proof
@@ -1201,6 +1195,91 @@ exists.
   every prior diagnostics addition); the gateway/Python control plane is
   completely untouched (this slice is Android/Kotlin reachability-decision
   logic only).
+
+### B28 review fix (PR #42) - correct no-viable-relay semantics + real hysteresis
+
+Two blockers found on first review, both fixed within the SAME single
+decision authority (no redesign):
+
+- **Blocker 1 - endpoint reachability must never silently override
+  restriction classification.** The original slice let `buildCombinedAttempts`
+  offer a Direct attempt whenever ITS OWN endpoint happened to be reachable,
+  even while `POSSIBLE_HARD_WHITELIST` was suspected and no eligible relay
+  existed - collapsing two distinct evidence layers (requirement 5) back
+  into one. Fixed: `AutoGatewaySelector.buildCombinedAttempts` gained a
+  `restrictionClass` parameter (threaded from `MainViewModel`'s already-
+  computed value, no new evidence source) and ONE inline gate, applied right
+  where Direct and Relayed are already merged (still the one existing
+  authority, never a second selector): `directAllowed = restrictionClass !=
+  POSSIBLE_HARD_WHITELIST || relayed.isNotEmpty()`. When no eligible relay
+  exists under `POSSIBLE_HARD_WHITELIST`, EVERY Direct candidate is excluded
+  - the combined list becomes empty regardless of how reachable any single
+  Direct endpoint's own probe says it is - producing genuine, truthful
+  exhaustion rather than a silent fallback. When an eligible relay DOES
+  exist, Direct is NOT excluded; it re-enters the same ranked list, where
+  `RESTRICTION_TIER` already biases the ranking toward relay (requirement 3's
+  "rank normally with relay preference"). A companion pure function,
+  `AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts,
+  restrictionClass)`, is `true` exactly when this specific gate produced the
+  empty result - used ONLY for truthful error labeling, never for
+  ranking/eligibility. `MainViewModel.connectAuto()` uses it to report the
+  new `VpnError.RestrictedNetworkNoViableRelay` (distinct from the generic
+  `NoCandidateAvailable`) and sets `AutoGatewayDiagnostics.lastFailureReason
+  = "RestrictedNetworkNoViableRelay"` - both purely presentational, no
+  decision logic lives outside `buildCombinedAttempts` itself. Proven by
+  `AutoGatewaySelectorTest`'s four new required cases (zero-eligible-relay
+  exhaustion excludes Direct entirely; one-eligible-relay lets it execute
+  and Direct still participates ranked; UNKNOWN-evidence-zero-relay stays
+  ordinary Direct; a reachable Direct across MULTIPLE healthy gateways still
+  cannot override the decision with zero relay candidates in the manifest at
+  all) and one real end-to-end `MainViewModelAutoGatewayTest` case (a real
+  manual handshake failure produces real `POSSIBLE_HARD_WHITELIST` evidence;
+  switching to Auto afterward never dials a second candidate and reports
+  `RestrictedNetworkNoViableRelay`).
+- **Blocker 2 - TTL alone is not hysteresis.** `RestrictionClassifier`'s
+  30-minute staleness window (requirement 8's first half) only EXPIRES old
+  evidence - it does nothing to stop two back-to-back FRESH, genuinely
+  differing probe results from flipping the DIRECT/RELAY ranking on every
+  single read (e.g. `HARD_WHITELIST -> UNKNOWN -> HARD_WHITELIST` inside a
+  few seconds). Fixed with a new, small, pure, O(1)-state object,
+  `smartconnect/RestrictionStabilizer.kt` (option (b) from the task's own
+  two choices - a minimum-RESIDENCE hold window, not "N consistent
+  observations": a hold window needs only the single most-recent pending
+  observation and its own timestamp, never an unbounded observation
+  history). `State{establishedClass, establishedAtEpochMillis, pendingClass?,
+  pendingSinceEpochMillis?}`; `advance(state, rawClass, now,
+  minResidenceMillis = DEFAULT_MIN_RESIDENCE_MILLIS = 90_000L)` is the one
+  pure transition function: a raw class differing from `establishedClass`
+  only gets PROMOTED once it has been observed continuously (never reverting
+  back to `establishedClass` or switching to a THIRD differing class in
+  between - either resets its own residency timer) for at least
+  `minResidenceMillis`; `RestrictionClass.NO_NETWORK`/`CAPTIVE_PORTAL` are
+  exempt entirely (requirement's own "should not be hidden behind long
+  hysteresis") and take effect immediately in both directions, entering AND
+  leaving. The very FIRST observation any session ever makes is trusted
+  immediately too (`initial()`) - hysteresis only guards CHANGES away from an
+  already-established value, never an artificial startup delay.
+  `MainViewModel` holds the one piece of state this needs
+  (`restrictionStabilizerState: RestrictionStabilizer.State?`, its own
+  session-scoped var) behind a NEW function, `stabilizedRestrictionClass()`
+  - deliberately SEPARATE from the existing `restrictionClass()`, which
+  stays the raw, immediate value every pre-B28 consumer (routing's
+  `NO_NETWORK` check, `reachabilityDiagnostics()`'s own "OBSERVATIONAL ONLY"
+  contract, and existing tests asserting a probe result is reflected right
+  after it completes) keeps reading unchanged. ONLY
+  `buildCombinedAutoAttempts()` - the one function that actually merges and
+  ranks Direct against Relayed, feeding `connectAuto()`'s real execution -
+  reads the stabilized value; `buildAutoGatewayCandidates()` (Direct-only,
+  no relay comparison ever happens there) keeps reading the raw value.
+  Proven by `RestrictionStabilizerTest` (single transient flip absorbed;
+  sustained change eventually establishes in both directions - entering AND
+  recovering out of `POSSIBLE_HARD_WHITELIST` are bounded by the identical
+  window, never permanent; `NO_NETWORK`/`CAPTIVE_PORTAL` stay immediate;
+  alternating short-lived evidence never accumulates enough continuous
+  residency to oscillate the established value; a custom
+  `minResidenceMillis` is honored).
+- **Full re-run**: `compileDebugKotlin`/`testDebugUnitTest`/`assembleDebug`
+  all green after both fixes, zero regressions across the existing suite.
 
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 

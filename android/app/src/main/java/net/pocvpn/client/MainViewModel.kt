@@ -1061,9 +1061,17 @@ class MainViewModel(
      * lastDiverseReachabilityEpochMillis) so RestrictionClassifier.classify
      * can time-box POSSIBLE_HARD_WHITELIST/POSSIBLE_UDP_OR_AWG_FILTERING to
      * genuinely fresh evidence (see that function's own staleness docs) -
-     * this is the hysteresis mechanism requirement 8 asked for, reusing
+     * this is the PROBE-FRESHNESS half of requirement 8, reusing
      * RestrictionMonitor's existing single-flight probe trigger rather than
      * a second polling/expiry mechanism.
+     *
+     * Deliberately stays the RAW, immediate value (unchanged by B28 blocker
+     * 2) - every existing consumer of this exact function (routing's
+     * NO_NETWORK check, OBSERVATIONAL-only diagnostics, and any test
+     * asserting a probe result is reflected right after it completes) keeps
+     * its own pre-B28 "always current truth" contract. See
+     * [stabilizedRestrictionClass] for the SEPARATE, hysteresis-smoothed
+     * value the actual DIRECT-vs-RELAY decision authority reads.
      */
     fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(
         RestrictionEvidence(
@@ -1077,6 +1085,38 @@ class MainViewModel(
         ),
         nowEpochMillis = System.currentTimeMillis(),
     )
+
+    /** B28 review fix (blocker 2) - see [stabilizedRestrictionClass]'s own docs; the ONLY mutable field this stabilization mechanism needs. */
+    private var restrictionStabilizerState: net.pocvpn.client.smartconnect.RestrictionStabilizer.State? = null
+
+    /**
+     * B28 review fix (blocker 2) - the DECISION-DRIVING restriction value:
+     * runs [restrictionClass]'s own raw, freshly-classified output through
+     * [net.pocvpn.client.smartconnect.RestrictionStabilizer.advance] (held
+     * in [restrictionStabilizerState], this ViewModel's own single piece of
+     * hysteresis state - never a second, independent copy) so a single
+     * transient flip away from an already-established class never
+     * immediately re-ranks DIRECT vs RELAYED (see that object's own docs
+     * for the exact minimum-residence rule; NO_NETWORK/CAPTIVE_PORTAL stay
+     * exempt, taking effect immediately in both directions). ONLY
+     * [buildCombinedAutoAttempts] - the one function that actually merges
+     * and ranks DIRECT and RELAYED candidates together, feeding
+     * [connectAuto]'s real execution - reads this value.
+     * [buildAutoGatewayCandidates] (Direct-only, no relay comparison ever
+     * happens there), [restrictionClass] itself, [reachabilityDiagnostics]
+     * (its own "OBSERVATIONAL ONLY" contract), and the routing-mode
+     * restriction supplier all deliberately keep reading the RAW,
+     * un-stabilized value, so nothing outside the actual DIRECT-vs-RELAY
+     * ranking authority is ever delayed.
+     */
+    fun stabilizedRestrictionClass(): RestrictionClass {
+        val now = System.currentTimeMillis()
+        val raw = restrictionClass()
+        val previous = restrictionStabilizerState ?: net.pocvpn.client.smartconnect.RestrictionStabilizer.initial(now, raw)
+        val next = net.pocvpn.client.smartconnect.RestrictionStabilizer.advance(previous, raw, now)
+        restrictionStabilizerState = next
+        return next.establishedClass
+    }
 
     /**
      * B11 - OBSERVATIONAL ONLY: assembles the current reachability fabric
@@ -2342,7 +2382,11 @@ class MainViewModel(
     private fun buildCombinedAutoAttempts(): List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt> {
         val now = System.currentTimeMillis()
         val profile = networkProfile.value
-        val restriction = restrictionClass()
+        // B28 review fix (blocker 2) - the STABILIZED value (see
+        // stabilizedRestrictionClass()'s own docs): this is the one place
+        // restriction evidence actually drives a DIRECT-vs-RELAYED ranking
+        // decision, so it is the one place hysteresis applies.
+        val restriction = stabilizedRestrictionClass()
         val health = transportHealth()
         val outcomes = recentConnectionOutcomes()
         val fingerprint = fingerprintKeyProvider?.let {
@@ -2396,6 +2440,7 @@ class MainViewModel(
             historyFor = { pathId, kind -> fingerprint?.let { pathHistoryStore?.get(it, pathId, kind) } },
             preference = userTransportPreference,
             nowEpochMillis = now,
+            restrictionClass = restriction,
         )
     }
 
@@ -2436,11 +2481,24 @@ class MainViewModel(
     private suspend fun connectAuto() {
         val attempts = buildCombinedAutoAttempts()
         if (attempts.isEmpty()) {
+            // B28 review fix (blocker 1) - report TRUTHFULLY when this
+            // empty result specifically came from restriction evidence
+            // suspecting a fixed allowlist with no eligible relay to route
+            // around it (buildCombinedAutoAttempts already excluded every
+            // Direct candidate in exactly that case - see
+            // AutoGatewaySelector.buildCombinedAttempts's own docs), never
+            // the generic NoCandidateAvailable that would also cover an
+            // ordinary "nothing configured" case.
+            val restricted = net.pocvpn.client.smartconnect.AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, stabilizedRestrictionClass())
             _autoGatewayDiagnostics.value = AutoGatewayDiagnostics(
                 rankedCandidates = emptyList(), attempted = emptyList(), current = null,
-                lastFailureReason = null, exhausted = true,
+                lastFailureReason = if (restricted) "RestrictedNetworkNoViableRelay" else null, exhausted = true,
             )
-            controller.rejectPreflight(VpnError.NoCandidateAvailable, "No automatic gateway candidate available")
+            if (restricted) {
+                controller.rejectPreflight(VpnError.RestrictedNetworkNoViableRelay, "Restricted network suspected (possible fixed allowlist) and no eligible relay path exists")
+            } else {
+                controller.rejectPreflight(VpnError.NoCandidateAvailable, "No automatic gateway candidate available")
+            }
             return
         }
         val directOnly = attempts.filterIsInstance<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt>().map { it.candidate }

@@ -494,6 +494,68 @@ class MainViewModelAutoGatewayTest {
         assertTrue(manifestPort != ProductionGatewayCatalog.GERMANY.awg.endpointPort)
     }
 
+    // --- B28 review fix (blocker 1) - restricted-network exhaustion, real end-to-end through MainViewModel.connectAuto() ---
+
+    /**
+     * A real manual attempt fails its handshake with restrictionProbe/diverse
+     * probes all reporting unreachable - real evidence that classifies as
+     * POSSIBLE_HARD_WHITELIST (validated internet, AWG handshake failed,
+     * gateway HTTPS unreachable, diverse destinations also unreachable).
+     * This is the FIRST time this ViewModel instance ever calls
+     * `stabilizedRestrictionClass()` (never invoked by the manual attempt
+     * itself, only by Auto's own candidate building) - so B28's
+     * "first observation is trusted immediately" rule applies, and no
+     * hysteresis delay is needed to observe the effect deterministically.
+     * The manifest names ONLY Germany/Stockholm (no ingress/relay at all),
+     * so switching to Auto afterward must find zero eligible relay
+     * candidates - the exact no-viable-relay scenario blocker 1 fixed.
+     */
+    @Test
+    fun `B28 review fix - connectAuto reports RestrictedNetworkNoViableRelay, never a silent Direct fallback, once real evidence indicates a possible hard whitelist and no relay exists`() = runTest {
+        val transport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val diagnosticsStore = DiagnosticsStore()
+        val autoStore = FakeGatewayAutoModeStore(initial = false)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = diagnosticsStore,
+            selectedGatewayStore = FakeSelectedGatewayStore(),
+            clientTunnelIdentityStore = bothProvisioned,
+            gatewayAutoModeStore = autoStore,
+            initialNetworkProfile = USABLE_WIFI,
+            manifestRepository = manifestRepositoryNaming("frankfurt", "stockholm"),
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+            diverseReachabilityProbes = listOf(
+                net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+                net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+                net.pocvpn.client.smartconnect.GatewayReachabilityProbe { false },
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        // Manual attempt - fails closed via the ordinary handshake-timeout path (same real mechanism MainViewModelTest's own B8J test uses).
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_HARD_WHITELIST, viewModel.restrictionClass())
+
+        // Now switch to Auto - the first-ever stabilizedRestrictionClass() call for this instance, trusted immediately.
+        viewModel.setGatewayAutoMode(true)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(
+            "the manual attempt above is the ONLY dial - Auto must never silently fall back to an ordinary Direct gateway",
+            1, transport.connectCallCount,
+        )
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.RestrictedNetworkNoViableRelay, diagnosticsStore.snapshot.value.lastError)
+    }
+
     // --- B28: combinedAutoRankingDiagnostics - sanitized, kind-labeled, no-secret diagnostics ---
 
     @Test

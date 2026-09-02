@@ -37,6 +37,16 @@ sealed class VpnError(val category: String, val reason: String? = null) {
     // never secret.
     data class UnsupportedTransportSelected(val kind: String) : VpnError("UnsupportedTransportSelected", kind)
 
+    // B28 - restriction evidence suspects a fixed allowlist
+    // (RestrictionClass.POSSIBLE_HARD_WHITELIST) and no eligible relay
+    // candidate exists to route around it (see
+    // AutoGatewaySelector.isRestrictedNetworkExhaustion's own docs) -
+    // distinct from the generic NoCandidateAvailable above so this state is
+    // reported TRUTHFULLY: connectivity genuinely failed because the
+    // higher-level restriction state was never overridden by an ordinary
+    // reachable Direct endpoint, never a silently-generic "no candidates".
+    object RestrictedNetworkNoViableRelay : VpnError("RestrictedNetworkNoViableRelay")
+
     /** Safe to show a developer, e.g. in the diagnostics panel - never includes key material. */
     fun displayText(): String = if (reason != null) "$category: $reason" else category
 }
