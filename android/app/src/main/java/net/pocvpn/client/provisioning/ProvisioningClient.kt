@@ -135,6 +135,138 @@ object ProvisioningClient {
         executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost))
 
     /**
+     * B26 (task D) - POST /v1/ingress-profile: the SAME request shape as
+     * [fetchXrayProfile]/[fetchXrayTlsProfile] (existing activation
+     * credential + existing device public key, optional `transport`
+     * field), against an ingress endpoint's own edge. Never persists
+     * anything itself - the caller ([net.pocvpn.client.relay.IngressProfileProvisioner])
+     * decides whether/how to save a [IngressProfileResult.Success] into
+     * [net.pocvpn.client.relay.IngressProfileStore].
+     */
+    fun fetchIngressProfile(publicKey: String, bearerToken: String, endpointHost: String, useTls: Boolean): IngressProfileResult =
+        executeIngressProfile(
+            if (useTls) {
+                buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost).copy(url = "https://$endpointHost/v1/ingress-profile")
+            } else {
+                buildXrayProfileRequest(publicKey, bearerToken, endpointHost).copy(url = "https://$endpointHost/v1/ingress-profile")
+            },
+        )
+
+    private fun executeIngressProfile(request: OutgoingRequest): IngressProfileResult =
+        executeGeneric(request, IngressProfileResult::NetworkError, ::mapIngressProfileResponse)
+
+    /**
+     * POST /v1/ingress-profile response mapping (gateway/api/handler.py's
+     * _handle_ingress_profile_inner) - `internal` so each status/error_code
+     * combination is unit-testable without a live HTTP connection. Mirrors
+     * [mapXrayProfileResponse]/[mapXrayTlsProfileResponse]'s own shape, plus
+     * the "expired"/"ingress_not_configured"/"ingress_tls_not_configured"
+     * cases those endpoints don't have.
+     */
+    internal fun mapIngressProfileResponse(status: Int, rawBody: String): IngressProfileResult = when (status) {
+        200, 201 -> parseIngressProfileSuccessBody(rawBody)
+        401 -> IngressProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> IngressProfileResult.Revoked
+            "expired" -> IngressProfileResult.Expired
+            "device_not_bound" -> IngressProfileResult.DeviceNotBound
+            else -> IngressProfileResult.Unauthorized
+        }
+        503 -> IngressProfileResult.ServiceUnavailable
+        else -> IngressProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    private fun parseIngressProfileSuccessBody(raw: String): IngressProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return IngressProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val ingressEndpointId = json.optString("ingress_endpoint_id", "")
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val uuid = json.optString("uuid", "")
+        val serverName = json.optString("server_name", "")
+        val fingerprint = json.optString("fingerprint", "")
+        val flow = json.optString("flow", "")
+        val realityPublicKey = json.optString("reality_public_key", "")
+        val shortId = json.optString("short_id", "")
+        val profileVersion = json.optInt("profile_version", -1)
+        val issuedAt = if (json.isNull("issued_at")) null else json.optLong("issued_at", -1L)
+        val expiresAt = if (json.has("expires_at") && !json.isNull("expires_at")) json.optLong("expires_at", -1L) else null
+        val probeUrl = if (json.has("probe_url") && !json.isNull("probe_url")) json.optString("probe_url", "") else null
+        val probeToken = if (json.has("probe_token") && !json.isNull("probe_token")) json.optString("probe_token", "") else null
+
+        if (ingressEndpointId.isBlank()) {
+            return IngressProfileResult.MalformedResponse("ingress_endpoint_id missing or blank")
+        }
+        if (serverAddress.isBlank()) {
+            return IngressProfileResult.MalformedResponse("server_address missing or blank")
+        }
+        if (serverPort !in 1..65535) {
+            return IngressProfileResult.MalformedResponse("server_port missing or out of range")
+        }
+        if (!UUID_REGEX.matches(uuid)) {
+            return IngressProfileResult.MalformedResponse("uuid missing or not a well-formed UUID")
+        }
+        if (serverName.isBlank()) {
+            return IngressProfileResult.MalformedResponse("server_name missing or blank")
+        }
+        if (fingerprint.isBlank()) {
+            return IngressProfileResult.MalformedResponse("fingerprint missing or blank")
+        }
+        if (profileVersion < 0) {
+            return IngressProfileResult.MalformedResponse("profile_version missing")
+        }
+        if (issuedAt == null || issuedAt < 0) {
+            return IngressProfileResult.MalformedResponse("issued_at missing or invalid")
+        }
+        if (probeUrl.isNullOrBlank() || !probeUrl.startsWith("https://")) {
+            return IngressProfileResult.MalformedResponse("probe_url missing or not HTTPS")
+        }
+        if (probeToken.isNullOrBlank()) {
+            return IngressProfileResult.MalformedResponse("probe_token missing")
+        }
+
+        // TLS responses carry no flow/realityPublicKey/shortId at all (see
+        // handler.py's own transport-shaped payload) - only validate those
+        // three when the caller actually asked for REALITY (useTls=false),
+        // exactly mirroring parseXrayProfileSuccessBody/parseXrayTlsProfileSuccessBody's
+        // own split, just folded into one response shape here since a
+        // single ingress-profile response always carries exactly the
+        // fields its own transport implies.
+        val isRealityShaped = json.has("flow") || json.has("reality_public_key") || json.has("short_id")
+        if (isRealityShaped) {
+            if (flow.isBlank()) return IngressProfileResult.MalformedResponse("flow missing or blank")
+            if (!REALITY_KEY_REGEX.matches(realityPublicKey)) {
+                return IngressProfileResult.MalformedResponse("reality_public_key missing or not a well-formed public key")
+            }
+            if (!SHORT_ID_REGEX.matches(shortId)) {
+                return IngressProfileResult.MalformedResponse("short_id missing or not well-formed hex")
+            }
+        }
+
+        return IngressProfileResult.Success(
+            ingressEndpointId = ingressEndpointId,
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            uuid = uuid,
+            serverName = serverName,
+            fingerprint = fingerprint,
+            flow = flow.ifBlank { null },
+            realityPublicKey = realityPublicKey.ifBlank { null },
+            shortId = shortId.ifBlank { null },
+            isRealityShaped = isRealityShaped,
+            profileVersion = profileVersion,
+            issuedAtEpochSeconds = issuedAt,
+            expiresAtEpochSeconds = expiresAt,
+            probeUrl = probeUrl,
+            probeToken = probeToken,
+        )
+    }
+
+    /**
      * B8C2 - the exact outgoing request shape (url/headers/body), built as
      * plain data with NO network I/O. `internal` so the request CONTRACT
      * (method target, exact Authorization header, exact JSON body) is

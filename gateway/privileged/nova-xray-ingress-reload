@@ -1,0 +1,40 @@
+#!/bin/bash
+# B26 (task F) - the ingress-role counterpart of nova-xray-reload: the ONE
+# root-owned privileged wrapper pocvpn-api's ingress role is ever allowed
+# to reach, via sudo, for the ingress Xray activation boundary. Deployed
+# to:
+#
+#   /usr/local/libexec/nova-xray-ingress-reload   (root:root, 0750 or 0755)
+#
+# and invoked ONLY as:
+#
+#   pocvpn-api (ingress role)  --sudo-->  /usr/bin/sudo -n  --sudoers-->  this wrapper
+#
+# Byte-for-byte the SAME security philosophy as nova-xray-reload (see that
+# file's own docstring in full - not repeated here): fixed absolute
+# interpreter, zero arguments accepted, no external command before the
+# environment is sanitized, BASH_ENV/ENV injection defended upstream in
+# sudoers.
+#
+# The ONE difference from nova-xray-reload: this wrapper additionally sets
+# XRAY_ACTIVATE_ENV_FILE so the SHARED xray-activate.sh script (see that
+# file's own B26 docs) sources the INGRESS role's own config/xray-ingress.env
+# instead of the regular gateway's config/xray.env - never both, never a
+# fallback between them.
+set -euo pipefail
+
+# --- fixed, non-configurable targets: literals, never read from any
+# environment variable, argument, or config file. ---
+readonly ACTIVATE_SCRIPT="/opt/pocvpn/gateway/scripts/xray-activate.sh"
+readonly INGRESS_ENV_FILE="/opt/pocvpn/gateway/config/xray-ingress.env"
+
+if [ "$#" -ne 0 ]; then
+    echo "usage: nova-xray-ingress-reload (no arguments)" >&2
+    exit 2
+fi
+
+exec /usr/bin/env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    LANG=C \
+    XRAY_ACTIVATE_ENV_FILE="$INGRESS_ENV_FILE" \
+    "$ACTIVATE_SCRIPT"

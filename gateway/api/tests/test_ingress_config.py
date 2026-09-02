@@ -24,6 +24,9 @@ def _valid_env(tmp_dir, **overrides):
     wrapper_path = os.path.join(tmp_dir, "fake-wrapper")
     with open(wrapper_path, "w", encoding="utf-8") as handle:
         handle.write("#!/usr/bin/env bash\nexit 0\n")
+    probe_secret_file = os.path.join(tmp_dir, "probe-hmac-secret.bin")
+    with open(probe_secret_file, "wb") as handle:
+        handle.write(b"S" * 32)
 
     env = {
         "NOVA_INGRESS_ENDPOINT_ID": "ru-ingress-1",
@@ -42,6 +45,9 @@ def _valid_env(tmp_dir, **overrides):
         "NOVA_INGRESS_UPSTREAM_SERVER_NAME": "www.apple.com",
         "NOVA_INGRESS_UPSTREAM_PUBLIC_KEY": "B" * 43,
         "NOVA_INGRESS_UPSTREAM_SHORT_ID": "cd34",
+        "NOVA_INGRESS_EXIT_ENDPOINT_ID": "frankfurt",
+        "NOVA_INGRESS_EXIT_PROBE_HOST": "203.0.113.60",
+        "NOVA_INGRESS_PROBE_HMAC_SECRET_FILE": probe_secret_file,
         "NOVA_INGRESS_ACTIVATION_STORE_PATH": os.path.join(tmp_dir, "activations.json"),
         "NOVA_INGRESS_ACTIVATION_LOCK_PATH": os.path.join(tmp_dir, ".activations.lock"),
         "NOVA_INGRESS_XRAY_STORE_PATH": os.path.join(tmp_dir, "xray.json"),
@@ -65,6 +71,28 @@ class IngressConfigTests(unittest.TestCase):
             self.assertEqual(cfg.ingress_endpoint_id, "ru-ingress-1")
             self.assertEqual(cfg.ingress_upstream_transport, "reality")
             self.assertEqual(cfg.ingress_profile_ttl_seconds, 0)
+            self.assertEqual(cfg.ingress_exit_endpoint_id, "frankfurt")
+            self.assertEqual(cfg.ingress_probe_ttl_seconds, 300)
+
+    def test_probe_hmac_secret_file_must_exist(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir)
+            env["NOVA_INGRESS_PROBE_HMAC_SECRET_FILE"] = os.path.join(tmp_dir, "does-not-exist")
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
+
+    def test_missing_exit_endpoint_id_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir)
+            del env["NOVA_INGRESS_EXIT_ENDPOINT_ID"]
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
+
+    def test_negative_probe_ttl_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir, NOVA_INGRESS_PROBE_TTL_SECONDS="-1")
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
 
     def test_a_partially_configured_environment_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

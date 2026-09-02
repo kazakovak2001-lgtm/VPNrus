@@ -70,6 +70,41 @@ class IngressAppConfig:
     ingress_upstream_sni: str = ""
     ingress_upstream_flow: str = ""
 
+    # --- B26 (task B/C) - the exit-side end-to-end health-probe contract ---
+    # A stable, non-secret identifier for the PINNED exit this ingress
+    # relays to - the SAME endpoint id value Android's manifest/reachability
+    # model uses for that exit (never invented independently), so the
+    # historyPathId this process computes for a probe token
+    # (ingress_endpoint_id:transport->ingress_exit_endpoint_id:upstream_transport)
+    # matches EXACTLY what the client's own PathCandidate.Relayed.historyPathId
+    # already computes - see relay_probe_token.py's own docs and
+    # PathCandidate.kt's historyPathId format.
+    ingress_exit_endpoint_id: str = ""
+    # The exit's own public HTTPS control-plane host (same edge every other
+    # /v1/* endpoint on that exit is served from) - NOT necessarily identical
+    # to ingress_upstream_host (that one is the Xray upstream connect
+    # target; this one is where a GET /v1/relay-health lands after
+    # traversing the tunnel). In today's one-VPS-per-role topology they are
+    # typically the same host, but this is kept as its own explicit field
+    # rather than assumed, since conflating "Xray upstream address" with
+    # "control-plane address" is exactly the kind of silent coupling that
+    # breaks the first time they diverge.
+    ingress_exit_probe_host: str = ""
+    # A FILE path (never a raw value here) - the ONE secret this ingress and
+    # its pinned exit share, minted together by
+    # gateway/tools/provision_relay_upstream_identity.py and distributed
+    # out-of-band (task C's "never in PR/docs/logcat/server logs"). Read
+    # once per /v1/ingress-profile request, transiently, never held beyond
+    # that call's local scope - same discipline as
+    # ingress_upstream_uuid_file.
+    ingress_probe_hmac_secret_file: str = ""
+    # Task C's "short-lived credential" - independent of, and normally much
+    # shorter than, ingress_profile_ttl_seconds below (a leaked probe token
+    # only ever authenticates one bound health GET, never VPN traffic - see
+    # relay_probe_token.py - so a short TTL here is a real, effective bound
+    # on exposure even though the surrounding profile lives longer).
+    ingress_probe_ttl_seconds: int = 300
+
     # --- this deployment's own activation/identity stores (never shared with a different gateway/ingress instance) ---
     activation_store_path: str = ""
     activation_lock_path: str = ""
@@ -174,6 +209,22 @@ def load_ingress_config(env=None):
         upstream_sni = require("UPSTREAM_SNI")
     upstream_flow = _get(env, "UPSTREAM_FLOW")
 
+    # B26 (task B/C) - the exit-side probe contract. Required once the
+    # ingress role is configured at all - a real ingress deployment with no
+    # way to prove end-to-end reachability is not deployment-ready (see
+    # PROJECT_ARCHITECTURE.md's B25 "remaining condition" list, item 4).
+    exit_endpoint_id = require("EXIT_ENDPOINT_ID")
+    exit_probe_host = require("EXIT_PROBE_HOST")
+    probe_hmac_secret_file = require("PROBE_HMAC_SECRET_FILE")
+    if not os.path.isabs(probe_hmac_secret_file):
+        raise IngressConfigError(f"{_ENV_PREFIX}PROBE_HMAC_SECRET_FILE must be an absolute path")
+    if not os.path.isfile(probe_hmac_secret_file):
+        raise IngressConfigError(f"{_ENV_PREFIX}PROBE_HMAC_SECRET_FILE does not exist: {probe_hmac_secret_file!r}")
+    probe_ttl_raw = _get(env, "PROBE_TTL_SECONDS")
+    probe_ttl_seconds = int(probe_ttl_raw) if probe_ttl_raw else 300
+    if probe_ttl_seconds <= 0:
+        raise IngressConfigError(f"{_ENV_PREFIX}PROBE_TTL_SECONDS must be positive")
+
     activation_store_path = require("ACTIVATION_STORE_PATH")
     activation_lock_path = require("ACTIVATION_LOCK_PATH")
     xray_store_path = require("XRAY_STORE_PATH")
@@ -226,6 +277,10 @@ def load_ingress_config(env=None):
         ingress_upstream_short_id=upstream_short_id,
         ingress_upstream_sni=upstream_sni,
         ingress_upstream_flow=upstream_flow,
+        ingress_exit_endpoint_id=exit_endpoint_id,
+        ingress_exit_probe_host=exit_probe_host,
+        ingress_probe_hmac_secret_file=probe_hmac_secret_file,
+        ingress_probe_ttl_seconds=probe_ttl_seconds,
         activation_store_path=activation_store_path,
         activation_lock_path=activation_lock_path,
         xray_store_path=xray_store_path,

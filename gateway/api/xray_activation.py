@@ -31,7 +31,7 @@ import json
 import os
 import tempfile
 
-from . import activations, xray_config_renderer, xray_provisioning, xray_reload
+from . import activations, relay_identity_store, xray_config_renderer, xray_provisioning, xray_reload
 
 
 class XrayActivationNotConfigured(Exception):
@@ -129,7 +129,13 @@ def _render_candidate(app_config):
     tls = build_tls_config(app_config)
     activations_data = activations.read_store_shared(app_config.activation_store_path, app_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(app_config.xray_store_path, app_config.xray_lock_path)
-    config_dict = xray_config_renderer.render_server_config(activations_data, xray_data, reality, tls=tls, flow=app_config.xray_flow)
+    # B26 (task G) - a genuinely separate trust domain from activations_data
+    # above: see relay_identity_store.py's own docs for why this is never
+    # cross-referenced against per-user activation/revocation state.
+    static_clients = relay_identity_store.load_static_clients(app_config.static_relay_clients_file)
+    config_dict = xray_config_renderer.render_server_config(
+        activations_data, xray_data, reality, tls=tls, flow=app_config.xray_flow, static_clients=static_clients,
+    )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
     return config_dict, sha256_hex

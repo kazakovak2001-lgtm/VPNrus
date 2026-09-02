@@ -108,6 +108,7 @@ def make_app_config(
     xray_tls_server_port=0, xray_tls_server_name="", xray_tls_fingerprint="",
     xray_tls_cert_file="", xray_tls_key_file="",
     manifest_path="",
+    relay_probe_hmac_secret_file="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -145,7 +146,18 @@ def make_app_config(
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
         manifest_path=manifest_path,
+        relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
     )
+
+
+def make_relay_probe_hmac_secret_file(tmp_dir, name="relay-probe-hmac-secret.bin", content=None):
+    """B26 - a throwaway 32-byte shared secret, written with the same
+    0600/never-in-repo discipline as every other test secret file."""
+    path = os.path.join(tmp_dir, name)
+    with open(path, "wb") as handle:
+        handle.write(content if content is not None else secrets.token_bytes(32))
+    os.chmod(path, 0o600)
+    return path
 
 
 def write_fake_manifest_artifact(tmp_dir, body=b"\x00\x00\x00\x01fake-manifest-bytes"):
@@ -353,6 +365,10 @@ def make_ingress_config(tmp_dir, **overrides):
     if wrapper_path is None:
         wrapper_path = write_fake_xray_wrapper(tmp_dir)
 
+    probe_secret_file = overrides.pop("ingress_probe_hmac_secret_file", None)
+    if probe_secret_file is None:
+        probe_secret_file = make_relay_probe_hmac_secret_file(tmp_dir, name="ingress-probe-hmac-secret.bin")
+
     defaults = dict(
         ingress_endpoint_id="ru-ingress-1",
         ingress_endpoint_host="203.0.113.50",
@@ -371,6 +387,9 @@ def make_ingress_config(tmp_dir, **overrides):
         ingress_upstream_server_name="www.apple.com",
         ingress_upstream_public_key="B" * 43,
         ingress_upstream_short_id="ef56ab78",
+        ingress_exit_endpoint_id="frankfurt",
+        ingress_exit_probe_host="203.0.113.60",
+        ingress_probe_hmac_secret_file=probe_secret_file,
         activation_store_path=activation_store_path,
         activation_lock_path=activation_lock_path,
         xray_store_path=xray_store_path,

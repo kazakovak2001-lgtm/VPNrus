@@ -1,0 +1,50 @@
+# B26 (task F) - the ingress-host variant of pocvpn-api.service. Byte-for-
+# byte the SAME hardening posture and reasoning (see pocvpn-api.service's
+# own comments for the full rationale behind every directive - not
+# repeated here), with exactly two differences:
+#
+#   1. EnvironmentFile points at this host's own /etc/pocvpn/ingress.env
+#      (POCVPN_API_* AWG-required fields - see config.py's _REQUIRED_KEYS,
+#      structurally mandatory even on an ingress-only host that has no real
+#      AWG gateway of its own; see gateway/config/ingress.env.example's own
+#      comment on why a harmless placeholder script/key satisfies this -
+#      PLUS this host's own NOVA_INGRESS_*/POCVPN_API_RELAY_PROBE_HMAC_SECRET_FILE/
+#      POCVPN_API_STATIC_RELAY_CLIENTS_FILE fields);
+#   2. ReadWritePaths drops /etc/amnezia/amneziawg (no real AWG mutation
+#      ever happens on a DIRECT_IP-ingress-only host) and adds
+#      /var/lib/pocvpn-provision-ingress + /etc/nova-xray-ingress instead
+#      of /var/lib/pocvpn-provision + /etc/nova-xray (this host's own,
+#      dedicated ingress-role storage - never the regular gateway role's).
+#
+# A host running BOTH roles for temporary testing purposes would instead
+# run pocvpn-api.service unmodified with an env file union of both
+# POCVPN_API_*/NOVA_INGRESS_* fields and BOTH sets of ReadWritePaths - not
+# recommended for a first real deployment (see docs/B26_FIRST_INGRESS_RUNBOOK.md).
+[Unit]
+Description=pocvpn localhost provisioning API - ingress role (non-root)
+After=network.target
+
+[Service]
+Type=simple
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+EnvironmentFile=/etc/pocvpn/ingress.env
+ExecStart=/usr/bin/python3 -m api.server
+Restart=on-failure
+RestartSec=2
+
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pocvpn-provision-ingress /etc/nova-xray-ingress
+
+[Install]
+WantedBy=multi-user.target

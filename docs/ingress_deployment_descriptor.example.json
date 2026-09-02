@@ -1,0 +1,25 @@
+{
+  "ingress_id": "ru-ingress-1",
+  "role": "INGRESS",
+  "ingress_kind": "DIRECT_IP",
+  "region": "REPLACE_WITH_REGION",
+  "provider": "REPLACE_WITH_PROVIDER",
+  "asn": "REPLACE_WITH_ASN",
+  "public_host": "REPLACE_WITH_PUBLIC_IP_OR_HOSTNAME",
+  "supported_client_transports": ["XRAY_REALITY"],
+  "supported_exits": ["frankfurt"],
+  "ports": {
+    "reality": 8443,
+    "tls": null
+  },
+  "reality_connection_facts": {
+    "server_name": "REPLACE_WITH_CAMOUFLAGE_DOMAIN",
+    "fingerprint": "chrome",
+    "reality_public_key": "REPLACE_WITH_43_CHAR_X25519_PUBLIC_KEY",
+    "short_id": "REPLACE_WITH_HEX_SHORT_ID"
+  },
+  "tls_connection_facts": null,
+  "health_path": "/v1/relay-health",
+  "status_path": "/v1/ingress-profile",
+  "deployment_status": "CANDIDATE"
+}

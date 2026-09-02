@@ -112,6 +112,28 @@ class AppConfig:
     # "no private signing key on the production VPS if avoidable" requirement.
     manifest_path: str = ""
 
+    # B26 (task G) - an OPTIONAL, operator-maintained file naming the
+    # ingress->exit relay identities (RenderedClient entries) this EXIT
+    # authorizes unconditionally, via xray_config_renderer.render_server_config's
+    # own additive `static_clients` parameter - see relay_identity_store.py's
+    # own docs. Blank (the default) means zero static clients, byte-for-byte
+    # the pre-B26 render output for every existing gateway deployment. The
+    # file itself is managed ONLY by gateway/tools/apply_relay_upstream_identity.py
+    # (apply/revoke) - this process only ever READS it, at render time,
+    # never writes it.
+    static_relay_clients_file: str = ""
+
+    # B26 (task B/C) - GET /v1/relay-health: blank (the default) means the
+    # endpoint is not configured and always fails closed with 503, same
+    # convention as every other optional group above. Set on an EXIT
+    # deployment that some ingress is pinned to relay traffic toward - see
+    # relay_probe_token.py's own docs and ingress_config.py's matching
+    # ingress_probe_hmac_secret_file (the two must hold the SAME bytes,
+    # provisioned together by gateway/tools/provision_relay_upstream_identity.py).
+    # A FILE PATH only - this process reads its contents transiently, once
+    # per request, never logs them, never returns them.
+    relay_probe_hmac_secret_file: str = ""
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -421,12 +443,26 @@ def load_config(env=None):
     # same "absolute and actually a file" bar as every other file-path
     # config value above (provision_script_path, xray_tls_cert_file, ...) -
     # fail closed at startup, never at first request.
+    static_relay_clients_file = _get(env, "STATIC_RELAY_CLIENTS_FILE")
+    if static_relay_clients_file and not os.path.isabs(static_relay_clients_file):
+        raise ConfigError(f"{_ENV_PREFIX}STATIC_RELAY_CLIENTS_FILE must be an absolute path: {static_relay_clients_file!r}")
+
     manifest_path = _get(env, "MANIFEST_PATH")
     if manifest_path:
         if not os.path.isabs(manifest_path):
             raise ConfigError(f"{_ENV_PREFIX}MANIFEST_PATH must be an absolute path: {manifest_path!r}")
         if not os.path.isfile(manifest_path):
             raise ConfigError(f"{_ENV_PREFIX}MANIFEST_PATH does not exist or is not a file: {manifest_path!r}")
+
+    # B26 (task B/C) - see AppConfig.relay_probe_hmac_secret_file's own
+    # docs. When set, held to the same "absolute and actually a file" bar
+    # as every other secret/cert file-path value above.
+    relay_probe_hmac_secret_file = _get(env, "RELAY_PROBE_HMAC_SECRET_FILE")
+    if relay_probe_hmac_secret_file:
+        if not os.path.isabs(relay_probe_hmac_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}RELAY_PROBE_HMAC_SECRET_FILE must be an absolute path: {relay_probe_hmac_secret_file!r}")
+        if not os.path.isfile(relay_probe_hmac_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}RELAY_PROBE_HMAC_SECRET_FILE does not exist: {relay_probe_hmac_secret_file!r}")
 
     return AppConfig(
         endpoint_host=endpoint_host,
@@ -462,4 +498,6 @@ def load_config(env=None):
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
         manifest_path=manifest_path,
+        static_relay_clients_file=static_relay_clients_file,
+        relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
     )

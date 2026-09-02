@@ -34,7 +34,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, ingress_activation, provision, tokens, xray_activation, xray_provisioning
+from . import activations, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -44,6 +44,15 @@ _PATH_ACTIVATE = "/v1/activate"
 _PATH_XRAY_PROFILE = "/v1/xray-profile"
 _PATH_INGRESS_PROFILE = "/v1/ingress-profile"
 _PATH_MANIFEST = "/v1/manifest"
+_PATH_RELAY_HEALTH = "/v1/relay-health"
+
+# B26 (task B) - the same TransportKind.name strings Android's TransportKind
+# enum uses (see transport/TransportKind.kt - no custom toString(), so
+# ${transportKind} interpolation IS the enum constant name) - this mapping
+# is what lets ingress_config.py compute a historyPathId that matches
+# PathCandidate.Relayed.historyPathId byte-for-byte without either side
+# depending on the other's source.
+_TRANSPORT_KIND_NAMES = {"reality": "XRAY_REALITY", "tls": "TLS_TCP"}
 _MAX_BODY_BYTES = 1024
 _MAX_MANIFEST_BYTES = 1_000_000
 _BEARER_PREFIX = "Bearer "
@@ -154,6 +163,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_manifest()
+            elif self.path == _PATH_RELAY_HEALTH:
+                if method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_relay_health()
             else:
                 status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
@@ -627,6 +641,89 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         payload["profile_version"] = 1
         payload["issued_at"] = issued_at_epoch_seconds
         payload["expires_at"] = expires_at_epoch_seconds
+
+        # B26 (task B/C) - mint the real end-to-end proof coordinates this
+        # device's IngressClientProfile.endToEndProbeUrl/endToEndProbeToken
+        # will carry (see relay/IngressProfile.kt's own docs). historyPathId
+        # is computed the SAME way PathCandidate.Relayed.historyPathId is on
+        # the client - see _TRANSPORT_KIND_NAMES's own docs - never a value
+        # invented independently that could drift from what the client
+        # itself checks the probe response against
+        # (HttpRelayEndToEndProbe.probe: `body.contains(plan.historyPathId)`).
+        exit_transport_name = _TRANSPORT_KIND_NAMES[ingress_cfg.ingress_upstream_transport]
+        history_path_id = (
+            f"{ingress_cfg.ingress_endpoint_id}:{_TRANSPORT_KIND_NAMES[transport]}->"
+            f"{ingress_cfg.ingress_exit_endpoint_id}:{exit_transport_name}"
+        )
+        try:
+            with open(ingress_cfg.ingress_probe_hmac_secret_file, "rb") as handle:
+                probe_secret = handle.read().strip()
+            probe_token = relay_probe_token.mint(
+                probe_secret, history_path_id, public_key, issued_at_epoch_seconds, ingress_cfg.ingress_probe_ttl_seconds,
+            )
+        except (OSError, ValueError) as exc:
+            logger.error("probe_token_mint_failed exc_type=%s", exc.__class__.__name__)
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_activation_failed")
+        finally:
+            probe_secret = None  # never held beyond this one mint() call
+
+        payload["probe_url"] = f"https://{ingress_cfg.ingress_exit_probe_host}{_PATH_RELAY_HEALTH}"
+        payload["probe_token"] = probe_token
+        return self._success(HTTPStatus.OK, payload)
+
+    # --- GET /v1/relay-health (B26 task B) ---
+    def _handle_relay_health(self):
+        try:
+            return self._handle_relay_health_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_relay_health_inner(self):
+        """The real EXIT-side proof [HttpRelayEndToEndProbe] calls, over
+        whatever route the OS resolves at request time - since Android only
+        ever calls this AFTER its ingress transport handshake succeeds, a
+        genuine 200 here is only reachable at all when traffic actually
+        traversed client -> ingress -> exit (task B's own "must prove real
+        traffic reached the EXIT" - this process being reachable via HTTP
+        IS that proof, the same way GET /v1/manifest's mere reachability is
+        never claimed to prove anything about content). NEVER a generic
+        `/health = 200` - reachability alone is insufficient; the request
+        must additionally carry a valid, non-expired, correctly-signed
+        [relay_probe_token] bound to a specific relayed path identity, or
+        this fails closed with 401 - see that module's own docs.
+
+        Deliberately stateless: no store lookup, no revocation list at
+        verification time - only the shared HMAC secret this exit was
+        provisioned with (see AppConfig.relay_probe_hmac_secret_file). Never
+        logs the raw token - only its digest, same discipline
+        activations.credential_digest's callers already use.
+        """
+        if not self.server.config.relay_probe_hmac_secret_file:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "relay_health_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        token = self._require_bearer_token()
+        self._log_fields["relay_probe_digest"] = tokens.token_digest(token)[:8]
+
+        try:
+            with open(self.server.config.relay_probe_hmac_secret_file, "rb") as handle:
+                secret = handle.read().strip()
+            claims = relay_probe_token.verify(secret, token, int(time.time()))
+        except (OSError, relay_probe_token.ProbeTokenError):
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        finally:
+            secret = None  # never held beyond this one verify() call
+
+        self._log_fields["relay_probe_path"] = claims.history_path_id
+        # The response body echoes the token's OWN signed path claim (never
+        # anything client-supplied) - this is what makes it "bound to the
+        # current relay attempt/path identity" (task B) rather than a
+        # generic ack a client could reuse to claim a DIFFERENT path
+        # succeeded: the path identity comes from the verified signature,
+        # not from the request.
+        payload = {"status": "ok", "path": claims.history_path_id}
         return self._success(HTTPStatus.OK, payload)
 
     # --- GET /v1/manifest (B12) ---

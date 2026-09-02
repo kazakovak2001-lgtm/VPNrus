@@ -92,12 +92,21 @@ class IngressProfileEndpointTests(unittest.TestCase):
         self.assertNotIn("private_key", payload)
         self.assertNotIn("upstream_uuid", payload)
 
+        # B26 (task B/C) - the real end-to-end probe coordinates.
+        self.assertIn("probe_url", payload)
+        self.assertIn("probe_token", payload)
+        self.assertEqual(payload["probe_url"], f"https://{self.ingress_cfg.ingress_exit_probe_host}/v1/relay-health")
+        self.assertGreater(len(payload["probe_token"]), 0)
+
         with open(self.ingress_cfg.ingress_reality_private_key_file, "rb") as handle:
             raw_private_key = handle.read().strip()
         with open(self.ingress_cfg.ingress_upstream_uuid_file, "rb") as handle:
             raw_upstream_uuid = handle.read().strip()
+        with open(self.ingress_cfg.ingress_probe_hmac_secret_file, "rb") as handle:
+            raw_probe_secret = handle.read().strip()
         self.assertNotIn(raw_private_key, body)
         self.assertNotIn(raw_upstream_uuid, body)
+        self.assertNotIn(raw_probe_secret, body)
 
     def test_device_never_activated_against_this_ingress_is_forbidden(self):
         status, _headers, body = post_ingress_profile(self.server.port, credential="unknown-credential", body_obj={"public_key": self.key_a})

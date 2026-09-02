@@ -804,6 +804,84 @@ applied to a live EXIT's own activation wiring via `static_clients` (a
 deliberate, human-reviewed step, not automated). None of these five exist
 yet - no new infrastructure was purchased or deployed by this slice.
 
+## First Real DIRECT_IP Ingress Deployment Readiness (B26) - software/repo side only
+
+Closes B25's remaining named client/server prerequisites for a real
+DIRECT_IP ingress deployment. **Still no real ingress is deployed - Russia
+hard-whitelist bypass remains UNVERIFIED.** See `docs/ROADMAP.md`'s B26 row
+for the full evidence trail and `docs/B26_FIRST_INGRESS_RUNBOOK.md` for the
+exact remaining physical-deployment sequence (human-approval-gated).
+
+- **Composition root wired for real**: `MainViewModel.Factory` now
+  constructs `FileIngressProfileStore` -> `RelayIngressResolverImpl` ->
+  `HttpRelayEndToEndProbe`, plus per-endpoint `XrayProfileRepositoryResolver`/
+  `XrayTlsProfileRepositoryResolver` lambdas (the same `{ id -> Factory.create(context, id, ...) }`
+  shape the pre-existing Stockholm wiring already used), and passes all of
+  it into `MainViewModel`'s constructor. `NotProvisionedRelayIngressResolver`/
+  `NotConfiguredRelayEndToEndProbe` remain only as class-level defaults for
+  tests/unwired callers - production no longer uses them. No Robolectric/
+  instrumentation test proves this wiring mechanically (this repo's Kotlin
+  suite has no such dependency) - reviewed by hand instead; a real gap, not
+  claimed otherwise. `./gradlew compileDebugKotlin`, the full
+  `testDebugUnitTest` suite (all pre-existing tests plus this slice's own),
+  and `assembleDebug` all pass with this wiring in place (verified this
+  slice against JDK 21/Gradle 8.10).
+- **Real EXIT-side end-to-end health endpoint**: `GET /v1/relay-health`
+  (`gateway/api/handler.py`), authenticated by a short-lived, self-verifying
+  HMAC token (`gateway/api/relay_probe_token.py`) - minted by the INGRESS at
+  `/v1/ingress-profile` time, verified by the EXIT using only a shared
+  secret file (`POCVPN_API_RELAY_PROBE_HMAC_SECRET_FILE`/
+  `NOVA_INGRESS_PROBE_HMAC_SECRET_FILE`, provisioned together by
+  `gateway/tools/provision_relay_upstream_identity.py`). No shared live
+  store between ingress and exit at verification time - the response is
+  bound to the token's own signed `historyPathId` claim, computed
+  server-side with the SAME `"ingressId:transport->exitId:transport"`
+  format `PathCandidate.Relayed.historyPathId` already uses, so
+  `HttpRelayEndToEndProbe.probe`'s existing `body.contains(plan.historyPathId)`
+  check needed no change. A stolen probe token authenticates ONLY this one
+  bound health GET, never VPN traffic (task C's own scoping requirement).
+- **Android ingress activation client**: `ProvisioningClient.fetchIngressProfile`
+  + `net.pocvpn.client.relay.IngressProfileProvisioner` -
+  `MainViewModel.activateIngress(...)` is the real, production-wired
+  control-plane path: POST `/v1/ingress-profile` -> cross-check the
+  response's own `ingress_endpoint_id`/`server_address`/`server_port`
+  against the CALLER's already-pinned facts (never re-derived from the
+  response) -> `IngressClientProfile` -> `FileIngressProfileStore`
+  (endpoint-scoped, so this can never overwrite a different ingress
+  endpoint's profile). `ensureFreshProfile` is the bounded refresh policy:
+  reuse a still-valid stored profile as-is, re-activate (at most one
+  attempt) only when nothing usable is stored - no retry loop. No product
+  UI screen invokes this yet (`ingressActivationState` is exposed but
+  unwired to any Composable) - a real, named remaining gap.
+- **EXIT relay identity apply/revoke**: `gateway/api/relay_identity_store.py` -
+  an operator-maintained, atomically-written JSON file
+  (`POCVPN_API_STATIC_RELAY_CLIENTS_FILE`) feeding `xray_config_renderer
+  .render_server_config`'s pre-existing `static_clients` parameter (B25),
+  applied/revoked via `gateway/tools/apply_relay_upstream_identity.py`.
+  Proven by direct unit test to be idempotent and to never touch/be touched
+  by ordinary per-user `activations_data` - a genuinely separate trust
+  domain, not merely documented as one.
+- **Ingress deploy tooling**: `gateway/scripts/install-ingress-role.sh`
+  (idempotent bootstrap: users/dirs/perms/wrapper/sudoers/systemd units,
+  installs no secret), `gateway/systemd/pocvpn-api-ingress.service`,
+  `gateway/privileged/nova-xray-ingress-reload` +
+  `gateway/config/xray-ingress.env`. These reuse the EXISTING
+  `gateway/scripts/xray-activate.sh` validate/`xray run -test`/stage/atomic-
+  replace/reload/rollback pipeline verbatim via one new, additive seam
+  (`XRAY_ACTIVATE_ENV_FILE`, defaulting to the pre-B26 fixed path so every
+  existing gateway deployment is byte-for-byte unaffected) - never a
+  duplicated implementation.
+- **Preflight/doctor**: `gateway/tools/ingress_preflight.py` - read-only,
+  PASS/FAIL, no secret output.
+- **Deployment descriptor**: `docs/ingress_deployment_descriptor.example.json`
+  - secret-free, explicitly NOT folded into the signed production manifest
+  by this slice (see `docs/B26_INGRESS_DEPLOYMENT_DESCRIPTOR.md`).
+- **Not done this slice**: no product UI to trigger `activateIngress`; no
+  Robolectric-backed composition-root test; the Frankfurt/Stockholm
+  read-only SSH suitability audit could not be completed (no working
+  credential available in this session for either host - see this PR's own
+  report, no SAFE/NOT_SAFE verdict asserted).
+
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
 Architecture principle 9: a user may connect through the managed gateway
@@ -946,3 +1024,15 @@ endpoint + ingress->exit relay identity contract + deployment tooling on
 the server. Still FOUNDATION - no real ingress deployed, Russia
 hard-whitelist bypass remains UNVERIFIED. See ROADMAP's own B25 row for
 the full evidence trail and the exact remaining physical-deployment steps.)
+
+---
+Last updated: 2026-09-02 (B26 - added the "First Real DIRECT_IP Ingress
+Deployment Readiness" section above: real production composition wiring,
+a real EXIT-side end-to-end health endpoint + probe token lifecycle, a
+real Android ingress activation client, EXIT relay identity apply/revoke
+tooling, ingress deploy/preflight tooling, and a deployment descriptor.
+Repository/software side is DEPLOYMENT READY per ROADMAP's own B26 row;
+still no real ingress deployed, Russia hard-whitelist bypass remains
+UNVERIFIED. Named remaining gaps: no product UI for activateIngress, no
+Robolectric composition-root test, Frankfurt/Stockholm SSH audit
+incomplete (no working credential this session).)

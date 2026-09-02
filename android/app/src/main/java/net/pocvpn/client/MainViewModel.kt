@@ -381,6 +381,14 @@ class MainViewModel(
     // real per-endpoint Xray profile resolution for ingress endpoints.
     private val relayXrayProfileRepositoryResolver: net.pocvpn.client.identity.XrayProfileRepositoryResolver? = null,
     private val relayXrayTlsProfileRepositoryResolver: net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver? = null,
+    // B26 (task D) - the real ingress activation control-plane path
+    // (POST /v1/ingress-profile -> validate -> IngressClientProfile ->
+    // FileIngressProfileStore), consulted by [activateIngress] below.
+    // Defaults to null (same "no wiring, no behavior" seam as every other
+    // optional dependency above): with no provisioner wired,
+    // activateIngress() below is a no-op that reports
+    // IngressActivationOutcome.Unavailable, never a fabricated success.
+    private val ingressProfileProvisioner: net.pocvpn.client.relay.IngressProfileProvisioner? = null,
     // B12/B20 - additive, defaults to null (same seam as every optional
     // dependency above): with no client, refreshManifest() below is a
     // no-op that returns null, and manifestRepository's trusted state is
@@ -1803,6 +1811,52 @@ class MainViewModel(
         }
     }
 
+    private val _ingressActivationState = MutableStateFlow<net.pocvpn.client.relay.IngressActivationOutcome?>(null)
+    val ingressActivationState: StateFlow<net.pocvpn.client.relay.IngressActivationOutcome?> = _ingressActivationState.asStateFlow()
+
+    /**
+     * B26 (task D) - the real Android control-plane path for a selected
+     * ingress: activation credential + this device's existing public key
+     * (the SAME reused identity every other activation in this class
+     * already uses - never a second credential/key system for an ingress,
+     * mirroring [ingress_activation.py]'s own "no second identity system")
+     * -> [ingressProfileProvisioner] -> a validated, endpoint-scoped
+     * [net.pocvpn.client.relay.IngressClientProfile] persisted via
+     * [net.pocvpn.client.relay.FileIngressProfileStore]. [ingressBinding]/
+     * [ingressTransport] are the caller's own already-pinned facts (from
+     * the signed manifest, e.g. a real [net.pocvpn.client.smartconnect
+     * .AutoGatewaySelector.RelayAttemptCandidate]) - this function never
+     * invents or re-derives them. Fails closed (reports
+     * [net.pocvpn.client.relay.IngressActivationOutcome.Unavailable]) when
+     * no [ingressProfileProvisioner] is wired (no real ingress deployment
+     * to activate against) or the device's public key has not loaded yet -
+     * never a fabricated success. A subsequent relayed connect attempt
+     * (see [attemptRelayedAttempt]) picks up the freshly saved profile
+     * through the SAME [net.pocvpn.client.relay.RelayIngressResolver] path
+     * every other relayed attempt already reads from - this function does
+     * not itself trigger a connect.
+     */
+    fun activateIngress(
+        ingressEndpointId: net.pocvpn.client.reachability.EndpointId,
+        ingressBinding: net.pocvpn.client.reachability.EndpointTransportBinding,
+        ingressTransport: net.pocvpn.client.transport.TransportKind,
+        activationCredential: String,
+    ) {
+        val trimmedCredential = activationCredential.trim()
+        val provisioner = ingressProfileProvisioner
+        val key = _publicKey.value
+        if (provisioner == null || key == null || trimmedCredential.isEmpty()) {
+            _ingressActivationState.value = net.pocvpn.client.relay.IngressActivationOutcome.Unavailable
+            return
+        }
+        viewModelScope.launch {
+            val outcome = withContext(ioDispatcher) {
+                provisioner.provision(ingressEndpointId, ingressBinding, ingressTransport, key, trimmedCredential)
+            }
+            _ingressActivationState.value = outcome
+        }
+    }
+
     fun gatewayStatus(): GatewayConfiguration = controller.gatewayStatus()
 
     /**
@@ -2824,6 +2878,28 @@ class MainViewModel(
             // constructed against zero origins (every real HTTPS fetch
             // would just fail, which is a worse failure mode than "clearly
             // not configured").
+            // B26 (task A) - the real relay/ingress composition: an
+            // endpoint-scoped, encrypted-at-rest ingress profile store; the
+            // real RelayIngressResolverImpl reading from it (never
+            // NotProvisionedRelayIngressResolver in production from here on
+            // - a real profile activated via activateIngress() below is
+            // what makes a relayed candidate resolvable); the real HTTPS
+            // end-to-end probe; and per-ingress-endpoint Xray/TLS profile
+            // repository resolvers built the SAME way the Stockholm
+            // xrayTransport/xrayTlsTransport resolver lambdas above already
+            // resolve an arbitrary endpoint id's own repository (never a
+            // fixed map that would need a code change per ingress).
+            val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
+            val relayIngressResolver = net.pocvpn.client.relay.RelayIngressResolverImpl(context, ingressProfileStore)
+            val relayEndToEndProbe = net.pocvpn.client.relay.HttpRelayEndToEndProbe()
+            val relayXrayProfileRepositoryResolver = net.pocvpn.client.identity.XrayProfileRepositoryResolver { id ->
+                XrayProfileRepositoryFactory.create(context, id, migrateFromLegacyUnscopedFile = false)
+            }
+            val relayXrayTlsProfileRepositoryResolver = net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver { id ->
+                XrayTlsProfileRepositoryFactory.create(context, id, migrateFromLegacyUnscopedFile = false)
+            }
+            val ingressProfileProvisioner = net.pocvpn.client.relay.IngressProfileProvisioner(ingressProfileStore)
+
             val manifestOrigins = net.pocvpn.client.reachability.ManifestOriginConfig.parse(BuildConfig.MANIFEST_URLS)
             val manifestDistributionClient = manifestOrigins.takeIf { it.isNotEmpty() }?.let { origins ->
                 net.pocvpn.client.reachability.MultiOriginManifestDistributionClient(
@@ -2941,6 +3017,20 @@ class MainViewModel(
                 pathHistoryStore = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createPathHistoryStore(context),
                 fingerprintKeyProvider = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createFingerprintKeyProvider(context),
                 manifestDistributionClient = manifestDistributionClient,
+                // B26 (task A) - the real relay/ingress composition wired
+                // above: this is what supersedes NotProvisionedRelayIngressResolver/
+                // NotConfiguredRelayEndToEndProbe as production defaults -
+                // a relayed Auto winner now genuinely resolves against a
+                // real, activated IngressClientProfile when one exists, and
+                // fails closed (PROFILE_NOT_PROVISIONED) exactly as before
+                // when none does yet (no relay profile -> fail closed,
+                // never a silent fallback to a different ingress/profile -
+                // see RelayIngressResolverImpl's own docs).
+                relayIngressResolver = relayIngressResolver,
+                relayEndToEndProbe = relayEndToEndProbe,
+                relayXrayProfileRepositoryResolver = relayXrayProfileRepositoryResolver,
+                relayXrayTlsProfileRepositoryResolver = relayXrayTlsProfileRepositoryResolver,
+                ingressProfileProvisioner = ingressProfileProvisioner,
             ) as T
         }
     }
