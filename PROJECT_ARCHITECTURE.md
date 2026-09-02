@@ -1036,14 +1036,44 @@ guarantee of whitelist reachability, and this slice claims neither.
   NOT weakened or special-cased for CDN_FRONTED - task F's own "not only
   successful TCP/TLS connection to the CDN edge" is satisfied by construction,
   not by a new check.
-- **Reachability/history (task G) - unchanged, and that is also the
-  point**: `historyPathId` already scopes local connection memory per
-  (ingress endpoint, transport) pair, so a DIRECT_IP ingress's history can
-  never be confused with a CDN_FRONTED one's (different endpoint ids by
-  construction). B19's existing bounded, time-decaying failure cooldown
+- **Reachability/history (task G) - review fix: `IngressKind` IS a pinned
+  component of relay history identity**: an earlier version of this section
+  claimed history could stay unchanged because `historyPathId` already
+  scopes by (ingress endpoint, transport) - insufficient, since the SAME
+  endpoint+transport reclassified or redeployed from DIRECT_IP to
+  CDN_FRONTED (or vice versa) would otherwise silently reuse the OLD
+  strategy's success/failure/cooldown evidence for the NEW one - a
+  DIRECT_IP ingress's own proven reachability says nothing real about a
+  CDN edge that happens to share its endpoint id, and vice versa. Fixed:
+  `PathCandidate.Relayed.historyPathId` (`reachability/PathCandidate.kt`)
+  now encodes `ingressKind` explicitly - the real, current format is
+  `"<ingressId>:<ingressKind>:<ingressTransport>-><exitId>:<exitTransport>"`
+  (was `"<ingressId>:<ingressTransport>-><exitId>:<exitTransport>"` before
+  this fix). `AutoGatewaySelector.RelayAttemptCandidate.historyPathId`
+  copies this value verbatim (unchanged mechanism - B24's own "a pure
+  formula over the already-pinned fields, never a second/independent
+  encoding"). **Migration rule**: no pre-B27 relay history exists on any
+  real device (no ingress of either kind has ever been deployed - see this
+  file's own B26/B27 sections), so this format change orphans nothing;
+  `PathHistoryStore.get()` already treats an unmatched key as "no
+  evidence" (never "trust it anyway"), the same fail-open-to-neutral
+  behavior a first-ever lookup already has - no explicit migration code
+  was needed or written. Direct's own `historyPathId` (`gateway.endpoint.id.value`,
+  B11/B19, unaffected by this class - `PathCandidate.Direct` has no
+  `IngressKind` concept at all) is completely untouched by this change.
+  B19's existing bounded, time-decaying failure cooldown
   (`PathHistoryEntry.consecutiveFailures`/`FAILURE_COOLDOWN_WINDOW_MILLIS`)
-  already applies uniformly - no CDN-specific "permanently healthy" shortcut
-  was added or would be consistent with this codebase's own architecture.
+  still applies uniformly to whichever kind-scoped key it is recorded
+  under - no CDN-specific "permanently healthy" shortcut exists or would be
+  consistent with this codebase's own architecture. Proven directly:
+  `PathCandidateBuilderTest`/`AutoGatewaySelectorTest` (the SAME
+  endpoint+transport reclassified between kinds produces two genuinely
+  distinct `historyPathId` strings; stale evidence recorded under one
+  kind's key never influences `PathScorer.score` for the other kind's
+  candidate at the identical endpoint+transport) and
+  `MainViewModelRelayActivationTest` (a bounded activation retry keeps the
+  IDENTICAL kind-aware `historyPathId`, never re-ranked into a different
+  identity).
 - **Not done this slice**: no real CDN-fronted ingress host exists to
   validate against (matches B23's own original caveat on `CDN_FRONTED`,
   never claimed resolved here); no product UI distinguishes ingress kind in
@@ -1224,9 +1254,16 @@ construction (AutoGatewaySelector.RelayAttemptCandidate), execution
 wire contract) - DIRECT_IP and CDN_FRONTED ingress candidates now coexist
 in one ranked relay fabric, and a provisioning response whose ingress_kind
 disagrees with the pinned candidate fails closed. No kind-specific
-execution/health/history branch was added anywhere (the point of the
-slice, not an oversight) - a CDN-fronted session reaches RelayProtected
-through the exact same evidence-driven, end-to-end-proof-gated path a
-DIRECT_IP one does. Still FOUNDATION - no real ingress of either kind is
-deployed, Russia hard-whitelist bypass remains UNVERIFIED, and this slice
-does not claim CDN whitelist bypass works.)
+execution/health branch was added anywhere - a CDN-fronted session reaches
+RelayProtected through the exact same evidence-driven, end-to-end-proof-
+gated path a DIRECT_IP one does. PR #41 review fix (same day): history
+IS kind-scoped after all - PathCandidate.Relayed.historyPathId now encodes
+ingressKind explicitly (format: ingressId:ingressKind:transport->exitId:
+exitTransport), so the same endpoint+transport reclassified between
+DIRECT_IP and CDN_FRONTED can never silently reuse the other kind's
+success/failure/cooldown evidence - see this file's own "Reachability/
+history" bullet above for the exact format and why no migration code was
+needed (no pre-B27 relay history exists on any real device). Still
+FOUNDATION - no real ingress of either kind is deployed, Russia
+hard-whitelist bypass remains UNVERIFIED, and this slice does not claim
+CDN whitelist bypass works.)

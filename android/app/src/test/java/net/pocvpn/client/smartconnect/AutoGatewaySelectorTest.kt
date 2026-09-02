@@ -593,6 +593,72 @@ class AutoGatewaySelectorTest {
         // relay identities, exactly like two Direct gateways coexisting.
         assertEquals(exitEndpoint.id, byIngressId.getValue(directIpIngressEndpoint.id).exitEndpointId)
         assertEquals(exitEndpoint.id, byIngressId.getValue(ingressEndpoint.id).exitEndpointId)
+        // B27 review fix - the two candidates' own historyPathId strings
+        // must be genuinely distinct too, not merely their in-memory
+        // ingressKind field - this is what actually determines which
+        // PathHistoryStore slot each one's evidence is recorded/read under.
+        assertTrue(
+            byIngressId.getValue(directIpIngressEndpoint.id).historyPathId !=
+                byIngressId.getValue(ingressEndpoint.id).historyPathId,
+        )
+    }
+
+    @Test
+    fun `B27 review fix - the SAME ingress endpoint+transport reclassified from DIRECT_IP to CDN_FRONTED produces a different historyPathId`() {
+        val directCandidate = buildRelayedDefault(manifestEndpoints = listOf(directIpIngressEndpoint, exitEndpoint)).single()
+        val reclassified = directIpIngressEndpoint.copy(
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.51", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+        )
+        val cdnCandidate = buildRelayedDefault(manifestEndpoints = listOf(reclassified, exitEndpoint)).single()
+
+        assertEquals(directCandidate.ingressEndpointId, cdnCandidate.ingressEndpointId)
+        assertEquals(directCandidate.ingressTransport, cdnCandidate.ingressTransport)
+        assertTrue(
+            "the SAME endpoint+transport reclassified to a different IngressKind must produce a DIFFERENT historyPathId",
+            directCandidate.historyPathId != cdnCandidate.historyPathId,
+        )
+    }
+
+    @Test
+    fun `B27 review fix - stale history recorded under one ingress kind's historyPathId never influences scoring for the same endpoint+transport under a different kind`() {
+        // A caller's own recorded evidence store, keyed by the EXACT
+        // historyPathId string a real PathHistoryStore would use - only
+        // the DIRECT_IP-shaped key has any evidence at all.
+        val directHistoryPathId = "${directIpIngressEndpoint.id.value}:${IngressKind.DIRECT_IP}:TLS_TCP->${exitEndpoint.id.value}:AMNEZIA_WG"
+        val richPositiveHistory = PathHistoryEntry(successCount = 20, failureCount = 0, lastOutcomeEpochMillis = 0L, lastOutcomeSuccess = true)
+        val historyFor: (String, TransportKind) -> PathHistoryEntry? = { pathId, _ -> if (pathId == directHistoryPathId) richPositiveHistory else null }
+
+        val reclassifiedToCdn = directIpIngressEndpoint.copy(
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.51", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+        )
+
+        val directCandidates = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(directIpIngressEndpoint, exitEndpoint),
+            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = historyFor,
+        )
+        val cdnCandidates = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(reclassifiedToCdn, exitEndpoint),
+            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = historyFor,
+        )
+
+        // The DIRECT_IP candidate's own historyPathId genuinely matches the
+        // seeded key, so its score reflects the rich positive history.
+        // The CDN_FRONTED candidate, despite the SAME endpoint id and
+        // transport, has a DIFFERENT historyPathId - the stale DIRECT_IP
+        // evidence must never be read back for it (and vice versa: a
+        // CDN_FRONTED-keyed history entry, symmetric by construction, could
+        // never leak into a DIRECT_IP lookup either, since historyFor is
+        // looked up by the exact string either way).
+        assertTrue(
+            "a candidate whose historyPathId has real evidence must score higher than an otherwise-identical candidate with none",
+            directCandidates.single().score > cdnCandidates.single().score,
+        )
     }
 
     @Test

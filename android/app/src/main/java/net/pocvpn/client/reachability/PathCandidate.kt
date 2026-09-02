@@ -74,7 +74,11 @@ sealed class PathCandidate {
      * ingress's own upstream to the exit speaks TLS_TCP (or vice versa) -
      * this candidate's identity ([id]/[historyPathId]) encodes BOTH
      * transports precisely so such a chain is never confused with a
-     * same-endpoints-different-transport alternative.
+     * same-endpoints-different-transport alternative. B27 - [historyPathId]
+     * additionally encodes [ingressKind] (DIRECT_IP/CDN_FRONTED): the SAME
+     * endpoint id/transport reclassified from one ingress strategy to the
+     * other must never let old evidence carry over - see [historyPathId]'s
+     * own docs for why.
      */
     data class Relayed(
         val ingress: PathHop,
@@ -85,9 +89,34 @@ sealed class PathCandidate {
         /** The SEPARATE ingress<->exit upstream transport - never assumed equal to [transport] (the client<->ingress transport). */
         val exitTransport: TransportKind = exit.binding.kind
 
+        // B27 - the ingress hop's own pinned IngressKind (DIRECT_IP/
+        // CDN_FRONTED), read straight off its own binding metadata (see
+        // EndpointTransportBinding.ingressKind()'s own docs) - a binding
+        // with no declared kind defaults to DIRECT_IP, never inferred.
+        val ingressKind: IngressKind = ingress.binding.ingressKind() ?: IngressKind.DIRECT_IP
+
         override val hops: List<PathHop> = listOf(ingress, exit)
         override val id: String = "relayed:${transport}->${exitTransport}:${ingress.endpoint.id.value}->${exit.endpoint.id.value}"
-        override val historyPathId: String = "${ingress.endpoint.id.value}:${transport}->${exit.endpoint.id.value}:${exitTransport}"
+
+        // B27 review fix (blocker) - [ingressKind] is now a PINNED component
+        // of relay history identity, not merely of the candidate's own
+        // execution facts: if the SAME ingress endpoint/transport is ever
+        // reclassified or redeployed from DIRECT_IP to CDN_FRONTED (or vice
+        // versa), old success/failure/cooldown evidence recorded under the
+        // OLD key must never silently apply to the new strategy - a
+        // DIRECT_IP ingress's own proven reachability says nothing real
+        // about a CDN edge that happens to share its endpoint id, and vice
+        // versa (a CDN edge's reachability is a fact about the FRONTING
+        // path, not the origin). No pre-B27 relay history exists on any
+        // real device (no ingress of either kind has ever been deployed -
+        // see PROJECT_ARCHITECTURE.md's B26/B27 sections), so this format
+        // change orphans nothing: legacy entries (if any ever existed)
+        // simply stop matching, never get silently reinterpreted under the
+        // new key - PathHistoryStore.get() already treats an unmatched key
+        // as "no evidence", the same fail-open-to-neutral (never
+        // fail-open-to-wrongly-trusted) behavior a first-ever lookup
+        // already has.
+        override val historyPathId: String = "${ingress.endpoint.id.value}:${ingressKind}:${transport}->${exit.endpoint.id.value}:${exitTransport}"
     }
 }
 

@@ -129,7 +129,10 @@ class MainViewModelRelayActivationTest {
         exitRegion = "de",
         score = 1_000L,
         reasons = listOf("test"),
-        historyPathId = "${ingressId.value}:XRAY_REALITY->frankfurt:XRAY_REALITY",
+        // B27 review fix - kind-aware, matching PathCandidate.Relayed
+        // .historyPathId's own real format exactly (never a stand-in that
+        // could hide a kind-conflation bug in these tests).
+        historyPathId = "${ingressId.value}:$ingressKind:XRAY_REALITY->frankfurt:XRAY_REALITY",
     )
 
     private fun asAttempt(c: AutoGatewaySelector.RelayAttemptCandidate) = AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt(c)
@@ -285,6 +288,12 @@ class MainViewModelRelayActivationTest {
         assertEquals("the persisted profile must keep the pinned CDN_FRONTED kind", IngressKind.CDN_FRONTED, saved?.ingressKind)
         assertEquals(2, resolver.resolvedPlans.size)
         assertEquals(IngressKind.CDN_FRONTED, resolver.resolvedPlans[0].ingressKind)
+        // Requirement 4: the retry keeps the IDENTICAL kind-aware
+        // historyPathId - never re-ranked into a different (endpoint,
+        // kind, transport) identity.
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[0].historyPathId)
+        assertEquals(candA.historyPathId, resolver.resolvedPlans[1].historyPathId)
+        assertTrue(candA.historyPathId.contains(":CDN_FRONTED:"))
         assertEquals(IngressKind.CDN_FRONTED, resolver.resolvedPlans[1].ingressKind)
     }
 

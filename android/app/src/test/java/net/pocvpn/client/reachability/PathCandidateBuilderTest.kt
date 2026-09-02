@@ -222,9 +222,37 @@ class PathCandidateBuilderTest {
             reach(ingress.id, TransportKind.TLS_TCP),
             reach(exit.id, TransportKind.AMNEZIA_WG),
         )!!
-        assertEquals("in1:TLS_TCP->exit1:AMNEZIA_WG", candidate.historyPathId)
+        // B27 - historyPathId now also encodes the ingress's own pinned
+        // IngressKind (DIRECT_IP here, since this fixture's binding
+        // declares none) - see PathCandidate.Relayed.historyPathId's own
+        // docs for why.
+        assertEquals("in1:DIRECT_IP:TLS_TCP->exit1:AMNEZIA_WG", candidate.historyPathId)
         assertTrue(candidate.historyPathId != ingress.id.value)
         assertTrue(candidate.historyPathId != exit.id.value)
+    }
+
+    @Test
+    fun `B27 - the SAME ingress endpoint-transport pair produces a DIFFERENT historyPathId for DIRECT_IP vs CDN_FRONTED`() {
+        val cdnFrontedIngress = ingress.copy(
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.2", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+        )
+        val directCandidate = PathCandidateBuilder.buildRelayed(
+            ingress, exit, TransportKind.TLS_TCP, TransportKind.AMNEZIA_WG,
+            reach(ingress.id, TransportKind.TLS_TCP), reach(exit.id, TransportKind.AMNEZIA_WG),
+        )!!
+        val cdnCandidate = PathCandidateBuilder.buildRelayed(
+            cdnFrontedIngress, exit, TransportKind.TLS_TCP, TransportKind.AMNEZIA_WG,
+            reach(cdnFrontedIngress.id, TransportKind.TLS_TCP), reach(exit.id, TransportKind.AMNEZIA_WG),
+        )!!
+
+        assertEquals(IngressKind.DIRECT_IP, directCandidate.ingressKind)
+        assertEquals(IngressKind.CDN_FRONTED, cdnCandidate.ingressKind)
+        // Same ingress/exit endpoint ids, same transports - the ONLY
+        // difference is ingressKind - and that alone must produce two
+        // genuinely distinct history identities, never the same key.
+        assertTrue(directCandidate.historyPathId != cdnCandidate.historyPathId)
+        assertEquals("in1:DIRECT_IP:TLS_TCP->exit1:AMNEZIA_WG", directCandidate.historyPathId)
+        assertEquals("in1:CDN_FRONTED:TLS_TCP->exit1:AMNEZIA_WG", cdnCandidate.historyPathId)
     }
 
     @Test

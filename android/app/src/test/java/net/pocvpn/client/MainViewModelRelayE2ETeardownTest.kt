@@ -287,8 +287,11 @@ class MainViewModelRelayE2ETeardownTest {
         relayEndToEndProbe = relayEndToEndProbe,
     )
 
+    // B27 - every ingress fixture in this file declares no withIngressKind()
+    // at all, so its historyPathId defaults to DIRECT_IP - see
+    // PathCandidate.Relayed.historyPathId's own docs for the format.
     private fun compositeHistoryPathId(ingressId: EndpointId, exitId: EndpointId) =
-        "${ingressId.value}:${TransportKind.AMNEZIA_WG}->${exitId.value}:${TransportKind.AMNEZIA_WG}"
+        "${ingressId.value}:${net.pocvpn.client.reachability.IngressKind.DIRECT_IP}:${TransportKind.AMNEZIA_WG}->${exitId.value}:${TransportKind.AMNEZIA_WG}"
 
     // --- A: ingress Connected, E2E fails -> transport.disconnect() called -> controller no longer Connected -> Direct B actually connects ---
 

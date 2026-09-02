@@ -7,7 +7,6 @@ import net.pocvpn.client.reachability.EndpointRole
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.reachability.PathCandidate
-import net.pocvpn.client.reachability.ingressKind
 import net.pocvpn.client.reachability.PathCandidateBuilder
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
@@ -467,7 +466,12 @@ object AutoGatewaySelector {
                 // never re-looked-up by endpointId/TransportKind.
                 ingressBinding = candidate.ingress.binding,
                 exitBinding = candidate.exit.binding,
-                ingressKind = candidate.ingress.binding.ingressKind() ?: IngressKind.DIRECT_IP,
+                // B27 review fix - reuses PathCandidate.Relayed's own
+                // ingressKind (the SAME value historyPathId below is
+                // computed from) rather than re-deriving it a second time
+                // from the binding, so this can never disagree with what
+                // the candidate's own historyPathId already encodes.
+                ingressKind = candidate.ingressKind,
                 ingressRegion = candidate.ingress.endpoint.region,
                 exitRegion = candidate.exit.endpoint.region,
                 score = result.score,
