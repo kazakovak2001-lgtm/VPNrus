@@ -131,6 +131,24 @@ fun ProvisioningUiState.toActivationErrorText(): String? = when (this) {
 fun shouldClearCredentialInput(state: ProvisioningUiState): Boolean = state is ProvisioningUiState.Success
 
 /**
+ * B26 review fix (blocker 1) - the ingress-activation counterpart of
+ * [toActivationErrorText], for the SAME reused `ActivationScreen`
+ * composable's `errorText` slot. `null` for every non-terminal/success
+ * state (nothing to show), same convention as the AWG one.
+ */
+fun net.pocvpn.client.relay.IngressActivationOutcome?.toIngressActivationErrorText(): String? = when (this) {
+    null, is net.pocvpn.client.relay.IngressActivationOutcome.Saved -> null
+    is net.pocvpn.client.relay.IngressActivationOutcome.AuthorizationFailed -> "Invalid activation"
+    is net.pocvpn.client.relay.IngressActivationOutcome.Unavailable -> "Service temporarily unavailable"
+    is net.pocvpn.client.relay.IngressActivationOutcome.UnsupportedTransport -> "This connection type is not supported yet"
+    is net.pocvpn.client.relay.IngressActivationOutcome.Mismatched -> "Activation did not match the expected server - try again"
+}
+
+/** B26 review fix (blocker 1) - same "clear the credential from UI memory on success" discipline as [shouldClearCredentialInput]. */
+fun shouldClearIngressCredentialInput(state: net.pocvpn.client.relay.IngressActivationOutcome?): Boolean =
+    state is net.pocvpn.client.relay.IngressActivationOutcome.Saved
+
+/**
  * B8D "DEBUG / DIAGNOSTICS" gate, expressed as a pure function of an
  * explicit flag rather than reading BuildConfig.DEBUG directly, so the
  * decision itself (not just the compile-time constant) is unit-testable.
