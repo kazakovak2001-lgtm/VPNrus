@@ -5,6 +5,7 @@ import net.pocvpn.client.relay.RelayedExecutionPlan
 import net.pocvpn.client.relay.VpnAttemptContext
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -21,6 +22,7 @@ class VpnSessionHealthTest {
         ingressEndpointId = EndpointId("ru-ingress-1"),
         ingressBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 443),
         ingressTransport = TransportKind.XRAY_REALITY,
+        ingressKind = IngressKind.DIRECT_IP,
         exitEndpointId = EndpointId("germany"),
         exitBinding = EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.60", 51820),
         exitTransport = TransportKind.AMNEZIA_WG,

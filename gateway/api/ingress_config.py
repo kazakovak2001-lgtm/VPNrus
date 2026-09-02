@@ -25,6 +25,13 @@ _REALITY_PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
 _SUPPORTED_UPSTREAM_TRANSPORTS = ("reality", "tls")
 
+# B27 - the two IngressKind values the Android client's own
+# net.pocvpn.client.reachability.IngressKind enum recognizes - kept as
+# plain lowercase env-var values (matching this file's own "reality"/"tls"
+# convention) and upper-cased only at the HTTP response boundary
+# (handler.py) to match the client's exact enum constant names.
+_SUPPORTED_INGRESS_KINDS = ("direct_ip", "cdn_fronted")
+
 
 class IngressConfigError(Exception):
     """Raised when the ingress role is partially configured or a value is
@@ -122,6 +129,18 @@ class IngressAppConfig:
     # --- profile validity window handed to a device (task E) ---
     ingress_profile_ttl_seconds: int = 0  # 0 means no expiry
 
+    # B27 - "direct_ip" (the default) or "cdn_fronted" - see
+    # _SUPPORTED_INGRESS_KINDS's own docs. Purely a LABEL this process
+    # echoes back in /v1/ingress-profile's response (task E's own
+    # cross-check contract) - it changes NOTHING about how this process
+    # renders/serves the client-facing REALITY/TLS inbound, which is
+    # byte-for-byte identical either way (a CDN-fronted ingress is still
+    # just a REALITY/TLS_TCP endpoint from xray-core's own point of view -
+    # the "fronting" is a network-topology/DNS fact entirely outside this
+    # process's own config, e.g. which public IP/CNAME actually routes to
+    # ingress_endpoint_host).
+    ingress_kind: str = "direct_ip"
+
 
 def _get(env, name):
     return env.get(_ENV_PREFIX + name, "").strip()
@@ -144,6 +163,13 @@ def load_ingress_config(env=None):
 
     ingress_endpoint_id = require("ENDPOINT_ID")
     ingress_endpoint_host = require("ENDPOINT_HOST")
+
+    # B27 - optional, defaults to "direct_ip" (every pre-B27 deployment's
+    # only real behavior) - never inferred from ENDPOINT_HOST/provider.
+    ingress_kind_raw = _get(env, "KIND")
+    ingress_kind = ingress_kind_raw.lower() if ingress_kind_raw else "direct_ip"
+    if ingress_kind not in _SUPPORTED_INGRESS_KINDS:
+        raise IngressConfigError(f"{_ENV_PREFIX}KIND must be one of {_SUPPORTED_INGRESS_KINDS}: {ingress_kind_raw!r}")
 
     reality_private_key_file = require("REALITY_PRIVATE_KEY_FILE")
     if not os.path.isabs(reality_private_key_file):
@@ -255,6 +281,7 @@ def load_ingress_config(env=None):
     return IngressAppConfig(
         ingress_endpoint_id=ingress_endpoint_id,
         ingress_endpoint_host=ingress_endpoint_host,
+        ingress_kind=ingress_kind,
         ingress_reality_private_key_file=reality_private_key_file,
         ingress_server_port=server_port,
         ingress_server_name=server_name,

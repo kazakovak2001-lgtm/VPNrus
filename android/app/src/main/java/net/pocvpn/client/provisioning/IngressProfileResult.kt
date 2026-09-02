@@ -1,5 +1,7 @@
 package net.pocvpn.client.provisioning
 
+import net.pocvpn.client.reachability.IngressKind
+
 /**
  * B26 (task D) - the outcome of one POST /v1/ingress-profile attempt.
  * Mirrors [XrayProfileResult]'s own shape/reasoning (a distinct wire shape
@@ -15,6 +17,13 @@ sealed class IngressProfileResult {
 
     data class Success(
         val ingressEndpointId: String,
+        // B27 - the server's OWN claim of which IngressKind this ingress is
+        // (parsed from the response's optional "ingress_kind" field -
+        // absent means DIRECT_IP, the only kind every pre-B27 gateway ever
+        // served). [net.pocvpn.client.relay.IngressProfileProvisioner.provision]
+        // cross-checks this against the CALLER's own pinned expectation
+        // before ever persisting anything - see that function's own docs.
+        val ingressKind: IngressKind,
         val serverAddress: String,
         val serverPort: Int,
         val uuid: String,

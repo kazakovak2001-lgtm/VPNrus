@@ -6,6 +6,7 @@ import net.pocvpn.client.provisioning.IngressProfileResult
 import net.pocvpn.client.provisioning.ProvisioningClient
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.transport.TransportKind
 
 /**
@@ -39,6 +40,14 @@ class IngressProfileProvisioner(
         ingressEndpointId: EndpointId,
         ingressBinding: EndpointTransportBinding,
         ingressTransport: TransportKind,
+        // B27 - the pinned facts a real relayed attempt's own candidate
+        // already resolved (see [RelayedExecutionPlan.ingressKind]'s own
+        // docs) - cross-checked below against the server's OWN
+        // `ingress_kind` claim, never assumed from [ingressBinding] alone
+        // (task requirement E's "frontend host/origin/backend confusion
+        // must fail closed" - a server that returns the right host/port but
+        // the WRONG ingress kind is exactly the confusion this catches).
+        ingressKind: IngressKind,
         publicKey: String,
         activationCredential: String,
     ): IngressActivationOutcome {
@@ -61,6 +70,11 @@ class IngressProfileProvisioner(
                         "response server ${result.serverAddress}:${result.serverPort} does not match the pinned binding ${ingressBinding.host}:${ingressBinding.port}",
                     )
                 }
+                if (result.ingressKind != ingressKind) {
+                    return IngressActivationOutcome.Mismatched(
+                        "response declares ingress kind ${result.ingressKind}, expected $ingressKind - refusing a frontend/origin/backend mismatch",
+                    )
+                }
                 if (useTls && result.isRealityShaped) {
                     return IngressActivationOutcome.Mismatched("requested TLS but response carries REALITY-shaped fields")
                 }
@@ -72,6 +86,10 @@ class IngressProfileProvisioner(
                     ingressEndpointId = ingressEndpointId,
                     ingressBinding = ingressBinding,
                     transport = ingressTransport,
+                    // B27 - the VALIDATED kind (already cross-checked
+                    // against result.ingressKind above), never re-derived
+                    // from ingressBinding's own metadata.
+                    ingressKind = ingressKind,
                     realityProfile = if (!useTls) {
                         XrayProfile(
                             server = result.serverAddress,
@@ -129,6 +147,7 @@ class IngressProfileProvisioner(
         ingressEndpointId: EndpointId,
         ingressBinding: EndpointTransportBinding,
         ingressTransport: TransportKind,
+        ingressKind: IngressKind,
         publicKey: String,
         activationCredential: String,
     ): IngressActivationOutcome {
@@ -137,11 +156,12 @@ class IngressProfileProvisioner(
             existing.ingressEndpointId == ingressEndpointId &&
             existing.ingressBinding == ingressBinding &&
             existing.transport == ingressTransport &&
+            existing.ingressKind == ingressKind &&
             !existing.isExpired(nowProvider())
         if (stillGood) {
             return IngressActivationOutcome.Saved(existing!!)
         }
-        return provision(ingressEndpointId, ingressBinding, ingressTransport, publicKey, activationCredential)
+        return provision(ingressEndpointId, ingressBinding, ingressTransport, ingressKind, publicKey, activationCredential)
     }
 }
 

@@ -108,6 +108,29 @@ class IngressProfileEndpointTests(unittest.TestCase):
         self.assertNotIn(raw_upstream_uuid, body)
         self.assertNotIn(raw_probe_secret, body)
 
+        # B27 - the response echoes this deployment's own configured
+        # ingress_kind, upper-cased to match the client's IngressKind enum.
+        self.assertEqual(payload["ingress_kind"], "DIRECT_IP")
+
+    def test_a_cdn_fronted_deployment_echoes_that_kind(self):
+        self.ingress_cfg = make_ingress_config(self._tmp.name, ingress_kind="cdn_fronted")
+        self.app_config = make_app_config(
+            self._tmp.name, self.app_config.provision_script_path,
+            activation_store_path=self.ingress_cfg.activation_store_path,
+            activation_lock_path=self.ingress_cfg.activation_lock_path,
+        )
+        self.server.close()
+        self.server = RunningServer(self.app_config, ingress_config=self.ingress_cfg)
+
+        activation_id, credential = activations_module.issue_activation(
+            self.ingress_cfg.activation_store_path, self.ingress_cfg.activation_lock_path, max_devices=1,
+        )
+        post_activate(self.server.port, credential=credential, body_obj={"public_key": self.key_a})
+        status, _headers, body = post_ingress_profile(self.server.port, credential=credential, body_obj={"public_key": self.key_a})
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["ingress_kind"], "CDN_FRONTED")
+
     def test_device_never_activated_against_this_ingress_is_forbidden(self):
         status, _headers, body = post_ingress_profile(self.server.port, credential="unknown-credential", body_obj={"public_key": self.key_a})
         self.assertEqual(status, 401)

@@ -5,7 +5,9 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
 import net.pocvpn.client.reachability.EndpointRole
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.reachability.PathCandidate
+import net.pocvpn.client.reachability.ingressKind
 import net.pocvpn.client.reachability.PathCandidateBuilder
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
@@ -335,6 +337,17 @@ object AutoGatewaySelector {
         // could silently redirect an in-flight relay attempt.
         val ingressBinding: EndpointTransportBinding,
         val exitBinding: EndpointTransportBinding,
+        // B27 - the ingress's own [IngressKind] (DIRECT_IP/CDN_FRONTED),
+        // copied straight off [ingressBinding]'s own metadata at candidate-
+        // BUILD time (never re-derived later) - see
+        // EndpointTransportBinding.ingressKind()'s own docs for why this is
+        // stored in binding metadata rather than a new manifest field, and
+        // RelayedExecutionPlan/IngressClientProfile for how it stays pinned
+        // through activation/execution. A binding with no declared kind
+        // (every pre-B27 manifest) defaults to DIRECT_IP - the historical,
+        // only-ever-real behavior - never CDN_FRONTED by inference from
+        // host/provider.
+        val ingressKind: IngressKind,
         val ingressRegion: String,
         val exitRegion: String,
         val score: Long,
@@ -454,6 +467,7 @@ object AutoGatewaySelector {
                 // never re-looked-up by endpointId/TransportKind.
                 ingressBinding = candidate.ingress.binding,
                 exitBinding = candidate.exit.binding,
+                ingressKind = candidate.ingress.binding.ingressKind() ?: IngressKind.DIRECT_IP,
                 ingressRegion = candidate.ingress.endpoint.region,
                 exitRegion = candidate.exit.endpoint.region,
                 score = result.score,

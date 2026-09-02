@@ -3,6 +3,7 @@ package net.pocvpn.client.relay
 import kotlinx.coroutines.test.runTest
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
@@ -20,6 +21,7 @@ class RelayExecutionTest {
         ingressEndpointId = EndpointId("ingress-1"),
         ingressBinding = EndpointTransportBinding(ingressTransport, "203.0.113.50", 443),
         ingressTransport = ingressTransport,
+        ingressKind = IngressKind.DIRECT_IP,
         exitEndpointId = EndpointId("exit-1"),
         exitBinding = EndpointTransportBinding(exitTransport, "203.0.113.60", 51820),
         exitTransport = exitTransport,
@@ -35,6 +37,7 @@ class RelayExecutionTest {
             exitTransport = TransportKind.AMNEZIA_WG,
             ingressBinding = EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.50", 443),
             exitBinding = EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.60", 51820),
+            ingressKind = IngressKind.CDN_FRONTED,
             ingressRegion = "ru",
             exitRegion = "de",
             score = 1_000_000L,
@@ -45,6 +48,7 @@ class RelayExecutionTest {
         assertEquals(candidate.ingressEndpointId, built.ingressEndpointId)
         assertEquals(candidate.ingressBinding, built.ingressBinding)
         assertEquals(candidate.ingressTransport, built.ingressTransport)
+        assertEquals(candidate.ingressKind, built.ingressKind)
         assertEquals(candidate.exitEndpointId, built.exitEndpointId)
         assertEquals(candidate.exitBinding, built.exitBinding)
         assertEquals(candidate.exitTransport, built.exitTransport)
@@ -151,6 +155,7 @@ internal fun fakeIngressClientProfile(
     ingressEndpointId = plan.ingressEndpointId,
     ingressBinding = plan.ingressBinding,
     transport = plan.ingressTransport,
+    ingressKind = plan.ingressKind,
     realityProfile = if (plan.ingressTransport == TransportKind.XRAY_REALITY) {
         net.pocvpn.client.identity.XrayProfile(
             server = plan.ingressBinding.host,

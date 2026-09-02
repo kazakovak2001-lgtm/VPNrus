@@ -955,6 +955,106 @@ exact remaining physical-deployment sequence (human-approval-gated).
   available in this session for either host - see this PR's own report,
   no SAFE/NOT_SAFE verdict asserted).
 
+## CDN_FRONTED Ingress Support (B27) - FOUNDATION
+
+Threads B23's `IngressKind` (`DIRECT_IP`/`CDN_FRONTED`) - a real type since
+B23, but never consumed anywhere until now - through real candidate
+construction, execution, and provisioning, so both ingress strategies can
+coexist in one ranked relay fabric. **Still FOUNDATION, no real ingress of
+either kind is deployed, and Russia hard-whitelist bypass remains
+UNVERIFIED** - CDN_FRONTED is an ingress TRANSPORT STRATEGY, never a
+guarantee of whitelist reachability, and this slice claims neither.
+
+- **What CDN_FRONTED actually means here (architecture principle 3's own
+  "never impersonate a third party" - re-affirmed, not weakened)**: an
+  operator-controlled backend legitimately reachable through a CDN/origin
+  architecture the OPERATOR configured - never a spoof of a named
+  third-party service's identity, never a hardcoded trust relationship
+  with Yandex/VK/Beeline/Selectel/a bank/any other real organization (none
+  of those names appear anywhere in this codebase, and none should). From
+  the CLIENT's own socket-level point of view, dialing a CDN-fronted
+  ingress is MECHANICALLY IDENTICAL to dialing a DIRECT_IP one - a normal
+  XRAY_REALITY/TLS_TCP handshake against `EndpointTransportBinding.host`/
+  `.port` - which is exactly why execution needed almost no new code (task
+  D's "no second VPN service or second transport core" - satisfied
+  structurally, not by discipline: there is no kind-specific branch
+  anywhere in `RelayIngressResolverImpl`/`VlessRealityTransport`/
+  `VlessTlsTransport`).
+- **Typed strategy, no inference (task A)**: `IngressKind` and
+  `EndpointTransportBinding.ingressKind()`/`.withIngressKind()` (B23,
+  `reachability/Endpoint.kt`) are the ONE place a binding's kind is
+  read/written - stored in the binding's own `metadata` map (already part
+  of the signed manifest wire format, zero re-signing ceremony needed - see
+  B23's own docs). A binding with no declared kind (every pre-B27 manifest)
+  defaults to `DIRECT_IP` - never inferred from host/provider/ASN.
+- **Candidate construction (task C)**: `AutoGatewaySelector.RelayAttemptCandidate`
+  gained an explicit `ingressKind` field, copied straight off the winning
+  `PathCandidate.Relayed.ingress.binding.ingressKind()` at candidate-BUILD
+  time inside `buildRelayedCandidates` - never re-derived later. A
+  DIRECT_IP and a CDN_FRONTED ingress candidate (two distinct
+  `EndpointDescriptor`s, each with their own `relayTo`) coexist in the SAME
+  ranked `PathScorer.rank` output and share the SAME `MAX_ATTEMPTS`
+  combined budget - proven directly in `AutoGatewaySelectorTest`. Every
+  other pinned fact (`ingressEndpointId`/`ingressBinding`/`ingressTransport`/
+  `exitEndpointId`/`exitBinding`/`exitTransport`/`historyPathId`) is
+  unaffected - `historyPathId`'s own format is unchanged (still
+  `ingressId:transport->exitId:transport`), since `IngressKind` is already
+  uniquely determined by (endpoint id, transport) for any one manifest
+  snapshot (`EndpointDescriptor.init` already forbids two bindings sharing
+  one `TransportKind`).
+- **Execution (task D)**: `RelayedExecutionPlan` and `RelayActivationRequest`
+  both gained the SAME explicit `ingressKind` field, copied verbatim from
+  the candidate at `.from(...)` construction time - `RelayIngressResolverImpl`
+  itself needed NO new branch (it already dispatches purely on
+  `ingressTransport`, which fully determines which real `VpnTransport`
+  gets constructed regardless of kind).
+- **Provisioning and security (task E)**: `IngressClientProfile` gained an
+  explicit, PERSISTED `ingressKind` field (deliberately NOT derived from
+  `ingressBinding`'s own metadata at read time - the validated value from
+  the provisioning transaction itself is the one source of truth, so a
+  test/caller binding that happens to lack the metadata can never silently
+  read back a different kind than what was actually cross-checked).
+  `IngressClientProfile.matches(plan)` checks it explicitly alongside
+  endpoint/binding/transport (task requirement F.3's own "every pinned fact
+  named explicitly"). Server-side: `/v1/ingress-profile`'s response gained
+  an optional `ingress_kind` field (`gateway/api/ingress_config.py`'s new
+  `NOVA_INGRESS_KIND` env var, `"direct_ip"`/`"cdn_fronted"`, defaulting to
+  `"direct_ip"` for every pre-B27 deployment) -
+  `IngressProfileProvisioner.provision` cross-checks the server's OWN claim
+  against the caller's pinned expectation and fails closed as `Mismatched`
+  on any disagreement (task requirement E's own "frontend host/origin/
+  backend confusion must fail closed") - exactly the same fail-closed
+  discipline B26 already applied to `server_address`/`server_port`/
+  `ingress_endpoint_id`, now covering kind too. No secret was added to any
+  wire format - `ingress_kind` is a label, structurally incapable of
+  carrying key material (it is a 2-value enum name).
+- **Health/proof (task F) - unchanged, and that is the point**: B25's real
+  end-to-end proof contract (`RelayReadinessStage`/`HttpRelayEndToEndProbe`/
+  `VpnSessionHealth`) has no kind-specific branch anywhere - a CDN_FRONTED
+  session reaches `RelayProtected` through EXACTLY the same
+  `END_TO_END_DATA_PLANE_OK`-only gate a DIRECT_IP one does. Deliberately
+  NOT weakened or special-cased for CDN_FRONTED - task F's own "not only
+  successful TCP/TLS connection to the CDN edge" is satisfied by construction,
+  not by a new check.
+- **Reachability/history (task G) - unchanged, and that is also the
+  point**: `historyPathId` already scopes local connection memory per
+  (ingress endpoint, transport) pair, so a DIRECT_IP ingress's history can
+  never be confused with a CDN_FRONTED one's (different endpoint ids by
+  construction). B19's existing bounded, time-decaying failure cooldown
+  (`PathHistoryEntry.consecutiveFailures`/`FAILURE_COOLDOWN_WINDOW_MILLIS`)
+  already applies uniformly - no CDN-specific "permanently healthy" shortcut
+  was added or would be consistent with this codebase's own architecture.
+- **Not done this slice**: no real CDN-fronted ingress host exists to
+  validate against (matches B23's own original caveat on `CDN_FRONTED`,
+  never claimed resolved here); no product UI distinguishes ingress kind in
+  its display text (Home/LocationCard stay geography-only per this
+  codebase's own production-vs-debug boundary - provider/kind metadata is
+  diagnostics-only); the deployment/preflight/runbook tooling B26 built for
+  DIRECT_IP (`install-ingress-role.sh`, `ingress_preflight.py`, the
+  first-deployment runbook) was not extended for a CDN-fronted rollout
+  sequence - a real CDN account/configuration would be needed to design
+  that meaningfully, and none is available.
+
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
 Architecture principle 9: a user may connect through the managed gateway
@@ -1114,3 +1214,19 @@ graph was extracted into RelayCompositionFactory with a real,
 Robolectric-backed composition-root test proving production selects the
 real implementations. Remaining gap: Frankfurt/Stockholm SSH audit
 incomplete (no working credential this session).)
+
+---
+Last updated: 2026-09-02 (B27 - added the "CDN_FRONTED Ingress Support"
+section above: threaded B23's typed IngressKind through real candidate
+construction (AutoGatewaySelector.RelayAttemptCandidate), execution
+(RelayedExecutionPlan/RelayActivationRequest), and provisioning
+(IngressClientProfile/IngressProfileProvisioner/the /v1/ingress-profile
+wire contract) - DIRECT_IP and CDN_FRONTED ingress candidates now coexist
+in one ranked relay fabric, and a provisioning response whose ingress_kind
+disagrees with the pinned candidate fails closed. No kind-specific
+execution/health/history branch was added anywhere (the point of the
+slice, not an oversight) - a CDN-fronted session reaches RelayProtected
+through the exact same evidence-driven, end-to-end-proof-gated path a
+DIRECT_IP one does. Still FOUNDATION - no real ingress of either kind is
+deployed, Russia hard-whitelist bypass remains UNVERIFIED, and this slice
+does not claim CDN whitelist bypass works.)

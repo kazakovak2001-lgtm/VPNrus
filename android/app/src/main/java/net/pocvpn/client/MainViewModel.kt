@@ -1978,7 +1978,8 @@ class MainViewModel(
         viewModelScope.launch {
             val outcome = withContext(ioDispatcher) {
                 provisioner.ensureFreshProfile(
-                    pending.candidate.ingressEndpointId, pending.candidate.ingressBinding, pending.candidate.ingressTransport, key, trimmedCredential,
+                    pending.candidate.ingressEndpointId, pending.candidate.ingressBinding, pending.candidate.ingressTransport,
+                    pending.candidate.ingressKind, key, trimmedCredential,
                 )
             }
             _ingressActivating.value = false

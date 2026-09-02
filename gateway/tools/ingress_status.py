@@ -95,6 +95,7 @@ def main(argv=None):
     report = {
         "configured": True,
         "ingress_endpoint_id": ingress_cfg.ingress_endpoint_id,
+        "ingress_kind": ingress_cfg.ingress_kind,
         "ingress_endpoint_host": ingress_cfg.ingress_endpoint_host,
         "upstream_host": ingress_cfg.ingress_upstream_host,
         "upstream_port": ingress_cfg.ingress_upstream_port,
@@ -108,7 +109,7 @@ def main(argv=None):
     if args.json:
         print(json.dumps(report, indent=2))
     else:
-        print(f"ingress role: configured (endpoint_id={ingress_cfg.ingress_endpoint_id})")
+        print(f"ingress role: configured (endpoint_id={ingress_cfg.ingress_endpoint_id}, kind={ingress_cfg.ingress_kind})")
         print(f"  client-facing host: {ingress_cfg.ingress_endpoint_host}")
         print(f"  upstream exit:      {ingress_cfg.ingress_upstream_host}:{ingress_cfg.ingress_upstream_port} ({ingress_cfg.ingress_upstream_transport})")
         print(f"  last activated:     {'yes (sha256=' + last_hash[:12] + '...)' if last_hash_present else 'no'}")

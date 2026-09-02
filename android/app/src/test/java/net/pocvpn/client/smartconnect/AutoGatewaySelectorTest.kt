@@ -555,6 +555,44 @@ class AutoGatewaySelectorTest {
         assertEquals(exitEndpoint.id, candidates.first().exitEndpointId)
         assertEquals(TransportKind.TLS_TCP, candidates.first().ingressTransport)
         assertEquals(TransportKind.AMNEZIA_WG, candidates.first().exitTransport)
+        // B27 - the candidate's own ingressKind is copied straight off the
+        // manifest binding's own withIngressKind(CDN_FRONTED) metadata.
+        assertEquals(IngressKind.CDN_FRONTED, candidates.first().ingressKind)
+    }
+
+    // --- B27: DIRECT_IP and CDN_FRONTED ingress candidates coexist ---
+
+    private val directIpIngressEndpoint = EndpointDescriptor(
+        id = EndpointId("direct-ip-ingress-1"),
+        roles = setOf(EndpointRole.INGRESS),
+        region = "ru",
+        provider = "operator-b",
+        // No withIngressKind() call at all - every pre-B27 manifest's own
+        // shape - must default to DIRECT_IP, never inferred as CDN_FRONTED.
+        transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.51", 443)),
+        relayTo = germanyId,
+    )
+
+    @Test
+    fun `a binding with no declared ingress kind defaults to DIRECT_IP, never inferred as CDN_FRONTED`() {
+        val candidates = buildRelayedDefault(manifestEndpoints = listOf(directIpIngressEndpoint, exitEndpoint))
+        assertEquals(1, candidates.size)
+        assertEquals(IngressKind.DIRECT_IP, candidates.first().ingressKind)
+    }
+
+    @Test
+    fun `DIRECT_IP and CDN_FRONTED ingress candidates coexist in one ranked list, each keeping its own pinned kind`() {
+        val candidates = buildRelayedDefault(manifestEndpoints = listOf(directIpIngressEndpoint, ingressEndpoint, exitEndpoint))
+
+        assertEquals(2, candidates.size)
+        val byIngressId = candidates.associateBy { it.ingressEndpointId }
+        assertEquals(IngressKind.DIRECT_IP, byIngressId.getValue(directIpIngressEndpoint.id).ingressKind)
+        assertEquals(IngressKind.CDN_FRONTED, byIngressId.getValue(ingressEndpoint.id).ingressKind)
+        // Neither candidate's own historyPathId/exit facts are affected by
+        // the other candidate's presence or kind - two fully independent
+        // relay identities, exactly like two Direct gateways coexisting.
+        assertEquals(exitEndpoint.id, byIngressId.getValue(directIpIngressEndpoint.id).exitEndpointId)
+        assertEquals(exitEndpoint.id, byIngressId.getValue(ingressEndpoint.id).exitEndpointId)
     }
 
     @Test
