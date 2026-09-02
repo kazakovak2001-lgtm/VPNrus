@@ -9,19 +9,9 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.provisioning.IngressProfileResult
-import net.pocvpn.client.reachability.Ed25519ManifestVerifier
-import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
-import net.pocvpn.client.reachability.EndpointManifest
-import net.pocvpn.client.reachability.EndpointManifestRepository
-import net.pocvpn.client.reachability.EndpointRole
 import net.pocvpn.client.reachability.EndpointTransportBinding
-import net.pocvpn.client.reachability.FileLastKnownGoodManifestStore
-import net.pocvpn.client.reachability.FixedManifestTrustAnchors
-import net.pocvpn.client.reachability.ManifestCanonicalizer
 import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
-import net.pocvpn.client.reachability.SignedManifest
-import net.pocvpn.client.reachability.TrustedKeyId
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.IngressProfileProvisioner
 import net.pocvpn.client.relay.InMemoryIngressProfileStore
@@ -37,25 +27,17 @@ import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeSelectedGatewayStore
 import net.pocvpn.client.vpn.FakeVpnTransport
-import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayAutoModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
-import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
-import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
-import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
-import org.junit.Rule
 import org.junit.Test
-import org.junit.rules.TemporaryFolder
-import java.security.SecureRandom
 
 private fun configuredGateway() = GatewayConfiguration.Configured(
     endpointHost = "203.0.113.10",
@@ -78,6 +60,7 @@ private class RelayActivationAlwaysAutoModeStore : GatewayAutoModeStore {
     override fun write(auto: Boolean) {}
 }
 
+/** A resolver stub keyed by ingress endpoint id, so a two-candidate test can give each its own scripted resolution. */
 private class RelayActivationStubResolver(private val resolutionFor: (RelayedExecutionPlan) -> RelayIngressResolution) : RelayIngressResolver {
     val resolvedPlans = mutableListOf<RelayedExecutionPlan>()
     override suspend fun resolve(plan: RelayedExecutionPlan): RelayIngressResolution {
@@ -87,44 +70,37 @@ private class RelayActivationStubResolver(private val resolutionFor: (RelayedExe
 }
 
 /**
- * B26 review fix (blocker 1) - proves the real product activation flow:
- * a relayed Auto attempt that hits an activation-fixable
- * [RelayFailureCategory] surfaces a bounded, UI-observable
- * [net.pocvpn.client.relay.RelayActivationRequest] carrying ONLY the
- * already-pinned candidate facts; [MainViewModel.activateIngress] runs
- * the REAL [IngressProfileProvisioner] (never a second credential/profile
- * system), never mutates the pinned endpoint/binding, clears the prompt
- * and retries the connect flow EXACTLY once on success, and never prompts
- * at all for a category no activation could fix.
+ * B26 review fix (round 2, blocker) - proves the real PAUSE/RESUME/RETRY
+ * design: a relayed Auto attempt that hits an activation-fixable
+ * [RelayFailureCategory] PAUSES the combined sequence (never advances via
+ * [MainViewModel] internal `attemptCombined` while a prompt is pending -
+ * task requirement G), storing the FULL resume context so a successful
+ * activation retries the BYTE-FOR-BYTE IDENTICAL candidate exactly once
+ * (task requirement B/C/D), and any other outcome (failure, or the user
+ * dismissing) resumes the ORIGINAL combined attempt list/budget exactly
+ * once, never a freshly re-ranked one (task requirement E/F/H).
+ *
+ * Uses [MainViewModel.attemptRelayedAttempt] directly (now `internal`, not
+ * `private` - see its own docs) with a hand-built
+ * [AutoGatewaySelector.RelayAttemptCandidate] rather than going through
+ * the full [MainViewModel.combinedAutoAttempts]/`connect()` ranking
+ * pipeline: a genuinely ELIGIBLE XRAY_REALITY/TLS_TCP relayed candidate
+ * cannot be produced through that pipeline in this test harness
+ * (`isXrayAvailableFor` is hardcoded to the Germany/Stockholm production
+ * endpoints only - see `buildTransportRegistry`'s own init-time wiring),
+ * and [net.pocvpn.client.relay.IngressProfileProvisioner] only ever
+ * supports XRAY_REALITY/TLS_TCP - this is the real, meaningful transport
+ * combination task D/E's own tests need, not a stand-in.
  */
 class MainViewModelRelayActivationTest {
 
-    @get:Rule
-    val tmp = TemporaryFolder()
-
     private val testDispatcher = StandardTestDispatcher()
-    private val manifestSigningKey = Ed25519PrivateKeyParameters(SecureRandom())
-    private val manifestTrustAnchors = FixedManifestTrustAnchors(
-        mapOf(TrustedKeyId("test-manifest-key") to manifestSigningKey.generatePublicKey().encoded),
-    )
-    private val ingressId = EndpointId("ru-ingress-1")
-    // AMNEZIA_WG here deliberately, NOT XRAY_REALITY - see
-    // manifestRepositoryWithIngressOnly's own comment on why a genuinely
-    // ELIGIBLE relayed candidate (as buildCombinedAutoAttempts' real
-    // PathScorer eligibility check requires) needs a transport this
-    // ViewModel's own buildTransportRegistry reports as AVAILABLE without
-    // additional per-endpoint xrayAvailableEndpoints wiring this test
-    // harness has no seam for - exactly the same reason
-    // MainViewModelRelayAttemptTest's own fixture uses AMNEZIA_WG.
-    // IngressProfileProvisioner's own XRAY_REALITY/TLS_TCP-specific
-    // behavior (the actual thing task D/E care about) is exercised via a
-    // MANUALLY constructed RelayActivationRequest below (activateIngress
-    // does not require its request to have come from a real connect()
-    // attempt - see xrayActivationRequest's own docs) and, more
-    // thoroughly, by IngressProfileProvisionerTest.
-    private val ingressBinding = EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.50", 8443)
-    private val xrayIngressBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 8443)
-    private fun xrayActivationRequest() = net.pocvpn.client.relay.RelayActivationRequest(ingressId, xrayIngressBinding, TransportKind.XRAY_REALITY)
+    private val ingressIdA = EndpointId("ru-ingress-a")
+    private val ingressIdB = EndpointId("ru-ingress-b")
+    private val exitId = EndpointId("frankfurt")
+    private val bindingA = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 8443)
+    private val bindingB = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.60", 8443)
+    private val exitBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "152.70.43.1", 8443)
 
     @Before
     fun setUp() {
@@ -136,60 +112,24 @@ class MainViewModelRelayActivationTest {
         Dispatchers.resetMain()
     }
 
-    /** A trusted, signed manifest naming ONE INGRESS (relayTo Germany, XRAY_REALITY both hops) and Germany as EXIT - mirrors MainViewModelRelayAttemptTest's own fixture, transport kind changed to exercise the real IngressProfileProvisioner (XRAY_REALITY/TLS_TCP only). */
-    private fun manifestRepositoryWithIngressOnly(): EndpointManifestRepository {
-        val germany = ProductionGatewayCatalog.GERMANY
-        val manifest = EndpointManifest(
-            manifestVersion = 1,
-            issuedAtEpochMillis = 1_000L,
-            expiresAtEpochMillis = 9_000_000_000_000L,
-            signingKeyId = "test-manifest-key",
-            endpoints = listOf(
-                EndpointDescriptor(
-                    id = germany.endpointId,
-                    roles = setOf(EndpointRole.EXIT),
-                    region = "Germany / Frankfurt",
-                    provider = "Oracle Cloud",
-                    // AMNEZIA_WG, not XRAY_REALITY, for the EXIT hop
-                    // deliberately: a catalog-known endpoint's reachability
-                    // lookup (buildCombinedAutoAttempts' own reachabilityFor)
-                    // derives its descriptor from ProductionGatewayEndpoints
-                    // .descriptorFor, which only reports XRAY_REALITY/TLS_TCP
-                    // support when this ViewModel's own xrayAvailableEndpoints
-                    // includes it (unrelated to this test - see
-                    // MainViewModelRelayAttemptTest's own AMNEZIA_WG choice
-                    // for the same reason). The INGRESS hop below is what
-                    // actually exercises XRAY_REALITY/IngressProfileProvisioner -
-                    // client<->ingress and ingress<->exit are independent
-                    // transports by design (PROJECT_ARCHITECTURE.md's B23
-                    // section), so this is a real, valid combination.
-                    transports = listOf(
-                        EndpointTransportBinding(TransportKind.AMNEZIA_WG, germany.awg.endpointHost, germany.awg.endpointPort),
-                    ),
-                ),
-                EndpointDescriptor(
-                    id = ingressId,
-                    roles = setOf(EndpointRole.INGRESS),
-                    region = "ru",
-                    provider = "operator-a",
-                    transports = listOf(ingressBinding),
-                    relayTo = germany.endpointId,
-                ),
-            ),
-        )
-        val signer = Ed25519Signer()
-        signer.init(true, manifestSigningKey)
-        val bytes = ManifestCanonicalizer.canonicalBytes(manifest)
-        signer.update(bytes, 0, bytes.size)
-        val signed = SignedManifest(manifest, signer.generateSignature())
-        return EndpointManifestRepository(
-            verifier = Ed25519ManifestVerifier(),
-            trustAnchors = manifestTrustAnchors,
-            lkgStore = FileLastKnownGoodManifestStore(tmp.newFolder()),
-            bootstrapManifest = signed,
-            nowEpochMillis = { 2_000L },
-        )
-    }
+    private fun candidate(
+        ingressId: EndpointId = ingressIdA,
+        ingressBinding: EndpointTransportBinding = bindingA,
+    ) = AutoGatewaySelector.RelayAttemptCandidate(
+        ingressEndpointId = ingressId,
+        exitEndpointId = exitId,
+        ingressTransport = TransportKind.XRAY_REALITY,
+        exitTransport = TransportKind.XRAY_REALITY,
+        ingressBinding = ingressBinding,
+        exitBinding = exitBinding,
+        ingressRegion = "ru",
+        exitRegion = "de",
+        score = 1_000L,
+        reasons = listOf("test"),
+        historyPathId = "${ingressId.value}:XRAY_REALITY->frankfurt:XRAY_REALITY",
+    )
+
+    private fun asAttempt(c: AutoGatewaySelector.RelayAttemptCandidate) = AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt(c)
 
     private fun newViewModel(
         transport: VpnTransport = FakeVpnTransport(),
@@ -205,15 +145,14 @@ class MainViewModelRelayActivationTest {
         clientTunnelIdentityStore = FakeClientTunnelIdentityStore(),
         gatewayAutoModeStore = RelayActivationAlwaysAutoModeStore(),
         initialNetworkProfile = USABLE_WIFI,
-        manifestRepository = manifestRepositoryWithIngressOnly(),
         fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
         relayIngressResolver = relayIngressResolver,
         ingressProfileProvisioner = ingressProfileProvisioner,
         ioDispatcher = testDispatcher,
     )
 
-    private fun successResult(serverAddress: String = ingressBinding.host, serverPort: Int = ingressBinding.port) = IngressProfileResult.Success(
-        ingressEndpointId = ingressId.value,
+    private fun successResult(serverAddress: String = bindingA.host, serverPort: Int = bindingA.port, ingressEndpointId: String = ingressIdA.value) = IngressProfileResult.Success(
+        ingressEndpointId = ingressEndpointId,
         serverAddress = serverAddress,
         serverPort = serverPort,
         uuid = "11111111-1111-1111-1111-111111111111",
@@ -230,185 +169,216 @@ class MainViewModelRelayActivationTest {
         probeToken = "test-token",
     )
 
-    // --- A: PROFILE_NOT_PROVISIONED (and the other two fixable categories) surface a bounded prompt ---
+    // --- A/G: first encounter with a fixable category PAUSES - no auto-advance ---
 
     @Test
-    fun `PROFILE_NOT_PROVISIONED surfaces a relayActivationNeeded prompt carrying the pinned ingress facts`() = runTest {
-        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+    fun `PROFILE_NOT_PROVISIONED pauses and surfaces a prompt carrying byte-for-byte the pinned facts - no other candidate starts`() = runTest {
+        val candA = candidate()
+        val candB = candidate(ingressIdB, bindingB)
+        val resolver = RelayActivationStubResolver { plan ->
+            if (plan.ingressEndpointId == ingressIdA) RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED)
+            else RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+        }
         val viewModel = newViewModel(relayIngressResolver = resolver)
+        val attempts = listOf(asAttempt(candA), asAttempt(candB))
 
-        viewModel.connect()
+        viewModel.attemptRelayedAttempt(candA, attempts, setOf(candA.historyPathId))
         testDispatcher.scheduler.runCurrent()
 
         val request = viewModel.relayActivationNeeded.value
         assertNotNull(request)
-        assertEquals(ingressId, request!!.ingressEndpointId)
-        assertEquals(ingressBinding, request.ingressBinding)
-        assertEquals(TransportKind.AMNEZIA_WG, request.ingressTransport)
+        assertEquals(ingressIdA, request!!.ingressEndpointId)
+        assertEquals(bindingA, request.ingressBinding)
+        assertEquals(TransportKind.XRAY_REALITY, request.ingressTransport)
+        // G: candidate B (still in `attempts`, not yet attempted) is never
+        // touched while the prompt is pending - attemptCombined never ran.
+        assertEquals(1, resolver.resolvedPlans.size)
     }
 
     @Test
-    fun `PROFILE_EXPIRED and PROFILE_MISMATCH also surface the prompt`() = runTest {
+    fun `PROFILE_EXPIRED and PROFILE_MISMATCH also pause`() = runTest {
         for (category in listOf(RelayFailureCategory.PROFILE_EXPIRED, RelayFailureCategory.PROFILE_MISMATCH)) {
+            val candA = candidate()
             val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(category) }
             val viewModel = newViewModel(relayIngressResolver = resolver)
-            viewModel.connect()
+            viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
             testDispatcher.scheduler.runCurrent()
-            assertNotNull("category $category must surface an activation prompt", viewModel.relayActivationNeeded.value)
+            assertNotNull("category $category must pause with a prompt", viewModel.relayActivationNeeded.value)
         }
     }
 
     @Test
-    fun `a category no activation can fix never surfaces the prompt`() = runTest {
+    fun `a category no activation can fix never pauses - the combined sequence advances immediately`() = runTest {
         for (category in listOf(
             RelayFailureCategory.INGRESS_UNREACHABLE,
             RelayFailureCategory.RELAY_AUTH_FAILED,
             RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED,
         )) {
+            val candA = candidate()
             val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(category) }
             val viewModel = newViewModel(relayIngressResolver = resolver)
-            viewModel.connect()
+            viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
             testDispatcher.scheduler.runCurrent()
-            assertNull("category $category must never surface an activation prompt", viewModel.relayActivationNeeded.value)
+            assertNull("category $category must never pause/prompt", viewModel.relayActivationNeeded.value)
+            // attemptCombined ran immediately (exhausted, only one candidate, already attempted).
+            assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
         }
     }
 
-    @Test
-    fun `the combined bounded attempt budget is unaffected by the activation prompt - still resolved exactly once`() = runTest {
-        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
-        val viewModel = newViewModel(relayIngressResolver = resolver)
-
-        viewModel.connect()
-        testDispatcher.scheduler.runCurrent()
-
-        assertEquals(1, resolver.resolvedPlans.size)
-        assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
-    }
-
-    // --- B: unauthorized/revoked fails closed, no prompt-clearing, no retry ---
+    // --- B/C/D: successful activation retries the SAME candidate exactly once, no re-ranking ---
 
     @Test
-    fun `unauthorized activation credential fails closed - prompt stays, no retry connect fires`() = runTest {
-        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
-        val store = InMemoryIngressProfileStore()
-        val provisioner = IngressProfileProvisioner(
-            store = store,
-            fetchIngressProfile = { _, _, _, _ -> IngressProfileResult.Unauthorized },
-        )
-        val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
-        viewModel.connect()
-        testDispatcher.scheduler.runCurrent()
-        assertNotNull(viewModel.relayActivationNeeded.value)
-
-        viewModel.activateIngress(xrayActivationRequest(), "bad-credential")
-        testDispatcher.scheduler.runCurrent()
-
-        assertEquals(IngressActivationOutcome.AuthorizationFailed, viewModel.ingressActivationState.value)
-        // Fails closed: the prompt is NOT cleared (nothing was fixed), and
-        // no profile was ever persisted.
-        assertNotNull(viewModel.relayActivationNeeded.value)
-        assertNull(store.getProfileOrNull(ingressId))
-        // Only the original connect() call resolved the candidate - the
-        // failed activation attempt never triggers a second connect().
-        assertEquals(1, resolver.resolvedPlans.size)
-    }
-
-    // --- C/D: successful activation clears the prompt, saves the profile, retries exactly once ---
-
-    @Test
-    fun `successful activation saves the profile, clears the prompt, and retries connect exactly once`() = runTest {
+    fun `successful activation retries the byte-for-byte identical candidate exactly once`() = runTest {
+        val candA = candidate()
         val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
         val store = InMemoryIngressProfileStore()
         var fetchCount = 0
-        val provisioner = IngressProfileProvisioner(
-            store = store,
-            fetchIngressProfile = { _, _, _, _ -> fetchCount++; successResult() },
-        )
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> fetchCount++; successResult() })
         val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
-        viewModel.connect()
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
         testDispatcher.scheduler.runCurrent()
         assertNotNull(viewModel.relayActivationNeeded.value)
         assertEquals(1, resolver.resolvedPlans.size)
 
-        viewModel.activateIngress(xrayActivationRequest(), "real-credential")
+        viewModel.activateIngress("real-credential")
         testDispatcher.scheduler.runCurrent()
 
         assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
-        assertNotNull("the profile must be persisted", store.getProfileOrNull(ingressId))
+        assertNotNull("the profile must be persisted", store.getProfileOrNull(ingressIdA))
         assertEquals(1, fetchCount)
-        // The bounded retry: exactly ONE additional connect() attempt fired
-        // (still resolved via the same STILL-NotProvisioned stub resolver in
-        // this test, since re-resolving against the real store isn't wired
-        // to the stub - what matters here is the retry COUNT, not its
-        // eventual outcome). That retry's own (fresh) NotProvisioned result
-        // legitimately re-populates relayActivationNeeded with a NEW request
-        // - activateIngress() cleared the OLD one at the moment of success,
-        // it never promises the prompt stays empty forever (see the
-        // dedicated "activation is bounded" test below for that exact
-        // transient-then-repopulated sequence).
+        // D: exactly ONE additional resolve() call - the bounded retry.
         assertEquals(2, resolver.resolvedPlans.size)
+        // B/C: the retry resolved the EXACT SAME plan (same historyPathId,
+        // same bindings/transport) - never rebuilt/re-ranked.
+        assertEquals(resolver.resolvedPlans[0], resolver.resolvedPlans[1])
     }
 
     @Test
-    fun `activation is bounded - a second connect() failure requires a NEW explicit submission, never fires on its own`() = runTest {
-        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+    fun `if the bounded retry itself still fails, it never pauses again - the combined sequence just resumes`() = runTest {
+        val candA = candidate()
+        val candB = candidate(ingressIdB, bindingB)
+        // A resolves NotProvisioned every time (even after "activation");
+        // the retry must not re-pause despite this still being a fixable category.
+        val resolver = RelayActivationStubResolver { plan ->
+            if (plan.ingressEndpointId == ingressIdA) RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED)
+            else RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+        }
         val store = InMemoryIngressProfileStore()
-        val provisioner = IngressProfileProvisioner(
-            store = store,
-            fetchIngressProfile = { _, _, _, _ -> successResult() },
-        )
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> successResult() })
         val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
-        viewModel.connect()
+        val attempts = listOf(asAttempt(candA), asAttempt(candB))
+
+        viewModel.attemptRelayedAttempt(candA, attempts, setOf(candA.historyPathId))
         testDispatcher.scheduler.runCurrent()
         assertNotNull(viewModel.relayActivationNeeded.value)
 
-        viewModel.activateIngress(xrayActivationRequest(), "real-credential")
+        viewModel.activateIngress("real-credential")
         testDispatcher.scheduler.runCurrent()
-        // The retried connect() ALSO still hits the same NotProvisioned stub
-        // (this resolver doesn't consult the real store) - so a fresh prompt
-        // is surfaced again. It must NOT auto-resolve itself again.
-        assertNotNull(viewModel.relayActivationNeeded.value)
-        val resolvedAfterRetry = resolver.resolvedPlans.size
-        assertEquals(2, resolvedAfterRetry)
 
-        // No further connect() attempts happen without another explicit
-        // activateIngress() call.
-        testDispatcher.scheduler.runCurrent()
-        assertEquals(resolvedAfterRetry, resolver.resolvedPlans.size)
+        // The retry (2nd resolvedPlans entry) failed again, but did not
+        // re-pause: it resumed the ORIGINAL combined list/budget, which
+        // then attempted candidate B (3rd entry) - never a THIRD attempt
+        // at A.
+        assertNull("must not pause a second time for the same candidate", viewModel.relayActivationNeeded.value)
+        assertEquals(3, resolver.resolvedPlans.size)
+        assertEquals(ingressIdA, resolver.resolvedPlans[0].ingressEndpointId)
+        assertEquals(ingressIdA, resolver.resolvedPlans[1].ingressEndpointId)
+        assertEquals(ingressIdB, resolver.resolvedPlans[2].ingressEndpointId)
     }
 
-    // --- E: activation never mutates the originally pinned endpoint/binding ---
+    // --- E/F: dismiss resumes the ORIGINAL combined list/budget, never a fresh ranking ---
 
     @Test
-    fun `a response naming a different server address is rejected as Mismatched - the pinned binding is never used with different facts`() = runTest {
-        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+    fun `dismissing the prompt never retries the paused candidate and resumes the original list to the next candidate exactly once`() = runTest {
+        val candA = candidate()
+        val candB = candidate(ingressIdB, bindingB)
+        val resolver = RelayActivationStubResolver { plan ->
+            if (plan.ingressEndpointId == ingressIdA) RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED)
+            else RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+        }
+        val viewModel = newViewModel(relayIngressResolver = resolver)
+        val attempts = listOf(asAttempt(candA), asAttempt(candB))
+
+        viewModel.attemptRelayedAttempt(candA, attempts, setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+        assertNotNull(viewModel.relayActivationNeeded.value)
+        assertEquals(1, resolver.resolvedPlans.size)
+
+        viewModel.dismissRelayActivationPrompt()
+        testDispatcher.scheduler.runCurrent()
+
+        assertNull(viewModel.relayActivationNeeded.value)
+        // A was never retried; the ORIGINAL list/budget resumed straight to
+        // B (the only other, still-unattempted candidate in `attempts`) -
+        // never a freshly rebuilt/re-ranked list, and never a second A.
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(ingressIdA, resolver.resolvedPlans[0].ingressEndpointId)
+        assertEquals(ingressIdB, resolver.resolvedPlans[1].ingressEndpointId)
+    }
+
+    // --- H: unauthorized/revoked activation fails closed and resumes exactly once ---
+
+    @Test
+    fun `unauthorized activation credential fails closed, never persists, never retries A, and resumes to B exactly once`() = runTest {
+        val candA = candidate()
+        val candB = candidate(ingressIdB, bindingB)
+        val resolver = RelayActivationStubResolver { plan ->
+            if (plan.ingressEndpointId == ingressIdA) RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED)
+            else RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+        }
         val store = InMemoryIngressProfileStore()
-        val provisioner = IngressProfileProvisioner(
-            store = store,
-            fetchIngressProfile = { _, _, _, _ -> successResult(serverAddress = "198.51.100.99") },
-        )
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> IngressProfileResult.Unauthorized })
         val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
-        viewModel.connect()
+        val attempts = listOf(asAttempt(candA), asAttempt(candB))
+
+        viewModel.attemptRelayedAttempt(candA, attempts, setOf(candA.historyPathId))
         testDispatcher.scheduler.runCurrent()
         assertNotNull(viewModel.relayActivationNeeded.value)
 
-        viewModel.activateIngress(xrayActivationRequest(), "real-credential")
+        viewModel.activateIngress("bad-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(IngressActivationOutcome.AuthorizationFailed, viewModel.ingressActivationState.value)
+        assertNull("fails closed: the prompt must be cleared, not left standing", viewModel.relayActivationNeeded.value)
+        assertNull(store.getProfileOrNull(ingressIdA))
+        // A was never retried (no usable profile) - the original list/budget
+        // resumed straight to B exactly once.
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(ingressIdA, resolver.resolvedPlans[0].ingressEndpointId)
+        assertEquals(ingressIdB, resolver.resolvedPlans[1].ingressEndpointId)
+    }
+
+    @Test
+    fun `activateIngress with nothing pending is a safe no-op`() = runTest {
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val viewModel = newViewModel(relayIngressResolver = resolver)
+
+        viewModel.activateIngress("credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(IngressActivationOutcome.Unavailable, viewModel.ingressActivationState.value)
+        assertEquals(0, resolver.resolvedPlans.size)
+    }
+
+    // --- Mismatch is never persisted, and still resumes closed like any other non-Saved outcome ---
+
+    @Test
+    fun `a response naming a different server address is rejected as Mismatched, never persisted, and still resumes`() = runTest {
+        val candA = candidate()
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> successResult(serverAddress = "198.51.100.99") })
+        val viewModel = newViewModel(relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateIngress("real-credential")
         testDispatcher.scheduler.runCurrent()
 
         assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Mismatched)
-        assertNull("a mismatched response must never be persisted", store.getProfileOrNull(ingressId))
-        // Mismatched is not a Saved outcome, so no bounded retry connect()
-        // fires and the prompt is left standing for a new submission.
-        assertNotNull(viewModel.relayActivationNeeded.value)
-    }
-
-    // --- G: combinedAutoAttempts still resolves the real candidate the same way ---
-
-    @Test
-    fun `combinedAutoAttempts still contains the same relayed candidate regardless of activation wiring`() {
-        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
-        val viewModel = newViewModel(relayIngressResolver = resolver)
-        val attempts = viewModel.combinedAutoAttempts()
-        assertTrue(attempts.any { it is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt })
+        assertNull("a mismatched response must never be persisted", store.getProfileOrNull(ingressIdA))
+        assertNull(viewModel.relayActivationNeeded.value)
     }
 }

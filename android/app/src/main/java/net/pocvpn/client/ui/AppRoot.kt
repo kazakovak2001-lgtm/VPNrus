@@ -168,7 +168,7 @@ fun AppRoot(
                 relayActivationNeeded != null -> ActivationScreen(
                     credential = ingressCredential,
                     onCredentialChange = { ingressCredential = it },
-                    onActivateClick = { viewModel.activateIngress(relayActivationNeeded!!, ingressCredential) },
+                    onActivateClick = { viewModel.activateIngress(ingressCredential) },
                     errorText = ingressActivationState.toIngressActivationErrorText(),
                     isSubmitting = ingressActivating,
                     onCancel = { viewModel.dismissRelayActivationPrompt(); ingressCredential = "" },

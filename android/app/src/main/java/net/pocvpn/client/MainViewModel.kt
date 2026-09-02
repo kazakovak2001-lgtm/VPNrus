@@ -1814,28 +1814,75 @@ class MainViewModel(
     private val _ingressActivationState = MutableStateFlow<net.pocvpn.client.relay.IngressActivationOutcome?>(null)
     val ingressActivationState: StateFlow<net.pocvpn.client.relay.IngressActivationOutcome?> = _ingressActivationState.asStateFlow()
 
+    // B26 review fix (round 2, blocker) - the FULL pinned context a paused
+    // relayed attempt needs to be resumed EXACTLY where it left off: the
+    // same already-ranked [candidate] (never rebuilt/re-scored - a fresh
+    // [combinedAutoAttempts]/[buildCombinedAutoAttempts] call could rank
+    // differently against then-current evidence, silently substituting a
+    // different ingress/exit/transport/historyPathId - the exact defect
+    // this type exists to prevent) and the exact [attempts]/[attemptedKeys]
+    // [attemptCombined] was mid-sequence with when this candidate's
+    // resolution first came back NotProvisioned-but-fixable (attemptedKeys
+    // already includes this candidate's own key - see
+    // buildCombinedAutoAttempts' dispatch site - so resuming
+    // [attemptCombined] with this SAME pair can never re-select it).
+    // `private` - never exposed to the UI layer, which only ever sees the
+    // smaller, display-only [RelayActivationRequest] via
+    // [relayActivationNeeded] below.
+    private data class PendingRelayActivation(
+        val candidate: net.pocvpn.client.smartconnect.AutoGatewaySelector.RelayAttemptCandidate,
+        val attempts: List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt>,
+        val attemptedKeys: Set<String>,
+    )
+
+    // B26 review fix (round 2, blocker) - the ONE place a paused relayed
+    // attempt's full resume context lives. Non-null is what "the combined
+    // Auto sequence is paused, waiting on a human activation decision"
+    // MEANS - see attemptRelayedAttempt's own docs: while this is non-null,
+    // NOTHING else advances the combined sequence (no attemptCombined call
+    // happens until activation succeeds, fails, or is dismissed) - task
+    // requirement G's own "no second concurrent Auto progression".
+    private var pendingRelayActivation: PendingRelayActivation? = null
+
     // B26 review fix (blocker 1) - the real, product-UI-observable signal a
     // relayed Auto attempt just failed with a RelayFailureCategory an
     // explicit device activation can actually fix - see
     // RelayActivationRequest's own docs for exactly which categories and
-    // why. Set ONLY from attemptRelayedAttempt's NotProvisioned branch
-    // below; cleared either by a successful activateIngress() call or by
-    // the UI calling dismissRelayActivationPrompt() (the user backing out,
-    // mirroring activatingGatewayId's own cancel semantics).
+    // why. A pure DISPLAY projection of [pendingRelayActivation] above -
+    // set/cleared in lockstep with it, never independently. Set ONLY from
+    // attemptRelayedAttempt's NotProvisioned branch below; cleared by
+    // activateIngress() (success or failure) or dismissRelayActivationPrompt().
     private val _relayActivationNeeded = MutableStateFlow<net.pocvpn.client.relay.RelayActivationRequest?>(null)
     val relayActivationNeeded: StateFlow<net.pocvpn.client.relay.RelayActivationRequest?> = _relayActivationNeeded.asStateFlow()
 
     private val _ingressActivating = MutableStateFlow(false)
     val ingressActivating: StateFlow<Boolean> = _ingressActivating.asStateFlow()
 
-    /** B26 review fix (blocker 1) - lets the UI back out of the activation prompt without submitting anything (mirrors activatingGatewayId's own cancel path). */
+    /**
+     * B26 review fix (round 2, blocker) - the user backing out without
+     * submitting anything (mirrors activatingGatewayId's own cancel path).
+     * Task requirement F: never retries the paused candidate, and resumes
+     * the ORIGINAL combined sequence (same attempts/attemptedKeys captured
+     * when it paused) EXACTLY once - the candidate's key is already in
+     * attemptedKeys (see [PendingRelayActivation]'s own docs), so
+     * [attemptCombined] moves on to the next ranked candidate rather than
+     * re-offering this same ingress.
+     */
     fun dismissRelayActivationPrompt() {
+        val pending = pendingRelayActivation
+        pendingRelayActivation = null
         _relayActivationNeeded.value = null
+        if (pending != null) {
+            viewModelScope.launch { attemptCombined(pending.attempts, pending.attemptedKeys) }
+        }
     }
 
     /**
-     * B26 (task D) / review fix (blocker 1) - the real Android control-plane
-     * path for a selected ingress: activation credential + this device's
+     * B26 (task D) / review fix (round 2, blocker) - the real Android
+     * control-plane path for the CURRENTLY paused ingress
+     * ([pendingRelayActivation] - there is at most one at a time by
+     * construction, so this takes no candidate-identifying parameter of
+     * its own to go stale against): activation credential + this device's
      * existing public key (the SAME reused identity every other activation
      * in this class already uses - never a second credential/key system
      * for an ingress, mirroring [ingress_activation.py]'s own "no second
@@ -1844,52 +1891,63 @@ class MainViewModel(
      * (reuses a still-valid stored profile as-is, otherwise exactly ONE
      * network attempt - never a retry loop) -> a validated, endpoint-scoped
      * [net.pocvpn.client.relay.IngressClientProfile] persisted via
-     * [net.pocvpn.client.relay.FileIngressProfileStore]. [request]'s
-     * endpoint id/binding/transport are the CALLER's own already-pinned
-     * facts (read from [relayActivationNeeded], itself built straight off
-     * the failed [net.pocvpn.client.relay.RelayedExecutionPlan] - see
-     * [RelayActivationRequest.from]) - this function never invents or
-     * re-derives them, and [IngressProfileProvisioner.provision] itself
-     * additionally cross-checks the server's own response against them
-     * (task K's own "activation never changes the originally pinned
-     * ingress endpoint/binding").
+     * [net.pocvpn.client.relay.FileIngressProfileStore]. The pinned
+     * endpoint id/binding/transport come from [pendingRelayActivation]'s
+     * own already-ranked candidate - never re-derived - and
+     * [IngressProfileProvisioner.provision] itself additionally cross-
+     * checks the server's own response against them (task K's own
+     * "activation never changes the originally pinned ingress
+     * endpoint/binding").
      *
-     * On success: clears [relayActivationNeeded] and calls [connect] EXACTLY
-     * ONCE more - a bounded, real retry of the SAME connect flow the failed
-     * relayed attempt was part of (never the same low-level attempt object,
-     * always a fresh top-level connect() - the identical mechanism a user
-     * manually tapping the power button again already uses). This function
-     * is reached only via one explicit, human-submitted credential per
-     * failure - it never re-invokes itself, so this can never become an
-     * unbounded loop even if the fresh attempt fails again for a different
-     * reason (a NEW [relayActivationNeeded] would require a NEW submission).
+     * On success: retries THAT EXACT SAME [PendingRelayActivation.candidate]
+     * via [attemptRelayedAttempt] with `isActivationRetry = true` - never a
+     * fresh [combinedAutoAttempts]/[connect] call, which could re-rank and
+     * silently resolve to a different ingress/exit/transport/historyPathId
+     * (task requirement B/C's own "byte-for-byte identical" /  "no fresh
+     * ranking"). `isActivationRetry = true` is what makes this bounded to
+     * EXACTLY one retry (task requirement D): even if that retry ALSO comes
+     * back NotProvisioned-but-otherwise-fixable, attemptRelayedAttempt does
+     * not pause a second time - it resumes the combined sequence via
+     * [attemptCombined] instead (task requirement E).
      *
-     * Fails closed (reports
-     * [net.pocvpn.client.relay.IngressActivationOutcome.Unavailable]) when
-     * no [ingressProfileProvisioner] is wired (no real ingress deployment
-     * to activate against) or the device's public key has not loaded yet -
-     * never a fabricated success, never a retry.
+     * On any other (non-Saved) outcome - unauthorized/revoked/mismatched/
+     * unavailable/unsupported-transport - fails closed (task requirement H):
+     * the paused candidate is NEVER retried (no usable profile exists to
+     * retry it with), and the ORIGINAL combined sequence resumes exactly
+     * once via [attemptCombined], the same way [dismissRelayActivationPrompt]
+     * does.
      */
-    fun activateIngress(request: net.pocvpn.client.relay.RelayActivationRequest, activationCredential: String) {
+    fun activateIngress(activationCredential: String) {
         val trimmedCredential = activationCredential.trim()
         val provisioner = ingressProfileProvisioner
         val key = _publicKey.value
+        val pending = pendingRelayActivation
+        if (pending == null) {
+            _ingressActivationState.value = net.pocvpn.client.relay.IngressActivationOutcome.Unavailable
+            return
+        }
         if (provisioner == null || key == null || trimmedCredential.isEmpty()) {
             _ingressActivationState.value = net.pocvpn.client.relay.IngressActivationOutcome.Unavailable
+            pendingRelayActivation = null
+            _relayActivationNeeded.value = null
+            viewModelScope.launch { attemptCombined(pending.attempts, pending.attemptedKeys) }
             return
         }
         _ingressActivating.value = true
         viewModelScope.launch {
             val outcome = withContext(ioDispatcher) {
                 provisioner.ensureFreshProfile(
-                    request.ingressEndpointId, request.ingressBinding, request.ingressTransport, key, trimmedCredential,
+                    pending.candidate.ingressEndpointId, pending.candidate.ingressBinding, pending.candidate.ingressTransport, key, trimmedCredential,
                 )
             }
             _ingressActivating.value = false
             _ingressActivationState.value = outcome
+            pendingRelayActivation = null
+            _relayActivationNeeded.value = null
             if (outcome is net.pocvpn.client.relay.IngressActivationOutcome.Saved) {
-                _relayActivationNeeded.value = null
-                connect()
+                attemptRelayedAttempt(pending.candidate, pending.attempts, pending.attemptedKeys, isActivationRetry = true)
+            } else {
+                attemptCombined(pending.attempts, pending.attemptedKeys)
             }
         }
     }
@@ -2329,10 +2387,30 @@ class MainViewModel(
      * requirement 8 - Protected/health must come from the real runtime
      * state authority, never inferred here).
      */
-    private suspend fun attemptRelayedAttempt(
+    // `internal` (not `private`), same "tests can inspect this directly
+    // without needing a real Android Context to drive the full
+    // combinedAutoAttempts()/connect() ranking pipeline" reasoning
+    // buildTransportRegistry's own docs already state - a genuinely
+    // eligible XRAY_REALITY/TLS_TCP relayed candidate cannot be produced
+    // through that pipeline in this test harness (isXrayAvailableFor is
+    // hardcoded to the Germany/Stockholm production endpoints only), so
+    // pause/resume/retry tests construct a RelayAttemptCandidate directly
+    // and call this function with it.
+    internal suspend fun attemptRelayedAttempt(
         candidate: net.pocvpn.client.smartconnect.AutoGatewaySelector.RelayAttemptCandidate,
         attempts: List<net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt>,
         attemptedKeys: Set<String>,
+        // B26 review fix (round 2, blocker) - true ONLY for the one bounded
+        // re-invocation activateIngress() makes after a successful
+        // activation (see that function's own docs). Reusing THIS SAME
+        // function for the retry - never a parallel "retry" code path - is
+        // what guarantees the retry dials the byte-for-byte identical
+        // [candidate]/[plan] (task requirement B/C). When true, a
+        // NotProvisioned result NEVER pauses again, regardless of category -
+        // task requirement D's "at most one retry for that candidate": the
+        // combined sequence simply resumes via attemptCombined, exactly the
+        // same as any other terminal failure.
+        isActivationRetry: Boolean = false,
     ) {
         val plan = net.pocvpn.client.relay.RelayedExecutionPlan.from(candidate)
         when (val resolution = relayIngressResolver.resolve(plan)) {
@@ -2347,19 +2425,22 @@ class MainViewModel(
                 _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(
                     lastFailureReason = "${outcome.category}" + (outcome.detail?.let { ": $it" } ?: ""),
                 )
-                // B26 review fix (blocker 1) - surface a real, product-UI-
-                // observable activation prompt for exactly the categories a
-                // fresh activation can fix (see RelayActivationRequest's own
-                // docs) - every other category (e.g. EXECUTION_NOT_IMPLEMENTED)
-                // is left alone: no prompt, fails closed exactly as before.
-                // The combined bounded sequence below is COMPLETELY
-                // unaffected either way - this is a side-channel signal for
-                // the UI, never a change to attemptCombined's own budget/
-                // advancement logic.
-                if (resolution.category in net.pocvpn.client.relay.RelayActivationRequest.ACTIVATION_FIXABLE_CATEGORIES) {
+                // B26 review fix (round 2, blocker) - PAUSE the combined
+                // sequence (never call attemptCombined here) for exactly the
+                // categories a fresh activation can fix, and only on this
+                // candidate's FIRST encounter (never on the bounded
+                // activation-retry itself - see isActivationRetry's own
+                // docs, task requirement D). Pausing means storing the FULL
+                // resume context ([PendingRelayActivation]) so a later
+                // success/failure/dismiss resumes EXACTLY this state, never
+                // a freshly re-ranked one (task requirement G - nothing else
+                // advances the combined sequence while this is set).
+                if (!isActivationRetry && resolution.category in net.pocvpn.client.relay.RelayActivationRequest.ACTIVATION_FIXABLE_CATEGORIES) {
+                    pendingRelayActivation = PendingRelayActivation(candidate, attempts, attemptedKeys)
                     _relayActivationNeeded.value = net.pocvpn.client.relay.RelayActivationRequest.from(plan)
+                } else {
+                    attemptCombined(attempts, attemptedKeys)
                 }
-                attemptCombined(attempts, attemptedKeys)
             }
             is net.pocvpn.client.relay.RelayIngressResolution.Resolved -> {
                 val registry = TransportRegistry.build(

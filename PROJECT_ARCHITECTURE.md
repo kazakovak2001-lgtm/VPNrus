@@ -876,27 +876,44 @@ exact remaining physical-deployment sequence (human-approval-gated).
 - **Deployment descriptor**: `docs/ingress_deployment_descriptor.example.json`
   - secret-free, explicitly NOT folded into the signed production manifest
   by this slice (see `docs/B26_INGRESS_DEPLOYMENT_DESCRIPTOR.md`).
-- **Review fix (PR #40) - real product activation entry point**: an
-  earlier version of this slice wired `activateIngress` as a callable
+- **Review fix (PR #40, round 1) - real product activation entry point**:
+  an earlier version of this slice wired `activateIngress` as a callable
   function with no product UI ever invoking it - fixed before merge.
-  `attemptRelayedAttempt`'s `NotProvisioned` branch now surfaces a real,
-  bounded, UI-observable `MainViewModel.relayActivationNeeded`
-  (`net.pocvpn.client.relay.RelayActivationRequest`) for exactly the
-  `RelayFailureCategory` values an activation can fix
+  `AppRoot` reuses the EXISTING `ActivationScreen` composable verbatim
+  (the same single "activation credential" text field every other
+  endpoint's activation already uses - never a UUID/REALITY-key/probe-
+  token paste field; `IngressClientProfile`'s fields are never exposed to
+  any UI layer).
+- **Review fix (PR #40, round 2) - pause/resume, not "call connect()
+  again"**: round 1's own "on success, call `connect()` again" retry design
+  was itself a blocker - a fresh `connect()` rebuilds/re-ranks a brand new
+  combined candidate list, so the post-activation retry could silently
+  resolve to a DIFFERENT ingress/exit/transport/historyPathId than the one
+  that actually failed, violating the B23/B24/B25 attempt-pinning
+  invariant. Replaced with a real PAUSE/RESUME design:
+  `attemptRelayedAttempt`'s `NotProvisioned` branch, on its candidate's
+  FIRST encounter with an activation-fixable `RelayFailureCategory`
   (`PROFILE_NOT_PROVISIONED`/`PROFILE_EXPIRED`/`PROFILE_MISMATCH` - see
-  that type's own `ACTIVATION_FIXABLE_CATEGORIES`) - every other category
-  still fails closed with no prompt. `AppRoot` reuses the EXISTING
-  `ActivationScreen` composable verbatim (the same single "activation
-  credential" text field every other endpoint's activation already uses -
-  never a UUID/REALITY-key/probe-token paste field; `IngressClientProfile`'s
-  fields are never exposed to any UI layer). On success,
-  `MainViewModel.activateIngress` runs the real
-  `IngressProfileProvisioner.ensureFreshProfile` (bounded: reuse a
-  still-valid profile, otherwise exactly one network attempt), persists the
-  validated profile, clears the prompt, and retries `connect()` EXACTLY
-  once - bounded by construction (this function is reached only via one
-  explicit human credential submission per failure; it never re-invokes
-  itself).
+  `RelayActivationRequest.ACTIVATION_FIXABLE_CATEGORIES`), PAUSES the
+  combined Auto sequence entirely - it stores the FULL resume context
+  (`MainViewModel.PendingRelayActivation`: the exact already-ranked
+  `RelayAttemptCandidate` plus the `attempts`/`attemptedKeys` `attemptCombined`
+  was mid-sequence with) and does NOT call `attemptCombined` - so nothing
+  else (Direct or Relayed) starts while a human decision is pending. A
+  bounded, UI-observable `MainViewModel.relayActivationNeeded` (a display-
+  only projection) surfaces the prompt. On a successful
+  `activateIngress()`, the BYTE-FOR-BYTE IDENTICAL paused candidate is
+  retried via the SAME `attemptRelayedAttempt` function
+  (`isActivationRetry = true`) - never a fresh ranking - which is what
+  guarantees the retry's plan/binding/transport/historyPathId are
+  unchanged; `isActivationRetry = true` also means this retry can never
+  pause a second time (bounded to exactly one retry per activation), so
+  its own failure just resumes `attemptCombined` with the ORIGINAL
+  `attempts`/`attemptedKeys`. Any non-Saved activation outcome
+  (unauthorized/revoked/mismatched/unavailable/unsupported-transport) and
+  an explicit `dismissRelayActivationPrompt()` both take the SAME resume
+  path - the paused candidate is NEVER retried without a real profile, and
+  the original combined list/budget resumes exactly once, never re-ranked.
 - **Review fix (PR #40) - real composition-root test**: an earlier version
   built the relay/ingress dependency graph inline inside
   `MainViewModel.Factory.create`, which ALSO eagerly constructs unrelated
