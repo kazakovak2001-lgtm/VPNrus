@@ -1,5 +1,6 @@
 package net.pocvpn.client.transport
 
+import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
@@ -54,6 +55,14 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
             // ClientTunnelIdentityStore once this Resolution exists (see
             // VpnController.resolveGatewayConfiguration's own docs).
             val gatewayConfigSnapshot: GatewayConfigSnapshot? = null,
+            // B22 - non-null exactly when this resolution is a PRIVATE
+            // gateway attempt (see MainViewModel.connectPrivate) - the
+            // client keypair to use for THIS attempt instead of
+            // VpnController's own default (managed-network) ClientKeyRepository.
+            // null (the default) for every AUTO/MANUAL_MANAGED resolution,
+            // byte-for-byte unaffected - see VpnController.buildTransportConfig's
+            // own docs for exactly where this is consulted.
+            val privateKeyRepository: ClientKeyRepository? = null,
         ) : Resolution()
         data class NotSelectable(val decision: TransportSelectionDecision) : Resolution()
     }

@@ -70,6 +70,34 @@ class AwgConfigMapperTest {
         assertFalse(ifaceString.contains("DisableCookies = on"))
     }
 
+    // B22 physical-validation follow-up - proves the two junk-size fields the
+    // earlier test above did NOT cover (S3/S4, cookie-reply/transport) reach
+    // the real backend too - the same real Stockholm-profile values that
+    // physically fixed the private-gateway handshake blocker.
+    @Test
+    fun `maps the full junk-packet profile including S3-S4 onto the interface`() {
+        val profile = AwgProfile(
+            junkPacketCount = 6,
+            junkPacketMinSize = 40,
+            junkPacketMaxSize = 100,
+            initPacketJunkSize = 113,
+            responsePacketJunkSize = 159,
+            cookieReplyPacketJunkSize = 21,
+            transportPacketJunkSize = 37,
+            initPacketMagicHeader = "1106684696",
+            responsePacketMagicHeader = "3677857287",
+            underloadPacketMagicHeader = "353316806",
+            transportPacketMagicHeader = "2068198996",
+        )
+
+        val ifaceString = AwgConfigMapper.toBackendConfig(sampleConfig(profile)).getInterface().toAwgQuickString()
+
+        assertTrue(ifaceString.contains("S1 = 113"))
+        assertTrue(ifaceString.contains("S2 = 159"))
+        assertTrue(ifaceString.contains("S3 = 21"))
+        assertTrue(ifaceString.contains("S4 = 37"))
+    }
+
     @Test
     fun `does not throw for the plain no-obfuscation profile`() {
         // Diagnostic baseline: mapper must not require any AWG-specific field to build a valid config.

@@ -81,6 +81,7 @@ fun AppRoot(
     // mode (nothing attempted yet this session) it shows "Auto / Smart
     // Connect" instead of a location this device has not actually chosen.
     val gatewayAutoMode by viewModel.gatewayAutoMode.collectAsStateWithLifecycle()
+    val gatewaySelectionMode by viewModel.gatewaySelectionMode.collectAsStateWithLifecycle()
     val activeGatewayId by viewModel.activeGatewayId.collectAsStateWithLifecycle()
     val showAutoPlaceholder = gatewayAutoMode && !transportState.isConnectedOrConnecting()
     val displayGateway = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(if (gatewayAutoMode) activeGatewayId else selectedGatewayId)
@@ -88,6 +89,9 @@ fun AppRoot(
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showGatewayPicker by remember { mutableStateOf(false) }
+    var showPrivateGatewayDialog by remember { mutableStateOf(false) }
+    var privateGatewayValidationError by remember { mutableStateOf<net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason?>(null) }
+    var privateGatewayPublicKey by remember { mutableStateOf<String?>(null) }
     // B15 - non-null while the user is activating an ADDITIONAL gateway
     // (requested from GatewayPickerDialog's "Activate" action) on a device
     // that already has at least one provisioned gateway - see
@@ -245,6 +249,104 @@ fun AppRoot(
                 showGatewayPicker = false
             },
             onDismiss = { showGatewayPicker = false },
+            // B22 - Private Gateway Mode's own row (architecture constraint
+            // 2: a THIRD, disjoint selection, never overloading current/autoMode).
+            privateMode = gatewaySelectionMode == net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE,
+            privateConfigured = viewModel.privateGatewayConfig != null,
+            onSelectPrivate = {
+                if (!transportState.blocksGatewaySelection()) {
+                    viewModel.selectGatewaySelectionMode(net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE)
+                    showGatewayPicker = false
+                }
+            },
+            onConfigurePrivate = {
+                showGatewayPicker = false
+                showPrivateGatewayDialog = true
+            },
+        )
+    }
+
+    if (showPrivateGatewayDialog) {
+        val privateGatewayClipboard = LocalClipboardManager.current
+        LaunchedEffect(showPrivateGatewayDialog) {
+            privateGatewayPublicKey = viewModel.privateGatewayClientPublicKey()
+        }
+        net.pocvpn.client.ui.screens.PrivateGatewayDialog(
+            existing = viewModel.privateGatewayConfig,
+            clientPublicKey = privateGatewayPublicKey,
+            onCopyPublicKey = {
+                privateGatewayPublicKey?.let {
+                    privateGatewayClipboard.setText(androidx.compose.ui.text.AnnotatedString(it))
+                }
+            },
+            onSave = { host, port, serverKey, clientIp, gatewayIp, h1, h2, h3, h4, jc, jmin, jmax, s1, s2, s3, s4 ->
+                val portInt = port.toIntOrNull()
+                // B22 physical-validation follow-up - every junk field is
+                // OPTIONAL (blank -> null, exactly like a never-typed field),
+                // but a NON-blank value that fails to parse as an integer is
+                // a real input mistake and must fail closed, never silently
+                // become null as if the operator had left it blank - a
+                // sentinel that is never a legal parsed value marks that case.
+                val unparseableSentinel = Int.MIN_VALUE
+                fun parseJunkField(raw: String): Int? {
+                    val trimmed = raw.trim()
+                    if (trimmed.isEmpty()) return null
+                    return trimmed.toIntOrNull() ?: unparseableSentinel
+                }
+                val parsedJunk = listOf(jc, jmin, jmax, s1, s2, s3, s4).map(::parseJunkField)
+                if (portInt == null) {
+                    privateGatewayValidationError = net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason.INVALID_PORT
+                } else if (parsedJunk.any { it == unparseableSentinel }) {
+                    privateGatewayValidationError = net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason.INVALID_JUNK_PACKET_PARAMETERS
+                } else {
+                    val jcInt = parsedJunk[0]
+                    val jminInt = parsedJunk[1]
+                    val jmaxInt = parsedJunk[2]
+                    val s1Int = parsedJunk[3]
+                    val s2Int = parsedJunk[4]
+                    val s3Int = parsedJunk[5]
+                    val s4Int = parsedJunk[6]
+                    val result = viewModel.savePrivateGatewayConfig(
+                        host = host,
+                        port = portInt,
+                        serverPublicKeyBase64 = serverKey,
+                        clientTunnelIp = clientIp,
+                        gatewayTunnelIp = gatewayIp,
+                        awgProfile = net.pocvpn.client.vpn.config.AwgProfile(
+                            initPacketMagicHeader = h1,
+                            responsePacketMagicHeader = h2,
+                            underloadPacketMagicHeader = h3,
+                            transportPacketMagicHeader = h4,
+                            junkPacketCount = jcInt,
+                            junkPacketMinSize = jminInt,
+                            junkPacketMaxSize = jmaxInt,
+                            initPacketJunkSize = s1Int,
+                            responsePacketJunkSize = s2Int,
+                            cookieReplyPacketJunkSize = s3Int,
+                            transportPacketJunkSize = s4Int,
+                        ),
+                    )
+                    when (result) {
+                        is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Valid -> {
+                            privateGatewayValidationError = null
+                            showPrivateGatewayDialog = false
+                        }
+                        is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Invalid -> {
+                            privateGatewayValidationError = result.reason
+                        }
+                    }
+                }
+            },
+            validationError = privateGatewayValidationError,
+            onRemove = {
+                viewModel.removePrivateGatewayConfig()
+                privateGatewayValidationError = null
+                showPrivateGatewayDialog = false
+            },
+            onDismiss = {
+                privateGatewayValidationError = null
+                showPrivateGatewayDialog = false
+            },
         )
     }
 

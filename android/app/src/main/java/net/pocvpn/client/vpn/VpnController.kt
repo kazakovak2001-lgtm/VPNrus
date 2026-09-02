@@ -308,6 +308,15 @@ class VpnController(
     // discipline as [pendingConnectKind]/[pendingConnectEndpointId].
     private var pendingConnectConfig: net.pocvpn.client.vpn.config.GatewayConfigSnapshot? = null
 
+    // B22 - the private-gateway keypair repository for the CURRENT/most
+    // recent connect() attempt, when resolved carried one (see
+    // TransportOrchestrator.Resolution.Resolved.privateKeyRepository's own
+    // docs). null for every AUTO/MANUAL_MANAGED attempt - buildTransportConfig
+    // falls back to the constructor-owned [clientKeyRepository] exactly as
+    // before this field existed. Same lifecycle/locking discipline as
+    // [pendingConnectConfig] - reset alongside it on every path that clears it.
+    private var pendingConnectPrivateKeyRepository: net.pocvpn.client.identity.ClientKeyRepository? = null
+
     // B8I5 - the ONE active transport instance every lifecycle operation
     // (state observation, connect, disconnect, permission resume, stats
     // polling, handshake detection, shutdown) actually targets - never the
@@ -477,6 +486,7 @@ class VpnController(
             // requested - never re-derived later in this same attempt (see
             // [resolveGatewayConfiguration]'s own docs). null for manual mode.
             pendingConnectConfig = resolved.gatewayConfigSnapshot
+            pendingConnectPrivateKeyRepository = resolved.privateKeyRepository
             userInitiatedDisconnect = false
             cancelReconnectLocked()
 
@@ -508,6 +518,7 @@ class VpnController(
             // candidate config must not linger and be reported by
             // gatewayStatus() for a request nothing is acting on any more.
             pendingConnectConfig = null
+            pendingConnectPrivateKeyRepository = null
             return
         }
         connectMutex.withLock { doConnectAttempt(pendingConnectKind) }
@@ -536,6 +547,7 @@ class VpnController(
             // the NEXT connect() always sets this fresh (possibly null,
             // for manual mode) before it is ever read again.
             pendingConnectConfig = null
+            pendingConnectPrivateKeyRepository = null
         }
     }
 
@@ -735,7 +747,13 @@ class VpnController(
     ): TransportConfig =
         when (kind) {
             TransportKind.AMNEZIA_WG -> {
-                val privateKey = clientKeyRepository.getPrivateKeyForTunnel()
+                // B22 - a PRIVATE gateway attempt supplies its own
+                // ClientKeyRepository (a genuinely distinct keypair, never
+                // the managed-network identity - see
+                // PrivateGatewayKeyRepositoryFactory's own docs); every
+                // AUTO/MANUAL_MANAGED attempt has this null and is
+                // byte-for-byte unaffected.
+                val privateKey = (pendingConnectPrivateKeyRepository ?: clientKeyRepository).getPrivateKeyForTunnel()
                 val awgConfig = AwgConfig(
                     privateKeyBase64 = privateKey,
                     localAddresses = listOf("${config.clientTunnelIp}/32"),

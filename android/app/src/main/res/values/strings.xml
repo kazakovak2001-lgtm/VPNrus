@@ -36,6 +36,39 @@
     <string name="location_auto_country">Auto</string>
     <string name="location_auto_city">Smart Connect</string>
 
+    <!-- B22 - Private Gateway Mode -->
+    <string name="gateway_picker_private_title">Private Gateway</string>
+    <string name="gateway_picker_private_subtitle_configured">Your own server</string>
+    <string name="gateway_picker_private_subtitle_unconfigured">Not configured yet</string>
+    <string name="gateway_picker_private_configure">Configure</string>
+    <string name="private_gateway_title">Private Gateway</string>
+    <string name="private_gateway_helper">Connect through your own AmneziaWG server (gateway/provision.sh). Your device\'s private key never leaves this device.</string>
+    <string name="private_gateway_field_host">Server host or IP</string>
+    <string name="private_gateway_field_port">Server port</string>
+    <string name="private_gateway_field_server_key">Server public key</string>
+    <string name="private_gateway_field_client_ip">Your tunnel address (assigned by the server)</string>
+    <string name="private_gateway_field_gateway_ip">Server tunnel address</string>
+    <string name="private_gateway_obfuscation_title">Obfuscation (must match the server)</string>
+    <string name="private_gateway_field_h1">Init packet magic header</string>
+    <string name="private_gateway_field_h2">Response packet magic header</string>
+    <string name="private_gateway_field_h3">Underload packet magic header</string>
+    <string name="private_gateway_field_h4">Transport packet magic header</string>
+    <string name="private_gateway_junk_title">Junk packets (optional - leave blank unless your server needs them)</string>
+    <string name="private_gateway_field_jc">Junk packet count (Jc)</string>
+    <string name="private_gateway_field_jmin">Junk packet min size (Jmin)</string>
+    <string name="private_gateway_field_jmax">Junk packet max size (Jmax)</string>
+    <string name="private_gateway_field_s1">Init packet junk size (S1)</string>
+    <string name="private_gateway_field_s2">Response packet junk size (S2)</string>
+    <string name="private_gateway_field_s3">Cookie reply packet junk size (S3)</string>
+    <string name="private_gateway_field_s4">Transport packet junk size (S4)</string>
+    <string name="private_gateway_invalid_prefix">Invalid: %1$s</string>
+    <string name="private_gateway_public_key_title">Your device\'s public key</string>
+    <string name="private_gateway_public_key_unavailable">Unavailable</string>
+    <string name="private_gateway_copy_public_key">Copy public key</string>
+    <string name="private_gateway_close">Close</string>
+    <string name="private_gateway_remove">Remove</string>
+    <string name="private_gateway_save">Save</string>
+
     <!-- Settings / split tunneling -->
     <string name="settings_title">Settings</string>
     <string name="settings_back_content_description">Back</string>
