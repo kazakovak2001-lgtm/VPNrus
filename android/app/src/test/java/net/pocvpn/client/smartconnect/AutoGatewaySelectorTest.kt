@@ -548,7 +548,8 @@ class AutoGatewaySelectorTest {
         assertEquals(1, candidates.size)
         assertEquals(ingressEndpoint.id, candidates.first().ingressEndpointId)
         assertEquals(exitEndpoint.id, candidates.first().exitEndpointId)
-        assertEquals(TransportKind.TLS_TCP, candidates.first().transport)
+        assertEquals(TransportKind.TLS_TCP, candidates.first().ingressTransport)
+        assertEquals(TransportKind.AMNEZIA_WG, candidates.first().exitTransport)
     }
 
     @Test
@@ -633,5 +634,59 @@ class AutoGatewaySelectorTest {
     @Test
     fun `no ingress endpoints in the manifest yields no relay candidates - fail closed, never a fabricated one`() {
         assertTrue(buildRelayedDefault(manifestEndpoints = listOf(exitEndpoint)).isEmpty())
+    }
+
+    // --- B23 (PR #37 review fix): ingress and exit transports are pinned independently ---
+
+    @Test
+    fun `an ingress with two transports and an exit with two transports scores every pair independently, never assuming a shared transport`() {
+        val ingressTwoTransports = ingressEndpoint.copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.50", 443),
+                EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 8443),
+            ),
+        )
+        val exitTwoTransports = exitEndpoint.copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.TLS_TCP, ProductionGatewayCatalog.GERMANY.awg.endpointHost, 443),
+            ),
+        )
+        val relayed = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(ingressTwoTransports, exitTwoTransports),
+            registryFor = { TransportRegistry.build(listOf(TransportKind.TLS_TCP, TransportKind.XRAY_REALITY).map { kind -> TransportDescriptor(kind = kind, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { throw UnsupportedOperationException() }) }) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+        )
+        // 2 ingress transports x 2 exit transports = 4 independently-scored pairs.
+        assertEquals(4, relayed.size)
+        val pairs = relayed.map { it.ingressTransport to it.exitTransport }.toSet()
+        assertEquals(4, pairs.size)
+        assertTrue((TransportKind.TLS_TCP to TransportKind.AMNEZIA_WG) in pairs)
+        assertTrue((TransportKind.XRAY_REALITY to TransportKind.TLS_TCP) in pairs)
+    }
+
+    @Test
+    fun `a MANUAL preference pins only the client-facing ingress transport, never the exit-upstream transport`() {
+        val exitTwoTransports = exitEndpoint.copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.TLS_TCP, ProductionGatewayCatalog.GERMANY.awg.endpointHost, 443),
+            ),
+        )
+        val relayed = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(ingressEndpoint, exitTwoTransports),
+            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            reachabilityFor = { id, kind -> relayReachable(id, kind) },
+            transportHealthFor = { healthy() },
+            historyFor = { _, _ -> null },
+            preference = UserTransportPreference.Manual(TransportKind.TLS_TCP),
+        )
+        // The single ingress transport (TLS_TCP) matches the pin, so both of
+        // the exit's own transports remain viable - the pin never touches exitTransport.
+        assertEquals(2, relayed.size)
+        assertTrue(relayed.all { it.ingressTransport == TransportKind.TLS_TCP })
+        assertEquals(setOf(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP), relayed.map { it.exitTransport }.toSet())
     }
 }

@@ -304,8 +304,11 @@ object AutoGatewaySelector {
     }
 
     /**
-     * B23 - one ranked, real candidate to attempt a RELAYED path (client ->
-     * [ingressEndpointId] -> [exitEndpointId]) through, over [transport].
+     * B23 - one ranked, real candidate to attempt a RELAYED path: client ->
+     * [ingressEndpointId] over [ingressTransport] -> [exitEndpointId] over
+     * [exitTransport]. [ingressTransport]/[exitTransport] are pinned
+     * INDEPENDENTLY (PR #37 review fix) - never assumed equal, exactly
+     * mirroring [PathCandidate.Relayed]'s own transport/exitTransport split.
      * Deliberately has NO [ProductionGatewayId]/[GatewayConfigSnapshot] -
      * unlike [GatewayAttemptCandidate], which is pinned against this
      * codebase's real, provisioned AWG gateway catalog, a relayed candidate
@@ -317,7 +320,8 @@ object AutoGatewaySelector {
     data class RelayAttemptCandidate(
         val ingressEndpointId: EndpointId,
         val exitEndpointId: EndpointId,
-        val transport: TransportKind,
+        val ingressTransport: TransportKind,
+        val exitTransport: TransportKind,
         val ingressRegion: String,
         val exitRegion: String,
         val score: Long,
@@ -325,12 +329,18 @@ object AutoGatewaySelector {
     )
 
     /**
-     * B23 - the real relayed-path counterpart of [buildCandidates], promoting
-     * [PathCandidateBuilder.buildRelayed]/[PathScorer] (the SAME reachability/
-     * scoring pipeline every Direct candidate already goes through - never a
-     * parallel engine) into a genuine, callable decision surface on THIS
-     * object - the one [buildCandidates] itself already documents as "the
-     * real Auto decision path".
+     * B23 - an executable candidate model / scoring foundation for relayed
+     * paths, promoting [PathCandidateBuilder.buildRelayed]/[PathScorer] (the
+     * SAME reachability/scoring pipeline every Direct candidate already goes
+     * through - never a parallel engine) into a real, callable function on
+     * THIS object. **Not yet consumed by the live connect path**: neither
+     * `MainViewModel.connectAuto()`/`attemptAutoCandidate()` nor
+     * `VpnController` call this function today - see
+     * PROJECT_ARCHITECTURE.md's "Restricted-Network / Whitelist Bridge
+     * Runtime Foundation (B23)" section for why (no real RU ingress is
+     * deployed, so wiring execution now would be dead code no physical test
+     * could exercise) and for what final promotion into the real Auto
+     * selection/execution decision requires.
      *
      * Discovery is manifest-only (task requirement 9.D's own fail-closed
      * discipline, same as [buildCandidates]): an INGRESS endpoint not also
@@ -347,17 +357,16 @@ object AutoGatewaySelector {
      * [PathScorer]'s reachability tier already ranks UNKNOWN strictly below
      * REACHABLE, so a healthy proven Direct/relay candidate elsewhere in the
      * same ranked set is never displaced by an unproven one just because it
-     * is relayed - task requirement E's own "must not beat a healthy Direct
-     * candidate simply because it is relayed").
+     * is relayed).
      *
-     * Execution of a winning [RelayAttemptCandidate] (actually dialing
-     * client->ingress->exit) is intentionally NOT wired into
-     * MainViewModel/VpnController by this slice - see PROJECT_ARCHITECTURE.md's
-     * "Restricted-Network / Whitelist Bridge Runtime Foundation (B23)"
-     * section for why: with no real ingress deployed, wiring an execution
-     * path here would be dead code no physical test could exercise (task's
-     * own "do not simulate a successful relay" / "keep the final data-plane
-     * portion FOUNDATION").
+     * Every (ingress transport, exit transport) PAIR the manifest actually
+     * supports is scored independently (PR #37 review fix - never assumes
+     * the ingress and exit share one transport): [ingressTransport] is
+     * filtered by [preference] the SAME way a manually pinned transport
+     * already filters Direct candidates (it is what the CLIENT dials), while
+     * every [exitTransport] the exit endpoint declares is tried regardless -
+     * the client never dials the exit directly, so a user's transport
+     * preference has no meaning for that hop.
      */
     fun buildRelayedCandidates(
         manifestEndpoints: List<EndpointDescriptor>,
@@ -378,31 +387,40 @@ object AutoGatewaySelector {
             val registry = registryFor(ingress.id)
             ingress.transports
                 .filter { pinnedKind == null || it.kind == pinnedKind }
-                .forEach { binding ->
-                    val kind = binding.kind
-                    val candidate = PathCandidateBuilder.buildRelayed(
-                        ingress = ingress,
-                        exit = exit,
-                        transport = kind,
-                        ingressReachability = reachabilityFor(ingress.id, kind),
-                        exitReachability = reachabilityFor(exit.id, kind),
-                    ) ?: return@forEach
-                    val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
-                    val result = PathScorer.score(
-                        candidate = candidate,
-                        registry = registry,
-                        capabilities = capabilities,
-                        transportHealth = transportHealthFor(kind),
-                        history = historyFor(candidate.historyPathId, kind),
-                        // B23 - no per-candidate diversity reference exists here either,
-                        // same deliberate omission [MainViewModel.reachabilityDiagnostics]
-                        // already documents for the identical reason (PathScorer's own
-                        // parameter stays real/tested - see PathScorerTest - only this
-                        // call site has nothing meaningful to diff against yet).
-                        diverseProviderOrAsnSeenElsewhere = false,
-                        nowEpochMillis = nowEpochMillis,
-                    )
-                    if (result.eligible) scored += result to candidate
+                .forEach { ingressBinding ->
+                    val ingressKind = ingressBinding.kind
+                    exit.transports.forEach { exitBinding ->
+                        val exitKind = exitBinding.kind
+                        val candidate = PathCandidateBuilder.buildRelayed(
+                            ingress = ingress,
+                            exit = exit,
+                            ingressTransport = ingressKind,
+                            exitTransport = exitKind,
+                            ingressReachability = reachabilityFor(ingress.id, ingressKind),
+                            exitReachability = reachabilityFor(exit.id, exitKind),
+                        ) ?: return@forEach
+                        val capabilities = registry.descriptorFor(ingressKind)?.capabilities ?: TransportCapabilities.notImplemented()
+                        val result = PathScorer.score(
+                            candidate = candidate,
+                            registry = registry,
+                            capabilities = capabilities,
+                            // B23 - scored against the CLIENT-facing (ingress) transport's own
+                            // health/registry, same as candidate.transport's own docs: the
+                            // client never dials the exit directly, so there is no local
+                            // TransportRegistry/TransportHealth entry for exitTransport to
+                            // score against.
+                            transportHealth = transportHealthFor(ingressKind),
+                            history = historyFor(candidate.historyPathId, ingressKind),
+                            // B23 - no per-candidate diversity reference exists here either,
+                            // same deliberate omission [MainViewModel.reachabilityDiagnostics]
+                            // already documents for the identical reason (PathScorer's own
+                            // parameter stays real/tested - see PathScorerTest - only this
+                            // call site has nothing meaningful to diff against yet).
+                            diverseProviderOrAsnSeenElsewhere = false,
+                            nowEpochMillis = nowEpochMillis,
+                        )
+                        if (result.eligible) scored += result to candidate
+                    }
                 }
         }
 
@@ -411,7 +429,8 @@ object AutoGatewaySelector {
             RelayAttemptCandidate(
                 ingressEndpointId = candidate.ingress.endpoint.id,
                 exitEndpointId = candidate.exit.endpoint.id,
-                transport = result.candidate.transport,
+                ingressTransport = candidate.transport,
+                exitTransport = candidate.exitTransport,
                 ingressRegion = candidate.ingress.endpoint.region,
                 exitRegion = candidate.exit.endpoint.region,
                 score = result.score,

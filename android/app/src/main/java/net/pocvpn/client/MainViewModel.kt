@@ -1068,12 +1068,17 @@ class MainViewModel(
         // has always been a sealed Direct/Relayed type - see the scoring
         // loop below for why that omission made an unsafe cast look safe
         // by coincidence, not by design). One relayed candidate per
-        // INGRESS endpoint, over its FIRST declared transport (deterministic;
-        // this slice does not yet score multiple transport choices for the
-        // ingress hop specifically) - PathCandidateBuilder.buildRelayed
-        // itself rejects anything the manifest doesn't actually support
-        // (wrong role, unsupported transport, relayTo mismatch), returning
-        // null rather than a fabricated candidate.
+        // INGRESS endpoint, over its FIRST declared transport for EACH hop
+        // (deterministic; this slice does not yet score multiple transport
+        // choices for either hop here - see AutoGatewaySelector.
+        // buildRelayedCandidates for the real cross-product scorer) -
+        // PathCandidateBuilder.buildRelayed itself rejects anything the
+        // manifest doesn't actually support (wrong role, unsupported
+        // transport, relayTo mismatch), returning null rather than a
+        // fabricated candidate. B23 (PR #37 review fix) - ingress and exit
+        // transports are independent inputs to buildRelayed (never assumed
+        // equal); this call site already computed them separately before
+        // that fix, it just wasn't able to express it.
         val relayedCandidates = manifest.endpoints.mapNotNull { ingress ->
             if (net.pocvpn.client.reachability.EndpointRole.INGRESS !in ingress.roles) return@mapNotNull null
             val exitId = ingress.relayTo ?: return@mapNotNull null
@@ -1081,7 +1086,7 @@ class MainViewModel(
             val ingressTransport = ingress.transports.firstOrNull()?.kind ?: return@mapNotNull null
             val exitTransport = exit.transports.firstOrNull()?.kind ?: return@mapNotNull null
             net.pocvpn.client.reachability.PathCandidateBuilder.buildRelayed(
-                ingress, exit, ingressTransport,
+                ingress, exit, ingressTransport, exitTransport,
                 reachabilityFor(ingress.id, ingressTransport),
                 reachabilityFor(exit.id, exitTransport),
             )

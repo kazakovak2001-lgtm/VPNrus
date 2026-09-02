@@ -209,12 +209,12 @@ class PathScorerTest {
             transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.3", 443)),
         )
         val bothHopsFailed = PathCandidateBuilder.buildRelayed(
-            ingressEndpoint, exitEndpoint, TransportKind.TLS_TCP,
+            ingressEndpoint, exitEndpoint, TransportKind.TLS_TCP, TransportKind.TLS_TCP,
             reachWithEvidence(ingressEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE, endpointSpecificReachable = false),
             reachWithEvidence(exitEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE, endpointSpecificReachable = false),
         )!!
         val oneHopFailed = PathCandidateBuilder.buildRelayed(
-            ingressEndpoint, exitEndpoint, TransportKind.TLS_TCP,
+            ingressEndpoint, exitEndpoint, TransportKind.TLS_TCP, TransportKind.TLS_TCP,
             reachWithEvidence(ingressEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE, endpointSpecificReachable = false),
             reachWithEvidence(exitEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE, endpointSpecificReachable = null),
         )!!
@@ -225,7 +225,7 @@ class PathScorerTest {
         val oneFailure = PathScorer.score(oneHopFailed, registry, capsAtOne, health, null, false)
         val zeroFailures = PathScorer.score(
             PathCandidateBuilder.buildRelayed(
-                ingressEndpoint, exitEndpoint, TransportKind.TLS_TCP,
+                ingressEndpoint, exitEndpoint, TransportKind.TLS_TCP, TransportKind.TLS_TCP,
                 reachWithEvidence(ingressEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE),
                 reachWithEvidence(exitEndpoint.id, TransportKind.TLS_TCP, ReachabilityState.REACHABLE),
             )!!,

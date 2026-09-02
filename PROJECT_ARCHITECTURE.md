@@ -421,10 +421,12 @@ reproduced - root/server access would be required).
 ## Restricted-Network / Whitelist Bridge Runtime Foundation (B23) - FOUNDATION
 
 Turns the B11 `PathCandidate.Relayed` (client -> INGRESS -> EXIT) model from
-observational-only into a real, evidence-scored, decision-integrated
-candidate shape - still **FOUNDATION**, not IMPLEMENTED: no real RU ingress
-is deployed, and client->ingress->exit data-plane forwarding does not exist.
-Real restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
+observational-only into a real, evidence-scored EXECUTABLE CANDIDATE MODEL -
+still **FOUNDATION**, not IMPLEMENTED, and deliberately **not described as
+decision-integrated**: no real RU ingress is deployed, client->ingress->exit
+data-plane forwarding does not exist, and nothing in the live connect path
+calls this model yet (see the explicit "not consumed" note below). Real
+restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
 
 - **`IngressKind` (`reachability/Endpoint.kt`)** - `DIRECT_IP`/`CDN_FRONTED`,
   stored through `EndpointTransportBinding.metadata`'s existing reserved-key
@@ -435,28 +437,51 @@ Real restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   ceremony (`ManifestVerifier.verify` re-canonicalizes the decoded manifest
   and checks the signature against THOSE bytes - any wire-schema change
   would have broken it). Never encodes a named third-party provider.
+- **Independent per-hop transports (PR #37 review fix)** - `PathCandidate
+  .Relayed` never assumes the client<->ingress hop and the ingress<->exit
+  hop share one `TransportKind`. `PathHop` now carries its own exact,
+  immutable `EndpointTransportBinding` (`binding`) - the SPECIFIC binding
+  each hop was pinned against, not merely re-derivable from the endpoint
+  after the fact. `Relayed.transport` is the client-facing (ingress)
+  transport; the new `Relayed.exitTransport` is the SEPARATE ingress<->exit
+  upstream transport - a real future topology may legitimately dial the
+  ingress over XRAY_REALITY while the ingress's own upstream to the exit
+  speaks TLS_TCP. `PathCandidateBuilder.buildRelayed` takes independent
+  `ingressTransport`/`exitTransport` parameters and now also requires the
+  EXIT endpoint to actually support `exitTransport` (a real tightening - the
+  pre-fix version never checked this at all).
 - **`PathCandidate.historyPathId`** - the key `PathHistoryStore` local
   connection memory is read/recorded under. `Direct` keeps the pre-B23 key
   (`endpoint.id.value`, byte-for-byte unchanged); `Relayed` gets its own
-  composite `"ingress->exit"` key, never conflated with either hop's own
-  Direct history and never shared between two relays through the same
-  ingress to different exits. `PathHistoryStore.get/record` widened from a
-  raw `EndpointId` parameter to this `pathId: String` (same on-disk format,
-  only the acceptable string-length bound grew to fit a composite id).
+  composite key encoding BOTH hop endpoint ids AND both hop transports
+  (`"ingressId:ingressTransport->exitId:exitTransport"`) - never conflated
+  with either hop's own Direct history, never shared between two relays
+  through the same ingress to different exits, and never collided across two
+  paths that share both endpoints but differ in either hop's transport.
+  `PathHistoryStore.get/record` widened from a raw `EndpointId` parameter to
+  this `pathId: String` (same on-disk format, only the acceptable
+  string-length bound grew to fit a composite id).
   `MainViewModel.reachabilityDiagnostics()`'s Relayed candidates now get real
   local history credit (previously deliberately `null` - "deferred, not
   invented" - see that call site's own prior note in git history).
-- **`AutoGatewaySelector.buildRelayedCandidates`** - the real relay
-  counterpart of `buildCandidates` (both now the documented "real Auto
-  decision path" object), reusing `PathCandidateBuilder.buildRelayed` /
-  `ReachabilityEngine` / `PathScorer` verbatim - never a parallel engine.
-  Discovery is manifest-only (an INGRESS endpoint absent a `relayTo`
-  EXIT/GATEWAY target in the SAME trusted manifest is never a candidate -
-  same fail-closed discipline as `buildCandidates`). Unlike `buildCandidates`,
-  it consults no `ProductionGatewayCatalog`/per-device AWG provisioning - an
-  ingress has no such catalog entry (no RU ingress exists), so eligibility
-  rests entirely on the manifest's own facts plus real reachability/health/
-  history evidence. UNKNOWN ingress evidence is never treated as reachable
+- **`AutoGatewaySelector.buildRelayedCandidates`** - an executable candidate
+  model / scoring foundation for relayed paths: a real, callable function on
+  the SAME object `buildCandidates` lives on, reusing
+  `PathCandidateBuilder.buildRelayed` / `ReachabilityEngine` / `PathScorer`
+  verbatim - never a parallel engine. Scores every (ingress transport, exit
+  transport) PAIR the manifest actually supports independently (PR #37
+  review fix): `ingressTransport` is filtered by a `UserTransportPreference
+  .Manual` pin the same way Direct candidates already are (it is what the
+  CLIENT dials); every `exitTransport` the exit endpoint declares is tried
+  regardless, since the client never dials the exit directly and a transport
+  preference has no meaning for that hop. Discovery is manifest-only (an
+  INGRESS endpoint absent a `relayTo` EXIT/GATEWAY target in the SAME
+  trusted manifest is never a candidate - same fail-closed discipline as
+  `buildCandidates`). Unlike `buildCandidates`, it consults no
+  `ProductionGatewayCatalog`/per-device AWG provisioning - an ingress has no
+  such catalog entry (no RU ingress exists), so eligibility rests entirely
+  on the manifest's own facts plus real reachability/health/history
+  evidence. UNKNOWN ingress evidence is never treated as reachable
   (`PathScorer`'s existing reachability tier already ranks it strictly below
   REACHABLE), so a healthy proven Direct candidate is never displaced by an
   unproven relay just because it is relayed; a hard-whitelist network's own
@@ -464,17 +489,21 @@ Real restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   reachable ingress stays eligible, so no separate "prefer relay under
   restriction" rule was invented - the SAME reachability-first tiering
   produces the right outcome from real evidence alone.
-- **NOT done this slice (execution wiring)** - `MainViewModel`/`VpnController`
-  do not call `buildRelayedCandidates` and cannot execute a `RelayAttemptCandidate`.
-  Wiring it into `connectAuto()`/the real attempt loop would be dead code no
-  physical test could exercise (no ingress to dial) - deferred to the slice
-  that deploys a real ingress, matching this codebase's own established
-  "carried through truthfully, not yet decision-driving, later promoted"
-  lifecycle already used for `RestrictionClassifier`/`TransportHealth`/
-  `ReachabilityEngine` itself. Preferred eventual topology: Android ->
-  encrypted transport to INGRESS -> ingress-controlled encrypted upstream to
-  EXIT -> Internet, through the SAME single Android VPN ownership path
-  (`VpnController`) - never a nested VpnService stack.
+- **NOT yet consumed by the live connect path** - `MainViewModel
+  .connectAuto()`/`attemptAutoCandidate()` and `VpnController` do not call
+  `buildRelayedCandidates` and cannot execute a `RelayAttemptCandidate`.
+  `buildRelayedCandidates` is callable and unit-tested in isolation only -
+  no real connection attempt reaches it today. Wiring it into the real
+  attempt loop now would be dead code no physical test could exercise (no
+  ingress to dial) - final promotion into the real Auto selection/execution
+  decision is deferred to the slice that deploys a real ingress runtime,
+  matching this codebase's own established "carried through truthfully, not
+  yet decision-driving, later promoted" lifecycle already used for
+  `RestrictionClassifier`/`TransportHealth`/`ReachabilityEngine` itself.
+  Preferred eventual topology: Android -> encrypted transport to INGRESS ->
+  ingress-controlled encrypted upstream to EXIT -> Internet, through the
+  SAME single Android VPN ownership path (`VpnController`) - never a nested
+  VpnService stack.
 - Existing Direct gateway behavior (`buildCandidates`, `GatewayAttemptCandidate`,
   `connectAuto()`/`attemptAutoCandidate()`) is unchanged - only the
   `historyFor` callback's parameter type widened (`EndpointId` -> `String`),
