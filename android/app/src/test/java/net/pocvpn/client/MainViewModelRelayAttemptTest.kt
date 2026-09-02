@@ -25,11 +25,17 @@ import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathHistoryStore
 import net.pocvpn.client.reachability.SignedManifest
 import net.pocvpn.client.reachability.TrustedKeyId
+import net.pocvpn.client.relay.IngressClientProfile
+import net.pocvpn.client.relay.NotConfiguredRelayEndToEndProbe
 import net.pocvpn.client.relay.NotProvisionedRelayIngressResolver
+import net.pocvpn.client.relay.RelayEndToEndProbe
 import net.pocvpn.client.relay.RelayFailureCategory
 import net.pocvpn.client.relay.RelayIngressResolution
 import net.pocvpn.client.relay.RelayIngressResolver
+import net.pocvpn.client.relay.RelayProbeResult
 import net.pocvpn.client.relay.RelayedExecutionPlan
+import net.pocvpn.client.relay.fakeIngressClientProfile
+import net.pocvpn.client.vpn.VpnSessionHealth
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
@@ -99,6 +105,15 @@ private class StubRelayIngressResolver(private val resolutionFor: (RelayedExecut
     override suspend fun resolve(plan: RelayedExecutionPlan): RelayIngressResolution {
         resolvedPlans += plan
         return resolutionFor(plan)
+    }
+}
+
+/** B25 - a probe stub that always returns the given result and records every (plan, profile) it was asked to probe. */
+private class StubRelayEndToEndProbe(private val resultFor: (RelayedExecutionPlan, IngressClientProfile) -> RelayProbeResult) : RelayEndToEndProbe {
+    val probedPlans = mutableListOf<RelayedExecutionPlan>()
+    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult {
+        probedPlans += plan
+        return resultFor(plan, profile)
     }
 }
 
@@ -217,6 +232,7 @@ class MainViewModelRelayAttemptTest {
     private fun newViewModel(
         transport: VpnTransport = FakeVpnTransport(),
         relayIngressResolver: RelayIngressResolver = NotProvisionedRelayIngressResolver,
+        relayEndToEndProbe: RelayEndToEndProbe = NotConfiguredRelayEndToEndProbe,
         pathHistoryStore: PathHistoryStore? = null,
         fingerprintKeyProvider: NetworkFingerprintKeyProvider? = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
     ) = MainViewModel(
@@ -233,6 +249,7 @@ class MainViewModelRelayAttemptTest {
         pathHistoryStore = pathHistoryStore,
         fingerprintKeyProvider = fingerprintKeyProvider,
         relayIngressResolver = relayIngressResolver,
+        relayEndToEndProbe = relayEndToEndProbe,
     )
 
     // --- Task requirement A/B (integration level) ---
@@ -280,7 +297,7 @@ class MainViewModelRelayAttemptTest {
         // doConnectAttempt() catch-block setState(Error), exactly like
         // every other real transport double in this codebase already does.
         val fakeTransport = AlwaysFailingIngressTransport()
-        val resolver = StubRelayIngressResolver { RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG) }
+        val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
         val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, pathHistoryStore = store)
 
         viewModel.connect()
@@ -307,7 +324,7 @@ class MainViewModelRelayAttemptTest {
     fun `a resolved ingress transport reaching a real Connected state is STILL never recorded as relay success under the composite historyPathId`() = runTest {
         val store = RecordingPathHistoryStore()
         val fakeTransport = HandshakeSucceedingIngressTransport()
-        val resolver = StubRelayIngressResolver { RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG) }
+        val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
         val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, pathHistoryStore = store)
 
         viewModel.connect()
@@ -374,5 +391,58 @@ class MainViewModelRelayAttemptTest {
         val plan = resolver.resolvedPlans.single()
         assertEquals(ingressId, plan.ingressEndpointId)
         assertEquals(ProductionGatewayCatalog.GERMANY.endpointId, plan.exitEndpointId)
+    }
+
+    // --- B25 task C/B/M#3 - a real end-to-end probe success is the ONLY way to reach RelayProtected ---
+
+    @Test
+    fun `a genuine end-to-end probe success promotes the relayed session to RelayProtected and records a real Success`() = runTest {
+        val store = RecordingPathHistoryStore()
+        val fakeTransport = HandshakeSucceedingIngressTransport()
+        val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
+        val probe = StubRelayEndToEndProbe { _, _ -> RelayProbeResult.Success }
+        val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, relayEndToEndProbe = probe, pathHistoryStore = store)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, probe.probedPlans.size)
+        assertEquals(VpnSessionHealth.RelayProtected, viewModel.sessionHealth.value)
+        val relayRecords = store.records.filter { it.pathId.contains("->") }
+        assertTrue("a genuine end-to-end probe success must record a real Success under the composite historyPathId", relayRecords.any { it.success })
+    }
+
+    @Test
+    fun `a failed end-to-end probe never shows RelayProtected, fails closed, and advances the combined attempt budget`() = runTest {
+        val store = RecordingPathHistoryStore()
+        val fakeTransport = HandshakeSucceedingIngressTransport()
+        val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
+        val probe = StubRelayEndToEndProbe { _, _ -> RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, "simulated") }
+        val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, relayEndToEndProbe = probe, pathHistoryStore = store)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(viewModel.sessionHealth.value !is VpnSessionHealth.RelayProtected)
+        val relayRecords = store.records.filter { it.pathId.contains("->") }
+        assertTrue(relayRecords.isNotEmpty())
+        assertFalse(relayRecords.any { it.success })
+        assertTrue(viewModel.autoGatewayDiagnostics.value?.lastFailureReason?.contains("UPSTREAM_EXIT_UNREACHABLE") == true)
+        // Only one relay candidate exists in this manifest - the combined
+        // budget genuinely advanced past it (exhausted), never stuck
+        // re-showing a stale Connected/Protected state for the failed attempt.
+        assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
+    }
+
+    @Test
+    fun `NotConfiguredRelayEndToEndProbe (the production default) never fabricates RelayProtected for a real ingress handshake`() = runTest {
+        val fakeTransport = HandshakeSucceedingIngressTransport()
+        val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
+        val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(viewModel.sessionHealth.value !is VpnSessionHealth.RelayProtected)
     }
 }

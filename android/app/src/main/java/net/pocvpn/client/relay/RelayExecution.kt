@@ -84,6 +84,15 @@ enum class RelayFailureCategory {
     RELAY_AUTH_FAILED,
     END_TO_END_DATA_PLANE_FAILED,
 
+    /** B25 (task E/F/K) - no [IngressProfileStore] entry exists at all for this ingress endpoint - the device has never been activated against it. */
+    PROFILE_NOT_PROVISIONED,
+
+    /** B25 (task E/F/K) - a profile exists for this ingress endpoint, but its pinned endpoint/binding/transport does not match the current [RelayedExecutionPlan] (see [IngressClientProfile.matches]) - never used anyway, fails closed rather than silently re-binding. */
+    PROFILE_MISMATCH,
+
+    /** B25 (task E/F/K) - a matching profile exists but its [IngressClientProfile.expiresAtEpochMillis] has passed. */
+    PROFILE_EXPIRED,
+
     /** B24 - this client build has no real [RelayIngressResolver] implementation wired (see that interface's own docs) - never a fabricated attempt outcome. */
     EXECUTION_NOT_IMPLEMENTED,
 }
@@ -151,7 +160,18 @@ sealed class RelayIngressResolution {
      * CALLER's job (`MainViewModel`) - this type carries no state of its
      * own and starts nothing by existing.
      */
-    data class Resolved(val transport: VpnTransport, val kind: TransportKind) : RelayIngressResolution()
+    data class Resolved(
+        val transport: VpnTransport,
+        val kind: TransportKind,
+        // B25 (task C) - the SAME already-loaded, already-validated
+        // IngressClientProfile [RelayIngressResolverImpl] matched against
+        // this plan - carried alongside the transport so a caller (armFailoverWatch)
+        // never has to re-resolve the profile store mid-attempt to find the
+        // real end-to-end proof coordinates ([IngressClientProfile.endToEndProbeUrl]/
+        // [IngressClientProfile.endToEndProbeToken]) - same attempt-pinning
+        // discipline every other resolved fact in this file already follows.
+        val profile: IngressClientProfile,
+    ) : RelayIngressResolution()
 
     /** No real ingress client profile/credential is available to prepare a dial with - a typed reason, never a fabricated attempt. */
     data class NotProvisioned(val category: RelayFailureCategory, val detail: String? = null) : RelayIngressResolution()
@@ -193,4 +213,118 @@ object NotProvisionedRelayIngressResolver : RelayIngressResolver {
         category = RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED,
         detail = "no RelayIngressResolver is provisioned for ingress ${plan.ingressEndpointId.value}",
     )
+}
+
+/**
+ * B25 (task C) - the result of the real end-to-end data-plane proof: the
+ * ONLY signal that may ever promote a relayed session's
+ * [RelayReadinessStage] past [RelayReadinessStage.INGRESS_HANDSHAKE_OK].
+ * [Success] means real traffic was confirmed to have traversed
+ * client -> ingress -> exit -> the probe target (never a process-running
+ * check, an open socket, or an ingress-only handshake - the task's own
+ * explicit "do NOT accept" list).
+ */
+sealed class RelayProbeResult {
+    object Success : RelayProbeResult()
+    data class Failure(val category: RelayFailureCategory, val detail: String? = null) : RelayProbeResult()
+}
+
+/**
+ * B25 (task C) - the real client/server contract proving the upstream and
+ * end-to-end relay stages: given the pinned [RelayedExecutionPlan] and the
+ * already-matched [IngressClientProfile] for it (never re-resolved from the
+ * store mid-attempt - same pinning discipline as everything else in this
+ * file), ask whatever real proof channel the control-plane issued whether
+ * client -> ingress -> exit -> Internet is genuinely functional RIGHT NOW,
+ * over the tunnel this attempt just brought up (never before the transport
+ * reports [net.pocvpn.client.vpn.TransportState.Connected] for the ingress
+ * hop - see [net.pocvpn.client.MainViewModel]'s `armFailoverWatch` for the
+ * one real call site).
+ */
+fun interface RelayEndToEndProbe {
+    suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult
+}
+
+/**
+ * B25 - the honest default: no real proof channel is wired, so every probe
+ * fails closed with [RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED] -
+ * never a fabricated success. A relayed session can only ever reach
+ * [RelayReadinessStage.END_TO_END_DATA_PLANE_OK]/Protected once a caller
+ * explicitly wires [HttpRelayEndToEndProbe] (or an equivalent real
+ * implementation) against a real ingress deployment - see that class's own
+ * docs.
+ */
+object NotConfiguredRelayEndToEndProbe : RelayEndToEndProbe {
+    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult =
+        RelayProbeResult.Failure(
+            category = RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED,
+            detail = "no RelayEndToEndProbe is configured for ingress ${plan.ingressEndpointId.value}",
+        )
+}
+
+/**
+ * B25 (task C) - the real implementation: performs a genuine HTTPS GET to
+ * [IngressClientProfile.endToEndProbeUrl] carrying
+ * [IngressClientProfile.endToEndProbeToken] as a bearer credential, over
+ * whatever socket/route the OS resolves at call time - since this is only
+ * ever invoked AFTER the ingress transport reports a real
+ * [net.pocvpn.client.vpn.TransportState.Connected] handshake (see
+ * [RelayEndToEndProbe]'s own docs), ordinary OS routing sends this request
+ * through the just-established tunnel interface exactly like any other app
+ * traffic would - never a bespoke socket-binding hack. [endToEndProbeUrl]
+ * is the control-plane's own authenticated internal readiness endpoint
+ * (task requirement C's first accepted option) - reachable in practice only
+ * because this request actually traverses ingress -> exit, so a real,
+ * non-fabricated 200 response is only obtainable when that path genuinely
+ * works end to end. A disconnected/rebuilt socket, non-200 status, or a
+ * response body that fails [expectedBodyMarker] all fail closed - this
+ * function NEVER returns [RelayProbeResult.Success] merely because a
+ * connection was accepted (no "TCP connect == healthy", the same B21 lesson
+ * [RelayReadinessStage]'s own docs already reference).
+ *
+ * No profile ([IngressClientProfile.endToEndProbeUrl] null) is reported as
+ * [RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED], never silently skipped
+ * as success.
+ */
+class HttpRelayEndToEndProbe(
+    private val connectTimeoutMillis: Int = 5_000,
+    private val readTimeoutMillis: Int = 5_000,
+) : RelayEndToEndProbe {
+    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult {
+        val urlString = profile.endToEndProbeUrl
+            ?: return RelayProbeResult.Failure(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, "profile carries no end-to-end probe URL")
+        return try {
+            val url = java.net.URL(urlString)
+            if (url.protocol != "https") {
+                return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "refusing a non-HTTPS probe URL")
+            }
+            val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = connectTimeoutMillis
+                readTimeout = readTimeoutMillis
+                useCaches = false
+                setRequestProperty("Cache-Control", "no-store")
+                profile.endToEndProbeToken?.let { token -> setRequestProperty("Authorization", "Bearer $token") }
+            }
+            try {
+                val status = connection.responseCode
+                if (status != java.net.HttpURLConnection.HTTP_OK) {
+                    return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe returned HTTP $status")
+                }
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                if (!body.contains(plan.historyPathId)) {
+                    return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe response did not echo this session's path identity")
+                }
+                RelayProbeResult.Success
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: java.net.SocketTimeoutException) {
+            RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+        } catch (e: java.io.IOException) {
+            RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+        } catch (e: Exception) {
+            RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, e.javaClass.simpleName)
+        }
+    }
 }

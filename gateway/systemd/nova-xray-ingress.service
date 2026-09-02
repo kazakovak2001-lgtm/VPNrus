@@ -1,0 +1,59 @@
+# B25 (task I) - systemd unit TEMPLATE for the ingress-role deployment of
+# the SAME pinned Xray-core binary nova-xray.service already runs (task
+# requirement 7 - "reuse the existing Xray server machinery, no new
+# daemon"). This is a TEMPLATE, reviewed but NOT installed against any real
+# host by this slice - see PROJECT_ARCHITECTURE.md's infra-safety
+# invariant and ROADMAP's own B25 row for why no ingress host exists yet.
+#
+# Differs from nova-xray.service ONLY in:
+#   - the config path (a dedicated /etc/nova-xray-ingress/config.json,
+#     rendered by api/ingress_activation.py via
+#     xray_ingress_config_renderer.render_ingress_server_config - upstream
+#     outbound to the pinned EXIT, never freedom - see that module's own
+#     "structurally incapable of becoming an open relay" docs);
+#   - a dedicated system user/group (nova-xray-ingress), so a compromise of
+#     this process can never read the REGULAR gateway's own REALITY private
+#     key file (different file, different user, different mode/ownership -
+#     defense in depth, same reasoning ProductionGatewayCatalog keeps
+#     per-gateway identity separate).
+#
+# The companion pocvpn-api process for THIS host (serving POST
+# /v1/ingress-profile) is the SAME pocvpn-api.service unit already used for
+# an ordinary gateway - see gateway/systemd/pocvpn-api.service - configured
+# via this host's own /etc/pocvpn/ingress.env (NOVA_INGRESS_* variables,
+# see api/ingress_config.py) in ADDITION to its ordinary POCVPN_API_*
+# variables (this host's own activation/xray-identity stores - never
+# shared with a different gateway/ingress instance).
+[Unit]
+Description=Nova Xray VLESS+REALITY ingress relay (non-root)
+After=network.target
+
+[Service]
+Type=simple
+User=nova-xray-ingress
+Group=nova-xray-ingress
+# Pinned, versioned install path - same binary nova-xray.service uses (see
+# gateway/xray/fetch-xray-server.sh) - update deliberately when bumping
+# gateway/xray/VERSION, never via a floating "latest" symlink.
+ExecStart=/opt/pocvpn/xray/v26.7.28/xray run -config /etc/nova-xray-ingress/config.json
+Restart=on-failure
+RestartSec=2
+
+# --- hardening (identical to nova-xray.service's own - see that unit's comments) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+
+ProtectSystem=strict
+ReadOnlyPaths=/etc/nova-xray-ingress /opt/pocvpn/xray
+
+[Install]
+WantedBy=multi-user.target

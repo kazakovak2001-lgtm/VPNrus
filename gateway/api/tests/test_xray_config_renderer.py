@@ -337,5 +337,61 @@ class RegeneratePipelineTests(RendererTestBase):
         self.assertTrue(os.path.isfile(self.config_path))  # left for operator inspection, per this function's own docs
 
 
+class StaticClientsTests(RendererTestBase):
+    """B25 (task H) - render_server_config's additive static_clients: an
+    infra-level relay identity that is authorized unconditionally, never
+    cross-referenced against activations_data/revocation."""
+
+    def test_no_static_clients_is_byte_for_byte_the_pre_B25_output(self):
+        with_default = renderer_module.render_server_config({}, {}, self.reality)
+        with_explicit_empty = renderer_module.render_server_config({}, {}, self.reality, static_clients=())
+        self.assertEqual(with_default, with_explicit_empty)
+
+    def test_a_static_client_is_authorized_even_with_no_matching_activation_at_all(self):
+        relay_client = renderer_module.RenderedClient(
+            activation_id="relay-ru-ingress-1", device_public_key="relay:ru-ingress-1", vless_uuid=self.uuid_a,
+        )
+        config = renderer_module.render_server_config({}, {}, self.reality, static_clients=(relay_client,))
+        clients = config["inbounds"][0]["settings"]["clients"]
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0]["id"], self.uuid_a)
+
+    def test_a_static_client_survives_ordinary_activation_revocation_being_absent_entirely(self):
+        # No activations_data/xray_data entry exists for this identity AT
+        # ALL (task H's own point: it is not a per-user entitlement) - an
+        # ordinary identity in this situation would be silently dropped by
+        # _active_clients; a static one must not be.
+        activations_data = {"deadbeef" * 8: _activation_record("some-user", activations_module.REVOKED)}
+        xray_data = {}
+        relay_client = renderer_module.RenderedClient(
+            activation_id="relay-ru-ingress-1", device_public_key="relay:ru-ingress-1", vless_uuid=self.uuid_a,
+        )
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, static_clients=(relay_client,))
+        self.assertEqual([c["id"] for c in config["inbounds"][0]["settings"]["clients"]], [self.uuid_a])
+
+    def test_a_malformed_static_client_uuid_fails_closed(self):
+        bad_client = renderer_module.RenderedClient(activation_id="relay-x", device_public_key="relay:x", vless_uuid="not-a-uuid")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, static_clients=(bad_client,))
+
+    def test_static_clients_appear_in_both_reality_and_tls_inbounds(self):
+        tls = renderer_module.TlsServerConfig(listen_port=2053, cert_file="/etc/nova-xray/fullchain.pem", key_file="/etc/nova-xray/privkey.pem")
+        relay_client = renderer_module.RenderedClient(
+            activation_id="relay-ru-ingress-1", device_public_key="relay:ru-ingress-1", vless_uuid=self.uuid_a,
+        )
+        config = renderer_module.render_server_config({}, {}, self.reality, tls=tls, static_clients=(relay_client,))
+        self.assertEqual([c["id"] for c in config["inbounds"][0]["settings"]["clients"]], [self.uuid_a])
+        self.assertEqual([c["id"] for c in config["inbounds"][1]["settings"]["clients"]], [self.uuid_a])
+
+    def test_redacted_render_hides_the_static_client_uuid_too(self):
+        relay_client = renderer_module.RenderedClient(
+            activation_id="relay-ru-ingress-1", device_public_key="relay:ru-ingress-1", vless_uuid=self.uuid_a,
+        )
+        redacted = renderer_module.render_server_config_redacted({}, {}, self.reality, static_clients=(relay_client,))
+        redacted_text = json.dumps(redacted)
+        self.assertNotIn(self.uuid_a, redacted_text)
+        self.assertIn("<redacted-relay-identity>", redacted_text)
+
+
 if __name__ == "__main__":
     unittest.main()

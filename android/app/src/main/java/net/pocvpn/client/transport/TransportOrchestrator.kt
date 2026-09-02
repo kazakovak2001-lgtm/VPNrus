@@ -2,6 +2,7 @@ package net.pocvpn.client.transport
 
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.relay.VpnAttemptContext
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
 import net.pocvpn.client.vpn.VpnTransport
@@ -63,6 +64,15 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
             // byte-for-byte unaffected - see VpnController.buildTransportConfig's
             // own docs for exactly where this is consulted.
             val privateKeyRepository: ClientKeyRepository? = null,
+            // B25 (task A) - the real, typed session identity this attempt
+            // carries all the way into VpnController (see that class's own
+            // `pendingAttemptContext` docs). Defaults to
+            // [VpnAttemptContext.Direct] so every pre-B25 caller (every
+            // Direct/manual/private-gateway resolution) is byte-for-byte
+            // unaffected - only a caller that actually resolved a relayed
+            // candidate (MainViewModel.attemptRelayedAttempt) passes
+            // [VpnAttemptContext.Relayed] explicitly.
+            val attemptContext: VpnAttemptContext = VpnAttemptContext.Direct,
         ) : Resolution()
         data class NotSelectable(val decision: TransportSelectionDecision) : Resolution()
     }
@@ -86,12 +96,13 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
         decision: TransportSelectionDecision,
         endpointId: EndpointId = EndpointId(ProductionGateway.ID),
         gatewayConfigSnapshot: GatewayConfigSnapshot? = null,
+        attemptContext: VpnAttemptContext = VpnAttemptContext.Direct,
     ): Resolution {
         val selected = decision as? TransportSelectionDecision.SelectTransport
             ?: return Resolution.NotSelectable(decision)
         val transport = registry.createTransport(selected.kind)
             ?: return Resolution.NotSelectable(decision)
-        return Resolution.Resolved(transport, selected.kind, endpointId, gatewayConfigSnapshot)
+        return Resolution.Resolved(transport, selected.kind, endpointId, gatewayConfigSnapshot, attemptContext = attemptContext)
     }
 
     /** Deterministic ordering of currently-available transports, for a future failover sequence (not yet acted on). */
