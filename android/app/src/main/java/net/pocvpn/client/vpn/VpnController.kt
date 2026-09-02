@@ -642,6 +642,67 @@ class VpnController(
     }
 
     /**
+     * B25 review fix (PR #39) - the ONE way a caller abandons a FAILED
+     * attempt whose transport already reached a real [TransportState.Connected]
+     * (a genuine handshake) but that the caller has independently determined
+     * is NOT actually healthy - today, exclusively
+     * [net.pocvpn.client.MainViewModel.armFailoverWatch]'s relay branch,
+     * when a resolved relay's ingress-handshake `Connected` is followed by a
+     * REAL [net.pocvpn.client.relay.RelayEndToEndProbe] failure (see that
+     * function's own docs - a relayed session must never be left claiming
+     * Connected once its end-to-end proof has genuinely failed).
+     *
+     * This closes a real bug: [connect] immediately returns whenever
+     * `_state.value` is already [TransportState.Connecting] or
+     * [TransportState.Connected] (see its own early-return guard) - so
+     * without an explicit teardown here, the NEXT globally-ranked combined
+     * candidate's own `controller.connect(...)` call would silently be
+     * swallowed by that guard, never actually dialing anything, while the
+     * UI kept observing the stale (already-failed) relay session.
+     *
+     * Deliberately NOT the same thing as a user pressing disconnect: never
+     * sets [userInitiatedDisconnect]. That flag exists only to gate
+     * [handleNetworkLost]'s automatic reconnect loop, and this function
+     * already makes that loop structurally unreachable for the abandoned
+     * session by moving `_state` away from [TransportState.Connected] BEFORE
+     * returning - [handleNetworkLost]'s own `state !is Connected` guard means
+     * a later network-loss callback for this (now torn-down) session can
+     * never start [reconnectLoop] for it, with no need to also repurpose a
+     * flag whose name and only other reader ([reconnectLoop] itself) both
+     * mean "the USER asked to stop". [disconnect]'s own manual-disconnect
+     * semantics (including that flag) are completely untouched by this
+     * function existing.
+     *
+     * Runs under the SAME [connectMutex] every other lifecycle operation
+     * uses (never manipulates [activeTransport]/VpnService state from
+     * outside this class - task's own "do not manipulate VpnService/
+     * transport directly from MainViewModel"), reuses the exact teardown
+     * steps [disconnect] already performs (cancel any in-flight reconnect,
+     * tear down the active transport, clear applied routing/pending-config/
+     * attempt-context state), and additionally clears [_relayStage] so no
+     * stale [net.pocvpn.client.vpn.VpnSessionHealth.RelayHandshake]/
+     * [net.pocvpn.client.vpn.VpnSessionHealth.RelayProtected] can survive
+     * into whatever the caller does next. Ends at a genuine
+     * [TransportState.Disconnected] - the NEXT real [connect] call (for a
+     * different candidate) is therefore genuinely accepted, never silently
+     * swallowed by the guard this function exists to unblock.
+     */
+    suspend fun abandonAttemptForFailover() {
+        connectMutex.withLock {
+            cancelReconnectLocked()
+            hasTouchedTransport = true
+            activeTransport.disconnect()
+            _appliedRoutingPolicy.value = null
+            _appliedRoutingMode.value = null
+            pendingConnectConfig = null
+            pendingConnectPrivateKeyRepository = null
+            pendingAttemptContext = VpnAttemptContext.Direct
+            _relayStage.value = null
+            setState(TransportState.Disconnected)
+        }
+    }
+
+    /**
      * Caller must already hold connectMutex. Returns true only if
      * transport.connect() completed without throwing. The reconnect loop
      * relies on this return value - NOT on re-reading `_state`, which is
@@ -730,8 +791,20 @@ class VpnController(
                         if (awaitFreshHandshake(attemptStartEpochMillis)) {
                             recordCurrentStats()
                             setState(TransportState.Connected)
-                            recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
-                            recordPathHistory(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                            // B25 (task D fix) - see the catch block's own
+                            // docs below for why a relayed attempt's outcome
+                            // is recorded EXCLUSIVELY by
+                            // MainViewModel.recordRelayOutcome, never here.
+                            // AMNEZIA_WG is not a real client<->ingress
+                            // transport in production (see PROJECT_ARCHITECTURE.md's
+                            // B24 relay matrix) - this guard exists for
+                            // defense in depth/test-double correctness, not
+                            // because a real relay attempt reaches this
+                            // branch today.
+                            if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
+                                recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
+                                recordPathHistory(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                            }
                             true
                         } else {
                             diagnostics.recordError(VpnError.HandshakeTimeout)
@@ -740,8 +813,10 @@ class VpnController(
                             // slice (see class docs). The interface may still be
                             // up; only the user-visible state reflects the truth.
                             setState(TransportState.HandshakeFailed)
-                            recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
-                            recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                            if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
+                                recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
+                                recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                            }
                             false
                         }
                     } else {
@@ -1077,8 +1152,15 @@ class VpnController(
                 // B8I - ONE outcome for the whole exhausted recovery cycle,
                 // not one per backoff attempt - keeps the bounded history
                 // meaningful instead of filling up with per-attempt noise.
-                recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.RECONNECT_EXHAUSTED, reconnectionThresholdEpochMillis)
-                recordPathHistory(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                // B25 (task D fix) - same relayed-context guard as
+                // doConnectAttempt's own AMNEZIA_WG branch (see that
+                // function's own docs) - defense in depth, since a real
+                // relayed attempt never actually reaches this AWG-only
+                // reconnect loop today (see handleNetworkLost's own docs).
+                if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
+                    recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.RECONNECT_EXHAUSTED, reconnectionThresholdEpochMillis)
+                    recordPathHistory(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                }
                 return
             }
 

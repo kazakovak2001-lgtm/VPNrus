@@ -2562,6 +2562,24 @@ class MainViewModel(
                                 )
                                 failoverObserverJob?.cancel()
                                 failoverObserverJob = null
+                                // B25 review fix (PR #39) - a failed
+                                // end-to-end probe means this attempt's
+                                // ingress transport is genuinely UP
+                                // (controller.state is still Connected) but
+                                // NOT healthy - controller.connect() itself
+                                // refuses to do anything while state is
+                                // already Connecting/Connected (see its own
+                                // early-return guard), so the NEXT combined
+                                // candidate's controller.connect() call below
+                                // would otherwise be silently swallowed.
+                                // abandonAttemptForFailover() is the ONE
+                                // controller-owned teardown that tears down
+                                // THIS failed attempt (never touching
+                                // VpnService/transport directly from here)
+                                // and leaves the controller genuinely able
+                                // to accept the next real connect() call -
+                                // see that function's own docs.
+                                controller.abandonAttemptForFailover()
                                 attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
                             }
                         }
