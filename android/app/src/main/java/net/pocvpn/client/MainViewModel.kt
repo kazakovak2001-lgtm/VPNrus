@@ -1068,12 +1068,17 @@ class MainViewModel(
         // has always been a sealed Direct/Relayed type - see the scoring
         // loop below for why that omission made an unsafe cast look safe
         // by coincidence, not by design). One relayed candidate per
-        // INGRESS endpoint, over its FIRST declared transport (deterministic;
-        // this slice does not yet score multiple transport choices for the
-        // ingress hop specifically) - PathCandidateBuilder.buildRelayed
-        // itself rejects anything the manifest doesn't actually support
-        // (wrong role, unsupported transport, relayTo mismatch), returning
-        // null rather than a fabricated candidate.
+        // INGRESS endpoint, over its FIRST declared transport for EACH hop
+        // (deterministic; this slice does not yet score multiple transport
+        // choices for either hop here - see AutoGatewaySelector.
+        // buildRelayedCandidates for the real cross-product scorer) -
+        // PathCandidateBuilder.buildRelayed itself rejects anything the
+        // manifest doesn't actually support (wrong role, unsupported
+        // transport, relayTo mismatch), returning null rather than a
+        // fabricated candidate. B23 (PR #37 review fix) - ingress and exit
+        // transports are independent inputs to buildRelayed (never assumed
+        // equal); this call site already computed them separately before
+        // that fix, it just wasn't able to express it.
         val relayedCandidates = manifest.endpoints.mapNotNull { ingress ->
             if (net.pocvpn.client.reachability.EndpointRole.INGRESS !in ingress.roles) return@mapNotNull null
             val exitId = ingress.relayTo ?: return@mapNotNull null
@@ -1081,7 +1086,7 @@ class MainViewModel(
             val ingressTransport = ingress.transports.firstOrNull()?.kind ?: return@mapNotNull null
             val exitTransport = exit.transports.firstOrNull()?.kind ?: return@mapNotNull null
             net.pocvpn.client.reachability.PathCandidateBuilder.buildRelayed(
-                ingress, exit, ingressTransport,
+                ingress, exit, ingressTransport, exitTransport,
                 reachabilityFor(ingress.id, ingressTransport),
                 reachabilityFor(exit.id, exitTransport),
             )
@@ -1111,26 +1116,15 @@ class MainViewModel(
         // is deliberately disabled until a future slice defines a real
         // per-candidate reference. See docs/ROADMAP.md's own note.
         val scored = candidates.map { candidate ->
-            // B12 (PR #24 second audit fix) - exhaustive `when` over the
-            // sealed PathCandidate type, never an unchecked cast: PathScorer.score
-            // itself already accepts PathCandidate generically (it doesn't
-            // need hop-shape-specific data), so the ONLY reason to
-            // distinguish Direct/Relayed at all here is the history lookup
-            // below, which IS genuinely hop-shape-specific.
-            val history = when (candidate) {
-                is net.pocvpn.client.reachability.PathCandidate.Direct ->
-                    fingerprint?.let { pathHistoryStore?.get(it, candidate.gateway.endpoint.id, candidate.transport) }
-                // Deferred, not invented: FilePathHistoryStore is keyed
-                // networkFingerprint x endpointId x transportKind - a
-                // single endpoint id, which has no well-defined meaning yet
-                // for a multi-hop chain (the ingress? the exit? a
-                // synthetic composite key?). Rather than guess, a Relayed
-                // candidate simply carries no local history credit until a
-                // future slice deliberately designs that key - explicitly
-                // null, never a fabricated lookup against one hop that
-                // could misrepresent the OTHER hop's own history.
-                is net.pocvpn.client.reachability.PathCandidate.Relayed -> null
-            }
+            // B23 - PathHistoryStore is now keyed networkFingerprint x
+            // pathId x transportKind (pathId = PathCandidate.historyPathId -
+            // see that property's own docs), so a Relayed candidate gets its
+            // OWN composite "ingress->exit" history entry, never conflated
+            // with either hop's Direct history and never a fabricated
+            // single-hop lookup - the exact gap this call site previously
+            // deferred (see git history for the prior "deliberately null
+            // until a future slice designs that key" note this replaces).
+            val history = fingerprint?.let { pathHistoryStore?.get(it, candidate.historyPathId, candidate.transport) }
             // B13 SECOND consolidated review fix - THIS candidate's own
             // endpoint (the client-facing hop it actually executes against:
             // the gateway itself for Direct, the ingress for Relayed - the
@@ -1341,7 +1335,7 @@ class MainViewModel(
                 it.keyBytes(),
             )
         }
-        fingerprint?.let { pathHistoryStore?.record(it, endpointId, kind, success = success, nowEpochMillis = nowMs) }
+        fingerprint?.let { pathHistoryStore?.record(it, endpointId.value, kind, success = success, nowEpochMillis = nowMs) }
     }
 
     private val _publicKey = MutableStateFlow<String?>(null)

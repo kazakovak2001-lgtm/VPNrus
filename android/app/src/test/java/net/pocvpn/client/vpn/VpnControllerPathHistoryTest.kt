@@ -38,14 +38,14 @@ private fun configuredGateway() = GatewayConfiguration.Configured(
 )
 
 private class RecordingPathHistoryStore : PathHistoryStore {
-    data class Record(val fingerprint: String, val endpointId: EndpointId, val transport: TransportKind, val success: Boolean)
+    data class Record(val fingerprint: String, val pathId: String, val transport: TransportKind, val success: Boolean)
 
     val records = mutableListOf<Record>()
 
-    override fun get(networkFingerprint: String, endpointId: EndpointId, transport: TransportKind) = null
+    override fun get(networkFingerprint: String, pathId: String, transport: TransportKind) = null
 
-    override fun record(networkFingerprint: String, endpointId: EndpointId, transport: TransportKind, success: Boolean, nowEpochMillis: Long) {
-        records += Record(networkFingerprint, endpointId, transport, success)
+    override fun record(networkFingerprint: String, pathId: String, transport: TransportKind, success: Boolean, nowEpochMillis: Long) {
+        records += Record(networkFingerprint, pathId, transport, success)
     }
 }
 
@@ -92,7 +92,7 @@ class VpnControllerPathHistoryTest {
         val record = store.records.single()
         assertTrue(record.success)
         assertEquals(TransportKind.AMNEZIA_WG, record.transport)
-        assertEquals(EndpointId(ProductionGateway.ID), record.endpointId)
+        assertEquals(ProductionGateway.ID, record.pathId)
     }
 
     @Test
@@ -311,7 +311,7 @@ class VpnControllerPathHistoryTest {
         controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.AMNEZIA_WG, endpointA))
         runCurrent()
         assertEquals(1, store.records.size)
-        assertEquals(endpointA, store.records.single().endpointId)
+        assertEquals(endpointA.value, store.records.single().pathId)
 
         controller.disconnect()
         runCurrent()
@@ -324,9 +324,9 @@ class VpnControllerPathHistoryTest {
         runCurrent()
 
         assertEquals(2, store.records.size)
-        assertEquals(endpointB, store.records.last().endpointId)
+        assertEquals(endpointB.value, store.records.last().pathId)
         // The FIRST record (endpoint A) must remain exactly as it was -
         // never rewritten/reattributed to endpoint B in place.
-        assertEquals(endpointA, store.records.first().endpointId)
+        assertEquals(endpointA.value, store.records.first().pathId)
     }
 }

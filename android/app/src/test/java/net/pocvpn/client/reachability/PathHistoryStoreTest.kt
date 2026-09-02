@@ -15,9 +15,9 @@ class PathHistoryStoreTest {
     @Test
     fun `recording success then reading back returns the aggregated entry`() {
         val store = FilePathHistoryStore(tempFolder.newFolder())
-        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 100L)
-        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 200L)
-        val entry = store.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)
+        store.record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 100L)
+        store.record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 200L)
+        val entry = store.get("fp-1", "gw", TransportKind.AMNEZIA_WG)
         assertEquals(1, entry!!.successCount)
         assertEquals(1, entry.failureCount)
         assertEquals(false, entry.lastOutcomeSuccess)
@@ -26,35 +26,35 @@ class PathHistoryStoreTest {
     @Test
     fun `different networkFingerprint x endpointId x transportKind keys never collide`() {
         val store = FilePathHistoryStore(tempFolder.newFolder())
-        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
-        store.record("fp-2", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
-        store.record("fp-1", EndpointId("gw2"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
-        store.record("fp-1", EndpointId("gw"), TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
+        store.record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
+        store.record("fp-2", "gw", TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
+        store.record("fp-1", "gw2", TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
+        store.record("fp-1", "gw", TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
 
-        assertEquals(true, store.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
-        assertEquals(false, store.get("fp-2", EndpointId("gw"), TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
-        assertEquals(false, store.get("fp-1", EndpointId("gw2"), TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
-        assertEquals(false, store.get("fp-1", EndpointId("gw"), TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+        assertEquals(true, store.get("fp-1", "gw", TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
+        assertEquals(false, store.get("fp-2", "gw", TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
+        assertEquals(false, store.get("fp-1", "gw2", TransportKind.AMNEZIA_WG)!!.lastOutcomeSuccess)
+        assertEquals(false, store.get("fp-1", "gw", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
     }
 
     @Test
     fun `history is bounded - recording beyond maxEntries evicts the least-recently-updated key`() {
         val store = FilePathHistoryStore(tempFolder.newFolder(), maxEntries = 3)
-        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
-        store.record("fp-2", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 2L)
-        store.record("fp-3", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 3L)
-        store.record("fp-4", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 4L)
+        store.record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
+        store.record("fp-2", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 2L)
+        store.record("fp-3", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 3L)
+        store.record("fp-4", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 4L)
 
-        assertNull(store.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG))
-        assertTrue(store.get("fp-4", EndpointId("gw"), TransportKind.AMNEZIA_WG) != null)
+        assertNull(store.get("fp-1", "gw", TransportKind.AMNEZIA_WG))
+        assertTrue(store.get("fp-4", "gw", TransportKind.AMNEZIA_WG) != null)
     }
 
     @Test
     fun `persists across a simulated restart`() {
         val dir = tempFolder.newFolder()
-        FilePathHistoryStore(dir).record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
+        FilePathHistoryStore(dir).record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = 1L)
         val reopened = FilePathHistoryStore(dir)
-        assertEquals(1, reopened.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)!!.successCount)
+        assertEquals(1, reopened.get("fp-1", "gw", TransportKind.AMNEZIA_WG)!!.successCount)
     }
 
     @Test
@@ -62,7 +62,7 @@ class PathHistoryStoreTest {
         val dir = tempFolder.newFolder()
         java.io.File(dir, "path_history.bin").writeBytes(byteArrayOf(9, 9, 9))
         val store = FilePathHistoryStore(dir)
-        assertNull(store.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG))
+        assertNull(store.get("fp-1", "gw", TransportKind.AMNEZIA_WG))
     }
 
     @Test
@@ -73,7 +73,7 @@ class PathHistoryStoreTest {
             Thread {
                 try {
                     repeat(200) { i ->
-                        store.record("fp-$t", EndpointId("gw-$i"), TransportKind.AMNEZIA_WG, success = i % 2 == 0, nowEpochMillis = i.toLong())
+                        store.record("fp-$t", "gw-$i", TransportKind.AMNEZIA_WG, success = i % 2 == 0, nowEpochMillis = i.toLong())
                     }
                 } catch (e: Throwable) {
                     errors.add(e)
@@ -84,7 +84,7 @@ class PathHistoryStoreTest {
             Thread {
                 try {
                     repeat(500) { i ->
-                        store.get("fp-$t", EndpointId("gw-${i % 200}"), TransportKind.AMNEZIA_WG)
+                        store.get("fp-$t", "gw-${i % 200}", TransportKind.AMNEZIA_WG)
                     }
                 } catch (e: Throwable) {
                     errors.add(e)
@@ -102,7 +102,7 @@ class PathHistoryStoreTest {
     @Test
     fun `consecutiveFailures increments on each failure and resets to 0 on any success`() {
         val store = FilePathHistoryStore(tempFolder.newFolder())
-        val key = Triple("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)
+        val key = Triple("fp-1", "gw", TransportKind.AMNEZIA_WG)
         store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 1L)
         store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 2L)
         store.record(key.first, key.second, key.third, success = false, nowEpochMillis = 3L)
@@ -119,11 +119,11 @@ class PathHistoryStoreTest {
     fun `consecutiveFailures survives a simulated restart`() {
         val dir = tempFolder.newFolder()
         val store = FilePathHistoryStore(dir)
-        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
-        store.record("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 2L)
+        store.record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 1L)
+        store.record("fp-1", "gw", TransportKind.AMNEZIA_WG, success = false, nowEpochMillis = 2L)
 
         val reopened = FilePathHistoryStore(dir)
-        assertEquals(2, reopened.get("fp-1", EndpointId("gw"), TransportKind.AMNEZIA_WG)!!.consecutiveFailures)
+        assertEquals(2, reopened.get("fp-1", "gw", TransportKind.AMNEZIA_WG)!!.consecutiveFailures)
     }
 
     @Test
@@ -131,5 +131,39 @@ class PathHistoryStoreTest {
         val fields = PathHistoryEntry::class.java.declaredFields.map { it.name }.toSet()
         val forbidden = setOf("ssid", "bssid", "imsi", "phoneNumber", "dnsServerAddresses", "dns", "networkType")
         assertTrue(fields.intersect(forbidden).isEmpty())
+    }
+
+    // --- B23: composite relay pathId scoping ---
+
+    @Test
+    fun `a Relayed composite pathId never collides with either hop's own Direct pathId history`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder())
+        store.record("fp-1", "ingress1", TransportKind.TLS_TCP, success = true, nowEpochMillis = 1L)
+        store.record("fp-1", "ingress1->exit1", TransportKind.TLS_TCP, success = false, nowEpochMillis = 2L)
+        store.record("fp-1", "exit1", TransportKind.TLS_TCP, success = true, nowEpochMillis = 3L)
+
+        assertEquals(true, store.get("fp-1", "ingress1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+        assertEquals(false, store.get("fp-1", "ingress1->exit1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+        assertEquals(true, store.get("fp-1", "exit1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+    }
+
+    @Test
+    fun `the same ingress relayed to two different exits keeps two separate history entries`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder())
+        store.record("fp-1", "ingress1->exitA", TransportKind.TLS_TCP, success = true, nowEpochMillis = 1L)
+        store.record("fp-1", "ingress1->exitB", TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
+
+        assertEquals(true, store.get("fp-1", "ingress1->exitA", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+        assertEquals(false, store.get("fp-1", "ingress1->exitB", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+    }
+
+    @Test
+    fun `a different networkFingerprint keeps a relayed path's history separate too`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder())
+        store.record("network-a", "ingress1->exit1", TransportKind.TLS_TCP, success = true, nowEpochMillis = 1L)
+        store.record("network-b", "ingress1->exit1", TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
+
+        assertEquals(true, store.get("network-a", "ingress1->exit1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
+        assertEquals(false, store.get("network-b", "ingress1->exit1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
     }
 }

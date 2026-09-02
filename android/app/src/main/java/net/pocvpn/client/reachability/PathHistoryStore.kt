@@ -10,7 +10,7 @@ import java.nio.file.StandardCopyOption
 import net.pocvpn.client.transport.TransportKind
 
 /**
- * Aggregated local history for one (networkFingerprint, endpointId, transportKind) key - never raw per-attempt destinations/timestamps beyond what's needed to bound recency.
+ * Aggregated local history for one (networkFingerprint, pathId, transportKind) key - never raw per-attempt destinations/timestamps beyond what's needed to bound recency.
  *
  * B19 - [consecutiveFailures] is the RECENT streak (resets to 0 on any
  * success, increments on each failure) - deliberately distinct from
@@ -31,16 +31,24 @@ data class PathHistoryEntry(
 
 /**
  * B11 - network-specific local connection memory, keyed by
- * (networkFingerprint x endpointId x transportKind) exactly as the task
- * specifies. [networkFingerprint] must already be the HMAC output of
- * NetworkFingerprinter - this store has no way to enforce that itself, but
- * it structurally CANNOT hold raw SSID/BSSID/IMSI/DNS data because its
- * key/value shape has no field for them (same "the format itself cannot
- * represent it" discipline as ConnectionOutcomeStore).
+ * (networkFingerprint x pathId x transportKind). [networkFingerprint] must
+ * already be the HMAC output of NetworkFingerprinter - this store has no way
+ * to enforce that itself, but it structurally CANNOT hold raw SSID/BSSID/
+ * IMSI/DNS data because its key/value shape has no field for them (same "the
+ * format itself cannot represent it" discipline as ConnectionOutcomeStore).
+ *
+ * B23 - [pathId] widened from a single [EndpointId] to a plain path
+ * identity string: [PathCandidate.historyPathId] for a [PathCandidate
+ * .Direct] is still exactly `endpoint.id.value` (byte-for-byte the same key
+ * every pre-B23 entry was already stored under), while a [PathCandidate
+ * .Relayed] gets its own composite "ingress->exit" key - never conflated
+ * with either hop's own Direct history, and never a fabricated lookup
+ * against only one hop (see PathCandidate.historyPathId's own docs for why
+ * this was previously left deliberately unscored rather than guessed at).
  */
 interface PathHistoryStore {
-    fun get(networkFingerprint: String, endpointId: EndpointId, transport: TransportKind): PathHistoryEntry?
-    fun record(networkFingerprint: String, endpointId: EndpointId, transport: TransportKind, success: Boolean, nowEpochMillis: Long)
+    fun get(networkFingerprint: String, pathId: String, transport: TransportKind): PathHistoryEntry?
+    fun record(networkFingerprint: String, pathId: String, transport: TransportKind, success: Boolean, nowEpochMillis: Long)
 }
 
 /**
@@ -54,19 +62,19 @@ class FilePathHistoryStore(
     private val maxEntries: Int = 200,
 ) : PathHistoryStore {
 
-    private data class Key(val fingerprint: String, val endpointId: String, val transportOrdinal: Int)
+    private data class Key(val fingerprint: String, val pathId: String, val transportOrdinal: Int)
 
     private val file: File get() = File(directory, fileName)
     private val lock = Any()
 
     @Volatile private var cached: LinkedHashMap<Key, PathHistoryEntry> = readFromDisk()
 
-    override fun get(networkFingerprint: String, endpointId: EndpointId, transport: TransportKind): PathHistoryEntry? =
-        cached[Key(networkFingerprint, endpointId.value, transport.ordinal)]
+    override fun get(networkFingerprint: String, pathId: String, transport: TransportKind): PathHistoryEntry? =
+        cached[Key(networkFingerprint, pathId, transport.ordinal)]
 
-    override fun record(networkFingerprint: String, endpointId: EndpointId, transport: TransportKind, success: Boolean, nowEpochMillis: Long) {
+    override fun record(networkFingerprint: String, pathId: String, transport: TransportKind, success: Boolean, nowEpochMillis: Long) {
         synchronized(lock) {
-            val key = Key(networkFingerprint, endpointId.value, transport.ordinal)
+            val key = Key(networkFingerprint, pathId, transport.ordinal)
             val existing = cached[key]
             val updated = PathHistoryEntry(
                 successCount = (existing?.successCount ?: 0) + if (success) 1 else 0,
@@ -122,7 +130,7 @@ class FilePathHistoryStore(
 
     private fun readEntryOrNull(input: DataInputStream): Pair<Key, PathHistoryEntry>? {
         val fingerprint = readString(input)
-        val endpointId = readString(input)
+        val pathId = readString(input)
         val transportOrdinal = input.readInt()
         if (TransportKind.entries.getOrNull(transportOrdinal) == null) return null
         val successCount = input.readInt()
@@ -130,7 +138,7 @@ class FilePathHistoryStore(
         val lastOutcomeEpochMillis = input.readLong()
         val lastOutcomeSuccess = input.readBoolean()
         val consecutiveFailures = input.readInt()
-        return Key(fingerprint, endpointId, transportOrdinal) to
+        return Key(fingerprint, pathId, transportOrdinal) to
             PathHistoryEntry(successCount, failureCount, lastOutcomeEpochMillis, lastOutcomeSuccess, consecutiveFailures)
     }
 
@@ -143,7 +151,7 @@ class FilePathHistoryStore(
                 out.writeInt(entries.size)
                 entries.forEach { (key, entry) ->
                     writeString(out, key.fingerprint)
-                    writeString(out, key.endpointId)
+                    writeString(out, key.pathId)
                     out.writeInt(key.transportOrdinal)
                     out.writeInt(entry.successCount)
                     out.writeInt(entry.failureCount)
@@ -183,7 +191,12 @@ class FilePathHistoryStore(
         // other store here already uses) - never a crash, never a
         // misread field.
         const val FORMAT_VERSION = 2
-        const val MAX_STRING_LEN = 256
+        // B23 - widened from 256: a Relayed candidate's composite
+        // "ingress->exit" pathId can exceed a single EndpointId's own
+        // 128-char max (see EndpointId's own bound) - this is a read-side
+        // plausibility bound on untrusted disk data, not a wire-format
+        // field, so widening it never breaks decoding an existing file.
+        const val MAX_STRING_LEN = 512
         const val MAX_PLAUSIBLE_COUNT = 100_000
     }
 }
