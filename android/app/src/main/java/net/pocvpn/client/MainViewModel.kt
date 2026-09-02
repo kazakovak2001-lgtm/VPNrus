@@ -111,6 +111,15 @@ private class PendingFailoverAttempt(
     // docs. null (the default) means "manual gateway, existing intra-gateway
     // AWG->Xray failover only" - byte-for-byte the pre-B16 shape.
     val autoContext: PendingAutoGatewayContext? = null,
+    // B24 review fix (PR #38, round 3) - non-null exactly when this attempt
+    // is a RELAYED combined-Auto candidate (see RelayIngressResolver's own
+    // docs). Lets armFailoverWatch's SAME real controller.state observation
+    // record the terminal outcome under the correct FULL relayed
+    // historyPathId (never a single-hop endpoint id) and route a failure
+    // back into the combined coordinator - a relay attempt has no AWG<->Xray
+    // intra-gateway concept, so this also skips that branch entirely. null
+    // (the default) is byte-for-byte the pre-B24 Direct/Manual shape.
+    val relayPlan: net.pocvpn.client.relay.RelayedExecutionPlan? = null,
 )
 
 /**
@@ -340,13 +349,16 @@ class MainViewModel(
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
-    // B24 - the real client<->ingress execution boundary a relayed Auto
-    // winner is handed to (see RelayIngressDialer's own docs). Defaults to
-    // NotProvisionedRelayIngressDialer - the ONLY implementation wired into
-    // production today - which fails closed for every plan (no real ingress
-    // is deployed/activated against this slice). Additive seam, same
-    // pattern as every optional collaborator above.
-    private val relayIngressDialer: net.pocvpn.client.relay.RelayIngressDialer = net.pocvpn.client.relay.NotProvisionedRelayIngressDialer,
+    // B24 review fix (PR #38, round 3) - the real client<->ingress
+    // PREPARATION boundary a relayed Auto winner is handed to (see
+    // RelayIngressResolver's own docs). A Resolved result is fed into the
+    // SAME TransportOrchestrator/VpnController path Direct uses - this
+    // object never owns tunnel state itself. Defaults to
+    // NotProvisionedRelayIngressResolver - the ONLY implementation wired
+    // into production today - which reports NotProvisioned for every plan
+    // (no real ingress is deployed/activated against this slice). Additive
+    // seam, same pattern as every optional collaborator above.
+    private val relayIngressResolver: net.pocvpn.client.relay.RelayIngressResolver = net.pocvpn.client.relay.NotProvisionedRelayIngressResolver,
     // B12/B20 - additive, defaults to null (same seam as every optional
     // dependency above): with no client, refreshManifest() below is a
     // no-op that returns null, and manifestRepository's trusted state is
@@ -2164,21 +2176,35 @@ class MainViewModel(
     }
 
     /**
-     * B24 - executes ONE relayed attempt via [relayIngressDialer] (task
-     * requirement 3/13). Builds a [net.pocvpn.client.relay.RelayedExecutionPlan]
+     * B24 review fix (PR #38, round 3 - ownership boundary) - executes ONE
+     * relayed attempt by asking [relayIngressResolver] to PREPARE a real
+     * ingress transport (task requirement 3/13), never to own or claim its
+     * state. Builds a [net.pocvpn.client.relay.RelayedExecutionPlan]
      * straight off [candidate]'s own already-pinned fields (never a
-     * manifest/catalog re-resolution - task requirement 2), dials it, and
-     * records the real outcome under the FULL relayed `historyPathId` (task
-     * requirement 11/G - never poisons either hop's own Direct history).
-     * [relayIngressDialer] defaults to [net.pocvpn.client.relay
-     * .NotProvisionedRelayIngressDialer] in production, which fails closed
-     * for every plan (task requirement "no fake relay success" - see that
-     * object's own docs for exactly why) - a failure here advances the
-     * SHARED combined budget via [attemptCombined], never retries the SAME
-     * candidate, and never substitutes a different exit while keeping this
-     * candidate's own identity (task requirement 13's own "no relayed
-     * attempt may silently fall back to a different exit while keeping the
-     * same candidate identity").
+     * manifest/catalog re-resolution - task requirement 2).
+     *
+     * On [net.pocvpn.client.relay.RelayIngressResolution.NotProvisioned]
+     * (the ONLY thing [relayIngressResolver] returns in production today -
+     * see [net.pocvpn.client.relay.NotProvisionedRelayIngressResolver]'s
+     * own docs), records a typed failure and advances the SHARED combined
+     * budget via [attemptCombined] - never retries the same candidate,
+     * never substitutes a different exit while keeping this candidate's
+     * own identity (task requirement 13).
+     *
+     * On [net.pocvpn.client.relay.RelayIngressResolution.Resolved], the
+     * prepared transport is fed into the EXACT SAME
+     * [TransportOrchestrator]/[VpnController]/[PendingFailoverAttempt]/
+     * [armFailoverWatch] path Direct already uses (task requirement 1/2/4 -
+     * one VpnService owner, no second connection controller) - a real
+     * per-endpoint `TransportRegistry`/`TransportOrchestrator` is built for
+     * [plan]'s ingress endpoint id and handed to `controller.connect()`
+     * exactly like a Direct candidate is. [PendingFailoverAttempt.relayPlan]
+     * marks this attempt as relayed so [armFailoverWatch]'s SAME real
+     * `controller.state` observation authority (never this function's own
+     * belief about what happened) governs what gets recorded and whether
+     * the combined sequence advances - see that function's own docs (task
+     * requirement 8 - Protected/health must come from the real runtime
+     * state authority, never inferred here).
      */
     private suspend fun attemptRelayedAttempt(
         candidate: net.pocvpn.client.smartconnect.AutoGatewaySelector.RelayAttemptCandidate,
@@ -2186,28 +2212,61 @@ class MainViewModel(
         attemptedKeys: Set<String>,
     ) {
         val plan = net.pocvpn.client.relay.RelayedExecutionPlan.from(candidate)
-        val outcome = relayIngressDialer.dial(plan)
-        recordRelayOutcome(plan, outcome)
-        when (outcome) {
-            is net.pocvpn.client.relay.RelayAttemptOutcome.Success -> {
-                // B24 - not reachable in production today: NotProvisionedRelayIngressDialer
-                // never returns Success (see its own docs). Kept as a real branch
-                // rather than a TODO so a future real RelayIngressDialer's Success
-                // is genuinely wired through without this call site needing a
-                // rewrite. State-transition ownership (actually driving the tunnel
-                // to Connected/Protected) belongs to the RelayIngressDialer
-                // implementation itself - by the time dial() returns Success, a
-                // real dialer has ALREADY reached END_TO_END_DATA_PLANE_OK, so
-                // there is nothing to fake here. _activeGatewayId is
-                // deliberately left untouched - it is a ProductionGatewayId
-                // (Direct-gateway-shaped), which has no meaning for a relay.
-                _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(lastFailureReason = null)
-            }
-            is net.pocvpn.client.relay.RelayAttemptOutcome.Failure -> {
+        when (val resolution = relayIngressResolver.resolve(plan)) {
+            is net.pocvpn.client.relay.RelayIngressResolution.NotProvisioned -> {
+                val outcome = net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
+                    plan = plan,
+                    highestStageReached = null,
+                    category = resolution.category,
+                    detail = resolution.detail,
+                )
+                recordRelayOutcome(plan, outcome)
                 _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(
                     lastFailureReason = "${outcome.category}" + (outcome.detail?.let { ": $it" } ?: ""),
                 )
                 attemptCombined(attempts, attemptedKeys)
+            }
+            is net.pocvpn.client.relay.RelayIngressResolution.Resolved -> {
+                val registry = TransportRegistry.build(
+                    listOf(
+                        TransportDescriptor(
+                            kind = resolution.kind,
+                            status = TransportStatus.AVAILABLE,
+                            capabilities = resolution.transport.capabilities,
+                            factory = { resolution.transport },
+                        ),
+                    ),
+                )
+                val orchestrator = TransportOrchestrator(registry)
+                val decision = TransportSelectionDecision.SelectTransport(resolution.kind)
+                when (val orchResolution = orchestrator.resolve(decision, plan.ingressEndpointId)) {
+                    is TransportOrchestrator.Resolution.Resolved -> {
+                        val permissionPending = orchResolution.transport.preparePermissionIntent() != null
+                        val attempt = PendingFailoverAttempt(
+                            initialKind = resolution.kind,
+                            preference = userTransportPreference,
+                            registry = registry,
+                            orchestrator = orchestrator,
+                            endpointId = plan.ingressEndpointId,
+                            autoContext = PendingAutoGatewayContext(attempts, attemptedKeys),
+                            relayPlan = plan,
+                        )
+                        pendingFailoverAttempt = attempt
+                        controller.connect(orchResolution)
+                        if (!permissionPending) armFailoverWatch(attempt)
+                    }
+                    is TransportOrchestrator.Resolution.NotSelectable -> {
+                        val outcome = net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
+                            plan = plan,
+                            highestStageReached = null,
+                            category = net.pocvpn.client.relay.RelayFailureCategory.INGRESS_HANDSHAKE_FAILED,
+                            detail = "resolved ingress transport was not selectable",
+                        )
+                        recordRelayOutcome(plan, outcome)
+                        _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(lastFailureReason = "${outcome.category}: ${outcome.detail}")
+                        attemptCombined(attempts, attemptedKeys)
+                    }
+                }
             }
         }
     }
@@ -2397,6 +2456,64 @@ class MainViewModel(
                 if (pendingFailoverAttempt !== attempt) {
                     failoverObserverJob?.cancel()
                     failoverObserverJob = null
+                    return@collect
+                }
+                val relayPlan = attempt.relayPlan
+                if (relayPlan != null) {
+                    // B24 review fix (PR #38, round 3) - a RELAYED combined
+                    // attempt: this SAME real controller.state authority
+                    // (never this attempt's own belief, never a resolver
+                    // return value) governs both what gets recorded and
+                    // whether the combined sequence advances (task
+                    // requirement 8).
+                    val autoContext = attempt.autoContext!!
+                    if (state is TransportState.Connected) {
+                        // Task requirement 8's own core point: even a REAL,
+                        // controller-observed Connected state for the
+                        // client<->ingress hop only proves
+                        // RelayReadinessStage.INGRESS_HANDSHAKE_OK - it says
+                        // NOTHING about the ingress's own upstream link to
+                        // the exit (no end-to-end data-plane proof channel
+                        // exists for a relay yet - see that enum's own
+                        // UPSTREAM_EXIT_HANDSHAKE_OK docs). This branch NEVER
+                        // constructs RelayAttemptOutcome.Success, no matter
+                        // what the transport itself reports - fail-closed by
+                        // construction (RelayAttemptOutcome.Failure cannot
+                        // even represent END_TO_END_DATA_PLANE_OK - see that
+                        // sealed class's own init{}).
+                        recordRelayOutcome(
+                            relayPlan,
+                            net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
+                                plan = relayPlan,
+                                highestStageReached = net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK,
+                                category = net.pocvpn.client.relay.RelayFailureCategory.UPSTREAM_EXIT_HANDSHAKE_FAILED,
+                                detail = "no end-to-end data-plane proof channel exists yet for a relayed attempt",
+                            ),
+                        )
+                        pendingFailoverAttempt = null
+                        failoverObserverJob?.cancel()
+                        failoverObserverJob = null
+                        return@collect
+                    }
+                    val error = diagnosticsStore.snapshot.value.lastError
+                    val eligible = net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy.isEligibleForNextCandidate(state, error)
+                    if (!eligible) return@collect
+                    recordRelayOutcome(
+                        relayPlan,
+                        net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
+                            plan = relayPlan,
+                            highestStageReached = null,
+                            category = net.pocvpn.client.relay.RelayFailureCategory.INGRESS_HANDSHAKE_FAILED,
+                            detail = error?.let { it::class.simpleName } ?: state::class.simpleName,
+                        ),
+                    )
+                    pendingFailoverAttempt = null
+                    _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(
+                        lastFailureReason = error?.let { it::class.simpleName } ?: state::class.simpleName,
+                    )
+                    failoverObserverJob?.cancel()
+                    failoverObserverJob = null
+                    attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
                     return@collect
                 }
                 val autoContext = attempt.autoContext

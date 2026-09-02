@@ -26,10 +26,9 @@ import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathHistoryStore
 import net.pocvpn.client.reachability.SignedManifest
 import net.pocvpn.client.reachability.TrustedKeyId
-import net.pocvpn.client.relay.RelayAttemptOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
-import net.pocvpn.client.relay.RelayIngressDialer
-import net.pocvpn.client.relay.RelayReadinessStage
+import net.pocvpn.client.relay.RelayIngressResolution
+import net.pocvpn.client.relay.RelayIngressResolver
 import net.pocvpn.client.relay.RelayedExecutionPlan
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.transport.TransportCapabilities
@@ -152,15 +151,15 @@ private class OrderLoggingFailNThenSucceedTransport(
     override fun observeState(): Flow<TransportState> = stateFlow
 }
 
-private class OrderLoggingDialer(
+private class OrderLoggingResolver(
     private val orderLog: MutableList<String>,
-    private val outcomeFor: (RelayedExecutionPlan) -> RelayAttemptOutcome,
-) : RelayIngressDialer {
-    val dialedPlans = mutableListOf<RelayedExecutionPlan>()
-    override suspend fun dial(plan: RelayedExecutionPlan): RelayAttemptOutcome {
-        dialedPlans += plan
+    private val resolutionFor: (RelayedExecutionPlan) -> RelayIngressResolution,
+) : RelayIngressResolver {
+    val resolvedPlans = mutableListOf<RelayedExecutionPlan>()
+    override suspend fun resolve(plan: RelayedExecutionPlan): RelayIngressResolution {
+        resolvedPlans += plan
         orderLog += "relay:${plan.ingressEndpointId.value}"
-        return outcomeFor(plan)
+        return resolutionFor(plan)
     }
 }
 
@@ -305,7 +304,7 @@ class MainViewModelCombinedFailoverTest {
 
     private fun newViewModel(
         transport: VpnTransport,
-        relayIngressDialer: RelayIngressDialer,
+        relayIngressResolver: RelayIngressResolver,
         manifestRepository: EndpointManifestRepository,
         pathHistoryStore: PathHistoryStore? = null,
     ) = MainViewModel(
@@ -323,11 +322,11 @@ class MainViewModelCombinedFailoverTest {
         manifestRepository = manifestRepository,
         pathHistoryStore = pathHistoryStore,
         fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
-        relayIngressDialer = relayIngressDialer,
+        relayIngressResolver = relayIngressResolver,
     )
 
-    private fun alwaysFailingRelayOutcome(plan: RelayedExecutionPlan) =
-        RelayAttemptOutcome.Failure(plan, highestStageReached = RelayReadinessStage.INGRESS_REACHABLE, category = RelayFailureCategory.INGRESS_UNREACHABLE)
+    private fun alwaysFailingRelayResolution(plan: RelayedExecutionPlan): RelayIngressResolution =
+        RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
 
     // --- A: Direct A fails -> Relayed B is attempted next (Relayed ranks ABOVE Direct STOCKHOLM here too - see D) ---
 
@@ -338,8 +337,8 @@ class MainViewModelCombinedFailoverTest {
         // (rank 2: no history) - only two candidates exist in this manifest.
         val history = SeededPathHistoryStore(mapOf(germany.endpointId.value to richSuccessHistory))
         val transport = OrderLoggingAlwaysFailTransport(orderLog, hostLabels)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepositoryWithGermanyAndIngress(), history)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithGermanyAndIngress(), history)
 
         // Sanity: combined ranking really does put Direct GERMANY first.
         val attempts = viewModel.combinedAutoAttempts()
@@ -360,8 +359,8 @@ class MainViewModelCombinedFailoverTest {
         // history (historyRank -1), the relay gets none (historyRank 0).
         val history = SeededPathHistoryStore(mapOf(germany.endpointId.value to richFailureHistory))
         val transport = OrderLoggingAlwaysFailTransport(orderLog, hostLabels)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepositoryWithGermanyAndIngress(), history)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithGermanyAndIngress(), history)
 
         val attempts = viewModel.combinedAutoAttempts()
         assertTrue(attempts.first() is AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt)
@@ -387,8 +386,8 @@ class MainViewModelCombinedFailoverTest {
             ),
         )
         val transport = OrderLoggingAlwaysFailTransport(orderLog, hostLabels)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepositoryWithAllThree(), history)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithAllThree(), history)
 
         val attempts = viewModel.combinedAutoAttempts()
         assertEquals(
@@ -418,8 +417,8 @@ class MainViewModelCombinedFailoverTest {
             ),
         )
         val transport = OrderLoggingAlwaysFailTransport(orderLog, hostLabels)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepositoryWithAllThree(), history)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithAllThree(), history)
 
         viewModel.connect()
         testDispatcher.scheduler.runCurrent()
@@ -443,8 +442,8 @@ class MainViewModelCombinedFailoverTest {
             ),
         )
         val transport = OrderLoggingAlwaysFailTransport(orderLog, hostLabels)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepositoryWithAllThree(), history)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithAllThree(), history)
 
         viewModel.connect()
         testDispatcher.scheduler.runCurrent()
@@ -461,8 +460,8 @@ class MainViewModelCombinedFailoverTest {
         // tried and fails, THEN Direct GERMANY is tried and succeeds.
         val history = SeededPathHistoryStore(mapOf(germany.endpointId.value to richFailureHistory))
         val transport = OrderLoggingFailNThenSucceedTransport(orderLog, hostLabels, succeedOnCall = 1)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepositoryWithGermanyAndIngress(), history)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithGermanyAndIngress(), history)
 
         viewModel.connect()
         testDispatcher.scheduler.runCurrent()
@@ -515,8 +514,8 @@ class MainViewModelCombinedFailoverTest {
 
         val orderLog = mutableListOf<String>()
         val transport = OrderLoggingFailNThenSucceedTransport(orderLog, hostLabels, succeedOnCall = 1)
-        val dialer = OrderLoggingDialer(orderLog) { alwaysFailingRelayOutcome(it) }
-        val viewModel = newViewModel(transport, dialer, manifestRepository)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(transport, resolver, manifestRepository)
 
         val attempts = viewModel.combinedAutoAttempts()
         assertTrue(attempts.all { it is AutoGatewaySelector.AutoConnectAttempt.DirectAttempt })
@@ -526,6 +525,6 @@ class MainViewModelCombinedFailoverTest {
 
         assertEquals(listOf("direct:GERMANY"), orderLog)
         assertTrue(viewModel.transportState.value is TransportState.Connected)
-        assertEquals(0, dialer.dialedPlans.size)
+        assertEquals(0, resolver.resolvedPlans.size)
     }
 }

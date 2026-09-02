@@ -504,10 +504,11 @@ restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   B24's "Real Ingress Runtime / Server-Side Relay Execution Foundation"
   section (immediately below) wires it into `connectAuto()`/
   `attemptCombined()` for real - a `RelayAttemptCandidate` CAN now be the
-  winner of a real Auto connect() request, though it still only ever
-  reaches `RelayIngressDialer.dial()`, which has no production
-  implementation that could actually establish a tunnel (see that section's
-  own docs). Preferred eventual topology remains: Android -> encrypted
+  winner of a real Auto connect() request, and its resolution converges into
+  the SAME `TransportOrchestrator`/`VpnController` dial path Direct uses
+  (see `RelayIngressResolver`'s own docs, PR #38 round 3) - though the ONLY
+  production resolver never leaves `NotProvisioned`, so a tunnel is never
+  actually established there today. Preferred eventual topology remains: Android -> encrypted
   transport to INGRESS -> ingress-controlled encrypted upstream to EXIT ->
   Internet, through the SAME single Android VPN ownership path
   (`VpnController`) - never a nested VpnService stack.
@@ -554,13 +555,65 @@ ingress<->exit are INDEPENDENT (never collapsed to one shared
   `END_TO_END_DATA_PLANE_OK` - fail-closed by TYPE CONSTRUCTION (a `Failure`
   literally cannot claim that stage - `init{}` enforces it), not by
   convention.
-- `RelayIngressDialer` - the real client<->ingress execution boundary a
-  future transport implementation fulfills. `NotProvisionedRelayIngressDialer`
-  is the ONLY implementation wired into production: it fails closed
-  (`EXECUTION_NOT_IMPLEMENTED`) for every plan, honestly, because dialing an
-  ingress over XRAY_REALITY/TLS_TCP needs a real per-ingress-provisioned
-  Xray client profile that cannot exist without a real ingress and a real
-  per-device activation against it (out of scope - "no new infrastructure").
+- **`RelayIngressResolver` - a PREPARATION boundary, never a second VPN
+  execution/state owner (PR #38 review fix, round 3).** An earlier version
+  of this had `RelayIngressDialer.dial()` itself return the TERMINAL
+  attempt outcome (including a `Success` case) - meaning a real
+  implementation would have had to independently drive a tunnel to
+  `END_TO_END_DATA_PLANE_OK` and report back, becoming a SECOND VPN
+  execution authority beside `TransportOrchestrator`/`VpnController`/the
+  real `VpnService` (violating "one Android VpnService owner, no second
+  connection controller"). Fixed before any real implementation was built
+  on the wrong seam: `RelayIngressResolver.resolve(plan)` now returns a
+  `RelayIngressResolution` - either `Resolved(transport, kind)` (a real,
+  already-constructed `VpnTransport` for the client<->ingress hop, reusing
+  the EXISTING Xray transport/service stack - task requirement 4/7, never a
+  bespoke networking path) or `NotProvisioned(category, detail)` (no real
+  credential exists to prepare one). `RelayIngressResolution` carries NO
+  state of its own - existing purely as data, never starting anything.
+  `MainViewModel.attemptRelayedAttempt` is what feeds a `Resolved` result
+  into the SAME `TransportOrchestrator.resolve`/`VpnController.connect`/
+  `PendingFailoverAttempt`/`armFailoverWatch` path a Direct candidate
+  already goes through - a fresh per-attempt `TransportRegistry` naming
+  only the resolved transport/kind, exactly mirroring how Direct already
+  builds a fresh registry per candidate. `PendingFailoverAttempt.relayPlan`
+  (non-null only for a relayed attempt) lets `armFailoverWatch`'s SAME real
+  `controller.state` observation - never this attempt's own belief, never
+  a resolver return value - govern both what gets recorded and whether the
+  combined sequence advances (task requirement 8). Critically: even when
+  `controller.state` genuinely reaches `TransportState.Connected` for the
+  resolved ingress transport (a REAL handshake, not faked), this branch
+  NEVER constructs `RelayAttemptOutcome.Success` - a client<->ingress
+  handshake alone only proves `RelayReadinessStage.INGRESS_HANDSHAKE_OK`,
+  never `UPSTREAM_EXIT_HANDSHAKE_OK`/`END_TO_END_DATA_PLANE_OK` (no
+  server-side upstream readiness signal channel exists yet - see that
+  enum's own docs), so it is recorded as a `Failure` instead, every time,
+  by construction (`RelayAttemptOutcome.Failure` cannot even represent
+  `END_TO_END_DATA_PLANE_OK` - its own `init{}` forbids it).
+  `NotProvisionedRelayIngressResolver` is the ONLY implementation wired
+  into production today: it reports `NotProvisioned(EXECUTION_NOT_IMPLEMENTED)`
+  for every plan, honestly, because preparing a real ingress transport over
+  XRAY_REALITY/TLS_TCP needs a real per-ingress-provisioned Xray client
+  profile that cannot exist without a real ingress and a real per-device
+  activation against it (out of scope - "no new infrastructure"). **Known,
+  named remaining gap** (explicitly not closed by this fix, since closing
+  it would mean redesigning shared, Direct-affecting `VpnController`/UI
+  code well beyond this task's narrow scope): `VpnController`'s OWN
+  pre-existing generic `recordPathHistory` also fires for a resolved
+  relay's `controller.connect()` call, writing a real but SEPARATE,
+  single-hop record keyed by the bare ingress endpoint id (never the
+  composite `historyPathId` relay scoring actually reads - harmless to
+  scoring, but see `MainViewModelRelayAttemptTest`'s own note). More
+  importantly, `TransportState.Connected` still drives the generic
+  `"Protected"` UI text application-wide (`ProductFlowPresentation
+  .toHomeStatusText`) with no awareness that an attempt was relayed - so a
+  FUTURE real `RelayIngressResolver` reaching genuine ingress-handshake
+  `Connected` would show "Protected" in the UI even though this codebase's
+  own relay-outcome bookkeeping correctly refuses to call it healthy. Since
+  `NotProvisionedRelayIngressResolver` never reaches that branch, this has
+  no production impact today - but a future slice wiring a real resolver
+  MUST also teach `VpnController`/the UI layer to distinguish a relayed
+  attempt before claiming "Protected" for one.
 - `AutoGatewaySelector.AutoConnectAttempt` (sealed `DirectAttempt`/
   `RelayedAttempt`) + `buildCombinedAttempts`/`nextCombinedAttempt` - ONE
   combined, real, ranked attempt list built from `buildCandidates` +
@@ -573,12 +626,15 @@ ingress<->exit are INDEPENDENT (never collapsed to one shared
   `GatewayAttemptCandidate.configSnapshot`, the same AWG->Xray intra-gateway
   failover, byte-for-byte (task requirement 7/8: no duplicated Direct
   execution logic, no second connection controller). A **Relayed** winner is
-  DIALED through `attemptRelayedAttempt`/`relayIngressDialer`, its outcome
-  recorded under the FULL `historyPathId` (task requirement 11 - never
-  poisons either hop's own Direct history). **PR #38 review fix**: on EITHER
-  shape's terminal failure - `attemptAutoCandidate`'s own `NotSelectable`
-  branch, `armFailoverWatch`'s async observation of a real Direct failure,
-  or `attemptRelayedAttempt`'s dialer `Failure` branch - control returns to
+  resolved via `attemptRelayedAttempt`/`relayIngressResolver`, and on
+  `Resolved` is ALSO dialed through that SAME `TransportOrchestrator`/
+  `VpnController` path (see the `RelayIngressResolver` bullet above); its
+  outcome is recorded under the FULL `historyPathId` (task requirement 11 -
+  never poisons either hop's own Direct history). **PR #38 review fix**: on
+  EITHER shape's terminal failure - `attemptAutoCandidate`'s own
+  `NotSelectable` branch, `armFailoverWatch`'s async observation of a real
+  Direct OR relayed failure, or `attemptRelayedAttempt`'s own
+  `NotProvisioned`/`NotSelectable` branches - control returns to
   `attemptCombined` with the SAME `(attempts, attemptedKeys)` state, so the
   VERY NEXT globally-ranked unattempted candidate is chosen regardless of
   shape. An earlier version of this row wrongly had a Direct winner
@@ -645,7 +701,7 @@ one.
 **Remaining condition to exercise any of this physically**: a real ingress
 host (DIRECT_IP first) running `xray_ingress_config_renderer`'s output,
 plus a real per-device activation against that ingress issuing a real Xray
-client profile, plus a real `RelayIngressDialer` implementation dialing it
+client profile, plus a real `RelayIngressResolver` implementation preparing it
 - none of which exist yet (task's own "no new infrastructure without
 approval").
 

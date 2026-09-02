@@ -102,15 +102,14 @@ class RelayExecutionTest {
         }
     }
 
-    // --- B24 - NotProvisionedRelayIngressDialer: no fake relay success ---
+    // --- B24 - NotProvisionedRelayIngressResolver: no fake relay success ---
 
     @Test
-    fun `NotProvisionedRelayIngressDialer always fails closed with EXECUTION_NOT_IMPLEMENTED - never a fabricated success`() = runTest {
-        val outcome = NotProvisionedRelayIngressDialer.dial(plan())
-        assertTrue(outcome is RelayAttemptOutcome.Failure)
-        val failure = outcome as RelayAttemptOutcome.Failure
-        assertEquals(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, failure.category)
-        assertFalse(failure.isHealthy)
+    fun `NotProvisionedRelayIngressResolver always reports NotProvisioned with EXECUTION_NOT_IMPLEMENTED - never a fabricated transport`() = runTest {
+        val resolution = NotProvisionedRelayIngressResolver.resolve(plan())
+        assertTrue(resolution is RelayIngressResolution.NotProvisioned)
+        val notProvisioned = resolution as RelayIngressResolution.NotProvisioned
+        assertEquals(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, notProvisioned.category)
     }
 
     @Test
@@ -119,5 +118,20 @@ class RelayExecutionTest {
         assertEquals(TransportKind.XRAY_REALITY, p.ingressBinding.kind)
         assertEquals(TransportKind.TLS_TCP, p.exitBinding.kind)
         assertTrue(p.ingressTransport != p.exitTransport)
+    }
+
+    // --- B24 review fix (PR #38, round 3) - RelayIngressResolver is a preparation boundary only ---
+
+    @Test
+    fun `RelayIngressResolution carries no state of its own - Resolved is only a transport and a kind, never an outcome`() {
+        val transport = net.pocvpn.client.vpn.FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val resolution = RelayIngressResolution.Resolved(transport, TransportKind.TLS_TCP)
+        // Structurally: Resolved has no `outcome`/`isHealthy`/`state` field
+        // to read - the only way to learn what happened is to actually
+        // dial `resolution.transport` through the real
+        // TransportOrchestrator/VpnController path and observe REAL
+        // controller.state, exactly like a Direct candidate.
+        assertEquals(transport, resolution.transport)
+        assertEquals(TransportKind.TLS_TCP, resolution.kind)
     }
 }

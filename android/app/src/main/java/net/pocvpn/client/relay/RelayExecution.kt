@@ -4,6 +4,7 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.VpnTransport
 
 /**
  * B24 - the real, immutable client-side execution contract for one relayed
@@ -62,11 +63,11 @@ enum class RelayReadinessStage {
      * The ingress's own encrypted upstream connection to the EXIT
      * succeeded. NOT directly observable from the client's own socket-level
      * view today (the client dials only the ingress - see
-     * [RelayIngressDialer]'s own docs) without a server-side readiness
+     * [RelayIngressResolver]'s own docs) without a server-side readiness
      * signal channel, which does not exist yet - this stage exists in the
      * typed vocabulary for when that channel is built, and so a future
-     * dialer can report it honestly rather than the model having no name
-     * for it at all.
+     * implementation can report it honestly rather than the model having no
+     * name for it at all.
      */
     UPSTREAM_EXIT_HANDSHAKE_OK,
 
@@ -83,7 +84,7 @@ enum class RelayFailureCategory {
     RELAY_AUTH_FAILED,
     END_TO_END_DATA_PLANE_FAILED,
 
-    /** B24 - this client build has no real [RelayIngressDialer] implementation wired (see that interface's own docs) - never a fabricated attempt outcome. */
+    /** B24 - this client build has no real [RelayIngressResolver] implementation wired (see that interface's own docs) - never a fabricated attempt outcome. */
     EXECUTION_NOT_IMPLEMENTED,
 }
 
@@ -120,32 +121,76 @@ sealed class RelayAttemptOutcome {
 }
 
 /**
- * B24 - the real client<->ingress execution boundary a future transport
- * implementation fulfills. Deliberately has NO production implementation in
- * this slice: dialing an ingress over XRAY_REALITY/TLS_TCP requires a real,
+ * B24 review fix (PR #38, round 3 - ownership boundary) - what
+ * [RelayIngressResolver.resolve] returns: EITHER the ingredients needed to
+ * feed the EXISTING `TransportOrchestrator`/`VpnController` dial path (never
+ * a live tunnel, never a state claim), or a typed reason it cannot be
+ * prepared at all.
+ *
+ * This is the architectural correction to an earlier version of this file,
+ * which had the resolver's own return value BE the terminal attempt
+ * outcome (including a `Success` case) - meaning a real implementation
+ * would have had to independently drive the tunnel to
+ * `END_TO_END_DATA_PLANE_OK` and report back, making it a SECOND VPN
+ * execution/state authority beside `VpnController`. That was fixed before
+ * any real implementation was built on it: `RelayIngressResolver` now only
+ * ever prepares data - actual tunnel start/stop and Connected/Protected
+ * state ownership stay entirely with `TransportOrchestrator`/
+ * `VpnController`/the existing `VpnService`, the SAME single ownership path
+ * Direct already uses (task requirement 1/2/3 - "no second connection
+ * controller").
+ */
+sealed class RelayIngressResolution {
+    /**
+     * The real, already-constructed [VpnTransport] (and the [TransportKind]
+     * it implements) to dial for the client<->ingress hop, pinned to
+     * [RelayedExecutionPlan.ingressBinding]/[RelayedExecutionPlan
+     * .ingressTransport] - reuses the EXISTING Xray transport/service stack
+     * (task requirement 4/7), never a bespoke networking path. Handing this
+     * to `TransportOrchestrator.resolve`/`VpnController.connect` is the
+     * CALLER's job (`MainViewModel`) - this type carries no state of its
+     * own and starts nothing by existing.
+     */
+    data class Resolved(val transport: VpnTransport, val kind: TransportKind) : RelayIngressResolution()
+
+    /** No real ingress client profile/credential is available to prepare a dial with - a typed reason, never a fabricated attempt. */
+    data class NotProvisioned(val category: RelayFailureCategory, val detail: String? = null) : RelayIngressResolution()
+}
+
+/**
+ * B24 review fix (PR #38, round 3) - the real client<->ingress PREPARATION
+ * boundary a future implementation fulfills: given a pinned
+ * [RelayedExecutionPlan], produce either a real [VpnTransport] ready to be
+ * dialed through the existing `TransportOrchestrator`/`VpnController` path,
+ * or a typed reason it cannot be (see [RelayIngressResolution]'s own docs
+ * for exactly why this is a RESOLVER, not a dialer that owns state).
+ *
+ * Deliberately has NO production implementation in this slice: preparing an
+ * ingress Xray transport over XRAY_REALITY/TLS_TCP requires a real,
  * per-ingress-provisioned Xray client profile (the SAME per-endpoint
  * credential discipline `VpnController` already requires for a real
  * gateway - see PROJECT_ARCHITECTURE.md's Xray address-authority note), and
  * no such profile can exist for an ingress that isn't deployed and that no
  * device has been activated against (task's own "no new infrastructure"
- * constraint this slice). [NotProvisionedRelayIngressDialer] is the ONLY
- * implementation wired into production - it fails closed for every plan,
- * honestly, rather than attempting a connection with no real credential
- * behind it (which would either crash outright or, worse, silently
- * misbehave). A future slice that deploys a real ingress and wires
- * per-ingress activation supplies a real implementation here - the call
- * site in `MainViewModel` never changes.
+ * constraint this slice). [NotProvisionedRelayIngressResolver] is the ONLY
+ * implementation wired into production - it reports [RelayIngressResolution
+ * .NotProvisioned] for every plan, honestly, rather than attempting to
+ * prepare a transport with no real credential behind it (which would
+ * either crash outright or, worse, silently misbehave). A future slice
+ * that deploys a real ingress and wires per-ingress activation supplies a
+ * real implementation here that constructs a real Xray transport from that
+ * profile - the call site in `MainViewModel` (feed the result into
+ * `TransportOrchestrator`/`VpnController`, exactly like Direct) never
+ * changes.
  */
-fun interface RelayIngressDialer {
-    suspend fun dial(plan: RelayedExecutionPlan): RelayAttemptOutcome
+fun interface RelayIngressResolver {
+    suspend fun resolve(plan: RelayedExecutionPlan): RelayIngressResolution
 }
 
-/** B24 - the production default: fails closed, honestly, for every plan (see [RelayIngressDialer]'s own docs). Never simulates traffic. */
-object NotProvisionedRelayIngressDialer : RelayIngressDialer {
-    override suspend fun dial(plan: RelayedExecutionPlan): RelayAttemptOutcome = RelayAttemptOutcome.Failure(
-        plan = plan,
-        highestStageReached = null,
+/** B24 - the production default: reports [RelayIngressResolution.NotProvisioned] for every plan, honestly (see [RelayIngressResolver]'s own docs). Never simulates a transport, never simulates traffic. */
+object NotProvisionedRelayIngressResolver : RelayIngressResolver {
+    override suspend fun resolve(plan: RelayedExecutionPlan): RelayIngressResolution = RelayIngressResolution.NotProvisioned(
         category = RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED,
-        detail = "no RelayIngressDialer is provisioned for ingress ${plan.ingressEndpointId.value}",
+        detail = "no RelayIngressResolver is provisioned for ingress ${plan.ingressEndpointId.value}",
     )
 }
