@@ -339,6 +339,11 @@ object AutoGatewaySelector {
         val exitRegion: String,
         val score: Long,
         val reasons: List<String>,
+        // B24 - copied straight off the underlying PathCandidate.Relayed's
+        // own historyPathId (see that property's own docs) - a pure formula
+        // over the already-pinned fields above, never a second/independent
+        // encoding that could drift from it.
+        val historyPathId: String,
     )
 
     /**
@@ -453,7 +458,95 @@ object AutoGatewaySelector {
                 exitRegion = candidate.exit.endpoint.region,
                 score = result.score,
                 reasons = result.reasons,
+                historyPathId = candidate.historyPathId,
             )
         }
+    }
+
+    /**
+     * B24 - ONE combined, executable attempt: either a [DirectAttempt] or a
+     * [RelayedAttempt], carrying the SAME already-scored candidate object
+     * [buildCandidates]/[buildRelayedCandidates] produced - never a
+     * re-derived summary. [attemptKey] is the stable identity
+     * [nextCombinedAttempt] advances past once attempted, byte-for-byte the
+     * same (gatewayId, transport) shape Direct's own bounded-failover
+     * already used pre-B24 for [DirectAttempt], and the Relayed candidate's
+     * own [RelayAttemptCandidate.historyPathId] (already unique per
+     * ingress/exit/transport-pair - see that property's own docs) for
+     * [RelayedAttempt].
+     */
+    sealed class AutoConnectAttempt {
+        abstract val score: Long
+        abstract val reasons: List<String>
+        abstract val attemptKey: String
+
+        data class DirectAttempt(val candidate: GatewayAttemptCandidate) : AutoConnectAttempt() {
+            override val score: Long = candidate.score
+            override val reasons: List<String> = candidate.reasons
+            override val attemptKey: String = "direct:${candidate.gatewayId.name}:${candidate.transport}"
+        }
+
+        data class RelayedAttempt(val candidate: RelayAttemptCandidate) : AutoConnectAttempt() {
+            override val score: Long = candidate.score
+            override val reasons: List<String> = candidate.reasons
+            override val attemptKey: String = candidate.historyPathId
+        }
+    }
+
+    /**
+     * B24 - task requirement 4: "build ONE combined executable attempt plan
+     * containing Direct and Relayed candidates. Do not maintain separate
+     * ranking/execution loops that can disagree." Builds BOTH
+     * [buildCandidates] (Direct - completely unchanged, same parameters,
+     * same call, same result) and [buildRelayedCandidates] (Relayed) from
+     * the SAME evidence accessors, wraps each into [AutoConnectAttempt], and
+     * ranks the combined list by [AutoConnectAttempt.score] - the EXACT
+     * `PathScorer.score` value each candidate already carries, so a
+     * Direct/Relayed comparison is never a second, independent scoring rule,
+     * only a merge of two already-scored lists. Ties broken by [attemptKey]
+     * for full determinism. The caller (`MainViewModel.connectAuto()`) hands
+     * the resulting winner - whichever type it is - directly to execution
+     * (`attemptAutoCandidate`/a relayed counterpart), so the candidate
+     * scoring picked is provably the SAME one execution receives.
+     */
+    fun buildCombinedAttempts(
+        manifestEndpoints: List<EndpointDescriptor>,
+        gatewayFactsFor: (EndpointId) -> ProductionGatewayDescriptor?,
+        provisioned: (ProductionGatewayId) -> Boolean,
+        clientTunnelIp: (ProductionGatewayId) -> String?,
+        registryFor: (EndpointId) -> TransportRegistry,
+        xrayAvailableFor: (EndpointId) -> Boolean,
+        xrayTlsAvailableFor: (EndpointId) -> Boolean,
+        reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability,
+        transportHealthFor: (TransportKind) -> TransportHealth,
+        historyFor: (String, TransportKind) -> PathHistoryEntry?,
+        preference: UserTransportPreference = UserTransportPreference.Auto,
+        nowEpochMillis: Long = Long.MAX_VALUE,
+    ): List<AutoConnectAttempt> {
+        val direct = buildCandidates(
+            manifestEndpoints, gatewayFactsFor, provisioned, clientTunnelIp, registryFor,
+            xrayAvailableFor, xrayTlsAvailableFor, reachabilityFor, transportHealthFor, historyFor,
+            preference, nowEpochMillis,
+        )
+        val relayed = buildRelayedCandidates(
+            manifestEndpoints, registryFor, reachabilityFor, transportHealthFor, historyFor,
+            preference, nowEpochMillis,
+        )
+        val combined: List<AutoConnectAttempt> =
+            direct.map { AutoConnectAttempt.DirectAttempt(it) } + relayed.map { AutoConnectAttempt.RelayedAttempt(it) }
+        return combined.sortedWith(compareByDescending<AutoConnectAttempt> { it.score }.thenBy { it.attemptKey })
+    }
+
+    /**
+     * B24 - the combined-attempt counterpart of [nextCandidate]: advances
+     * [attempts] (already ranked, from [buildCombinedAttempts]) past every
+     * [AutoConnectAttempt.attemptKey] in [attemptedKeys], sharing the SAME
+     * [MAX_ATTEMPTS] bound across Direct AND Relayed attempts together (one
+     * combined budget, never a separate one per type - task's own "no
+     * unbounded retries").
+     */
+    fun nextCombinedAttempt(attempts: List<AutoConnectAttempt>, attemptedKeys: Set<String>): AutoConnectAttempt? {
+        if (attemptedKeys.size >= MAX_ATTEMPTS) return null
+        return attempts.firstOrNull { it.attemptKey !in attemptedKeys }
     }
 }
