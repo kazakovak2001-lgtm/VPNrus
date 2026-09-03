@@ -49,7 +49,8 @@ class ActivationResilienceCoordinator(
         data class Success(val result: ProvisioningResult.Success, val originIndex: Int) : Outcome()
         /** A terminal, non-retryable rejection (Unauthorized/Revoked/Expired/DeviceLimitReached/BadRequest) - never tried against another origin, see [TrustedOriginRequestExecutor]'s own stopOnReasons docs. */
         data class Rejected(val result: ProvisioningResult) : Outcome()
-        data class AllOriginsExhausted(val failures: List<TrustedOriginRequestExecutor.OriginFailure>) : Outcome()
+        /** [lastResult] is the raw [ProvisioningResult] the LAST origin attempted actually returned (e.g. `ServiceUnavailable`/`MalformedResponse`/`NetworkError`) - carried so a caller that needs the exact pre-B30 per-status UI mapping can still reconstruct it, never losing fidelity to a coarser reason alone. With today's real, single-origin-per-gateway trusted configuration (see [ControlPlaneOriginSetBuilder]'s own docs) this is always simply "the one attempt's own result", byte-for-byte the same value a pre-B30 caller would have seen directly. */
+        data class AllOriginsExhausted(val failures: List<TrustedOriginRequestExecutor.OriginFailure>, val lastResult: ProvisioningResult) : Outcome()
     }
 
     fun activate(
@@ -75,6 +76,9 @@ class ActivationResilienceCoordinator(
         // richer ProvisioningResult a caller needs to show e.g. "revoked"
         // vs "expired" distinctly.
         var terminalRejection: ProvisioningResult? = null
+        // The LAST origin's own raw result, regardless of outcome - see
+        // Outcome.AllOriginsExhausted.lastResult's own docs for why.
+        var lastResult: ProvisioningResult? = null
 
         val originIndexOf = origins.withIndex().associate { (i, o) -> o to i }
         val executed = TrustedOriginRequestExecutor.execute(
@@ -89,6 +93,7 @@ class ActivationResilienceCoordinator(
             },
             callPerOrigin = { origin ->
                 val result = callActivate(origin, publicKey, activationCredential)
+                lastResult = result
                 val reason = classifyProvisioningResultFailure(result)
                 if (reason == null) {
                     TrustedOriginRequestExecutor.OriginCallResult.Success(result as ProvisioningResult.Success)
@@ -113,7 +118,7 @@ class ActivationResilienceCoordinator(
                     Outcome.Rejected(rejection)
                 } else {
                     diagnosticsRecorder?.recordActivationFailed(ControlPlaneFailureReason.ALL_ORIGINS_EXHAUSTED)
-                    Outcome.AllOriginsExhausted(executed.failures)
+                    Outcome.AllOriginsExhausted(executed.failures, lastResult!!)
                 }
             }
         }

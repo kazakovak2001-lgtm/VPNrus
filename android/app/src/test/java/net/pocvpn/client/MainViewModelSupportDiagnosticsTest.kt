@@ -157,4 +157,74 @@ class MainViewModelSupportDiagnosticsTest {
         val bundle = buildSupportBundle(viewModel.recentDiagnosticSessions(), "1.0", 1L, nowEpochMillis = 0L)
         assertTrue(bundle.sessions.isEmpty())
     }
+
+    // B30 review fix (blocker 2's own required test) - through the REAL
+    // MainViewModel.activateDevice() path (not the isolated
+    // ActivationResilienceCoordinator unit test), proves the resulting
+    // diagnostic session never carries an origin host/IP/URL/credential.
+    @Test
+    fun `B30 - activateDevice's real diagnostics never carry an origin host, IP, URL, or credential`() = runTest {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(store, appVersionName = "1.0", appVersionCode = 1L)
+        val origins = listOf(
+            net.pocvpn.client.controlplane.ControlPlaneOrigin(
+                net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
+                "super-secret-origin-host.invalid",
+            ),
+        )
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "device-public-key"),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            supportDiagnosticsRecorder = recorder,
+            supportDiagnosticsStore = store,
+            activationClient = { _, _ ->
+                net.pocvpn.client.provisioning.ProvisioningResult.Success(
+                    clientTunnelIp = "10.77.0.5",
+                    gatewayPublicKey = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.serverPublicKeyBase64,
+                    gatewayTunnelIp = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.gatewayTunnelIp,
+                    endpointHost = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.endpointHost,
+                    endpointPort = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.endpointPort,
+                )
+            },
+            controlPlaneOriginsForActivation = { origins },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        // activateDevice() itself is a standalone setup action (not part of
+        // connectAuto/connectManual's own session) - open a session the same
+        // way a real connect flow would, so its diagnostic events are
+        // actually captured (see SupportDiagnosticsRecorder.record()'s own
+        // "no-op with nothing open" rule) rather than silently discarded.
+        recorder.startSession(
+            SupportDiagnosticsRecorder.StartContext(
+                networkType = NetworkType.WIFI,
+                networkValidatedInternet = true,
+                networkCaptivePortal = false,
+                networkIpv4Available = true,
+                networkIpv6Available = false,
+                networkFingerprintId = null,
+                rawRestrictionClass = net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN,
+                stabilizedRestrictionClass = net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN,
+                routingMode = net.pocvpn.client.vpn.policy.RoutingMode.FULL_VPN,
+                gatewaySelectionMode = net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO,
+            ),
+        )
+        viewModel.activateDevice("super-secret-activation-credential")
+        testDispatcher.scheduler.runCurrent()
+        recorder.finishProtected()
+
+        val session = store.recent().single()
+        assertTrue(session.events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.ACTIVATION_STARTED })
+        assertTrue(session.events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.ACTIVATION_SUCCEEDED })
+        val allTagValues = session.events.flatMap { it.tags.values }
+        allTagValues.forEach { value ->
+            assertFalse(value.contains("super-secret-origin-host"))
+            assertFalse(value.contains("super-secret-activation-credential"))
+            assertFalse(value.contains("://"))
+        }
+    }
 }

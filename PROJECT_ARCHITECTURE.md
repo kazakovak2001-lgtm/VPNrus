@@ -1482,6 +1482,112 @@ Russia whitelist bypass, which remains UNVERIFIED.
 
 ## Resilient Activation & Control-Plane Access (B30) - FOUNDATION
 
+**PR #44 review fix (2026-09-03)** - two blockers fixed:
+
+1. **`MainViewModel.activateDevice()`'s real network call now genuinely
+   routes through `ActivationResilienceCoordinator`** (it did not before -
+   the coordinator previously existed only as tested-but-unused
+   foundation code). `activateDevice` builds `origins` via a new
+   `controlPlaneOriginsForActivation` constructor seam (defaults to
+   `ControlPlaneOriginSetBuilder::forGateway`, the real production
+   builder), calls `activationResilienceCoordinator.activate(...)` with
+   `hasValidLocalActivation = { false }` (this is an explicit,
+   user-triggered action - it must always actually attempt the network,
+   never silently skip because some prior local state happens to exist),
+   and unwraps the resulting `Outcome` back into the SAME `ProvisioningResult`
+   every pre-existing downstream line already branches on
+   (`Outcome.Success.result`/`Outcome.Rejected.result`/
+   `Outcome.AllOriginsExhausted.lastResult`) - the ~250-line success/
+   persistence block (gateway-identity `matchGatewayId` cross-check,
+   `gatewayConfigOverride.apply`/`profileStore.write`/
+   `clientTunnelIdentityStore.write`, Xray/TLS provisioning chain,
+   `reconcileSelectedGatewayIfNeeded`) is untouched, byte-for-byte the same
+   code, now fed a `result` that may have come from a later origin instead
+   of only ever the first. `retryActivation()` already called
+   `activateDevice` verbatim, so Retry automatically reuses the same
+   resilient path - no bypass. `Outcome.AllOriginsExhausted` gained a
+   `lastResult: ProvisioningResult` field specifically so this unwrapping
+   is possible without losing per-status UI fidelity (`ServiceUnavailable`/
+   `MalformedResponse`/`NetworkError` still map to their pre-existing
+   `ProvisioningUiState.Error` variants when only one real origin exists,
+   today's actual production case). Manual `recordActivationStarted`/
+   `recordActivationSucceeded`/`recordActivationFailed` calls in
+   `activateDevice` were removed (the coordinator now records these
+   itself) except one narrow addition: a client-side gateway-identity
+   mismatch (a wire-level Success that `matchGatewayId` then rejects) is
+   recorded as an additional `TRUST_VALIDATION_REJECTED` failure, since the
+   coordinator's own narrow view already recorded `ACTIVATION_SUCCEEDED`
+   for the wire response alone.
+2. **Trusted-origin audit, performed rather than assumed**: decoded the
+   embedded signed bootstrap manifest's canonical bytes directly (see
+   `EmbeddedBootstrapManifest.kt`) - each of Germany's and Stockholm's
+   `EndpointDescriptor`s carries exactly ONE host across all three
+   transport bindings (AWG/51820, a second VPN-transport port/2053,
+   TLS/2083 - different PORTS/PROTOCOLS on the SAME IP, not alternate
+   hosts, and none of them an HTTP activation-API port anyway). Audited
+   `gateway/api/activations.py`: activation state is a durable JSON store
+   **local to each gateway's own VPS filesystem** - Germany and Stockholm
+   run fully independent `pocvpn-api` processes with independent
+   credential-digest-keyed stores; a credential valid on one has no
+   meaning to the other (confirmed independently by
+   `ProductionGatewayCatalog.matchGatewayId`'s own full-fact,
+   never-guessed-at matching). **Conclusion: no genuine second trusted
+   control-plane origin exists today, for either gateway** - the two
+   production gateways are NOT interchangeable activation backends, and
+   there is no alternate edge/host for either one's own control plane in
+   any compiled or signed trusted data. Per the review's own accepted
+   alternative ("report the architecture blocker instead of fabricating
+   failover"), `ControlPlaneOriginSetBuilder.forGateway()` was left
+   unchanged (still exactly one real origin per gateway) - inventing a
+   second host would violate the "never accept/invent an untrusted origin"
+   invariant this same slice exists to enforce. Provisioning a genuine
+   second edge (e.g. a load balancer/CDN edge sharing the SAME backend
+   store) is real infrastructure work requiring explicit owner approval per
+   this repo's own rules, out of scope for a client-only PR.
+   `controlPlaneOriginsForActivation` (see point 1) makes the FALLBACK
+   MECHANISM itself verifiable today anyway: a new
+   `MainViewModelActivationGatewayIdentityTest` integration test injects a
+   synthetic two-origin list through this real seam and proves
+   `activateDevice()` genuinely retries and persists a later origin's
+   success - the mechanism is proven correct through the real production
+   code path even though real production data cannot yet exercise it with
+   two DIFFERENT physical hosts.
+3. **Xray/TLS profile fetch now also genuinely routed through the executor**
+   (review's own "verify all profile retrieval endpoints... are actually
+   wired through it, not only instrumented"): `XrayProfileProvisioner`/
+   `XrayTlsProfileProvisioner` gained additive nullable `gatewayId`/
+   `diagnosticsRecorder` params (both null preserves the exact old
+   single-call behavior for every pre-B30 test/call site); when
+   `gatewayId` is set (now true for all four Factory-constructed
+   instances - Germany and Stockholm, REALITY and TLS), `provision()`
+   routes its fetch through the new `fetchThroughTrustedOrigins` helper
+   (`controlplane/TrustedOriginProfileFetch.kt`) - the SAME
+   `TrustedOriginRequestExecutor`/`ControlPlaneOriginSetBuilder`
+   activation uses, generalized for any gateway-scoped fetch.
+   `IngressProfileProvisioner` (relay/ingress profile fetch) deliberately
+   stays diagnostics-instrumented only, NOT routed through this same
+   mechanism: an ingress endpoint is `EndpointId`-scoped, not
+   `ProductionGatewayId`-scoped (need not be one of the two production
+   gateways at all), so forcing it into the gateway-identified origin
+   model would misrepresent what is actually trusted for it - its own
+   single, already-pinned `ingressBinding.host` is the ONLY origin that
+   could ever be correct for that specific ingress.
+- **New tests**: `TrustedOriginProfileFetchTest` (executor reuse for
+  profile fetch, `classifyXrayProfileResultFailure`/
+  `classifyXrayTlsProfileResultFailure` exhaustive mapping),
+  `MainViewModelActivationGatewayIdentityTest` additions (primary-fails/
+  secondary-succeeds applied+persisted through the REAL activateDevice
+  flow; malformed primary response leaves no partial state and the
+  secondary's success is what persists; all-origins-exhausted produces
+  the required friendly message with no host/exception leakage;
+  authorization rejection stops fallback with the secondary never
+  attempted), `MainViewModelSupportDiagnosticsTest` addition (activateDevice's
+  real diagnostics carry no origin host/IP/URL/credential). All new + full
+  existing suite green (1190 total, the same one pre-existing unrelated
+  `EffectiveConfigDiffTest` failure); `compileDebugKotlin`/
+  `testDebugUnitTest`/`assembleDebug` all re-verified green after these
+  fixes.
+
 Architecture goal: activation/profile-retrieval network calls (POST
 `/v1/activate`/`/v1/xray-profile`/`/v1/ingress-profile` via
 `ProvisioningClient`) become bounded, typed, and origin-list-driven rather
@@ -1570,17 +1676,11 @@ UNVERIFIED.
   `gatewayConfigOverride`/`profileStore`/`clientTunnelIdentityStore` writes
   to the caller, unchanged from `MainViewModel.activateDevice`'s own
   existing "only after full validation, never partial" ordering.
-  **Scope limit, stated plainly**: `MainViewModel.activateDevice`'s
-  primary network call itself is NOT cut over to this coordinator in this
-  slice - deliberately, to avoid a large, high-risk refactor of that
-  ~250-line, heavily-tested function under this slice's time budget. What
-  IS wired into it for real: `recordActivationStarted`/
-  `recordActivationSucceeded`/`recordActivationFailed` diagnostics
-  bracketing the existing call (zero behavior change), plus
-  `activationFailureMessage` (task 6) and `retryActivation()` (task 7,
-  below). Cutting `activateDevice` over to the coordinator for genuine
-  per-call multi-origin activation is explicit, tracked follow-up work, not
-  an oversight.
+  **PR #44 review fix**: `MainViewModel.activateDevice`'s primary network
+  call now genuinely routes through this coordinator (see this section's
+  own "PR #44 review fix" note at the top for the full detail) - the
+  scope-limited "foundation only, not wired in" state described in the
+  original B30 slice no longer holds.
 - **First-run failure UX / Retry (task 6/7, `provisioning/ActivationFailureMessage.kt`,
   `MainViewModel.activationFailureMessage`/`retryActivation`)**:
   `activationFailureMessage: StateFlow<String?>` is a pure DERIVED
@@ -1657,20 +1757,26 @@ UNVERIFIED.
   touched this slice (server-side idempotent activation, confirmed via
   `gateway/api/activations.py`'s existing credential-digest locking, was
   sufficient - no server change needed).
-- **Not done this slice**: `MainViewModel.activateDevice`'s own network call
-  is not yet cut over to `ActivationResilienceCoordinator` for genuine
-  per-call multi-origin fallback (see that class's own "scope limit" docs
-  above) - today it still calls the pre-bound, single-host `activationClient`/
-  `stockholmActivationClient` lambdas directly; production `ProductionGatewayCatalog`
-  data also currently carries only one physical origin per gateway, so
-  even a cutover would not yet exercise real cross-origin fallback (the
-  executor's own N-origin capability is proven with synthetic test
-  origins, not live redundant infrastructure); no live-HTTPS integration
-  test proves the redirect lock-down against a real 3xx response (no mock
-  HTTPS server in this test setup - covered by code-level review plus a
-  unit-level executor test asserting a redirect-classified failure is never
-  treated as success); this does NOT prove Russia hard-whitelist bypass,
-  which remains UNVERIFIED.
+- **Not done this slice**: production `ProductionGatewayCatalog`/signed
+  manifest data currently carries only one physical origin per gateway
+  (audited, see this section's "PR #44 review fix" note - Germany and
+  Stockholm are confirmed NOT interchangeable activation backends, and no
+  alternate edge/host exists for either one's own control plane), so even
+  though `activateDevice` now genuinely routes through
+  `ActivationResilienceCoordinator`, real production traffic cannot yet
+  exercise cross-HOST fallback - the executor's own N-origin capability is
+  proven correct through the real `activateDevice()` code path via an
+  injected test seam (`controlPlaneOriginsForActivation`), not live
+  redundant infrastructure; provisioning a genuine second edge is real
+  infrastructure work requiring explicit owner approval, out of scope
+  here. `IngressProfileProvisioner` (relay/ingress profile fetch) is not
+  routed through the same gateway-scoped executor (see this section's own
+  reasoning for why that would misrepresent its `EndpointId`-scoped
+  trust). No live-HTTPS integration test proves the redirect lock-down
+  against a real 3xx response (no mock HTTPS server in this test setup -
+  covered by code-level review plus a unit-level executor test asserting a
+  redirect-classified failure is never treated as success); this does NOT
+  prove Russia hard-whitelist bypass, which remains UNVERIFIED.
 
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
