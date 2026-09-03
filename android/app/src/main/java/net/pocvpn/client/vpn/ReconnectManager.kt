@@ -47,6 +47,68 @@ internal class NetworkAvailabilitySet {
 }
 
 /**
+ * B30B review fix (PR #46) - the blocker: [AndroidReconnectManager]'s own
+ * `stop()` unregistered the Android callback but never reset ITS SHARED
+ * [NetworkAvailabilitySet]/`networkAvailable` fields, so a network id (or a
+ * stale "still available" flag) from an OLD start()/stop() lifetime could
+ * leak into a NEW one - e.g. stop() while a network was up, then start()
+ * again with genuinely nothing available, would still report
+ * isNetworkAvailable()==true from the never-cleared old state.
+ *
+ * Fix: each start() begins a brand-new GENERATION with its own fresh
+ * [NetworkAvailabilitySet] and `networkAvailable=false` - the "construct a
+ * fresh instance per registration lifetime" design, not a shared-field
+ * reset, specifically because it ALSO closes the race a mere reset() could
+ * not: an in-flight callback invocation from an OLD registration (already
+ * posted before `stop()`'s `unregisterNetworkCallback` takes effect - Android
+ * gives no synchronous guarantee against this) is tagged with the OLD
+ * generation number at capture time (see [AndroidReconnectManager.start]),
+ * so [onAvailable]/[onLost] below reject it outright rather than letting it
+ * mutate the NEW generation's state - structurally impossible for a stale
+ * callback to corrupt the current one, not merely "unlikely". Pulled out
+ * pure/Android-type-free (same reasoning as [NetworkAvailabilitySet] itself)
+ * so this exact lifecycle-reset/stale-callback-rejection behavior is
+ * directly unit-testable.
+ */
+internal class ReconnectAvailabilityLifecycle {
+    private var currentGeneration = 0L
+    private var availability = NetworkAvailabilitySet()
+
+    @Volatile var networkAvailable = false
+        private set
+
+    /** Starts a fresh generation - empty availability, networkAvailable=false - and returns its id. */
+    fun beginGeneration(): Long {
+        currentGeneration++
+        availability = NetworkAvailabilitySet()
+        networkAvailable = false
+        return currentGeneration
+    }
+
+    /** Ends whatever generation is current - bumps the generation id (so any still-in-flight callback tagged with it is now stale) and clears networkAvailable. */
+    fun endGeneration() {
+        currentGeneration++
+        networkAvailable = false
+    }
+
+    /** Returns true exactly when [generation] is current AND this call transitions empty -> non-empty for it - a stale [generation] is silently ignored. */
+    fun onAvailable(generation: Long, id: Any): Boolean {
+        if (generation != currentGeneration) return false
+        val transitioned = availability.markAvailable(id)
+        networkAvailable = true
+        return transitioned
+    }
+
+    /** Returns true exactly when [generation] is current AND this call transitions non-empty -> empty for it - a stale [generation] is silently ignored. */
+    fun onLost(generation: Long, id: Any): Boolean {
+        if (generation != currentGeneration) return false
+        val lostAll = availability.markLost(id)
+        if (lostAll) networkAvailable = false
+        return lostAll
+    }
+}
+
+/**
  * B30B physical-validation fix - root cause: [ConnectivityManager
  * .registerDefaultNetworkCallback] reports changes to THIS APP'S OWN default
  * network, which - once this app's VpnService has established its own tun
@@ -89,31 +151,28 @@ class AndroidReconnectManager(context: Context) : ReconnectManager {
     private val connectivityManager =
         context.applicationContext.getSystemService(ConnectivityManager::class.java)
     private var callback: ConnectivityManager.NetworkCallback? = null
-    private val availability = NetworkAvailabilitySet()
-
-    @Volatile private var networkAvailable = false
+    private val lifecycle = ReconnectAvailabilityLifecycle()
 
     override fun start(onNetworkLost: () -> Unit, onNetworkAvailable: () -> Unit) {
         stop()
+        // B30B review fix (PR #46) - this generation id is captured HERE, in
+        // this specific start() call's own local val, then closed over by
+        // the callback below - a callback instance from a PREVIOUS start()
+        // carries the PREVIOUS (now-stale) generation baked into ITS OWN
+        // closure, so it can never be confused with this one even if it
+        // fires late (see ReconnectAvailabilityLifecycle's own docs).
+        val generation = lifecycle.beginGeneration()
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (availability.markAvailable(network)) {
-                    networkAvailable = true
-                    onNetworkAvailable()
-                } else {
-                    networkAvailable = true
-                }
+                if (lifecycle.onAvailable(generation, network)) onNetworkAvailable()
             }
 
             override fun onLost(network: Network) {
-                if (availability.markLost(network)) {
-                    networkAvailable = false
-                    onNetworkLost()
-                }
+                if (lifecycle.onLost(generation, network)) onNetworkLost()
             }
         }
         callback = cb
@@ -129,9 +188,10 @@ class AndroidReconnectManager(context: Context) : ReconnectManager {
             }
         }
         callback = null
+        lifecycle.endGeneration()
     }
 
-    override fun isNetworkAvailable(): Boolean = networkAvailable
+    override fun isNetworkAvailable(): Boolean = lifecycle.networkAvailable
 }
 
 /** Bounded exponential backoff with jitter. Pure/deterministic when `random` is fixed, for tests. */
