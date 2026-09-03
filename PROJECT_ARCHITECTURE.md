@@ -1482,7 +1482,56 @@ Russia whitelist bypass, which remains UNVERIFIED.
 
 ## Resilient Activation & Control-Plane Access (B30) - FOUNDATION
 
-**PR #44 review fix (2026-09-03)** - two blockers fixed:
+**PR #44 review fix, round 2 (2026-09-03) - origin-discarding blocker
+fixed.** The round-1 fix wired `activateDevice()`/Xray/TLS profile fetch
+through `TrustedOriginRequestExecutor`/`fetchThroughTrustedOrigins`
+structurally, but every actual per-origin network callback still discarded
+the `ControlPlaneOrigin` it was handed and re-dialed the SAME pre-bound
+host every time - a 2-origin executor iterating the SAME request twice
+(retry, not failover). Fixed by making every gateway-scoped network seam
+genuinely **origin-aware**:
+
+- `MainViewModel.activationClient`/`stockholmActivationClient` changed
+  from `(publicKey, activationCredential) -> ProvisioningResult` to
+  `(origin: ControlPlaneOrigin, publicKey, activationCredential) -> ProvisioningResult`,
+  both now sharing the SAME origin-driven default -
+  `{ origin, pk, cred -> ProvisioningClient.activate(pk, cred, origin.host) }`
+  - no gateway-specific hardcoded host needed anymore, since
+    `origin.host` already carries whichever gateway's real host
+    `ControlPlaneOriginSetBuilder.forGateway` resolved it from.
+  - `activateDevice`'s `callActivate = { origin, pk, cred -> client(origin, pk, cred) }`
+    now genuinely forwards `origin` instead of discarding it.
+- `XrayProfileProvisioner.fetchXrayProfile`/`XrayTlsProfileProvisioner.fetchXrayTlsProfile`
+  changed the same way - `(origin, publicKey, activationCredential) -> XrayProfileResult`/
+  `XrayTlsProfileResult`, defaulting to
+  `{ origin, pk, cred -> ProvisioningClient.fetchXrayProfile(pk, cred, origin.host) }`
+  (and the TLS equivalent). `gatewayId` on both classes changed from
+  nullable (opt-in origin routing) to non-null, defaulting to `GERMANY`
+  (this codebase's own existing "Germany-default" convention) - `provision()`
+  now ALWAYS routes through `fetchThroughTrustedOrigins`, never a second,
+  parallel non-origin-aware code path that could silently diverge from the
+  real one. The Stockholm-specific `fetchXrayProfile`/`fetchXrayTlsProfile`
+  overrides in `MainViewModel.Factory.create` (previously hand-building the
+  Stockholm host) were removed entirely - the new default, combined with
+  `gatewayId = STOCKHOLM`, already resolves the correct host via
+  `ControlPlaneOriginSetBuilder`.
+- Every pre-existing test call site supplying a 2-arg
+  `activationClient`/`stockholmActivationClient`/`fetchXrayProfile`/
+  `fetchXrayTlsProfile` lambda was updated to the new 3-arg (origin-first)
+  shape - mechanical, behavior-preserving for tests that don't care about
+  origin (they just add a leading `_`).
+- **New tests directly prove host-level routing** (not just call count):
+  `MainViewModelActivationGatewayIdentityTest` gained
+  `primaryOrigin`/`secondaryOrigin` fixtures with real, distinct hostnames
+  (`"primary.example"`/`"secondary.example"`) and a fake `activationClient`
+  that branches ON `origin.host` and records every host it was actually
+  called with - asserting the exact sequence
+  `["primary.example", "secondary.example"]` for the fallback case and
+  `["primary.example"]` only for the authorization-rejection-stops-early
+  case. This is the proof a synthetic 2-origin executor could otherwise
+  silently dial the same host twice without any test catching it.
+
+**PR #44 review fix, round 1 (2026-09-03)** - two blockers fixed:
 
 1. **`MainViewModel.activateDevice()`'s real network call now genuinely
    routes through `ActivationResilienceCoordinator`** (it did not before -

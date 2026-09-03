@@ -180,7 +180,7 @@ class MainViewModelSupportDiagnosticsTest {
             diagnosticsStore = DiagnosticsStore(),
             supportDiagnosticsRecorder = recorder,
             supportDiagnosticsStore = store,
-            activationClient = { _, _ ->
+            activationClient = { _, _, _ ->
                 net.pocvpn.client.provisioning.ProvisioningResult.Success(
                     clientTunnelIp = "10.77.0.5",
                     gatewayPublicKey = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.serverPublicKeyBase64,

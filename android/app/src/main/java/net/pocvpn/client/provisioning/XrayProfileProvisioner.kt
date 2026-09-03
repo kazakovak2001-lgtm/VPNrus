@@ -22,38 +22,37 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
  */
 class XrayProfileProvisioner(
     private val repository: XrayProfileRepository,
-    // B30 review fix (blocker 2) - additive, both default to null (old,
-    // single-call behavior, byte-for-byte unchanged for every pre-B30
-    // test/call site). When [gatewayId] is set, provision() routes
-    // [fetchXrayProfile] through the SAME TrustedOriginRequestExecutor/
-    // ControlPlaneOriginSetBuilder net.pocvpn.client.controlplane
-    // .ActivationResilienceCoordinator uses for activation - genuinely
-    // wired through the generic executor, not only instrumented. Declared
-    // BEFORE fetchXrayProfile below (not after) so every pre-B30 call site
-    // using trailing-lambda syntax for fetchXrayProfile - e.g.
-    // `XrayProfileProvisioner(repo) { pk, cred -> ... }` - keeps binding
-    // that lambda to fetchXrayProfile, the last function-typed parameter.
-    private val gatewayId: ProductionGatewayId? = null,
+    // B30 review fix (origin-discarding blocker) - non-null, defaults to
+    // GERMANY (this codebase's own existing "Germany-default" convention -
+    // see ProvisioningClient's 2-arg overloads). provision() ALWAYS routes
+    // through fetchThroughTrustedOrigins/ControlPlaneOriginSetBuilder now -
+    // a pre-B30 call site that doesn't care about gateway/origin still gets
+    // exactly one real, correct origin (behaviorally identical to a single
+    // direct call), rather than a second, parallel non-origin-aware code
+    // path that could silently diverge from the real one. Declared BEFORE
+    // fetchXrayProfile below so every pre-B30 call site using
+    // trailing-lambda syntax for fetchXrayProfile - e.g.
+    // `XrayProfileProvisioner(repo) { origin, pk, cred -> ... }` - keeps
+    // binding that lambda to fetchXrayProfile, the last function-typed
+    // parameter.
+    private val gatewayId: ProductionGatewayId = ProductionGatewayId.GERMANY,
     private val diagnosticsRecorder: SupportDiagnosticsRecorder? = null,
-    // Additive seam, same reasoning as MainViewModel's own activationClient
-    // param: defaults to the real network call so production wiring is
-    // byte-for-byte ProvisioningClient::fetchXrayProfile, while tests can
-    // substitute a fake without a live HTTPS call.
-    private val fetchXrayProfile: (publicKey: String, activationCredential: String) -> XrayProfileResult =
-        ProvisioningClient::fetchXrayProfile,
+    // B30 review fix (origin-discarding blocker) - now ORIGIN-AWARE: the
+    // default genuinely dials [net.pocvpn.client.controlplane.ControlPlaneOrigin.host],
+    // never a fixed/pre-bound host - see MainViewModel's own
+    // activationClient docs for the identical reasoning. A 2-origin
+    // executor must actually reach two different hosts, never silently
+    // repeat the same request under a different label.
+    private val fetchXrayProfile: (origin: net.pocvpn.client.controlplane.ControlPlaneOrigin, publicKey: String, activationCredential: String) -> XrayProfileResult =
+        { origin, publicKey, activationCredential -> ProvisioningClient.fetchXrayProfile(publicKey, activationCredential, origin.host) },
 ) {
     suspend fun provision(publicKey: String, activationCredential: String): XrayProfileProvisioningOutcome {
-        val gwId = gatewayId
-        val result = if (gwId == null) {
-            fetchXrayProfile(publicKey, activationCredential)
-        } else {
-            fetchThroughTrustedOrigins(
-                gatewayId = gwId,
-                diagnosticsRecorder = diagnosticsRecorder,
-                classify = ::classifyXrayProfileResultFailure,
-                fetch = { fetchXrayProfile(publicKey, activationCredential) },
-            )
-        }
+        val result = fetchThroughTrustedOrigins(
+            gatewayId = gatewayId,
+            diagnosticsRecorder = diagnosticsRecorder,
+            classify = ::classifyXrayProfileResultFailure,
+            fetch = { origin -> fetchXrayProfile(origin, publicKey, activationCredential) },
+        )
         return when (result) {
             is XrayProfileResult.Success -> {
                 repository.saveProfile(result.toXrayProfile())

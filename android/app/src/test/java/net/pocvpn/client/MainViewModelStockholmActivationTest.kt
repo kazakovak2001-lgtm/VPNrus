@@ -109,18 +109,18 @@ class MainViewModelStockholmActivationTest {
         diagnosticsStore = DiagnosticsStore(),
         clientTunnelIdentityStore = w.identity,
         selectedGatewayStore = FakeSelectedGatewayStore(),
-        activationClient = { _, _ -> w.germanyResult },
-        stockholmActivationClient = { _, _ -> w.stockholmResult },
+        activationClient = { _, _, _ -> w.germanyResult },
+        stockholmActivationClient = { _, _, _ -> w.stockholmResult },
         xrayProfileRepository = w.germanyXrayRepo,
         stockholmXrayProfileRepository = w.stockholmXrayRepo,
         stockholmXrayTlsProfileRepository = w.stockholmXrayTlsRepo,
         stockholmXrayProfileProvisioner = XrayProfileProvisioner(
             repository = w.stockholmXrayRepo,
-            fetchXrayProfile = { _, _ -> sampleXrayProfileResult },
+            fetchXrayProfile = { _, _, _ -> sampleXrayProfileResult },
         ),
         stockholmXrayTlsProfileProvisioner = XrayTlsProfileProvisioner(
             repository = w.stockholmXrayTlsRepo,
-            fetchXrayTlsProfile = { _, _ -> sampleXrayTlsProfileResult },
+            fetchXrayTlsProfile = { _, _, _ -> sampleXrayTlsProfileResult },
         ),
         ioDispatcher = testDispatcher,
     )

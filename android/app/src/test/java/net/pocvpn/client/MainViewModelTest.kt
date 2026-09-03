@@ -218,7 +218,7 @@ class MainViewModelTest {
             gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
             reconnectManager = FakeReconnectManager(),
             diagnosticsStore = DiagnosticsStore(),
-            activationClient = { publicKey, credential ->
+            activationClient = { _, publicKey, credential ->
                 capturedPublicKey = publicKey
                 capturedCredential = credential
                 SAMPLE_ACTIVATION_SUCCESS
@@ -248,7 +248,7 @@ class MainViewModelTest {
             diagnosticsStore = DiagnosticsStore(),
             gatewayConfigOverride = gatewayConfigSource,
             profileStore = profileStore,
-            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            activationClient = { _, _, _ -> SAMPLE_ACTIVATION_SUCCESS },
             ioDispatcher = testDispatcher,
         )
         testDispatcher.scheduler.runCurrent()
@@ -289,7 +289,7 @@ class MainViewModelTest {
             diagnosticsStore = diagnosticsStore,
             gatewayConfigOverride = gatewayConfigSource,
             profileStore = profileStore,
-            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            activationClient = { _, _, _ -> SAMPLE_ACTIVATION_SUCCESS },
             ioDispatcher = testDispatcher,
         )
         testDispatcher.scheduler.runCurrent()
@@ -361,9 +361,9 @@ class MainViewModelTest {
             gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
             reconnectManager = FakeReconnectManager(),
             diagnosticsStore = DiagnosticsStore(),
-            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            activationClient = { _, _, _ -> SAMPLE_ACTIVATION_SUCCESS },
             ioDispatcher = testDispatcher,
-            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _ -> SAMPLE_XRAY_PROFILE_SUCCESS },
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _, _ -> SAMPLE_XRAY_PROFILE_SUCCESS },
         )
         testDispatcher.scheduler.runCurrent()
 
@@ -387,13 +387,13 @@ class MainViewModelTest {
             gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
             reconnectManager = FakeReconnectManager(),
             diagnosticsStore = DiagnosticsStore(),
-            activationClient = { publicKey, credential ->
+            activationClient = { _, publicKey, credential ->
                 awgPublicKey = publicKey
                 awgCredential = credential
                 SAMPLE_ACTIVATION_SUCCESS
             },
             ioDispatcher = testDispatcher,
-            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { publicKey, credential ->
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, publicKey, credential ->
                 xrayPublicKey = publicKey
                 xrayCredential = credential
                 SAMPLE_XRAY_PROFILE_SUCCESS
@@ -433,9 +433,9 @@ class MainViewModelTest {
             diagnosticsStore = DiagnosticsStore(),
             gatewayConfigOverride = gatewayConfigSource,
             profileStore = profileStore,
-            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            activationClient = { _, _, _ -> SAMPLE_ACTIVATION_SUCCESS },
             ioDispatcher = testDispatcher,
-            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _ -> XrayProfileResult.ServiceUnavailable },
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _, _ -> XrayProfileResult.ServiceUnavailable },
         )
         testDispatcher.scheduler.runCurrent()
 
@@ -913,9 +913,9 @@ class MainViewModelTest {
             gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
             reconnectManager = FakeReconnectManager(),
             diagnosticsStore = DiagnosticsStore(),
-            activationClient = { _, _ -> SAMPLE_ACTIVATION_SUCCESS },
+            activationClient = { _, _, _ -> SAMPLE_ACTIVATION_SUCCESS },
             ioDispatcher = testDispatcher,
-            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _ -> SAMPLE_XRAY_PROFILE_SUCCESS },
+            xrayProfileProvisioner = XrayProfileProvisioner(xrayRepository) { _, _, _ -> SAMPLE_XRAY_PROFILE_SUCCESS },
             xrayTransport = xrayTransport,
             xrayProfileRepository = xrayRepository,
         )

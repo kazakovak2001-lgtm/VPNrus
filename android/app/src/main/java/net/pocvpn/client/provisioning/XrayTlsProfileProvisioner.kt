@@ -15,28 +15,24 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
  */
 class XrayTlsProfileProvisioner(
     private val repository: XrayTlsProfileRepository,
-    // B30 review fix (blocker 2) - additive, both default to null (old,
-    // single-call behavior, byte-for-byte unchanged for every pre-B30
-    // test/call site) - see XrayProfileProvisioner's own docs for the full
+    // B30 review fix (origin-discarding blocker) - non-null, defaults to
+    // GERMANY - see XrayProfileProvisioner's own docs for the full
     // reasoning, identical here, including WHY these are declared before
     // fetchXrayTlsProfile (keeps trailing-lambda call sites binding to it).
-    private val gatewayId: ProductionGatewayId? = null,
+    private val gatewayId: ProductionGatewayId = ProductionGatewayId.GERMANY,
     private val diagnosticsRecorder: SupportDiagnosticsRecorder? = null,
-    private val fetchXrayTlsProfile: (publicKey: String, activationCredential: String) -> XrayTlsProfileResult =
-        ProvisioningClient::fetchXrayTlsProfile,
+    // B30 review fix (origin-discarding blocker) - now ORIGIN-AWARE, same
+    // reasoning as XrayProfileProvisioner's own fetchXrayProfile.
+    private val fetchXrayTlsProfile: (origin: net.pocvpn.client.controlplane.ControlPlaneOrigin, publicKey: String, activationCredential: String) -> XrayTlsProfileResult =
+        { origin, publicKey, activationCredential -> ProvisioningClient.fetchXrayTlsProfile(publicKey, activationCredential, origin.host) },
 ) {
     suspend fun provision(publicKey: String, activationCredential: String): XrayProfileProvisioningOutcome {
-        val gwId = gatewayId
-        val result = if (gwId == null) {
-            fetchXrayTlsProfile(publicKey, activationCredential)
-        } else {
-            fetchThroughTrustedOrigins(
-                gatewayId = gwId,
-                diagnosticsRecorder = diagnosticsRecorder,
-                classify = ::classifyXrayTlsProfileResultFailure,
-                fetch = { fetchXrayTlsProfile(publicKey, activationCredential) },
-            )
-        }
+        val result = fetchThroughTrustedOrigins(
+            gatewayId = gatewayId,
+            diagnosticsRecorder = diagnosticsRecorder,
+            classify = ::classifyXrayTlsProfileResultFailure,
+            fetch = { origin -> fetchXrayTlsProfile(origin, publicKey, activationCredential) },
+        )
         return when (result) {
             is XrayTlsProfileResult.Success -> {
                 repository.saveProfile(result.toXrayTlsProfile())

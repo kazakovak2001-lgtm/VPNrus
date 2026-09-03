@@ -260,26 +260,30 @@ class MainViewModel(
     // apply()/write() wiring are unit-testable without a live HTTPS call to
     // the real production edge (same reasoning as gatewayConfigOverride/
     // profileStore above - an additive seam, not a network abstraction).
-    private val activationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
-        ProvisioningClient::activate,
-    // B14 - Stockholm's OWN activation client. Real by default (mirrors
-    // [activationClient] immediately above, never a null "not wired" seam)
-    // so production/every non-test call site genuinely attempts a request
-    // to Stockholm's own edge without needing explicit Factory wiring - see
-    // MainViewModel's own docs for why this is a SEPARATE function value
-    // rather than [activationClient] itself parameterized by a target host:
-    // [activationClient] stays exactly 2-arg so every pre-B14 test/call
-    // site (including `ProvisioningClient::activate` used as a bare
-    // function reference) stays byte-for-byte unchanged. Stockholm has no
-    // deployed control-plane today, so this genuinely fails closed with a
-    // real [ProvisioningResult.NetworkError] (connection refused/TLS
-    // failure/timeout) until an operator deploys one (see
-    // gateway/DEPLOYMENT.md's own second-gateway section) - never a
-    // fabricated success.
-    private val stockholmActivationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
-        { publicKey, activationCredential ->
-            ProvisioningClient.activate(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
-        },
+    // B30 review fix (origin-discarding blocker) - now ORIGIN-AWARE: the
+    // default genuinely dials [ControlPlaneOrigin.host], never a
+    // pre-bound/fixed host that would silently ignore which origin the
+    // caller (activateDevice, via ActivationResilienceCoordinator/
+    // TrustedOriginRequestExecutor) actually selected for this attempt -
+    // see MainViewModel's own docs at the activateDevice() call site for
+    // why this matters (a 2-origin executor must be able to actually reach
+    // TWO different origins, not silently repeat the same request).
+    private val activationClient: (origin: net.pocvpn.client.controlplane.ControlPlaneOrigin, publicKey: String, activationCredential: String) -> ProvisioningResult =
+        { origin, publicKey, activationCredential -> ProvisioningClient.activate(publicKey, activationCredential, origin.host) },
+    // B14 - Stockholm's OWN activation client - kept as a SEPARATE function
+    // value (never collapsed into [activationClient] itself) so a test can
+    // still independently stub Germany's vs Stockholm's own response, even
+    // though - B30 review fix - both now share byte-for-byte the SAME
+    // origin-aware default: [ControlPlaneOrigin.host] already carries
+    // whichever gateway's real host [ControlPlaneOriginSetBuilder.forGateway]
+    // resolved it from, so no gateway-specific hardcoded host is needed
+    // here anymore. Stockholm has no deployed control-plane today, so this
+    // genuinely fails closed with a real [ProvisioningResult.NetworkError]
+    // (connection refused/TLS failure/timeout) until an operator deploys
+    // one (see gateway/DEPLOYMENT.md's own second-gateway section) - never
+    // a fabricated success.
+    private val stockholmActivationClient: (origin: net.pocvpn.client.controlplane.ControlPlaneOrigin, publicKey: String, activationCredential: String) -> ProvisioningResult =
+        { origin, publicKey, activationCredential -> ProvisioningClient.activate(publicKey, activationCredential, origin.host) },
     // B30 review fix (blocker 2's own required integration test) - the ONE
     // place activateDevice below resolves its trusted origin list. Defaults
     // to ControlPlaneOriginSetBuilder::forGateway - the real, audited,
@@ -1901,21 +1905,18 @@ class MainViewModel(
             // silently no-op because SOME prior local state happens to exist
             // (the offline-reuse skip is for automatic/background reuse, e.g.
             // IngressProfileProvisioner.ensureFreshProfile, not for a request
-            // the user just explicitly made). callActivate ignores `origin`
-            // and calls the SAME pre-bound `client` as before - correct as
-            // long as ControlPlaneOriginSetBuilder returns exactly one origin
-            // per gateway, which is what today's real, audited trusted
-            // topology actually supports (see ControlPlaneOriginSetBuilder's
-            // and PROJECT_ARCHITECTURE.md's B30 section for why no second
-            // real origin exists yet) - the moment a second one is added,
-            // `client` must become origin-aware too, tracked as follow-up.
+            // the user just explicitly made). B30 review fix (origin-discarding
+            // blocker) - callActivate now actually forwards `origin` into
+            // `client`, which is itself origin-aware (dials origin.host) -
+            // a 2-origin executor genuinely dials two different hosts, never
+            // silently repeating the same request under a different label.
             val outcome = withContext(ioDispatcher) {
                 activationResilienceCoordinator.activate(
                     gatewayId = targetGatewayId,
                     publicKey = key,
                     activationCredential = trimmedCredential,
                     hasValidLocalActivation = { false },
-                    callActivate = { _, pk, cred -> client(pk, cred) },
+                    callActivate = { origin, pk, cred -> client(origin, pk, cred) },
                     origins = controlPlaneOriginsForActivation(targetGatewayId),
                 )
             }
@@ -3682,19 +3683,20 @@ class MainViewModel(
                 // stockholmXrayTlsProfileRepository instances above (never
                 // a second, independently-constructed store) and each
                 // fetching from Stockholm's own edge - never Germany's.
+                // B30 review fix (origin-discarding blocker) - no explicit
+                // fetchXrayProfile/fetchXrayTlsProfile override needed
+                // anymore: the default is origin-aware (dials
+                // ControlPlaneOrigin.host), and gatewayId = STOCKHOLM makes
+                // ControlPlaneOriginSetBuilder resolve Stockholm's own real
+                // host into that origin - byte-for-byte the same request
+                // this explicit override used to build by hand.
                 stockholmXrayProfileProvisioner = XrayProfileProvisioner(
                     repository = stockholmXrayProfileRepository,
-                    fetchXrayProfile = { publicKey, activationCredential ->
-                        ProvisioningClient.fetchXrayProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
-                    },
                     gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM,
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
                 stockholmXrayTlsProfileProvisioner = XrayTlsProfileProvisioner(
                     repository = stockholmXrayTlsProfileRepository,
-                    fetchXrayTlsProfile = { publicKey, activationCredential ->
-                        ProvisioningClient.fetchXrayTlsProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
-                    },
                     gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM,
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
