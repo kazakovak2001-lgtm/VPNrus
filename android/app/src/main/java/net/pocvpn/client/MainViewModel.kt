@@ -1744,6 +1744,34 @@ class MainViewModel(
                         -> supportDiagnosticsRecorder.finishProtected()
                         is net.pocvpn.client.vpn.VpnSessionHealth.RelayHandshake ->
                             supportDiagnosticsRecorder.recordDataPlaneReadinessResult(health.stage)
+                        // B30C - the fix: B29's own session for the initial
+                        // attempt already closed as PROTECTED the moment this
+                        // health first reached DirectProtected/RelayProtected
+                        // above, so a LATER real reconnect incident (this
+                        // branch - reached ONLY via VpnController.handleNetworkLost's
+                        // own Connected-only guard, never during an initial
+                        // connect attempt, which never passes through
+                        // Reconnecting) would otherwise have no open session
+                        // to record into at all - finishFailed()/
+                        // finishProtected() below would silently no-op (see
+                        // SupportDiagnosticsRecorder.finish's own "open ?:
+                        // return" guard). currentSessionId() == null is the
+                        // single-authority dedup: it is true exactly once per
+                        // incident (false for every repeated Reconnecting
+                        // emission while this session is still open, whether
+                        // from the StateFlow's own equals-conflation of the
+                        // singleton VpnSessionHealth.Reconnecting value or
+                        // from a distinct attempt count that still maps to
+                        // the same health) - so a Reconnecting -> attempt 1
+                        // -> attempt 2 -> ... run opens exactly ONE session,
+                        // never one per backoff attempt.
+                        is net.pocvpn.client.vpn.VpnSessionHealth.Reconnecting -> {
+                            if (supportDiagnosticsRecorder.currentSessionId() == null) {
+                                val restriction = restrictionClass()
+                                supportDiagnosticsRecorder.startSession(buildDiagnosticStartContext(restriction, restriction))
+                                supportDiagnosticsRecorder.recordReconnectIncidentStarted()
+                            }
+                        }
                         is net.pocvpn.client.vpn.VpnSessionHealth.Failed -> {
                             val mapped = diagnosticsStore.snapshot.value.lastError
                                 ?.let { net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(it) }

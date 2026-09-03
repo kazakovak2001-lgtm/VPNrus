@@ -78,6 +78,18 @@ enum class DiagnosticEventType {
     PROFILE_FETCH_FAILED,
     PROFILE_FETCH_SUCCEEDED,
     OFFLINE_STATE_REUSED,
+
+    // B30C - mid-session incident capture. B29's own session lifecycle closes
+    // a session the moment the initial attempt reaches PROTECTED (see
+    // SupportDiagnosticsRecorder.finishProtected's own docs); this single
+    // event marks the ONE other place a session is ever opened - not for a
+    // fresh connect() request, but for a later real reconnect/degraded
+    // incident on an already-protected session (see
+    // MainViewModel's sessionHealth collector, VpnSessionHealth.Reconnecting
+    // branch). Nothing else about a session's shape changes: it still
+    // terminates through the SAME finishProtected()/finishFailed()/
+    // finishDisconnected() calls every other session already uses.
+    RECONNECT_INCIDENT_STARTED,
 }
 
 /**

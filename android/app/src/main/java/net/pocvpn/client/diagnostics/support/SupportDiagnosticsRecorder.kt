@@ -245,6 +245,15 @@ class SupportDiagnosticsRecorder(
      */
     fun recordOfflineStateReused() = record(DiagnosticEventType.OFFLINE_STATE_REUSED)
 
+    // B30C - mid-session incident capture. Caller starts a NEW session (via
+    // [startSession], same as any other real attempt) then calls this ONE
+    // extra event to label it as a reconnect incident rather than a fresh
+    // connect() request - see [DiagnosticEventType.RECONNECT_INCIDENT_STARTED]'s
+    // own docs. The session still terminates through the existing
+    // [finishProtected]/[finishFailed]/[finishDisconnected] - no new outcome
+    // vocabulary needed.
+    fun recordReconnectIncidentStarted() = record(DiagnosticEventType.RECONNECT_INCIDENT_STARTED)
+
     private fun record(type: DiagnosticEventType, tags: Map<String, String> = emptyMap()) {
         val session = open ?: return
         // Task D's own per-session bound (see DiagnosticSession.MAX_EVENTS_PER_SESSION) - a runaway retry loop can never grow one session's timeline unboundedly.
