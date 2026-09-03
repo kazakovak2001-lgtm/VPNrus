@@ -62,6 +62,22 @@ enum class DiagnosticEventType {
     CONTROL_PLANE_FAILURE,
     VPN_PROTECTED,
     VPN_DISCONNECTED,
+
+    // B30 (task 8) - resilient activation/control-plane access. Labels over
+    // net.pocvpn.client.controlplane.TrustedOriginRequestExecutor's own
+    // attempt/result callbacks and the activation/profile-fetch call sites
+    // that use it - never a second, independently-driven state machine,
+    // same discipline as every event above.
+    ACTIVATION_STARTED,
+    CONTROL_ORIGIN_ATTEMPT,
+    CONTROL_ORIGIN_FAILED,
+    CONTROL_ORIGIN_SUCCEEDED,
+    ACTIVATION_SUCCEEDED,
+    ACTIVATION_FAILED,
+    PROFILE_FETCH_STARTED,
+    PROFILE_FETCH_FAILED,
+    PROFILE_FETCH_SUCCEEDED,
+    OFFLINE_STATE_REUSED,
 }
 
 /**
@@ -94,6 +110,24 @@ enum class DiagnosticFailureReason {
     MANIFEST_UNAVAILABLE,
     NO_CANDIDATE,
     INTERNAL_ERROR,
+
+    // B30 (task 9) - the closed, finer-grained control-plane failure
+    // taxonomy, mapped from net.pocvpn.client.controlplane.ControlPlaneFailureReason
+    // (see DiagnosticFailureMapping.mapControlPlaneFailureReasonToFailureReason).
+    // Distinct from the pre-existing, coarser CONTROL_PLANE_UNREACHABLE/
+    // ACTIVATION_FAILED above (kept for RelayFailureCategory/VpnError
+    // mapping, unchanged) - this finer set is what a support bundle needs
+    // to distinguish DNS from TLS from an exhausted origin set for a
+    // control-plane call specifically.
+    CONTROL_PLANE_DNS_FAILURE,
+    CONTROL_PLANE_CONNECT_TIMEOUT,
+    CONTROL_PLANE_TLS_FAILURE,
+    CONTROL_PLANE_HTTP_UNAVAILABLE,
+    CONTROL_PLANE_AUTHORIZATION_REJECTED,
+    CONTROL_PLANE_MALFORMED_RESPONSE,
+    CONTROL_PLANE_TRUST_REJECTED,
+    CONTROL_PLANE_REDIRECT_REJECTED,
+    CONTROL_PLANE_ORIGINS_EXHAUSTED,
 }
 
 /** B29 - the terminal shape of one [DiagnosticSession], mirroring [net.pocvpn.client.vpn.VpnSessionHealth]'s own real terminal states (never a fourth, independently-invented state). */

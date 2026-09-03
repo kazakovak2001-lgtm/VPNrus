@@ -1871,4 +1871,44 @@ class MainViewModelTest {
         // Scoring must succeed for the Relayed candidate too - no crash, no unsafe cast.
         assertTrue(snapshot.rankedPaths.any { it.candidate is PathCandidate.Relayed })
     }
+
+    // B30 (task 5/13) - offline/existing-user resilience: a temporarily
+    // unreachable control plane must never block an otherwise-valid connect
+    // using already-persisted local state.
+
+    @Test
+    fun `an already-activated user connects using valid local state while the control plane (manifest refresh) is failing`() = runTest {
+        val transport = FakeVpnTransport()
+        val repository = testManifestRepository()
+        val fetchAttempts = AtomicInteger(0)
+        // A real, wired distribution client that ALWAYS fails - simulating
+        // a genuinely unreachable control plane, never simply omitted.
+        val failingFetcher = RemoteManifestFetcher {
+            fetchAttempts.incrementAndGet()
+            ManifestFetchResult.Failed(ManifestFetchFailureKind.NETWORK_ERROR, "simulated control-plane outage")
+        }
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            // Already-valid local activation state - GatewayConfiguration.Configured,
+            // exactly what a real activateDevice() success would have persisted.
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            manifestRepository = repository,
+            manifestDistributionClient = singleOriginClient(failingFetcher, repository),
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+        assertTrue("the control-plane call must have genuinely been attempted and failed, not merely omitted", fetchAttempts.get() >= 1)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(
+            "a temporarily unreachable control plane must never prevent an otherwise-valid existing connection",
+            1,
+            transport.connectCallCount,
+        )
+    }
 }

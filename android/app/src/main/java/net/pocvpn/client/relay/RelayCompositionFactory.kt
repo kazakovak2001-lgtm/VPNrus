@@ -1,6 +1,7 @@
 package net.pocvpn.client.relay
 
 import android.content.Context
+import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.identity.XrayProfileRepositoryResolver
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
@@ -41,7 +42,13 @@ object RelayCompositionFactory {
         val ingressProfileProvisioner: IngressProfileProvisioner,
     )
 
-    fun build(context: Context, ingressProfileStore: IngressProfileStore): RelayComposition = RelayComposition(
+    fun build(
+        context: Context,
+        ingressProfileStore: IngressProfileStore,
+        // B30 - additive nullable param, defaults to null (no diagnostics)
+        // so every pre-B30 call site (tests included) is unaffected.
+        diagnosticsRecorder: SupportDiagnosticsRecorder? = null,
+    ): RelayComposition = RelayComposition(
         relayIngressResolver = RelayIngressResolverImpl(context, ingressProfileStore),
         relayEndToEndProbe = HttpRelayEndToEndProbe(),
         // Same "resolve an arbitrary endpoint id's own repository, never a
@@ -55,6 +62,6 @@ object RelayCompositionFactory {
         relayXrayTlsProfileRepositoryResolver = XrayTlsProfileRepositoryResolver { id ->
             XrayTlsProfileRepositoryFactory.create(context, id, migrateFromLegacyUnscopedFile = false)
         },
-        ingressProfileProvisioner = IngressProfileProvisioner(ingressProfileStore),
+        ingressProfileProvisioner = IngressProfileProvisioner(ingressProfileStore, diagnosticsRecorder = diagnosticsRecorder),
     )
 }

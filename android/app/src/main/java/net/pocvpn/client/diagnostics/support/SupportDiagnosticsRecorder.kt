@@ -1,5 +1,6 @@
 package net.pocvpn.client.diagnostics.support
 
+import net.pocvpn.client.controlplane.ControlPlaneFailureReason
 import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
@@ -8,6 +9,7 @@ import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.GatewaySelectionMode
+import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
@@ -180,6 +182,69 @@ class SupportDiagnosticsRecorder(
         finish(DiagnosticOutcome.DISCONNECTED, null)
     }
 
+    // B30 (task 8) - resilient activation/control-plane diagnostics. Every
+    // function below takes only closed enums/ints - never [ControlPlaneOrigin]
+    // itself (which carries a raw host) and never a raw String - so, exactly
+    // like every record* function above, none of these can carry a
+    // hostname/IP/URL/credential/UUID/token into a tag. [originIndex] is the
+    // origin's ordinal position in the trusted origin list actually tried
+    // (0 = primary), never the host itself - enough for a human reading a
+    // bundle to see "origin 2 of 2 failed", never which literal address that was.
+
+    fun recordActivationStarted(gatewayId: ProductionGatewayId) =
+        record(DiagnosticEventType.ACTIVATION_STARTED, mapOf(TAG_GATEWAY to gatewayId.name))
+
+    fun recordControlOriginAttempt(gatewayId: ProductionGatewayId, originIndex: Int) =
+        record(DiagnosticEventType.CONTROL_ORIGIN_ATTEMPT, mapOf(TAG_GATEWAY to gatewayId.name, TAG_ORIGIN_INDEX to originIndex.toString()))
+
+    fun recordControlOriginFailed(gatewayId: ProductionGatewayId, originIndex: Int, reason: ControlPlaneFailureReason) =
+        record(
+            DiagnosticEventType.CONTROL_ORIGIN_FAILED,
+            mapOf(
+                TAG_GATEWAY to gatewayId.name,
+                TAG_ORIGIN_INDEX to originIndex.toString(),
+                TAG_FAILURE_REASON to mapControlPlaneFailureReasonToFailureReason(reason).name,
+            ),
+        )
+
+    fun recordControlOriginSucceeded(gatewayId: ProductionGatewayId, originIndex: Int) =
+        record(DiagnosticEventType.CONTROL_ORIGIN_SUCCEEDED, mapOf(TAG_GATEWAY to gatewayId.name, TAG_ORIGIN_INDEX to originIndex.toString()))
+
+    fun recordActivationSucceeded(gatewayId: ProductionGatewayId) =
+        record(DiagnosticEventType.ACTIVATION_SUCCEEDED, mapOf(TAG_GATEWAY to gatewayId.name))
+
+    /** NON-TERMINAL - same reasoning as [recordPathFailed]: labels one activation attempt's own failure; the caller decides whether/how the enclosing session finishes. */
+    fun recordActivationFailed(reason: ControlPlaneFailureReason) =
+        record(DiagnosticEventType.ACTIVATION_FAILED, mapOf(TAG_FAILURE_REASON to mapControlPlaneFailureReasonToFailureReason(reason).name))
+
+    // profile-fetch events carry no gateway/endpoint tag - they are used by
+    // BOTH gateway-scoped Xray/TLS profile fetch (activation-time,
+    // ProductionGatewayId-keyed) and ingress-profile fetch
+    // (IngressProfileProvisioner, EndpointId-keyed, not necessarily one of
+    // the two production gateways at all) - a single closed identity model
+    // that fit one would misrepresent the other, so neither is recorded
+    // here (consistent with this file's own "no origin hostname/IP" rule -
+    // an EndpointId is not secret, but is also not needed to answer "did a
+    // profile fetch succeed").
+    fun recordProfileFetchStarted() = record(DiagnosticEventType.PROFILE_FETCH_STARTED)
+
+    fun recordProfileFetchFailed(reason: ControlPlaneFailureReason) =
+        record(DiagnosticEventType.PROFILE_FETCH_FAILED, mapOf(TAG_FAILURE_REASON to mapControlPlaneFailureReasonToFailureReason(reason).name))
+
+    fun recordProfileFetchSucceeded() = record(DiagnosticEventType.PROFILE_FETCH_SUCCEEDED)
+
+    /**
+     * B30 (task 5) - an existing, still-valid local activation/profile was
+     * reused instead of a network refresh (e.g.
+     * [net.pocvpn.client.relay.IngressProfileProvisioner.ensureFreshProfile]'s
+     * own `stillGood` branch) - never a partial/expired/unsigned substitute,
+     * the caller's own freshness check already guarantees that. No
+     * gateway/endpoint tag for the same reason [recordProfileFetchStarted]
+     * has none - this event is reused by both gateway-scoped and
+     * endpoint-scoped callers.
+     */
+    fun recordOfflineStateReused() = record(DiagnosticEventType.OFFLINE_STATE_REUSED)
+
     private fun record(type: DiagnosticEventType, tags: Map<String, String> = emptyMap()) {
         val session = open ?: return
         // Task D's own per-session bound (see DiagnosticSession.MAX_EVENTS_PER_SESSION) - a runaway retry loop can never grow one session's timeline unboundedly.
@@ -226,5 +291,7 @@ class SupportDiagnosticsRecorder(
         const val TAG_SUCCESS = "success"
         const val TAG_STAGE = "stage"
         const val TAG_FAILURE_REASON = "failureReason"
+        const val TAG_GATEWAY = "gateway"
+        const val TAG_ORIGIN_INDEX = "originIndex"
     }
 }

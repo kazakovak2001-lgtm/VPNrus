@@ -8,8 +8,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -28,6 +31,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkProfiler
 import net.pocvpn.client.provisioning.ProvisioningClient
+import net.pocvpn.client.provisioning.friendlyActivationFailureMessage
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.provisioning.XrayProfileProvisioner
@@ -1589,6 +1593,33 @@ class MainViewModel(
     private val _provisioningState = MutableStateFlow<ProvisioningUiState>(ProvisioningUiState.Idle)
     val provisioningState: StateFlow<ProvisioningUiState> = _provisioningState.asStateFlow()
 
+    // B30 (task 6) - a purely DERIVED, non-technical projection of
+    // provisioningState above - never mutates it, never a second activation
+    // state machine. Every failure variant (including ProvisioningUiState.Error,
+    // which today carries a raw NetworkError message/hostname-shaped string
+    // or "malformed response: <reason>") collapses to ONE fixed,
+    // non-technical sentence - no raw exception text, hostname, port, or
+    // TLS detail ever reaches this flow. Idle/Provisioning/Success collapse
+    // to null (nothing to show). See friendlyActivationFailureMessage's own
+    // docs for the exact per-outcome copy.
+    val activationFailureMessage: StateFlow<String?> = provisioningState
+        .map(::friendlyActivationFailureMessage)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, friendlyActivationFailureMessage(provisioningState.value))
+
+    /**
+     * B30 (task 7) - "Retry activation": reuses the exact same activation
+     * call [activateDevice] already makes - never a manual endpoint/host
+     * entry point, and never a new device identity (activateDevice always
+     * reads the SAME already-get-or-created public key - see
+     * [net.pocvpn.client.identity.ClientKeyRepository.getOrCreateIdentity] -
+     * and the server's own activation endpoint is idempotent by credential
+     * digest, see gateway/api/activations.py). A UI Retry button needs
+     * nothing more than this one call plus the same credential text the
+     * user already typed once.
+     */
+    fun retryActivation(activationCredential: String, targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value) =
+        activateDevice(activationCredential, targetGatewayId)
+
     // B8B3C - debug-only visibility into where the effective profile came
     // from this session. DEV_FALLBACK until either a persisted profile is
     // restored below or a fresh provisionDevice() succeeds.
@@ -1833,6 +1864,7 @@ class MainViewModel(
         }
 
         _provisioningState.value = ProvisioningUiState.Provisioning
+        supportDiagnosticsRecorder?.recordActivationStarted(targetGatewayId)
         viewModelScope.launch {
             val result = withContext(ioDispatcher) {
                 client(key, trimmedCredential)
@@ -2006,6 +2038,26 @@ class MainViewModel(
                 is ProvisioningResult.ServiceUnavailable -> ProvisioningUiState.Error("service temporarily unavailable")
                 is ProvisioningResult.MalformedResponse -> ProvisioningUiState.Error("malformed response: ${result.reason}")
                 is ProvisioningResult.NetworkError -> ProvisioningUiState.Error(result.message)
+            }
+            // B30 (task 8) - brackets the SAME activation call above with
+            // typed diagnostics, never changing its outcome/UI-state
+            // mapping (everything above this line is byte-for-byte
+            // unchanged). A gateway-identity mismatch (matchedGatewayId !=
+            // targetGatewayId) is real evidence of a trust/pinning
+            // rejection even though the wire response was itself
+            // structurally a Success - net.pocvpn.client.provisioning.classifyProvisioningResultFailure
+            // only classifies the raw wire response, so that specific case
+            // is detected here from the resulting UI state instead.
+            val diagnosticsReason = net.pocvpn.client.provisioning.classifyProvisioningResultFailure(result)
+                ?: if (_provisioningState.value !is ProvisioningUiState.Success) {
+                    net.pocvpn.client.controlplane.ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED
+                } else {
+                    null
+                }
+            if (diagnosticsReason == null) {
+                supportDiagnosticsRecorder?.recordActivationSucceeded(targetGatewayId)
+            } else {
+                supportDiagnosticsRecorder?.recordActivationFailed(diagnosticsReason)
             }
         }
     }
@@ -3450,8 +3502,22 @@ class MainViewModel(
             // the ONE place this whole graph is assembled, now a directly
             // testable unit on its own (see MainViewModelCompositionRootTest
             // and RelayCompositionFactoryTest) rather than inline here.
+            // B29 - the one real support-diagnostics store/recorder pair for
+            // this ViewModel instance - never a second, independently-
+            // constructed store (see MainViewModel's own supportDiagnosticsStore
+            // docs for why both are wired here together). Built BEFORE
+            // relayComposition below (B30) so the SAME recorder instance can
+            // be threaded into IngressProfileProvisioner - never a second,
+            // independently-constructed recorder for relay/ingress
+            // diagnostics.
+            val supportDiagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+            val supportDiagnosticsRecorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(
+                store = supportDiagnosticsStore,
+                appVersionName = BuildConfig.VERSION_NAME,
+                appVersionCode = BuildConfig.VERSION_CODE.toLong(),
+            )
             val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
-            val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore)
+            val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore, supportDiagnosticsRecorder)
 
             val manifestOrigins = net.pocvpn.client.reachability.ManifestOriginConfig.parse(BuildConfig.MANIFEST_URLS)
             val manifestDistributionClient = manifestOrigins.takeIf { it.isNotEmpty() }?.let { origins ->
@@ -3460,16 +3526,6 @@ class MainViewModel(
                     repository = manifestRepository,
                 )
             }
-            // B29 - the one real support-diagnostics store/recorder pair for
-            // this ViewModel instance - never a second, independently-
-            // constructed store (see MainViewModel's own supportDiagnosticsStore
-            // docs for why both are wired here together).
-            val supportDiagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
-            val supportDiagnosticsRecorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(
-                store = supportDiagnosticsStore,
-                appVersionName = BuildConfig.VERSION_NAME,
-                appVersionCode = BuildConfig.VERSION_CODE.toLong(),
-            )
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),

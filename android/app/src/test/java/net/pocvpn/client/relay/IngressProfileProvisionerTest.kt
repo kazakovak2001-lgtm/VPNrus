@@ -7,6 +7,7 @@ import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -221,4 +222,134 @@ class IngressProfileProvisionerTest {
         assertTrue(outcome is IngressActivationOutcome.Saved)
         assertEquals("a kind change must trigger a fresh fetch, never reuse the stale DIRECT_IP profile", 2, fetchCount)
     }
+
+    // B30 (task 5/8/13) - offline reuse and diagnostics wiring.
+
+    @Test
+    fun `ensureFreshProfile's offline reuse (no network call) records OFFLINE_STATE_REUSED, never a profile-fetch event`() = runBlocking {
+        val store = InMemoryIngressProfileStore()
+        var fetchCount = 0
+        val diagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+        val recorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(diagnosticsStore, "1.0", 1L)
+        recorder.startSession(startContext())
+        val provisioner = IngressProfileProvisioner(
+            store,
+            fetchIngressProfile = { _, _, _, _ -> fetchCount++; successResult() },
+            diagnosticsRecorder = recorder,
+        )
+        provisioner.provision(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "cred")
+        assertEquals(1, fetchCount)
+
+        // Control plane is now unreachable, but the just-saved profile is still valid - a temporary outage must not block reuse.
+        val outcome = provisioner.ensureFreshProfile(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "cred")
+
+        assertTrue(outcome is IngressActivationOutcome.Saved)
+        assertEquals("offline reuse must never trigger a network call", 1, fetchCount)
+        recorder.finishProtected()
+        val events = diagnosticsStore.recent().single().events
+        assertTrue(events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.OFFLINE_STATE_REUSED })
+    }
+
+    @Test
+    fun `a malformed profile response is never persisted, and is recorded as a typed control-plane failure`() = runBlocking {
+        val store = InMemoryIngressProfileStore()
+        val diagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+        val recorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(diagnosticsStore, "1.0", 1L)
+        recorder.startSession(startContext())
+        val provisioner = IngressProfileProvisioner(
+            store,
+            fetchIngressProfile = { _, _, _, _ -> IngressProfileResult.MalformedResponse("server_address missing or blank") },
+            diagnosticsRecorder = recorder,
+        )
+
+        val outcome = provisioner.provision(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "cred")
+
+        assertTrue(outcome is IngressActivationOutcome.Mismatched)
+        assertNull("a malformed response must never be persisted", store.getProfileOrNull(endpointId))
+        recorder.finishProtected()
+        val events = diagnosticsStore.recent().single().events
+        assertTrue(events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.PROFILE_FETCH_FAILED })
+    }
+
+    @Test
+    fun `a pinned-fact mismatch (frontend-backend confusion) is recorded as a trust-validation rejection, never persisted`() = runBlocking {
+        val store = InMemoryIngressProfileStore()
+        val diagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+        val recorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(diagnosticsStore, "1.0", 1L)
+        recorder.startSession(startContext())
+        val provisioner = IngressProfileProvisioner(
+            store,
+            fetchIngressProfile = { _, _, _, _ -> successResult(serverAddress = "203.0.113.99") },
+            diagnosticsRecorder = recorder,
+        )
+
+        val outcome = provisioner.provision(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "cred")
+
+        assertTrue(outcome is IngressActivationOutcome.Mismatched)
+        assertNull(store.getProfileOrNull(endpointId))
+        recorder.finishProtected()
+        val events = diagnosticsStore.recent().single().events
+        val failed = events.single { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.PROFILE_FETCH_FAILED }
+        assertEquals(
+            net.pocvpn.client.diagnostics.support.DiagnosticFailureReason.CONTROL_PLANE_TRUST_REJECTED.name,
+            failed.tags["failureReason"],
+        )
+    }
+
+    @Test
+    fun `a successful fetch records PROFILE_FETCH_STARTED then PROFILE_FETCH_SUCCEEDED, carrying no host, IP, UUID, or token`() = runBlocking {
+        val store = InMemoryIngressProfileStore()
+        val diagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+        val recorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(diagnosticsStore, "1.0", 1L)
+        recorder.startSession(startContext())
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> successResult() }, diagnosticsRecorder = recorder)
+
+        provisioner.provision(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "super-secret-cred")
+
+        recorder.finishProtected()
+        val events = diagnosticsStore.recent().single().events
+        assertTrue(events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.PROFILE_FETCH_STARTED })
+        assertTrue(events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.PROFILE_FETCH_SUCCEEDED })
+        val allValues = events.flatMap { it.tags.values }
+        allValues.forEach { value ->
+            assertFalse(value.contains(binding.host))
+            assertFalse(value.contains("super-secret-cred"))
+            assertFalse(value.contains("11111111-1111-1111-1111-111111111111"))
+            assertFalse(value.contains("test-token"))
+        }
+    }
+
+    @Test
+    fun `an expired profile is never returned when the network refresh itself then fails - fails closed, never silently extended`() = runBlocking {
+        val store = InMemoryIngressProfileStore()
+        val fixedNow = 100_000L
+        var fetchCount = 0
+        val provisioner = IngressProfileProvisioner(
+            store,
+            fetchIngressProfile = { _, _, _, _ ->
+                fetchCount++
+                if (fetchCount == 1) successResult(expiresAtEpochSeconds = (fixedNow / 1000) - 1) else IngressProfileResult.ServiceUnavailable
+            },
+            nowProvider = { fixedNow },
+        )
+        provisioner.provision(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "cred")
+
+        val outcome = provisioner.ensureFreshProfile(endpointId, binding, TransportKind.XRAY_REALITY, IngressKind.DIRECT_IP, "pubkey", "cred")
+
+        assertTrue("an expired profile whose refresh failed must fail closed, never return the stale Saved profile", outcome is IngressActivationOutcome.Unavailable)
+        assertEquals(2, fetchCount)
+    }
+
+    private fun startContext() = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder.StartContext(
+        networkType = net.pocvpn.client.network.NetworkType.WIFI,
+        networkValidatedInternet = true,
+        networkCaptivePortal = false,
+        networkIpv4Available = true,
+        networkIpv6Available = false,
+        networkFingerprintId = null,
+        rawRestrictionClass = net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN,
+        stabilizedRestrictionClass = net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN,
+        routingMode = net.pocvpn.client.vpn.policy.RoutingMode.FULL_VPN,
+        gatewaySelectionMode = net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO,
+    )
 }

@@ -358,6 +358,19 @@ object ProvisioningClient {
         return try {
             connection.connectTimeout = CONNECT_TIMEOUT_MS
             connection.readTimeout = READ_TIMEOUT_MS
+            // B30 (task 10 redirect audit) - HttpsURLConnection follows
+            // redirects TRANSPARENTLY by default, before any status-code
+            // branch below ever runs, and would follow them cross-host with
+            // no re-validation of the destination. Every endpoint this
+            // client calls (activate/xray-profile/ingress-profile/peers)
+            // carries a bearer credential - an auto-followed redirect would
+            // silently resend that Authorization header to whatever host
+            // the response named. Disabled unconditionally: a 3xx response
+            // now surfaces as a real status code, which every mapResponse
+            // function's own `else -> NetworkError(...)`/`NetworkError`
+            // branch already rejects - never followed, never treated as
+            // success.
+            connection.instanceFollowRedirects = false
             connection.requestMethod = "POST"
             connection.doOutput = true
             request.headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }

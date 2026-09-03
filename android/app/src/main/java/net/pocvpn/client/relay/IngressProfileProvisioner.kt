@@ -1,5 +1,8 @@
 package net.pocvpn.client.relay
 
+import net.pocvpn.client.controlplane.ControlPlaneFailureReason
+import net.pocvpn.client.controlplane.classifyNetworkErrorMessage
+import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.provisioning.IngressProfileResult
@@ -35,6 +38,10 @@ class IngressProfileProvisioner(
     private val fetchIngressProfile: (publicKey: String, activationCredential: String, endpointHost: String, useTls: Boolean) -> IngressProfileResult =
         ProvisioningClient::fetchIngressProfile,
     private val nowProvider: () -> Long = System::currentTimeMillis,
+    // B30 (task 4/8) - additive nullable collaborator, same convention as
+    // every other B29/B30 diagnostics wiring: null means diagnostics are
+    // simply not recorded, never a behavior change to provisioning itself.
+    private val diagnosticsRecorder: SupportDiagnosticsRecorder? = null,
 ) {
     suspend fun provision(
         ingressEndpointId: EndpointId,
@@ -57,28 +64,49 @@ class IngressProfileProvisioner(
             else -> return IngressActivationOutcome.UnsupportedTransport
         }
 
+        diagnosticsRecorder?.recordProfileFetchStarted()
         val result = fetchIngressProfile(publicKey, activationCredential, ingressBinding.host, useTls)
+
+        // B30 (task 4/9) - one pinned-fact mismatch check below can still
+        // return early past this point (a Mismatched outcome), which is why
+        // the SUCCEEDED event is recorded only once every check in this
+        // block has already passed (further down), never here on the raw
+        // HTTP-level success alone.
+        fun failed(reason: ControlPlaneFailureReason): IngressActivationOutcome {
+            diagnosticsRecorder?.recordProfileFetchFailed(reason)
+            return if (reason == ControlPlaneFailureReason.AUTHORIZATION_REJECTED) {
+                IngressActivationOutcome.AuthorizationFailed
+            } else {
+                IngressActivationOutcome.Unavailable
+            }
+        }
+
         return when (result) {
             is IngressProfileResult.Success -> {
                 if (result.ingressEndpointId != ingressEndpointId.value) {
+                    diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED)
                     return IngressActivationOutcome.Mismatched(
                         "response named ingress '${result.ingressEndpointId}', expected '${ingressEndpointId.value}'",
                     )
                 }
                 if (result.serverAddress != ingressBinding.host || result.serverPort != ingressBinding.port) {
+                    diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED)
                     return IngressActivationOutcome.Mismatched(
                         "response server ${result.serverAddress}:${result.serverPort} does not match the pinned binding ${ingressBinding.host}:${ingressBinding.port}",
                     )
                 }
                 if (result.ingressKind != ingressKind) {
+                    diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED)
                     return IngressActivationOutcome.Mismatched(
                         "response declares ingress kind ${result.ingressKind}, expected $ingressKind - refusing a frontend/origin/backend mismatch",
                     )
                 }
                 if (useTls && result.isRealityShaped) {
+                    diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.MALFORMED_RESPONSE)
                     return IngressActivationOutcome.Mismatched("requested TLS but response carries REALITY-shaped fields")
                 }
                 if (!useTls && !result.isRealityShaped) {
+                    diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.MALFORMED_RESPONSE)
                     return IngressActivationOutcome.Mismatched("requested REALITY but response carries no REALITY fields")
                 }
 
@@ -122,15 +150,19 @@ class IngressProfileProvisioner(
                     endToEndProbeToken = result.probeToken,
                 )
                 store.saveProfile(profile)
+                diagnosticsRecorder?.recordProfileFetchSucceeded()
                 IngressActivationOutcome.Saved(profile)
             }
-            is IngressProfileResult.Unauthorized -> IngressActivationOutcome.AuthorizationFailed
-            is IngressProfileResult.Revoked -> IngressActivationOutcome.AuthorizationFailed
-            is IngressProfileResult.Expired -> IngressActivationOutcome.AuthorizationFailed
-            is IngressProfileResult.DeviceNotBound -> IngressActivationOutcome.AuthorizationFailed
-            is IngressProfileResult.ServiceUnavailable -> IngressActivationOutcome.Unavailable
-            is IngressProfileResult.MalformedResponse -> IngressActivationOutcome.Mismatched(result.reason)
-            is IngressProfileResult.NetworkError -> IngressActivationOutcome.Unavailable
+            is IngressProfileResult.Unauthorized -> failed(ControlPlaneFailureReason.AUTHORIZATION_REJECTED)
+            is IngressProfileResult.Revoked -> failed(ControlPlaneFailureReason.AUTHORIZATION_REJECTED)
+            is IngressProfileResult.Expired -> failed(ControlPlaneFailureReason.AUTHORIZATION_REJECTED)
+            is IngressProfileResult.DeviceNotBound -> failed(ControlPlaneFailureReason.AUTHORIZATION_REJECTED)
+            is IngressProfileResult.ServiceUnavailable -> failed(ControlPlaneFailureReason.HTTP_UNAVAILABLE)
+            is IngressProfileResult.MalformedResponse -> {
+                diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.MALFORMED_RESPONSE)
+                IngressActivationOutcome.Mismatched(result.reason)
+            }
+            is IngressProfileResult.NetworkError -> failed(classifyNetworkErrorMessage(result.message))
         }
     }
 
@@ -159,6 +191,12 @@ class IngressProfileProvisioner(
             existing.ingressKind == ingressKind &&
             !existing.isExpired(nowProvider())
         if (stillGood) {
+            // B30 (task 5) - the real, already-existing offline-resilience
+            // point: a still-valid, unexpired, pinned-fact-matching stored
+            // profile is reused with ZERO network calls - a temporarily
+            // unreachable control plane never blocks this. Never expired -
+            // isExpired(nowProvider()) above already excludes that.
+            diagnosticsRecorder?.recordOfflineStateReused()
             return IngressActivationOutcome.Saved(existing!!)
         }
         return provision(ingressEndpointId, ingressBinding, ingressTransport, ingressKind, publicKey, activationCredential)
