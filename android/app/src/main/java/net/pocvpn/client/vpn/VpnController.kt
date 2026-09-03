@@ -1101,18 +1101,24 @@ class VpnController(
     }
 
     /**
-     * B8I5/B8I6 - reconnect (this whole automatic-recovery polling
-     * mechanism) stays AWG-only, explicitly: it only ever triggers when
-     * `_state.value is Connected`, which today is set ONLY by
-     * doConnectAttempt()'s AMNEZIA_WG branch (see its own docs) -
-     * XRAY_REALITY's branch there deliberately never forces Connected
-     * (VlessRealityTransport has no proven handshake-evidence channel yet),
-     * so this can structurally never engage for it. No generic "retry" is
-     * invented here for a kind that doesn't support it - a future Xray
-     * transport that DOES earn a real Connected signal would need its own
-     * deliberate decision about whether polling-for-a-fresh-handshake even
-     * makes sense for that protocol, never assumed automatically by reusing
-     * this loop as-is.
+     * B8I5/B8I6 - triggers whenever `_state.value is Connected` when the
+     * real underlying network is lost - NOT AWG-specific: `_state` reaches
+     * Connected for TLS_TCP/XRAY_REALITY too, via [switchActiveTransport]'s
+     * own collector forwarding whatever [VlessTlsTransport]/
+     * [VlessRealityTransport].observeState() reports (see those classes' own
+     * docs) - so this loop engages for any kind once it is genuinely
+     * Connected, not only AMNEZIA_WG (B30B correction: an earlier version of
+     * this doc claimed otherwise, which was already imprecise and became a
+     * real bug once combined with [AndroidReconnectManager]'s pre-B30B
+     * network-scope defect - see that class's own docs for the full root
+     * cause). [awaitFreshHandshake] below still degrades gracefully per
+     * kind: AWG gets a real fresh-handshake check; a kind with no evidence
+     * channel (`TransportStats.Unsupported`/`NotImplemented` - Xray/TLS_TCP,
+     * XRAY_REALITY today) is trusted once the real network is confirmed back
+     * (same "trust the transport's own signal when it offers no counter-
+     * evidence" discipline [awaitFreshHandshake]'s own docs already
+     * establish for the initial connect) - never a second, kind-specific
+     * retry mechanism invented here.
      */
     private fun handleNetworkLost() {
         if (userInitiatedDisconnect) return
