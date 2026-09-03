@@ -20,6 +20,18 @@ import net.pocvpn.client.vpn.policy.RoutingMode
 enum class PathKind { DIRECT, CHAIN_DIRECT, CHAIN_CDN, PRIVATE, NONE }
 
 /**
+ * PR #43 review fix - the closed, non-secret label for which trusted-manifest
+ * source [net.pocvpn.client.MainViewModel.connectAuto] read from, mirroring
+ * [net.pocvpn.client.reachability.ManifestSource]'s own two real values
+ * (never a provider/host/URL-shaped label) plus [NONE] for "no trusted
+ * manifest at all" (the same case the old, since-removed raw-string call site
+ * expressed as the free-text `"none"`). See
+ * [mapManifestSourceToManifestSourceKind] for the pure mapping from the real
+ * [net.pocvpn.client.reachability.ManifestSource]? into this vocabulary.
+ */
+enum class ManifestSourceKind { LAST_KNOWN_GOOD, EMBEDDED_BOOTSTRAP, NONE }
+
+/**
  * B29 (task B) - the bounded, typed timeline vocabulary a support bundle
  * records. Every value here names a REAL transition this codebase's own
  * existing state (network profile, [RestrictionClassifier]/[RestrictionStabilizer],

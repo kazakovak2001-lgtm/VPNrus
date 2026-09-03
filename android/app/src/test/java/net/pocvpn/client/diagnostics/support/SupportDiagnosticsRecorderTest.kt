@@ -10,6 +10,7 @@ import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.GatewaySelectionMode
 import net.pocvpn.client.vpn.policy.RoutingMode
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -46,7 +47,7 @@ class SupportDiagnosticsRecorderTest {
         val store = InMemoryDiagnosticSessionStore()
         val recorder = newRecorder(store)
         recorder.startSession(context())
-        recorder.recordManifestSourceSelected("signed-manifest")
+        recorder.recordManifestSourceSelected(ManifestSourceKind.LAST_KNOWN_GOOD)
         recorder.recordCandidateRanked(2)
         recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG)
         recorder.recordEndpointReachabilityResult(ReachabilityState.REACHABLE)
@@ -238,6 +239,41 @@ class SupportDiagnosticsRecorderTest {
         recorder.finishProtected()
 
         assertEquals(1, store.recent().size)
+    }
+
+    @Test
+    fun `manifest-source diagnostics can never carry a URL, IP, arbitrary hostname, or credential - only the closed ManifestSourceKind label`() {
+        // PR #43 review fix - recordManifestSourceSelected used to take a raw
+        // String and this test's predecessor exercised it with a free-text
+        // label. Now the recorder can only ever be handed one of
+        // ManifestSourceKind's own enum constants, so the recorded tag value
+        // is provably never a URL, IP, arbitrary hostname, or credential/query
+        // material, for every real source this codebase can produce.
+        ManifestSourceKind.values().forEach { kind ->
+            val store = InMemoryDiagnosticSessionStore()
+            val recorder = newRecorder(store)
+            recorder.startSession(context())
+            recorder.recordManifestSourceSelected(kind)
+            recorder.finishProtected()
+
+            val session = store.recent().single()
+            val sourceEvent = session.events.single { it.type == DiagnosticEventType.MANIFEST_SOURCE_SELECTED }
+            val recordedValue = sourceEvent.tags.getValue("source")
+
+            assertEquals(kind.name, recordedValue)
+            assertTrue(ManifestSourceKind.values().map { it.name }.contains(recordedValue))
+            assertFalse("must never contain a URL scheme separator", recordedValue.contains("://"))
+            assertFalse("must never contain an IPv4-shaped run of digits/dots", Regex("\\d{1,3}(\\.\\d{1,3}){3}").containsMatchIn(recordedValue))
+            assertFalse("must never contain a dot (hostname/domain shape)", recordedValue.contains("."))
+            assertFalse("must never contain query/credential-shaped punctuation", recordedValue.any { it in "?&=@:/" })
+        }
+    }
+
+    @Test
+    fun `mapManifestSourceToManifestSourceKind only ever re-labels the two real ManifestSource values, never a host-derived label`() {
+        assertEquals(ManifestSourceKind.LAST_KNOWN_GOOD, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.LAST_KNOWN_GOOD))
+        assertEquals(ManifestSourceKind.EMBEDDED_BOOTSTRAP, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.EMBEDDED_BOOTSTRAP))
+        assertEquals(ManifestSourceKind.NONE, mapManifestSourceToManifestSourceKind(null))
     }
 
     @Test

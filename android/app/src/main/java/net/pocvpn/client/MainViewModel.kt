@@ -2705,7 +2705,9 @@ class MainViewModel(
         supportDiagnosticsRecorder?.startSession(
             buildDiagnosticStartContext(rawRestrictionClass = restrictionClass(), stabilizedRestrictionClass = snapshot.restrictionClass),
         )
-        supportDiagnosticsRecorder?.recordManifestSourceSelected(if (manifestRepository?.trusted() != null) "signed-manifest" else "none")
+        supportDiagnosticsRecorder?.recordManifestSourceSelected(
+            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(manifestRepository?.trustedSource()),
+        )
         supportDiagnosticsRecorder?.recordCandidateRanked(attempts.size)
         if (attempts.isEmpty()) {
             // B28 review fix (blocker 1) - report TRUTHFULLY when this

@@ -1370,9 +1370,16 @@ Russia whitelist bypass, which remains UNVERIFIED.
   consumer.
 - **Automatic capture (task D, `SupportDiagnosticsRecorder.kt`)**: the ONE
   place a session is assembled. Every `record*`/`finish*` function is
-  narrow and typed - none accepts a raw free-text string (proven by
-  `DiagnosticTypesTest`'s own reflection check) - so nothing secret-shaped
-  can enter `DiagnosticEvent.tags` through this API at all. Two-tier event
+  narrow and typed - EVERY `record*` function has zero raw `String`
+  parameters, with no exception (`DiagnosticTypesTest`'s reflection check
+  enforces this structurally, not by convention) - so nothing secret-shaped
+  can enter `DiagnosticEvent.tags` through this API at all.
+  `recordManifestSourceSelected` takes the closed `ManifestSourceKind`
+  enum (`LAST_KNOWN_GOOD`/`EMBEDDED_BOOTSTRAP`/`NONE`, mirroring
+  `reachability.ManifestSource`'s own two real values plus "no trusted
+  manifest") - never a free-text source label (PR #43 review fix; the
+  earlier revision passed a raw `String` here and the structural test
+  carried a one-method exception for it). Two-tier event
   model: NON-TERMINAL `record*` functions (`recordCandidateAttemptStarted`,
   `recordPathFailed`, `recordControlPlaneFailure`, etc.) append to the
   still-open session - a multi-candidate Auto failover sequence is ONE

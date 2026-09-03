@@ -1,6 +1,7 @@
 package net.pocvpn.client.diagnostics.support
 
 import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.reachability.ManifestSource
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
 import net.pocvpn.client.smartconnect.RestrictionClass
@@ -74,4 +75,18 @@ fun mapRestrictionClassToFailureReason(restrictionClass: RestrictionClass): Diag
     RestrictionClass.NO_RESTRICTION_OBSERVED,
     RestrictionClass.UNKNOWN,
     -> null
+}
+
+/**
+ * PR #43 review fix - pure mapping from the real, existing
+ * [net.pocvpn.client.reachability.ManifestSource]? (null meaning "no trusted
+ * manifest") into the closed [ManifestSourceKind] vocabulary
+ * [SupportDiagnosticsRecorder.recordManifestSourceSelected] records. Never
+ * invents a new source; only re-labels the two real
+ * [net.pocvpn.client.reachability.EndpointManifestRepository] outcomes.
+ */
+fun mapManifestSourceToManifestSourceKind(source: ManifestSource?): ManifestSourceKind = when (source) {
+    ManifestSource.LAST_KNOWN_GOOD -> ManifestSourceKind.LAST_KNOWN_GOOD
+    ManifestSource.EMBEDDED_BOOTSTRAP -> ManifestSourceKind.EMBEDDED_BOOTSTRAP
+    null -> ManifestSourceKind.NONE
 }

@@ -92,8 +92,9 @@ class SupportDiagnosticsRecorder(
         open = null
     }
 
-    fun recordManifestSourceSelected(sourceLabel: String) =
-        record(DiagnosticEventType.MANIFEST_SOURCE_SELECTED, mapOf(TAG_SOURCE to sourceLabel))
+    /** PR #43 review fix - takes the closed [ManifestSourceKind] vocabulary, never a raw free-text label (see [mapManifestSourceToManifestSourceKind] for how a caller derives it from the real [net.pocvpn.client.reachability.ManifestSource]?). */
+    fun recordManifestSourceSelected(source: ManifestSourceKind) =
+        record(DiagnosticEventType.MANIFEST_SOURCE_SELECTED, mapOf(TAG_SOURCE to source.name))
 
     fun recordCandidateRanked(candidateCount: Int) =
         record(DiagnosticEventType.CANDIDATE_RANKED, mapOf(TAG_COUNT to candidateCount.toString()))

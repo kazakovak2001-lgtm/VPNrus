@@ -45,19 +45,22 @@ class DiagnosticTypesTest {
 
     @Test
     fun `SupportDiagnosticsRecorder's record functions never accept a raw free-text String tag value parameter`() {
-        // The ONLY String parameters any record* function accepts are enum-backed
-        // labels (source label, already an enum-like closed string in production)
-        // - never an arbitrary detail/message string. This is a structural,
-        // reflection-based proof that the API surface itself cannot be handed
-        // a raw secret to embed.
+        // PR #43 review fix - EVERY record* function must take zero raw String
+        // parameters, with NO exceptions (recordManifestSourceSelected used to
+        // take a raw String label and was exempted here; it now takes the
+        // closed ManifestSourceKind enum - see DiagnosticTypes.kt). This is a
+        // structural, reflection-based proof that the API surface itself
+        // cannot be handed a raw secret, host, URL, or other free-text value
+        // to embed - not merely a convention enforced by review.
         val recordMethods = SupportDiagnosticsRecorder::class.java.declaredMethods
             .filter { it.name.startsWith("record") }
         assertTrue("expected at least one record* function", recordMethods.isNotEmpty())
         recordMethods.forEach { method ->
             val stringParams = method.parameterTypes.count { it == String::class.java }
-            assertTrue(
-                "record function '${method.name}' takes $stringParams raw String params - only recordManifestSourceSelected's single closed label is expected to take one",
-                stringParams == 0 || method.name == "recordManifestSourceSelected",
+            assertEquals(
+                "record function '${method.name}' takes $stringParams raw String params - every record* function must take zero",
+                0,
+                stringParams,
             )
         }
     }
