@@ -220,6 +220,22 @@ fun AppRoot(
                     onModeSelected = { mode -> viewModel.updateAppRoutingPolicy(savedRoutingPolicy.copy(mode = mode)) },
                     onSelectAppsClick = { settingsRoute = SettingsRoute.AppSelector },
                     onBack = { settingsRoute = null },
+                    // B29 (task I/J) - a simple human-readable summary on
+                    // the normal screen; the export button is the ONE
+                    // explicit user action that ever produces/shares the
+                    // sanitized bundle (never automatic, never silent).
+                    lastConnectionResult = viewModel.lastConnectionResultSummary(),
+                    onExportDiagnosticsClick = {
+                        val json = viewModel.exportSupportBundleJson()
+                        val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                            type = "application/json"
+                            putExtra(android.content.Intent.EXTRA_TEXT, json)
+                        }
+                        context.startActivity(
+                            android.content.Intent.createChooser(sendIntent, context.getString(net.pocvpn.client.R.string.settings_diagnostics_share_title)),
+                        )
+                    },
+                    onClearDiagnosticsClick = { viewModel.clearDiagnosticSessions() },
                 )
                 else -> HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),

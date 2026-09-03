@@ -53,6 +53,13 @@ fun SettingsScreen(
     onModeSelected: (AppRoutingMode) -> Unit,
     onSelectAppsClick: () -> Unit,
     onBack: () -> Unit,
+    // B29 (task I) - the ONE simple, human-readable sentence
+    // MainViewModel.lastConnectionResultSummary() already produces - never
+    // technical detail (that stays behind onExportDiagnosticsClick, task I's
+    // own "detailed technical data remains behind the diagnostic action").
+    lastConnectionResult: String,
+    onExportDiagnosticsClick: () -> Unit,
+    onClearDiagnosticsClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier.fillMaxSize().padding(horizontal = 24.dp)) {
@@ -211,6 +218,44 @@ fun SettingsScreen(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        // B29 (task I) - the field-diagnostics/support-bundle surface: the
+        // normal screen shows only a simple, human-readable last result;
+        // exporting/clearing is one explicit tap away (task J - no export
+        // ever happens without this exact user action), and nothing here
+        // renders a credential/endpoint/technical id.
+        Text(
+            text = stringResource(R.string.settings_diagnostics_title),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_diagnostics_explanation),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = stringResource(R.string.settings_diagnostics_last_result_label),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = lastConnectionResult,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        androidx.compose.material3.TextButton(onClick = onExportDiagnosticsClick, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.settings_diagnostics_export))
+        }
+        androidx.compose.material3.TextButton(onClick = onClearDiagnosticsClick, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.settings_diagnostics_clear))
+        }
     }
 }
 

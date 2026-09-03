@@ -17,6 +17,8 @@ import kotlinx.coroutines.withContext
 import net.pocvpn.client.diagnostics.DiagnosticsSnapshot
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.diagnostics.support.buildSupportBundle
+import net.pocvpn.client.diagnostics.support.toJson
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.identity.ClientKeyRepositoryFactory
 import net.pocvpn.client.identity.XrayProfileRepository
@@ -329,6 +331,23 @@ class MainViewModel(
     // .RestrictionStabilizer]'s minimum-residence hold window without a real
     // 90-second sleep.
     private val nowProvider: () -> Long = System::currentTimeMillis,
+    // B29 - additive, defaults to null (same reasoning as restrictionProbe
+    // above): when non-null, this ViewModel automatically captures a
+    // sanitized, structured [net.pocvpn.client.diagnostics.support
+    // .DiagnosticSession] for the real connect flow - see
+    // [net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder]'s
+    // own docs. Every existing pre-B29 caller/test is byte-for-byte
+    // unaffected (null means "capture nothing", the same no-op shape every
+    // other optional collaborator here already has).
+    private val supportDiagnosticsRecorder: net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder? = null,
+    // B29 - the SAME store instance the Factory constructs
+    // [supportDiagnosticsRecorder] with (never a second, independent
+    // store) - exposed here separately only so [recentDiagnosticSessions]/
+    // [exportSupportBundleJson]/[clearDiagnosticSessions] can read/clear it
+    // without needing a read-back API on the recorder itself.
+    private val supportDiagnosticsStore: net.pocvpn.client.diagnostics.support.DiagnosticSessionStore? = null,
+    private val supportDiagnosticsAppVersionName: String = "unknown",
+    private val supportDiagnosticsAppVersionCode: Long = 0L,
     // B8K4B - additive, defaults to null (same reasoning as gatewayConfigOverride/
     // profileStore above): when non-null, activateDevice() below fetches and
     // persists an Xray VLESS+REALITY profile immediately after a successful
@@ -1148,6 +1167,42 @@ class MainViewModel(
     }
 
     /**
+     * B29 - assembles a [net.pocvpn.client.diagnostics.support
+     * .SupportDiagnosticsRecorder.StartContext] from the SAME real evidence
+     * every other diagnostics/decision accessor here already reads
+     * (networkProfile/savedRoutingMode/gatewaySelectionMode, plus the
+     * caller's own already-computed raw/stabilized restriction pair - task
+     * requirement G, never re-derived here). [fingerprintKeyProvider] is
+     * optional (same additive-seam pattern as every other use of it in this
+     * class) - null simply means no fingerprint id is included, never a
+     * crash.
+     */
+    private fun buildDiagnosticStartContext(
+        rawRestrictionClass: RestrictionClass,
+        stabilizedRestrictionClass: RestrictionClass,
+    ): net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder.StartContext {
+        val profile = networkProfile.value
+        val fingerprintId = fingerprintKeyProvider?.let {
+            net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+                net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+                it.keyBytes(),
+            )
+        }
+        return net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder.StartContext(
+            networkType = profile.type,
+            networkValidatedInternet = profile.validatedInternet,
+            networkCaptivePortal = profile.captivePortal == true,
+            networkIpv4Available = profile.ipv4Available,
+            networkIpv6Available = profile.ipv6Available,
+            networkFingerprintId = fingerprintId,
+            rawRestrictionClass = rawRestrictionClass,
+            stabilizedRestrictionClass = stabilizedRestrictionClass,
+            routingMode = savedRoutingMode.value,
+            gatewaySelectionMode = gatewaySelectionMode.value,
+        )
+    }
+
+    /**
      * B11 - OBSERVATIONAL ONLY: assembles the current reachability fabric
      * snapshot from real evidence already computed above (transportHealth(),
      * restrictionClass(), networkProfile, buildTransportRegistry()) plus the
@@ -1615,6 +1670,42 @@ class MainViewModel(
         // gates connect() or any other user action.
         manifestDistributionClient?.let {
             viewModelScope.launch { refreshManifest() }
+        }
+        // B29 (task D) - automatic capture, terminal-outcome safety net:
+        // observes the SAME real [sessionHealth] StateFlow the UI already
+        // reads (never a second state machine). Every EXPLICIT typed
+        // finish*() call elsewhere in this class (connectAuto/connectManual/
+        // connectPrivate/attemptCombined) is more precise and runs first in
+        // practice, but [SupportDiagnosticsRecorder]'s own finish is a no-op
+        // once a session is already closed - so this collector is a safe,
+        // idempotent BACKSTOP that guarantees a session started for ANY real
+        // attempt is eventually closed (never left open forever) even for a
+        // failure path this class does not separately instrument, and is
+        // the ONE place [DiagnosticOutcome.PROTECTED]/[DiagnosticOutcome
+        // .DISCONNECTED] are ever recorded at all.
+        if (supportDiagnosticsRecorder != null) {
+            viewModelScope.launch {
+                var previousHealth: net.pocvpn.client.vpn.VpnSessionHealth = net.pocvpn.client.vpn.VpnSessionHealth.Idle
+                sessionHealth.collect { health ->
+                    when (health) {
+                        is net.pocvpn.client.vpn.VpnSessionHealth.DirectProtected,
+                        is net.pocvpn.client.vpn.VpnSessionHealth.RelayProtected,
+                        -> supportDiagnosticsRecorder.finishProtected()
+                        is net.pocvpn.client.vpn.VpnSessionHealth.RelayHandshake ->
+                            supportDiagnosticsRecorder.recordDataPlaneReadinessResult(health.stage)
+                        is net.pocvpn.client.vpn.VpnSessionHealth.Failed -> {
+                            val mapped = diagnosticsStore.snapshot.value.lastError
+                                ?.let { net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(it) }
+                                ?: net.pocvpn.client.diagnostics.support.DiagnosticFailureReason.INTERNAL_ERROR
+                            supportDiagnosticsRecorder.finishFailed(mapped)
+                        }
+                        is net.pocvpn.client.vpn.VpnSessionHealth.Idle ->
+                            if (previousHealth !is net.pocvpn.client.vpn.VpnSessionHealth.Idle) supportDiagnosticsRecorder.finishDisconnected()
+                        else -> Unit
+                    }
+                    previousHealth = health
+                }
+            }
         }
     }
 
@@ -2173,19 +2264,29 @@ class MainViewModel(
      * malformed-config case in this ViewModel.
      */
     private suspend fun connectPrivate() {
+        // B29 - PRIVATE never compares against relay candidates, so
+        // restriction evidence has no decision-driving effect here at all -
+        // reporting the SAME raw value for both fields is honest (task
+        // requirement G's "same actual decision" is trivially satisfied:
+        // there is only one decision, "dial the private gateway").
+        val restriction = restrictionClass()
+        supportDiagnosticsRecorder?.startSession(buildDiagnosticStartContext(restriction, restriction))
         val store = privateGatewayStore
         val keyRepository = privateGatewayKeyRepository
         if (store == null || keyRepository == null) {
+            supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.GatewayConfigurationMissing))
             controller.rejectPreflight(VpnError.GatewayConfigurationMissing, "Private gateway not configured on this build")
             return
         }
         val saved = store.read()
         if (saved == null) {
+            supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.GatewayConfigurationMissing))
             controller.rejectPreflight(VpnError.GatewayConfigurationMissing, "No private gateway configured")
             return
         }
         when (val validation = net.pocvpn.client.vpn.config.PrivateGatewayConfigValidator.revalidate(saved)) {
             is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Invalid -> {
+                supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.InvalidGatewayConfiguration(validation.reason.name)))
                 controller.rejectPreflight(
                     VpnError.InvalidGatewayConfiguration(validation.reason.name),
                     "Saved private gateway configuration is invalid: ${validation.reason.name}",
@@ -2193,6 +2294,7 @@ class MainViewModel(
                 return
             }
             is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Valid -> {
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(net.pocvpn.client.diagnostics.support.PathKind.PRIVATE, transport.kind)
                 _activeGatewayId.value = selectedGateway.value
                 val resolved = TransportOrchestrator.Resolution.Resolved(
                     transport = transport,
@@ -2208,9 +2310,15 @@ class MainViewModel(
 
     /** B8I1 - the pre-B16 connect() body, unchanged: manual gateway, existing intra-gateway AWG->Xray failover only. */
     private suspend fun connectManual() {
+        // B29 - MANUAL_MANAGED never compares Direct against a relay
+        // candidate either (same reasoning as connectPrivate() above) - raw
+        // and stabilized are reported identically, honestly.
+        val restriction = restrictionClass()
+        supportDiagnosticsRecorder?.startSession(buildDiagnosticStartContext(restriction, restriction))
         when (val decision = smartConnectDecision()) {
             is SmartConnectDecision.Selected -> {
                 val kind = decision.score.candidate.transport.kind
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(net.pocvpn.client.diagnostics.support.PathKind.DIRECT, kind)
                 // B13 - the real SmartConnectCandidateSelector-chosen
                 // GatewayCandidate.id (today always ProductionGateway.ID,
                 // but derived, never hardcoded here) - the first place
@@ -2260,6 +2368,7 @@ class MainViewModel(
                         // SAME attempt and start watching then.
                     }
                     is TransportOrchestrator.Resolution.NotSelectable -> {
+                        supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.UnsupportedTransportSelected(kind.name)))
                         controller.rejectPreflight(
                             VpnError.UnsupportedTransportSelected(kind.name),
                             "Selected transport ($kind) could not be resolved",
@@ -2268,6 +2377,7 @@ class MainViewModel(
                 }
             }
             SmartConnectDecision.NoCandidateAvailable -> {
+                supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.NoCandidateAvailable))
                 controller.rejectPreflight(VpnError.NoCandidateAvailable, "No connection candidate available")
             }
         }
@@ -2405,6 +2515,54 @@ class MainViewModel(
         )
     }
 
+    // --- B29 (task I/J) - the field-diagnostics/support-bundle UI surface ---
+
+    /** The most recent, sanitized [net.pocvpn.client.diagnostics.support.DiagnosticSession]s captured, newest first - empty when no [supportDiagnosticsRecorder] was ever wired. */
+    fun recentDiagnosticSessions(): List<net.pocvpn.client.diagnostics.support.DiagnosticSession> =
+        supportDiagnosticsStore?.recent().orEmpty()
+
+    /**
+     * B29 (task H/J) - builds the sanitized, deterministic JSON export a
+     * user explicitly shares/copies (task J - never sent anywhere by this
+     * function itself; the caller decides whether/how to hand it off, e.g.
+     * an Android share-sheet intent built entirely outside this ViewModel).
+     */
+    fun exportSupportBundleJson(): String {
+        val sessions = supportDiagnosticsStore?.recent().orEmpty()
+        val bundle = buildSupportBundle(
+            sessions = sessions,
+            appVersionName = supportDiagnosticsAppVersionName,
+            appVersionCode = supportDiagnosticsAppVersionCode,
+            nowEpochMillis = nowProvider(),
+        )
+        return bundle.toJson()
+    }
+
+    /** B29 (task J) - an explicit user action ("Clear diagnostics"), never automatic. */
+    fun clearDiagnosticSessions() {
+        supportDiagnosticsStore?.clear()
+    }
+
+    /**
+     * B29 (task I) - the ONE simple, human-readable sentence the normal
+     * screen may show (e.g. "Settings -> Diagnostics -> Last connection
+     * result") - technical detail (events/reason enum names) stays behind
+     * the explicit "Export diagnostics" action, never surfaced here. Never
+     * exposes a credential/endpoint - only the closed [DiagnosticOutcome]/
+     * [net.pocvpn.client.diagnostics.support.DiagnosticFailureReason]
+     * vocabulary.
+     */
+    fun lastConnectionResultSummary(): String {
+        val last = supportDiagnosticsStore?.recent()?.firstOrNull() ?: return "No connection attempts recorded yet"
+        return when (last.outcome) {
+            net.pocvpn.client.diagnostics.support.DiagnosticOutcome.PROTECTED -> "Last connection succeeded"
+            net.pocvpn.client.diagnostics.support.DiagnosticOutcome.DISCONNECTED -> "Last connection ended normally"
+            net.pocvpn.client.diagnostics.support.DiagnosticOutcome.IN_PROGRESS -> "Connecting..."
+            net.pocvpn.client.diagnostics.support.DiagnosticOutcome.FAILED ->
+                "Last connection failed" + (last.failureReason?.let { ": ${it.name}" } ?: "")
+        }
+    }
+
     /**
      * B24 - the combined Direct+Relayed counterpart of
      * [buildAutoGatewayCandidates]: identical evidence accessors, but calls
@@ -2540,6 +2698,15 @@ class MainViewModel(
         // - never a second, independently-timed stabilizedRestrictionClass() call here.
         val snapshot = buildCombinedAutoRankingSnapshot()
         val attempts = snapshot.attempts
+        // B29 (task G) - the diagnostic session's own raw/stabilized fields
+        // come from THIS SAME snapshot (snapshot.restrictionClass is the
+        // stabilized value that just decided `attempts` above) - never a
+        // second, independently-timed restriction read.
+        supportDiagnosticsRecorder?.startSession(
+            buildDiagnosticStartContext(rawRestrictionClass = restrictionClass(), stabilizedRestrictionClass = snapshot.restrictionClass),
+        )
+        supportDiagnosticsRecorder?.recordManifestSourceSelected(if (manifestRepository?.trusted() != null) "signed-manifest" else "none")
+        supportDiagnosticsRecorder?.recordCandidateRanked(attempts.size)
         if (attempts.isEmpty()) {
             // B28 review fix (blocker 1) - report TRUTHFULLY when this
             // empty result specifically came from restriction evidence
@@ -2555,8 +2722,10 @@ class MainViewModel(
                 lastFailureReason = if (restricted) "RestrictedNetworkNoViableRelay" else null, exhausted = true,
             )
             if (restricted) {
+                supportDiagnosticsRecorder?.finishRestrictedNetworkExhaustion()
                 controller.rejectPreflight(VpnError.RestrictedNetworkNoViableRelay, "Restricted network suspected (possible fixed allowlist) and no eligible relay path exists")
             } else {
+                supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.NoCandidateAvailable))
                 controller.rejectPreflight(VpnError.NoCandidateAvailable, "No automatic gateway candidate available")
             }
             return
@@ -2581,15 +2750,23 @@ class MainViewModel(
         if (next == null) {
             _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(exhausted = true)
                 ?: AutoGatewayDiagnostics(emptyList(), emptyList(), null, "candidate set exhausted", true)
+            supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.NoCandidateAvailable))
             controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
             return
         }
         val advancedKeys = attemptedKeys + next.attemptKey
         when (next) {
             is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt -> {
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(net.pocvpn.client.diagnostics.support.PathKind.DIRECT, next.candidate.transport)
                 attemptAutoCandidate(next.candidate, PendingAutoGatewayContext(attempts, advancedKeys))
             }
             is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt -> {
+                val pathKind = if (next.candidate.ingressKind == net.pocvpn.client.reachability.IngressKind.CDN_FRONTED) {
+                    net.pocvpn.client.diagnostics.support.PathKind.CHAIN_CDN
+                } else {
+                    net.pocvpn.client.diagnostics.support.PathKind.CHAIN_DIRECT
+                }
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(pathKind, next.candidate.ingressTransport)
                 attemptRelayedAttempt(next.candidate, attempts, advancedKeys)
             }
         }
@@ -2677,7 +2854,9 @@ class MainViewModel(
                 if (!isActivationRetry && resolution.category in net.pocvpn.client.relay.RelayActivationRequest.ACTIVATION_FIXABLE_CATEGORIES) {
                     pendingRelayActivation = PendingRelayActivation(candidate, attempts, attemptedKeys)
                     _relayActivationNeeded.value = net.pocvpn.client.relay.RelayActivationRequest.from(plan)
+                    supportDiagnosticsRecorder?.recordRelayActivationRequired()
                 } else {
+                    supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(resolution.category))
                     attemptCombined(attempts, attemptedKeys)
                 }
             }
@@ -2694,6 +2873,7 @@ class MainViewModel(
                 )
                 val orchestrator = TransportOrchestrator(registry)
                 val decision = TransportSelectionDecision.SelectTransport(resolution.kind)
+                supportDiagnosticsRecorder?.recordTransportStart(resolution.kind)
                 when (
                     val orchResolution = orchestrator.resolve(
                         decision,
@@ -2941,6 +3121,7 @@ class MainViewModel(
                         // genuinely functional right now, over the tunnel
                         // this attempt just brought up.
                         controller.reportRelayStage(net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK)
+                        supportDiagnosticsRecorder?.recordDataPlaneReadinessResult(net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK)
                         val profile = attempt.relayProfile
                         val probeResult = if (profile != null) {
                             relayEndToEndProbe.probe(relayPlan, profile)
@@ -2960,6 +3141,8 @@ class MainViewModel(
                                 // branch is reached only after a genuine
                                 // probe response traversed ingress -> exit.
                                 controller.reportRelayStage(net.pocvpn.client.relay.RelayReadinessStage.END_TO_END_DATA_PLANE_OK)
+                                supportDiagnosticsRecorder?.recordDataPlaneReadinessResult(net.pocvpn.client.relay.RelayReadinessStage.END_TO_END_DATA_PLANE_OK)
+                                supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = true, category = null)
                                 recordRelayOutcome(relayPlan, net.pocvpn.client.relay.RelayAttemptOutcome.Success(relayPlan))
                                 pendingFailoverAttempt = null
                                 failoverObserverJob?.cancel()
@@ -2970,6 +3153,8 @@ class MainViewModel(
                                 // "settled, nothing left to watch" case).
                             }
                             is net.pocvpn.client.relay.RelayProbeResult.Failure -> {
+                                supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category)
+                                supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(probeResult.category))
                                 recordRelayOutcome(
                                     relayPlan,
                                     net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
@@ -3011,6 +3196,7 @@ class MainViewModel(
                     val error = diagnosticsStore.snapshot.value.lastError
                     val eligible = net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy.isEligibleForNextCandidate(state, error)
                     if (!eligible) return@collect
+                    supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(net.pocvpn.client.relay.RelayFailureCategory.INGRESS_HANDSHAKE_FAILED))
                     recordRelayOutcome(
                         relayPlan,
                         net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
@@ -3272,6 +3458,16 @@ class MainViewModel(
                     repository = manifestRepository,
                 )
             }
+            // B29 - the one real support-diagnostics store/recorder pair for
+            // this ViewModel instance - never a second, independently-
+            // constructed store (see MainViewModel's own supportDiagnosticsStore
+            // docs for why both are wired here together).
+            val supportDiagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+            val supportDiagnosticsRecorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(
+                store = supportDiagnosticsStore,
+                appVersionName = BuildConfig.VERSION_NAME,
+                appVersionCode = BuildConfig.VERSION_CODE.toLong(),
+            )
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -3396,6 +3592,10 @@ class MainViewModel(
                 relayXrayProfileRepositoryResolver = relayComposition.relayXrayProfileRepositoryResolver,
                 relayXrayTlsProfileRepositoryResolver = relayComposition.relayXrayTlsProfileRepositoryResolver,
                 ingressProfileProvisioner = relayComposition.ingressProfileProvisioner,
+                supportDiagnosticsRecorder = supportDiagnosticsRecorder,
+                supportDiagnosticsStore = supportDiagnosticsStore,
+                supportDiagnosticsAppVersionName = BuildConfig.VERSION_NAME,
+                supportDiagnosticsAppVersionCode = BuildConfig.VERSION_CODE.toLong(),
             ) as T
         }
     }
