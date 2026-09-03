@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
@@ -62,7 +64,19 @@ fun SettingsScreen(
     onClearDiagnosticsClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(modifier = modifier.fillMaxSize().padding(horizontal = 24.dp)) {
+    // B30A - physical-validation fix: this Column has no bound on its
+    // content height, so on real devices (especially at larger display/font
+    // scale - see this fix's own PR docs) the Smart Connect and B29
+    // Diagnostics sections below were composed but pushed entirely past the
+    // bottom of the viewport, with no way to scroll to them. verticalScroll
+    // is the plain idiomatic fix - no LazyColumn needed since this is a
+    // short, fully-known, non-recycled list of sections.
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+    ) {
         Spacer(modifier = Modifier.height(24.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -256,6 +270,7 @@ fun SettingsScreen(
         androidx.compose.material3.TextButton(onClick = onClearDiagnosticsClick, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.settings_diagnostics_clear))
         }
+        Spacer(modifier = Modifier.height(24.dp))
     }
 }
 

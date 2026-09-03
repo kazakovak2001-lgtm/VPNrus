@@ -1,5 +1,6 @@
 package net.pocvpn.client.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
@@ -50,7 +51,22 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
  * navigation-compose dependency added for two screens, consistent with
  * DiagnosticsDialog's existing plain-boolean-toggle approach.
  */
-private enum class SettingsRoute { Settings, AppSelector }
+internal enum class SettingsRoute { Settings, AppSelector }
+
+/**
+ * B30A - physical-validation fix: the SAME transition each screen's own
+ * "back arrow" onBack lambda already performs (AppSelector -> Settings,
+ * Settings -> Home/null), pulled out so Android's system Back button
+ * (wired via BackHandler below) can drive the EXACT SAME settingsRoute
+ * authority instead of falling through to Activity-finish (which is what
+ * was exiting the app to the launcher on physical devices - see B30A's own
+ * validation findings). Pure/no side effects so it's independently
+ * unit-testable without a Compose test harness.
+ */
+internal fun settingsBackTarget(current: SettingsRoute?): SettingsRoute? = when (current) {
+    SettingsRoute.AppSelector -> SettingsRoute.Settings
+    SettingsRoute.Settings, null -> null
+}
 
 /**
  * B8E - single Compose entry point for MainActivity. Owns no VPN/profile
@@ -115,6 +131,16 @@ fun AppRoot(
     // unrelated AWG gateway activation attempt's own text.
     var ingressCredential by remember { mutableStateOf("") }
     var settingsRoute by remember { mutableStateOf<SettingsRoute?>(null) }
+    // B30A - physical-validation fix: without this, Android's system Back
+    // button while Settings/AppSelector is open falls through to the
+    // default Activity behavior (finish, since nothing was ever pushed onto
+    // a real back stack for this in-file settingsRoute state) and exits the
+    // app to the launcher instead of returning to Home - see
+    // settingsBackTarget's own docs. Enabled only while a settings screen
+    // is actually showing, so Back on Home/Activation/etc is untouched.
+    BackHandler(enabled = settingsRoute != null) {
+        settingsRoute = settingsBackTarget(settingsRoute)
+    }
     val context = LocalContext.current
     // B8H perf fix - constructing the repository is cheap (just stores
     // `context`); the actual PackageManager scan (queryIntentActivities +
