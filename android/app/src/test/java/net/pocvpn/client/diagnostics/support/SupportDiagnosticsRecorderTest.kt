@@ -284,6 +284,38 @@ class SupportDiagnosticsRecorderTest {
         assertTrue(store.recent().isEmpty())
     }
 
+    // B30C - a mid-session reconnect incident is just a NEW session (same
+    // startSession()/finish* lifecycle as any other attempt), labeled with
+    // one extra typed event so a support bundle can tell it apart from a
+    // fresh connect() request - see DiagnosticEventType.RECONNECT_INCIDENT_STARTED's
+    // own docs. No new outcome vocabulary: it still terminates PROTECTED/
+    // FAILED/DISCONNECTED through the existing finish* calls.
+    @Test
+    fun `a reconnect incident session is recorded with the RECONNECT_INCIDENT_STARTED marker and its own outcome`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+
+        // The original, already-closed session for the initial attempt.
+        recorder.startSession(context())
+        recorder.finishProtected()
+        assertEquals(1, store.recent().size)
+
+        // A later real reconnect incident: a NEW session, not a mutation of
+        // the one already closed above.
+        recorder.startSession(context())
+        recorder.recordReconnectIncidentStarted()
+        recorder.finishFailed(DiagnosticFailureReason.GATEWAY_UNREACHABLE)
+
+        val sessions = store.recent()
+        assertEquals(2, sessions.size)
+        val incident = sessions.first()
+        assertEquals(DiagnosticOutcome.FAILED, incident.outcome)
+        assertTrue(incident.events.any { it.type == DiagnosticEventType.RECONNECT_INCIDENT_STARTED })
+        val original = sessions.last()
+        assertEquals(DiagnosticOutcome.PROTECTED, original.outcome)
+        assertTrue(original.events.none { it.type == DiagnosticEventType.RECONNECT_INCIDENT_STARTED })
+    }
+
     private fun fakeProfile(): net.pocvpn.client.relay.IngressClientProfile = net.pocvpn.client.relay.IngressClientProfile(
         ingressEndpointId = net.pocvpn.client.reachability.EndpointId("ru-ingress-1"),
         ingressBinding = net.pocvpn.client.reachability.EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.50", 443),
