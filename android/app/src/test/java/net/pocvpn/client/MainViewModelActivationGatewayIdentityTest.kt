@@ -94,14 +94,14 @@ class MainViewModelActivationGatewayIdentityTest {
         diagnosticsStore = DiagnosticsStore(),
         clientTunnelIdentityStore = identity,
         selectedGatewayStore = selectedGatewayStore,
-        activationClient = { _, _ -> result },
+        activationClient = { _, _, _ -> result },
         // B14 - each test here only ever activates ONE target at a time,
         // so reusing the SAME fake `result` for Stockholm's own client is
         // harmless and keeps this helper simple - without this, a
         // STOCKHOLM-targeted activateDevice() call would fall through to
         // the REAL production default (an actual HTTPS request) instead of
         // this test's fake response.
-        stockholmActivationClient = { _, _ -> result },
+        stockholmActivationClient = { _, _, _ -> result },
         ioDispatcher = testDispatcher,
     )
 
@@ -204,5 +204,170 @@ class MainViewModelActivationGatewayIdentityTest {
         // Stockholm was already usable - a fresh, unrelated Germany
         // provisioning must not bounce the user's own existing selection.
         assertEquals(ProductionGatewayId.STOCKHOLM, viewModel.selectedGateway.value)
+    }
+
+    // B30 review fix (blocker 1) - proves the REAL activateDevice() call now
+    // genuinely goes through ActivationResilienceCoordinator's bounded
+    // multi-origin fallback, not merely a single direct call, and that a
+    // successful result from a NON-first origin is applied/persisted by the
+    // exact same real production logic as every test above (matchGatewayId
+    // cross-check, clientTunnelIdentityStore write, ProvisioningUiState.Success).
+    //
+    // controlPlaneOriginsForActivation is injected here as a test seam (see
+    // MainViewModel's own docs on that param) - production code never
+    // supplies more than one real origin (see ControlPlaneOriginSetBuilder's
+    // own audited docs), but the FALLBACK MECHANISM itself is genuinely
+    // origin-count-agnostic and this proves it end to end through the real
+    // activateDevice() path, not just at the ActivationResilienceCoordinator
+    // unit level.
+    // B30 review fix (origin-discarding blocker) - "primary.example"/
+    // "secondary.example" per the review's own exact request: these hosts
+    // are captured by the fake activationClient below and asserted on
+    // directly, proving the real per-origin call actually dials the origin
+    // it was given - not merely called twice with the SAME (discarded)
+    // origin, which would be retry, not failover.
+    private val primaryOrigin = net.pocvpn.client.controlplane.ControlPlaneOrigin(ProductionGatewayId.GERMANY, "primary.example")
+    private val secondaryOrigin = net.pocvpn.client.controlplane.ControlPlaneOrigin(ProductionGatewayId.GERMANY, "secondary.example")
+
+    @Test
+    fun `B30 - primary origin failure then secondary origin success is applied and persisted by the real activateDevice flow`() = runTest {
+        val identity = FakeClientTunnelIdentityStore()
+        var callCount = 0
+        val seenHosts = mutableListOf<String>()
+        val seenPublicKeys = mutableListOf<String>()
+        val seenCredentials = mutableListOf<String>()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "device-public-key"),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            clientTunnelIdentityStore = identity,
+            activationClient = { origin, publicKey, credential ->
+                callCount++
+                seenHosts += origin.host
+                seenPublicKeys += publicKey
+                seenCredentials += credential
+                if (origin.host == "primary.example") {
+                    ProvisioningResult.NetworkError("SocketTimeoutException: simulated primary-origin timeout")
+                } else {
+                    germanyMatchingSuccess(clientTunnelIp = "10.77.0.9")
+                }
+            },
+            controlPlaneOriginsForActivation = { listOf(primaryOrigin, secondaryOrigin) },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.runCurrent() // let init's getPublicKey() complete
+
+        viewModel.activateDevice("shared-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals("the primary AND secondary origin must both actually have been attempted", 2, callCount)
+        assertEquals(
+            "the first request must use primary.example, and after its retryable failure the second request must use secondary.example - never the same host twice",
+            listOf("primary.example", "secondary.example"),
+            seenHosts,
+        )
+        assertEquals(listOf("device-public-key", "device-public-key"), seenPublicKeys)
+        assertEquals(listOf("shared-credential", "shared-credential"), seenCredentials)
+        assertTrue(
+            "the successful (secondary-origin) result must reach the real ProvisioningUiState.Success path",
+            viewModel.provisioningState.value is ProvisioningUiState.Success,
+        )
+        assertEquals(
+            "the successful result must actually be persisted via the real clientTunnelIdentityStore write",
+            "10.77.0.9",
+            identity.read(ProductionGatewayId.GERMANY),
+        )
+    }
+
+    @Test
+    fun `B30 - a malformed primary response leaves no partial state, and the secondary origin's success is what actually gets persisted`() = runTest {
+        val identity = FakeClientTunnelIdentityStore()
+        val seenHosts = mutableListOf<String>()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "device-public-key"),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            clientTunnelIdentityStore = identity,
+            activationClient = { origin, _, _ ->
+                seenHosts += origin.host
+                if (origin.host == "primary.example") {
+                    ProvisioningResult.MalformedResponse("client_tunnel_ip missing or not a valid IPv4 address")
+                } else {
+                    germanyMatchingSuccess(clientTunnelIp = "10.77.0.7")
+                }
+            },
+            controlPlaneOriginsForActivation = { listOf(primaryOrigin, secondaryOrigin) },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateDevice("some-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(listOf("primary.example", "secondary.example"), seenHosts)
+        assertEquals("10.77.0.7", identity.read(ProductionGatewayId.GERMANY))
+    }
+
+    @Test
+    fun `B30 - all trusted origins exhausted produces a user-friendly typed failure, never a raw exception or hostname`() = runTest {
+        val identity = FakeClientTunnelIdentityStore()
+        val seenHosts = mutableListOf<String>()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "device-public-key"),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            clientTunnelIdentityStore = identity,
+            activationClient = { origin, _, _ ->
+                seenHosts += origin.host
+                ProvisioningResult.NetworkError("SocketTimeoutException: simulated outage on ${origin.host}")
+            },
+            controlPlaneOriginsForActivation = { listOf(primaryOrigin, secondaryOrigin) },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateDevice("some-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals("both distinct origins must genuinely have been dialed before exhaustion", listOf("primary.example", "secondary.example"), seenHosts)
+        assertNull("no partial state must ever be persisted when every origin fails", identity.read(ProductionGatewayId.GERMANY))
+        assertEquals(
+            "VPN setup could not be completed on this network. Try another network or send diagnostics.",
+            viewModel.activationFailureMessage.value,
+        )
+        val message = viewModel.activationFailureMessage.value!!
+        assertTrue(!message.contains("primary.example"))
+        assertTrue(!message.contains("secondary.example"))
+        assertTrue(!message.contains("SocketTimeoutException"))
+    }
+
+    @Test
+    fun `B30 - authorization rejection stops fallback - the secondary origin is never attempted`() = runTest {
+        val identity = FakeClientTunnelIdentityStore()
+        val seenHosts = mutableListOf<String>()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(publicKey = "device-public-key"),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            clientTunnelIdentityStore = identity,
+            activationClient = { origin, _, _ -> seenHosts += origin.host; ProvisioningResult.Revoked },
+            controlPlaneOriginsForActivation = { listOf(primaryOrigin, secondaryOrigin) },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.activateDevice("revoked-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals("an authorization rejection must never be retried against a second origin", listOf("primary.example"), seenHosts)
+        assertEquals(ProvisioningUiState.Revoked, viewModel.provisioningState.value)
     }
 }

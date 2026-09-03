@@ -39,7 +39,7 @@ class XrayProfileProvisionerTest {
     @Test
     fun `successful fetch saves exactly one validated profile mapped via the B8K4A mapper`() = runBlocking {
         val repository = newRepository()
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> sampleSuccess }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> sampleSuccess }
 
         val outcome = provisioner.provision(validKey, "some-activation-credential")
 
@@ -52,7 +52,7 @@ class XrayProfileProvisionerTest {
     fun `same device public key and activation credential are forwarded to the fetch call`() = runBlocking {
         var capturedKey: String? = null
         var capturedCredential: String? = null
-        val provisioner = XrayProfileProvisioner(newRepository()) { key, credential ->
+        val provisioner = XrayProfileProvisioner(newRepository()) { _, key, credential ->
             capturedKey = key
             capturedCredential = credential
             sampleSuccess
@@ -74,7 +74,7 @@ class XrayProfileProvisionerTest {
         )
         repository.saveProfile(existing)
 
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.NetworkError("timeout") }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.NetworkError("timeout") }
         val outcome = provisioner.provision(validKey, "cred")
 
         assertEquals(XrayProfileProvisioningOutcome.Unavailable, outcome)
@@ -87,7 +87,7 @@ class XrayProfileProvisionerTest {
         val existing = sampleSuccess.toXrayProfile()
         repository.saveProfile(existing)
 
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.ServiceUnavailable }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.ServiceUnavailable }
         val outcome = provisioner.provision(validKey, "cred")
 
         assertEquals(XrayProfileProvisioningOutcome.Unavailable, outcome)
@@ -100,7 +100,7 @@ class XrayProfileProvisionerTest {
         val existing = sampleSuccess.toXrayProfile()
         repository.saveProfile(existing)
 
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.Unauthorized }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.Unauthorized }
         val outcome = provisioner.provision(validKey, "cred")
 
         assertEquals(XrayProfileProvisioningOutcome.AuthorizationFailed, outcome)
@@ -113,7 +113,7 @@ class XrayProfileProvisionerTest {
         val existing = sampleSuccess.toXrayProfile()
         repository.saveProfile(existing)
 
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.Revoked }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.Revoked }
         val outcome = provisioner.provision(validKey, "cred")
 
         assertEquals(XrayProfileProvisioningOutcome.AuthorizationFailed, outcome)
@@ -126,7 +126,7 @@ class XrayProfileProvisionerTest {
         val existing = sampleSuccess.toXrayProfile()
         repository.saveProfile(existing)
 
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.DeviceNotBound }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.DeviceNotBound }
         val outcome = provisioner.provision(validKey, "cred")
 
         assertEquals(XrayProfileProvisioningOutcome.AuthorizationFailed, outcome)
@@ -139,7 +139,7 @@ class XrayProfileProvisionerTest {
         val existing = sampleSuccess.toXrayProfile()
         repository.saveProfile(existing)
 
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.MalformedResponse("bad short_id") }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.MalformedResponse("bad short_id") }
         val outcome = provisioner.provision(validKey, "cred")
 
         assertTrue(outcome is XrayProfileProvisioningOutcome.Malformed)
@@ -150,7 +150,7 @@ class XrayProfileProvisionerTest {
     @Test
     fun `malformed response with no prior stored profile still saves nothing`() = runBlocking {
         val repository = newRepository()
-        val provisioner = XrayProfileProvisioner(repository) { _, _ -> XrayProfileResult.MalformedResponse("bad uuid") }
+        val provisioner = XrayProfileProvisioner(repository) { _, _, _ -> XrayProfileResult.MalformedResponse("bad uuid") }
 
         provisioner.provision(validKey, "cred")
 

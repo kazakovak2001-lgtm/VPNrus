@@ -8,8 +8,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -28,6 +31,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkProfiler
 import net.pocvpn.client.provisioning.ProvisioningClient
+import net.pocvpn.client.provisioning.friendlyActivationFailureMessage
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
 import net.pocvpn.client.provisioning.XrayProfileProvisioner
@@ -256,26 +260,46 @@ class MainViewModel(
     // apply()/write() wiring are unit-testable without a live HTTPS call to
     // the real production edge (same reasoning as gatewayConfigOverride/
     // profileStore above - an additive seam, not a network abstraction).
-    private val activationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
-        ProvisioningClient::activate,
-    // B14 - Stockholm's OWN activation client. Real by default (mirrors
-    // [activationClient] immediately above, never a null "not wired" seam)
-    // so production/every non-test call site genuinely attempts a request
-    // to Stockholm's own edge without needing explicit Factory wiring - see
-    // MainViewModel's own docs for why this is a SEPARATE function value
-    // rather than [activationClient] itself parameterized by a target host:
-    // [activationClient] stays exactly 2-arg so every pre-B14 test/call
-    // site (including `ProvisioningClient::activate` used as a bare
-    // function reference) stays byte-for-byte unchanged. Stockholm has no
-    // deployed control-plane today, so this genuinely fails closed with a
-    // real [ProvisioningResult.NetworkError] (connection refused/TLS
-    // failure/timeout) until an operator deploys one (see
-    // gateway/DEPLOYMENT.md's own second-gateway section) - never a
-    // fabricated success.
-    private val stockholmActivationClient: (publicKey: String, activationCredential: String) -> ProvisioningResult =
-        { publicKey, activationCredential ->
-            ProvisioningClient.activate(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
-        },
+    // B30 review fix (origin-discarding blocker) - now ORIGIN-AWARE: the
+    // default genuinely dials [ControlPlaneOrigin.host], never a
+    // pre-bound/fixed host that would silently ignore which origin the
+    // caller (activateDevice, via ActivationResilienceCoordinator/
+    // TrustedOriginRequestExecutor) actually selected for this attempt -
+    // see MainViewModel's own docs at the activateDevice() call site for
+    // why this matters (a 2-origin executor must be able to actually reach
+    // TWO different origins, not silently repeat the same request).
+    private val activationClient: (origin: net.pocvpn.client.controlplane.ControlPlaneOrigin, publicKey: String, activationCredential: String) -> ProvisioningResult =
+        { origin, publicKey, activationCredential -> ProvisioningClient.activate(publicKey, activationCredential, origin.host) },
+    // B14 - Stockholm's OWN activation client - kept as a SEPARATE function
+    // value (never collapsed into [activationClient] itself) so a test can
+    // still independently stub Germany's vs Stockholm's own response, even
+    // though - B30 review fix - both now share byte-for-byte the SAME
+    // origin-aware default: [ControlPlaneOrigin.host] already carries
+    // whichever gateway's real host [ControlPlaneOriginSetBuilder.forGateway]
+    // resolved it from, so no gateway-specific hardcoded host is needed
+    // here anymore. Stockholm has no deployed control-plane today, so this
+    // genuinely fails closed with a real [ProvisioningResult.NetworkError]
+    // (connection refused/TLS failure/timeout) until an operator deploys
+    // one (see gateway/DEPLOYMENT.md's own second-gateway section) - never
+    // a fabricated success.
+    private val stockholmActivationClient: (origin: net.pocvpn.client.controlplane.ControlPlaneOrigin, publicKey: String, activationCredential: String) -> ProvisioningResult =
+        { origin, publicKey, activationCredential -> ProvisioningClient.activate(publicKey, activationCredential, origin.host) },
+    // B30 review fix (blocker 2's own required integration test) - the ONE
+    // place activateDevice below resolves its trusted origin list. Defaults
+    // to ControlPlaneOriginSetBuilder::forGateway - the real, audited,
+    // compiled-trusted-config-only builder (see that object's own docs:
+    // today's real production topology has exactly one physical origin per
+    // gateway, confirmed by decoding the embedded signed manifest and
+    // auditing gateway/api/activations.py's per-VPS-local activation store -
+    // Germany and Stockholm are NOT interchangeable activation backends, see
+    // PROJECT_ARCHITECTURE.md's B30 section for the full audit). An
+    // additive constructor seam, the SAME established pattern as
+    // activationClient/fetchXrayProfile above - lets a test inject a
+    // synthetic multi-origin list to prove the fallback MECHANISM works
+    // through the REAL activateDevice() code path, without this class ever
+    // inventing a fake production host itself.
+    private val controlPlaneOriginsForActivation: (net.pocvpn.client.vpn.config.ProductionGatewayId) -> List<net.pocvpn.client.controlplane.ControlPlaneOrigin> =
+        net.pocvpn.client.controlplane.ControlPlaneOriginSetBuilder::forGateway,
     // B8C2A - additive, defaults to Dispatchers.IO (byte-for-byte unchanged
     // production behavior). Lets tests run activateDevice()'s coroutine on
     // the SAME (virtual-time) test dispatcher as the rest of the test instead
@@ -1589,6 +1613,33 @@ class MainViewModel(
     private val _provisioningState = MutableStateFlow<ProvisioningUiState>(ProvisioningUiState.Idle)
     val provisioningState: StateFlow<ProvisioningUiState> = _provisioningState.asStateFlow()
 
+    // B30 (task 6) - a purely DERIVED, non-technical projection of
+    // provisioningState above - never mutates it, never a second activation
+    // state machine. Every failure variant (including ProvisioningUiState.Error,
+    // which today carries a raw NetworkError message/hostname-shaped string
+    // or "malformed response: <reason>") collapses to ONE fixed,
+    // non-technical sentence - no raw exception text, hostname, port, or
+    // TLS detail ever reaches this flow. Idle/Provisioning/Success collapse
+    // to null (nothing to show). See friendlyActivationFailureMessage's own
+    // docs for the exact per-outcome copy.
+    val activationFailureMessage: StateFlow<String?> = provisioningState
+        .map(::friendlyActivationFailureMessage)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, friendlyActivationFailureMessage(provisioningState.value))
+
+    /**
+     * B30 (task 7) - "Retry activation": reuses the exact same activation
+     * call [activateDevice] already makes - never a manual endpoint/host
+     * entry point, and never a new device identity (activateDevice always
+     * reads the SAME already-get-or-created public key - see
+     * [net.pocvpn.client.identity.ClientKeyRepository.getOrCreateIdentity] -
+     * and the server's own activation endpoint is idempotent by credential
+     * digest, see gateway/api/activations.py). A UI Retry button needs
+     * nothing more than this one call plus the same credential text the
+     * user already typed once.
+     */
+    fun retryActivation(activationCredential: String, targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value) =
+        activateDevice(activationCredential, targetGatewayId)
+
     // B8B3C - debug-only visibility into where the effective profile came
     // from this session. DEV_FALLBACK until either a persisted profile is
     // restored below or a fresh provisionDevice() succeeds.
@@ -1796,6 +1847,14 @@ class MainViewModel(
      * rejected exactly like an unmatched one, never silently applied to
      * the wrong endpoint's identity.
      */
+    // B30 review fix (blocker 1) - the ONE coordinator instance
+    // activateDevice below actually routes its network call through (never
+    // a second, independently-constructed coordinator). Built from the SAME
+    // supportDiagnosticsRecorder this ViewModel already has - not a
+    // constructor param, so no pre-B30 MainViewModel(...) call site (test or
+    // production) needs to change.
+    private val activationResilienceCoordinator = net.pocvpn.client.controlplane.ActivationResilienceCoordinator(supportDiagnosticsRecorder)
+
     fun activateDevice(
         activationCredential: String,
         targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value,
@@ -1834,8 +1893,43 @@ class MainViewModel(
 
         _provisioningState.value = ProvisioningUiState.Provisioning
         viewModelScope.launch {
-            val result = withContext(ioDispatcher) {
-                client(key, trimmedCredential)
+            // B30 review fix (blocker 1) - the real activation network call
+            // now goes through activationResilienceCoordinator, which itself
+            // records ACTIVATION_STARTED/CONTROL_ORIGIN_*/ACTIVATION_SUCCEEDED/
+            // ACTIVATION_FAILED (never duplicated here - see that class's own
+            // docs). origins comes from ControlPlaneOriginSetBuilder -
+            // ProductionGatewayCatalog's own compiled, trusted facts, never a
+            // caller-supplied host. hasValidLocalActivation is always false
+            // here: activateDevice is an explicit, user-triggered "activate"
+            // action - it must always actually attempt the network call, never
+            // silently no-op because SOME prior local state happens to exist
+            // (the offline-reuse skip is for automatic/background reuse, e.g.
+            // IngressProfileProvisioner.ensureFreshProfile, not for a request
+            // the user just explicitly made). B30 review fix (origin-discarding
+            // blocker) - callActivate now actually forwards `origin` into
+            // `client`, which is itself origin-aware (dials origin.host) -
+            // a 2-origin executor genuinely dials two different hosts, never
+            // silently repeating the same request under a different label.
+            val outcome = withContext(ioDispatcher) {
+                activationResilienceCoordinator.activate(
+                    gatewayId = targetGatewayId,
+                    publicKey = key,
+                    activationCredential = trimmedCredential,
+                    hasValidLocalActivation = { false },
+                    callActivate = { origin, pk, cred -> client(origin, pk, cred) },
+                    origins = controlPlaneOriginsForActivation(targetGatewayId),
+                )
+            }
+            // hasValidLocalActivation is always false above, so
+            // AlreadyValidLocally is structurally unreachable here - the
+            // fallback Error state below exists only so this `when` is
+            // exhaustive, never expected to actually run.
+            val result: ProvisioningResult = when (outcome) {
+                is net.pocvpn.client.controlplane.ActivationResilienceCoordinator.Outcome.Success -> outcome.result
+                is net.pocvpn.client.controlplane.ActivationResilienceCoordinator.Outcome.Rejected -> outcome.result
+                is net.pocvpn.client.controlplane.ActivationResilienceCoordinator.Outcome.AllOriginsExhausted -> outcome.lastResult
+                is net.pocvpn.client.controlplane.ActivationResilienceCoordinator.Outcome.AlreadyValidLocally ->
+                    ProvisioningResult.NetworkError("activation was unexpectedly skipped")
             }
             _provisioningState.value = when (result) {
                 is ProvisioningResult.Success -> {
@@ -2006,6 +2100,22 @@ class MainViewModel(
                 is ProvisioningResult.ServiceUnavailable -> ProvisioningUiState.Error("service temporarily unavailable")
                 is ProvisioningResult.MalformedResponse -> ProvisioningUiState.Error("malformed response: ${result.reason}")
                 is ProvisioningResult.NetworkError -> ProvisioningUiState.Error(result.message)
+            }
+            // B30 review fix (blocker 1) - activationResilienceCoordinator
+            // .activate() above already recorded ACTIVATION_STARTED/
+            // CONTROL_ORIGIN_*/ACTIVATION_SUCCEEDED/ACTIVATION_FAILED for the
+            // wire-level result - never duplicated here. The one thing it
+            // cannot know about is the client-side gateway-identity
+            // cross-check a few lines up (matchedGatewayId != targetGatewayId):
+            // from the coordinator's own narrow view the wire response WAS a
+            // valid Success, so it already recorded ACTIVATION_SUCCEEDED -
+            // this records the ADDITIONAL, more specific trust-validation
+            // rejection when that cross-check overrides it to a failure, so a
+            // support bundle shows the full truth rather than a misleadingly
+            // happy ACTIVATION_SUCCEEDED with no explanation for why the UI
+            // state ended up on Error.
+            if (result is ProvisioningResult.Success && _provisioningState.value !is ProvisioningUiState.Success) {
+                supportDiagnosticsRecorder?.recordActivationFailed(net.pocvpn.client.controlplane.ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED)
             }
         }
     }
@@ -3450,8 +3560,22 @@ class MainViewModel(
             // the ONE place this whole graph is assembled, now a directly
             // testable unit on its own (see MainViewModelCompositionRootTest
             // and RelayCompositionFactoryTest) rather than inline here.
+            // B29 - the one real support-diagnostics store/recorder pair for
+            // this ViewModel instance - never a second, independently-
+            // constructed store (see MainViewModel's own supportDiagnosticsStore
+            // docs for why both are wired here together). Built BEFORE
+            // relayComposition below (B30) so the SAME recorder instance can
+            // be threaded into IngressProfileProvisioner - never a second,
+            // independently-constructed recorder for relay/ingress
+            // diagnostics.
+            val supportDiagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
+            val supportDiagnosticsRecorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(
+                store = supportDiagnosticsStore,
+                appVersionName = BuildConfig.VERSION_NAME,
+                appVersionCode = BuildConfig.VERSION_CODE.toLong(),
+            )
             val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
-            val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore)
+            val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore, supportDiagnosticsRecorder)
 
             val manifestOrigins = net.pocvpn.client.reachability.ManifestOriginConfig.parse(BuildConfig.MANIFEST_URLS)
             val manifestDistributionClient = manifestOrigins.takeIf { it.isNotEmpty() }?.let { origins ->
@@ -3460,16 +3584,6 @@ class MainViewModel(
                     repository = manifestRepository,
                 )
             }
-            // B29 - the one real support-diagnostics store/recorder pair for
-            // this ViewModel instance - never a second, independently-
-            // constructed store (see MainViewModel's own supportDiagnosticsStore
-            // docs for why both are wired here together).
-            val supportDiagnosticsStore = net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore()
-            val supportDiagnosticsRecorder = net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder(
-                store = supportDiagnosticsStore,
-                appVersionName = BuildConfig.VERSION_NAME,
-                appVersionCode = BuildConfig.VERSION_CODE.toLong(),
-            )
             @Suppress("UNCHECKED_CAST")
             return MainViewModel(
                 clientKeyRepository = ClientKeyRepositoryFactory.create(context),
@@ -3518,7 +3632,11 @@ class MainViewModel(
                     HttpsGatewayReachabilityProbe(urlString = "https://captive.apple.com/hotspot-detect.html"),
                     HttpsGatewayReachabilityProbe(urlString = "https://detectportal.firefox.com/success.txt"),
                 ),
-                xrayProfileProvisioner = XrayProfileProvisioner(xrayProfileRepository),
+                xrayProfileProvisioner = XrayProfileProvisioner(
+                    xrayProfileRepository,
+                    gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
+                ),
                 // B8I7 - the SAME real VlessRealityTransport instance is
                 // registered for BOTH Smart Connect selection
                 // (buildTransportRegistry) and execution
@@ -3539,7 +3657,11 @@ class MainViewModel(
                 // B8O2 - same reasoning as xrayTransport/xrayProfileRepository
                 // above, for TLS/TCP: the SAME real VlessTlsTransport instance
                 // is registered for BOTH Smart Connect selection and execution.
-                xrayTlsProfileProvisioner = XrayTlsProfileProvisioner(xrayTlsProfileRepository),
+                xrayTlsProfileProvisioner = XrayTlsProfileProvisioner(
+                    xrayTlsProfileRepository,
+                    gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
+                ),
                 xrayTlsTransport = VlessTlsTransport(context) { id ->
                     if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayTlsProfileRepository else XrayTlsProfileRepositoryFactory.create(context, id)
                 },
@@ -3561,17 +3683,22 @@ class MainViewModel(
                 // stockholmXrayTlsProfileRepository instances above (never
                 // a second, independently-constructed store) and each
                 // fetching from Stockholm's own edge - never Germany's.
+                // B30 review fix (origin-discarding blocker) - no explicit
+                // fetchXrayProfile/fetchXrayTlsProfile override needed
+                // anymore: the default is origin-aware (dials
+                // ControlPlaneOrigin.host), and gatewayId = STOCKHOLM makes
+                // ControlPlaneOriginSetBuilder resolve Stockholm's own real
+                // host into that origin - byte-for-byte the same request
+                // this explicit override used to build by hand.
                 stockholmXrayProfileProvisioner = XrayProfileProvisioner(
                     repository = stockholmXrayProfileRepository,
-                    fetchXrayProfile = { publicKey, activationCredential ->
-                        ProvisioningClient.fetchXrayProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
-                    },
+                    gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
                 stockholmXrayTlsProfileProvisioner = XrayTlsProfileProvisioner(
                     repository = stockholmXrayTlsProfileRepository,
-                    fetchXrayTlsProfile = { publicKey, activationCredential ->
-                        ProvisioningClient.fetchXrayTlsProfile(publicKey, activationCredential, net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost)
-                    },
+                    gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
                 // B11 - real, live-wired, OBSERVATIONAL ONLY - see
                 // reachabilityDiagnostics()'s own docs for why this cannot

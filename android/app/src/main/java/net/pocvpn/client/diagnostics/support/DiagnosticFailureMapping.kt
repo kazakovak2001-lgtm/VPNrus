@@ -1,5 +1,6 @@
 package net.pocvpn.client.diagnostics.support
 
+import net.pocvpn.client.controlplane.ControlPlaneFailureReason
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.reachability.ManifestSource
 import net.pocvpn.client.relay.IngressActivationOutcome
@@ -89,4 +90,24 @@ fun mapManifestSourceToManifestSourceKind(source: ManifestSource?): ManifestSour
     ManifestSource.LAST_KNOWN_GOOD -> ManifestSourceKind.LAST_KNOWN_GOOD
     ManifestSource.EMBEDDED_BOOTSTRAP -> ManifestSourceKind.EMBEDDED_BOOTSTRAP
     null -> ManifestSourceKind.NONE
+}
+
+/**
+ * B30 (task 9) - pure mapping from [ControlPlaneFailureReason] (the closed
+ * taxonomy net.pocvpn.client.controlplane.TrustedOriginRequestExecutor and
+ * its callers classify a control-plane attempt failure into) onto this
+ * file's own [DiagnosticFailureReason] vocabulary, exactly the same
+ * "re-label, never replace" discipline every other mapper in this file
+ * follows.
+ */
+fun mapControlPlaneFailureReasonToFailureReason(reason: ControlPlaneFailureReason): DiagnosticFailureReason = when (reason) {
+    ControlPlaneFailureReason.DNS_RESOLUTION_FAILED -> DiagnosticFailureReason.CONTROL_PLANE_DNS_FAILURE
+    ControlPlaneFailureReason.CONNECT_TIMEOUT -> DiagnosticFailureReason.CONTROL_PLANE_CONNECT_TIMEOUT
+    ControlPlaneFailureReason.TLS_TRUST_FAILED -> DiagnosticFailureReason.CONTROL_PLANE_TLS_FAILURE
+    ControlPlaneFailureReason.HTTP_UNAVAILABLE -> DiagnosticFailureReason.CONTROL_PLANE_HTTP_UNAVAILABLE
+    ControlPlaneFailureReason.AUTHORIZATION_REJECTED -> DiagnosticFailureReason.CONTROL_PLANE_AUTHORIZATION_REJECTED
+    ControlPlaneFailureReason.MALFORMED_RESPONSE -> DiagnosticFailureReason.CONTROL_PLANE_MALFORMED_RESPONSE
+    ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED -> DiagnosticFailureReason.CONTROL_PLANE_TRUST_REJECTED
+    ControlPlaneFailureReason.UNTRUSTED_REDIRECT_REJECTED -> DiagnosticFailureReason.CONTROL_PLANE_REDIRECT_REJECTED
+    ControlPlaneFailureReason.ALL_ORIGINS_EXHAUSTED -> DiagnosticFailureReason.CONTROL_PLANE_ORIGINS_EXHAUSTED
 }
