@@ -33,6 +33,13 @@ from . import xray_config_renderer as base
 _SUPPORTED_UPSTREAM_TRANSPORTS = ("reality", "tls")
 _REALITY_PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
+# B31C - same pinned constant as ingress_config.py's own
+# _SUPPORTED_UPSTREAM_FLOWS (that module's docstring has the full "why") -
+# duplicated here deliberately: this renderer is called directly by tests
+# and any future caller with an UpstreamExitConfig built by hand, not only
+# via ingress_config.load_ingress_config, so an invalid flow must fail
+# closed at render time too, not only at config-load time.
+_SUPPORTED_UPSTREAM_FLOWS = ("xtls-rprx-vision",)
 
 
 class IngressConfigRenderError(Exception):
@@ -108,6 +115,11 @@ def _validate_upstream(upstream):
     else:  # tls
         if not upstream.sni:
             raise IngressConfigRenderError("TLS upstream requires sni")
+
+    if upstream.flow and upstream.flow not in _SUPPORTED_UPSTREAM_FLOWS:
+        raise IngressConfigRenderError(
+            f"upstream flow must be blank or one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream.flow!r}"
+        )
 
 
 def _render_upstream_outbound(upstream):

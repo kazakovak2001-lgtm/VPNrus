@@ -148,6 +148,46 @@ class NoOpenRelayTests(IngressRendererTestBase):
         with self.assertRaises(renderer_module.IngressConfigRenderError):
             renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, bad_upstream)
 
+    def test_a_configured_upstream_flow_reaches_the_rendered_outbound_user_exactly(self):
+        # B31C - the live bug this closes: a relay-upstream outbound whose
+        # user carries no "flow" field at all is silently accepted by the
+        # renderer/Xray config loader and only rejected later, by the
+        # EXIT's own inbound, at actual connection time.
+        activations_data, xray_data = self._activations_and_xray()
+        upstream = renderer_module.UpstreamExitConfig(
+            host="203.0.113.60", port=8444, transport="reality", uuid=self.upstream_reality.uuid,
+            server_name="www.microsoft.com", public_key="B" * 43, short_id="ef567890", flow="xtls-rprx-vision",
+        )
+        config = renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, upstream)
+        user = config["outbounds"][0]["settings"]["vnext"][0]["users"][0]
+        self.assertEqual("xtls-rprx-vision", user["flow"])
+        self.assertEqual(upstream.uuid, user["id"])
+
+    def test_a_blank_upstream_flow_omits_the_field_rather_than_emitting_it_empty(self):
+        activations_data, xray_data = self._activations_and_xray()
+        config = renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, self.upstream_reality)
+        user = config["outbounds"][0]["settings"]["vnext"][0]["users"][0]
+        self.assertNotIn("flow", user)
+
+    def test_an_unsupported_upstream_flow_fails_closed_rather_than_rendering_it(self):
+        activations_data, xray_data = self._activations_and_xray()
+        bad_upstream = renderer_module.UpstreamExitConfig(
+            host="203.0.113.60", port=8444, transport="reality", uuid=self.upstream_reality.uuid,
+            server_name="www.microsoft.com", public_key="B" * 43, short_id="ef567890", flow="xtls-rprx-splice",
+        )
+        with self.assertRaises(renderer_module.IngressConfigRenderError):
+            renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, bad_upstream)
+
+    def test_relay_upstream_uuid_is_unchanged_by_flow_handling(self):
+        activations_data, xray_data = self._activations_and_xray()
+        upstream = renderer_module.UpstreamExitConfig(
+            host="203.0.113.60", port=8444, transport="reality", uuid=self.upstream_reality.uuid,
+            server_name="www.microsoft.com", public_key="B" * 43, short_id="ef567890", flow="xtls-rprx-vision",
+        )
+        config = renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, upstream)
+        user = config["outbounds"][0]["settings"]["vnext"][0]["users"][0]
+        self.assertEqual(self.upstream_reality.uuid, user["id"])
+
 
 class PerHopTransportIndependenceTests(IngressRendererTestBase):
     """Task requirement 6/14 - client->ingress transport may differ from ingress->exit transport; never collapsed to one."""

@@ -24,6 +24,18 @@ _ENV_PREFIX = "NOVA_INGRESS_"
 _REALITY_PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
 _SUPPORTED_UPSTREAM_TRANSPORTS = ("reality", "tls")
+# B31C - xray-core's own proxy/vless package only actually implements
+# "xtls-rprx-vision" (besides no flow at all) - the SAME constant
+# config.py's own XRAY_FLOW validation already pins for the ordinary
+# gateway's client-facing flow (see that module's own comment). The pinned
+# EXIT's relay-facing REALITY inbound requires this flow for the ingress's
+# relay identity (found live - B31C) - blank is still accepted (a TLS
+# upstream, or a future non-Vision REALITY deployment, may legitimately
+# have none), but a set value that isn't this exact string is never
+# silently accepted as "probably fine": it would only be discovered at
+# Xray's own connection-time rejection, exactly the live failure this
+# closes.
+_SUPPORTED_UPSTREAM_FLOWS = ("xtls-rprx-vision",)
 
 # B27 - the two IngressKind values the Android client's own
 # net.pocvpn.client.reachability.IngressKind enum recognizes - kept as
@@ -231,9 +243,20 @@ def load_ingress_config(env=None):
         upstream_short_id = require("UPSTREAM_SHORT_ID")
         if not _SHORT_ID_RE.match(upstream_short_id) or len(upstream_short_id) % 2 != 0:
             raise IngressConfigError(f"{_ENV_PREFIX}UPSTREAM_SHORT_ID is malformed")
+        # B31C - a REALITY relay upstream's flow is required, not merely
+        # validated-if-present: the live production failure this closes was
+        # exactly a SILENTLY blank flow (config loaded fine, Xray started
+        # fine, only the actual relay connection was rejected by the
+        # pinned EXIT's own inbound). Requiring it here turns that into a
+        # fail-closed startup error instead.
+        upstream_flow = require("UPSTREAM_FLOW")
     else:
         upstream_sni = require("UPSTREAM_SNI")
-    upstream_flow = _get(env, "UPSTREAM_FLOW")
+        upstream_flow = _get(env, "UPSTREAM_FLOW")
+    if upstream_flow and upstream_flow not in _SUPPORTED_UPSTREAM_FLOWS:
+        raise IngressConfigError(
+            f"{_ENV_PREFIX}UPSTREAM_FLOW must be blank or one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream_flow!r}"
+        )
 
     # B26 (task B/C) - the exit-side probe contract. Required once the
     # ingress role is configured at all - a real ingress deployment with no

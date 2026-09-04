@@ -45,6 +45,7 @@ def _valid_env(tmp_dir, **overrides):
         "NOVA_INGRESS_UPSTREAM_SERVER_NAME": "www.apple.com",
         "NOVA_INGRESS_UPSTREAM_PUBLIC_KEY": "B" * 43,
         "NOVA_INGRESS_UPSTREAM_SHORT_ID": "cd34",
+        "NOVA_INGRESS_UPSTREAM_FLOW": "xtls-rprx-vision",
         "NOVA_INGRESS_EXIT_ENDPOINT_ID": "frankfurt",
         "NOVA_INGRESS_EXIT_PROBE_HOST": "203.0.113.60",
         "NOVA_INGRESS_PROBE_HMAC_SECRET_FILE": probe_secret_file,
@@ -158,6 +159,55 @@ class IngressConfigTests(unittest.TestCase):
             env["NOVA_INGRESS_UPSTREAM_UUID_FILE"] = os.path.join(tmp_dir, "does-not-exist")
             with self.assertRaises(ingress_config_module.IngressConfigError):
                 ingress_config_module.load_ingress_config(env=env)
+
+    # --- B31C - relay upstream VLESS flow parity ---
+
+    def test_configured_upstream_flow_reaches_config_exactly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir)
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(cfg.ingress_upstream_flow, "xtls-rprx-vision")
+
+    def test_reality_upstream_missing_flow_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir)
+            del env["NOVA_INGRESS_UPSTREAM_FLOW"]
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
+
+    def test_unsupported_upstream_flow_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir, NOVA_INGRESS_UPSTREAM_FLOW="xtls-rprx-splice")
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
+
+    def test_tls_upstream_flow_is_optional(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir)
+            env["NOVA_INGRESS_UPSTREAM_TRANSPORT"] = "tls"
+            del env["NOVA_INGRESS_UPSTREAM_SERVER_NAME"]
+            del env["NOVA_INGRESS_UPSTREAM_PUBLIC_KEY"]
+            del env["NOVA_INGRESS_UPSTREAM_SHORT_ID"]
+            del env["NOVA_INGRESS_UPSTREAM_FLOW"]
+            env["NOVA_INGRESS_UPSTREAM_SNI"] = "www.apple.com"
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(cfg.ingress_upstream_flow, "")
+
+    def test_client_facing_ingress_flow_is_unaffected_by_upstream_flow(self):
+        # B31C touches ONLY the ingress -> exit relay leg - the client-
+        # facing ingress inbound's own flow (NOVA_INGRESS_FLOW, unrelated
+        # env var, absent from _valid_env by default) must be completely
+        # untouched by this change: still absent by default, and still
+        # settable independently of NOVA_INGRESS_UPSTREAM_FLOW.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            default_env = _valid_env(tmp_dir)
+            self.assertNotIn("NOVA_INGRESS_FLOW", default_env)
+            self.assertEqual(ingress_config_module.load_ingress_config(env=default_env).ingress_flow, "")
+
+            env = _valid_env(tmp_dir, NOVA_INGRESS_FLOW="xtls-rprx-vision")
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(cfg.ingress_flow, "xtls-rprx-vision")
+            self.assertEqual(cfg.ingress_upstream_flow, "xtls-rprx-vision")
 
 
 if __name__ == "__main__":
