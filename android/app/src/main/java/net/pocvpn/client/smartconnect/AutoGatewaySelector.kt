@@ -573,7 +573,58 @@ object AutoGatewaySelector {
         val combined: List<AutoConnectAttempt> =
             (if (directAllowed) direct.map { AutoConnectAttempt.DirectAttempt(it) } else emptyList()) +
                 relayed.map { AutoConnectAttempt.RelayedAttempt(it) }
-        return combined.sortedWith(compareByDescending<AutoConnectAttempt> { it.score }.thenBy { it.attemptKey })
+        val sorted = combined.sortedWith(compareByDescending<AutoConnectAttempt> { it.score }.thenBy { it.attemptKey })
+        return applyRelayFairness(sorted)
+    }
+
+    /**
+     * B34 - path-family fairness, physically reproduced as a real bug
+     * (PR #53's CHAIN_DIRECT physical validation): a pure score sort alone
+     * can let enough eligible Direct candidates outrank a real, eligible
+     * Relayed one that the whole shared [MAX_ATTEMPTS] budget is consumed by
+     * Direct failures before the Relayed candidate is ever tried at all -
+     * observed directly: 4 Direct Xray candidates (2 gateways x 2
+     * transports), each correctly and truthfully failing after B33's own
+     * bounded remote-confirmation, exhausted the ENTIRE budget while a real,
+     * eligible `stockholm-ingress-1` CHAIN_DIRECT candidate sat ranked 5th
+     * and was never attempted - Auto reported "Automatic gateway candidates
+     * exhausted" despite a genuinely viable path existing.
+     *
+     * This function ONLY reorders [sorted] (already fully score-ranked,
+     * already the SAME list [nextCombinedAttempt] will walk unchanged) - it
+     * never re-scores anything (task's own "do not alter PathScorer"), never
+     * prefers Relayed over a higher-ranked Direct candidate (task's own "do
+     * not artificially prefer CHAIN_DIRECT over a healthy Direct path" - a
+     * Direct candidate ranked ABOVE the reserved slot is completely
+     * unaffected and still gets its earlier turn first), and never changes
+     * the total bounded attempt count (still exactly [maxAttempts] distinct
+     * attempts, enforced by the UNCHANGED [nextCombinedAttempt]/
+     * `attemptedKeys.size >= MAX_ATTEMPTS` check).
+     *
+     * The policy: find the single highest-ranked [AutoConnectAttempt.RelayedAttempt]
+     * (the FIRST one in [sorted] - the list is already score-descending, so
+     * this is genuinely the best-ranked relay, never an arbitrary one - task
+     * requirement 5's "only the highest-ranked one needs the reserved
+     * slot"). If it already falls within the first [maxAttempts] positions
+     * on pure merit, this is a no-op (byte-for-byte unchanged order) - a
+     * relay that already earns a slot honestly must never be moved. If it
+     * falls OUTSIDE that window (the exact bug above), move it to EXACTLY
+     * position [maxAttempts] (1-indexed - the LAST attempt the budget
+     * allows), never earlier: every Direct candidate that outranks it keeps
+     * its earlier position and its earlier turn, and only the single
+     * lowest-ranked Direct candidate that would otherwise have occupied that
+     * last slot is displaced past the budget instead - the total number of
+     * slots never grows. A no-op when there is no Relayed candidate at all,
+     * or [sorted] already fits within [maxAttempts] entries (nothing to
+     * reserve against).
+     */
+    internal fun applyRelayFairness(sorted: List<AutoConnectAttempt>, maxAttempts: Int = MAX_ATTEMPTS): List<AutoConnectAttempt> {
+        val topRelayIndex = sorted.indexOfFirst { it is AutoConnectAttempt.RelayedAttempt }
+        if (topRelayIndex == -1 || topRelayIndex < maxAttempts) return sorted
+        val topRelay = sorted[topRelayIndex]
+        val withoutTopRelay = sorted.filterIndexed { index, _ -> index != topRelayIndex }
+        val reservedSlotIndex = (maxAttempts - 1).coerceIn(0, withoutTopRelay.size)
+        return withoutTopRelay.subList(0, reservedSlotIndex) + topRelay + withoutTopRelay.subList(reservedSlotIndex, withoutTopRelay.size)
     }
 
     /**
