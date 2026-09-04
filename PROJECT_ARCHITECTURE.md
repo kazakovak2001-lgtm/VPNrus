@@ -706,6 +706,66 @@ shell`), not inferred.
   untouched, per this follow-up's own scope). A user must reconnect
   manually after this failure, same as any other terminal Xray error today.
 
+## Combined Auto attempt fairness and terminal teardown (hard invariant, B34)
+
+A real physical Oppo CPH2173 test (PR #53's own CHAIN_DIRECT validation,
+2026-09-04) found two separate defects in the same Auto terminal-attempt
+lifecycle, surfaced together once B33 made every failed Direct Xray attempt
+correctly take its full bounded confirmation window instead of falsely
+succeeding instantly: with 4 ranked Direct candidates (2 gateways x 2
+transports) all outranking a real, eligible Relayed `stockholm-ingress-1`
+candidate, the entire shared `AutoGatewaySelector.MAX_ATTEMPTS` budget was
+consumed by Direct failures before the Relayed candidate was ever tried -
+Auto reported "Automatic gateway candidates exhausted" despite a genuinely
+viable path existing - and once exhausted, the device was left with a
+stale, non-functional VPN interface and NO working Internet at all (worse
+than the "Connection failed" UI communicated) until the app process was
+force-stopped.
+
+- **`MAX_ATTEMPTS` semantics (unchanged, now precisely documented)**: it
+  bounds attempts CONSUMED at runtime (`attemptedKeys.size >= MAX_ATTEMPTS`
+  in `nextCombinedAttempt`), never an admission cap on how many candidates
+  `buildCombinedAttempts` may return - the full ranked list can be (and
+  routinely is) longer than `MAX_ATTEMPTS`; `nextCombinedAttempt` simply
+  stops advancing once that many have genuinely been tried.
+- **Attempt fairness, never re-scoring**: `AutoGatewaySelector.applyRelayFairness`
+  (called from inside `buildCombinedAttempts`, right after the existing
+  score sort - `nextCombinedAttempt` itself is completely unchanged) finds
+  the single highest-ranked `RelayedAttempt` and, ONLY if it would otherwise
+  fall outside the first `MAX_ATTEMPTS` positions, moves it to exactly
+  position `MAX_ATTEMPTS` (the last slot the budget allows) - never earlier,
+  never re-scored, never preferred over a higher-ranked Direct candidate.
+  Every Direct candidate that genuinely outranks the relay keeps its earlier
+  turn; only the single lowest-ranked Direct candidate that would have
+  occupied that last slot is displaced past the budget instead. A no-op
+  when the top Relayed candidate already earns a slot on pure merit, when
+  there is no Relayed candidate at all, or when there is no Direct candidate
+  to be fair against. Multiple Relayed candidates: only the single
+  highest-ranked one is ever guaranteed a slot. The total bounded attempt
+  count never changes.
+- **Terminal-exhaustion teardown**: `MainViewModel.attemptCombined`'s
+  genuine-exhaustion branch (reached only after at least one real candidate
+  in the SAME sequence was actually dialed) now calls
+  `VpnController.abandonAttemptWithTerminalError(error, message)` instead of
+  `rejectPreflight` - the latter is a DIFFERENT, pre-existing function built
+  for "reject before this controller was ever touched" (still correctly
+  used by `connectAuto()`'s own separate zero-candidate check, where nothing
+  was ever touched) and never tears down a transport/tun a real prior
+  attempt already brought up. `abandonAttemptWithTerminalError` shares the
+  EXACT SAME extracted teardown (`teardownActiveAttemptLocked` - cancels any
+  reconnect, cancels the active-transport observer job BEFORE calling
+  `disconnect()` to prevent that collector's own async re-forwarding of the
+  transport's post-disconnect state from racing/clobbering the terminal
+  error, clears every per-attempt pinned field) `abandonAttemptForFailover`
+  (B25) already used, then records the typed error and sets a genuine
+  `TransportState.Error(message)` - never silently falling back to plain
+  `Disconnected`, which the UI/diagnostics could not distinguish from an
+  ordinary user-initiated stop. `abandonAttemptForFailover`'s own pre-existing
+  behavior (ends at `Disconnected`, used mid-sequence when Auto is about to
+  try the next candidate) is unaffected - it shares the extracted helper but
+  still sets its own terminal state itself. Never duplicates disconnect
+  logic - both public functions call the one private helper.
+
 ## Control-plane vs data-plane
 
 - `gateway/api/*.py` (`pocvpn-api`) is fully env-var-driven per instance - zero
