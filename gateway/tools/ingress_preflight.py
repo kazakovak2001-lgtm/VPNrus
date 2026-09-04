@@ -30,6 +30,25 @@ from api import ingress_config as ingress_config_module  # noqa: E402
 from api import relay_identity_store as relay_identity_store_module  # noqa: E402
 
 _XRAY_BIN_PATH_EXPECTED_PREFIX = "/opt/pocvpn/xray/"
+_XRAY_VERSION_FILE = os.path.join(_GATEWAY_DIR, "xray", "VERSION")
+
+
+def _pinned_xray_core_commit():
+    """B31A - parse gateway/xray/VERSION's own XRAY_CORE_COMMIT= line (a
+    plain bash-sourced env-style file, never imported as Python) - the
+    SAME pinned commit gateway/xray/fetch-xray-server.sh itself verifies
+    the downloaded release asset against. Returns None if the file is
+    missing or the line can't be found - callers treat that as "cannot
+    verify", never as "pinned commit is empty string"."""
+    try:
+        with open(_XRAY_VERSION_FILE, "r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped.startswith("XRAY_CORE_COMMIT="):
+                    return stripped.split("=", 1)[1].strip()
+    except OSError:
+        return None
+    return None
 _MAX_SANE_CLOCK_SKEW_SECONDS = 300
 
 
@@ -79,9 +98,40 @@ def run_checks(ingress_cfg, env):
         ok = os.path.isfile(xray_bin) and os.access(xray_bin, os.X_OK)
         checks.append(Check("xray binary present and executable", ok, xray_bin if ok else f"missing/non-executable: {xray_bin}"))
         if ok:
+            # B31A - the pinned-path requirement, actually enforced (this
+            # constant existed but was never checked against anything -
+            # found live: a manual `ln -s /usr/local/bin/xray ...` symlink
+            # into the expected path silently passed the OLD check above,
+            # which only ever asked "is SOMETHING executable here", never
+            # "is it the pinned build" - see gateway/xray/fetch-xray-server.sh
+            # for the real fetch+checksum+commit verification this now
+            # cross-checks against, applied here to whatever is ACTUALLY
+            # installed, catching a stale/foreign/manually-symlinked binary
+            # even if it happens to sit at the expected path).
+            path_ok = xray_bin.startswith(_XRAY_BIN_PATH_EXPECTED_PREFIX)
+            checks.append(Check(
+                "xray binary is at the pinned canonical path",
+                path_ok,
+                xray_bin if path_ok else f"expected a path under {_XRAY_BIN_PATH_EXPECTED_PREFIX}, got {xray_bin}",
+            ))
             try:
                 proc = subprocess.run([xray_bin, "version"], capture_output=True, text=True, timeout=5)
-                checks.append(Check("xray version reports successfully", proc.returncode == 0, proc.stdout.strip().splitlines()[0] if proc.stdout else ""))
+                version_line = proc.stdout.strip().splitlines()[0] if proc.stdout else ""
+                checks.append(Check("xray version reports successfully", proc.returncode == 0, version_line))
+                if proc.returncode == 0:
+                    pinned_commit = _pinned_xray_core_commit()
+                    if pinned_commit:
+                        commit_ok = pinned_commit in proc.stdout
+                        checks.append(Check(
+                            "xray binary matches the pinned commit (gateway/xray/VERSION)",
+                            commit_ok,
+                            f"expected commit {pinned_commit} in version output" if not commit_ok else pinned_commit,
+                        ))
+                    else:
+                        checks.append(Check(
+                            "xray binary matches the pinned commit (gateway/xray/VERSION)",
+                            False, f"could not read XRAY_CORE_COMMIT from {_XRAY_VERSION_FILE}",
+                        ))
             except (OSError, subprocess.TimeoutExpired) as exc:
                 checks.append(Check("xray version reports successfully", False, exc.__class__.__name__))
     else:

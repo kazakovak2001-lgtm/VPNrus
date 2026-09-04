@@ -161,12 +161,17 @@ def activate_if_needed(ingress_config):
 
 
 def provision_and_activate(credential, public_key, ingress_config, now=None):
-    """The full POST /v1/ingress-profile transaction - mirrors
-    xray_activation.provision_and_activate exactly, reusing
-    xray_provisioning.provision_and_activate_identity VERBATIM (task G's
-    "reuse existing activation authentication/revocation/quota discipline",
-    never a second identity system for an ingress)."""
-    return xray_provisioning.provision_and_activate_identity(
+    """The full POST /v1/ingress-profile transaction. B31A: reuses
+    xray_provisioning.provision_and_activate_identity_selfbind, NOT
+    provision_and_activate_identity - the ingress role has no separate
+    POST /v1/activate step and no AWG peer to provision, so it is its own
+    first-use binding authority rather than a lookup against some other
+    flow's prior CONFIRMED decision (see that function's own docstring for
+    the full root-cause analysis and why this is still task G's "reuse
+    existing activation credential/revocation/quota discipline" - it reuses
+    activations.py's own decide_and_bind/finalize_reservation primitives
+    directly, never a second identity/entitlement system)."""
+    return xray_provisioning.provision_and_activate_identity_selfbind(
         credential, public_key,
         ingress_config.activation_store_path, ingress_config.activation_lock_path,
         ingress_config.xray_store_path, ingress_config.xray_lock_path,

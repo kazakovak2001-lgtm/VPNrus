@@ -600,8 +600,15 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
         if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_EXPIRED:
             raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
-        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
-            raise _RequestError(HTTPStatus.FORBIDDEN, "device_not_bound")
+        # B31A - the ingress role's own self-binding authority (see
+        # ingress_activation.provision_and_activate's own docs) never
+        # returns NOT_ELIGIBLE_DEVICE_NOT_BOUND at all (there is no prior
+        # /v1/activate decision to have skipped) - its own conflicting-
+        # identity outcome is NOT_ELIGIBLE_DEVICE_LIMIT instead: this
+        # credential already has a DIFFERENT device bound, at its own
+        # device cap.
+        if identity_outcome.outcome == xray_provisioning.NOT_ELIGIBLE_DEVICE_LIMIT:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_limit")
 
         self._log_fields["ingress_activated"] = bool(result.activated)
         if not result.activated:

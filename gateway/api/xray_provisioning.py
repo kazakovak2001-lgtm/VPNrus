@@ -76,6 +76,13 @@ NOT_ELIGIBLE_UNKNOWN = "not_eligible_unknown"       # no such activation
 NOT_ELIGIBLE_REVOKED = "not_eligible_revoked"
 NOT_ELIGIBLE_EXPIRED = "not_eligible_expired"
 NOT_ELIGIBLE_DEVICE_NOT_BOUND = "not_eligible_device_not_bound"  # never went through /v1/activate
+# B31A - self-binding path only (see provision_and_activate_identity_selfbind
+# below): this credential already has a DIFFERENT device bound and its
+# max_devices is exhausted - the self-binding counterpart of
+# activations.DEVICE_LIMIT. Never returned by the eligibility-gated
+# provision_and_activate_identity above (that path has no concept of
+# "binding a new device" at all - see this module's own docs on why).
+NOT_ELIGIBLE_DEVICE_LIMIT = "not_eligible_device_limit"
 ISSUED = "issued"
 
 _UNSAFE_MODE_MASK = 0o137  # same rejection rule as activations.py's own
@@ -433,6 +440,135 @@ def provision_and_activate_identity(
         # required nesting order (per-activation -> xray store lock
         # [released] -> global activation lock, taken inside activate_fn).
         activation_result = activate_fn()
+        return ProvisionAndActivateResult(
+            identity_outcome=identity_outcome,
+            is_new_identity=is_new_identity,
+            activated=activation_result.activated,
+            activation_error=activation_result.error,
+        )
+
+
+def provision_and_activate_identity_selfbind(
+    credential, public_key,
+    activation_store_path, activation_lock_path,
+    xray_store_path, xray_lock_path,
+    activate_fn,
+    now=None,
+):
+    """B31A - the ingress role's own counterpart of
+    provision_and_activate_identity above, for a control-plane surface
+    (POST /v1/ingress-profile) that has no separate POST /v1/activate step
+    at all and no AWG peer to ever provision - see
+    gateway/api/ingress_activation.py's own docs for why. The module-level
+    docstring's "Eligibility gate: ... already completed POST /v1/activate
+    successfully" does NOT apply to this function - it is the ingress
+    role's OWN first (and only) activation-decision authority, not a
+    lookup against some other flow's prior decision.
+
+    Root cause this closes (found live during the first real Stockholm
+    ingress deployment): reusing provision_and_activate_identity's own
+    _check_device_eligibility for the ingress role required a device to
+    already be CONFIRMED-bound, and that CONFIRMED transition previously
+    happened ONLY via activations.finalize_reservation, called ONLY by
+    activations.provision_with_activation, called ONLY by POST /v1/activate
+    - which an ingress-only deployment never receives (there is no real
+    AWG peer to provision, so POCVPN_API_PROVISION_SCRIPT_PATH is
+    deliberately a permanent no-op there - see
+    gateway/config/ingress.env.example's own comment) and which Android's
+    real activateIngress() call site never even attempts (it calls
+    fetchIngressProfile only). The result: device_not_bound, forever, for
+    every possible device, through every real path - not a config error.
+
+    The fix REUSES activations.decide_and_bind/finalize_reservation/
+    unbind_reservation/per_activation_lock VERBATIM - the SAME race-safe,
+    atomic, already-tested primitives activations.provision_with_activation
+    itself is built from (see that function's own docs for the exact
+    concurrency argument, unchanged here) - substituting THIS function's
+    own activate_fn() (an ingress Xray render/stage/reload, via
+    ingress_activation.activate_if_needed) for AWG's run_provision_peer()
+    as the one external side effect finalize/unbind is gated on. NEVER
+    imports or calls gateway.api.provision / run_provision_peer - no AWG
+    peer is ever provisioned by this path, structurally (the import simply
+    does not exist in this module).
+
+    Outcome mapping for the CALLER (handler.py): decide_and_bind's
+    INVALID/REVOKED_OUTCOME/EXPIRED map onto this module's own
+    NOT_ELIGIBLE_UNKNOWN/REVOKED/EXPIRED (identical meaning regardless of
+    which flow made the decision); DEVICE_LIMIT (a different device
+    already bound this credential, at its own device cap - "conflicting
+    identity for an already-bound credential fails closed") maps onto the
+    NEW NOT_ELIGIBLE_DEVICE_LIMIT - deliberately NOT
+    NOT_ELIGIBLE_DEVICE_NOT_BOUND, whose "never went through /v1/activate"
+    meaning does not apply to a flow that has no /v1/activate step to have
+    skipped. BOUND_NEW/BOUND_EXISTING both proceed to identity mint-or-
+    reuse (idempotent, byte-for-byte the same block
+    provision_and_activate_identity already uses) and activate_fn(), same
+    as the regular flow. Rollback discipline mirrors
+    activations.provision_with_activation exactly: on activate_fn()
+    failure, a BOUND_NEW reservation is rolled back via unbind_reservation
+    (so a retry is a genuinely fresh first-use attempt, never stuck
+    "reserved" against a device that never got a working profile); a
+    BOUND_EXISTING caller owns no reservation and rolls nothing back,
+    exactly like the AWG flow's own ownership rule. The minted Xray
+    identity itself is NEVER rolled back on activation failure (same
+    documented reasoning as provision_and_activate_identity above) - only
+    the ACTIVATION-BINDING is.
+    """
+    now = now or datetime.now(timezone.utc)
+    digest = activations.credential_digest(credential)
+
+    with activations.per_activation_lock(activation_store_path, digest):
+        decision = activations.decide_and_bind(
+            credential, public_key, activation_store_path, activation_lock_path, now=now,
+        )
+        if decision.outcome == activations.INVALID:
+            return ProvisionAndActivateResult(identity_outcome=XrayIdentityResult(outcome=NOT_ELIGIBLE_UNKNOWN))
+        if decision.outcome == activations.REVOKED_OUTCOME:
+            return ProvisionAndActivateResult(identity_outcome=XrayIdentityResult(outcome=NOT_ELIGIBLE_REVOKED))
+        if decision.outcome == activations.EXPIRED:
+            return ProvisionAndActivateResult(identity_outcome=XrayIdentityResult(outcome=NOT_ELIGIBLE_EXPIRED))
+        if decision.outcome == activations.DEVICE_LIMIT:
+            return ProvisionAndActivateResult(identity_outcome=XrayIdentityResult(outcome=NOT_ELIGIBLE_DEVICE_LIMIT))
+        # decision.outcome is BOUND_NEW or BOUND_EXISTING from here on -
+        # both proceed to identity mint-or-reuse, byte-for-byte the same
+        # block provision_and_activate_identity already uses.
+
+        with _exclusive_lock(xray_lock_path, create=False):
+            data = _read_and_validate_under_lock(xray_store_path)
+            identities = data.get(digest, [])
+
+            existing = next((i for i in identities if i["device_public_key"] == public_key), None)
+            if existing is not None:
+                identity_outcome = XrayIdentityResult(outcome=ISSUED, vless_uuid=existing["vless_uuid"])
+                is_new_identity = False
+            else:
+                new_uuid = str(uuid.uuid4())
+                new_identity = {
+                    "device_public_key": public_key,
+                    "vless_uuid": new_uuid,
+                    "created_at": _utc_now_iso(),
+                }
+                data[digest] = identities + [new_identity]
+                _atomic_write_store_or_raise(xray_store_path, data)
+                identity_outcome = XrayIdentityResult(outcome=ISSUED, vless_uuid=new_uuid)
+                is_new_identity = True
+
+        activation_result = activate_fn()
+
+        # Finalize/rollback the ACTIVATION-BINDING itself (never the Xray
+        # identity above, which is never rolled back - see this function's
+        # own docstring) - only a BOUND_NEW caller owns a reservation to
+        # settle either way; a BOUND_EXISTING caller owns nothing and must
+        # do neither, exactly like activations.provision_with_activation's
+        # own ownership rule for run_provision_peer's outcome.
+        if decision.outcome == activations.BOUND_NEW:
+            if activation_result.activated:
+                activations.finalize_reservation(credential, public_key, activation_store_path, activation_lock_path)
+            else:
+                activations.unbind_reservation(
+                    credential, public_key, decision.reservation_id, activation_store_path, activation_lock_path,
+                )
+
         return ProvisionAndActivateResult(
             identity_outcome=identity_outcome,
             is_new_identity=is_new_identity,

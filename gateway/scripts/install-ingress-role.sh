@@ -72,6 +72,25 @@ find "$INSTALL_PREFIX/gateway" -type f -exec chmod 0644 {} +
 chmod 0755 "$INSTALL_PREFIX/gateway/scripts"/*.sh
 log "application code installed read-only under $INSTALL_PREFIX/gateway"
 
+# --- 2.5. B31A fix: converge the PINNED xray-core binary at the tracked
+# canonical path (gateway/systemd/nova-xray-ingress.service's own
+# ExecStart hardcodes it, never reads it from an env file). Found live:
+# neither real production host has a binary at this path at all (both
+# predate this pinned-path convention, running an older, differently-
+# versioned /usr/local/bin/xray for their own EXISTING exit role) - a
+# manual `ln -s /usr/local/bin/xray ...` "fix" would silently point the
+# NEW ingress role at an unpinned, unverified, possibly-different-version
+# binary. gateway/xray/fetch-xray-server.sh is the real, reproducible,
+# checksum-and-commit-verified installer this repo already has for
+# EXACTLY this - reused verbatim here rather than inventing a second
+# fetch/verify mechanism. Idempotent (skips if $XRAY_CORE_TAG is already
+# installed) and touches nothing but a fresh, independent, version-named
+# directory under $INSTALL_PREFIX/xray - never the existing exit role's
+# own /usr/local/bin/xray, which this step does not read, modify, or
+# depend on at all. ---
+XRAY_INSTALL_ROOT="$INSTALL_PREFIX/xray" bash "$REPO_ROOT/gateway/xray/fetch-xray-server.sh"
+log "pinned xray-core binary present under $INSTALL_PREFIX/xray (see gateway/xray/VERSION for the exact pinned tag/commit/sha256)"
+
 # --- 3. privileged wrapper (root:root 0750) ---
 install -o root -g root -m 0750 "$REPO_ROOT/gateway/privileged/nova-xray-ingress-reload" \
     /usr/local/libexec/nova-xray-ingress-reload
@@ -86,10 +105,17 @@ install -o root -g root -m 0440 "$REPO_ROOT/gateway/privileged/pocvpn-api.sudoer
 log "installed /etc/sudoers.d/pocvpn-api (0440 root:root, visudo-validated)"
 
 # --- 5. /etc/pocvpn (config; secrets filled in by the operator later) ---
+# B31A fix (found live on the first real Stockholm deployment): this
+# directory previously came out root:root, so pocvpn-api-ingress (running
+# as the pocvpn-api service account, not root) could not even traverse
+# into it to read the secret files step 3 of the runbook places here,
+# regardless of THEIR own ownership/mode - group must be pocvpn-api,
+# mirroring the already-correct convention the regular gateway role's own
+# /etc/pocvpn/xray directory uses (root:pocvpn-api, 0750).
 mkdir -p /etc/pocvpn/ingress
 chown root:pocvpn-api /etc/pocvpn
 chmod 0755 /etc/pocvpn
-chown root:root /etc/pocvpn/ingress
+chown root:pocvpn-api /etc/pocvpn/ingress
 chmod 0750 /etc/pocvpn/ingress
 if [ ! -f /etc/pocvpn/ingress.env ]; then
     install -o root -g pocvpn-api -m 0640 "$REPO_ROOT/gateway/config/ingress.env.example" /etc/pocvpn/ingress.env
@@ -98,13 +124,22 @@ else
     log "/etc/pocvpn/ingress.env already exists - left unchanged"
 fi
 
-# --- 6. durable ingress-role state directories (root:pocvpn-api, 0750) ---
+# --- 6. durable ingress-role state directories (pocvpn-api:pocvpn-api, 0750) ---
+# B31A fix (found live): these MUST be owned by the pocvpn-api service
+# account itself, not merely group-readable by it - pocvpn-api-ingress
+# writes durably into both (the activation/xray-identity stores directly
+# in the first, the staged candidate Xray config in xray/) on every real
+# request, not just reads. root:pocvpn-api (this directory's pre-B31A
+# ownership) grants read+traverse but not write, so every real write here
+# failed until an operator manually re-chowned it - mirrors the regular
+# gateway role's own /var/lib/pocvpn-activation and /var/lib/pocvpn-xray,
+# both pocvpn-api:pocvpn-api on every real deployment.
 for dir in /var/lib/pocvpn-provision-ingress /var/lib/pocvpn-provision-ingress/xray; do
     mkdir -p "$dir"
-    chown root:pocvpn-api "$dir"
+    chown pocvpn-api:pocvpn-api "$dir"
     chmod 0750 "$dir"
 done
-log "durable state directories ready under /var/lib/pocvpn-provision-ingress (root:pocvpn-api, 0750)"
+log "durable state directories ready under /var/lib/pocvpn-provision-ingress (pocvpn-api:pocvpn-api, 0750)"
 
 # --- 7. live Xray config directory for nova-xray-ingress.service (root:nova-xray-ingress) ---
 mkdir -p /etc/nova-xray-ingress
@@ -133,19 +168,31 @@ install-ingress-role: bootstrap complete. REMAINING MANUAL STEPS (never
 automated by this script - see docs/B26_FIRST_INGRESS_RUNBOOK.md):
 
   1. generate/place this host's REALITY keypair, and write the PRIVATE key
-     to /etc/pocvpn/ingress/reality-private-key.txt (0600 root:root);
+     to /etc/pocvpn/ingress/reality-private-key.txt (0600, owned by the
+     pocvpn-api user - it is THIS process, not root, that reads it at
+     activation time);
   2. run gateway/tools/provision_relay_upstream_identity.py to mint the
      ingress->exit relay uuid + probe HMAC secret, transfer the ingress
-     files to THIS host at the paths ingress.env points at, and transfer
-     the exit-fragment file to the EXIT operator out-of-band;
+     files to THIS host at the paths ingress.env points at (same 0600,
+     pocvpn-api-owned convention as step 1), and transfer the exit-fragment
+     file to the EXIT operator out-of-band;
   3. edit /etc/pocvpn/ingress.env with this host's real values;
-  4. python3 gateway/tools/activation_tokens.py --store <NOVA_INGRESS_ACTIVATION_STORE_PATH> \
-       --lock <NOVA_INGRESS_ACTIVATION_LOCK_PATH> init
-  5. cd /opt/pocvpn/gateway && python3 -c \
-       "from api import xray_provisioning; xray_provisioning.init_store('<NOVA_INGRESS_XRAY_STORE_PATH>', '<NOVA_INGRESS_XRAY_LOCK_PATH>')"
-  6. run gateway/tools/ingress_preflight.py --env-file /etc/pocvpn/ingress.env
+  4. B31A - initialize every durable store/lock AS THE pocvpn-api USER
+     (sudo -u pocvpn-api), never plain root - a store/lock file created by
+     root cannot be written by the pocvpn-api-ingress service itself
+     afterward (found live: this is exactly what left the durable state
+     directories unwritable even after step 6's chown, until each file
+     inside them was ALSO individually re-owned):
+       sudo -u pocvpn-api python3 gateway/tools/activation_tokens.py \
+           --store <NOVA_INGRESS_ACTIVATION_STORE_PATH> \
+           --lock <NOVA_INGRESS_ACTIVATION_LOCK_PATH> init
+       cd /opt/pocvpn/gateway && sudo -u pocvpn-api python3 -c \
+           "from api import xray_provisioning; xray_provisioning.init_store('<NOVA_INGRESS_XRAY_STORE_PATH>', '<NOVA_INGRESS_XRAY_LOCK_PATH>')"
+       cd /opt/pocvpn/gateway && sudo -u pocvpn-api python3 -c \
+           "from api import xray_activation; xray_activation.init_activation_lock('<NOVA_INGRESS_ACTIVATION_GLOBAL_LOCK_PATH>')"
+  5. run gateway/tools/ingress_preflight.py --env-file /etc/pocvpn/ingress.env
      and confirm PASS before starting anything;
-  7. systemctl enable --now pocvpn-api-ingress.service nova-xray-ingress.service;
-  8. run gateway/tools/ingress_status.py --env-file /etc/pocvpn/ingress.env.
+  6. systemctl enable --now pocvpn-api-ingress.service nova-xray-ingress.service;
+  7. run gateway/tools/ingress_status.py --env-file /etc/pocvpn/ingress.env.
 
 EOF

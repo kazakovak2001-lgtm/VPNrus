@@ -176,6 +176,75 @@ Unchanged by this PR - physical Android verification, E2E proof, public-IP
 proof, deliberate failure test, etc. Still gated on the repository owner's
 explicit approval, per that runbook's own human-approval gate.
 
+## B31A - real deployment-convergence gaps found live, closed here
+
+The actual first Stockholm ingress-role install (performed against this
+document's own procedure above) surfaced four real gaps between what
+`install-ingress-role.sh`/`docs/B26_FIRST_INGRESS_RUNBOOK.md` documented
+and what a real host actually needed - the operator had to correct all
+four by hand, live, before the ingress role would run at all. **This PR
+does not undo that already-corrected live Stockholm state** (see the
+B31A ROADMAP entry) - it makes a FRESH deployment reproduce that corrected
+state automatically, closing the gap between the documented procedure and
+what was actually required:
+
+1. **`/etc/pocvpn/ingress` directory ownership** - `install-ingress-role.sh`
+   created it `root:root`; `pocvpn-api-ingress` (running as the `pocvpn-api`
+   service account, never root) could not even traverse into it to reach
+   the secret files step 3 places there, regardless of THEIR own
+   ownership. Fixed: `root:pocvpn-api`, matching the regular gateway
+   role's own already-correct `/etc/pocvpn/xray` convention.
+2. **Secret file mode** - the runbook's own step 3/4 said `0600 root:root`;
+   `ingress_preflight.py`'s `_check_file_not_world_readable` requires
+   STRICT `0600` (any group/other bit at all fails, despite an unrelated
+   part of that check's own error text once implying `0640` was also
+   fine) and the file must be owned by `pocvpn-api` itself (the reading
+   process), not merely root with `pocvpn-api` in its group. Fixed:
+   runbook steps 3/4 now `chown pocvpn-api:pocvpn-api`/`chmod 0600`
+   explicitly.
+3. **Durable state directory ownership** - `/var/lib/pocvpn-provision-ingress`
+   and its `xray/` subdirectory were `root:pocvpn-api` (read+traverse
+   only); `pocvpn-api-ingress` durably WRITES into both on every real
+   request (the activation/xray-identity stores directly, the staged
+   candidate Xray config in `xray/`). Fixed: `install-ingress-role.sh`
+   now creates both `pocvpn-api:pocvpn-api`, matching the regular gateway
+   role's own `/var/lib/pocvpn-activation`/`/var/lib/pocvpn-xray`
+   convention. The runbook's own store-init commands (step 6) now also
+   run `sudo -u pocvpn-api` rather than plain root, for the same reason -
+   a store/lock file `init`-ed as root could not be written by the
+   service afterward either, even once the containing directory's own
+   ownership was fixed.
+4. **Missing activation-global-lock init step** - the runbook's step 6
+   never created `NOVA_INGRESS_ACTIVATION_GLOBAL_LOCK_PATH` at all; the
+   very first real `/v1/ingress-profile` request failed with "activation
+   lock not found - run 'init' first". Fixed: step 6 now calls
+   `xray_activation.init_activation_lock(...)`, the same idempotent
+   helper `_fixtures.py`'s own test setup already used.
+5. **Xray binary path** - `gateway/systemd/nova-xray-ingress.service`
+   hardcodes `ExecStart=/opt/pocvpn/xray/v26.7.28/xray`, but neither real
+   production host has anything at that path (both predate this pinned-
+   path convention - their own EXISTING exit role runs a differently-
+   versioned `/usr/local/bin/xray`). A manual `ln -s /usr/local/bin/xray`
+   symlink (what the operator actually did live, to unblock testing) would
+   silently point the ingress role at an unpinned, unverified binary -
+   the project's own pinned-core requirement (`gateway/xray/VERSION`)
+   forbids exactly that. Fixed: `install-ingress-role.sh` now runs the
+   repository's own real, checksum-and-commit-verified
+   `gateway/xray/fetch-xray-server.sh` to converge a genuine, independently-
+   fetched, pinned binary at the canonical path - never reusing or
+   depending on whatever `/usr/local/bin/xray` a host happens to already
+   have for an unrelated role. `ingress_preflight.py` gained a matching
+   check (`xray binary matches the pinned commit`) - its own
+   `_XRAY_BIN_PATH_EXPECTED_PREFIX` constant existed before this fix but
+   was never actually enforced by anything, dead code found live.
+
+None of these five are secrets - only ownership/mode/path facts, safe in
+this document. Stockholm's own already-corrected live state was fixed by
+hand during the original deployment session, verified working (server-side
+relay-health proof passed), and is left as-is; a FUTURE fresh ingress host
+now converges to the same corrected state automatically via this PR's
+fixes to `install-ingress-role.sh`/`docs/B26_FIRST_INGRESS_RUNBOOK.md`.
+
 ## Rollback
 
 - **Code upgrade (steps 1-2):** `deploy-backend-update.sh` prints the exact
