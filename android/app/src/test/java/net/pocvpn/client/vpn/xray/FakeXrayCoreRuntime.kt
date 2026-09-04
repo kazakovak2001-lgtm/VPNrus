@@ -8,7 +8,16 @@ import android.content.Context
  * tests can assert the exact renderedConfig/fd reached it, and can force
  * startLoop to throw to exercise [XrayCoreController]'s failure path.
  */
-class FakeXrayCoreRuntime(private val startLoopThrows: Throwable? = null) : XrayCoreRuntime {
+class FakeXrayCoreRuntime(
+    private val startLoopThrows: Throwable? = null,
+    // B33 - defaults to a successful measurement (a positive delay) so
+    // every pre-B33 test/call site that never configures this is
+    // byte-for-byte unaffected: XrayCoreController.requestStart's new
+    // bounded confirmation step succeeds by default, exactly as if the
+    // remote gateway were genuinely reachable.
+    private val measureDelayThrows: Throwable? = null,
+    private val measureDelayResult: Long = 42L,
+) : XrayCoreRuntime {
 
     var ensureCoreEnvInitializedCallCount = 0
         private set
@@ -19,6 +28,10 @@ class FakeXrayCoreRuntime(private val startLoopThrows: Throwable? = null) : Xray
     var lastStartedConfigContent: String? = null
         private set
     var lastStartedTunFd: Int? = null
+        private set
+    var measureDelayCallCount = 0
+        private set
+    var lastMeasureDelayUrl: String? = null
         private set
 
     override fun ensureCoreEnvInitialized(context: Context) {
@@ -37,5 +50,12 @@ class FakeXrayCoreRuntime(private val startLoopThrows: Throwable? = null) : Xray
 
     override fun stopLoop() {
         stopLoopCallCount++
+    }
+
+    override fun measureDelay(url: String): Long {
+        measureDelayCallCount++
+        lastMeasureDelayUrl = url
+        measureDelayThrows?.let { throw it }
+        return measureDelayResult
     }
 }

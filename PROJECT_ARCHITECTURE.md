@@ -376,6 +376,114 @@ NetworkProfiler
   selection). A response matching no known gateway, or a DIFFERENT gateway than the
   one requested, is rejected outright - never accepted-but-ignored.
 
+## Xray/TLS Connected confirmation (hard invariant, B33)
+
+A real physical Oppo CPH2173 test (client's ordinary DIRECT ports
+deliberately blocked server-side) found the app reporting Protected/Connected
+for an XRAY_REALITY session whose real remote handshake never completed -
+`NovaXrayVpnService`'s local `coreRuntime.startLoop(...)` returning without
+throwing was, by itself, being treated as sufficient proof of a healthy
+tunnel. It is not: `startLoop()` only proves the LOCAL core/tun exist: real
+HTTPS/DNS through the tunnel timed out the entire time, and the combined Auto
+sequence never advanced past the falsely-"successful" attempt.
+
+- **Local process start != healthy connection.** `XrayCoreController.requestStart`
+  now runs a bounded, real, positive confirmation
+  (`confirmRemoteConnectivity`, `REMOTE_CONFIRM_TIMEOUT_MS = 6s`) AFTER
+  `coreRuntime.startLoop(...)` succeeds and BEFORE ever returning
+  `XrayCoreStartOutcome.Started` - a real `measureDelay(url)` round trip
+  (the pinned AndroidLibXrayLite AAR's own native `CoreController.measureDelay`,
+  the exact primitive v2rayNG's own "test configuration" feature uses -
+  see `XrayCoreRuntime.measureDelay`'s own docs) through the JUST-STARTED
+  core's own configured outbound/routing, targeting THIS attempt's own real
+  gateway's already-deployed, unauthenticated `/v1/manifest` endpoint on port
+  443 - never a third-party public-IP service, never "process alive"/"tun
+  exists", never a fixed sleep, never a debug-only signal. On failure, the
+  loop is stopped and the tun released BEFORE returning
+  `XrayCoreStartOutcome.RemoteUnconfirmed(reason)` - a genuinely distinct
+  outcome from `CoreStartFailed` (that means `startLoop()` itself threw, an
+  earlier failure) - never left half-up, and the lifecycle gate is never
+  marked running for an unconfirmed attempt (a fresh retry can always
+  proceed). `NovaXrayVpnService` publishes the SAME `XrayRuntimeEvent.Failed`
+  either way, so `VlessRealityTransport`/`VlessTlsTransport`'s own
+  `xrayTransportStateFor` mapping (unchanged) only ever reports
+  `TransportState.Connected` after this real confirmation.
+- **Auto-progression fix, the other half of the same bug**: even with the
+  above, a real terminal Xray failure only arrives asynchronously (via
+  `XrayRuntimeState` -> the transport's own `observeState()`), well after
+  `VpnController.doConnectAttempt`'s Xray branch has already returned - the
+  SAME branch, unchanged, still trusts whatever state the transport
+  genuinely reports rather than fabricating one (see that branch's own
+  docs). `VpnController.switchActiveTransport`'s existing active-transport
+  collector now records `VpnError.HandshakeTimeout` - the SAME typed
+  category `AutoGatewayFailoverPolicy.isEligibleForNextCandidate` already
+  treats as eligible for AWG - the instant it observes a
+  `TransportState.Error` from an XRAY_REALITY/TLS_TCP transport, BEFORE
+  `setState` runs, so a concurrently-attached `armFailoverWatch` always sees
+  the correct typed error already in place. AWG's own `HandshakeFailed`
+  recording (`doConnectAttempt`'s own `awaitFreshHandshake` branch) is
+  completely unaffected - this only ever fires for an XRAY_REALITY/TLS_TCP
+  transport's own `Error` state. No relay/CHAIN_DIRECT-specific code exists
+  anywhere in this fix - health code only ever reports a failure;
+  `attemptCombined`/`AutoGatewaySelector` remain the sole authority deciding
+  what is tried next (never called directly from here).
+- **What did NOT change**: `awaitFreshHandshake`/`HANDSHAKE_TIMEOUT_MS`
+  (AWG's own cheap local-stats poll, a different signal with a different
+  cost shape) is untouched - Xray's confirmation is a one-shot bounded probe
+  inside `XrayCoreController`, not a repeated poll, since a real network
+  round trip is far more expensive than AWG's local counter read.
+  `handleNetworkLost`/B30B reconnect semantics, `xrayTransportStateFor`'s
+  `Started`/`Stopped` mappings, and every AWG connect/handshake/reconnect
+  path are all byte-for-byte unchanged.
+- **Round 2 review fix - the timeout must isolate the BLOCKING native call,
+  never merely wrap it.** `XrayCoreRuntime.measureDelay` is an ordinary
+  blocking JNI method with no suspension point - an earlier version of
+  `confirmRemoteConnectivity` wrapped the blocking call DIRECTLY in
+  `withTimeoutOrNull`, which does not bound it at all: the very coroutine
+  running that block IS the thread stuck inside the blocking call, so there
+  is no separate execution path left for the timeout to fire on (coroutine
+  cancellation only takes effect at a suspension point, which a raw
+  blocking call never reaches). Fixed by giving the blocking call its own,
+  independent coroutine on a dedicated `probeScope` (constructor-injected,
+  defaults to a real `CoroutineScope(SupervisorJob() + Dispatchers.IO)` in
+  production - `NovaXrayVpnService` passes its own supervisorJob-backed
+  `scope` explicitly, so an abandoned probe is cancelled for real when the
+  service is destroyed) - deliberately NOT a structured child of the
+  calling coroutine. `withTimeoutOrNull` now bounds only the SUSPENDING
+  `CompletableDeferred.await()`, which genuinely can be abandoned; the
+  underlying native call keeps running independently until it naturally
+  returns/throws, at which point it completes a `CompletableDeferred` that
+  is fresh and LOCAL to that one `confirmRemoteConnectivity` call - never
+  instance-level shared state - so a late completion after timeout has
+  nothing left reading it, can never publish `Started` after the timeout
+  branch already committed to `RemoteUnconfirmed`, and can never affect a
+  later, independent attempt's own outcome. Bounded resource growth: each
+  timed-out probe leaves at most one coroutine on `probeScope` (backed by
+  `Dispatchers.IO`'s own bounded elastic pool) until the native call's own
+  OS-level socket timeout eventually resolves it (the pinned AAR exposes no
+  configurable timeout parameter for `measureDelay`, confirmed against its
+  decompiled native method signature) - never literally unbounded, since
+  the number of concurrently-abandoned probes per connect() sequence is
+  capped by the same `AutoGatewaySelector.MAX_ATTEMPTS` bound already
+  governing the whole combined attempt sequence.
+  `NovaXrayServiceLifecycleCoordinatorTest`'s own `buildController` test
+  helper now must pass `probeScope = this` (the enclosing `runTest`'s own
+  `TestScope`) explicitly - mixing the production default (real
+  `Dispatchers.IO`) into a `kotlinx-coroutines-test` virtual-time test would
+  reintroduce the exact same class of flakiness the original
+  `withContext(Dispatchers.IO)` mistake already caused once, since
+  `runCurrent()`/`advanceUntilIdle()` cannot wait for a real background
+  thread to finish.
+- **Probe target verified for real, without a certificate bypass.** Both
+  production gateways (`152.70.43.1`, `16.170.208.231`) were checked
+  directly (read-only SSH) dialing `https://<own-public-IP>/v1/manifest`:
+  both present a real Let's Encrypt certificate with an IP-address SAN
+  (`subjectAltName: host "..." matched cert's IP address!`,
+  `SSL certificate verify ok`) - `measureDelay`'s dial-by-IP probe target
+  performs genuine TLS verification with no `-k`/bypass required on either
+  host, so a healthy tunnel cannot be mistaken for a broken one due to a
+  hostname/certificate mismatch.
+
 ## Control-plane vs data-plane
 
 - `gateway/api/*.py` (`pocvpn-api`) is fully env-var-driven per instance - zero

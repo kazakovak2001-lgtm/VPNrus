@@ -458,6 +458,29 @@ class VpnController(
             newTransport.observeState().collect { transportState ->
                 if (!hasTouchedTransport) return@collect
                 if (newTransport !== activeTransport) return@collect
+                // B33 - an Xray-kind transport's OWN async observeState()
+                // (never doConnectAttempt itself - that branch deliberately
+                // does not fabricate a stronger signal than the transport
+                // provides, see its own docs) is the only place a REAL
+                // post-startLoop() remote-confirmation failure
+                // (NovaXrayVpnService's XrayRuntimeEvent.Failed, published
+                // only after XrayCoreController.requestStart's own bounded
+                // confirmation - see that function's own docs) ever surfaces
+                // for a Direct/Manual attempt. Recorded here, BEFORE
+                // setState below, so a concurrently-attached armFailoverWatch
+                // observing the SAME state transition always sees the
+                // correct typed error already in place - never a stale/null
+                // one. Reuses the SAME eligible-for-Auto-advance category
+                // AWG's own handshake timeout already uses (task's own
+                // "reuse the correct existing place", never a second
+                // failure taxonomy) - AWG's own HandshakeTimeout recording
+                // (VpnController.doConnectAttempt) is completely unaffected,
+                // this only ever fires for an XRAY_REALITY/TLS_TCP transport.
+                if (transportState is TransportState.Error &&
+                    (newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP)
+                ) {
+                    diagnostics.recordError(VpnError.HandshakeTimeout)
+                }
                 // While a reconnect cycle owns the visible state (Reconnecting/backoff),
                 // don't let a transient Disconnected from an internal retry attempt
                 // flicker the UI back to plain Disconnected.
@@ -820,21 +843,36 @@ class VpnController(
                             false
                         }
                     } else {
-                        // B8I6 - XRAY_REALITY (the only other kind reaching
-                        // here) has no proven handshake-evidence channel yet -
-                        // VlessRealityTransport's own observeState() never
-                        // reports Connected without one (see its own docs).
-                        // Never fabricate a stronger success signal than the
-                        // transport itself provides: no awaitFreshHandshake
-                        // wait, no forced Connected here - the ALREADY-
-                        // attached active-transport collector (switchActiveTransport,
-                        // called earlier in connect()) is what surfaces
-                        // whatever _state genuinely becomes. No
-                        // ConnectionOutcome recording either - that model is
-                        // AWG-handshake-specific (see recordConnectionOutcome's
-                        // own docs) and does not yet have an Xray equivalent -
-                        // see handleNetworkLost's own docs for why this also
-                        // means no automatic reconnect for this kind.
+                        // B8I6/B33 - XRAY_REALITY/TLS_TCP (the only other
+                        // kinds reaching here): never fabricate a stronger
+                        // success signal than the transport itself provides -
+                        // no forced Connected here, ever. As of B33,
+                        // VlessRealityTransport/VlessTlsTransport's own
+                        // observeState() only reports Connected AFTER
+                        // XrayCoreController.requestStart's own bounded
+                        // remote/data-plane confirmation genuinely succeeded
+                        // (a real measureDelay round trip through the
+                        // just-started core's own outbound - see that
+                        // function's own docs) - a real failure to confirm
+                        // surfaces as Error via the SAME channel. The
+                        // ALREADY-attached active-transport collector
+                        // (switchActiveTransport, called earlier in
+                        // connect()) is what surfaces whatever _state
+                        // genuinely becomes, and (B33) now also records the
+                        // typed VpnError.HandshakeTimeout the instant that
+                        // Error state arrives - see that collector's own
+                        // docs for why recording it there (not here) is what
+                        // lets a concurrently-attached armFailoverWatch
+                        // correctly advance the combined Auto sequence past
+                        // a genuinely failed Xray Direct attempt. No
+                        // ConnectionOutcome/PathHistory recording here either
+                        // - that model is AWG-handshake-specific (see
+                        // recordConnectionOutcome's own docs) and does not
+                        // yet have an Xray equivalent - see
+                        // handleNetworkLost's own docs for why this also
+                        // means no automatic RECONNECT (distinct from Auto
+                        // gateway advancement, which B33 does now support)
+                        // for this kind.
                         true
                     }
                 } catch (e: Exception) {

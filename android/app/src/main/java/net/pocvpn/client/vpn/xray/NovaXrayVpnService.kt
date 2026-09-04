@@ -101,6 +101,14 @@ class NovaXrayVpnService : VpnService() {
                 establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
                 closeTun = { closeTunInterface() },
                 tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
+                // B33 review fix (round 2) - the SAME supervisorJob-backed
+                // scope this whole service already uses, so an abandoned
+                // post-timeout remote-confirmation probe (see
+                // XrayCoreController.confirmRemoteConnectivity's own docs)
+                // is cancelled for real when the service itself is
+                // destroyed, rather than an independent, never-cleaned-up
+                // scope living for the process's whole lifetime.
+                probeScope = scope,
             )
         }
     }
@@ -189,6 +197,16 @@ class NovaXrayVpnService : VpnService() {
                 }
                 is XrayCoreStartOutcome.CoreStartFailed -> {
                     Log.e(TAG, "Xray core failed to start: ${outcome.reason}")
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    stopSelf()
+                }
+                is XrayCoreStartOutcome.RemoteUnconfirmed -> {
+                    // B33 - the local core genuinely started but the bounded
+                    // post-start remote/data-plane confirmation never
+                    // succeeded (see XrayCoreController.requestStart's own
+                    // docs) - a real, distinct terminal failure, never
+                    // reported as Started/Connected.
+                    Log.w(TAG, "Xray core started locally but remote connectivity never confirmed: ${outcome.reason}")
                     XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
