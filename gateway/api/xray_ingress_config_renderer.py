@@ -112,14 +112,26 @@ def _validate_upstream(upstream):
             raise IngressConfigRenderError("REALITY upstream public_key is not a well-formed X25519 base64url key")
         if not upstream.short_id or not _SHORT_ID_RE.match(upstream.short_id) or len(upstream.short_id) % 2 != 0:
             raise IngressConfigRenderError("REALITY upstream short_id is malformed")
+        # B31C - a REALITY relay upstream's flow is REQUIRED here too, not
+        # merely validated-if-present: this renderer is called directly by
+        # callers that build an UpstreamExitConfig by hand (tests, or any
+        # future caller), not only via ingress_config.load_ingress_config's
+        # own now-required check - a blank flow must fail closed at BOTH
+        # layers, the same "no layer alone is trusted" discipline this
+        # function already applies to public_key/short_id above. The live
+        # failure this whole change closes was exactly a blank flow that
+        # rendered "successfully".
+        if not upstream.flow or upstream.flow not in _SUPPORTED_UPSTREAM_FLOWS:
+            raise IngressConfigRenderError(
+                f"REALITY upstream flow must be one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream.flow!r}"
+            )
     else:  # tls
         if not upstream.sni:
             raise IngressConfigRenderError("TLS upstream requires sni")
-
-    if upstream.flow and upstream.flow not in _SUPPORTED_UPSTREAM_FLOWS:
-        raise IngressConfigRenderError(
-            f"upstream flow must be blank or one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream.flow!r}"
-        )
+        if upstream.flow and upstream.flow not in _SUPPORTED_UPSTREAM_FLOWS:
+            raise IngressConfigRenderError(
+                f"upstream flow must be blank or one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream.flow!r}"
+            )
 
 
 def _render_upstream_outbound(upstream):

@@ -55,6 +55,10 @@ class IngressRendererTestBase(unittest.TestCase):
             server_name="www.microsoft.com",
             public_key="B" * 43,
             short_id="ef567890",
+            # B31C - required for any REALITY upstream since this PR;
+            # tests specifically about flow handling build their own
+            # UpstreamExitConfig rather than relying on this shared one.
+            flow="xtls-rprx-vision",
         )
         self.upstream_tls = renderer_module.UpstreamExitConfig(
             host="203.0.113.60",
@@ -163,17 +167,51 @@ class NoOpenRelayTests(IngressRendererTestBase):
         self.assertEqual("xtls-rprx-vision", user["flow"])
         self.assertEqual(upstream.uuid, user["id"])
 
-    def test_a_blank_upstream_flow_omits_the_field_rather_than_emitting_it_empty(self):
+    def test_a_blank_flow_on_a_REALITY_upstream_fails_closed(self):
+        # B31C blocker fix - this is EXACTLY the live failure mode: a
+        # hand-built REALITY UpstreamExitConfig with no flow at all must
+        # never render "successfully" only to be rejected later by the
+        # EXIT's own inbound at actual connection time.
         activations_data, xray_data = self._activations_and_xray()
-        config = renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, self.upstream_reality)
+        bad_upstream = renderer_module.UpstreamExitConfig(
+            host="203.0.113.60", port=8444, transport="reality", uuid=self.upstream_reality.uuid,
+            server_name="www.microsoft.com", public_key="B" * 43, short_id="ef567890", flow="",
+        )
+        with self.assertRaises(renderer_module.IngressConfigRenderError):
+            renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, bad_upstream)
+
+    def test_a_REALITY_upstream_with_the_supported_flow_passes(self):
+        activations_data, xray_data = self._activations_and_xray()
+        upstream = renderer_module.UpstreamExitConfig(
+            host="203.0.113.60", port=8444, transport="reality", uuid=self.upstream_reality.uuid,
+            server_name="www.microsoft.com", public_key="B" * 43, short_id="ef567890", flow="xtls-rprx-vision",
+        )
+        config = renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, upstream)
         user = config["outbounds"][0]["settings"]["vnext"][0]["users"][0]
-        self.assertNotIn("flow", user)
+        self.assertEqual("xtls-rprx-vision", user["flow"])
 
     def test_an_unsupported_upstream_flow_fails_closed_rather_than_rendering_it(self):
         activations_data, xray_data = self._activations_and_xray()
         bad_upstream = renderer_module.UpstreamExitConfig(
             host="203.0.113.60", port=8444, transport="reality", uuid=self.upstream_reality.uuid,
             server_name="www.microsoft.com", public_key="B" * 43, short_id="ef567890", flow="xtls-rprx-splice",
+        )
+        with self.assertRaises(renderer_module.IngressConfigRenderError):
+            renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, bad_upstream)
+
+    def test_a_blank_flow_on_a_TLS_upstream_still_passes(self):
+        # TLS upstreams never carry a REALITY-style flow requirement -
+        # blank must remain accepted for that transport only.
+        activations_data, xray_data = self._activations_and_xray()
+        config = renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, self.upstream_tls)
+        user = config["outbounds"][0]["settings"]["vnext"][0]["users"][0]
+        self.assertNotIn("flow", user)
+
+    def test_an_unsupported_flow_on_a_TLS_upstream_still_fails_closed(self):
+        activations_data, xray_data = self._activations_and_xray()
+        bad_upstream = renderer_module.UpstreamExitConfig(
+            host="203.0.113.60", port=8443, transport="tls", uuid=self.upstream_tls.uuid,
+            sni="relay-exit.example.test", flow="xtls-rprx-splice",
         )
         with self.assertRaises(renderer_module.IngressConfigRenderError):
             renderer_module.render_ingress_server_config(activations_data, xray_data, self.reality, bad_upstream)

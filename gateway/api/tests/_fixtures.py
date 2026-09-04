@@ -387,6 +387,8 @@ def make_ingress_config(tmp_dir, **overrides):
         ingress_upstream_server_name="www.apple.com",
         ingress_upstream_public_key="B" * 43,
         ingress_upstream_short_id="ef56ab78",
+        # B31C - required (not merely optional) for a "reality" upstream_transport.
+        ingress_upstream_flow="xtls-rprx-vision",
         ingress_exit_endpoint_id="frankfurt",
         ingress_exit_probe_host="203.0.113.60",
         ingress_probe_hmac_secret_file=probe_secret_file,
