@@ -459,6 +459,75 @@ class XrayCoreControllerTest {
         assertFalse(outcome.reason.contains(validProfile.shortId))
     }
 
+    // --- B33 relay follow-up: RemoteConfirmationContext is context-aware ---
+
+    @Test
+    fun `requestStart with no confirmationContext argument still uses the Direct manifest probe - byte-for-byte unaffected`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, runtime.measureDelayCallCount)
+        assertEquals("https://${validProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+    }
+
+    // B33 relay follow-up (round 2) - a fixed EXIT host, deliberately
+    // DIFFERENT from [validProfile.server] (the client's own dial target -
+    // the INGRESS for a real relayed attempt), so a test asserting on
+    // [FakeXrayCoreRuntime.lastMeasureDelayUrl] genuinely proves which host
+    // was dialed, not merely that a coincidentally-identical string was
+    // reused.
+    private val relayExitProbeHost = "203.0.113.60"
+
+    @Test
+    fun `a Relayed context dials the EXIT host's own manifest via measureDelay - never the client's own dial target (the ingress)`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed(exitProbeHost = relayExitProbeHost),
+        )
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, runtime.measureDelayCallCount)
+        assertEquals("https://$relayExitProbeHost/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertTrue(
+            "must never dial the client's own INGRESS dial target for a Relayed attempt (the round-1 self-referential-ingress bug)",
+            runtime.lastMeasureDelayUrl != "https://${validProfile.server}/v1/manifest",
+        )
+    }
+
+    @Test
+    fun `a Relayed context whose EXIT manifest probe fails reports RemoteUnconfirmed and tears down - never Started`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = java.io.IOException("exit unreachable"))
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed(exitProbeHost = relayExitProbeHost),
+        )
+
+        assertTrue("expected RemoteUnconfirmed, got $outcome", outcome is XrayCoreStartOutcome.RemoteUnconfirmed)
+        assertEquals(1, runtime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+    }
+
+    // A Relayed EXIT-manifest probe blocking past the bound is abandoned the
+    // exact same way a Direct probe is - both now go through the SAME
+    // measureDelay/withTimeoutOrNull code path in confirmRemoteConnectivity
+    // (see `RemoteConfirmationContext.Relayed`'s own docs), so the generic
+    // coverage above ("a measureDelay call blocking far longer than the
+    // bound...", "late completion of an abandoned probe...") already proves
+    // this for both branches - no separate Relayed-specific blocking test is
+    // needed.
+
     @Test
     fun `TLS_TCP and REALITY share the same lifecycle gate - a second start while one is running is rejected`() = runBlocking {
         val repository = newRepository()

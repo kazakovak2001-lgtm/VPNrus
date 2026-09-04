@@ -3249,13 +3249,86 @@ class MainViewModel(
                     // advances (task requirement 8/L).
                     val autoContext = attempt.autoContext!!
                     if (state is TransportState.Connected) {
+                        // B33 relay follow-up (round 2) - for an
+                        // XRAY_REALITY/TLS_TCP relayed attempt (the ONLY
+                        // transport kinds any real RelayIngressResolver
+                        // implementation constructs today - AWG upstream
+                        // chaining is explicitly not implemented, see
+                        // PROJECT_ARCHITECTURE.md's B24 table), a REAL
+                        // controller-observed Connected state is no longer
+                        // merely "the client<->ingress hop is up":
+                        // XrayCoreController.requestStart never returns
+                        // Started/publishes this Connected transition until
+                        // its own Xray-native RemoteConfirmationContext
+                        // .Relayed confirmation (measureDelay against the
+                        // EXIT's own manifest, through the just-started
+                        // core's own outbound - see that sealed class's own
+                        // docs) has ALREADY succeeded - a genuine, in-tunnel
+                        // client->ingress->exit data-plane proof, the SAME
+                        // authority Direct's B33 confirmation already is for
+                        // a Direct attempt. This branch trusts that proof
+                        // directly rather than re-gating on a second,
+                        // separate out-of-band check.
+                        //
+                        // For any OTHER resolved kind (none exist in
+                        // production today, but RelayIngressResolver is a
+                        // general interface - never assume every future/test
+                        // implementation is Xray-backed), Connected alone is
+                        // NOT evidence of end-to-end health - falls through
+                        // to the pre-round-2 real end-to-end
+                        // [relayEndToEndProbe.probe] gate below, unchanged.
+                        val xrayNativeConfirmationAlreadyProvedDataPlane =
+                            attempt.initialKind == TransportKind.XRAY_REALITY || attempt.initialKind == TransportKind.TLS_TCP
+                        if (xrayNativeConfirmationAlreadyProvedDataPlane) {
+                            controller.reportRelayStage(net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK)
+                            supportDiagnosticsRecorder?.recordDataPlaneReadinessResult(net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK)
+                            controller.reportRelayStage(net.pocvpn.client.relay.RelayReadinessStage.END_TO_END_DATA_PLANE_OK)
+                            supportDiagnosticsRecorder?.recordDataPlaneReadinessResult(net.pocvpn.client.relay.RelayReadinessStage.END_TO_END_DATA_PLANE_OK)
+                            recordRelayOutcome(relayPlan, net.pocvpn.client.relay.RelayAttemptOutcome.Success(relayPlan))
+                            pendingFailoverAttempt = null
+                            failoverObserverJob?.cancel()
+                            failoverObserverJob = null
+                            // Session stays Connected/RelayProtected - no
+                            // advance, no further watching needed for this
+                            // attempt (mirrors the Direct/Manual "settled,
+                            // nothing left to watch" case).
+                            //
+                            // HttpRelayEndToEndProbe stays real and useful as
+                            // an OUT-OF-BAND credential/control-plane/
+                            // historyPathId-attribution diagnostic (task
+                            // requirement 4 - path attribution is a separate
+                            // concern from tunnel liveness), fired here
+                            // fire-and-forget on its own coroutine so it can
+                            // never delay this collector nor - per task
+                            // requirement 3/6 - be a second veto capable of
+                            // overturning the genuine Xray-native Connected
+                            // state already recorded above. See
+                            // HttpRelayEndToEndProbe's own corrected docs for
+                            // why its result alone is never authoritative for
+                            // tunnel liveness (it runs from Nova's own
+                            // VPN-excluded process).
+                            val profile = attempt.relayProfile
+                            if (profile != null) {
+                                viewModelScope.launch {
+                                    val probeResult = relayEndToEndProbe.probe(relayPlan, profile)
+                                    when (probeResult) {
+                                        is net.pocvpn.client.relay.RelayProbeResult.Success ->
+                                            supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = true, category = null)
+                                        is net.pocvpn.client.relay.RelayProbeResult.Failure ->
+                                            supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category)
+                                    }
+                                }
+                            }
+                            return@collect
+                        }
                         // B25 (task B/C) - a REAL controller-observed
-                        // Connected state for the client<->ingress hop
-                        // proves ONLY RelayReadinessStage.INGRESS_HANDSHAKE_OK
-                        // - it says nothing about the ingress's own upstream
-                        // link to the exit. Report that stage immediately
-                        // (so sessionHealth never reads RelayProtected before
-                        // the real probe below runs), then ask the real
+                        // Connected state for the client<->ingress hop, for a
+                        // non-Xray-native resolved kind, proves ONLY
+                        // RelayReadinessStage.INGRESS_HANDSHAKE_OK - it says
+                        // nothing about the ingress's own upstream link to
+                        // the exit. Report that stage immediately (so
+                        // sessionHealth never reads RelayProtected before the
+                        // real probe below runs), then ask the real
                         // end-to-end proof channel (task requirement C)
                         // whether client -> ingress -> exit -> Internet is
                         // genuinely functional right now, over the tunnel

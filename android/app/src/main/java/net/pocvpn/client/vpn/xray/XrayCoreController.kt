@@ -52,6 +52,102 @@ sealed class XrayCoreStartOutcome {
     data class RemoteUnconfirmed(val reason: String) : XrayCoreStartOutcome()
 }
 
+/**
+ * B33 relay follow-up - which real, positive confirmation
+ * [XrayCoreController.requestStart] must obtain beyond local process startup
+ * before ever reporting [XrayCoreStartOutcome.Started], keyed to the actual
+ * execution context of THIS attempt - never decided by this class itself
+ * from an endpoint id or transport kind (this class has, and must keep
+ * having, zero knowledge of "stockholm-ingress-1"/CHAIN_DIRECT or any other
+ * specific ingress). The caller that already knows which kind of attempt
+ * this is ([NovaXrayVpnService], threaded from [net.pocvpn.client.relay.VpnAttemptContext]
+ * all the way from [net.pocvpn.client.vpn.VpnController] - see that sealed
+ * class's own docs) picks the variant; this class only ever executes it.
+ *
+ * [Direct] is the default for every pre-existing call site - byte-for-byte
+ * the SAME generic `/v1/manifest` round trip [confirmRemoteConnectivity]
+ * already performed before this type existed. Physical integration testing
+ * (combined PR #55 + PR #53 pre-merge validation) proved that same generic
+ * probe is UNSOUND for a Relayed attempt: the client's rendered Xray config
+ * has exactly one outbound and no routing rules (see [XrayConfigRenderer]),
+ * so ANY destination [confirmRemoteConnectivity] asks for is dialed through
+ * that one outbound - the ingress. The ingress's OWN server-side routing
+ * (verified directly against the deployed `/etc/nova-xray-ingress/config.json`,
+ * not assumed) then unconditionally forwards EVERY destination to its fixed
+ * relay-upstream hop, with no exception for the ingress's own address - so a
+ * generic `https://<ingressHost>/v1/manifest` probe does not test "is the
+ * client<->ingress hop alive", it accidentally asks the exit hop to dial
+ * back to the ingress's own control-plane over the public internet, an
+ * unrelated, fragile, self-referential round trip that has nothing to do
+ * with genuine relay health and was observed to fail even while real
+ * end-user DNS/HTTPS traffic was concurrently, successfully traversing the
+ * SAME tunnel (confirmed server-side in the ingress's own access log).
+ *
+ * **B33 relay follow-up (round 2) - now a genuine Xray-native in-tunnel
+ * primitive, not the out-of-band HTTP check this class used before.** An
+ * earlier version of [Relayed] carried a `confirm: suspend () -> Boolean`
+ * action backed by [net.pocvpn.client.relay.HttpRelayEndToEndProbe.probeProfile]
+ * - an ordinary `java.net.URL.openConnection()` call issued from Nova's own
+ * process. [net.pocvpn.client.vpn.xray.NovaXrayVpnService.establishInterface]
+ * always excludes that process from its own VPN
+ * (`addDisallowedApplication`, recursion prevention), so that request never
+ * traversed the just-started tunnel - it reached
+ * [net.pocvpn.client.relay.IngressClientProfile.endToEndProbeUrl] (the
+ * EXIT's own publicly-reachable `/v1/relay-health` host, see
+ * `gateway/api/handler.py`) over the device's ordinary default network,
+ * regardless of whether the relay tunnel itself worked - the confirmed
+ * cause of a real physical false negative (see
+ * PROJECT_ARCHITECTURE.md's "B33 relay follow-up" sections).
+ *
+ * [Relayed] now instead carries [exitProbeHost] - the EXIT endpoint's own
+ * plaintext HTTPS host (never the ingress host [Direct]'s own branch
+ * effectively targets for a Direct attempt) - and [confirmRemoteConnectivity]
+ * dials `https://$exitProbeHost/v1/manifest` via the SAME
+ * [XrayCoreRuntime.measureDelay] primitive [Direct] already uses, through
+ * the SAME just-started core's own outbound/routing. **Empirically verified
+ * safe end to end, read-only, against the real deployed Stockholm
+ * ingress/Frankfurt exit pair (2026-09-04):** the ingress's rendered config
+ * (`/etc/nova-xray-ingress/config.json`) has exactly one unconditional
+ * routing rule forwarding EVERY destination from the client inbound to its
+ * `nova-relay-upstream-out` VLESS outbound (dialing the exit's own
+ * `nova-vless-reality-in` inbound directly, by IP:port - never CDN/DNS
+ * dependent); the exit's own rendered config
+ * (`/etc/nova-xray/config.json`) has NO routing rules at all beyond its
+ * single `freedom`/`direct` outbound, which dials whatever destination the
+ * proxied connection names - so a client dialing `152.70.43.1:443` through
+ * this exact ingress genuinely arrives at the EXIT, which then dials
+ * `152.70.43.1:443` AS ITSELF (a real self-connect, not a guess): confirmed
+ * via direct read-only SSH to both hosts that (a) the exit's own public IP
+ * self-TCP-connects on 443, (b) `curl https://152.70.43.1/v1/manifest`
+ * from the exit itself completes a REAL TLS 1.3 handshake with certificate
+ * verification (`SSL certificate verify ok`, IP-SAN match, no `-k`) and
+ * returns HTTP 200 with genuine signed-manifest bytes served by the same
+ * nginx this deployment already trusts for Direct's own confirmation, and
+ * (c) the SAME request works identically when issued from the Stockholm
+ * ingress host toward the Frankfurt exit's public IP. This is architecturally
+ * DIFFERENT from the original round-1 bug: that bug dialed the INGRESS's
+ * own address (which the ingress's blanket forwarding rule then bounced
+ * back out to the exit and beyond, a genuinely unrelated public round trip);
+ * this dials the EXIT's address, which the SAME forwarding rule delivers TO
+ * the exit, which then serves it locally - never leaving the exit machine a
+ * second time. This class stays entirely free of any dependency on the
+ * `relay` package - [exitProbeHost] is a plain string, resolved by the
+ * caller from [net.pocvpn.client.relay.RelayedExecutionPlan.exitBinding]
+ * (see [net.pocvpn.client.vpn.config.TransportConfig.Xray.relayExitProbeHost]'s
+ * own docs for the threading path).
+ *
+ * [net.pocvpn.client.relay.HttpRelayEndToEndProbe] is NOT removed - it
+ * remains real and useful as an out-of-band control-plane/credential
+ * diagnostic (a 401 IS proof the token/HMAC binding is broken) - but it is
+ * no longer wired as this gate, and callers must never let its result
+ * overturn a [TransportState.Connected] this Xray-native check already
+ * produced (see `MainViewModel.armFailoverWatch`'s own docs).
+ */
+sealed class RemoteConfirmationContext {
+    object Direct : RemoteConfirmationContext()
+    data class Relayed(val exitProbeHost: String) : RemoteConfirmationContext()
+}
+
 /** Result of one [XrayCoreController.requestStop] call. */
 data class XrayCoreStopOutcome(
     /** False (no-op - matches [XrayServiceLifecycleGate.tryBeginTeardown]'s own contract) if nothing was running. */
@@ -127,7 +223,15 @@ class XrayCoreController(
     // B18-2 - [routingMode] defaults to FULL_VPN so every pre-B18-2 call site
     // (real or test) is byte-for-byte unaffected - see buildXrayVpnPlan's own
     // docs for the exact route-set contract this threads into.
-    suspend fun requestStart(kind: TransportKind = TransportKind.XRAY_REALITY, routingMode: RoutingMode = RoutingMode.FULL_VPN): XrayCoreStartOutcome {
+    // B33 relay follow-up - [confirmationContext] defaults to
+    // [RemoteConfirmationContext.Direct] so every pre-existing call site
+    // (real or test) is byte-for-byte unaffected - see that sealed class's
+    // own docs for why a Relayed attempt must supply a different value here.
+    suspend fun requestStart(
+        kind: TransportKind = TransportKind.XRAY_REALITY,
+        routingMode: RoutingMode = RoutingMode.FULL_VPN,
+        confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
+    ): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
             XrayServiceStartDecision.IGNORE_START_IN_FLIGHT -> return XrayCoreStartOutcome.StartInFlight
@@ -170,7 +274,7 @@ class XrayCoreController(
                 // that the LOCAL core/tun exist - see confirmRemoteConnectivity's
                 // own docs for why that is never, by itself, sufficient
                 // evidence the tunnel is actually usable.
-                if (confirmRemoteConnectivity(ready.serverHost)) {
+                if (confirmRemoteConnectivity(ready.serverHost, confirmationContext)) {
                     success = true
                     XrayCoreStartOutcome.Started
                 } else {
@@ -274,13 +378,43 @@ class XrayCoreController(
      *   by the SAME [net.pocvpn.client.smartconnect.AutoGatewaySelector.MAX_ATTEMPTS]
      *   bound that already caps the whole combined attempt sequence - this
      *   introduces no new unbounded-retry surface.
+     *
+     * B33 relay follow-up - [context] selects WHICH host [measureDelay]
+     * dials `/v1/manifest` against inside the abandonable probe coroutine
+     * below (see [RemoteConfirmationContext]'s own docs for exactly why a
+     * Relayed attempt must dial the EXIT's host, never the INGRESS host
+     * [serverHost] names for that attempt) - every other guarantee described
+     * above (the independent probe coroutine, the real bounded
+     * [withTimeoutOrNull] deadline, "late completion is inert") is
+     * completely unchanged and applies identically to both branches: the
+     * [RemoteConfirmationContext.Relayed] branch's `measureDelay` call is
+     * just as much an ordinary blocking-native call running on [probeScope]
+     * here, abandoned exactly the same way on timeout.
      */
-    private suspend fun confirmRemoteConnectivity(serverHost: String): Boolean {
+    private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         probeScope.launch {
             val confirmed = try {
-                coreRuntime.measureDelay("https://$serverHost/v1/manifest")
-                true
+                when (context) {
+                    is RemoteConfirmationContext.Direct -> {
+                        coreRuntime.measureDelay("https://$serverHost/v1/manifest")
+                        true
+                    }
+                    // B33 relay follow-up (round 2) - the EXIT's own host,
+                    // never [serverHost] (that is the client's dial target -
+                    // the INGRESS for a Relayed attempt, see this function's
+                    // own top-level docs for why that host specifically
+                    // reintroduces the round-1 self-referential-ingress bug).
+                    // Same real native primitive, same just-started core's
+                    // outbound/routing, same unauthenticated `/v1/manifest`
+                    // path every gateway already serves for Direct - see
+                    // [RemoteConfirmationContext.Relayed]'s own docs for the
+                    // empirical proof this target is safe.
+                    is RemoteConfirmationContext.Relayed -> {
+                        coreRuntime.measureDelay("https://${context.exitProbeHost}/v1/manifest")
+                        true
+                    }
+                }
             } catch (t: Throwable) {
                 false
             }

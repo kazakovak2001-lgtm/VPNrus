@@ -151,7 +151,20 @@ class NovaXrayVpnService : VpnService() {
                 val routingMode = intent.getStringExtra(EXTRA_ROUTING_MODE)
                     ?.let { runCatching { RoutingMode.valueOf(it) }.getOrNull() }
                     ?: RoutingMode.FULL_VPN
-                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode)
+                // B33 relay follow-up - absent for any pre-B33-relay-follow-up
+                // caller/intent, defaulting to false (Direct) - see
+                // TransportConfig.Xray.isRelayed's own docs.
+                val isRelayed = intent.getBooleanExtra(EXTRA_IS_RELAYED, false)
+                // B33 relay follow-up (round 2) - the EXIT host to confirm
+                // against for a Relayed attempt - see
+                // TransportConfig.Xray.relayExitProbeHost's own docs. Always
+                // present when isRelayed is true (VpnController always sets
+                // it alongside EXTRA_IS_RELAYED for a real Relayed attempt);
+                // absent/null here is treated as a genuine configuration
+                // defect, never silently downgraded to Direct - see
+                // startIfNotAlreadyRunning's own handling.
+                val relayExitProbeHost = intent.getStringExtra(EXTRA_RELAY_EXIT_PROBE_HOST)
+                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode, isRelayed, relayExitProbeHost)
                 return Service.START_NOT_STICKY
             }
 
@@ -180,9 +193,38 @@ class NovaXrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind, endpointId: EndpointId, routingMode: RoutingMode) {
+    private fun startIfNotAlreadyRunning(
+        sessionId: Long,
+        kind: TransportKind,
+        endpointId: EndpointId,
+        routingMode: RoutingMode,
+        isRelayed: Boolean,
+        relayExitProbeHost: String?,
+    ) {
         scope.launch {
-            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode)) {
+            // B33 relay follow-up (round 2) - a genuinely missing exit host
+            // for a Relayed attempt fails closed immediately (never a silent
+            // Direct-shaped fallback, which would dial the WRONG host's
+            // /v1/manifest and resurrect the exact self-referential-ingress
+            // class of bug round 1 fixed) - structurally unreachable via the
+            // real VpnController/VlessRealityTransport/VlessTlsTransport
+            // path (it always sets this extra alongside EXTRA_IS_RELAYED for
+            // a real Relayed attempt - see TransportConfig.Xray
+            // .relayExitProbeHost's own docs), same "defensive, not a real
+            // code path" shape XrayCoreStartOutcome.Rejected's other call
+            // sites already use.
+            if (isRelayed && relayExitProbeHost == null) {
+                Log.e(TAG, "refusing to start: relayed attempt with no exit probe host")
+                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "relayed attempt missing exit probe host"))
+                stopSelf()
+                return@launch
+            }
+            val confirmationContext = if (isRelayed) {
+                RemoteConfirmationContext.Relayed(exitProbeHost = relayExitProbeHost!!)
+            } else {
+                RemoteConfirmationContext.Direct
+            }
+            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode, confirmationContext)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
@@ -308,6 +350,19 @@ class NovaXrayVpnService : VpnService() {
         // own parsing. VlessRealityTransport/VlessTlsTransport set this from
         // TransportConfig.Xray/XrayTls.routingMode.
         const val EXTRA_ROUTING_MODE = "net.pocvpn.client.vpn.xray.extra.ROUTING_MODE"
+
+        // B33 relay follow-up - true only when VpnController's own
+        // pendingAttemptContext is VpnAttemptContext.Relayed for THIS
+        // attempt (TransportConfig.Xray/XrayTls.isRelayed - see that field's
+        // own docs). Absent (false) for any pre-existing caller/intent - see
+        // onStartCommand's own parsing.
+        const val EXTRA_IS_RELAYED = "net.pocvpn.client.vpn.xray.extra.IS_RELAYED"
+
+        // B33 relay follow-up (round 2) - the EXIT endpoint's own plaintext
+        // HTTPS host (TransportConfig.Xray/XrayTls.relayExitProbeHost - see
+        // that field's own docs) - present exactly when EXTRA_IS_RELAYED is
+        // true for a real Relayed attempt.
+        const val EXTRA_RELAY_EXIT_PROBE_HOST = "net.pocvpn.client.vpn.xray.extra.RELAY_EXIT_PROBE_HOST"
 
         private const val TAG = "NovaXrayVpnService"
     }

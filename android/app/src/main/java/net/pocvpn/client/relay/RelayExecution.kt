@@ -278,24 +278,46 @@ object NotConfiguredRelayEndToEndProbe : RelayEndToEndProbe {
 }
 
 /**
- * B25 (task C) - the real implementation: performs a genuine HTTPS GET to
+ * B25 (task C) - performs a genuine HTTPS GET to
  * [IngressClientProfile.endToEndProbeUrl] carrying
- * [IngressClientProfile.endToEndProbeToken] as a bearer credential, over
- * whatever socket/route the OS resolves at call time - since this is only
- * ever invoked AFTER the ingress transport reports a real
- * [net.pocvpn.client.vpn.TransportState.Connected] handshake (see
- * [RelayEndToEndProbe]'s own docs), ordinary OS routing sends this request
- * through the just-established tunnel interface exactly like any other app
- * traffic would - never a bespoke socket-binding hack. [endToEndProbeUrl]
- * is the control-plane's own authenticated internal readiness endpoint
- * (task requirement C's first accepted option) - reachable in practice only
- * because this request actually traverses ingress -> exit, so a real,
- * non-fabricated 200 response is only obtainable when that path genuinely
- * works end to end. A disconnected/rebuilt socket, non-200 status, or a
- * response body that fails [expectedBodyMarker] all fail closed - this
- * function NEVER returns [RelayProbeResult.Success] merely because a
- * connection was accepted (no "TCP connect == healthy", the same B21 lesson
- * [RelayReadinessStage]'s own docs already reference).
+ * [IngressClientProfile.endToEndProbeToken] as a bearer credential.
+ *
+ * **B33 relay follow-up (round 2) - CORRECTED, this is an OUT-OF-BAND
+ * control-plane check, NOT in-tunnel data-plane proof.** An earlier version
+ * of this doc claimed "ordinary OS routing sends this request through the
+ * just-established tunnel interface exactly like any other app traffic
+ * would" - that claim is FALSE and was never physically verified. This
+ * request is issued from Nova's OWN process (`java.net.URL.openConnection()`
+ * inside the Nova app/service), and [net.pocvpn.client.vpn.xray.NovaXrayVpnService.establishInterface]
+ * always calls `builder.addDisallowedApplication(novaPackageId)` (see
+ * [net.pocvpn.client.vpn.xray.XrayVpnBuilderPlan.disallowedApplications] -
+ * recursion prevention, so Xray's own outbound sockets don't loop back into
+ * their own tun). That exclusion applies to EVERY socket Nova's process
+ * opens, including this one - so this request is routed over the device's
+ * ordinary default network, never through the just-established Xray tunnel,
+ * regardless of whether that tunnel is healthy. A real physical
+ * CHAIN_DIRECT integration test (2026-09, PR #57 investigation) proved this
+ * concretely: [IngressClientProfile.endToEndProbeUrl] resolves to the
+ * EXIT gateway's own public control-plane host (`GET /v1/relay-health`,
+ * see `gateway/api/handler.py`'s own docs) - a host directly reachable from
+ * ordinary internet, not one bound to a private/relay-only address - so a
+ * genuine 200/non-200 result here says only "is this device's credential
+ * valid and is the exit's control-plane API reachable right now", NOT "did
+ * my traffic just traverse client -> ingress -> exit". This is why this
+ * probe produced a false negative against a physically-proven-working
+ * relay tunnel (see PROJECT_ARCHITECTURE.md's "B33 relay follow-up" section)
+ * and MUST NOT be treated, by itself, as authoritative in-tunnel proof -
+ * see the callers of [probe]/[probeProfile] for how their results are
+ * scoped accordingly. Still real and still useful as a credential/
+ * control-plane-reachability diagnostic (a 401 IS proof the token/HMAC
+ * binding is broken) - just never a data-plane liveness signal on its own.
+ *
+ * A disconnected/rebuilt socket, non-200 status, or a response body that
+ * fails the historyPathId echo all fail closed - this function NEVER
+ * returns [RelayProbeResult.Success] merely because a connection was
+ * accepted (no "TCP connect == healthy", the same B21 lesson
+ * [RelayReadinessStage]'s own docs already reference) - that discipline is
+ * unchanged by the correction above.
  *
  * No profile ([IngressClientProfile.endToEndProbeUrl] null) is reported as
  * [RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED], never silently skipped
@@ -305,13 +327,55 @@ class HttpRelayEndToEndProbe(
     private val connectTimeoutMillis: Int = 5_000,
     private val readTimeoutMillis: Int = 5_000,
 ) : RelayEndToEndProbe {
-    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult {
+    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult =
+        when (val result = fetch(profile)) {
+            is FetchResult.Failure -> result.asRelayProbeResult
+            is FetchResult.Success ->
+                if (!result.body.contains(plan.historyPathId)) {
+                    RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe response did not echo this session's path identity")
+                } else {
+                    RelayProbeResult.Success
+                }
+        }
+
+    /**
+     * B33 relay follow-up - the narrower half of [probe]: the SAME real,
+     * bearer-authenticated HTTPS round trip [probe] performs, minus its
+     * historyPathId echo check (there is no [RelayedExecutionPlan] to echo
+     * against at the point this is called). [fetch] is the ONE real
+     * HTTP-calling implementation both this and [probe] share - never two
+     * independent network paths that could silently diverge.
+     *
+     * **B33 relay follow-up (round 2) - NOT in-tunnel proof - see [probe]'s
+     * own corrected docs.** This call is issued from Nova's own (VPN-
+     * excluded) process the same way [probe] is, so it does not traverse
+     * the just-started tunnel either. Using this as
+     * [net.pocvpn.client.vpn.xray.XrayCoreController.requestStart]'s
+     * pre-`Started` gate is therefore an out-of-band credential/control-
+     * plane-reachability check, not a genuine data-plane confirmation - see
+     * that class's own corrected docs for the consequence and the currently
+     * missing real primitive.
+     */
+    suspend fun probeProfile(profile: IngressClientProfile): RelayProbeResult =
+        when (val result = fetch(profile)) {
+            is FetchResult.Failure -> result.asRelayProbeResult
+            is FetchResult.Success -> RelayProbeResult.Success
+        }
+
+    private sealed class FetchResult {
+        data class Success(val body: String) : FetchResult()
+        data class Failure(val category: RelayFailureCategory, val detail: String?) : FetchResult() {
+            val asRelayProbeResult: RelayProbeResult get() = RelayProbeResult.Failure(category, detail)
+        }
+    }
+
+    private fun fetch(profile: IngressClientProfile): FetchResult {
         val urlString = profile.endToEndProbeUrl
-            ?: return RelayProbeResult.Failure(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, "profile carries no end-to-end probe URL")
+            ?: return FetchResult.Failure(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, "profile carries no end-to-end probe URL")
         return try {
             val url = java.net.URL(urlString)
             if (url.protocol != "https") {
-                return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "refusing a non-HTTPS probe URL")
+                return FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "refusing a non-HTTPS probe URL")
             }
             val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -324,22 +388,19 @@ class HttpRelayEndToEndProbe(
             try {
                 val status = connection.responseCode
                 if (status != java.net.HttpURLConnection.HTTP_OK) {
-                    return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe returned HTTP $status")
+                    return FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe returned HTTP $status")
                 }
                 val body = connection.inputStream.bufferedReader().use { it.readText() }
-                if (!body.contains(plan.historyPathId)) {
-                    return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe response did not echo this session's path identity")
-                }
-                RelayProbeResult.Success
+                FetchResult.Success(body)
             } finally {
                 connection.disconnect()
             }
         } catch (e: java.net.SocketTimeoutException) {
-            RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
         } catch (e: java.io.IOException) {
-            RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
         } catch (e: Exception) {
-            RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, e.javaClass.simpleName)
         }
     }
 }

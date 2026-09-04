@@ -94,6 +94,10 @@ class VlessTlsTransport(
                 .putExtra(NovaXrayVpnService.EXTRA_ENDPOINT_ID, config.endpointId.value)
                 // B18-2 - see VlessRealityTransport's own docs on this extra.
                 .putExtra(NovaXrayVpnService.EXTRA_ROUTING_MODE, config.routingMode.name)
+                // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
+                .putExtra(NovaXrayVpnService.EXTRA_IS_RELAYED, config.isRelayed)
+            // B33 relay follow-up (round 2) - see TransportConfig.Xray.relayExitProbeHost's own docs.
+            config.relayExitProbeHost?.let { intent.putExtra(NovaXrayVpnService.EXTRA_RELAY_EXIT_PROBE_HOST, it) }
             context.startService(intent)
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "connect failed", t)

@@ -139,6 +139,10 @@ class VlessRealityTransport(
                 // docs) - NovaXrayVpnService threads it into the same
                 // RoutingDecisionEngine.resolveIpv4Routes authority AWG uses.
                 .putExtra(NovaXrayVpnService.EXTRA_ROUTING_MODE, config.routingMode.name)
+                // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
+                .putExtra(NovaXrayVpnService.EXTRA_IS_RELAYED, config.isRelayed)
+            // B33 relay follow-up (round 2) - see TransportConfig.Xray.relayExitProbeHost's own docs.
+            config.relayExitProbeHost?.let { intent.putExtra(NovaXrayVpnService.EXTRA_RELAY_EXIT_PROBE_HOST, it) }
             context.startService(intent)
             // Real confirmation arrives asynchronously via XrayRuntimeState
             // (see the observer above) - never claim Connected merely

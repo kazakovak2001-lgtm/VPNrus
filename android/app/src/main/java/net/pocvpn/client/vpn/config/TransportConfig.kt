@@ -68,12 +68,36 @@ sealed class TransportConfig {
         // pre-B18-2 construction (every existing test) is byte-for-byte
         // unaffected.
         val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+        // B33 relay follow-up - true only when VpnController's own
+        // pendingAttemptContext is VpnAttemptContext.Relayed for THIS
+        // attempt (see VpnController.buildTransportConfig's own docs) -
+        // threaded through NovaXrayVpnService.EXTRA_IS_RELAYED so that
+        // service can build the correct XrayCoreController.RemoteConfirmationContext
+        // (Direct vs Relayed - see that sealed class's own docs) without
+        // itself hardcoding any endpoint id. Defaults to false so every
+        // pre-existing construction (every existing test, every Direct
+        // attempt) is byte-for-byte unaffected.
+        val isRelayed: Boolean = false,
+        // B33 relay follow-up (round 2) - the EXIT endpoint's own plaintext
+        // HTTPS control-plane host (RelayedExecutionPlan.exitBinding.host -
+        // never the ingress host [isRelayed] attempts already dial) that
+        // XrayCoreController's Relayed confirmation gate dials via
+        // XrayCoreRuntime.measureDelay, through the SAME just-started core's
+        // outbound the ingress dial itself uses - see
+        // XrayCoreController.RemoteConfirmationContext.Relayed's own docs for
+        // why this, and not the ingress host, is the correct target. Always
+        // non-null exactly when [isRelayed] is true; null for every Direct
+        // attempt (every pre-existing construction is byte-for-byte
+        // unaffected).
+        val relayExitProbeHost: String? = null,
     ) : TransportConfig()
 
-    /** B8O2/B13/B18-2 - the TLS/TCP counterpart of [Xray], including the same [endpointId]/[routingMode] threading - see those fields' own docs. */
+    /** B8O2/B13/B18-2/B33 - the TLS/TCP counterpart of [Xray], including the same [endpointId]/[routingMode]/[isRelayed]/[relayExitProbeHost] threading - see those fields' own docs. */
     data class XrayTls(
         val config: net.pocvpn.client.vpn.xray.XrayVlessTlsConfig,
         val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
         val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+        val isRelayed: Boolean = false,
+        val relayExitProbeHost: String? = null,
     ) : TransportConfig()
 }
