@@ -8,7 +8,10 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
+import net.pocvpn.client.provisioning.FieldCredential
+import net.pocvpn.client.provisioning.FieldCredentialStore
 import net.pocvpn.client.provisioning.IngressProfileResult
+import net.pocvpn.client.provisioning.InMemoryFieldCredentialStore
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
@@ -141,6 +144,8 @@ class MainViewModelRelayActivationTest {
         transport: VpnTransport = FakeVpnTransport(),
         relayIngressResolver: RelayIngressResolver,
         ingressProfileProvisioner: IngressProfileProvisioner? = null,
+        zeroTouchEnrollmentEnabled: Boolean = false,
+        fieldCredentialStore: FieldCredentialStore = InMemoryFieldCredentialStore(),
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -155,6 +160,8 @@ class MainViewModelRelayActivationTest {
         relayIngressResolver = relayIngressResolver,
         ingressProfileProvisioner = ingressProfileProvisioner,
         ioDispatcher = testDispatcher,
+        zeroTouchEnrollmentEnabled = zeroTouchEnrollmentEnabled,
+        fieldCredentialStore = fieldCredentialStore,
     )
 
     private fun successResult(
@@ -264,6 +271,62 @@ class MainViewModelRelayActivationTest {
         // B/C: the retry resolved the EXACT SAME plan (same historyPathId,
         // same bindings/transport) - never rebuilt/re-ranked.
         assertEquals(resolver.resolvedPlans[0], resolver.resolvedPlans[1])
+    }
+
+    // --- Russia field-test zero-touch enrollment: ingress auto-reuses the device's own stored credential, no prompt ---
+
+    @Test
+    fun `zero-touch PROFILE_NOT_PROVISIONED auto-reuses the stored field credential - no prompt, same candidate retried`() = runTest {
+        val candA = candidate()
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        var fetchCount = 0
+        var lastCredentialUsed: String? = null
+        val provisioner = IngressProfileProvisioner(
+            store,
+            fetchIngressProfile = { _, credential, _, _ -> fetchCount++; lastCredentialUsed = credential; successResult() },
+        )
+        val fieldCredentialStore = InMemoryFieldCredentialStore()
+        fieldCredentialStore.save(FieldCredential("device-own-credential", "152.70.43.1"))
+        val viewModel = newViewModel(
+            relayIngressResolver = resolver,
+            ingressProfileProvisioner = provisioner,
+            zeroTouchEnrollmentEnabled = true,
+            fieldCredentialStore = fieldCredentialStore,
+        )
+        testDispatcher.scheduler.runCurrent() // let init's getPublicKey() complete - the zero-touch path needs it
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+
+        // No prompt was ever shown - this is the whole point of zero-touch.
+        assertNull(viewModel.relayActivationNeeded.value)
+        assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
+        assertNotNull("the profile must be persisted", store.getProfileOrNull(ingressIdA))
+        assertEquals(1, fetchCount)
+        assertEquals("device-own-credential", lastCredentialUsed)
+        // The SAME candidate was retried exactly once - byte-for-byte the
+        // same bounded-retry guarantee the manual path already proves.
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(resolver.resolvedPlans[0], resolver.resolvedPlans[1])
+    }
+
+    @Test
+    fun `zero-touch disabled falls back to the ordinary manual prompt, byte-for-byte unchanged`() = runTest {
+        val candA = candidate()
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val fieldCredentialStore = InMemoryFieldCredentialStore()
+        fieldCredentialStore.save(FieldCredential("device-own-credential", "152.70.43.1"))
+        // zeroTouchEnrollmentEnabled left at its default (false) - a stored
+        // field credential existing must NOT matter when the build itself
+        // isn't a zero-touch build.
+        val viewModel = newViewModel(relayIngressResolver = resolver, fieldCredentialStore = fieldCredentialStore)
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+
+        assertNotNull(viewModel.relayActivationNeeded.value)
+        assertEquals(1, resolver.resolvedPlans.size)
     }
 
     @Test

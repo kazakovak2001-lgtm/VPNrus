@@ -77,6 +77,24 @@ android {
         // both currently resolve to the same production origin pair, on
         // purpose (B20 does not add a distinct staging manifest source).
         buildConfigField("String", "MANIFEST_URLS", "\"${resolveManifestUrls()}\"")
+
+        // Russia field-test zero-touch enrollment - OFF by default for
+        // every ordinary debug/release build (the ordinary repo checkout,
+        // CI, and every developer machine without a local override). A
+        // field-test APK is built by setting `fieldEnrollmentEnabled=true`
+        // in this SAME gitignored, developer-local gateway-dev.properties
+        // file (never committed - see .gitignore) before running
+        // `./gradlew assembleRelease` - the smallest possible build-config
+        // change (no new build type/flavor - see PROJECT_ARCHITECTURE.md's
+        // own "Recommended build type" note), and one that cannot
+        // accidentally ship enabled from an ordinary checkout. This flag
+        // ONLY changes client-side UX (skips ActivationScreen, calls
+        // POST /v1/field-enroll automatically - see MainViewModel
+        // .ensureZeroTouchEnrollment) - it has no effect at all unless the
+        // TARGET gateway has ALSO separately enabled field enrollment
+        // server-side (POCVPN_API_FIELD_ENROLLMENT_ENABLED), which defaults
+        // to disabled there too (see gateway/api/config.py).
+        buildConfigField("boolean", "FIELD_ENROLLMENT_ENABLED", gatewayDevProp("fieldEnrollmentEnabled").ifBlank { "false" })
     }
 
     buildTypes {

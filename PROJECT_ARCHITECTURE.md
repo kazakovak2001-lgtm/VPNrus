@@ -784,6 +784,37 @@ force-stopped.
   (`xrayAvailableEndpoints`/`xrayTlsAvailableEndpoints`, `Set<EndpointId>`) - one
   endpoint's profile can never make a different endpoint appear available.
 
+## Field-test zero-touch enrollment (Russia field test) - bounded, opt-in, FOUNDATION until physically validated
+
+A separate, additive enrollment PATH onto the SAME `/v1/activate` entitlement
+model above - never a second authorization system. Server: `POST
+/v1/field-enroll` (`gateway/api/field_enrollment.py`), disabled by default
+(`AppConfig.field_enrollment_enabled`, requires an explicit env-var opt-in
+plus a `FIELD_ENROLLMENT_HMAC_SECRET_FILE` that never leaves the server).
+Given only a fresh device's public key (no credential - none exists yet), it
+derives a deterministic, unique-per-device credential
+(`HMAC-SHA256(secret, publicKey)` - never randomly generated and stored, so
+no new raw-credential-bearing store exists anywhere; see that module's own
+docs for the full rationale) and issues it through
+`activations.issue_activation_if_under_cap` (new, bounded by a global device
+cap) -> the SAME `provision_with_activation` `/v1/activate` already uses.
+Client: `MainViewModel.ensureZeroTouchEnrollment()` (called from `connect()`
+only when `BuildConfig.FIELD_ENROLLMENT_ENABLED` and the device has never
+been activated) calls `ProvisioningClient.fieldEnroll`, persists the
+returned credential in a new encrypted `FieldCredentialStore`
+(AndroidKeyStore-backed, same discipline as `FileIngressProfileStore`), then
+calls the EXISTING `activateDevice(credential, ...)` verbatim - no parallel
+apply/persist path. `attemptRelayedAttempt`'s `PROFILE_NOT_PROVISIONED`
+branch reuses the same stored credential automatically (via the same
+`performIngressActivation` helper `activateIngress` itself calls) instead of
+pausing for `ActivationScreen`, when zero-touch is enabled. `BuildConfig
+.FIELD_ENROLLMENT_ENABLED` defaults `false` (set only via a developer-local,
+gitignored `gateway-dev.properties` key) - an ordinary debug/release build
+is byte-for-byte unaffected. Does not touch Smart Connect/PathScorer/
+AutoGatewaySelector/attempt budgets/AWG/Xray-Reality/TLS-fallback/relay
+watchdog - enrollment/UX only. Not yet physically exercised end to end
+against a real field-test deployment.
+
 ## Current gateway state (verify against `docs/ROADMAP.md`'s Gateway Pool row before
 relying on this for anything user-facing - this table is a snapshot, ROADMAP is truth)
 

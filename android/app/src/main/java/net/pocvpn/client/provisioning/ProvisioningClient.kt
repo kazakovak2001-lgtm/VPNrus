@@ -152,6 +152,88 @@ object ProvisioningClient {
             },
         )
 
+    /**
+     * Russia field-test zero-touch enrollment - POST /v1/field-enroll:
+     * public key ONLY, no credential (there is none yet) -> a brand new,
+     * device-specific activation credential minted by the server. See
+     * gateway/api/field_enrollment.py's own docs. Never persists anything
+     * itself - the caller (MainViewModel) decides whether/how to save the
+     * credential (see [net.pocvpn.client.provisioning.FieldCredentialStore]).
+     */
+    fun fieldEnroll(publicKey: String, endpointHost: String): FieldEnrollmentResult =
+        executeFieldEnroll(buildFieldEnrollRequest(publicKey, endpointHost))
+
+    internal fun buildFieldEnrollRequest(publicKey: String, endpointHost: String): OutgoingRequest =
+        OutgoingRequest(
+            url = "https://$endpointHost/v1/field-enroll",
+            headers = mapOf("Content-Type" to "application/json"),
+            body = buildRequestBody(publicKey),
+        )
+
+    private fun executeFieldEnroll(request: OutgoingRequest): FieldEnrollmentResult =
+        executeGeneric(request, FieldEnrollmentResult::NetworkError, ::mapFieldEnrollResponse)
+
+    /**
+     * POST /v1/field-enroll response mapping (gateway/api/handler.py's
+     * _handle_field_enroll_inner) - `internal` so each status/error_code
+     * combination is unit-testable without a live HTTP connection.
+     */
+    internal fun mapFieldEnrollResponse(status: Int, rawBody: String): FieldEnrollmentResult = when (status) {
+        200, 201 -> parseFieldEnrollSuccessBody(rawBody)
+        400 -> FieldEnrollmentResult.BadRequest
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> FieldEnrollmentResult.Revoked
+            "expired" -> FieldEnrollmentResult.Expired
+            "device_limit_reached" -> FieldEnrollmentResult.DeviceLimitReached
+            else -> FieldEnrollmentResult.ServiceUnavailable
+        }
+        503, 504 -> FieldEnrollmentResult.ServiceUnavailable
+        else -> FieldEnrollmentResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    private fun parseFieldEnrollSuccessBody(raw: String): FieldEnrollmentResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return FieldEnrollmentResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val activationCredential = json.optString("activation_credential", "")
+        val clientTunnelIp = json.optString("client_tunnel_ip", "")
+        val gatewayPublicKey = json.optString("gateway_public_key", "")
+        val gatewayTunnelIp = json.optString("gateway_tunnel_ip", "")
+        val endpointHost = json.optString("endpoint_host", "")
+        val endpointPort = json.optInt("endpoint_port", -1)
+
+        if (activationCredential.isBlank()) {
+            return FieldEnrollmentResult.MalformedResponse("activation_credential missing or blank")
+        }
+        if (!net.pocvpn.client.vpn.config.Ipv4Format.isValid(clientTunnelIp)) {
+            return FieldEnrollmentResult.MalformedResponse("client_tunnel_ip missing or not a valid IPv4 address")
+        }
+        if (!WG_KEY_REGEX.matches(gatewayPublicKey)) {
+            return FieldEnrollmentResult.MalformedResponse("gateway_public_key missing or not a well-formed public key")
+        }
+        if (!net.pocvpn.client.vpn.config.Ipv4Format.isValid(gatewayTunnelIp)) {
+            return FieldEnrollmentResult.MalformedResponse("gateway_tunnel_ip missing or not a valid IPv4 address")
+        }
+        if (endpointHost.isBlank()) {
+            return FieldEnrollmentResult.MalformedResponse("endpoint_host missing or blank")
+        }
+        if (endpointPort !in 1..65535) {
+            return FieldEnrollmentResult.MalformedResponse("endpoint_port missing or out of range")
+        }
+
+        return FieldEnrollmentResult.Success(
+            activationCredential = activationCredential,
+            clientTunnelIp = clientTunnelIp,
+            gatewayPublicKey = gatewayPublicKey,
+            gatewayTunnelIp = gatewayTunnelIp,
+            endpointHost = endpointHost,
+            endpointPort = endpointPort,
+        )
+    }
+
     private fun executeIngressProfile(request: OutgoingRequest): IngressProfileResult =
         executeGeneric(request, IngressProfileResult::NetworkError, ::mapIngressProfileResponse)
 

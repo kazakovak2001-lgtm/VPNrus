@@ -23,6 +23,16 @@ _PER_TOKEN_RATE_WINDOW_SECONDS = 10.0
 _GLOBAL_RATE_LIMIT = 60
 _GLOBAL_RATE_WINDOW_SECONDS = 10.0
 
+# Field-test zero-touch enrollment (POST /v1/field-enroll) - a SEPARATE,
+# stricter, per-public-key limiter from per_token_limiter above (that one is
+# keyed by an already-issued credential's digest; a field-enroll request has
+# no credential yet, so it is keyed by the presented public key instead).
+# Deliberately tighter than the general per-credential limit - this endpoint
+# mints a brand new activation record on first use, a strictly more
+# expensive/sensitive operation than an ordinary already-activated request.
+_FIELD_ENROLLMENT_RATE_LIMIT = 3
+_FIELD_ENROLLMENT_RATE_WINDOW_SECONDS = 60.0
+
 
 class ProvisioningServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -42,6 +52,9 @@ class ProvisioningServer(ThreadingHTTPServer):
         )
         self.global_limiter = ratelimit.RateLimiter(
             _GLOBAL_RATE_LIMIT, _GLOBAL_RATE_WINDOW_SECONDS, clock=time.monotonic
+        )
+        self.field_enrollment_limiter = ratelimit.RateLimiter(
+            _FIELD_ENROLLMENT_RATE_LIMIT, _FIELD_ENROLLMENT_RATE_WINDOW_SECONDS, clock=time.monotonic
         )
 
 

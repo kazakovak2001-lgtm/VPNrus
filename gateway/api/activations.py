@@ -721,6 +721,85 @@ def issue_activation(store_path, lock_path, max_devices, expires_in_days=None):
     return activation_id, credential
 
 
+# --- field-enrollment support (Russia field test - see gateway/api/field_enrollment.py) --
+
+def issue_activation_if_under_cap(store_path, lock_path, global_cap, credential, max_devices=1, expires_in_days=None, now=None):
+    """Bounded, race-free counterpart of issue_activation() for zero-touch
+    field enrollment: the caller has already DERIVED `credential`
+    deterministically (see field_enrollment.derive_credential - this
+    function never generates a credential itself, unlike issue_activation)
+    and this is the ONE atomic operation that both (a) checks the store's
+    TOTAL record count against `global_cap` and (b) creates a new
+    single-device activation record for it, under the SAME
+    _exclusive_lock(lock_path) issue_activation already uses - so two
+    concurrent field-enrollment requests for two DIFFERENT new public keys
+    can never both push the store past global_cap (whichever request's
+    flock() completes first sees and commits the true count; the second
+    sees the just-updated count under the same lock).
+
+    Idempotent: if a record for this exact credential's digest ALREADY
+    exists (a benign race with a concurrent identical-public-key request,
+    or a genuine client retry after a previous response was lost), this
+    returns that existing record's activation_id UNCHANGED - it never
+    double-writes and never counts a repeat request against the cap a
+    second time.
+
+    Returns the activation_id on success (new or already-existing).
+    Returns None ONLY when this would be a genuinely NEW record and the
+    cap is already reached - the caller (field_enrollment.enroll_device)
+    must treat None as "device cap reached", never as an error.
+    """
+    if not isinstance(max_devices, int) or max_devices < 1:
+        raise ValueError("max_devices must be a positive integer")
+    if not isinstance(global_cap, int) or global_cap < 1:
+        raise ValueError("global_cap must be a positive integer")
+
+    digest = credential_digest(credential)
+    with _exclusive_lock(lock_path, create=False):
+        data = _read_and_validate_under_lock(store_path)
+
+        existing = data.get(digest)
+        if existing is not None:
+            return existing["activation_id"]
+
+        if len(data) >= global_cap:
+            return None
+
+        existing_ids = {r["activation_id"] for r in data.values()}
+        activation_id = None
+        for _attempt in range(_MAX_GENERATION_ATTEMPTS):
+            candidate_id = secrets.token_hex(_ACTIVATION_ID_BYTES)
+            if candidate_id not in existing_ids:
+                activation_id = candidate_id
+                break
+        if activation_id is None:
+            raise ActivationStoreError("failed to generate a unique activation id after several attempts")
+
+        expires_at = None
+        if expires_in_days is not None:
+            from datetime import timedelta
+            expires_at = ((now or datetime.now(timezone.utc)) + timedelta(days=expires_in_days)).isoformat()
+
+        data[digest] = {
+            "activation_id": activation_id,
+            "status": ACTIVE,
+            "max_devices": max_devices,
+            "created_at": _utc_now_iso(),
+            "expires_at": expires_at,
+            "bound_devices": [],
+        }
+        _atomic_write_store_or_raise(store_path, data)
+        return activation_id
+
+
+def find_by_credential_digest(store_path, lock_path, digest):
+    """Read-only (LOCK_SH) lookup by an ALREADY-COMPUTED credential digest -
+    never takes a raw credential, matching every other read path's own
+    no-raw-credential discipline. Returns the record dict, or None."""
+    data = read_store_shared(store_path, lock_path)
+    return data.get(digest)
+
+
 def revoke_activation(store_path, lock_path, activation_id):
     """B8C1C: revoke must serialize with any in-flight provisioning for the
     SAME activation - otherwise a revoke could complete without a

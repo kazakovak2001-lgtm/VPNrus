@@ -79,6 +79,14 @@ fun AppRoot(
     viewModel: MainViewModel,
     isDebugBuild: Boolean,
     onRequestVpnPermission: (android.content.Intent) -> Unit,
+    // Russia field-test zero-touch enrollment - defaults to false so every
+    // pre-existing call site/test is byte-for-byte unaffected. When true,
+    // NONE of the three ActivationScreen branches below are ever reachable -
+    // MainViewModel.connect()'s own ensureZeroTouchEnrollment()/zero-touch
+    // ingress path (see attemptRelayedAttempt's own docs) handle enrollment
+    // and ingress provisioning silently, with no credential/key/server UI
+    // ever shown to the field tester.
+    isZeroTouchEnrollmentBuild: Boolean = false,
 ) {
     val profileSource by viewModel.profileSource.collectAsStateWithLifecycle()
     val transportState by viewModel.transportState.collectAsStateWithLifecycle()
@@ -191,7 +199,7 @@ fun AppRoot(
                 // token paste field (this codebase's own explicit
                 // prohibition - IngressClientProfile's private fields are
                 // never exposed to any UI layer at all).
-                relayActivationNeeded != null -> ActivationScreen(
+                !isZeroTouchEnrollmentBuild && relayActivationNeeded != null -> ActivationScreen(
                     credential = ingressCredential,
                     onCredentialChange = { ingressCredential = it },
                     onActivateClick = { viewModel.activateIngress(ingressCredential) },
@@ -203,7 +211,7 @@ fun AppRoot(
                 // choice: activating an ADDITIONAL gateway is orthogonal to
                 // whether a first-run profile already exists (screenFor only
                 // ever answers "has ANY gateway ever been provisioned").
-                activatingGatewayId != null -> ActivationScreen(
+                !isZeroTouchEnrollmentBuild && activatingGatewayId != null -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
                     onActivateClick = { viewModel.activateDevice(credential, activatingGatewayId!!) },
@@ -211,7 +219,7 @@ fun AppRoot(
                     isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
                     onCancel = { activatingGatewayId = null; credential = "" },
                 )
-                screenFor(profileSource) == AppScreen.ACTIVATION -> ActivationScreen(
+                screenFor(profileSource, isZeroTouchEnrollmentBuild) == AppScreen.ACTIVATION -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
                     onActivateClick = { viewModel.activateDevice(credential) },
