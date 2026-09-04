@@ -723,36 +723,41 @@ def issue_activation(store_path, lock_path, max_devices, expires_in_days=None):
 
 # --- field-enrollment support (Russia field test - see gateway/api/field_enrollment.py) --
 
-def issue_activation_if_under_cap(store_path, lock_path, global_cap, credential, max_devices=1, expires_in_days=None, now=None):
-    """Bounded, race-free counterpart of issue_activation() for zero-touch
-    field enrollment: the caller has already DERIVED `credential`
-    deterministically (see field_enrollment.derive_credential - this
-    function never generates a credential itself, unlike issue_activation)
-    and this is the ONE atomic operation that both (a) checks the store's
-    TOTAL record count against `global_cap` and (b) creates a new
-    single-device activation record for it, under the SAME
-    _exclusive_lock(lock_path) issue_activation already uses - so two
-    concurrent field-enrollment requests for two DIFFERENT new public keys
-    can never both push the store past global_cap (whichever request's
-    flock() completes first sees and commits the true count; the second
-    sees the just-updated count under the same lock).
+def register_credential(store_path, lock_path, credential, activation_id, max_devices=1, expires_in_days=None, now=None):
+    """Field-enrollment variant of issue_activation(): the caller has
+    already generated BOTH `credential` (a genuinely random, per-device
+    value, never derived from anything) AND `activation_id` (see
+    field_enrollment.py's own FieldEnrollmentIndex, which must record the
+    SAME activation_id this call durably assigns - passing it in, rather
+    than generating a second, independent one here, is what keeps the
+    index and this store from ever disagreeing about a device's
+    activation_id) and has ALREADY made its own admission/cap decision
+    (field_enrollment.py's index owns that - never this store's own total
+    record count, which may also hold unrelated operator-issued
+    multi-device activations). This is the atomic, race-free "create a new
+    single-device activation record for this exact credential, unless one
+    already exists" primitive, under the SAME _exclusive_lock(lock_path)
+    issue_activation itself uses. Unlike the earlier
+    issue_activation_if_under_cap this replaces, this function enforces NO
+    cap of its own - it is a pure idempotent insert.
 
     Idempotent: if a record for this exact credential's digest ALREADY
-    exists (a benign race with a concurrent identical-public-key request,
-    or a genuine client retry after a previous response was lost), this
-    returns that existing record's activation_id UNCHANGED - it never
-    double-writes and never counts a repeat request against the cap a
-    second time.
+    exists (a benign race, or a genuine retry), returns that existing
+    record's activation_id UNCHANGED (which the caller already knows,
+    since it derives from the SAME durable index entry) - never
+    double-writes.
 
-    Returns the activation_id on success (new or already-existing).
-    Returns None ONLY when this would be a genuinely NEW record and the
-    cap is already reached - the caller (field_enrollment.enroll_device)
-    must treat None as "device cap reached", never as an error.
+    Raises ActivationStoreError if `activation_id` collides with a
+    DIFFERENT existing record's own id - should be unreachable (both id
+    spaces are 128-bit random hex), kept as a defensive, explicit failure
+    rather than silently overwriting an unrelated record.
+
+    Returns the activation_id (new or already-existing).
     """
     if not isinstance(max_devices, int) or max_devices < 1:
         raise ValueError("max_devices must be a positive integer")
-    if not isinstance(global_cap, int) or global_cap < 1:
-        raise ValueError("global_cap must be a positive integer")
+    if not _ACTIVATION_ID_RE.match(activation_id):
+        raise ValueError("activation_id must be 32 lowercase hex characters")
 
     digest = credential_digest(credential)
     with _exclusive_lock(lock_path, create=False):
@@ -762,18 +767,9 @@ def issue_activation_if_under_cap(store_path, lock_path, global_cap, credential,
         if existing is not None:
             return existing["activation_id"]
 
-        if len(data) >= global_cap:
-            return None
-
-        existing_ids = {r["activation_id"] for r in data.values()}
-        activation_id = None
-        for _attempt in range(_MAX_GENERATION_ATTEMPTS):
-            candidate_id = secrets.token_hex(_ACTIVATION_ID_BYTES)
-            if candidate_id not in existing_ids:
-                activation_id = candidate_id
-                break
-        if activation_id is None:
-            raise ActivationStoreError("failed to generate a unique activation id after several attempts")
+        for record in data.values():
+            if record["activation_id"] == activation_id:
+                raise ActivationStoreError(f"activation_id {activation_id} already used by a different credential")
 
         expires_at = None
         if expires_in_days is not None:

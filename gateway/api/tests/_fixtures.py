@@ -111,7 +111,8 @@ def make_app_config(
     relay_probe_hmac_secret_file="",
     field_enrollment_enabled=False,
     field_enrollment_max_devices=0,
-    field_enrollment_hmac_secret_file="",
+    field_enrollment_index_path="",
+    field_enrollment_index_lock_path="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -152,18 +153,9 @@ def make_app_config(
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
         field_enrollment_enabled=field_enrollment_enabled,
         field_enrollment_max_devices=field_enrollment_max_devices,
-        field_enrollment_hmac_secret_file=field_enrollment_hmac_secret_file,
+        field_enrollment_index_path=field_enrollment_index_path,
+        field_enrollment_index_lock_path=field_enrollment_index_lock_path,
     )
-
-
-def make_field_enrollment_hmac_secret_file(tmp_dir, name="field-enrollment-hmac-secret.bin", content=None):
-    """A throwaway 32-byte shared secret, written with the same 0600/
-    never-in-repo discipline as make_relay_probe_hmac_secret_file."""
-    path = os.path.join(tmp_dir, name)
-    with open(path, "wb") as handle:
-        handle.write(content if content is not None else secrets.token_bytes(32))
-    os.chmod(path, 0o600)
-    return path
 
 
 def make_relay_probe_hmac_secret_file(tmp_dir, name="relay-probe-hmac-secret.bin", content=None):

@@ -114,7 +114,10 @@ class MainViewModelZeroTouchEnrollmentTest {
 
         assertTrue(proceed)
         assertEquals(1, callCount)
-        assertEquals("device-specific-credential", credentialStore.getOrNull()?.credential)
+        assertEquals(
+            "device-specific-credential",
+            credentialStore.getOrNull(ProductionGatewayCatalog.GERMANY.awg.endpointHost)?.credential,
+        )
         assertTrue(viewModel.provisioningState.value is ProvisioningUiState.Success)
     }
 

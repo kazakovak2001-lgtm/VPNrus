@@ -790,30 +790,74 @@ A separate, additive enrollment PATH onto the SAME `/v1/activate` entitlement
 model above - never a second authorization system. Server: `POST
 /v1/field-enroll` (`gateway/api/field_enrollment.py`), disabled by default
 (`AppConfig.field_enrollment_enabled`, requires an explicit env-var opt-in
-plus a `FIELD_ENROLLMENT_HMAC_SECRET_FILE` that never leaves the server).
-Given only a fresh device's public key (no credential - none exists yet), it
-derives a deterministic, unique-per-device credential
-(`HMAC-SHA256(secret, publicKey)` - never randomly generated and stored, so
-no new raw-credential-bearing store exists anywhere; see that module's own
-docs for the full rationale) and issues it through
-`activations.issue_activation_if_under_cap` (new, bounded by a global device
-cap) -> the SAME `provision_with_activation` `/v1/activate` already uses.
-Client: `MainViewModel.ensureZeroTouchEnrollment()` (called from `connect()`
-only when `BuildConfig.FIELD_ENROLLMENT_ENABLED` and the device has never
-been activated) calls `ProvisioningClient.fieldEnroll`, persists the
-returned credential in a new encrypted `FieldCredentialStore`
-(AndroidKeyStore-backed, same discipline as `FileIngressProfileStore`), then
-calls the EXISTING `activateDevice(credential, ...)` verbatim - no parallel
-apply/persist path. `attemptRelayedAttempt`'s `PROFILE_NOT_PROVISIONED`
-branch reuses the same stored credential automatically (via the same
-`performIngressActivation` helper `activateIngress` itself calls) instead of
-pausing for `ActivationScreen`, when zero-touch is enabled. `BuildConfig
-.FIELD_ENROLLMENT_ENABLED` defaults `false` (set only via a developer-local,
-gitignored `gateway-dev.properties` key) - an ordinary debug/release build
-is byte-for-byte unaffected. Does not touch Smart Connect/PathScorer/
-AutoGatewaySelector/attempt budgets/AWG/Xray-Reality/TLS-fallback/relay
-watchdog - enrollment/UX only. Not yet physically exercised end to end
-against a real field-test deployment.
+plus a `FIELD_ENROLLMENT_INDEX_PATH`). Given only a fresh device's public
+key (no credential - none exists yet), it mints a genuinely RANDOM
+per-device credential (`secrets.token_urlsafe` - round-2 review fix,
+replacing an earlier `HMAC-SHA256(secret, publicKey)` design whose
+compromise would have been a silent, un-rotatable skeleton key over every
+past AND future device; see that module's own docs for the full
+before/after security analysis) and registers it via
+`activations.register_credential` -> the SAME `provision_with_activation`
+`/v1/activate` already uses. A random (non-derivable) credential needs ONE
+piece of durable, non-secret bookkeeping to stay race-free/idempotent under
+concurrency: `FieldEnrollmentIndex` (`field_enrollment.py`'s own small,
+self-initializing, capped index file, keyed by public key - never secret,
+already sent in cleartext on every request) is the single atomic operation
+making "same public key -> idempotent replay" and "global device cap" (now
+scoped to THIS index, never to the shared `activations.json`'s own total
+record count, which may also hold unrelated operator-issued multi-device
+activations) race-free together. Two independent rate limiters gate the
+endpoint (`server.py`): a per-public-key one (`field_enrollment_limiter`)
+and a NEW global one (`field_enrollment_global_limiter`, keyed by a single
+constant) sized near the device cap itself - the per-key limiter cannot
+help against an attacker minting a fresh public key per request, so the
+global one is the actual defense against fast device-cap exhaustion (a
+throttle, not a guarantee - a cap this small has no stronger guarantee
+available without the kind of identity proof, e.g. IP allowlisting or a
+manually-typed credential, this field test's own constraints rule out).
+
+**Cross-host topology (round-2 review finding, corrects an earlier wrong
+assumption in this same note)**: Germany/Stockholm-the-gateway and the
+Stockholm ingress ROLE are SEPARATE `pocvpn-api` processes with their OWN,
+independent activation stores even when co-located on the same physical
+host (see `gateway/config/ingress.env.example`'s own "THIS host's own
+dedicated activation store, never shared with a real gateway" docs) - a
+credential minted against one is meaningless to the other; pointing both
+configs at the same file path is NOT a shared store across hosts. The fix
+is `field_enrollment.py` being deployed, independently and identically,
+on EVERY control-plane role a device needs zero-touch authority against
+(the target gateway AND, separately, the ingress role) - never a
+server-to-server call or a shared filesystem. Client:
+`MainViewModel.ensureZeroTouchEnrollment()` (called from `connect()` only
+when `BuildConfig.FIELD_ENROLLMENT_ENABLED` and the device has never been
+activated) calls `ProvisioningClient.fieldEnroll` against the TARGET
+GATEWAY's own host, persists the credential in `FieldCredentialStore`
+(AndroidKeyStore-backed, keyed BY ENDPOINT HOST - same per-endpoint
+discipline `FileIngressProfileStore` already uses, since a gateway's and
+an ingress's credentials are now cryptographically and administratively
+distinct), then calls the EXISTING `activateDevice(credential, ...)`
+verbatim - no parallel apply/persist path. `attemptRelayedAttempt`'s
+`PROFILE_NOT_PROVISIONED` branch, when zero-touch is enabled, separately
+field-enrolls (or reuses a stored credential) against THIS candidate's own
+`ingressBinding.host` specifically (the same host `IngressProfileProvisioner`
+itself POSTs `/v1/ingress-profile` to) before calling the same
+`performIngressActivation` helper `activateIngress` uses - never confusing
+the two hosts' credentials. If ingress-side enrollment cannot succeed
+(not deployed/enabled there, or a network failure), the combined sequence
+advances to the next candidate immediately rather than pausing for
+`ActivationScreen` - a field build can never render that prompt (see
+`AppRoot`'s `isZeroTouchEnrollmentBuild` gating), so pausing would strand
+the sequence forever with nothing able to resume it.
+
+`BuildConfig.FIELD_ENROLLMENT_ENABLED` defaults `false` (set only via a
+developer-local, gitignored `gateway-dev.properties` key) - an ordinary
+debug/release build is byte-for-byte unaffected. Does not touch Smart
+Connect/PathScorer/AutoGatewaySelector/attempt budgets/AWG/Xray-Reality/
+TLS-fallback/relay watchdog - enrollment/UX only. Not yet physically
+exercised end to end against a real field-test deployment (in particular,
+the ingress role's own `POCVPN_API_FIELD_ENROLLMENT_*` env vars have never
+been deployed - only unit/integration-tested against a fake ingress
+config).
 
 ## Current gateway state (verify against `docs/ROADMAP.md`'s Gateway Pool row before
 relying on this for anything user-facing - this table is a snapshot, ROADMAP is truth)

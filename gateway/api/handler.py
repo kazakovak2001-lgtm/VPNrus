@@ -764,10 +764,24 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         mere existence.
         """
         cfg = self.server.config
-        if not (cfg.field_enrollment_enabled and cfg.activation_store_path and cfg.field_enrollment_hmac_secret_file):
+        if not (cfg.field_enrollment_enabled and cfg.activation_store_path and cfg.field_enrollment_index_path):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "field_enrollment_not_configured")
 
         if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        # Round-2 review fix (cap exhaustion) - a SEPARATE, much stricter
+        # limiter than the general global_limiter above, scoped to this one
+        # endpoint and applied regardless of which public key is presented.
+        # An attacker who mints unlimited public keys cannot exhaust
+        # field_enrollment_max_devices (a small number, e.g. 5) faster than
+        # this window allows - see server.py's own docs for the exact
+        # constants and rationale. Checked before body parsing: a request
+        # this endpoint would reject anyway (malformed body, invalid key)
+        # still consumes an attempt slot, since generating a fresh
+        # malformed-but-plausible request is exactly as cheap for an
+        # attacker as a well-formed one.
+        if not self.server.field_enrollment_global_limiter.allow("field-enroll"):
             raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
 
         if self.headers.get_all("Transfer-Encoding"):
@@ -788,30 +802,24 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # Per-public-key limiter (a DIFFERENT limiter from per_token_limiter -
         # there is no credential yet to key that one on) - see server.py's
         # own docs for why this is deliberately tighter than the general
-        # per-credential rate.
+        # per-credential rate. Kept alongside the new global limiter above -
+        # defense against one key retry-looping is a separate concern from
+        # defense against many distinct keys exhausting the device cap.
         if not self.server.field_enrollment_limiter.allow(public_key):
             raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
 
         try:
-            with open(cfg.field_enrollment_hmac_secret_file, "rb") as handle:
-                hmac_secret = handle.read().strip()
-        except OSError:
-            logger.error("field_enrollment_secret_read_error")
-            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "field_enrollment_unavailable")
-
-        try:
             result = field_enrollment.enroll_device(
-                public_key, hmac_secret,
+                public_key,
+                cfg.field_enrollment_index_path, cfg.field_enrollment_index_lock_path,
                 cfg.activation_store_path, cfg.activation_lock_path,
                 cfg.provision_script_path, cfg.subprocess_timeout_seconds,
                 cfg.field_enrollment_max_devices,
                 sudo_path=cfg.sudo_path or None,
             )
-        except activations.ActivationStoreError:
+        except (activations.ActivationStoreError, field_enrollment.FieldEnrollmentIndexError):
             logger.error("field_enrollment_store_error")
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_store_unavailable")
-        finally:
-            hmac_secret = None  # never held beyond this one enroll_device() call
 
         self._log_fields["field_enrollment_outcome"] = result.outcome
 

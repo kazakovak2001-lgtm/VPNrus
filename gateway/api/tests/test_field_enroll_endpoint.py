@@ -17,7 +17,6 @@ from api import activations as activations_module
 from _fixtures import (
     RunningServer,
     make_app_config,
-    make_field_enrollment_hmac_secret_file,
     make_public_key,
     set_plan,
     write_fake_provision_script,
@@ -39,7 +38,8 @@ class FieldEnrollEndpointTests(unittest.TestCase):
         self.activation_lock_path = os.path.join(self._tmp.name, ".activations.lock")
         activations_module.init_store(self.activation_store_path, self.activation_lock_path)
 
-        self.secret_file = make_field_enrollment_hmac_secret_file(self._tmp.name)
+        self.index_path = os.path.join(self._tmp.name, "field-enrollment-index.json")
+        self.index_lock_path = os.path.join(self._tmp.name, ".field-enrollment-index.lock")
 
     def _server(self, enabled=True, max_devices=5):
         app_config = make_app_config(
@@ -48,7 +48,8 @@ class FieldEnrollEndpointTests(unittest.TestCase):
             activation_lock_path=self.activation_lock_path,
             field_enrollment_enabled=enabled,
             field_enrollment_max_devices=max_devices,
-            field_enrollment_hmac_secret_file=self.secret_file if enabled else "",
+            field_enrollment_index_path=self.index_path if enabled else "",
+            field_enrollment_index_lock_path=self.index_lock_path if enabled else "",
         )
         server = RunningServer(app_config)
         self.addCleanup(server.close)
@@ -105,12 +106,24 @@ class FieldEnrollEndpointTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(body)["error"], "device_limit_reached")
 
-    def test_rate_limit_enforced_per_public_key(self):
+    def test_per_key_rate_limit_enforced(self):
         server = self._server()
         key = make_public_key(0x40)
         statuses = []
         for _ in range(6):
             status, _headers, _body = post_field_enroll(server.port, body_obj={"public_key": key})
+            statuses.append(status)
+        self.assertIn(429, statuses)
+
+    def test_global_rate_limit_enforced_across_distinct_public_keys(self):
+        """Round-2 review fix (cap exhaustion) - a burst of requests using
+        a DIFFERENT public key each time (the per-key limiter cannot help
+        here at all) must still eventually be throttled by the endpoint's
+        own global limiter."""
+        server = self._server(max_devices=100)  # cap set high so DEVICE_CAP_REACHED never masks the rate-limit assertion
+        statuses = []
+        for seed in range(20):
+            status, _headers, _body = post_field_enroll(server.port, body_obj={"public_key": make_public_key(seed)})
             statuses.append(status)
         self.assertIn(429, statuses)
 

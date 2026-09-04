@@ -33,6 +33,26 @@ _GLOBAL_RATE_WINDOW_SECONDS = 10.0
 _FIELD_ENROLLMENT_RATE_LIMIT = 3
 _FIELD_ENROLLMENT_RATE_WINDOW_SECONDS = 60.0
 
+# Round-2 review fix (cap exhaustion) - a SECOND, GLOBAL limiter for the
+# SAME endpoint, keyed by a single constant (not the public key) so it
+# bounds the TOTAL rate of field-enroll attempts regardless of how many
+# distinct public keys an attacker presents (the per-key limiter above
+# cannot help here at all - an attacker who mints a fresh public key per
+# request never repeats a key). Deliberately set at/near
+# field_enrollment_max_devices' own typical size (e.g. 5): even a
+# perfectly-timed attack can never mint more than one field-enrolled
+# device, on average, faster than roughly once per this window - the cap
+# (a small, fixed number) can no longer be exhausted in a single instant,
+# giving an operator a real chance to notice and disable the endpoint
+# (POCVPN_API_FIELD_ENROLLMENT_ENABLED) before real damage is done. This is
+# a THROTTLE, not a guarantee the cap can never be exhausted by a
+# determined attacker within a few minutes - a cap this small has no
+# stronger guarantee available without adding the kind of identity proof
+# (IP allowlisting, per-tester manual credential, ...) this field test's
+# own constraints explicitly rule out.
+_FIELD_ENROLLMENT_GLOBAL_RATE_LIMIT = 5
+_FIELD_ENROLLMENT_GLOBAL_RATE_WINDOW_SECONDS = 60.0
+
 
 class ProvisioningServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -55,6 +75,9 @@ class ProvisioningServer(ThreadingHTTPServer):
         )
         self.field_enrollment_limiter = ratelimit.RateLimiter(
             _FIELD_ENROLLMENT_RATE_LIMIT, _FIELD_ENROLLMENT_RATE_WINDOW_SECONDS, clock=time.monotonic
+        )
+        self.field_enrollment_global_limiter = ratelimit.RateLimiter(
+            _FIELD_ENROLLMENT_GLOBAL_RATE_LIMIT, _FIELD_ENROLLMENT_GLOBAL_RATE_WINDOW_SECONDS, clock=time.monotonic
         )
 
 

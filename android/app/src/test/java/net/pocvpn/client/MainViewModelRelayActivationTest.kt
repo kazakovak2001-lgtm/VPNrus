@@ -146,6 +146,8 @@ class MainViewModelRelayActivationTest {
         ingressProfileProvisioner: IngressProfileProvisioner? = null,
         zeroTouchEnrollmentEnabled: Boolean = false,
         fieldCredentialStore: FieldCredentialStore = InMemoryFieldCredentialStore(),
+        fieldEnrollmentClient: (publicKey: String, endpointHost: String) -> net.pocvpn.client.provisioning.FieldEnrollmentResult =
+            { _, _ -> error("fieldEnrollmentClient should not be called in this test") },
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -162,6 +164,7 @@ class MainViewModelRelayActivationTest {
         ioDispatcher = testDispatcher,
         zeroTouchEnrollmentEnabled = zeroTouchEnrollmentEnabled,
         fieldCredentialStore = fieldCredentialStore,
+        fieldEnrollmentClient = fieldEnrollmentClient,
     )
 
     private fun successResult(
@@ -287,7 +290,10 @@ class MainViewModelRelayActivationTest {
             fetchIngressProfile = { _, credential, _, _ -> fetchCount++; lastCredentialUsed = credential; successResult() },
         )
         val fieldCredentialStore = InMemoryFieldCredentialStore()
-        fieldCredentialStore.save(FieldCredential("device-own-credential", "152.70.43.1"))
+        // Keyed by the INGRESS's own control-plane host (bindingA.host) -
+        // cross-host review fix: this is a DIFFERENT credential/store from
+        // whatever the target gateway's own field-enrollment issued.
+        fieldCredentialStore.save(FieldCredential("device-own-credential", bindingA.host))
         val viewModel = newViewModel(
             relayIngressResolver = resolver,
             ingressProfileProvisioner = provisioner,
@@ -327,6 +333,77 @@ class MainViewModelRelayActivationTest {
 
         assertNotNull(viewModel.relayActivationNeeded.value)
         assertEquals(1, resolver.resolvedPlans.size)
+    }
+
+    @Test
+    fun `zero-touch with NO stored ingress credential auto-enrolls against the ingress host specifically`() = runTest {
+        val candA = candidate()
+        val resolver = RelayActivationStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        var fetchCount = 0
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> fetchCount++; successResult() })
+        val fieldCredentialStore = InMemoryFieldCredentialStore()
+        // A credential for the GATEWAY host already exists (as ensureZeroTouchEnrollment
+        // would have left behind) - it must NOT be reused for the ingress's
+        // own, DIFFERENT control-plane host.
+        fieldCredentialStore.save(FieldCredential("gateway-credential", "203.0.113.10"))
+
+        var enrollCallHost: String? = null
+        val viewModel = newViewModel(
+            relayIngressResolver = resolver,
+            ingressProfileProvisioner = provisioner,
+            zeroTouchEnrollmentEnabled = true,
+            fieldCredentialStore = fieldCredentialStore,
+            fieldEnrollmentClient = { _, host ->
+                enrollCallHost = host
+                net.pocvpn.client.provisioning.FieldEnrollmentResult.Success(
+                    activationCredential = "freshly-enrolled-ingress-credential",
+                    clientTunnelIp = "10.77.0.5",
+                    gatewayPublicKey = "A".repeat(43),
+                    gatewayTunnelIp = "10.77.0.1",
+                    endpointHost = host,
+                    endpointPort = 443,
+                )
+            },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(bindingA.host, enrollCallHost)
+        assertNull(viewModel.relayActivationNeeded.value)
+        assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
+        assertEquals(1, fetchCount)
+        assertEquals("freshly-enrolled-ingress-credential", fieldCredentialStore.getOrNull(bindingA.host)?.credential)
+        // The gateway's own credential must be untouched.
+        assertEquals("gateway-credential", fieldCredentialStore.getOrNull("203.0.113.10")?.credential)
+    }
+
+    @Test
+    fun `zero-touch with ingress enrollment failing never pauses for a prompt - the combined sequence just advances`() = runTest {
+        val candA = candidate()
+        val candB = candidate(ingressIdB, bindingB)
+        val resolver = RelayActivationStubResolver { plan ->
+            if (plan.ingressEndpointId == ingressIdA) RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED)
+            else RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+        }
+        val viewModel = newViewModel(
+            relayIngressResolver = resolver,
+            ingressProfileProvisioner = IngressProfileProvisioner(InMemoryIngressProfileStore(), fetchIngressProfile = { _, _, _, _ -> successResult() }),
+            zeroTouchEnrollmentEnabled = true,
+            fieldEnrollmentClient = { _, _ -> net.pocvpn.client.provisioning.FieldEnrollmentResult.ServiceUnavailable },
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.attemptRelayedAttempt(candA, listOf(asAttempt(candA), asAttempt(candB)), setOf(candA.historyPathId))
+        testDispatcher.scheduler.runCurrent()
+
+        // Never pauses for a prompt the field build could never show -
+        // the combined sequence must have advanced (exhausted, since
+        // candidate B's own category is not fixable either).
+        assertNull(viewModel.relayActivationNeeded.value)
+        assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
     }
 
     @Test

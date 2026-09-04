@@ -143,11 +143,12 @@ class AppConfig:
     # specific field-test gateway instance.
     field_enrollment_enabled: bool = False
     field_enrollment_max_devices: int = 0
-    # A FILE PATH only - see field_enrollment.derive_credential's own docs
-    # for the one place (and only place) this process ever reads its
-    # contents: transiently, per request, never logged, never returned in
-    # any response, never cached beyond one function call's local variable.
-    field_enrollment_hmac_secret_file: str = ""
+    # Round-2 review fix: field_enrollment.py no longer derives credentials
+    # from a server secret (see that module's own docs for why) - these
+    # name its own small, self-initializing, non-secret index file (public
+    # key -> already-issued credential/activation_id), never a secret file.
+    field_enrollment_index_path: str = ""
+    field_enrollment_index_lock_path: str = ""
 
 
 def _get(env, key):
@@ -485,7 +486,10 @@ def load_config(env=None):
     # typo) leaves it disabled, fail-closed, never accidentally on.
     field_enrollment_enabled = _get(env, "FIELD_ENROLLMENT_ENABLED").lower() == "true"
     field_enrollment_max_devices_raw = _get(env, "FIELD_ENROLLMENT_MAX_DEVICES")
-    field_enrollment_hmac_secret_file = _get(env, "FIELD_ENROLLMENT_HMAC_SECRET_FILE")
+    field_enrollment_index_path = _get(env, "FIELD_ENROLLMENT_INDEX_PATH")
+    field_enrollment_index_lock_path = _get(env, "FIELD_ENROLLMENT_INDEX_LOCK_PATH") or (
+        field_enrollment_index_path + ".lock" if field_enrollment_index_path else ""
+    )
     field_enrollment_max_devices = 0
     if field_enrollment_max_devices_raw:
         try:
@@ -507,14 +511,12 @@ def load_config(env=None):
             raise ConfigError(
                 f"{_ENV_PREFIX}FIELD_ENROLLMENT_MAX_DEVICES must be a positive integer when field enrollment is enabled"
             )
-        if not field_enrollment_hmac_secret_file:
+        if not field_enrollment_index_path:
             raise ConfigError(
-                f"{_ENV_PREFIX}FIELD_ENROLLMENT_HMAC_SECRET_FILE is required when field enrollment is enabled"
+                f"{_ENV_PREFIX}FIELD_ENROLLMENT_INDEX_PATH is required when field enrollment is enabled"
             )
-        if not os.path.isabs(field_enrollment_hmac_secret_file):
-            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_HMAC_SECRET_FILE must be an absolute path: {field_enrollment_hmac_secret_file!r}")
-        if not os.path.isfile(field_enrollment_hmac_secret_file):
-            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_HMAC_SECRET_FILE does not exist: {field_enrollment_hmac_secret_file!r}")
+        if not os.path.isabs(field_enrollment_index_path):
+            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_INDEX_PATH must be an absolute path: {field_enrollment_index_path!r}")
 
     return AppConfig(
         endpoint_host=endpoint_host,
@@ -554,5 +556,6 @@ def load_config(env=None):
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
         field_enrollment_enabled=field_enrollment_enabled,
         field_enrollment_max_devices=field_enrollment_max_devices,
-        field_enrollment_hmac_secret_file=field_enrollment_hmac_secret_file,
+        field_enrollment_index_path=field_enrollment_index_path,
+        field_enrollment_index_lock_path=field_enrollment_index_lock_path,
     )

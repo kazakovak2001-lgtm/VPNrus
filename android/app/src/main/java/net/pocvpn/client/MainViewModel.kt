@@ -2523,12 +2523,12 @@ class MainViewModel(
             return false
         }
 
-        val storedCredential = fieldCredentialStore.getOrNull()?.credential
+        val endpointHost = when (zeroTouchTargetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.endpointHost
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost
+        }
+        val storedCredential = fieldCredentialStore.getOrNull(endpointHost)?.credential
         val credential = storedCredential ?: run {
-            val endpointHost = when (zeroTouchTargetGatewayId) {
-                net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.endpointHost
-                net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost
-            }
             _provisioningState.value = ProvisioningUiState.Provisioning
             val enrollResult = withContext(ioDispatcher) { fieldEnrollmentClient(key, endpointHost) }
             when (enrollResult) {
@@ -3213,24 +3213,58 @@ class MainViewModel(
                 // a freshly re-ranked one (task requirement G - nothing else
                 // advances the combined sequence while this is set).
                 if (!isActivationRetry && resolution.category in net.pocvpn.client.relay.RelayActivationRequest.ACTIVATION_FIXABLE_CATEGORIES) {
-                    // Russia field-test zero-touch path: reuse this device's
-                    // OWN already-issued field-enrollment credential
-                    // automatically - no PendingRelayActivation is ever
-                    // stored, no _relayActivationNeeded prompt is ever
-                    // shown, nothing waits on a human decision. Falls
-                    // through to the ordinary manual-prompt pause below
-                    // whenever zero-touch is off, no credential is stored
-                    // yet (should not happen once ensureZeroTouchEnrollment
-                    // has already run once for this device - see connect()'s
-                    // own docs), or ingressProfileProvisioner/publicKey
-                    // aren't wired - never a silent skip.
-                    val zeroTouchCredential = if (zeroTouchEnrollmentEnabled) fieldCredentialStore.getOrNull()?.credential else null
+                    // Russia field-test zero-touch path. Cross-host review
+                    // fix: the ingress role is a SEPARATE pocvpn-api process
+                    // with its OWN, independent activation store from
+                    // whatever gateway ensureZeroTouchEnrollment() already
+                    // activated against (see gateway/config/ingress.env.example's
+                    // own "never shared with a real gateway" docs) - a
+                    // credential minted for the gateway is meaningless here.
+                    // This device therefore field-enrolls AGAIN, separately,
+                    // against THIS candidate's own ingress control-plane
+                    // host (candidate.ingressBinding.host - the SAME host
+                    // IngressProfileProvisioner itself POSTs
+                    // /v1/ingress-profile to), reusing any credential
+                    // already stored for that exact host first. No
+                    // PendingRelayActivation is ever stored and no
+                    // _relayActivationNeeded prompt is ever shown for this
+                    // path - nothing waits on a human decision.
+                    var zeroTouchCredential: String? = null
                     val provisioner = ingressProfileProvisioner
                     val key = _publicKey.value
+                    if (zeroTouchEnrollmentEnabled && provisioner != null && key != null) {
+                        val ingressHost = candidate.ingressBinding.host
+                        zeroTouchCredential = fieldCredentialStore.getOrNull(ingressHost)?.credential
+                        if (zeroTouchCredential == null) {
+                            when (val enrollResult = withContext(ioDispatcher) { fieldEnrollmentClient(key, ingressHost) }) {
+                                is net.pocvpn.client.provisioning.FieldEnrollmentResult.Success -> {
+                                    fieldCredentialStore.save(
+                                        net.pocvpn.client.provisioning.FieldCredential(enrollResult.activationCredential, ingressHost),
+                                    )
+                                    zeroTouchCredential = enrollResult.activationCredential
+                                }
+                                else -> { /* zeroTouchCredential stays null - falls through below */ }
+                            }
+                        }
+                    }
                     if (zeroTouchCredential != null && provisioner != null && key != null) {
                         supportDiagnosticsRecorder?.recordRelayActivationRequired()
                         _ingressActivating.value = true
                         performIngressActivation(PendingRelayActivation(candidate, attempts, attemptedKeys), zeroTouchCredential, provisioner, key)
+                    } else if (zeroTouchEnrollmentEnabled) {
+                        // Zero-touch is enabled but no working ingress
+                        // credential could be obtained (ingress-role field
+                        // enrollment not deployed/enabled on this host,
+                        // network failure, or provisioner/publicKey not
+                        // wired) - never pause for a manual prompt: the
+                        // field build's own UI can never show one (see
+                        // AppRoot's isZeroTouchEnrollmentBuild gating), so
+                        // pausing here would strand the combined sequence
+                        // forever with nothing able to resume it. Treat
+                        // this exactly like a non-fixable category instead -
+                        // the combined sequence simply moves on.
+                        supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(resolution.category))
+                        attemptCombined(attempts, attemptedKeys)
                     } else {
                         pendingRelayActivation = PendingRelayActivation(candidate, attempts, attemptedKeys)
                         _relayActivationNeeded.value = net.pocvpn.client.relay.RelayActivationRequest.from(plan)

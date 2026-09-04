@@ -11,36 +11,43 @@ import org.json.JSONObject
 
 /**
  * Russia field-test zero-touch enrollment - this device's OWN, auto-issued
- * activation credential (see gateway/api/field_enrollment.py's own docs),
- * persisted so it never needs to be re-obtained after the first successful
- * POST /v1/field-enroll. This is the ONLY place this credential is ever
- * written to disk, and it is written encrypted - the same AndroidKeystoreAesGcmEncryptor
- * discipline [net.pocvpn.client.relay.FileIngressProfileStore] already uses
- * for the (structurally similar) ingress credential, with its own key
- * alias so this credential is never encrypted under key material shared
- * with anything else.
+ * activation credential(s) (see gateway/api/field_enrollment.py's own
+ * docs), persisted so they never need to be re-obtained after the first
+ * successful POST /v1/field-enroll. This is the ONLY place a field
+ * credential is ever written to disk, and it is written encrypted - the
+ * same AndroidKeystoreAesGcmEncryptor discipline [net.pocvpn.client.relay.FileIngressProfileStore]
+ * already uses for the (structurally similar) ingress credential, with its
+ * own key alias so this credential is never encrypted under key material
+ * shared with anything else.
  *
- * A single credential, not endpoint-scoped: the whole point of zero-touch
- * enrollment is ONE device-specific credential that authorizes both its
- * own gateway activation AND (per the same activated-device authority)
- * ingress provisioning - see MainViewModel's own field-enrollment docs.
+ * Cross-host review fix: Germany/Stockholm (a gateway) and the Stockholm
+ * ingress role are SEPARATE `pocvpn-api` processes with their OWN,
+ * independent activation stores (see gateway/config/ingress.env.example's
+ * own "THIS host's own dedicated activation store, never shared with a
+ * real gateway" docs) - a credential minted by one is meaningless to the
+ * other. This store is therefore keyed BY ENDPOINT HOST, exactly like
+ * [net.pocvpn.client.relay.FileIngressProfileStore] is keyed by
+ * [net.pocvpn.client.reachability.EndpointId] - a device holds ONE
+ * credential per host it has field-enrolled against (typically two: its
+ * target gateway, and separately the ingress host when CHAIN_DIRECT is
+ * needed - see MainViewModel's own docs), never a single global value.
  */
 data class FieldCredential(
     val credential: String,
-    /** The endpoint host this credential was minted against - kept only for diagnostics/debugging, never used to decide trust (the credential's own validity, checked server-side on every use, is the only authority). */
+    /** The endpoint host this credential was minted against and must be presented back to (never any other host's control plane). */
     val issuedByEndpointHost: String,
 )
 
 interface FieldCredentialStore {
-    suspend fun getOrNull(): FieldCredential?
+    suspend fun getOrNull(endpointHost: String): FieldCredential?
     suspend fun save(credential: FieldCredential)
-    suspend fun clear()
+    suspend fun clear(endpointHost: String)
 }
 
 class FieldCredentialCorruptedException(message: String) : Exception(message)
 
 class FileFieldCredentialStore(
-    private val file: File,
+    private val directory: File,
     private val encryptor: AesGcmKeyEncryptor,
 ) : FieldCredentialStore {
     private companion object {
@@ -49,7 +56,19 @@ class FileFieldCredentialStore(
         const val MAX_IV_LEN = 64
     }
 
-    override suspend fun getOrNull(): FieldCredential? {
+    // Same "lossy readable prefix + collision-free hash suffix" shape as
+    // net.pocvpn.client.identity.sanitizeForFileName (that one is typed to
+    // EndpointId, not a raw String, so this is a small local equivalent
+    // rather than a misuse of a differently-typed helper).
+    private fun fileFor(endpointHost: String): File {
+        val lossyPrefix = endpointHost.map { c -> if (c.isLetterOrDigit() || c == '-' || c == '_') c else '_' }.joinToString("")
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(endpointHost.toByteArray(Charsets.UTF_8))
+        val shortHash = digest.joinToString("") { "%02x".format(it) }.take(12)
+        return File(directory, "field_credential_$lossyPrefix-$shortHash.bin")
+    }
+
+    override suspend fun getOrNull(endpointHost: String): FieldCredential? {
+        val file = fileFor(endpointHost)
         if (!file.exists()) return null
         val encrypted = try {
             DataInputStream(file.inputStream().buffered()).use { input ->
@@ -76,11 +95,12 @@ class FileFieldCredentialStore(
     }
 
     override suspend fun save(credential: FieldCredential) {
-        file.parentFile?.mkdirs()
+        directory.mkdirs()
+        val file = fileFor(credential.issuedByEndpointHost)
         val json = JSONObject()
             .put("credential", credential.credential)
             .put("issued_by_endpoint_host", credential.issuedByEndpointHost)
-        val tmp = File(file.parentFile, "${file.name}.tmp")
+        val tmp = File(directory, "${file.name}.tmp")
         val encrypted = encryptor.encrypt(json.toString().toByteArray(StandardCharsets.UTF_8))
         val bytes = ByteArrayOutputStream().also { buffer ->
             DataOutputStream(buffer).use { out ->
@@ -102,8 +122,8 @@ class FileFieldCredentialStore(
         }
     }
 
-    override suspend fun clear() {
-        file.delete()
+    override suspend fun clear(endpointHost: String) {
+        fileFor(endpointHost).delete()
     }
 
     private fun writeLengthPrefixed(out: DataOutputStream, bytes: ByteArray) {
@@ -122,8 +142,8 @@ class FileFieldCredentialStore(
 
 /** In-memory store for tests/unwired defaults - never used in production (see [FileFieldCredentialStore]). */
 class InMemoryFieldCredentialStore : FieldCredentialStore {
-    private var stored: FieldCredential? = null
-    override suspend fun getOrNull(): FieldCredential? = stored
-    override suspend fun save(credential: FieldCredential) { stored = credential }
-    override suspend fun clear() { stored = null }
+    private val stored = mutableMapOf<String, FieldCredential>()
+    override suspend fun getOrNull(endpointHost: String): FieldCredential? = stored[endpointHost]
+    override suspend fun save(credential: FieldCredential) { stored[credential.issuedByEndpointHost] = credential }
+    override suspend fun clear(endpointHost: String) { stored.remove(endpointHost) }
 }
