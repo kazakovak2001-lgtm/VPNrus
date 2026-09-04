@@ -46,6 +46,32 @@ class ProductionIngressEndpointsTest {
         evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, 0, true, true, RestrictionClass.UNKNOWN, endpointSpecificReachableAgeMillis = 0),
     )
 
+    /**
+     * A never-dialed endpoint's OWN reachability - no endpoint-specific
+     * evidence, UNKNOWN state - matching a genuine first-ever CHAIN_DIRECT
+     * attempt at THIS isolated layer (unlike [reachable], which
+     * unconditionally claims confirmed evidence). Proves
+     * [AutoGatewaySelector.buildRelayedCandidates]'s own [PathScorer] rule 3
+     * ("transport-wide UNREACHABLE, no hop confirmed reachable ->
+     * ineligible") in isolation.
+     *
+     * This does NOT reproduce the full, real 2026-09 field-test bug on its
+     * own - that requires [net.pocvpn.client.reachability.ReachabilityEngine.assess]'s
+     * OWN fallback tier (which maps a poisoned shared TransportHealth
+     * directly into ReachabilityState.UNREACHABLE, tripping PathScorer's
+     * stronger, unconditional rule 2 instead) - a MainViewModel-level
+     * concern this isolated function's callers supply as an opaque,
+     * already-computed [EndpointReachability]. See
+     * `MainViewModelIngressWiringTest`'s "the real production Stockholm
+     * CHAIN_DIRECT candidate survives..." test for the full, real,
+     * end-to-end reproduction and proof through the actual
+     * `reachabilityFor`/`ReachabilityEngine.assess` pipeline.
+     */
+    private fun unconfirmed(id: EndpointId, kind: TransportKind) = EndpointReachability(
+        id, kind, ReachabilityState.UNKNOWN,
+        evidence = ReachabilityEvidenceSummary(TransportHealthState.UNKNOWN, null, null, true, RestrictionClass.UNKNOWN),
+    )
+
     private fun healthyRegistry(kind: TransportKind): TransportRegistry = TransportRegistry.build(
         listOf(TransportDescriptor(kind = kind, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { throw UnsupportedOperationException() })),
     )
@@ -133,6 +159,73 @@ class ProductionIngressEndpointsTest {
         assertEquals(germanyExit.id, viaRealityUpstream.exitEndpointId)
         assertEquals(TransportKind.XRAY_REALITY, viaRealityUpstream.ingressTransport)
         assertEquals(IngressKind.DIRECT_IP, viaRealityUpstream.ingressKind)
+    }
+
+    // --- PR #58 field-test fix: a DIFFERENT endpoint's Direct XRAY_REALITY
+    // failures must never poison the relay's own eligibility ---
+
+    @Test
+    fun `a shared kind-wide UNREACHABLE health (Germany's own blocked Direct REALITY port) does not exclude a never-yet-dialed Stockholm-ingress relay candidate when scoped health is healthy`() {
+        // Reproduces the exact 2026-09 Russia field-test bug: Germany's own
+        // Direct XRAY_REALITY dial (a different endpoint, a different port,
+        // 2053) correctly failed twice, flipping the SHARED
+        // transportHealthFor(XRAY_REALITY) to UNREACHABLE. The ingress hop
+        // uses `unconfirmed` (UNKNOWN reachability, no endpoint-specific
+        // evidence) - exactly what a genuine first-ever attempt at
+        // stockholm-ingress-1 looks like, never `reachable`'s unconditional
+        // confirmed-REACHABLE stub, which would never exercise PathScorer's
+        // "UNREACHABLE transport health, no hop confirmed reachable"
+        // exclusion rule at all. Before this fix, buildRelayedCandidates
+        // read the SAME shared bucket for the Stockholm-ingress candidate
+        // too and silently dropped it from ranking - CHAIN_DIRECT was never
+        // attempted, matching the observed zero requests at the Stockholm
+        // ingress control plane.
+        val sharedUnreachableHealth = TransportHealth(state = TransportHealthState.UNREACHABLE, consecutiveFailures = 2)
+        val scopedUnknownHealth = TransportHealth(state = TransportHealthState.UNKNOWN)
+
+        val candidates = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(ProductionIngressEndpoints.STOCKHOLM, germanyExit),
+            registryFor = { healthyRegistry(TransportKind.XRAY_REALITY) },
+            // Neither hop confirmed reachable - otherwise rule 3's own "...
+            // UNLESS some hop is confirmed REACHABLE" escape would trigger
+            // regardless of transport health, and this test would prove
+            // nothing about ingressTransportHealthFor at all.
+            reachabilityFor = { id, kind -> unconfirmed(id, kind) },
+            transportHealthFor = { sharedUnreachableHealth },
+            historyFor = { _, _ -> null },
+            // ingressTransportHealthFor scoped to the ingress endpoint's own
+            // (never-yet-dialed) evidence - UNKNOWN, not poisoned by
+            // Germany's unrelated Direct failures.
+            ingressTransportHealthFor = { _, _ -> scopedUnknownHealth },
+        )
+
+        val viaRealityUpstream = candidates.singleOrNull { it.exitTransport == TransportKind.XRAY_REALITY }
+        assertNotNull(
+            "the Stockholm-ingress CHAIN_DIRECT candidate must remain eligible when its OWN scoped health is fine, even though the shared kind-wide bucket is UNREACHABLE",
+            viaRealityUpstream,
+        )
+        assertEquals(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID, viaRealityUpstream!!.ingressEndpointId)
+    }
+
+    @Test
+    fun `omitting ingressTransportHealthFor falls back to the shared transportHealthFor byte-for-byte - the pre-fix rule-3 exclusion is reproducible without the new parameter`() {
+        // Proves the default value truly preserves old behavior (every
+        // pre-existing caller/test is unaffected unless it opts in) AND
+        // documents PathScorer's rule-3 exclusion shape in isolation: with
+        // no scoping supplied at all, a shared UNREACHABLE bucket DOES drop
+        // a candidate whose own reachability carries no confirmed evidence.
+        val candidates = AutoGatewaySelector.buildRelayedCandidates(
+            manifestEndpoints = listOf(ProductionIngressEndpoints.STOCKHOLM, germanyExit),
+            registryFor = { healthyRegistry(TransportKind.XRAY_REALITY) },
+            reachabilityFor = { id, kind -> if (id == ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID) unconfirmed(id, kind) else unconfirmed(id, kind) },
+            transportHealthFor = { TransportHealth(state = TransportHealthState.UNREACHABLE, consecutiveFailures = 2) },
+            historyFor = { _, _ -> null },
+        )
+
+        assertTrue(
+            "without endpoint-scoped health, and with no hop confirmed reachable, the shared UNREACHABLE bucket must still (pre-fix behavior) exclude the relay candidate",
+            candidates.none { it.exitTransport == TransportKind.XRAY_REALITY },
+        )
     }
 
     // --- 6/7: existing standalone DIRECT candidates for both gateways remain unaffected ---

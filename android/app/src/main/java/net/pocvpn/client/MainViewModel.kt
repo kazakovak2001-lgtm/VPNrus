@@ -2956,6 +2956,18 @@ class MainViewModel(
         // [buildAutoGatewayCandidates] (which stays Direct-only and
         // intentionally untouched - see that function's own docs).
         val manifestEndpoints = mergedIngressAwareEndpoints(manifestRepository?.trusted()?.endpoints.orEmpty())
+        // PR #58 field-test fix - see ingressTransportHealthFor's own docs
+        // below. Reuses the SAME, unmodified TransportHealthCalculator every
+        // other health read in this file already calls, fed outcomes
+        // filtered to ONE endpoint's own gatewayId instead of the shared,
+        // kind-wide bucket every OTHER accessor here still (correctly, for
+        // Direct) uses.
+        val ingressScopedTransportHealth = { endpointId: net.pocvpn.client.reachability.EndpointId, kind: TransportKind ->
+            net.pocvpn.client.smartconnect.TransportHealthCalculator.fromOutcomes(
+                outcomes.filter { it.gatewayId == endpointId.value },
+                kind,
+            )
+        }
         val attempts = net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
             manifestEndpoints = manifestEndpoints,
             gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
@@ -2983,11 +2995,31 @@ class MainViewModel(
                     manifestEndpoints.first { it.id == endpointId }
                 }
                 val matchedOutcome = net.pocvpn.client.reachability.EndpointOutcomeMatcher.latestMatching(outcomes, endpointId, kind)
+                // PR #58 field-test fix - matchedOutcome above is already
+                // correctly endpoint-scoped (EndpointOutcomeMatcher filters
+                // by endpointId+kind), but ReachabilityEngine.assess's OWN
+                // fallback tier (rule 5: no fresh endpoint-specific evidence
+                // -> map the passed-in transportHealth directly into this
+                // hop's own state) was still fed the SHARED, kind-wide
+                // `health.getValue(kind)` bucket for EVERY endpoint,
+                // including a relay/ingress endpoint (gateway == null) that
+                // has never been dialed yet. A different endpoint's real
+                // Direct failures for the same TransportKind (e.g. Germany's
+                // blocked Direct XRAY_REALITY port) then mapped straight
+                // into an UNRELATED ingress candidate's OWN reachability
+                // state as UNREACHABLE, tripping PathScorer's unconditional
+                // "worstHopReachability == UNREACHABLE -> ineligible" rule
+                // before CHAIN_DIRECT was ever attempted - the actual,
+                // physically observed 2026-09 Russia field-test bug (see
+                // AutoGatewaySelector.buildRelayedCandidates' own docs for
+                // the full story). An ordinary GATEWAY endpoint (gateway !=
+                // null) keeps the EXACT pre-existing shared-bucket behavior -
+                // this only changes the relay/ingress branch.
                 net.pocvpn.client.reachability.ReachabilityEngine.assess(
                     endpoint = endpoint,
                     transportKind = kind,
                     networkUsable = profile.isUsable,
-                    transportHealth = health.getValue(kind),
+                    transportHealth = if (gateway != null) health.getValue(kind) else ingressScopedTransportHealth(endpointId, kind),
                     endpointSpecificReachable = matchedOutcome?.let { it.result == ConnectionOutcomeResult.SUCCESS },
                     restrictionClass = restriction,
                     nowEpochMillis = now,
@@ -3000,6 +3032,21 @@ class MainViewModel(
             preference = userTransportPreference,
             nowEpochMillis = now,
             restrictionClass = restriction,
+            // PR #58 field-test fix - a relayed (CHAIN_DIRECT) candidate's
+            // own eligibility must never be poisoned by a DIFFERENT
+            // endpoint's Direct failures for the same TransportKind (see
+            // AutoGatewaySelector.buildRelayedCandidates' own docs for the
+            // exact physically-observed bug this closes: Germany's blocked
+            // Direct XRAY_REALITY port marked the whole XRAY_REALITY kind
+            // UNREACHABLE, which then made Stockholm's completely separate,
+            // still-open ingress XRAY_REALITY candidate ineligible too,
+            // dropping CHAIN_DIRECT out of ranking before it was ever
+            // attempted). Scoped to THIS endpoint's own recorded outcomes
+            // via ConnectionOutcome.gatewayId - already-existing, already
+            // correctly populated by VpnController.recordConnectionOutcome -
+            // then handed to the SAME, unmodified TransportHealthCalculator
+            // every other health read in this file already uses.
+            ingressTransportHealthFor = ingressScopedTransportHealth,
         )
         return CombinedAutoRankingSnapshot(restrictionClass = restriction, attempts = attempts)
     }

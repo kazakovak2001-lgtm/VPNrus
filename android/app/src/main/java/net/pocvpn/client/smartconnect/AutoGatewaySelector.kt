@@ -397,6 +397,38 @@ object AutoGatewaySelector {
      * every [exitTransport] the exit endpoint declares is tried regardless -
      * the client never dials the exit directly, so a user's transport
      * preference has no meaning for that hop.
+     *
+     * PR #58 field-test fix - [ingressTransportHealthFor] (defaults to
+     * `{ _, kind -> transportHealthFor(kind) }`, byte-for-byte the OLD
+     * behavior, so every pre-existing caller/test is unaffected unless it
+     * opts in): [transportHealthFor] alone is keyed ONLY by [TransportKind],
+     * aggregated across every endpoint that ever dialed that kind (see
+     * [net.pocvpn.client.smartconnect.TransportHealthCalculator]'s own
+     * per-kind contract - untouched, still the ONE place a [TransportHealth]
+     * is computed). That is correct for Direct (one candidate IS the kind's
+     * only real-world meaning for that gateway) but wrong for a relayed
+     * ingress: a real, physically observed bug (2026-09 Russia field test) -
+     * Germany's own DIRECT XRAY_REALITY dial correctly failing (a
+     * deliberately blocked port, 2053) flips [TransportKind.XRAY_REALITY]
+     * transport-wide to UNREACHABLE, which then ALSO made the completely
+     * separate Stockholm-ingress XRAY_REALITY candidate (a different host,
+     * a different port, 2093, still open) ineligible via
+     * [PathScorer.ineligibilityReason]'s own "TRANSPORT_UNREACHABLE unless a
+     * hop is confirmed REACHABLE" rule - a fresh device has no such
+     * confirmation for an endpoint it has never dialed yet. The relayed
+     * candidate was silently dropped from [scored] before ranking, so
+     * `attempts` never contained a `RelayedAttempt` at all - CHAIN_DIRECT
+     * was never even ATTEMPTED, let alone field-enrolled, exactly matching
+     * the observed zero requests at the Stockholm ingress control plane.
+     * [ingressTransportHealthFor] lets the real caller
+     * ([net.pocvpn.client.MainViewModel.buildCombinedAutoRankingSnapshot])
+     * supply health SCOPED to the ingress endpoint's own recorded outcomes
+     * (via [net.pocvpn.client.smartconnect.ConnectionOutcome.gatewayId],
+     * which already carries this exact information - see that field's own
+     * docs) instead of the shared kind-wide bucket, while still calling the
+     * SAME unmodified [net.pocvpn.client.smartconnect.TransportHealthCalculator.fromOutcomes]
+     * - never a parallel/forked health calculation, never a change to
+     * [PathScorer]'s own eligibility rules or scoring architecture.
      */
     fun buildRelayedCandidates(
         manifestEndpoints: List<EndpointDescriptor>,
@@ -406,6 +438,7 @@ object AutoGatewaySelector {
         historyFor: (String, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
         nowEpochMillis: Long = Long.MAX_VALUE,
+        ingressTransportHealthFor: (EndpointId, TransportKind) -> TransportHealth = { _, kind -> transportHealthFor(kind) },
     ): List<RelayAttemptCandidate> {
         val byId = manifestEndpoints.associateBy { it.id }
         val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
@@ -439,7 +472,11 @@ object AutoGatewaySelector {
                             // client never dials the exit directly, so there is no local
                             // TransportRegistry/TransportHealth entry for exitTransport to
                             // score against.
-                            transportHealth = transportHealthFor(ingressKind),
+                            // PR #58 field-test fix - scoped to THIS ingress endpoint's own
+                            // outcomes (see ingressTransportHealthFor's own docs above), never
+                            // the shared kind-wide bucket a Direct candidate's own failures
+                            // would otherwise poison.
+                            transportHealth = ingressTransportHealthFor(ingress.id, ingressKind),
                             history = historyFor(candidate.historyPathId, ingressKind),
                             // B23 - no per-candidate diversity reference exists here either,
                             // same deliberate omission [MainViewModel.reachabilityDiagnostics]
@@ -559,6 +596,9 @@ object AutoGatewaySelector {
         preference: UserTransportPreference = UserTransportPreference.Auto,
         nowEpochMillis: Long = Long.MAX_VALUE,
         restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
+        // PR #58 field-test fix - see buildRelayedCandidates' own docs on
+        // why this must be endpoint-scoped, never the shared transportHealthFor.
+        ingressTransportHealthFor: (EndpointId, TransportKind) -> TransportHealth = { _, kind -> transportHealthFor(kind) },
     ): List<AutoConnectAttempt> {
         val direct = buildCandidates(
             manifestEndpoints, gatewayFactsFor, provisioned, clientTunnelIp, registryFor,
@@ -567,7 +607,7 @@ object AutoGatewaySelector {
         )
         val relayed = buildRelayedCandidates(
             manifestEndpoints, registryFor, reachabilityFor, transportHealthFor, historyFor,
-            preference, nowEpochMillis,
+            preference, nowEpochMillis, ingressTransportHealthFor,
         )
         val directAllowed = restrictionClass != RestrictionClass.POSSIBLE_HARD_WHITELIST || relayed.isNotEmpty()
         val combined: List<AutoConnectAttempt> =
