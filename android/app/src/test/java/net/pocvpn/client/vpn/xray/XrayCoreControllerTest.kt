@@ -292,6 +292,98 @@ class XrayCoreControllerTest {
         assertEquals(XrayConfigRenderer.render(validProfile.toXrayVlessRealityConfig()), harness.coreRuntime.lastStartedConfigContent)
     }
 
+    // --- B33: local startLoop() success is NOT by itself sufficient - a real, bounded remote confirmation is required ---
+
+    @Test
+    fun `startLoop succeeding but the remote confirmation throwing is reported as RemoteUnconfirmed - never Started`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = java.io.IOException("connection refused"))
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart()
+
+        assertTrue("expected RemoteUnconfirmed, got $outcome", outcome is XrayCoreStartOutcome.RemoteUnconfirmed)
+        assertEquals(1, runtime.startLoopCallCount)
+        // The local loop DID start - proving this is genuinely a DIFFERENT,
+        // later failure than CoreStartFailed (startLoop itself never threw).
+    }
+
+    @Test
+    fun `a RemoteUnconfirmed outcome stops the loop and closes the tun - never left half-up`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = java.io.IOException("timeout"))
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        harness.controller.requestStart()
+
+        assertEquals(1, runtime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+    }
+
+    @Test
+    fun `a RemoteUnconfirmed outcome never blocks a subsequent real start - the lifecycle gate was never marked running`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = java.io.IOException("timeout"))
+        val harness = Harness(repository, coreRuntime = runtime)
+        val first = harness.controller.requestStart()
+        assertTrue(first is XrayCoreStartOutcome.RemoteUnconfirmed)
+
+        // A fresh attempt (e.g. the SAME candidate retried, or a different
+        // one) must be able to PROCEED - never permanently wedged as
+        // AlreadyRunning/StartInFlight by an attempt that never actually
+        // confirmed (the lifecycle gate must never have been marked running
+        // for the first, unconfirmed attempt).
+        val second = harness.controller.requestStart()
+
+        assertTrue("expected a genuine second attempt, got $second", second is XrayCoreStartOutcome.RemoteUnconfirmed)
+        assertEquals(2, runtime.startLoopCallCount)
+        assertEquals(2, runtime.stopLoopCallCount)
+    }
+
+    @Test
+    fun `a successful remote confirmation reports Started and dials the exact resolved server host`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, runtime.measureDelayCallCount)
+        assertEquals("https://${validProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+    }
+
+    @Test
+    fun `TLS_TCP remote confirmation dials the TLS profile's own resolved server host`() = runBlocking {
+        val tlsRepository = newTlsRepository()
+        tlsRepository.saveProfile(validTlsProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(newRepository(), coreRuntime = runtime, tlsRepository = tlsRepository)
+
+        val outcome = harness.controller.requestStart(TransportKind.TLS_TCP)
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals("https://${validTlsProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+    }
+
+    @Test
+    fun `RemoteUnconfirmed reason never carries the profile's secret field values`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = IllegalStateException("boom"))
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart() as XrayCoreStartOutcome.RemoteUnconfirmed
+
+        assertFalse(outcome.reason.contains(validProfile.uuid))
+        assertFalse(outcome.reason.contains(validProfile.realityPublicKey))
+        assertFalse(outcome.reason.contains(validProfile.shortId))
+    }
+
     @Test
     fun `TLS_TCP and REALITY share the same lifecycle gate - a second start while one is running is rejected`() = runBlocking {
         val repository = newRepository()

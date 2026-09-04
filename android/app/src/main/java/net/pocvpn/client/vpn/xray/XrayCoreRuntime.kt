@@ -29,6 +29,22 @@ interface XrayCoreRuntime {
 
     /** Mirrors CoreController.stopLoop(). Safe to call when not running (no-op). */
     fun stopLoop()
+
+    /**
+     * B33 - mirrors the pinned AAR's real `CoreController.measureDelay(url)`
+     * native method (see docs/B8K1A_TUN_SOCKET_PATH_AUDIT.md §7 for the
+     * verified exported API surface) - dials [url] through the JUST-STARTED
+     * core's own configured outbound/routing, exactly like v2rayNG's own
+     * "test configuration" feature. Returns the measured delay in
+     * milliseconds on success; throws on failure (connection refused, no
+     * handshake, timeout inside the native implementation, etc.) - never a
+     * negative/sentinel "ok" value. This is the ONE real, production-capable
+     * signal [XrayCoreController.requestStart] uses to confirm the tunnel is
+     * genuinely usable beyond local process startup - see that function's
+     * own docs.
+     */
+    @Throws(Exception::class)
+    fun measureDelay(url: String): Long
 }
 
 /**
@@ -74,6 +90,8 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
             controller.stopLoop()
         }
     }
+
+    override fun measureDelay(url: String): Long = controller.measureDelay(url)
 
     /**
      * This adapter shell does not yet surface core lifecycle events anywhere

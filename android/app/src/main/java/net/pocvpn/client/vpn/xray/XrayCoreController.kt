@@ -29,6 +29,21 @@ sealed class XrayCoreStartOutcome {
 
     /** startLoop() itself threw - the just-established tun is closed before returning. */
     data class CoreStartFailed(val reason: String) : XrayCoreStartOutcome()
+
+    /**
+     * B33 - startLoop() itself returned without throwing (the LOCAL core is
+     * genuinely running), but the bounded post-start remote/data-plane
+     * confirmation (see [XrayCoreController.requestStart]'s own docs) never
+     * proved the tunnel is actually usable - a real handshake/HTTP round
+     * trip through the just-established outbound never succeeded within the
+     * bound. Deliberately distinct from [CoreStartFailed] (that means the
+     * LOCAL startLoop() call itself threw - a different, earlier failure)
+     * - callers must never conflate "local process wouldn't even start" with
+     * "local process started but the remote gateway never confirmed". The
+     * loop is stopped and the tun closed before this is ever returned -
+     * never left half-up.
+     */
+    data class RemoteUnconfirmed(val reason: String) : XrayCoreStartOutcome()
 }
 
 /** Result of one [XrayCoreController.requestStop] call. */
@@ -70,7 +85,12 @@ class XrayCoreController(
 ) {
     private val lifecycleGate = XrayServiceLifecycleGate()
 
-    private class ReadyToStart(val plan: XrayVpnBuilderPlan, val renderedConfig: String)
+    // B33 - [serverHost] carries the exact plaintext destination host THIS
+    // attempt resolved (XrayVlessRealityConfig.server / XrayVlessTlsConfig.server -
+    // never re-derived from anywhere else) so the post-start confirmation
+    // probe below targets the SAME real gateway this attempt actually
+    // dials, never a different/fabricated address.
+    private class ReadyToStart(val plan: XrayVpnBuilderPlan, val renderedConfig: String, val serverHost: String)
 
     /**
      * [kind] defaults to [TransportKind.XRAY_REALITY] so every existing
@@ -105,14 +125,14 @@ class XrayCoreController(
                     when (val resolution = XrayRuntimeResolver.resolveTls(tlsRepo)) {
                         is XrayTlsRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
                         is XrayTlsRuntimeResolution.Ready ->
-                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig, resolution.config.server)
                     }
                 }
                 TransportKind.XRAY_REALITY -> {
                     when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                         is XrayRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
                         is XrayRuntimeResolution.Ready ->
-                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig)
+                            ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig, resolution.config.server)
                     }
                 }
                 else -> return XrayCoreStartOutcome.Rejected("unsupported transport kind for NovaXrayVpnService: $kind")
@@ -128,8 +148,30 @@ class XrayCoreController(
             return try {
                 ensureCoreEnvInitialized()
                 coreRuntime.startLoop(ready.renderedConfig, fd)
-                success = true
-                XrayCoreStartOutcome.Started
+                // B33 - startLoop() returning without throwing proves ONLY
+                // that the LOCAL core/tun exist - see confirmRemoteConnectivity's
+                // own docs for why that is never, by itself, sufficient
+                // evidence the tunnel is actually usable.
+                if (confirmRemoteConnectivity(ready.serverHost)) {
+                    success = true
+                    XrayCoreStartOutcome.Started
+                } else {
+                    // B33 - the local loop IS running (startLoop() did not
+                    // throw) but was never confirmed usable within the
+                    // bound - stop it and release the tun ourselves (never
+                    // left half-up): lifecycleGate.endStart(false) below
+                    // means tryBeginTeardown() will never fire for this
+                    // attempt (isRunning was never set true), so this is the
+                    // ONLY teardown this attempt will ever get.
+                    val stopReason = try {
+                        coreRuntime.stopLoop()
+                        null
+                    } catch (t: Throwable) {
+                        t.javaClass.simpleName
+                    }
+                    closeTun()
+                    XrayCoreStartOutcome.RemoteUnconfirmed(stopReason?.let { "remote handshake not confirmed (stopLoop also failed: $it)" } ?: "remote handshake not confirmed")
+                }
             } catch (t: Throwable) {
                 closeTun()
                 XrayCoreStartOutcome.CoreStartFailed(t.javaClass.simpleName)
@@ -137,6 +179,58 @@ class XrayCoreController(
         } finally {
             lifecycleGate.endStart(success)
         }
+    }
+
+    /**
+     * B33 - the ONE real, positive, production-capable confirmation that the
+     * just-started Xray tunnel is genuinely usable beyond local process
+     * startup: a bounded [XrayCoreRuntime.measureDelay] round trip through
+     * the JUST-STARTED core's own configured outbound/routing (the exact
+     * same real native primitive v2rayNG's own "test configuration" feature
+     * uses - see [XrayCoreRuntime.measureDelay]'s own docs), targeting THIS
+     * attempt's own real gateway's already-deployed, unauthenticated
+     * `/v1/manifest` endpoint on port 443 - never a third-party public-IP
+     * service (task's own explicit prohibition), never a fabricated/local
+     * check ("process alive"/"tun exists"), never a fixed sleep. Bounded by
+     * [REMOTE_CONFIRM_TIMEOUT_MS] via [withTimeoutOrNull] - a native call
+     * that never returns (blackholed connection) still lets THIS function,
+     * and therefore the whole connect attempt, proceed/fail on schedule,
+     * even though the abandoned native call itself may keep a background
+     * thread occupied briefly until its own eventual OS-level timeout (an
+     * accepted, bounded-from-the-caller's-perspective tradeoff - the
+     * underlying JNI call is not itself cancellable). Deliberately does NOT
+     * force its own `withContext(Dispatchers.IO)` - [NovaXrayVpnService]
+     * (the one production caller) already runs this whole call chain on
+     * `Dispatchers.IO`, and forcing a SECOND dispatcher hop here would fight
+     * `kotlinx-coroutines-test`'s virtual-time scheduler in
+     * [XrayCoreControllerTest]/[NovaXrayServiceLifecycleCoordinatorTest]
+     * (a real, confirmed regression this class's own tests caught before
+     * merge) for no real benefit - the caller's dispatcher choice is
+     * authoritative, exactly like every other suspend function on this
+     * class. Never leaks credentials - the probe URL carries only the
+     * plaintext server host this attempt already resolved, the same
+     * non-secret fact [XrayCoreStartOutcome]'s own docs already establish is
+     * safe to carry in a reason string.
+     */
+    private suspend fun confirmRemoteConnectivity(serverHost: String): Boolean =
+        kotlinx.coroutines.withTimeoutOrNull(REMOTE_CONFIRM_TIMEOUT_MS) {
+            try {
+                coreRuntime.measureDelay("https://$serverHost/v1/manifest")
+                true
+            } catch (t: Throwable) {
+                false
+            }
+        } ?: false
+
+    private companion object {
+        /**
+         * B33 - bounded independently of VpnController's own
+         * HANDSHAKE_TIMEOUT_MS (AWG's cheap local-stats poll budget - a
+         * different signal with a different cost shape, see that constant's
+         * own docs): a real network round trip needs its own, longer-tail-
+         * tolerant bound, but still bounded, never unbounded.
+         */
+        const val REMOTE_CONFIRM_TIMEOUT_MS = 6_000L
     }
 
     fun requestStop(): XrayCoreStopOutcome {

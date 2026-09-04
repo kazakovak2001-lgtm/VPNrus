@@ -192,6 +192,16 @@ class NovaXrayVpnService : VpnService() {
                     XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
+                is XrayCoreStartOutcome.RemoteUnconfirmed -> {
+                    // B33 - the local core genuinely started but the bounded
+                    // post-start remote/data-plane confirmation never
+                    // succeeded (see XrayCoreController.requestStart's own
+                    // docs) - a real, distinct terminal failure, never
+                    // reported as Started/Connected.
+                    Log.w(TAG, "Xray core started locally but remote connectivity never confirmed: ${outcome.reason}")
+                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    stopSelf()
+                }
                 is XrayCoreStartOutcome.Started -> {
                     Log.i(TAG, "Xray core started")
                     // B8I7 - the ONE real, positive confirmation

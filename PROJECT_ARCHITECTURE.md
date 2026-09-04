@@ -376,6 +376,66 @@ NetworkProfiler
   selection). A response matching no known gateway, or a DIFFERENT gateway than the
   one requested, is rejected outright - never accepted-but-ignored.
 
+## Xray/TLS Connected confirmation (hard invariant, B33)
+
+A real physical Oppo CPH2173 test (client's ordinary DIRECT ports
+deliberately blocked server-side) found the app reporting Protected/Connected
+for an XRAY_REALITY session whose real remote handshake never completed -
+`NovaXrayVpnService`'s local `coreRuntime.startLoop(...)` returning without
+throwing was, by itself, being treated as sufficient proof of a healthy
+tunnel. It is not: `startLoop()` only proves the LOCAL core/tun exist: real
+HTTPS/DNS through the tunnel timed out the entire time, and the combined Auto
+sequence never advanced past the falsely-"successful" attempt.
+
+- **Local process start != healthy connection.** `XrayCoreController.requestStart`
+  now runs a bounded, real, positive confirmation
+  (`confirmRemoteConnectivity`, `REMOTE_CONFIRM_TIMEOUT_MS = 6s`) AFTER
+  `coreRuntime.startLoop(...)` succeeds and BEFORE ever returning
+  `XrayCoreStartOutcome.Started` - a real `measureDelay(url)` round trip
+  (the pinned AndroidLibXrayLite AAR's own native `CoreController.measureDelay`,
+  the exact primitive v2rayNG's own "test configuration" feature uses -
+  see `XrayCoreRuntime.measureDelay`'s own docs) through the JUST-STARTED
+  core's own configured outbound/routing, targeting THIS attempt's own real
+  gateway's already-deployed, unauthenticated `/v1/manifest` endpoint on port
+  443 - never a third-party public-IP service, never "process alive"/"tun
+  exists", never a fixed sleep, never a debug-only signal. On failure, the
+  loop is stopped and the tun released BEFORE returning
+  `XrayCoreStartOutcome.RemoteUnconfirmed(reason)` - a genuinely distinct
+  outcome from `CoreStartFailed` (that means `startLoop()` itself threw, an
+  earlier failure) - never left half-up, and the lifecycle gate is never
+  marked running for an unconfirmed attempt (a fresh retry can always
+  proceed). `NovaXrayVpnService` publishes the SAME `XrayRuntimeEvent.Failed`
+  either way, so `VlessRealityTransport`/`VlessTlsTransport`'s own
+  `xrayTransportStateFor` mapping (unchanged) only ever reports
+  `TransportState.Connected` after this real confirmation.
+- **Auto-progression fix, the other half of the same bug**: even with the
+  above, a real terminal Xray failure only arrives asynchronously (via
+  `XrayRuntimeState` -> the transport's own `observeState()`), well after
+  `VpnController.doConnectAttempt`'s Xray branch has already returned - the
+  SAME branch, unchanged, still trusts whatever state the transport
+  genuinely reports rather than fabricating one (see that branch's own
+  docs). `VpnController.switchActiveTransport`'s existing active-transport
+  collector now records `VpnError.HandshakeTimeout` - the SAME typed
+  category `AutoGatewayFailoverPolicy.isEligibleForNextCandidate` already
+  treats as eligible for AWG - the instant it observes a
+  `TransportState.Error` from an XRAY_REALITY/TLS_TCP transport, BEFORE
+  `setState` runs, so a concurrently-attached `armFailoverWatch` always sees
+  the correct typed error already in place. AWG's own `HandshakeFailed`
+  recording (`doConnectAttempt`'s own `awaitFreshHandshake` branch) is
+  completely unaffected - this only ever fires for an XRAY_REALITY/TLS_TCP
+  transport's own `Error` state. No relay/CHAIN_DIRECT-specific code exists
+  anywhere in this fix - health code only ever reports a failure;
+  `attemptCombined`/`AutoGatewaySelector` remain the sole authority deciding
+  what is tried next (never called directly from here).
+- **What did NOT change**: `awaitFreshHandshake`/`HANDSHAKE_TIMEOUT_MS`
+  (AWG's own cheap local-stats poll, a different signal with a different
+  cost shape) is untouched - Xray's confirmation is a one-shot bounded probe
+  inside `XrayCoreController`, not a repeated poll, since a real network
+  round trip is far more expensive than AWG's local counter read.
+  `handleNetworkLost`/B30B reconnect semantics, `xrayTransportStateFor`'s
+  `Started`/`Stopped` mappings, and every AWG connect/handshake/reconnect
+  path are all byte-for-byte unchanged.
+
 ## Control-plane vs data-plane
 
 - `gateway/api/*.py` (`pocvpn-api`) is fully env-var-driven per instance - zero
