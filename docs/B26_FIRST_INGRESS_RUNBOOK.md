@@ -30,11 +30,22 @@ systemd units - nothing is started yet.
 
 ## 3. Configure ingress secrets
 
+Step 2's `install-ingress-role.sh` already fetched and verified the pinned
+xray-core binary at `/opt/pocvpn/xray/<XRAY_CORE_TAG>/xray` (see
+`gateway/xray/VERSION`/`fetch-xray-server.sh`) - never a manual symlink to
+whatever `xray` a host happens to already have installed for an unrelated
+role.
+
 ```bash
-# REALITY keypair for this ingress's own client-facing inbound:
-/opt/pocvpn/xray/v26.7.28/xray x25519   # prints a private/public pair
-# write the PRIVATE half only:
-sudo install -o root -g root -m 0600 /dev/stdin /etc/pocvpn/ingress/reality-private-key.txt <<< '<private key>'
+# REALITY keypair for this ingress's own client-facing inbound (use the
+# EXACT path fetch-xray-server.sh reported, matching gateway/xray/VERSION's
+# current XRAY_CORE_TAG):
+/opt/pocvpn/xray/*/xray x25519   # prints a private/public pair
+# write the PRIVATE half only - owned by pocvpn-api (this process, not
+# root, is what actually reads it at activation time) and mode 0600
+# (B31A: ingress_preflight.py requires STRICT 0600, not merely
+# group-readable - see that check's own docs):
+sudo install -o pocvpn-api -g pocvpn-api -m 0600 /dev/stdin /etc/pocvpn/ingress/reality-private-key.txt <<< '<private key>'
 ```
 
 Edit `/etc/pocvpn/ingress.env`: fill in `NOVA_INGRESS_ENDPOINT_ID`,
@@ -57,10 +68,20 @@ python3 gateway/tools/provision_relay_upstream_identity.py \
 
 Transfer (scp over an already-authenticated channel, never email/chat/PR):
 - `/tmp/upstream-relay-uuid.txt` -> the ingress host, at the path
-  `NOVA_INGRESS_UPSTREAM_UUID_FILE` names (0600 root:root);
+  `NOVA_INGRESS_UPSTREAM_UUID_FILE` names (0600, owned by `pocvpn-api` -
+  same B31A convention as step 3's REALITY private key: this process
+  itself reads the file, so it must be the file's own OWNER, not merely
+  in its group);
 - `/tmp/probe-hmac-secret.txt` -> the ingress host, at the path
-  `NOVA_INGRESS_PROBE_HMAC_SECRET_FILE` names (0600 root:root);
+  `NOVA_INGRESS_PROBE_HMAC_SECRET_FILE` names (same 0600 `pocvpn-api`-owned
+  convention);
 - `/tmp/exit-fragment.json` -> the EXIT operator (out of band).
+
+```bash
+# on the ingress host, after transferring both files above:
+sudo chown pocvpn-api:pocvpn-api /etc/pocvpn/ingress/upstream-relay-uuid.txt /etc/pocvpn/ingress/probe-hmac-secret.txt
+sudo chmod 0600 /etc/pocvpn/ingress/upstream-relay-uuid.txt /etc/pocvpn/ingress/probe-hmac-secret.txt
+```
 
 Fill in `NOVA_INGRESS_UPSTREAM_HOST`/`PORT`/`TRANSPORT`/`SERVER_NAME`/
 `PUBLIC_KEY`/`SHORT_ID` (the pinned EXIT's own real REALITY facts) and
@@ -84,12 +105,27 @@ is never performed by the ingress host or automated by this repository.
 
 ## 6. Start the ingress
 
+B31A: every durable store/lock below is initialized AS THE `pocvpn-api`
+USER (`sudo -u pocvpn-api`), never plain root - a store/lock file created
+by root cannot be written by the `pocvpn-api-ingress` service itself
+afterward (found live on the first real deployment: this is exactly what
+left the durable state directories unwritable even after
+`install-ingress-role.sh`'s own directory-level `chown`, until every file
+inside them was individually re-owned by hand). This also includes the
+GLOBAL activation lock (`NOVA_INGRESS_ACTIVATION_GLOBAL_LOCK_PATH`) - a
+step this runbook previously omitted entirely, which fails the very first
+real `/v1/ingress-profile` request with "activation lock not found - run
+'init' first" until created.
+
 ```bash
-# on the ingress host, still as operator/root:
-python3 gateway/tools/activation_tokens.py --store <NOVA_INGRESS_ACTIVATION_STORE_PATH> \
+# on the ingress host, as operator/root, using sudo -u for each actual
+# store/lock file so pocvpn-api ends up owning every one of them:
+sudo -u pocvpn-api python3 gateway/tools/activation_tokens.py --store <NOVA_INGRESS_ACTIVATION_STORE_PATH> \
     --lock <NOVA_INGRESS_ACTIVATION_LOCK_PATH> init
-cd /opt/pocvpn/gateway && python3 -c \
+cd /opt/pocvpn/gateway && sudo -u pocvpn-api python3 -c \
     "from api import xray_provisioning; xray_provisioning.init_store('<NOVA_INGRESS_XRAY_STORE_PATH>', '<NOVA_INGRESS_XRAY_LOCK_PATH>')"
+cd /opt/pocvpn/gateway && sudo -u pocvpn-api python3 -c \
+    "from api import xray_activation; xray_activation.init_activation_lock('<NOVA_INGRESS_ACTIVATION_GLOBAL_LOCK_PATH>')"
 python3 gateway/tools/ingress_preflight.py --env-file /etc/pocvpn/ingress.env   # must PASS
 sudo systemctl enable --now pocvpn-api-ingress.service
 python3 gateway/tools/ingress_reconcile.py --env-file /etc/pocvpn/ingress.env  # first real activation, starts nova-xray-ingress.service
