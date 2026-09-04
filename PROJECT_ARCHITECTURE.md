@@ -423,10 +423,13 @@ sequence never advanced past the falsely-"successful" attempt.
   the correct typed error already in place. AWG's own `HandshakeFailed`
   recording (`doConnectAttempt`'s own `awaitFreshHandshake` branch) is
   completely unaffected - this only ever fires for an XRAY_REALITY/TLS_TCP
-  transport's own `Error` state. No relay/CHAIN_DIRECT-specific code exists
-  anywhere in this fix - health code only ever reports a failure;
-  `attemptCombined`/`AutoGatewaySelector` remain the sole authority deciding
-  what is tried next (never called directly from here).
+  transport's own `Error` state. At the time of this original fix, no relay/
+  CHAIN_DIRECT-specific code existed anywhere in it - health code only ever
+  reported a failure; `attemptCombined`/`AutoGatewaySelector` remained the
+  sole authority deciding what is tried next (never called directly from
+  here). **This is no longer true for the confirmation step itself - see the
+  "B33 relay follow-up" subsection below, which found that same generic
+  probe target unsound specifically for a Relayed attempt.**
 - **What did NOT change**: `awaitFreshHandshake`/`HANDSHAKE_TIMEOUT_MS`
   (AWG's own cheap local-stats poll, a different signal with a different
   cost shape) is untouched - Xray's confirmation is a one-shot bounded probe
@@ -483,6 +486,66 @@ sequence never advanced past the falsely-"successful" attempt.
   performs genuine TLS verification with no `-k`/bypass required on either
   host, so a healthy tunnel cannot be mistaken for a broken one due to a
   hostname/certificate mismatch.
+
+### B33 relay follow-up: the generic probe target is unsound for Relayed attempts
+
+A real physical combined-PR pre-merge integration test (PR #55 + PR #53,
+Stockholm relay black-hole scenario) proved the CHAIN_DIRECT relay tunnel
+genuinely worked end to end (real DNS/HTTPS traffic confirmed server-side in
+the ingress's own access log, under the activated device identity) while the
+ORIGINAL B33 confirmation above kept reporting `RemoteUnconfirmed` for it and
+tearing the working tunnel down every attempt.
+
+- **Root cause (proved from the deployed rendered config, not guessed).**
+  The client's rendered Xray config has exactly one outbound and no routing
+  rules (`XrayConfigRenderer`), so `confirmRemoteConnectivity`'s generic
+  `/v1/manifest` probe against `resolution.config.server` is dialed through
+  that one outbound regardless of destination - for a Relayed attempt, that
+  outbound IS the ingress. The ingress's own server-side routing (read
+  directly from the deployed `/etc/nova-xray-ingress/config.json`) has
+  exactly one rule: every destination from the client inbound is
+  unconditionally forwarded to its fixed relay-upstream hop, with no
+  exception for the ingress's own address. So the probe never tests "is the
+  client<->ingress hop alive" - it accidentally asks the exit hop to dial
+  back to the ingress's own control-plane over the public internet, a
+  fragile, self-referential detour unrelated to genuine relay health.
+- **Fix: a context-aware confirmation strategy, not a second health
+  authority.** `XrayCoreController.requestStart` now takes a
+  `RemoteConfirmationContext` (`Direct`/`Relayed(confirm: suspend () ->
+  Boolean)`), defaulting to `Direct` so every pre-existing call site is
+  byte-for-byte unaffected. `XrayCoreController` itself stays free of any
+  `relay`-package dependency and never hardcodes an ingress id - it only
+  ever executes whichever action the caller supplies.
+- **Threading, reusing the existing endpointId/routingMode extra pattern.**
+  `VpnController`'s existing `VpnAttemptContext.Relayed` (already pinned per
+  attempt) now also sets `TransportConfig.Xray/XrayTls.isRelayed`, threaded
+  through `VlessRealityTransport`/`VlessTlsTransport` into a new
+  `NovaXrayVpnService.EXTRA_IS_RELAYED` Intent extra - the exact same
+  mechanism `EXTRA_ENDPOINT_ID`/`EXTRA_ROUTING_MODE` already use.
+- **The real Relayed confirmation action reuses the existing
+  `HttpRelayEndToEndProbe` - never a fabricated/local check.**
+  `NovaXrayVpnService` loads the already-persisted `IngressClientProfile`
+  for the attempt's endpoint (the SAME `IngressProfileStore`
+  `RelayIngressResolverImpl` already matched moments earlier) and probes it
+  via a new `HttpRelayEndToEndProbe.probeProfile(profile)` - the narrower
+  half of the SAME `probe(plan, profile)` method `armFailoverWatch` already
+  calls later (after `Connected`) for the fuller, plan-scoped end-to-end
+  proof; both share one HTTP-calling implementation. `probeProfile` skips
+  only the `historyPathId` echo check (no `RelayedExecutionPlan` is in scope
+  yet at this earlier layer) - it is still the SAME real, bearer-
+  authenticated HTTPS round trip through client -> ingress -> exit, never a
+  "TCP/Reality handshake accepted == healthy" shortcut. No persisted profile
+  for the endpoint (should not happen - the attempt was only marked relayed
+  because a profile already resolved successfully moments earlier) fails
+  closed immediately, the same shape `NotConfiguredRelayEndToEndProbe`
+  already uses.
+- **What did NOT change.** Direct's own confirmation (the generic
+  `/v1/manifest` round trip above) is byte-for-byte unchanged.
+  `armFailoverWatch`'s later, plan-scoped `HttpRelayEndToEndProbe.probe()`
+  call is unchanged - still the sole authority for
+  `RelayAttemptOutcome.Success`/`RelayReadinessStage.END_TO_END_DATA_PLANE_OK`.
+  `PathScorer`, `AutoGatewaySelector`, attempt budgets, B34 fairness/
+  advancement, and AWG are all untouched.
 
 ## Control-plane vs data-plane
 
