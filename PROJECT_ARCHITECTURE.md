@@ -642,6 +642,70 @@ ingress / Frankfurt exit pair (2026-09-04)** - not guessed:
   fix does not weaken the resolver-agnostic safety net the B25 tests
   originally established.
 
+### B33 relay follow-up, round 3 - stale-Protected relay failure (post-Connected health watchdog)
+
+A further physical test proved a SEPARATE defect from rounds 1/2, on top of
+the round-2 fix: a genuinely healthy CHAIN_DIRECT session (Android ->
+Stockholm ingress `16.170.208.231:2093` -> Germany exit `152.70.43.1`, real
+Protected/HTTPS/DNS) had ONLY its relay-upstream link (Stockholm -> Germany)
+black-holed server-side. For 6+ minutes: the client<->ingress link stayed
+healthy (`ss -tno` showed zero failed keepalive probes to `:2093`), the data
+plane was genuinely dead (`HTTP=000`), `tun0` stayed up, Xray kept running,
+and the UI stayed falsely `Protected` - no detection, no teardown, no
+recovery, confirmed via direct on-device observation (screenshots + `adb
+shell`), not inferred.
+
+- **Root cause**: `MainViewModel.armFailoverWatch` cancels its own
+  `controller.state` observer the moment a Relayed attempt first reaches
+  genuine success (see that function's own docs) - a deliberate one-shot
+  design for the CONNECT-time decision, never intended as ongoing health
+  monitoring. `VpnController.handleNetworkLost`/`reconnectLoop` only fire on
+  an OS-level network-loss callback, never on a data-plane failure with the
+  underlying network (and the client<->ingress link) still healthy - exactly
+  this scenario. No other mechanism in the codebase re-checks a relayed
+  session's data-plane health after Connected.
+- **Fix: a bounded post-Connected relay-health watchdog, owned by
+  `XrayCoreController`** (`startRelayHealthWatchdog`) - started only for a
+  genuinely Connected `RemoteConfirmationContext.Relayed` session (never
+  Direct, never AWG - AWG has no code path through this class at all).
+  Reuses the EXACT SAME Xray-native EXIT-manifest primitive round 2 already
+  proved safe (`boundedMeasureDelay`, extracted from `confirmRemoteConnectivity`
+  so both share one implementation) - never the out-of-band Nova-process
+  `HttpURLConnection` check. Polls every `RELAY_HEALTH_PROBE_INTERVAL_MS`
+  (20s - no existing "ongoing session health" cadence constant was found to
+  reuse; `ReconnectManager`'s backoff and `VpnController.HANDSHAKE_TIMEOUT_MS`
+  both govern different concerns, see that constant's own docs). A single
+  transient miss is never terminal - only `RELAY_HEALTH_FAILURE_THRESHOLD`
+  (2) *consecutive* failures (reset by any intervening success) declare the
+  session unhealthy.
+- **Teardown ordering closes the "ownerless tun" risk by construction, not a
+  new ack primitive.** On reaching the threshold, the watchdog calls
+  `requestStop()` - the SAME real, `XrayServiceLifecycleGate`-serialized
+  teardown `ACTION_STOP`/disconnect already uses - SYNCHRONOUSLY on its own
+  coroutine and awaits it to completion BEFORE invoking the caller's
+  `onRelayHealthLost` callback. `NovaXrayVpnService` wires that callback to
+  the SAME `XrayRuntimeEvent.Failed` + `stopSelf()` shape every other Xray
+  failure already uses, so `VlessRealityTransport`/`VlessTlsTransport`'s
+  existing `observeState()` mapping (never a new one) carries it into
+  `TransportState.Error` - `VpnController.switchActiveTransport`'s existing
+  collector records `VpnError.HandshakeTimeout` and updates `_state`, moving
+  the UI off `Protected` - through machinery that already existed, wired to
+  a new trigger.
+- **Lifecycle**: cancelled by `requestStop()` (covers explicit disconnect,
+  and an endpoint switch - `NovaXrayServiceLifecycleCoordinator.selectControllerLocked`
+  already tears down the OLD endpoint's controller before building a new
+  one) and defensively at the top of every `requestStart()`. Never keyed on
+  a separately-tracked session id - `relayHealthWatchdogJob` is this
+  controller's own single field, and `lifecycleGate` guarantees only one
+  session is ever active at a time, so a stale watchdog cannot outlive into
+  a later, different session by construction.
+- **Known, explicitly out-of-scope boundary**: this fix makes the app
+  correctly LEAVE `Protected` and fully tear down on a relay-upstream
+  failure - it does NOT re-attempt a different candidate automatically
+  (`PathScorer`/`AutoGatewaySelector`/`MAX_ATTEMPTS`/`attemptCombined` are
+  untouched, per this follow-up's own scope). A user must reconnect
+  manually after this failure, same as any other terminal Xray error today.
+
 ## Control-plane vs data-plane
 
 - `gateway/api/*.py` (`pocvpn-api`) is fully env-var-driven per instance - zero
