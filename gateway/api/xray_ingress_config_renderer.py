@@ -33,6 +33,13 @@ from . import xray_config_renderer as base
 _SUPPORTED_UPSTREAM_TRANSPORTS = ("reality", "tls")
 _REALITY_PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
+# B31C - same pinned constant as ingress_config.py's own
+# _SUPPORTED_UPSTREAM_FLOWS (that module's docstring has the full "why") -
+# duplicated here deliberately: this renderer is called directly by tests
+# and any future caller with an UpstreamExitConfig built by hand, not only
+# via ingress_config.load_ingress_config, so an invalid flow must fail
+# closed at render time too, not only at config-load time.
+_SUPPORTED_UPSTREAM_FLOWS = ("xtls-rprx-vision",)
 
 
 class IngressConfigRenderError(Exception):
@@ -105,9 +112,26 @@ def _validate_upstream(upstream):
             raise IngressConfigRenderError("REALITY upstream public_key is not a well-formed X25519 base64url key")
         if not upstream.short_id or not _SHORT_ID_RE.match(upstream.short_id) or len(upstream.short_id) % 2 != 0:
             raise IngressConfigRenderError("REALITY upstream short_id is malformed")
+        # B31C - a REALITY relay upstream's flow is REQUIRED here too, not
+        # merely validated-if-present: this renderer is called directly by
+        # callers that build an UpstreamExitConfig by hand (tests, or any
+        # future caller), not only via ingress_config.load_ingress_config's
+        # own now-required check - a blank flow must fail closed at BOTH
+        # layers, the same "no layer alone is trusted" discipline this
+        # function already applies to public_key/short_id above. The live
+        # failure this whole change closes was exactly a blank flow that
+        # rendered "successfully".
+        if not upstream.flow or upstream.flow not in _SUPPORTED_UPSTREAM_FLOWS:
+            raise IngressConfigRenderError(
+                f"REALITY upstream flow must be one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream.flow!r}"
+            )
     else:  # tls
         if not upstream.sni:
             raise IngressConfigRenderError("TLS upstream requires sni")
+        if upstream.flow and upstream.flow not in _SUPPORTED_UPSTREAM_FLOWS:
+            raise IngressConfigRenderError(
+                f"upstream flow must be blank or one of {_SUPPORTED_UPSTREAM_FLOWS}: {upstream.flow!r}"
+            )
 
 
 def _render_upstream_outbound(upstream):
