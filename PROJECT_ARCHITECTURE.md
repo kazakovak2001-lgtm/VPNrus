@@ -906,6 +906,58 @@ restrictive-network/Russia whitelist bypass remains **UNVERIFIED**.
   `connectAuto()`/`attemptAutoCandidate()`) is unchanged - only the
   `historyFor` callback's parameter type widened (`EndpointId` -> `String`),
   every call site still passes the identical value for a Direct candidate.
+- **B32 - the real production Stockholm-ingress DATA (`ProductionIngressEndpoints`,
+  B31) is now genuinely fed into this SAME `connectAuto()`/`buildCombinedAttempts`
+  ranking flow, closing the "not yet consumed" gap every note above still
+  described.** `MainViewModel.mergedIngressAwareEndpoints` (`internal`, same
+  testability pattern as `buildTransportRegistry`) is the ONE seam: it unions
+  the trusted manifest's own endpoints with `ProductionIngressEndpoints.all`,
+  keyed by endpoint id, and is called exactly once, inside
+  `buildCombinedAutoRankingSnapshot` (the function `connectAuto()` itself
+  already called pre-B32) - never a second/parallel discovery path.
+  Precedence: a manifest-named id always wins over the hardcoded fallback
+  sharing that id (the fallback only ever supplements an id the manifest does
+  not name yet) - a future signed manifest naming the ingress itself
+  supersedes this fallback with zero code change. Filtering by id also makes
+  a duplicate endpoint id structurally impossible in the merged list.
+  `buildAutoGatewayCandidates` (the Direct-only pipeline `AutoGatewayDiagnostics`
+  reads) is deliberately NOT touched - it stays exactly as it was pre-B32.
+  **Registry-eligibility fix, required for the merged candidate to ever
+  survive `PathScorer.isEligible` at all**: `buildTransportRegistry(endpointId)`
+  previously gated XRAY_REALITY/TLS_TCP availability on `isXrayAvailableFor`/
+  `isXrayTlsAvailableFor` UNCONDITIONALLY - a per-GATEWAY-endpoint "has this
+  device's Direct profile been provisioned" flag that has no real meaning for
+  an INGRESS endpoint (no `ProductionGatewayCatalog` entry, hence no Direct
+  profile concept at all). Left unfixed, `ProductionIngressEndpoints.STOCKHOLM`
+  would have been merged into the endpoint list but PERMANENTLY ineligible
+  (`Reason.TRANSPORT_NOT_IMPLEMENTED`) on every real device, since no
+  per-device Xray profile is ever registered under the ingress's own distinct
+  endpoint id. Fixed narrowly: for any endpoint id NOT present in
+  `ProductionGatewayCatalog.all` (i.e. never a real GATEWAY id, only ever a
+  relay-only INGRESS/EXIT the manifest names), the corresponding transport is
+  registered AVAILABLE whenever the transport instance itself is wired
+  (`xrayTransport`/`xrayTlsTransport != null`), independent of
+  `isXrayAvailableFor`. This only asserts "this device can technically speak
+  the protocol" - it is NOT a credential/trust decision and cannot make an
+  unprovisioned relay connect: `NotProvisionedRelayIngressResolver` (the only
+  resolver wired into production today) still fails closed with the typed
+  `EXECUTION_NOT_IMPLEMENTED` category for every relay plan regardless,
+  exactly as it did before this change. Every GATEWAY endpoint id
+  (Germany's/Stockholm's own) is completely unaffected - still gated by
+  `isXrayAvailableFor`/`isXrayTlsAvailableFor` exactly as before B32.
+  **What did NOT change**: `RelayIngressResolver`/`RelayedExecutionPlan`/
+  `attemptRelayedAttempt` (all B24/B25) are untouched - a Relayed winner still
+  converges into the exact same execution boundary described above. On a real
+  device this means: the Stockholm CHAIN_DIRECT candidate now genuinely
+  exists, is genuinely ranked, and CAN win `attemptCombined()` - but resolving
+  it still terminates at `NotProvisioned(EXECUTION_NOT_IMPLEMENTED)` today (no
+  real per-device ingress credential is provisioned anywhere), so the combined
+  budget advances to the next-ranked candidate exactly like any other
+  unprovisioned attempt. Real Russia/restricted-network whitelist bypass
+  remains **UNVERIFIED** - this closes the discovery/ranking/execution-seam
+  gap only, not the separate "no real ingress activation exists yet" gap B24/
+  B25 already named. `sessions=[]` in a support export remains a physical
+  retest finding, not something this change altered diagnostics to address.
 
 ## Real Ingress Runtime / Server-Side Relay Execution Foundation (B24) - FOUNDATION
 

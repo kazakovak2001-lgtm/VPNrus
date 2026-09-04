@@ -1005,9 +1005,35 @@ class MainViewModel(
         val descriptors = mutableListOf(
             TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport }),
         )
+        // B32 - a RELAY-ONLY endpoint (an INGRESS such as
+        // ProductionIngressEndpoints.STOCKHOLM, or any future manifest-named
+        // one) has no ProductionGatewayCatalog entry and therefore no
+        // per-device Direct Xray PROFILE to gate on: isXrayAvailableFor's
+        // own per-endpoint semantics exist to answer "has a real Direct
+        // profile been provisioned for THIS gateway" (B8O2's own "one
+        // endpoint's profile can never make a different endpoint appear
+        // available" invariant) - a question with no meaning for an
+        // ingress, whose real per-device credential gating is
+        // RelayIngressResolver's own job downstream (IngressClientProfile
+        // matching - see that resolver's own docs), never this registry.
+        // Registering the transport as AVAILABLE here for a non-gateway
+        // endpoint id only asserts "this device can technically SPEAK this
+        // protocol at all" - it does NOT claim a real relay credential
+        // exists, so it cannot make an unprovisioned relay connect:
+        // NotProvisionedRelayIngressResolver (the only resolver wired into
+        // production today) still fails closed with EXECUTION_NOT_IMPLEMENTED
+        // for every relay plan regardless of this flag. Without this, a
+        // real ingress candidate could never even become ELIGIBLE for
+        // ranking (PathScorer.isEligible's TRANSPORT_NOT_IMPLEMENTED check),
+        // so buildRelayedCandidates would silently never rank it - never
+        // scored, never attempted, never diagnosable - defeating B32's own
+        // wiring fix before it could take effect. Every pre-B32 GATEWAY
+        // endpoint id (Germany/Stockholm's own) is completely unaffected -
+        // still gated by isXrayAvailableFor exactly as before.
+        val isKnownGatewayEndpoint = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.any { it.endpointId == endpointId }
         val xray = xrayTransport
         if (xray != null) {
-            val available = isXrayAvailableFor(endpointId)
+            val available = if (isKnownGatewayEndpoint) isXrayAvailableFor(endpointId) else true
             descriptors += TransportDescriptor(
                 kind = xray.kind,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
@@ -1024,7 +1050,8 @@ class MainViewModel(
         // failover decision - see docs/ROADMAP.md's own safety-boundary note.
         val xrayTls = xrayTlsTransport
         if (xrayTls != null) {
-            val available = isXrayTlsAvailableFor(endpointId)
+            // B32 - same non-gateway-endpoint reasoning as XRAY_REALITY above.
+            val available = if (isKnownGatewayEndpoint) isXrayTlsAvailableFor(endpointId) else true
             descriptors += TransportDescriptor(
                 kind = xrayTls.kind,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
@@ -2726,6 +2753,32 @@ class MainViewModel(
      * [net.pocvpn.client.smartconnect.RestrictionStabilizer] promotion and
      * silently disagree.
      */
+    /**
+     * B32 - the narrowest seam that feeds [ProductionIngressEndpoints]'
+     * real Stockholm-ingress topology into the SAME combined ranking
+     * [buildCombinedAutoRankingSnapshot] already builds for
+     * [connectAuto()] - not a second/parallel discovery path.
+     *
+     * Precedence rule (task requirement, matches this file's own existing
+     * fact-tier discipline - see [buildCombinedAutoRankingSnapshot]'s own
+     * docs on manifest-vs-catalog authority): a signed-manifest endpoint id
+     * is ALWAYS authoritative over the hardcoded fallback catalog entry
+     * sharing that id - the fallback only ever SUPPLEMENTS an id the
+     * manifest does not name yet. Once a real signed manifest ever names
+     * `stockholm-ingress-1` itself (the manifest-signing key ceremony
+     * extended to cover ingress topology - a distinct, future, operator-only
+     * action), that entry silently supersedes this fallback with zero code
+     * change here. Filtering by id also means this can never produce a
+     * duplicate endpoint id in the merged list, so [AutoGatewaySelector]
+     * (which has no id-dedup logic of its own) never sees two descriptors
+     * for the same id.
+     */
+    internal fun mergedIngressAwareEndpoints(manifestEndpoints: List<net.pocvpn.client.reachability.EndpointDescriptor>): List<net.pocvpn.client.reachability.EndpointDescriptor> {
+        val manifestIds = manifestEndpoints.mapTo(HashSet()) { it.id }
+        val fallbackIngress = net.pocvpn.client.smartconnect.ProductionIngressEndpoints.all.filter { it.id !in manifestIds }
+        return manifestEndpoints + fallbackIngress
+    }
+
     private fun buildCombinedAutoRankingSnapshot(): CombinedAutoRankingSnapshot {
         val now = System.currentTimeMillis()
         val profile = networkProfile.value
@@ -2745,7 +2798,11 @@ class MainViewModel(
             )
         }
         val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
-        val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
+        // B32 - [mergedIngressAwareEndpoints] is the ONLY difference from
+        // pre-B32: every other accessor below is byte-for-byte identical to
+        // [buildAutoGatewayCandidates] (which stays Direct-only and
+        // intentionally untouched - see that function's own docs).
+        val manifestEndpoints = mergedIngressAwareEndpoints(manifestRepository?.trusted()?.endpoints.orEmpty())
         val attempts = net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
             manifestEndpoints = manifestEndpoints,
             gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
