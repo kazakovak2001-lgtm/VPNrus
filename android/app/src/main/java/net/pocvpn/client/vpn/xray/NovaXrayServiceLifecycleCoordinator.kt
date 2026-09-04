@@ -66,13 +66,18 @@ class NovaXrayServiceLifecycleCoordinator(
     // [RemoteConfirmationContext.Direct], same reasoning -
     // every pre-existing caller is byte-for-byte unaffected; NovaXrayVpnService
     // is the one real caller that supplies a Relayed value.
+    // B33 relay follow-up (round 3) - [onRelayHealthLost] threaded straight
+    // through to XrayCoreController.requestStart's own param of the same
+    // name (see that function's own docs) - defaults to a no-op so every
+    // pre-existing caller is byte-for-byte unaffected.
     suspend fun start(
         endpointId: EndpointId,
         kind: TransportKind,
         routingMode: RoutingMode = RoutingMode.FULL_VPN,
         confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
+        onRelayHealthLost: suspend () -> Unit = {},
     ): XrayCoreStartOutcome = mutex.withLock {
-        selectControllerLocked(endpointId).requestStart(kind, routingMode, confirmationContext)
+        selectControllerLocked(endpointId).requestStart(kind, routingMode, confirmationContext, onRelayHealthLost)
     }
 
     /**

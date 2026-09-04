@@ -501,6 +501,13 @@ class XrayCoreControllerTest {
             "must never dial the client's own INGRESS dial target for a Relayed attempt (the round-1 self-referential-ingress bug)",
             runtime.lastMeasureDelayUrl != "https://${validProfile.server}/v1/manifest",
         )
+        // B33 relay follow-up (round 3) - a genuine Relayed Started outcome
+        // starts a real, independent, Dispatchers.IO-backed relay-health
+        // watchdog job (this Harness never injects a test probeScope) -
+        // stop it explicitly rather than leaking a real background
+        // coroutine past this test's own lifetime.
+        harness.controller.requestStop()
+        Unit
     }
 
     @Test
