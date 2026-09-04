@@ -212,6 +212,15 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         // .Relayed's own docs.
         assertEquals(1, runtime.measureDelayCallCount)
         assertEquals("https://203.0.113.60/v1/manifest", runtime.lastMeasureDelayUrl)
+        // B33 relay follow-up (round 3) - a genuine Relayed Started outcome
+        // now also starts XrayCoreController's own post-Connected relay-
+        // health watchdog on this SAME TestScope (probeScope = this) - an
+        // infinite loop by design (see startRelayHealthWatchdog's own docs)
+        // that runTest would otherwise flag as an uncompleted coroutine.
+        // stop() cancels it (real production teardown path), same as any
+        // other real session end.
+        coordinator.stop()
+        Unit
     }
 
     @Test

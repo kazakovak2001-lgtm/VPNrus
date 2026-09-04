@@ -3,7 +3,10 @@ package net.pocvpn.client.vpn.xray
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.identity.XrayProfileRepository
@@ -227,16 +230,50 @@ class XrayCoreController(
     // [RemoteConfirmationContext.Direct] so every pre-existing call site
     // (real or test) is byte-for-byte unaffected - see that sealed class's
     // own docs for why a Relayed attempt must supply a different value here.
+    // B33 relay follow-up (round 3) - the ONE post-Connected relay-health
+    // watchdog job for the CURRENTLY active session, or null when none is
+    // running (every Direct session, and any session before/after its own
+    // Relayed watchdog runs) - see [startRelayHealthWatchdog]'s own docs.
+    // Never a field per-attempt list/map: this controller only ever has ONE
+    // active session at a time ([lifecycleGate]'s own invariant), so a
+    // single nullable field is the whole lifecycle this needs - a NEW
+    // [requestStart] can only ever begin after the previous session's own
+    // watchdog (if any) has already been cancelled, either by [requestStop]
+    // (see that function's own docs) or by the watchdog's own terminal
+    // failure branch clearing itself.
+    @Volatile private var relayHealthWatchdogJob: Job? = null
+
     suspend fun requestStart(
         kind: TransportKind = TransportKind.XRAY_REALITY,
         routingMode: RoutingMode = RoutingMode.FULL_VPN,
         confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
+        // B33 relay follow-up (round 3) - called AFTER this controller has
+        // ALREADY synchronously torn down the just-failed session (stopLoop
+        // + tun closed - see [startRelayHealthWatchdog]'s own docs), exactly
+        // once, ONLY when the post-Connected relay-health watchdog itself
+        // (never [confirmRemoteConnectivity]'s own pre-Started gate, which
+        // reports its outcome through this function's own return value
+        // instead) declares the active Relayed session unhealthy. Default
+        // no-op so every pre-existing/Direct call site is byte-for-byte
+        // unaffected. This class stays entirely free of any dependency on
+        // `relay`/`XrayRuntimeState` - the caller ([NovaXrayVpnService])
+        // supplies whatever real publish/stopSelf action it needs, the same
+        // "opaque caller-supplied action" shape [RemoteConfirmationContext
+        // .Relayed] already established.
+        onRelayHealthLost: suspend () -> Unit = {},
     ): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
             XrayServiceStartDecision.IGNORE_START_IN_FLIGHT -> return XrayCoreStartOutcome.StartInFlight
             XrayServiceStartDecision.PROCEED -> Unit
         }
+        // Defensive - [lifecycleGate] already guarantees a NEW start only
+        // ever proceeds after any previous session (and therefore its own
+        // watchdog) has ended, so this should always find null. Never skip
+        // it on that assumption alone: a leaked job here would otherwise run
+        // forever against nothing.
+        relayHealthWatchdogJob?.cancel()
+        relayHealthWatchdogJob = null
 
         var success = false
         try {
@@ -276,6 +313,15 @@ class XrayCoreController(
                 // evidence the tunnel is actually usable.
                 if (confirmRemoteConnectivity(ready.serverHost, confirmationContext)) {
                     success = true
+                    // B33 relay follow-up (round 3) - a genuine Connected
+                    // relayed session gets ongoing health monitoring; a
+                    // Direct one does not (no ownerless-relay-tun class of
+                    // bug exists for Direct - see [startRelayHealthWatchdog]'s
+                    // own docs for exactly why only [RemoteConfirmationContext
+                    // .Relayed] qualifies).
+                    if (confirmationContext is RemoteConfirmationContext.Relayed) {
+                        startRelayHealthWatchdog(confirmationContext.exitProbeHost, onRelayHealthLost)
+                    }
                     XrayCoreStartOutcome.Started
                 } else {
                     // B33 - the local loop IS running (startLoop() did not
@@ -392,35 +438,147 @@ class XrayCoreController(
      * here, abandoned exactly the same way on timeout.
      */
     private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
+        val url = when (context) {
+            is RemoteConfirmationContext.Direct -> "https://$serverHost/v1/manifest"
+            // B33 relay follow-up (round 2) - the EXIT's own host,
+            // never [serverHost] (that is the client's dial target -
+            // the INGRESS for a Relayed attempt, see this function's
+            // own top-level docs for why that host specifically
+            // reintroduces the round-1 self-referential-ingress bug).
+            // Same real native primitive, same just-started core's
+            // outbound/routing, same unauthenticated `/v1/manifest`
+            // path every gateway already serves for Direct - see
+            // [RemoteConfirmationContext.Relayed]'s own docs for the
+            // empirical proof this target is safe.
+            is RemoteConfirmationContext.Relayed -> "https://${context.exitProbeHost}/v1/manifest"
+        }
+        return boundedMeasureDelay(url)
+    }
+
+    /**
+     * B33 relay follow-up (round 3) - the SAME bounded-abandonable
+     * [XrayCoreRuntime.measureDelay] primitive [confirmRemoteConnectivity]
+     * already established (see that function's own docs and its own docs on
+     * [XrayCoreStartOutcome.RemoteUnconfirmed] for the full "why a fresh
+     * coroutine on [probeScope], why [withTimeoutOrNull] only bounds the
+     * suspending await, why a late completion is inert" rationale - byte-
+     * for-byte the same guarantees, extracted here so [startRelayHealthWatchdog]'s
+     * periodic probe reuses the identical safety properties rather than a
+     * second, independently-written bounded-call pattern). Returns `true`
+     * only on a genuine, non-throwing `measureDelay` completion within
+     * [REMOTE_CONFIRM_TIMEOUT_MS] - a timeout or any thrown exception both
+     * report `false`, never propagated.
+     */
+    private suspend fun boundedMeasureDelay(url: String): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         probeScope.launch {
-            val confirmed = try {
-                when (context) {
-                    is RemoteConfirmationContext.Direct -> {
-                        coreRuntime.measureDelay("https://$serverHost/v1/manifest")
-                        true
-                    }
-                    // B33 relay follow-up (round 2) - the EXIT's own host,
-                    // never [serverHost] (that is the client's dial target -
-                    // the INGRESS for a Relayed attempt, see this function's
-                    // own top-level docs for why that host specifically
-                    // reintroduces the round-1 self-referential-ingress bug).
-                    // Same real native primitive, same just-started core's
-                    // outbound/routing, same unauthenticated `/v1/manifest`
-                    // path every gateway already serves for Direct - see
-                    // [RemoteConfirmationContext.Relayed]'s own docs for the
-                    // empirical proof this target is safe.
-                    is RemoteConfirmationContext.Relayed -> {
-                        coreRuntime.measureDelay("https://${context.exitProbeHost}/v1/manifest")
-                        true
-                    }
-                }
+            val ok = try {
+                coreRuntime.measureDelay(url)
+                true
             } catch (t: Throwable) {
                 false
             }
-            deferred.complete(confirmed)
+            deferred.complete(ok)
         }
         return withTimeoutOrNull(REMOTE_CONFIRM_TIMEOUT_MS) { deferred.await() } ?: false
+    }
+
+    /**
+     * B33 relay follow-up (round 3) - the fix for the physically-proven
+     * "stale Protected" defect: a genuinely healthy CHAIN_DIRECT session
+     * (Android -> Stockholm ingress -> Germany exit, real Protected/HTTPS/
+     * DNS) whose relay-upstream link was then black-holed server-side
+     * stayed reported Connected/Protected for 6+ minutes with a dead data
+     * plane, tun0 still up, and Xray still running - because
+     * [net.pocvpn.client.MainViewModel.armFailoverWatch] cancels its own
+     * watcher the moment a Relayed attempt first reaches genuine success
+     * (see that function's own docs), and no other mechanism in this
+     * codebase ever re-checks a relayed session's data-plane health after
+     * that point (`VpnController.handleNetworkLost`/`reconnectLoop` only
+     * ever fire on an OS-level network-loss callback - never on a
+     * relay-upstream failure with the underlying network, and the
+     * client<->ingress link, both still healthy - exactly this scenario).
+     *
+     * Started ONLY for a genuinely Connected [RemoteConfirmationContext
+     * .Relayed] session (never Direct - see [requestStart]'s own call site),
+     * on [probeScope] (the SAME scope every other probe in this class
+     * already uses - real, independent, `NovaXrayVpnService`-scoped in
+     * production). Periodically repeats the EXACT SAME Xray-native
+     * EXIT-manifest [boundedMeasureDelay] check [confirmRemoteConnectivity]
+     * already used to prove this session healthy in the first place - never
+     * the out-of-band Nova-process `HttpURLConnection` check
+     * ([net.pocvpn.client.relay.HttpRelayEndToEndProbe]), which cannot serve
+     * as tunnel liveness for the same reason it was removed from the
+     * pre-Started gate (see [RemoteConfirmationContext.Relayed]'s own docs).
+     *
+     * A single transient probe miss is deliberately NOT terminal - only
+     * [RELAY_HEALTH_FAILURE_THRESHOLD] *consecutive* failures (reset to zero
+     * by any intervening success) declare the relay unhealthy, the same
+     * "bounded, not trigger-happy" discipline this codebase already applies
+     * elsewhere (e.g. [net.pocvpn.client.reachability.PathHistoryEntry
+     * .consecutiveFailures]) - never a single noisy probe tearing down a
+     * genuinely-recoverable session.
+     *
+     * On reaching the threshold: tears down THIS exact session via
+     * [requestStop] - the SAME real, gate-serialized, "stopLoop then close
+     * tun, exactly once" path `ACTION_STOP`/[NovaXrayVpnService.teardown]
+     * already uses, called SYNCHRONOUSLY on this coroutine and awaited to
+     * completion BEFORE [onUnhealthy] is invoked - so by the time the caller
+     * publishes a terminal/failure event, the tun/core are ALREADY released;
+     * the exact "terminal state must never coexist with an ownerless active
+     * relay tun" invariant task requirements demanded, achieved by ordering
+     * alone (tear down, then notify), never a new ack/wait primitive - the
+     * SAME ordering [XrayCoreStartOutcome.RemoteUnconfirmed]'s own branch in
+     * [requestStart] already establishes. [requestStop]'s own
+     * [XrayServiceLifecycleGate] guarantees this can never double-teardown a
+     * session an external `ACTION_STOP`/[requestStop] call raced with (at
+     * most one of the two ever proceeds - see that gate's own invariant),
+     * and never leaves [relayHealthWatchdogJob] pointing at a job that
+     * already finished (cleared here, on this same coroutine, right before
+     * returning).
+     *
+     * Cancelled (never left running against a session that no longer
+     * exists, and never overlapping a NEWER session's own watchdog) by:
+     * [requestStop] (covers explicit disconnect, an activeTransport switch -
+     * which always disconnects the OLD transport first, see
+     * `VpnController.switchActiveTransport`'s own docs - and the
+     * coordinator's own endpoint-switch teardown), and defensively at the
+     * top of every [requestStart] (a fresh session never inherits a leaked
+     * watchdog job). Never watches for longer than the SAME session it was
+     * started for: [relayHealthWatchdogJob] is this controller's own single
+     * field, and [lifecycleGate] guarantees only one session is ever active
+     * at a time, so a stale watchdog cannot outlive into - or act on - a
+     * later, different session, by construction (never keyed on a
+     * separately-tracked session id that could drift).
+     */
+    private fun startRelayHealthWatchdog(exitProbeHost: String, onUnhealthy: suspend () -> Unit) {
+        val url = "https://$exitProbeHost/v1/manifest"
+        relayHealthWatchdogJob = probeScope.launch {
+            var consecutiveFailures = 0
+            while (isActive) {
+                delay(RELAY_HEALTH_PROBE_INTERVAL_MS)
+                if (!isActive) return@launch
+                val healthy = boundedMeasureDelay(url)
+                if (healthy) {
+                    consecutiveFailures = 0
+                    continue
+                }
+                consecutiveFailures++
+                if (consecutiveFailures >= RELAY_HEALTH_FAILURE_THRESHOLD) {
+                    // Cleared BEFORE requestStop() - requestStop() itself
+                    // also cancels relayHealthWatchdogJob (see that
+                    // function's own docs), and this coroutine IS that job:
+                    // clearing the field first makes that a safe no-op on
+                    // null, rather than this coroutine cancelling itself and
+                    // risking onUnhealthy() below never running (cancellation
+                    // is cooperative, but there is no reason to court it).
+                    relayHealthWatchdogJob = null
+                    requestStop()
+                    onUnhealthy()
+                    return@launch
+                }
+            }
+        }
     }
 
     private companion object {
@@ -432,12 +590,46 @@ class XrayCoreController(
          * tolerant bound, but still bounded, never unbounded. This IS the
          * real caller-visible deadline (see confirmRemoteConnectivity's own
          * round-2 docs for why the ORIGINAL version of this bound was not
-         * actually enforced).
+         * actually enforced). Also the per-probe bound [startRelayHealthWatchdog]
+         * reuses via [boundedMeasureDelay] - the same real network round
+         * trip, the same abandon-on-timeout safety.
          */
         const val REMOTE_CONFIRM_TIMEOUT_MS = 6_000L
+
+        /**
+         * B33 relay follow-up (round 3) - no existing "ongoing session
+         * health poll" cadence constant exists anywhere in this codebase to
+         * reuse (audited: [net.pocvpn.client.vpn.ReconnectManager]'s
+         * BASE_DELAY_MS/MAX_DELAY_MS govern reconnect BACKOFF after a
+         * network-loss event, a different concern; [VpnController
+         * .HANDSHAKE_TIMEOUT_MS]/HANDSHAKE_POLL_INTERVAL_MS govern AWG's
+         * cheap local-stats poll during ONE connect attempt, not an ongoing
+         * background health check). A conservative, deliberately
+         * infrequent interval - this is a REAL network round trip against
+         * production infrastructure, run for as long as the session stays
+         * connected, never a cheap local check.
+         */
+        const val RELAY_HEALTH_PROBE_INTERVAL_MS = 20_000L
+
+        /**
+         * B33 relay follow-up (round 3) - consecutive (not cumulative)
+         * failures required before the session is declared unhealthy - see
+         * [startRelayHealthWatchdog]'s own docs for why a single transient
+         * miss must never be terminal.
+         */
+        const val RELAY_HEALTH_FAILURE_THRESHOLD = 2
     }
 
     fun requestStop(): XrayCoreStopOutcome {
+        // B33 relay follow-up (round 3) - cancelled FIRST, before this
+        // session's own teardown runs, so an external disconnect/switch
+        // never races a still-polling watchdog against the very teardown it
+        // would otherwise (harmlessly, per requestStop's own idempotency,
+        // but wastefully) attempt a second time - see
+        // [startRelayHealthWatchdog]'s own docs on why a raced second call
+        // is safe regardless, this just avoids the pointless overlap.
+        relayHealthWatchdogJob?.cancel()
+        relayHealthWatchdogJob = null
         if (!lifecycleGate.tryBeginTeardown()) return XrayCoreStopOutcome(didTeardown = false)
         val failureReason = try {
             coreRuntime.stopLoop()

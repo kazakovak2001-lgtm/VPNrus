@@ -224,7 +224,22 @@ class NovaXrayVpnService : VpnService() {
             } else {
                 RemoteConfirmationContext.Direct
             }
-            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode, confirmationContext)) {
+            // B33 relay follow-up (round 3) - the ONE place a watchdog-
+            // detected relay-health failure is turned into a real,
+            // production-shaped terminal event - the SAME XrayRuntimeEvent
+            // .Failed + stopSelf() shape every other failure branch below
+            // already uses, so VlessRealityTransport/VlessTlsTransport's
+            // existing observeState() mapping (never a new one) carries it
+            // into TransportState.Error exactly like any other Xray
+            // failure. Fires only AFTER XrayCoreController has ALREADY
+            // synchronously torn down the session (see that class's own
+            // startRelayHealthWatchdog docs) - never before.
+            val onRelayHealthLost: suspend () -> Unit = {
+                Log.w(TAG, "relay health watchdog: consecutive probe failures exceeded threshold, session torn down")
+                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "relay data-plane health check failed"))
+                stopSelf()
+            }
+            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode, confirmationContext, onRelayHealthLost)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
