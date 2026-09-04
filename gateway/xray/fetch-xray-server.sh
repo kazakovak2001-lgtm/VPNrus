@@ -16,6 +16,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=VERSION
 source "$HERE/VERSION"
 
+# B31B - the canonical pinned fact stays the FULL 40-char commit
+# (XRAY_CORE_COMMIT, unchanged by this fix) - `xray version`'s own output
+# only ever reports the SHORT (7-char) git commit, never the full one (a
+# real fetch of the genuinely-pinned v26.7.28 asset - SHA256-verified -
+# reported "... 5ca6f4b ..." for pinned commit
+# "5ca6f4b7d4dc20a881d4330e498892697627ec0c", found live). This derives
+# the short form ONCE, from the canonical full value, rather than
+# hardcoding a second pinned constant that could drift from VERSION.
+if ! [[ "$XRAY_CORE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: XRAY_CORE_COMMIT in $HERE/VERSION is not a well-formed 40-char lowercase hex commit: ${XRAY_CORE_COMMIT:-<unset>}" >&2
+    exit 1
+fi
+EXPECTED_SHORT_COMMIT="${XRAY_CORE_COMMIT:0:7}"
+
 INSTALL_ROOT="${XRAY_INSTALL_ROOT:-/opt/pocvpn/xray}"
 VERSIONED_DIR="$INSTALL_ROOT/$XRAY_CORE_TAG"
 WORK="$(mktemp -d)"
@@ -41,8 +55,21 @@ mkdir -p "$WORK/extract"
 unzip -q "$WORK/$XRAY_RELEASE_ASSET" -d "$WORK/extract"
 
 actual_version="$("$WORK/extract/xray" version | head -1)"
-if [[ "$actual_version" != *"$XRAY_CORE_COMMIT"* ]]; then
-    echo "ERROR: extracted binary's own 'version' output does not mention the pinned commit $XRAY_CORE_COMMIT" >&2
+# B31B - token-aware match (an exact whitespace-delimited word equals the
+# EXPECTED SHORT commit), never a loose substring check against the full
+# 40-char value - see this file's own docs above for why the full value
+# can never appear in this output at all, and why a bare substring test
+# would also risk a false-positive match against an unrelated longer hex
+# run that merely happens to contain this short token.
+commit_matched=0
+for token in $actual_version; do
+    if [ "$token" = "$EXPECTED_SHORT_COMMIT" ]; then
+        commit_matched=1
+        break
+    fi
+done
+if [ "$commit_matched" -ne 1 ]; then
+    echo "ERROR: extracted binary's own 'version' output does not report the pinned commit's short form ($EXPECTED_SHORT_COMMIT, derived from the full pinned $XRAY_CORE_COMMIT)" >&2
     echo "  got: $actual_version" >&2
     exit 1
 fi
