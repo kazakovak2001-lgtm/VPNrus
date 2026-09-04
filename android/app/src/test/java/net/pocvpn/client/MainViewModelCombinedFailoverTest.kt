@@ -96,6 +96,14 @@ private class OrderLoggingAlwaysFailTransport(
     private val stateFlow = MutableStateFlow<TransportState>(TransportState.Disconnected)
     var connectCallCount = 0
         private set
+    // B34 - lets a test distinguish the OLD `rejectPreflight` terminal path
+    // (never touches the transport at all - see that function's own docs)
+    // from the NEW `abandonAttemptWithTerminalError` path (always tears
+    // down the active transport exactly once - see that function's own
+    // docs) even in a scenario where BOTH paths happen to leave `_state` at
+    // the SAME visible `TransportState.Error` value.
+    var disconnectCallCount = 0
+        private set
     val configs = mutableListOf<TransportConfig.Awg>()
 
     override fun preparePermissionIntent(): Intent? = null
@@ -110,6 +118,7 @@ private class OrderLoggingAlwaysFailTransport(
     }
 
     override suspend fun disconnect() {
+        disconnectCallCount++
         stateFlow.value = TransportState.Disconnected
     }
 
@@ -526,5 +535,69 @@ class MainViewModelCombinedFailoverTest {
         assertEquals(listOf("direct:GERMANY"), orderLog)
         assertTrue(viewModel.transportState.value is TransportState.Connected)
         assertEquals(0, resolver.resolvedPlans.size)
+    }
+
+    // --- I: B34 - full genuine exhaustion reaches the REAL terminal-teardown path, never the old rejectPreflight ---
+
+    /**
+     * B34 - physically reproduced as a real bug (PR #53's own CHAIN_DIRECT
+     * physical validation, 2026-09-04): once combined Auto genuinely
+     * exhausts every admitted candidate, `attemptCombined` previously
+     * reported the terminal error via `VpnController.rejectPreflight` -
+     * built for "reject before this controller was ever touched" - which
+     * never tears down whatever transport a real prior attempt in the SAME
+     * sequence already touched. This is the production-shaped integration
+     * proof requested for that fix, through the REAL
+     * `MainViewModel.connect()` -> `connectAuto()` -> `attemptCombined()`
+     * chain (not a hand-built candidate): Direct GERMANY, Direct STOCKHOLM,
+     * and a Relayed ingress (the SAME `manifestRepositoryWithAllThree()`
+     * shape test E/F already use - AMNEZIA_WG both hops, not
+     * XRAY_REALITY/TLS_TCP, for the SAME reason those tests already
+     * document: this MainViewModel test harness's `isXrayAvailableFor`/
+     * `isXrayTlsAvailableFor` flags are only ever populated by a real
+     * device-activation flow, never settable directly in a plain unit test
+     * - see [AutoGatewaySelectorFairnessTest]'s own dedicated
+     * REALITY/TLS_TCP-shaped production candidates test, which exercises
+     * the exact requested "Direct A REALITY, Direct A TLS, Direct B
+     * REALITY, Direct B TLS, Relayed" shape directly against the real
+     * [AutoGatewaySelector.buildCombinedAttempts]/[AutoGatewaySelector.applyRelayFairness]
+     * pipeline instead). [OrderLoggingAlwaysFailTransport.disconnectCallCount]
+     * is what actually distinguishes the OLD/broken path (never calls
+     * `disconnect()` at all) from the NEW/fixed one (calls it exactly once
+     * per real prior attempt) - the visible `TransportState.Error` value
+     * alone cannot tell them apart in this synchronous-failure transport
+     * shape, since both paths happen to leave that field identical here
+     * (see [net.pocvpn.client.vpn.VpnControllerTerminalTeardownTest] for
+     * the real, physically-relevant Xray-Connected-then-fails shape this
+     * scenario's own transport double cannot represent).
+     */
+    @Test
+    fun `I - full exhaustion (Direct GERMANY, Direct STOCKHOLM, Relayed all fail) reaches abandonAttemptWithTerminalError, tearing down every real prior attempt`() = runTest {
+        val orderLog = mutableListOf<String>()
+        val transport = OrderLoggingAlwaysFailTransport(orderLog, hostLabels)
+        val resolver = OrderLoggingResolver(orderLog, ::alwaysFailingRelayResolution)
+        val viewModel = newViewModel(transport, resolver, manifestRepositoryWithAllThree())
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        // All 3 real candidates genuinely attempted, well within the
+        // production MAX_ATTEMPTS budget.
+        assertEquals(3, orderLog.size)
+        assertTrue(orderLog.size <= AutoGatewaySelector.MAX_ATTEMPTS)
+
+        val state = viewModel.transportState.value
+        assertTrue("expected a terminal Error, was $state", state is TransportState.Error)
+        assertEquals("Automatic gateway candidates exhausted", (state as TransportState.Error).message)
+        assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
+
+        // The REAL distinguishing proof: every Direct attempt that actually
+        // touched the transport (connect() was called on it, even though it
+        // threw) was genuinely torn down via disconnect() too - the old
+        // rejectPreflight path would have left this at 0.
+        assertTrue(
+            "expected at least one real disconnect() call proving the NEW teardown path ran, got ${transport.disconnectCallCount}",
+            transport.disconnectCallCount >= 1,
+        )
     }
 }
