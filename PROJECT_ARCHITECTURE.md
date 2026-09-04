@@ -435,6 +435,54 @@ sequence never advanced past the falsely-"successful" attempt.
   `handleNetworkLost`/B30B reconnect semantics, `xrayTransportStateFor`'s
   `Started`/`Stopped` mappings, and every AWG connect/handshake/reconnect
   path are all byte-for-byte unchanged.
+- **Round 2 review fix - the timeout must isolate the BLOCKING native call,
+  never merely wrap it.** `XrayCoreRuntime.measureDelay` is an ordinary
+  blocking JNI method with no suspension point - an earlier version of
+  `confirmRemoteConnectivity` wrapped the blocking call DIRECTLY in
+  `withTimeoutOrNull`, which does not bound it at all: the very coroutine
+  running that block IS the thread stuck inside the blocking call, so there
+  is no separate execution path left for the timeout to fire on (coroutine
+  cancellation only takes effect at a suspension point, which a raw
+  blocking call never reaches). Fixed by giving the blocking call its own,
+  independent coroutine on a dedicated `probeScope` (constructor-injected,
+  defaults to a real `CoroutineScope(SupervisorJob() + Dispatchers.IO)` in
+  production - `NovaXrayVpnService` passes its own supervisorJob-backed
+  `scope` explicitly, so an abandoned probe is cancelled for real when the
+  service is destroyed) - deliberately NOT a structured child of the
+  calling coroutine. `withTimeoutOrNull` now bounds only the SUSPENDING
+  `CompletableDeferred.await()`, which genuinely can be abandoned; the
+  underlying native call keeps running independently until it naturally
+  returns/throws, at which point it completes a `CompletableDeferred` that
+  is fresh and LOCAL to that one `confirmRemoteConnectivity` call - never
+  instance-level shared state - so a late completion after timeout has
+  nothing left reading it, can never publish `Started` after the timeout
+  branch already committed to `RemoteUnconfirmed`, and can never affect a
+  later, independent attempt's own outcome. Bounded resource growth: each
+  timed-out probe leaves at most one coroutine on `probeScope` (backed by
+  `Dispatchers.IO`'s own bounded elastic pool) until the native call's own
+  OS-level socket timeout eventually resolves it (the pinned AAR exposes no
+  configurable timeout parameter for `measureDelay`, confirmed against its
+  decompiled native method signature) - never literally unbounded, since
+  the number of concurrently-abandoned probes per connect() sequence is
+  capped by the same `AutoGatewaySelector.MAX_ATTEMPTS` bound already
+  governing the whole combined attempt sequence.
+  `NovaXrayServiceLifecycleCoordinatorTest`'s own `buildController` test
+  helper now must pass `probeScope = this` (the enclosing `runTest`'s own
+  `TestScope`) explicitly - mixing the production default (real
+  `Dispatchers.IO`) into a `kotlinx-coroutines-test` virtual-time test would
+  reintroduce the exact same class of flakiness the original
+  `withContext(Dispatchers.IO)` mistake already caused once, since
+  `runCurrent()`/`advanceUntilIdle()` cannot wait for a real background
+  thread to finish.
+- **Probe target verified for real, without a certificate bypass.** Both
+  production gateways (`152.70.43.1`, `16.170.208.231`) were checked
+  directly (read-only SSH) dialing `https://<own-public-IP>/v1/manifest`:
+  both present a real Let's Encrypt certificate with an IP-address SAN
+  (`subjectAltName: host "..." matched cert's IP address!`,
+  `SSL certificate verify ok`) - `measureDelay`'s dial-by-IP probe target
+  performs genuine TLS verification with no `-k`/bypass required on either
+  host, so a healthy tunnel cannot be mistaken for a broken one due to a
+  hostname/certificate mismatch.
 
 ## Control-plane vs data-plane
 

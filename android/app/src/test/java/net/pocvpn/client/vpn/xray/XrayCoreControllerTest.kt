@@ -370,6 +370,81 @@ class XrayCoreControllerTest {
         assertEquals("https://${validTlsProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
     }
 
+    // --- B33 review fix (round 2, blocker): the timeout must be REAL wall-clock-bounded, not merely wrapped around the blocking call ---
+
+    /** A real, un-cancellable BLOCKING measureDelay - simulates the exact native-call shape the review's blocker concerned. */
+    private class BlockingMeasureDelayRuntime(private val blockMillis: Long) : XrayCoreRuntime {
+        var startLoopCallCount = 0
+            private set
+        var stopLoopCallCount = 0
+            private set
+        override fun ensureCoreEnvInitialized(context: android.content.Context) {}
+        override val isRunning: Boolean get() = startLoopCallCount > stopLoopCallCount
+        override fun startLoop(configContent: String, tunFd: Int) { startLoopCallCount++ }
+        override fun stopLoop() { stopLoopCallCount++ }
+        override fun measureDelay(url: String): Long {
+            Thread.sleep(blockMillis)
+            return 1L
+        }
+    }
+
+    private suspend fun blockingHarness(blockMillis: Long, repository: SecureXrayProfileRepository) =
+        BlockingMeasureDelayRuntime(blockMillis).let { runtime ->
+            runtime to XrayCoreController(
+                repository = repository,
+                coreRuntime = runtime,
+                novaPackageId = "net.pocvpn.client.test",
+                ensureCoreEnvInitialized = {},
+                establishTun = { 42 },
+                closeTun = {},
+            )
+        }
+
+    @Test
+    fun `a measureDelay call blocking far longer than the bound does not delay requestStart past it - the real, previously-broken timeout`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val (runtime, controller) = blockingHarness(blockMillis = 20_000L, repository = repository)
+
+        val startedAt = System.currentTimeMillis()
+        val outcome = controller.requestStart()
+        val elapsedMillis = System.currentTimeMillis() - startedAt
+
+        assertTrue("expected RemoteUnconfirmed, got $outcome", outcome is XrayCoreStartOutcome.RemoteUnconfirmed)
+        // Generous slack above the real 6s bound, but nowhere near the 20s
+        // the (fixed) blocking call actually takes - proves requestStart
+        // genuinely did not wait for it.
+        assertTrue("requestStart must return within the bound, took ${elapsedMillis}ms", elapsedMillis < 10_000L)
+        assertEquals(1, runtime.stopLoopCallCount)
+    }
+
+    @Test
+    fun `late completion of an abandoned probe after timeout never affects a subsequent fresh attempt`() = runBlocking {
+        // Blocks just past the bound (not the full 20s above) so the test
+        // can also afford to wait for it to actually finish below.
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val (runtime, controller) = blockingHarness(blockMillis = 6_500L, repository = repository)
+
+        val first = controller.requestStart()
+        assertTrue(first is XrayCoreStartOutcome.RemoteUnconfirmed)
+
+        // Let the abandoned first probe actually complete in the background -
+        // its late "success" must be inert: nothing reads it, nothing it
+        // could mutate is shared with a fresh attempt (see
+        // confirmRemoteConnectivity's own docs).
+        kotlinx.coroutines.delay(1_000)
+
+        // A genuinely FRESH attempt (the lifecycle gate was never marked
+        // running by the first, unconfirmed one) must proceed independently
+        // and correctly - never silently "completed" by the stale probe.
+        val second = controller.requestStart()
+
+        assertTrue("expected a genuine second RemoteUnconfirmed attempt, got $second", second is XrayCoreStartOutcome.RemoteUnconfirmed)
+        assertEquals(2, runtime.startLoopCallCount)
+        assertEquals(2, runtime.stopLoopCallCount)
+    }
+
     @Test
     fun `RemoteUnconfirmed reason never carries the profile's secret field values`() = runBlocking {
         val repository = newRepository()

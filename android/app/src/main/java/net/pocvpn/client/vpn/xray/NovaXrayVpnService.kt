@@ -101,6 +101,14 @@ class NovaXrayVpnService : VpnService() {
                 establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
                 closeTun = { closeTunInterface() },
                 tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
+                // B33 review fix (round 2) - the SAME supervisorJob-backed
+                // scope this whole service already uses, so an abandoned
+                // post-timeout remote-confirmation probe (see
+                // XrayCoreController.confirmRemoteConnectivity's own docs)
+                // is cancelled for real when the service itself is
+                // destroyed, rather than an independent, never-cleaned-up
+                // scope living for the process's whole lifetime.
+                probeScope = scope,
             )
         }
     }

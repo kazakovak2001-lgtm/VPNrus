@@ -47,7 +47,23 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         override suspend fun clearProfile() {}
     }
 
-    private fun buildController(gate: CompletableDeferred<Unit>? = null, runtime: FakeXrayCoreRuntime = FakeXrayCoreRuntime()): XrayCoreController =
+    // B33 review fix (round 2) - [probeScope] MUST be the calling test's own
+    // TestScope (never the real Dispatchers.IO-backed default
+    // XrayCoreController itself falls back to in production): the bounded
+    // remote-confirmation probe this class now runs on its own coroutine
+    // (see XrayCoreController.confirmRemoteConnectivity's own docs) would
+    // otherwise race kotlinx-coroutines-test's virtual scheduler exactly
+    // like the ORIGINAL (naive withTimeoutOrNull-only) version already did
+    // once before - runCurrent()/the test's own assertions have no way to
+    // wait for a REAL background thread's completion. Every FakeXrayCoreRuntime
+    // used in this file returns from measureDelay() synchronously/instantly,
+    // so running the probe on the SAME virtual test dispatcher is both
+    // correct and deterministic here.
+    private fun buildController(
+        gate: CompletableDeferred<Unit>? = null,
+        runtime: FakeXrayCoreRuntime = FakeXrayCoreRuntime(),
+        probeScope: kotlinx.coroutines.CoroutineScope,
+    ): XrayCoreController =
         XrayCoreController(
             repository = GatedXrayProfileRepository(validProfile, gate),
             coreRuntime = runtime,
@@ -55,6 +71,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
             ensureCoreEnvInitialized = {},
             establishTun = { 42 },
             closeTun = {},
+            probeScope = probeScope,
         )
 
     private val endpointA = EndpointId("gateway-a")
@@ -67,7 +84,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         var factoryCallCount = 0
         val coordinator = NovaXrayServiceLifecycleCoordinator {
             factoryCallCount++
-            buildController(gate, runtime)
+            buildController(gate, runtime, probeScope = this)
         }
 
         val first = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY) }
@@ -99,7 +116,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         val builtFor = mutableListOf<EndpointId>()
         val coordinator = NovaXrayServiceLifecycleCoordinator { endpointId ->
             builtFor += endpointId
-            if (endpointId == endpointA) buildController(gateA, runtimeA) else buildController(null, runtimeB)
+            if (endpointId == endpointA) buildController(gateA, runtimeA, probeScope = this) else buildController(null, runtimeB, probeScope = this)
         }
 
         val startA = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY) }
@@ -130,7 +147,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
     fun `stop racing an in-flight start is serialized, never lost, never races it`() = runTest {
         val gate = CompletableDeferred<Unit>()
         val runtime = FakeXrayCoreRuntime()
-        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(gate, runtime) }
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(gate, runtime, probeScope = this) }
 
         val start = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY) }
         runCurrent()
@@ -154,7 +171,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
     fun `sequential repeated START(A) still preserves AlreadyRunning - one controller reused`() = runTest {
         val runtime = FakeXrayCoreRuntime()
         var factoryCallCount = 0
-        val coordinator = NovaXrayServiceLifecycleCoordinator { factoryCallCount++; buildController(null, runtime) }
+        val coordinator = NovaXrayServiceLifecycleCoordinator { factoryCallCount++; buildController(null, runtime, probeScope = this) }
 
         val first = coordinator.start(endpointA, TransportKind.XRAY_REALITY)
         val second = coordinator.start(endpointA, TransportKind.XRAY_REALITY)
@@ -167,7 +184,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
 
     @Test
     fun `stop with nothing ever started is a safe no-op`() = runTest {
-        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController() }
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(probeScope = this) }
 
         val outcome = coordinator.stop()
 
@@ -180,7 +197,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         val coordinator = NovaXrayServiceLifecycleCoordinator { endpointId ->
             val runtime = FakeXrayCoreRuntime()
             runtimesByEndpoint.getOrPut(endpointId) { mutableListOf() } += runtime
-            buildController(null, runtime)
+            buildController(null, runtime, probeScope = this)
         }
 
         coordinator.start(endpointA, TransportKind.XRAY_REALITY)
