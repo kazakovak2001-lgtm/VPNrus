@@ -13,6 +13,7 @@ import grp
 import json
 import os
 import pwd
+import re
 import shutil
 import socket
 import stat
@@ -33,21 +34,49 @@ _XRAY_BIN_PATH_EXPECTED_PREFIX = "/opt/pocvpn/xray/"
 _XRAY_VERSION_FILE = os.path.join(_GATEWAY_DIR, "xray", "VERSION")
 
 
+_FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
 def _pinned_xray_core_commit():
     """B31A - parse gateway/xray/VERSION's own XRAY_CORE_COMMIT= line (a
     plain bash-sourced env-style file, never imported as Python) - the
     SAME pinned commit gateway/xray/fetch-xray-server.sh itself verifies
     the downloaded release asset against. Returns None if the file is
-    missing or the line can't be found - callers treat that as "cannot
-    verify", never as "pinned commit is empty string"."""
+    missing, the line can't be found, or the value is not a well-formed
+    40-char lowercase hex commit (B31B: fail closed on a malformed pin,
+    never silently treat it as a usable value) - callers treat None as
+    "cannot verify", never as "pinned commit is empty string"."""
     try:
         with open(_XRAY_VERSION_FILE, "r", encoding="utf-8") as handle:
             for line in handle:
                 stripped = line.strip()
                 if stripped.startswith("XRAY_CORE_COMMIT="):
-                    return stripped.split("=", 1)[1].strip()
+                    value = stripped.split("=", 1)[1].strip()
+                    return value if _FULL_COMMIT_RE.match(value) else None
     except OSError:
         return None
+    return None
+
+
+def _short_commit_matches(pinned_full_commit, version_output):
+    """B31B - the root cause this closes: a real, SHA256-verified fetch of
+    the genuinely-pinned v26.7.28 release reported
+    'Xray 26.7.28 (Xray, Penetrates Everything.) 5ca6f4b (go1.26.5
+    linux/amd64)' for pinned commit
+    '5ca6f4b7d4dc20a881d4330e498892697627ec0c' - `xray version` only ever
+    exposes the SHORT (7-char) git commit, never the full 40-char pinned
+    value this file (and fetch-xray-server.sh) canonically store. The full
+    value in VERSION stays authoritative; this derives the short form from
+    it ONCE, on every call, rather than hardcoding a second pinned
+    constant that could drift out of sync with VERSION.
+
+    Token-aware (an EXACT whitespace-delimited word in `version_output`
+    equals the derived short commit), never a bare substring test - a
+    substring check could also false-positive against an unrelated longer
+    hex run that merely happens to contain the same 7 characters.
+    """
+    expected_short = pinned_full_commit[:7]
+    return expected_short in version_output.split()
     return None
 _MAX_SANE_CLOCK_SKEW_SECONDS = 300
 
@@ -121,11 +150,15 @@ def run_checks(ingress_cfg, env):
                 if proc.returncode == 0:
                     pinned_commit = _pinned_xray_core_commit()
                     if pinned_commit:
-                        commit_ok = pinned_commit in proc.stdout
+                        # B31B - token-aware short-commit match (see
+                        # _short_commit_matches's own docs) - never a bare
+                        # substring test against the full 40-char value,
+                        # which `xray version` can never contain at all.
+                        commit_ok = _short_commit_matches(pinned_commit, proc.stdout)
                         checks.append(Check(
                             "xray binary matches the pinned commit (gateway/xray/VERSION)",
                             commit_ok,
-                            f"expected commit {pinned_commit} in version output" if not commit_ok else pinned_commit,
+                            f"expected short commit {pinned_commit[:7]} (from pinned {pinned_commit}) in version output" if not commit_ok else pinned_commit[:7],
                         ))
                     else:
                         checks.append(Check(
