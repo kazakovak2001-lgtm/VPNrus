@@ -203,12 +203,15 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         val outcome = coordinator.start(
             endpointA,
             TransportKind.XRAY_REALITY,
-            confirmationContext = RemoteConfirmationContext.Relayed { true },
+            confirmationContext = RemoteConfirmationContext.Relayed(exitProbeHost = "203.0.113.60"),
         )
 
         assertEquals(XrayCoreStartOutcome.Started, outcome)
-        // The generic self-manifest probe must never run for a Relayed attempt.
-        assertEquals(0, runtime.measureDelayCallCount)
+        // Dials the EXIT host's own manifest via the SAME Xray-native
+        // measureDelay primitive Direct uses - see RemoteConfirmationContext
+        // .Relayed's own docs.
+        assertEquals(1, runtime.measureDelayCallCount)
+        assertEquals("https://203.0.113.60/v1/manifest", runtime.lastMeasureDelayUrl)
     }
 
     @Test

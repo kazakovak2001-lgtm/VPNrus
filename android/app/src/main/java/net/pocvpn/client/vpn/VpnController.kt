@@ -1012,6 +1012,8 @@ class VpnController(
                         routingMode = routingMode,
                         // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
                         isRelayed = pendingAttemptContext is VpnAttemptContext.Relayed,
+                        // B33 relay follow-up (round 2) - see TransportConfig.Xray.relayExitProbeHost's own docs.
+                        relayExitProbeHost = (pendingAttemptContext as? VpnAttemptContext.Relayed)?.plan?.exitBinding?.host,
                     )
                 }
             }
@@ -1031,6 +1033,8 @@ class VpnController(
                         routingMode = routingMode,
                         // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
                         isRelayed = pendingAttemptContext is VpnAttemptContext.Relayed,
+                        // B33 relay follow-up (round 2) - see TransportConfig.Xray.relayExitProbeHost's own docs.
+                        relayExitProbeHost = (pendingAttemptContext as? VpnAttemptContext.Relayed)?.plan?.exitBinding?.host,
                     )
                 }
             }

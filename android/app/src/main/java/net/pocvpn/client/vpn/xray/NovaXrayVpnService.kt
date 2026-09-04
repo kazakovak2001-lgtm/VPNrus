@@ -81,25 +81,6 @@ class NovaXrayVpnService : VpnService() {
         net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory.create(context, endpointId)
     }
 
-    // B33 relay follow-up - same "overridable only for tests" contract as
-    // profileRepositoryFactory/tlsProfileRepositoryFactory above: production
-    // always reads the SAME real, encrypted-at-rest, per-endpoint
-    // IngressProfileStore MainViewModel/RelayIngressResolverImpl already
-    // persist to (see IngressProfileStoreFactory's own docs) - never a
-    // second, independent store.
-    internal var ingressProfileStoreFactory: (Context) -> net.pocvpn.client.relay.IngressProfileStore = { context ->
-        net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
-    }
-
-    // B33 relay follow-up - the SAME real HttpRelayEndToEndProbe
-    // RelayCompositionFactory wires for the LATER, plan-scoped end-to-end
-    // proof armFailoverWatch performs after Connected (see RelayExecution.kt's
-    // own docs) - constructed independently here (a cheap, stateless class)
-    // rather than threaded from MainViewModel, since this service has no
-    // direct object reference to that instance across the Service/Intent
-    // boundary. Overridable only for tests.
-    internal var relayEndToEndProbeFactory: () -> net.pocvpn.client.relay.HttpRelayEndToEndProbe = { net.pocvpn.client.relay.HttpRelayEndToEndProbe() }
-
     // B13 (2026-08-30 PR #25 review fix) - the ONE place [XrayCoreController]
     // is ever constructed, and the ONE place its per-endpoint selection AND
     // requestStart/requestStop calls are serialized - see that class's own
@@ -174,7 +155,16 @@ class NovaXrayVpnService : VpnService() {
                 // caller/intent, defaulting to false (Direct) - see
                 // TransportConfig.Xray.isRelayed's own docs.
                 val isRelayed = intent.getBooleanExtra(EXTRA_IS_RELAYED, false)
-                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode, isRelayed)
+                // B33 relay follow-up (round 2) - the EXIT host to confirm
+                // against for a Relayed attempt - see
+                // TransportConfig.Xray.relayExitProbeHost's own docs. Always
+                // present when isRelayed is true (VpnController always sets
+                // it alongside EXTRA_IS_RELAYED for a real Relayed attempt);
+                // absent/null here is treated as a genuine configuration
+                // defect, never silently downgraded to Direct - see
+                // startIfNotAlreadyRunning's own handling.
+                val relayExitProbeHost = intent.getStringExtra(EXTRA_RELAY_EXIT_PROBE_HOST)
+                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode, isRelayed, relayExitProbeHost)
                 return Service.START_NOT_STICKY
             }
 
@@ -209,10 +199,28 @@ class NovaXrayVpnService : VpnService() {
         endpointId: EndpointId,
         routingMode: RoutingMode,
         isRelayed: Boolean,
+        relayExitProbeHost: String?,
     ) {
         scope.launch {
+            // B33 relay follow-up (round 2) - a genuinely missing exit host
+            // for a Relayed attempt fails closed immediately (never a silent
+            // Direct-shaped fallback, which would dial the WRONG host's
+            // /v1/manifest and resurrect the exact self-referential-ingress
+            // class of bug round 1 fixed) - structurally unreachable via the
+            // real VpnController/VlessRealityTransport/VlessTlsTransport
+            // path (it always sets this extra alongside EXTRA_IS_RELAYED for
+            // a real Relayed attempt - see TransportConfig.Xray
+            // .relayExitProbeHost's own docs), same "defensive, not a real
+            // code path" shape XrayCoreStartOutcome.Rejected's other call
+            // sites already use.
+            if (isRelayed && relayExitProbeHost == null) {
+                Log.e(TAG, "refusing to start: relayed attempt with no exit probe host")
+                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "relayed attempt missing exit probe host"))
+                stopSelf()
+                return@launch
+            }
             val confirmationContext = if (isRelayed) {
-                buildRelayedConfirmationContext(endpointId)
+                RemoteConfirmationContext.Relayed(exitProbeHost = relayExitProbeHost!!)
             } else {
                 RemoteConfirmationContext.Direct
             }
@@ -253,32 +261,6 @@ class NovaXrayVpnService : VpnService() {
                     XrayRuntimeState.publish(XrayRuntimeEvent.Started(sessionId))
                 }
             }
-        }
-    }
-
-    /**
-     * B33 relay follow-up - builds the real, narrow Relayed confirmation
-     * action for [endpointId] from the SAME already-persisted, encrypted-at-
-     * rest [net.pocvpn.client.relay.IngressClientProfile]
-     * [net.pocvpn.client.relay.RelayIngressResolverImpl] already matched
-     * against this exact attempt moments earlier (see [ingressProfileStoreFactory]'s
-     * own docs) - never re-derived, never a fabricated/local check. No
-     * persisted profile for [endpointId] (should not happen: the attempt was
-     * only marked relayed because a profile already resolved successfully -
-     * this branch exists purely for fail-closed defense against a store
-     * cleared/raced between resolution and this call) confirms `false`
-     * immediately, the SAME fail-closed shape
-     * [net.pocvpn.client.relay.NotConfiguredRelayEndToEndProbe] already uses
-     * for "no real proof channel available" - never a silent Direct
-     * fallback, which would resurrect the exact false-negative/false-positive
-     * class this follow-up exists to fix.
-     */
-    private suspend fun buildRelayedConfirmationContext(endpointId: EndpointId): RemoteConfirmationContext {
-        val profile = ingressProfileStoreFactory(applicationContext).getProfileOrNull(endpointId)
-            ?: return RemoteConfirmationContext.Relayed { false }
-        val probe = relayEndToEndProbeFactory()
-        return RemoteConfirmationContext.Relayed {
-            probe.probeProfile(profile) is net.pocvpn.client.relay.RelayProbeResult.Success
         }
     }
 
@@ -375,6 +357,12 @@ class NovaXrayVpnService : VpnService() {
         // own docs). Absent (false) for any pre-existing caller/intent - see
         // onStartCommand's own parsing.
         const val EXTRA_IS_RELAYED = "net.pocvpn.client.vpn.xray.extra.IS_RELAYED"
+
+        // B33 relay follow-up (round 2) - the EXIT endpoint's own plaintext
+        // HTTPS host (TransportConfig.Xray/XrayTls.relayExitProbeHost - see
+        // that field's own docs) - present exactly when EXTRA_IS_RELAYED is
+        // true for a real Relayed attempt.
+        const val EXTRA_RELAY_EXIT_PROBE_HOST = "net.pocvpn.client.vpn.xray.extra.RELAY_EXIT_PROBE_HOST"
 
         private const val TAG = "NovaXrayVpnService"
     }

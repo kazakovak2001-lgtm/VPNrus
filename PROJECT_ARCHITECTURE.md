@@ -547,6 +547,101 @@ tearing the working tunnel down every attempt.
   `PathScorer`, `AutoGatewaySelector`, attempt budgets, B34 fairness/
   advancement, and AWG are all untouched.
 
+### B33 relay follow-up, round 2 - the replacement probe was ALSO not in-tunnel proof; fixed with an empirically-verified Xray-native target
+
+A further physical CHAIN_DIRECT integration test kept reporting a false
+negative (genuine relay data plane working, app UI still ending in
+`Connection failed`) even with the round-1 fix above deployed. Root cause,
+traced to actual sockets/routing (not inferred from names):
+
+- **Nova's own app process is excluded from its own VPN** -
+  `NovaXrayVpnService.establishInterface` always calls
+  `builder.addDisallowedApplication(novaPackageId)` (recursion prevention -
+  see that function's own docs). This exclusion applies to EVERY socket
+  Nova's process opens, with no exception for a "diagnostic" HTTP call.
+- **`HttpRelayEndToEndProbe.probe()`/`.probeProfile()` were ordinary
+  `java.net.URL.openConnection()` calls made from that SAME excluded
+  process** (`NovaXrayVpnService` for the pre-`Started` gate,
+  `MainViewModel`'s `armFailoverWatch` for the post-`Connected` end-to-end
+  check). Both therefore ran over the device's ordinary default network,
+  never through the just-established client->ingress->exit tunnel,
+  regardless of that tunnel's actual health. `VpnService.protect()` cannot
+  fix this - `protect(socket)` explicitly EXCLUDES a socket from the VPN,
+  the opposite of what would be needed.
+- **The probe target (`IngressClientProfile.endToEndProbeUrl` /
+  `GET /v1/relay-health`) made this concrete, not just theoretical.**
+  Traced through `gateway/api/handler.py`: `probe_url` is minted as
+  `https://{ingress_exit_probe_host}/v1/relay-health` - the EXIT gateway's
+  own public control-plane host, the SAME publicly-reachable address its
+  `/v1/manifest` is served from. A request from Nova's excluded process
+  reached this host DIRECTLY over ordinary internet, entirely bypassing the
+  ingress - a 200/401 there proved only "this device's credential is valid
+  and the exit's control-plane API is reachable right now", independent of
+  whether the Xray tunnel itself worked.
+
+**Fix: reuse Direct's own `measureDelay`/`/v1/manifest` primitive, dialed
+against the EXIT's host instead of the client's own dial target.**
+`XrayCoreRuntime.measureDelay(url)` is not itself excluded from the VPN - it
+dials through the JUST-STARTED core's own outbound/routing (the native
+primitive, not an app-process socket). `RemoteConfirmationContext.Relayed`
+now carries `exitProbeHost` (the EXIT endpoint's plaintext host, from
+`RelayedExecutionPlan.exitBinding.host` - threaded via a new
+`TransportConfig.Xray/XrayTls.relayExitProbeHost` field, `NovaXrayVpnService
+.EXTRA_RELAY_EXIT_PROBE_HOST`), and `confirmRemoteConnectivity` dials
+`https://$exitProbeHost/v1/manifest` - the SAME unauthenticated,
+already-served-by-every-gateway endpoint Direct already trusts, just
+targeting the EXIT rather than the ingress. This sidesteps the
+`measureDelay`-has-no-header-support problem entirely (no bearer token
+needed) and is architecturally distinct from the round-1 bug: round 1 dialed
+the INGRESS's own address (which the ingress's blanket forwarding rule
+bounced back out to the exit and beyond - a genuinely unrelated public round
+trip); this dials the EXIT's address, which the SAME forwarding rule
+delivers TO the exit, which serves it locally.
+
+**Empirically verified safe, read-only, against the real deployed Stockholm
+ingress / Frankfurt exit pair (2026-09-04)** - not guessed:
+- Traced both rendered configs directly: the ingress
+  (`/etc/nova-xray-ingress/config.json`) has exactly one unconditional
+  routing rule forwarding every destination from the client inbound to its
+  `nova-relay-upstream-out` VLESS outbound (dialing the exit's own
+  `nova-vless-reality-in` inbound at `152.70.43.1:2053` directly); the exit
+  (`/etc/nova-xray/config.json`) has NO routing rules at all beyond its
+  single `freedom`/`direct` outbound, which dials whatever destination the
+  proxied connection names.
+- Confirmed via direct read-only SSH to both hosts: (a) the exit's own
+  public IP self-TCP-connects on 443; (b) `curl https://152.70.43.1/v1/manifest`
+  issued FROM the exit itself completes a real TLS 1.3 handshake with
+  certificate verification (`SSL certificate verify ok`, IP-SAN match, no
+  `-k`) and returns HTTP 200 with genuine signed-manifest bytes served by
+  the same nginx Direct's own confirmation already trusts; (c) the identical
+  request works when issued from the Stockholm ingress host toward the
+  Frankfurt exit's public IP (79ms round trip).
+- Conclusion: a client dialing `152.70.43.1:443` through the real Stockholm
+  ingress genuinely arrives at the Frankfurt exit, which dials
+  `152.70.43.1:443` AS ITSELF - a real, working self-connect (not a
+  guess) - never leaving the exit machine a second time. Safe to use as the
+  authoritative in-tunnel Relayed confirmation target.
+
+- **`HttpRelayEndToEndProbe` is not removed** - still real and useful as an
+  OUT-OF-BAND control-plane/credential diagnostic (a 401 is genuine proof
+  the token/HMAC binding is broken) and for `historyPathId`
+  attribution/replay-binding, but is no longer wired as a gate that can
+  overturn a genuine Xray-native `Connected` state:
+  `XrayCoreController.requestStart`'s pre-`Started` gate now uses only the
+  Xray-native EXIT-manifest `measureDelay` check (never
+  `HttpRelayEndToEndProbe`); `MainViewModel.armFailoverWatch`'s
+  post-`Connected` branch, for an XRAY_REALITY/TLS_TCP-resolved relayed
+  attempt (the only kinds any real `RelayIngressResolver` implementation
+  constructs today - AWG upstream chaining remains not implemented, see the
+  B24 "Real supported relay transport matrix" section above), now trusts that already-proven Connected state directly
+  and fires `HttpRelayEndToEndProbe.probe()` fire-and-forget, diagnostic-only,
+  afterward - its result can no longer tear down or advance past a
+  genuinely-Connected relayed session. For any OTHER resolved kind
+  (defensive - `RelayIngressResolver` is a general interface, never assumed
+  Xray-backed), the pre-round-2 probe-gated behavior is unchanged, so this
+  fix does not weaken the resolver-agnostic safety net the B25 tests
+  originally established.
+
 ## Control-plane vs data-plane
 
 - `gateway/api/*.py` (`pocvpn-api`) is fully env-var-driven per instance - zero
