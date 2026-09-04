@@ -712,16 +712,84 @@ class VpnController(
      */
     suspend fun abandonAttemptForFailover() {
         connectMutex.withLock {
-            cancelReconnectLocked()
-            hasTouchedTransport = true
-            activeTransport.disconnect()
-            _appliedRoutingPolicy.value = null
-            _appliedRoutingMode.value = null
-            pendingConnectConfig = null
-            pendingConnectPrivateKeyRepository = null
-            pendingAttemptContext = VpnAttemptContext.Direct
-            _relayStage.value = null
+            teardownActiveAttemptLocked()
             setState(TransportState.Disconnected)
+        }
+    }
+
+    /**
+     * B34 - the shared teardown [disconnect]/[abandonAttemptForFailover]/
+     * [abandonAttemptWithTerminalError] all need: tear down whatever
+     * transport/VpnService/tun the CURRENT attempt owns and clear every
+     * piece of per-attempt pinned state, WITHOUT deciding what
+     * [TransportState] the caller ends up in - that decision is the ONE
+     * thing that genuinely differs between "the user asked to stop"
+     * (Disconnected), "Auto is moving to the next candidate" (Disconnected,
+     * transient - [abandonAttemptForFailover]), and "Auto has genuinely
+     * exhausted every candidate" (a terminal [TransportState.Error] the
+     * caller sets AFTER this returns - [abandonAttemptWithTerminalError] -
+     * so teardown itself can never silently overwrite that terminal reason
+     * back to a plain Disconnected the UI/diagnostics cannot tell apart from
+     * an ordinary user-initiated stop). Caller must already hold
+     * [connectMutex]. Never duplicated - every real transport/tun teardown
+     * on this class goes through this ONE function.
+     */
+    private suspend fun teardownActiveAttemptLocked() {
+        cancelReconnectLocked()
+        hasTouchedTransport = true
+        // B34 - cancelled BEFORE disconnect() (never after): activeTransport
+        // .disconnect() itself flips the transport's OWN observeState() to
+        // Disconnected, which the STILL-ATTACHED switchActiveTransport
+        // collector would otherwise asynchronously forward into `_state` -
+        // a real race that clobbered abandonAttemptWithTerminalError's own
+        // explicit terminal Error back to Disconnected the instant the
+        // caller's next `runCurrent()`/dispatch let that queued collector
+        // emission run (caught by this file's own tests). Harmless for
+        // [abandonAttemptForFailover] (which explicitly sets Disconnected
+        // itself immediately after anyway) and for [disconnect] (which
+        // already relied on this SAME collector to arrive at Disconnected -
+        // still true, since `switchActiveTransport`'s own guard
+        // (`activeObserverJob?.isActive == true`) already treats a
+        // cancelled job as "must attach a fresh one", so the very next real
+        // connect() genuinely reattaches a live collector for this exact
+        // instance, never left permanently deaf).
+        activeObserverJob?.cancel()
+        activeTransport.disconnect()
+        _appliedRoutingPolicy.value = null
+        _appliedRoutingMode.value = null
+        pendingConnectConfig = null
+        pendingConnectPrivateKeyRepository = null
+        pendingAttemptContext = VpnAttemptContext.Direct
+        _relayStage.value = null
+    }
+
+    /**
+     * B34 - the terminal-exhaustion counterpart of [abandonAttemptForFailover]:
+     * physically reproduced as a real bug (PR #53's CHAIN_DIRECT physical
+     * validation) - once the combined Auto sequence genuinely exhausts every
+     * admitted candidate, [MainViewModel.attemptCombined] previously called
+     * [rejectPreflight] to report the terminal error, but that function was
+     * built for the OTHER case ("reject before this controller was ever
+     * touched" - see its own docs) and never tears down a transport/tun a
+     * REAL prior attempt in this same sequence already brought up - the
+     * device was left with a stale, non-functional VPN interface and NO
+     * working Internet at all (worse than the "Connection failed" UI
+     * communicated) until the app process was force-stopped.
+     *
+     * Reuses the EXACT SAME teardown [abandonAttemptForFailover] already
+     * uses (never a second/duplicated disconnect path), but ends at a real
+     * [TransportState.Error] carrying [message] (after recording [error]
+     * into diagnostics, the same [diagnostics] instance every other error
+     * path already writes into) instead of [TransportState.Disconnected] -
+     * so the terminal reason is preserved for the UI/diagnostics, never
+     * silently replaced. The ONE production caller today is
+     * [MainViewModel.attemptCombined]'s own genuine-exhaustion branch.
+     */
+    suspend fun abandonAttemptWithTerminalError(error: VpnError, message: String) {
+        connectMutex.withLock {
+            teardownActiveAttemptLocked()
+            diagnostics.recordError(error)
+            setState(TransportState.Error(message))
         }
     }
 

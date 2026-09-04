@@ -2891,7 +2891,18 @@ class MainViewModel(
             _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(exhausted = true)
                 ?: AutoGatewayDiagnostics(emptyList(), emptyList(), null, "candidate set exhausted", true)
             supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.NoCandidateAvailable))
-            controller.rejectPreflight(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
+            // B34 - this branch is reached only AFTER at least one real
+            // candidate in this SAME combined sequence was actually dialed
+            // (attemptCombined's first call, with attemptedKeys empty,
+            // always finds an unattempted entry when attempts is non-empty -
+            // see nextCombinedAttempt's own docs) - a real transport/tun may
+            // still be up from that last failed attempt.
+            // rejectPreflight (used by connectAuto()'s OWN separate
+            // zero-candidate check above, where nothing was EVER touched) is
+            // the wrong tool here: it never tears down a transport/tun - see
+            // abandonAttemptWithTerminalError's own docs for the real bug
+            // this fixes.
+            controller.abandonAttemptWithTerminalError(VpnError.NoCandidateAvailable, "Automatic gateway candidates exhausted")
             return
         }
         val advancedKeys = attemptedKeys + next.attemptKey
