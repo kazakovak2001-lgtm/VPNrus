@@ -182,6 +182,35 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         assertEquals(1, runtime.startLoopCallCount)
     }
 
+    // --- B33 relay follow-up: confirmationContext threads through unchanged ---
+
+    @Test
+    fun `start with no confirmationContext argument still defaults to Direct - byte-for-byte unaffected`() = runTest {
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(null, runtime, probeScope = this) }
+
+        val outcome = coordinator.start(endpointA, TransportKind.XRAY_REALITY)
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, runtime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `start with an explicit Relayed confirmationContext threads it through to the underlying controller`() = runTest {
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(null, runtime, probeScope = this) }
+
+        val outcome = coordinator.start(
+            endpointA,
+            TransportKind.XRAY_REALITY,
+            confirmationContext = RemoteConfirmationContext.Relayed { true },
+        )
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        // The generic self-manifest probe must never run for a Relayed attempt.
+        assertEquals(0, runtime.measureDelayCallCount)
+    }
+
     @Test
     fun `stop with nothing ever started is a safe no-op`() = runTest {
         val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(probeScope = this) }

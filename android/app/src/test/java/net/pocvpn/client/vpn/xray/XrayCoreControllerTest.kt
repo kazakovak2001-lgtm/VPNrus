@@ -459,6 +459,98 @@ class XrayCoreControllerTest {
         assertFalse(outcome.reason.contains(validProfile.shortId))
     }
 
+    // --- B33 relay follow-up: RemoteConfirmationContext is context-aware ---
+
+    @Test
+    fun `requestStart with no confirmationContext argument still uses the Direct manifest probe - byte-for-byte unaffected`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart()
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, runtime.measureDelayCallCount)
+        assertEquals("https://${validProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+    }
+
+    @Test
+    fun `a Relayed context never calls measureDelay - the generic self-manifest probe is never used for a relayed attempt`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed { true },
+        )
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(0, runtime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `a Relayed context whose confirm action succeeds reports Started`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed { true },
+        )
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+    }
+
+    @Test
+    fun `a Relayed context whose confirm action fails reports RemoteUnconfirmed and tears down - never Started`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        val harness = Harness(repository, coreRuntime = runtime)
+
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed { false },
+        )
+
+        assertTrue("expected RemoteUnconfirmed, got $outcome", outcome is XrayCoreStartOutcome.RemoteUnconfirmed)
+        assertEquals(1, runtime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+    }
+
+    @Test
+    fun `a Relayed context whose confirm action throws reports RemoteUnconfirmed - fails closed, never propagates the exception`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed { throw java.io.IOException("upstream unreachable") },
+        )
+
+        assertTrue("expected RemoteUnconfirmed, got $outcome", outcome is XrayCoreStartOutcome.RemoteUnconfirmed)
+    }
+
+    @Test
+    fun `a Relayed context whose confirm action blocks past the bound is abandoned - requestStart still returns within the deadline`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+
+        val startedAt = System.currentTimeMillis()
+        val outcome = harness.controller.requestStart(
+            confirmationContext = RemoteConfirmationContext.Relayed {
+                kotlinx.coroutines.delay(20_000L)
+                true
+            },
+        )
+        val elapsedMillis = System.currentTimeMillis() - startedAt
+
+        assertTrue("expected RemoteUnconfirmed, got $outcome", outcome is XrayCoreStartOutcome.RemoteUnconfirmed)
+        assertTrue("requestStart must return within the bound, took ${elapsedMillis}ms", elapsedMillis < 10_000L)
+    }
+
     @Test
     fun `TLS_TCP and REALITY share the same lifecycle gate - a second start while one is running is rejected`() = runBlocking {
         val repository = newRepository()

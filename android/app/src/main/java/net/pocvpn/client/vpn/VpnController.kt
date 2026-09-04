@@ -1006,7 +1006,13 @@ class VpnController(
                     ?: throw XrayProfileNotReadyException("no Xray profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                     is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
+                    is XrayRuntimeResolution.Ready -> TransportConfig.Xray(
+                        resolution.config,
+                        endpointId = pendingConnectEndpointId,
+                        routingMode = routingMode,
+                        // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
+                        isRelayed = pendingAttemptContext is VpnAttemptContext.Relayed,
+                    )
                 }
             }
             TransportKind.TLS_TCP -> {
@@ -1019,7 +1025,13 @@ class VpnController(
                     ?: throw XrayProfileNotReadyException("no Xray TLS profile repository configured for endpoint ${pendingConnectEndpointId.value}")
                 when (val resolution = XrayRuntimeResolver.resolveTls(repository)) {
                     is XrayTlsRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
-                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(resolution.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
+                    is XrayTlsRuntimeResolution.Ready -> TransportConfig.XrayTls(
+                        resolution.config,
+                        endpointId = pendingConnectEndpointId,
+                        routingMode = routingMode,
+                        // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
+                        isRelayed = pendingAttemptContext is VpnAttemptContext.Relayed,
+                    )
                 }
             }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")

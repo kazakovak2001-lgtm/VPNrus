@@ -81,6 +81,25 @@ class NovaXrayVpnService : VpnService() {
         net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory.create(context, endpointId)
     }
 
+    // B33 relay follow-up - same "overridable only for tests" contract as
+    // profileRepositoryFactory/tlsProfileRepositoryFactory above: production
+    // always reads the SAME real, encrypted-at-rest, per-endpoint
+    // IngressProfileStore MainViewModel/RelayIngressResolverImpl already
+    // persist to (see IngressProfileStoreFactory's own docs) - never a
+    // second, independent store.
+    internal var ingressProfileStoreFactory: (Context) -> net.pocvpn.client.relay.IngressProfileStore = { context ->
+        net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
+    }
+
+    // B33 relay follow-up - the SAME real HttpRelayEndToEndProbe
+    // RelayCompositionFactory wires for the LATER, plan-scoped end-to-end
+    // proof armFailoverWatch performs after Connected (see RelayExecution.kt's
+    // own docs) - constructed independently here (a cheap, stateless class)
+    // rather than threaded from MainViewModel, since this service has no
+    // direct object reference to that instance across the Service/Intent
+    // boundary. Overridable only for tests.
+    internal var relayEndToEndProbeFactory: () -> net.pocvpn.client.relay.HttpRelayEndToEndProbe = { net.pocvpn.client.relay.HttpRelayEndToEndProbe() }
+
     // B13 (2026-08-30 PR #25 review fix) - the ONE place [XrayCoreController]
     // is ever constructed, and the ONE place its per-endpoint selection AND
     // requestStart/requestStop calls are serialized - see that class's own
@@ -151,7 +170,11 @@ class NovaXrayVpnService : VpnService() {
                 val routingMode = intent.getStringExtra(EXTRA_ROUTING_MODE)
                     ?.let { runCatching { RoutingMode.valueOf(it) }.getOrNull() }
                     ?: RoutingMode.FULL_VPN
-                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode)
+                // B33 relay follow-up - absent for any pre-B33-relay-follow-up
+                // caller/intent, defaulting to false (Direct) - see
+                // TransportConfig.Xray.isRelayed's own docs.
+                val isRelayed = intent.getBooleanExtra(EXTRA_IS_RELAYED, false)
+                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode, isRelayed)
                 return Service.START_NOT_STICKY
             }
 
@@ -180,9 +203,20 @@ class NovaXrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long, kind: TransportKind, endpointId: EndpointId, routingMode: RoutingMode) {
+    private fun startIfNotAlreadyRunning(
+        sessionId: Long,
+        kind: TransportKind,
+        endpointId: EndpointId,
+        routingMode: RoutingMode,
+        isRelayed: Boolean,
+    ) {
         scope.launch {
-            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode)) {
+            val confirmationContext = if (isRelayed) {
+                buildRelayedConfirmationContext(endpointId)
+            } else {
+                RemoteConfirmationContext.Direct
+            }
+            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode, confirmationContext)) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
@@ -219,6 +253,32 @@ class NovaXrayVpnService : VpnService() {
                     XrayRuntimeState.publish(XrayRuntimeEvent.Started(sessionId))
                 }
             }
+        }
+    }
+
+    /**
+     * B33 relay follow-up - builds the real, narrow Relayed confirmation
+     * action for [endpointId] from the SAME already-persisted, encrypted-at-
+     * rest [net.pocvpn.client.relay.IngressClientProfile]
+     * [net.pocvpn.client.relay.RelayIngressResolverImpl] already matched
+     * against this exact attempt moments earlier (see [ingressProfileStoreFactory]'s
+     * own docs) - never re-derived, never a fabricated/local check. No
+     * persisted profile for [endpointId] (should not happen: the attempt was
+     * only marked relayed because a profile already resolved successfully -
+     * this branch exists purely for fail-closed defense against a store
+     * cleared/raced between resolution and this call) confirms `false`
+     * immediately, the SAME fail-closed shape
+     * [net.pocvpn.client.relay.NotConfiguredRelayEndToEndProbe] already uses
+     * for "no real proof channel available" - never a silent Direct
+     * fallback, which would resurrect the exact false-negative/false-positive
+     * class this follow-up exists to fix.
+     */
+    private suspend fun buildRelayedConfirmationContext(endpointId: EndpointId): RemoteConfirmationContext {
+        val profile = ingressProfileStoreFactory(applicationContext).getProfileOrNull(endpointId)
+            ?: return RemoteConfirmationContext.Relayed { false }
+        val probe = relayEndToEndProbeFactory()
+        return RemoteConfirmationContext.Relayed {
+            probe.probeProfile(profile) is net.pocvpn.client.relay.RelayProbeResult.Success
         }
     }
 
@@ -308,6 +368,13 @@ class NovaXrayVpnService : VpnService() {
         // own parsing. VlessRealityTransport/VlessTlsTransport set this from
         // TransportConfig.Xray/XrayTls.routingMode.
         const val EXTRA_ROUTING_MODE = "net.pocvpn.client.vpn.xray.extra.ROUTING_MODE"
+
+        // B33 relay follow-up - true only when VpnController's own
+        // pendingAttemptContext is VpnAttemptContext.Relayed for THIS
+        // attempt (TransportConfig.Xray/XrayTls.isRelayed - see that field's
+        // own docs). Absent (false) for any pre-existing caller/intent - see
+        // onStartCommand's own parsing.
+        const val EXTRA_IS_RELAYED = "net.pocvpn.client.vpn.xray.extra.IS_RELAYED"
 
         private const val TAG = "NovaXrayVpnService"
     }

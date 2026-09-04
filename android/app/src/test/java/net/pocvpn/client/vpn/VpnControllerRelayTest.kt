@@ -130,6 +130,68 @@ class VpnControllerRelayTest {
         assertEquals(VpnSessionHealth.RelayProtected, controller.sessionHealth.value)
     }
 
+    // --- B33 relay follow-up: TransportConfig.Xray.isRelayed is set from the real pendingAttemptContext, never guessed ---
+
+    @Test
+    fun `a relayed attempt's real TransportConfig carries isRelayed=true - so NovaXrayVpnService can build the correct confirmation strategy`() = runTest {
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(net.pocvpn.client.identity.XrayProfile(
+            server = "203.0.113.50", serverPort = 443, uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+            flow = "", serverName = "example.com", fingerprint = "chrome",
+            realityPublicKey = "A".repeat(43), shortId = "ab",
+        ))
+        val plan = relayedPlan()
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), DiagnosticsStore(), backgroundScope,
+            relayXrayProfileRepositoryResolver = net.pocvpn.client.identity.XrayProfileRepositoryResolver { id -> if (id == plan.ingressEndpointId) xrayRepository else null },
+        )
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                transport = xrayTransport,
+                kind = TransportKind.XRAY_REALITY,
+                endpointId = plan.ingressEndpointId,
+                attemptContext = VpnAttemptContext.Relayed(plan),
+            ),
+        )
+        runCurrent()
+
+        val config = xrayTransport.lastConfig as net.pocvpn.client.vpn.config.TransportConfig.Xray
+        assertTrue("a relayed attempt's TransportConfig.Xray must carry isRelayed=true", config.isRelayed)
+    }
+
+    @Test
+    fun `a Direct XRAY_REALITY attempt's TransportConfig carries isRelayed=false (control, unaffected)`() = runTest {
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(net.pocvpn.client.identity.XrayProfile(
+            server = "203.0.113.50", serverPort = 443, uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+            flow = "", serverName = "example.com", fingerprint = "chrome",
+            realityPublicKey = "A".repeat(43), shortId = "ab",
+        ))
+        val endpointId = EndpointId("germany")
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), DiagnosticsStore(), backgroundScope,
+            xrayProfileRepositoryResolver = net.pocvpn.client.identity.XrayProfileRepositoryResolver { id -> if (id == endpointId) xrayRepository else null },
+        )
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                transport = xrayTransport,
+                kind = TransportKind.XRAY_REALITY,
+                endpointId = endpointId,
+                attemptContext = VpnAttemptContext.Direct,
+            ),
+        )
+        runCurrent()
+
+        val config = xrayTransport.lastConfig as net.pocvpn.client.vpn.config.TransportConfig.Xray
+        assertTrue("a Direct attempt's TransportConfig.Xray must carry isRelayed=false", !config.isRelayed)
+    }
+
     // --- task D: no single-hop PathHistoryStore/ConnectionOutcomeStore write for a relayed attempt ---
 
     @Test

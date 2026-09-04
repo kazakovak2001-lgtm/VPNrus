@@ -143,6 +143,74 @@ class RelayExecutionTest {
     }
 }
 
+// --- B33 relay follow-up: HttpRelayEndToEndProbe.probeProfile - the narrower half [XrayCoreController]'s Relayed confirmation reuses ---
+
+class HttpRelayEndToEndProbeTest {
+
+    private fun plan(historyPathId: String = "ingress-1:XRAY_REALITY->exit-1:AMNEZIA_WG") = RelayedExecutionPlan(
+        ingressEndpointId = EndpointId("ingress-1"),
+        ingressBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 2093),
+        ingressTransport = TransportKind.XRAY_REALITY,
+        ingressKind = IngressKind.DIRECT_IP,
+        exitEndpointId = EndpointId("exit-1"),
+        exitBinding = EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.60", 51820),
+        exitTransport = TransportKind.AMNEZIA_WG,
+        historyPathId = historyPathId,
+    )
+
+    // No real profile-issued endpoint is dialable from a plain JVM unit
+    // test (see this method's own scope note below) - these cases exercise
+    // the parts of probeProfile/probe that are decidable WITHOUT a live
+    // round trip: a missing/refused probe URL, and (for the real-network
+    // case) a genuinely refused loopback connection - proving the method
+    // fails closed with a typed category and never throws out of the
+    // suspend boundary, rather than asserting on a fabricated success.
+
+    @Test
+    fun `probeProfile fails closed with EXECUTION_NOT_IMPLEMENTED when the profile carries no probe URL`() = runTest {
+        val profile = fakeIngressClientProfile(plan(), endToEndProbeUrl = null, endToEndProbeToken = null)
+
+        val result = HttpRelayEndToEndProbe().probeProfile(profile)
+
+        assertTrue(result is RelayProbeResult.Failure)
+        assertEquals(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, (result as RelayProbeResult.Failure).category)
+    }
+
+    @Test
+    fun `probeProfile refuses a non-HTTPS probe URL without attempting any connection`() = runTest {
+        val profile = fakeIngressClientProfile(plan(), endToEndProbeUrl = "http://127.0.0.1:1/probe", endToEndProbeToken = "t")
+
+        val result = HttpRelayEndToEndProbe().probeProfile(profile)
+
+        assertTrue(result is RelayProbeResult.Failure)
+        assertEquals(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, (result as RelayProbeResult.Failure).category)
+    }
+
+    @Test
+    fun `probeProfile fails closed (never throws) against a genuinely unreachable real endpoint`() = runTest {
+        // Port 1 on loopback: a real TCP connect that is genuinely refused -
+        // exercises the actual java.net.HttpURLConnection code path for
+        // real, without depending on any externally-reachable host.
+        val profile = fakeIngressClientProfile(plan(), endToEndProbeUrl = "https://127.0.0.1:1/probe", endToEndProbeToken = "t")
+
+        val result = HttpRelayEndToEndProbe().probeProfile(profile)
+
+        assertTrue("expected a typed Failure, got $result", result is RelayProbeResult.Failure)
+        assertEquals(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, (result as RelayProbeResult.Failure).category)
+    }
+
+    @Test
+    fun `probe(plan, profile) fails closed the same way probeProfile does for a shared, unreachable target - never a fabricated success from either`() = runTest {
+        val profile = fakeIngressClientProfile(plan(), endToEndProbeUrl = "https://127.0.0.1:1/probe", endToEndProbeToken = "t")
+
+        val narrow = HttpRelayEndToEndProbe().probeProfile(profile)
+        val full = HttpRelayEndToEndProbe().probe(plan(), profile)
+
+        assertTrue(narrow is RelayProbeResult.Failure)
+        assertTrue(full is RelayProbeResult.Failure)
+    }
+}
+
 /** Shared test fixture - a structurally-valid [IngressClientProfile] matching [plan]. */
 internal fun fakeIngressClientProfile(
     plan: RelayedExecutionPlan,

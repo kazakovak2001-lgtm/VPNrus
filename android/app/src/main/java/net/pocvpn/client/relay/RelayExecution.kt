@@ -305,13 +305,48 @@ class HttpRelayEndToEndProbe(
     private val connectTimeoutMillis: Int = 5_000,
     private val readTimeoutMillis: Int = 5_000,
 ) : RelayEndToEndProbe {
-    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult {
+    override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult =
+        when (val result = fetch(profile)) {
+            is FetchResult.Failure -> result.asRelayProbeResult
+            is FetchResult.Success ->
+                if (!result.body.contains(plan.historyPathId)) {
+                    RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe response did not echo this session's path identity")
+                } else {
+                    RelayProbeResult.Success
+                }
+        }
+
+    /**
+     * B33 relay follow-up - the narrower half of [probe]: the SAME real,
+     * bearer-authenticated HTTPS round trip through client -> ingress ->
+     * exit, minus [probe]'s own historyPathId echo check (there is no
+     * [RelayedExecutionPlan] to echo against at the point this is called -
+     * see [net.pocvpn.client.vpn.xray.XrayCoreController.RemoteConfirmationContext.Relayed]'s
+     * own docs for exactly why THIS is the correct, narrowest positive
+     * signal for that gate, not [probe]). [fetch] is the ONE real
+     * HTTP-calling implementation both this and [probe] share - never two
+     * independent network paths that could silently diverge.
+     */
+    suspend fun probeProfile(profile: IngressClientProfile): RelayProbeResult =
+        when (val result = fetch(profile)) {
+            is FetchResult.Failure -> result.asRelayProbeResult
+            is FetchResult.Success -> RelayProbeResult.Success
+        }
+
+    private sealed class FetchResult {
+        data class Success(val body: String) : FetchResult()
+        data class Failure(val category: RelayFailureCategory, val detail: String?) : FetchResult() {
+            val asRelayProbeResult: RelayProbeResult get() = RelayProbeResult.Failure(category, detail)
+        }
+    }
+
+    private fun fetch(profile: IngressClientProfile): FetchResult {
         val urlString = profile.endToEndProbeUrl
-            ?: return RelayProbeResult.Failure(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, "profile carries no end-to-end probe URL")
+            ?: return FetchResult.Failure(RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED, "profile carries no end-to-end probe URL")
         return try {
             val url = java.net.URL(urlString)
             if (url.protocol != "https") {
-                return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "refusing a non-HTTPS probe URL")
+                return FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "refusing a non-HTTPS probe URL")
             }
             val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -324,22 +359,19 @@ class HttpRelayEndToEndProbe(
             try {
                 val status = connection.responseCode
                 if (status != java.net.HttpURLConnection.HTTP_OK) {
-                    return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe returned HTTP $status")
+                    return FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe returned HTTP $status")
                 }
                 val body = connection.inputStream.bufferedReader().use { it.readText() }
-                if (!body.contains(plan.historyPathId)) {
-                    return RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "probe response did not echo this session's path identity")
-                }
-                RelayProbeResult.Success
+                FetchResult.Success(body)
             } finally {
                 connection.disconnect()
             }
         } catch (e: java.net.SocketTimeoutException) {
-            RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
         } catch (e: java.io.IOException) {
-            RelayProbeResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
         } catch (e: Exception) {
-            RelayProbeResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, e.javaClass.simpleName)
         }
     }
 }

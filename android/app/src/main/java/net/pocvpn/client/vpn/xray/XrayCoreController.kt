@@ -52,6 +52,54 @@ sealed class XrayCoreStartOutcome {
     data class RemoteUnconfirmed(val reason: String) : XrayCoreStartOutcome()
 }
 
+/**
+ * B33 relay follow-up - which real, positive confirmation
+ * [XrayCoreController.requestStart] must obtain beyond local process startup
+ * before ever reporting [XrayCoreStartOutcome.Started], keyed to the actual
+ * execution context of THIS attempt - never decided by this class itself
+ * from an endpoint id or transport kind (this class has, and must keep
+ * having, zero knowledge of "stockholm-ingress-1"/CHAIN_DIRECT or any other
+ * specific ingress). The caller that already knows which kind of attempt
+ * this is ([NovaXrayVpnService], threaded from [net.pocvpn.client.relay.VpnAttemptContext]
+ * all the way from [net.pocvpn.client.vpn.VpnController] - see that sealed
+ * class's own docs) picks the variant; this class only ever executes it.
+ *
+ * [Direct] is the default for every pre-existing call site - byte-for-byte
+ * the SAME generic `/v1/manifest` round trip [confirmRemoteConnectivity]
+ * already performed before this type existed. Physical integration testing
+ * (combined PR #55 + PR #53 pre-merge validation) proved that same generic
+ * probe is UNSOUND for a Relayed attempt: the client's rendered Xray config
+ * has exactly one outbound and no routing rules (see [XrayConfigRenderer]),
+ * so ANY destination [confirmRemoteConnectivity] asks for is dialed through
+ * that one outbound - the ingress. The ingress's OWN server-side routing
+ * (verified directly against the deployed `/etc/nova-xray-ingress/config.json`,
+ * not assumed) then unconditionally forwards EVERY destination to its fixed
+ * relay-upstream hop, with no exception for the ingress's own address - so a
+ * generic `https://<ingressHost>/v1/manifest` probe does not test "is the
+ * client<->ingress hop alive", it accidentally asks the exit hop to dial
+ * back to the ingress's own control-plane over the public internet, an
+ * unrelated, fragile, self-referential round trip that has nothing to do
+ * with genuine relay health and was observed to fail even while real
+ * end-user DNS/HTTPS traffic was concurrently, successfully traversing the
+ * SAME tunnel (confirmed server-side in the ingress's own access log).
+ *
+ * [Relayed] carries the already-scoped confirmation action itself ([confirm]),
+ * never a [net.pocvpn.client.relay.RelayedExecutionPlan]/
+ * [net.pocvpn.client.relay.IngressClientProfile] directly - this class stays
+ * entirely free of any dependency on the `relay` package, and the action is
+ * free to be backed by whatever real proof channel the caller has already
+ * wired (today: [net.pocvpn.client.relay.HttpRelayEndToEndProbe.probeProfile],
+ * the SAME real, bearer-authenticated, purpose-built control-plane endpoint
+ * [net.pocvpn.client.relay.HttpRelayEndToEndProbe.probe] already uses for the
+ * LATER, plan-scoped end-to-end proof `armFailoverWatch` performs after
+ * `Connected` - never a fabricated/local check, never "TCP/Reality handshake
+ * accepted == healthy").
+ */
+sealed class RemoteConfirmationContext {
+    object Direct : RemoteConfirmationContext()
+    data class Relayed(val confirm: suspend () -> Boolean) : RemoteConfirmationContext()
+}
+
 /** Result of one [XrayCoreController.requestStop] call. */
 data class XrayCoreStopOutcome(
     /** False (no-op - matches [XrayServiceLifecycleGate.tryBeginTeardown]'s own contract) if nothing was running. */
@@ -127,7 +175,15 @@ class XrayCoreController(
     // B18-2 - [routingMode] defaults to FULL_VPN so every pre-B18-2 call site
     // (real or test) is byte-for-byte unaffected - see buildXrayVpnPlan's own
     // docs for the exact route-set contract this threads into.
-    suspend fun requestStart(kind: TransportKind = TransportKind.XRAY_REALITY, routingMode: RoutingMode = RoutingMode.FULL_VPN): XrayCoreStartOutcome {
+    // B33 relay follow-up - [confirmationContext] defaults to
+    // [RemoteConfirmationContext.Direct] so every pre-existing call site
+    // (real or test) is byte-for-byte unaffected - see that sealed class's
+    // own docs for why a Relayed attempt must supply a different value here.
+    suspend fun requestStart(
+        kind: TransportKind = TransportKind.XRAY_REALITY,
+        routingMode: RoutingMode = RoutingMode.FULL_VPN,
+        confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
+    ): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
             XrayServiceStartDecision.IGNORE_START_IN_FLIGHT -> return XrayCoreStartOutcome.StartInFlight
@@ -170,7 +226,7 @@ class XrayCoreController(
                 // that the LOCAL core/tun exist - see confirmRemoteConnectivity's
                 // own docs for why that is never, by itself, sufficient
                 // evidence the tunnel is actually usable.
-                if (confirmRemoteConnectivity(ready.serverHost)) {
+                if (confirmRemoteConnectivity(ready.serverHost, confirmationContext)) {
                     success = true
                     XrayCoreStartOutcome.Started
                 } else {
@@ -274,13 +330,29 @@ class XrayCoreController(
      *   by the SAME [net.pocvpn.client.smartconnect.AutoGatewaySelector.MAX_ATTEMPTS]
      *   bound that already caps the whole combined attempt sequence - this
      *   introduces no new unbounded-retry surface.
+     *
+     * B33 relay follow-up - [context] selects WHICH real check runs inside
+     * the abandonable probe coroutine below (see [RemoteConfirmationContext]'s
+     * own docs for exactly why a Relayed attempt cannot reuse the
+     * [RemoteConfirmationContext.Direct] branch's `/v1/manifest` round trip) -
+     * every other guarantee described above (the independent probe
+     * coroutine, the real bounded [withTimeoutOrNull] deadline, "late
+     * completion is inert") is completely unchanged and applies identically
+     * to both branches: [RemoteConfirmationContext.Relayed.confirm] is just
+     * as much an ordinary suspend call running on [probeScope] here,
+     * abandoned exactly the same way on timeout.
      */
-    private suspend fun confirmRemoteConnectivity(serverHost: String): Boolean {
+    private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         probeScope.launch {
             val confirmed = try {
-                coreRuntime.measureDelay("https://$serverHost/v1/manifest")
-                true
+                when (context) {
+                    is RemoteConfirmationContext.Direct -> {
+                        coreRuntime.measureDelay("https://$serverHost/v1/manifest")
+                        true
+                    }
+                    is RemoteConfirmationContext.Relayed -> context.confirm()
+                }
             } catch (t: Throwable) {
                 false
             }

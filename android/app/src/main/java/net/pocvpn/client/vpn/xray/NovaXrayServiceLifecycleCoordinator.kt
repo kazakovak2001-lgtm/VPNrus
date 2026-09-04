@@ -62,8 +62,17 @@ class NovaXrayServiceLifecycleCoordinator(
     // B18-2 - [routingMode] defaults to FULL_VPN, same reasoning as
     // XrayCoreController.requestStart's own default - every pre-B18-2 caller
     // is byte-for-byte unaffected.
-    suspend fun start(endpointId: EndpointId, kind: TransportKind, routingMode: RoutingMode = RoutingMode.FULL_VPN): XrayCoreStartOutcome = mutex.withLock {
-        selectControllerLocked(endpointId).requestStart(kind, routingMode)
+    // B33 relay follow-up - [confirmationContext] defaults to
+    // [RemoteConfirmationContext.Direct], same reasoning -
+    // every pre-existing caller is byte-for-byte unaffected; NovaXrayVpnService
+    // is the one real caller that supplies a Relayed value.
+    suspend fun start(
+        endpointId: EndpointId,
+        kind: TransportKind,
+        routingMode: RoutingMode = RoutingMode.FULL_VPN,
+        confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
+    ): XrayCoreStartOutcome = mutex.withLock {
+        selectControllerLocked(endpointId).requestStart(kind, routingMode, confirmationContext)
     }
 
     /**
