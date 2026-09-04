@@ -1005,35 +1005,52 @@ class MainViewModel(
         val descriptors = mutableListOf(
             TransportDescriptor(kind = transport.kind, status = TransportStatus.AVAILABLE, capabilities = transport.capabilities, factory = { transport }),
         )
-        // B32 - a RELAY-ONLY endpoint (an INGRESS such as
-        // ProductionIngressEndpoints.STOCKHOLM, or any future manifest-named
-        // one) has no ProductionGatewayCatalog entry and therefore no
-        // per-device Direct Xray PROFILE to gate on: isXrayAvailableFor's
-        // own per-endpoint semantics exist to answer "has a real Direct
-        // profile been provisioned for THIS gateway" (B8O2's own "one
-        // endpoint's profile can never make a different endpoint appear
-        // available" invariant) - a question with no meaning for an
-        // ingress, whose real per-device credential gating is
-        // RelayIngressResolver's own job downstream (IngressClientProfile
-        // matching - see that resolver's own docs), never this registry.
-        // Registering the transport as AVAILABLE here for a non-gateway
-        // endpoint id only asserts "this device can technically SPEAK this
-        // protocol at all" - it does NOT claim a real relay credential
-        // exists, so it cannot make an unprovisioned relay connect:
-        // NotProvisionedRelayIngressResolver (the only resolver wired into
-        // production today) still fails closed with EXECUTION_NOT_IMPLEMENTED
-        // for every relay plan regardless of this flag. Without this, a
-        // real ingress candidate could never even become ELIGIBLE for
-        // ranking (PathScorer.isEligible's TRANSPORT_NOT_IMPLEMENTED check),
-        // so buildRelayedCandidates would silently never rank it - never
-        // scored, never attempted, never diagnosable - defeating B32's own
-        // wiring fix before it could take effect. Every pre-B32 GATEWAY
-        // endpoint id (Germany/Stockholm's own) is completely unaffected -
-        // still gated by isXrayAvailableFor exactly as before.
-        val isKnownGatewayEndpoint = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.any { it.endpointId == endpointId }
+        // B32 review fix (round 2, narrowed) - a KNOWN, code-reviewed
+        // INGRESS endpoint (today, only ProductionIngressEndpoints.STOCKHOLM)
+        // has no ProductionGatewayCatalog entry and therefore no per-device
+        // Direct Xray PROFILE to gate on: isXrayAvailableFor's own
+        // per-endpoint semantics exist to answer "has a real Direct profile
+        // been provisioned for THIS gateway" (B8O2's own "one endpoint's
+        // profile can never make a different endpoint appear available"
+        // invariant) - a question with no meaning for an ingress, whose real
+        // per-device credential gating is RelayIngressResolver's own job
+        // downstream (IngressClientProfile matching - see that resolver's
+        // own docs), never this registry. Registering the transport as
+        // AVAILABLE here only for an id [ProductionIngressEndpoints] itself
+        // names only asserts "this device can technically SPEAK this
+        // protocol at all" for a REAL, reviewed ingress - it does NOT claim a
+        // real relay credential exists, so it cannot make an unprovisioned
+        // relay connect: RelayIngressResolverImpl's own PROFILE_NOT_PROVISIONED
+        // check (the real resolver MainViewModel.Factory wires into
+        // production) still fails closed regardless of this flag.
+        //
+        // Deliberately NARROWER than "any endpoint id absent from
+        // ProductionGatewayCatalog" (an earlier version of this fix, PR #53
+        // review round 2): that broader rule would have let ANY
+        // manifest-named id this device has never heard of - a malformed
+        // entry, an unrelated future EXIT-only id, a typo - spuriously
+        // report XRAY_REALITY/TLS_TCP as AVAILABLE too, purely by NOT being
+        // one of the two catalog gateways. Gating on membership in
+        // [ProductionIngressEndpoints.all] instead mirrors EXACTLY how a
+        // GATEWAY id is gated on membership in
+        // [net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all] -
+        // both are the SAME kind of hardcoded, code-reviewed catalog
+        // membership check, never a fallback for "unknown". Any OTHER
+        // endpoint id (including a future manifest-named ingress not yet in
+        // this catalog) falls through to the ORIGINAL isXrayAvailableFor
+        // gate, which is false for it today (no per-device provisioning
+        // exists for an id this app has never heard of) - fails closed by
+        // construction, not merely by convention. Without this fix, a real
+        // ingress candidate could never even become ELIGIBLE for ranking
+        // (PathScorer.isEligible's TRANSPORT_NOT_IMPLEMENTED check), so
+        // buildRelayedCandidates would silently never rank it - defeating
+        // B32's own discovery-wiring fix before it could take effect. Every
+        // GATEWAY endpoint id (Germany's/Stockholm's own) is completely
+        // unaffected - still gated by isXrayAvailableFor exactly as before.
+        val isKnownIngressEndpoint = net.pocvpn.client.smartconnect.ProductionIngressEndpoints.all.any { it.id == endpointId }
         val xray = xrayTransport
         if (xray != null) {
-            val available = if (isKnownGatewayEndpoint) isXrayAvailableFor(endpointId) else true
+            val available = if (isKnownIngressEndpoint) true else isXrayAvailableFor(endpointId)
             descriptors += TransportDescriptor(
                 kind = xray.kind,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
@@ -1050,8 +1067,8 @@ class MainViewModel(
         // failover decision - see docs/ROADMAP.md's own safety-boundary note.
         val xrayTls = xrayTlsTransport
         if (xrayTls != null) {
-            // B32 - same non-gateway-endpoint reasoning as XRAY_REALITY above.
-            val available = if (isKnownGatewayEndpoint) isXrayTlsAvailableFor(endpointId) else true
+            // B32 review fix (round 2) - same known-ingress-catalog-membership reasoning as XRAY_REALITY above.
+            val available = if (isKnownIngressEndpoint) true else isXrayTlsAvailableFor(endpointId)
             descriptors += TransportDescriptor(
                 kind = xrayTls.kind,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,

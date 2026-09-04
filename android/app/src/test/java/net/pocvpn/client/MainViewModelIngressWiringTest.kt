@@ -20,10 +20,19 @@ import net.pocvpn.client.reachability.ManifestCanonicalizer
 import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
 import net.pocvpn.client.reachability.SignedManifest
 import net.pocvpn.client.reachability.TrustedKeyId
+import net.pocvpn.client.provisioning.IngressProfileResult
+import net.pocvpn.client.relay.IngressActivationOutcome
+import net.pocvpn.client.relay.IngressProfileProvisioner
+import net.pocvpn.client.relay.InMemoryIngressProfileStore
 import net.pocvpn.client.relay.NotConfiguredRelayEndToEndProbe
 import net.pocvpn.client.relay.NotProvisionedRelayIngressResolver
+import net.pocvpn.client.relay.RelayFailureCategory
+import net.pocvpn.client.relay.RelayIngressResolution
+import net.pocvpn.client.relay.RelayIngressResolver
+import net.pocvpn.client.relay.RelayedExecutionPlan
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.smartconnect.ProductionIngressEndpoints
+import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.FakeClientKeyRepository
 import net.pocvpn.client.vpn.FakeClientTunnelIdentityStore
@@ -31,6 +40,8 @@ import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeSelectedGatewayStore
 import net.pocvpn.client.vpn.FakeVpnTransport
+import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayAutoModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -41,6 +52,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -69,6 +81,28 @@ private val USABLE_WIFI = net.pocvpn.client.network.NetworkProfile(
 private class IngressWiringAlwaysAutoModeStore : GatewayAutoModeStore {
     override fun read(): Boolean = true
     override fun write(auto: Boolean) {}
+}
+
+/** Same stubbing shape MainViewModelRelayActivationTest's own suite already uses to prove the resolver execution boundary. */
+private class IngressWiringStubResolver(private val resolutionFor: (RelayedExecutionPlan) -> RelayIngressResolution) : RelayIngressResolver {
+    val resolvedPlans = mutableListOf<RelayedExecutionPlan>()
+    override suspend fun resolve(plan: RelayedExecutionPlan): RelayIngressResolution {
+        resolvedPlans += plan
+        return resolutionFor(plan)
+    }
+}
+
+/** A minimal real [VpnTransport] a [RelayIngressResolution.Resolved] can hand to the real TransportOrchestrator/VpnController path. */
+private class IngressWiringFakeTransport(override val kind: TransportKind) : VpnTransport {
+    override val name: String = "ingress-wiring-fake"
+    override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
+    private val stateFlow = kotlinx.coroutines.flow.MutableStateFlow<TransportState>(TransportState.Disconnected)
+    override fun preparePermissionIntent(): android.content.Intent? = null
+    override suspend fun connect(config: net.pocvpn.client.vpn.config.TransportConfig) {
+        stateFlow.value = TransportState.Connected
+    }
+    override suspend fun disconnect() { stateFlow.value = TransportState.Disconnected }
+    override fun observeState(): kotlinx.coroutines.flow.Flow<TransportState> = stateFlow
 }
 
 /**
@@ -149,9 +183,12 @@ class MainViewModelIngressWiringTest {
                 ProductionGatewayCatalog.STOCKHOLM.id to "10.77.0.3",
             ),
         ),
+        transport: VpnTransport = FakeVpnTransport(),
+        relayIngressResolver: RelayIngressResolver = NotProvisionedRelayIngressResolver,
+        ingressProfileProvisioner: IngressProfileProvisioner? = null,
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
-        transport = FakeVpnTransport(),
+        transport = transport,
         xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY),
         gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
         reconnectManager = FakeReconnectManager(),
@@ -162,9 +199,14 @@ class MainViewModelIngressWiringTest {
         initialNetworkProfile = USABLE_WIFI,
         manifestRepository = manifestRepository,
         fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
-        relayIngressResolver = NotProvisionedRelayIngressResolver,
+        relayIngressResolver = relayIngressResolver,
         relayEndToEndProbe = NotConfiguredRelayEndToEndProbe,
+        ingressProfileProvisioner = ingressProfileProvisioner,
+        ioDispatcher = testDispatcher,
     )
+
+    /** No client tunnel identity for either gateway - Direct candidates are structurally excluded, so the merged Stockholm relay is the ONLY combined attempt, guaranteeing it is the one actually dialed. */
+    private fun relayOnlyClientTunnelIdentityStore() = FakeClientTunnelIdentityStore(emptyMap())
 
     // --- 1: the merge helper itself ---
 
@@ -267,6 +309,41 @@ class MainViewModelIngressWiringTest {
     }
 
     @Test
+    fun `an unknown manifest-named ingress id (not in ProductionIngressEndpoints) never becomes spuriously eligible, even with a valid relayTo`() {
+        // The registry-narrowing fix (B32 round 2): XRAY_REALITY availability
+        // for a non-gateway endpoint id is gated on membership in
+        // ProductionIngressEndpoints.all specifically, never "any id absent
+        // from ProductionGatewayCatalog" - this manifest-only ingress (valid
+        // shape, valid relayTo, otherwise indistinguishable from a real one)
+        // must NOT be treated as dial-capable just because it is unknown.
+        val unknownIngress = EndpointDescriptor(
+            id = EndpointId("some-unrelated-ingress-nobody-reviewed"),
+            roles = setOf(EndpointRole.INGRESS),
+            region = "nowhere",
+            provider = "unknown",
+            transports = listOf(EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.200", 4433)),
+            relayTo = ProductionGatewayCatalog.GERMANY.endpointId,
+        )
+        val manifest = EndpointManifest(
+            manifestVersion = 1,
+            issuedAtEpochMillis = 1_000L,
+            expiresAtEpochMillis = 9_000_000_000_000L,
+            signingKeyId = "test-manifest-key",
+            endpoints = listOf(manifestEndpointFor(ProductionGatewayCatalog.GERMANY), manifestEndpointFor(ProductionGatewayCatalog.STOCKHOLM), unknownIngress),
+        )
+        val viewModel = newViewModel(manifestRepository = signedRepositoryFor(manifest))
+
+        val attempts = viewModel.combinedAutoAttempts()
+
+        assertFalse(
+            "an id absent from the reviewed ProductionIngressEndpoints catalog must never be reported dial-capable",
+            attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>().any { it.candidate.ingressEndpointId == unknownIngress.id },
+        )
+        // The real Stockholm-ingress fallback merge still worked despite the unrelated unknown entry.
+        assertTrue(attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>().any { it.candidate.ingressEndpointId == ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID })
+    }
+
+    @Test
     fun `an ingress entry with no relayTo target fails closed - no relayed candidate, no crash`() {
         val conflicting = EndpointDescriptor(
             id = EndpointId("conflicting-ingress"),
@@ -314,5 +391,160 @@ class MainViewModelIngressWiringTest {
         assertFalse(viewModel.transportState.value is net.pocvpn.client.vpn.TransportState.Connected)
         assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
         assertTrue(viewModel.autoGatewayDiagnostics.value?.lastFailureReason?.contains("EXECUTION_NOT_IMPLEMENTED") == true)
+    }
+
+    // --- 5: the ACTUAL production dependency wiring (RelayIngressResolverImpl/
+    // IngressProfileProvisioner/FileIngressProfileStore/POST /v1/ingress-profile,
+    // all real and already wired by MainViewModel.Factory.create ->
+    // RelayCompositionFactory.build - see RelayCompositionFactoryTest for proof
+    // Factory selects these, never the NotProvisioned/NotConfigured
+    // stand-ins). Pre-B32 this could only be exercised against a HAND-BUILT
+    // RelayAttemptCandidate (see MainViewModelRelayActivationTest's own docs:
+    // "a genuinely ELIGIBLE XRAY_REALITY relayed candidate cannot be produced
+    // through [combinedAutoAttempts/connect()] in this test harness"). B32's
+    // buildTransportRegistry fix lifts exactly that restriction - these tests
+    // exercise the identical resolver contract through the REAL public
+    // connectAuto()/connect() ranking pipeline instead of a hand-built
+    // candidate, closing that gap for the ACTUAL discovered Stockholm ingress.
+
+    private fun stockholmSuccessResult(
+        serverAddress: String = ProductionIngressEndpoints.STOCKHOLM.bindingFor(TransportKind.XRAY_REALITY)!!.host,
+        serverPort: Int = ProductionIngressEndpoints.STOCKHOLM.bindingFor(TransportKind.XRAY_REALITY)!!.port,
+        ingressEndpointId: String = ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID.value,
+    ) = IngressProfileResult.Success(
+        ingressEndpointId = ingressEndpointId,
+        ingressKind = net.pocvpn.client.reachability.IngressKind.DIRECT_IP,
+        serverAddress = serverAddress,
+        serverPort = serverPort,
+        uuid = "11111111-1111-1111-1111-111111111111",
+        serverName = "www.bing.com",
+        fingerprint = "chrome",
+        flow = "",
+        realityPublicKey = "A".repeat(43),
+        shortId = "ab",
+        isRealityShaped = true,
+        profileVersion = 1,
+        issuedAtEpochSeconds = 1_000L,
+        expiresAtEpochSeconds = null,
+        probeUrl = "https://152.70.43.1/v1/relay-health",
+        probeToken = "test-token",
+    )
+
+    @Test
+    fun `connectAuto ranks the real Stockholm CHAIN_DIRECT candidate and dispatches it to relayIngressResolver_resolve - no premature transport connect while unprovisioned`() = kotlinx.coroutines.test.runTest {
+        val resolver = IngressWiringStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val viewModel = newViewModel(clientTunnelIdentityStore = relayOnlyClientTunnelIdentityStore(), relayIngressResolver = resolver)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, resolver.resolvedPlans.size)
+        assertEquals(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID, resolver.resolvedPlans.single().ingressEndpointId)
+        assertEquals(TransportKind.XRAY_REALITY, resolver.resolvedPlans.single().ingressTransport)
+        // Activation-required (PROFILE_NOT_PROVISIONED is activation-fixable) - a
+        // real prompt is raised, and the combined sequence PAUSES rather than
+        // silently exhausting or falling through to a premature connect.
+        assertNotNull(viewModel.relayActivationNeeded.value)
+        assertEquals(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID, viewModel.relayActivationNeeded.value?.ingressEndpointId)
+        assertFalse(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `an activation-INfixable category (e_g_ INGRESS_UNREACHABLE) never raises the activation prompt - fails closed and exhausts immediately`() = kotlinx.coroutines.test.runTest {
+        val resolver = IngressWiringStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE) }
+        val viewModel = newViewModel(clientTunnelIdentityStore = relayOnlyClientTunnelIdentityStore(), relayIngressResolver = resolver)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertNull(viewModel.relayActivationNeeded.value)
+        assertTrue(viewModel.autoGatewayDiagnostics.value?.exhausted == true)
+        assertFalse(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `a successful real activateIngress() persists the correct profile for stockholm-ingress-1 and retries the SAME pending candidate`() = kotlinx.coroutines.test.runTest {
+        val resolver = IngressWiringStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val store = InMemoryIngressProfileStore()
+        var fetchCount = 0
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> fetchCount++; stockholmSuccessResult() })
+        val viewModel = newViewModel(clientTunnelIdentityStore = relayOnlyClientTunnelIdentityStore(), relayIngressResolver = resolver, ingressProfileProvisioner = provisioner)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertNotNull(viewModel.relayActivationNeeded.value)
+        assertEquals(1, resolver.resolvedPlans.size)
+
+        viewModel.activateIngress("real-credential")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, fetchCount)
+        assertTrue(viewModel.ingressActivationState.value is IngressActivationOutcome.Saved)
+        val saved = store.getProfileOrNull(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID)
+        assertNotNull("the profile must be persisted under stockholm-ingress-1's own endpoint id", saved)
+        assertEquals(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID, saved!!.ingressEndpointId)
+        assertEquals(TransportKind.XRAY_REALITY, saved.transport)
+        // Requirement 5 - the retry resolves the SAME pending plan, never a freshly ranked one.
+        assertEquals(2, resolver.resolvedPlans.size)
+        assertEquals(resolver.resolvedPlans[0].historyPathId, resolver.resolvedPlans[1].historyPathId)
+        assertEquals(resolver.resolvedPlans[0].ingressBinding, resolver.resolvedPlans[1].ingressBinding)
+    }
+
+    @Test
+    fun `a successful provision() through the real IngressProfileProvisioner produces a profile RelayIngressResolverImpl's own match check accepts`() = kotlinx.coroutines.test.runTest {
+        // Proves requirement 6's data contract against the REAL
+        // IngressProfileProvisioner (the real /v1/ingress-profile client
+        // path) and IngressClientProfile.matches (the exact check
+        // RelayIngressResolverImpl.resolve gates Resolved on - see that
+        // class, read directly above) without constructing
+        // RelayIngressResolverImpl itself: its resolve() success branch
+        // additionally writes through XrayProfileRepositoryFactory's real
+        // AndroidKeyStore-backed encryptor, a documented, pre-existing
+        // incompatibility with this project's plain-JVM unit test
+        // environment (see RelayCompositionFactoryTest's own docs, which
+        // is why even THAT test only Robolectric-covers RelayCompositionFactory.build,
+        // never a full resolve() call) - see RelayIngressResolverImplTest
+        // (Robolectric) for the early-return branches (PROFILE_NOT_PROVISIONED/
+        // PROFILE_MISMATCH/PROFILE_EXPIRED) that don't touch Keystore at all.
+        val plan = RelayedExecutionPlan.from(
+            AutoGatewaySelector.RelayAttemptCandidate(
+                ingressEndpointId = ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID,
+                exitEndpointId = ProductionGatewayCatalog.GERMANY.endpointId,
+                ingressTransport = TransportKind.XRAY_REALITY,
+                exitTransport = TransportKind.XRAY_REALITY,
+                ingressBinding = ProductionIngressEndpoints.STOCKHOLM.bindingFor(TransportKind.XRAY_REALITY)!!,
+                exitBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "152.70.43.1", 443),
+                ingressKind = net.pocvpn.client.reachability.IngressKind.DIRECT_IP,
+                ingressRegion = "Stockholm", exitRegion = "Frankfurt",
+                score = 1_000L, reasons = listOf("test"),
+                historyPathId = "${ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID.value}:DIRECT_IP:XRAY_REALITY->frankfurt:XRAY_REALITY",
+            ),
+        )
+        val store = InMemoryIngressProfileStore()
+        val provisioner = IngressProfileProvisioner(store, fetchIngressProfile = { _, _, _, _ -> stockholmSuccessResult() })
+
+        val outcome = provisioner.provision(plan.ingressEndpointId, plan.ingressBinding, plan.ingressTransport, plan.ingressKind, "pub-key", "cred")
+
+        assertTrue(outcome is IngressActivationOutcome.Saved)
+        val stored = store.getProfileOrNull(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID)
+        assertNotNull(stored)
+        assertTrue("a real provisioned profile must be accepted by RelayIngressResolverImpl's own match check", stored!!.matches(plan))
+        assertFalse(stored.isExpired(System.currentTimeMillis()))
+        assertEquals(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID, stored.ingressEndpointId)
+        assertEquals(TransportKind.XRAY_REALITY, stored.transport)
+    }
+
+    @Test
+    fun `no secret fields (uuid, private key, activation credential) ever appear in autoGatewayDiagnostics text for a relay attempt`() = kotlinx.coroutines.test.runTest {
+        val resolver = IngressWiringStubResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.PROFILE_NOT_PROVISIONED) }
+        val viewModel = newViewModel(clientTunnelIdentityStore = relayOnlyClientTunnelIdentityStore(), relayIngressResolver = resolver)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        val reason = viewModel.autoGatewayDiagnostics.value?.lastFailureReason.orEmpty()
+        assertFalse(reason.contains("11111111-1111-1111-1111-111111111111"))
+        assertFalse(reason.contains("real-credential"))
+        assertFalse(reason.lowercase().contains("privatekey"))
     }
 }
