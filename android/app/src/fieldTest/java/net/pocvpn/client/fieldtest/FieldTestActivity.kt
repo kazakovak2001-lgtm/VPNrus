@@ -14,6 +14,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -39,13 +40,21 @@ class FieldTestActivity : AppCompatActivity() {
 
     private lateinit var viewModel: FieldTestViewModel
 
+    /**
+     * PR #61 follow-up - this callback previously discarded the result
+     * entirely, so the real system permission outcome never reached
+     * [FieldTestViewModel] at all (the actual root cause of the real-device
+     * incident this fix addresses: [FieldTestViewModel.connect]'s coroutine
+     * was left suspended forever - or, before that, the dialog was launched
+     * but its answer thrown away - while [FieldTestTunnelController] had
+     * already, wrongly, marked both gateways failed on its own separate,
+     * mistaken per-candidate check). Reports the REAL `resultCode` straight
+     * to [FieldTestViewModel.onVpnPermissionResult] - `RESULT_OK` means the
+     * user granted it, anything else means denied/dismissed.
+     */
     private val vpnPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            // Field-test connect() already fails this candidate closed when
-            // preparePermissionIntent() returns non-null (see
-            // FieldTestTunnelController) - a denied permission simply means
-            // the NEXT candidate (or Failed) is reached on the tester's next
-            // Connect tap, same as the normal app's own permission flow.
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            viewModel.onVpnPermissionResult(result.resultCode == RESULT_OK)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -87,6 +96,18 @@ private fun FieldTestScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val report by viewModel.lastReport.collectAsState()
+    val permissionRequest by viewModel.permissionRequest.collectAsState()
+
+    // PR #61 follow-up - THE fix: launch the real Android VPN-permission
+    // system dialog whenever FieldTestViewModel.ensureVpnPermission surfaces
+    // one, keyed on the Intent instance so it fires exactly once per
+    // request (recomposition alone never re-launches it) - the tester's
+    // own answer flows back via FieldTestActivity's launcher callback into
+    // FieldTestViewModel.onVpnPermissionResult, which resumes the SAME
+    // suspended connect() coroutine with no second manual tap required.
+    LaunchedEffect(permissionRequest) {
+        permissionRequest?.let { onRequestVpnPermission(it) }
+    }
 
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(

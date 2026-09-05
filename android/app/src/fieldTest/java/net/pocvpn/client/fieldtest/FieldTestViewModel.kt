@@ -1,9 +1,11 @@
 package net.pocvpn.client.fieldtest
 
 import android.app.Application
+import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,6 +45,17 @@ sealed class FieldTestUiState {
  * the connect attempt runs and settles completely before any report/upload
  * logic begins, and a report/upload failure can never roll back or affect
  * [uiState]).
+ *
+ * **VPN permission (PR #61 follow-up)** - a real-device incident showed
+ * Frankfurt/Stockholm both "failing" within milliseconds on a fresh
+ * install: [FieldTestTunnelController] used to check
+ * `transport.preparePermissionIntent()` PER CANDIDATE and mark that
+ * candidate failed without ever launching the Android system permission
+ * dialog. Permission is device/app-level, not gateway-specific, so
+ * [connect] now resolves it EXACTLY ONCE, via [ensureVpnPermission],
+ * BEFORE [controller] ever starts its candidate loop - a pending or denied
+ * permission is never confused with a real AWG/network failure on either
+ * gateway.
  */
 class FieldTestViewModel(
     private val transportFactory: (ProductionGatewayId) -> VpnTransport,
@@ -51,6 +64,16 @@ class FieldTestViewModel(
     private val reportUploader: FieldTestReportUploader = NoOpFieldTestReportUploader,
     private val networkTypeProvider: () -> NetworkType = { NetworkType.OTHER },
     private val nowProvider: () -> Long = System::currentTimeMillis,
+    /**
+     * Device/app-level VPN permission check, resolved once per [connect]
+     * call - null means "already granted, nothing to ask". Defaults to
+     * asking a fresh transport instance (which candidate's transport
+     * answers this is irrelevant - AmneziaWgTransport.preparePermissionIntent
+     * simply wraps `VpnService.prepare(context)`, a device/app fact, never a
+     * gateway-specific one); a throwaway GERMANY instance is used only
+     * because asking requires SOME transport instance to exist.
+     */
+    private val preparePermissionIntent: () -> Intent? = { transportFactory(ProductionGatewayId.GERMANY).preparePermissionIntent() },
 ) : ViewModel() {
 
     private val diagnostics = FieldTestDiagnosticsRecorder(nowProvider)
@@ -67,10 +90,60 @@ class FieldTestViewModel(
     /** The most recent run's report, or null before any Connect attempt - [FieldTestActivity]'s manual "Share report" action reads this directly (`lastReport.value != null`). */
     val lastReport: StateFlow<FieldTestReport?> = _lastReport.asStateFlow()
 
+    private val _permissionRequest = MutableStateFlow<Intent?>(null)
+    /** Non-null exactly while [FieldTestActivity] must launch the Android VPN-permission system dialog for this pending [connect] call - see [ensureVpnPermission]/[onVpnPermissionResult]. */
+    val permissionRequest: StateFlow<Intent?> = _permissionRequest.asStateFlow()
+
+    @Volatile private var pendingPermissionResult: CompletableDeferred<Boolean>? = null
+
+    /** [FieldTestActivity]'s permission-launcher callback reports the real system result here - completes whatever [connect] call is currently suspended in [ensureVpnPermission], if any (a stray call with none pending is a no-op). */
+    fun onVpnPermissionResult(granted: Boolean) {
+        _permissionRequest.value = null
+        pendingPermissionResult?.complete(granted)
+        pendingPermissionResult = null
+    }
+
+    /**
+     * Resolves the ONE device/app-level VPN permission decision for this
+     * [connect] call, exactly once, before any gateway candidate is ever
+     * attempted. Returns `true` immediately (no dialog, no diagnostics
+     * event) when [preparePermissionIntent] reports permission is already
+     * granted - task requirement "already granted -> Connect goes directly
+     * to Frankfurt". Otherwise records [FieldTestDiagnosticsRecorder
+     * .recordPermissionRequested], surfaces the intent via
+     * [permissionRequest] for the Activity to launch, and suspends until
+     * [onVpnPermissionResult] reports the real system outcome - the SAME
+     * coroutine then continues straight into [controller]'s candidate loop
+     * on grant, with no second manual Connect tap required.
+     */
+    private suspend fun ensureVpnPermission(): Boolean {
+        val intent = preparePermissionIntent() ?: return true
+        diagnostics.recordPermissionRequested()
+        val deferred = CompletableDeferred<Boolean>()
+        pendingPermissionResult = deferred
+        _permissionRequest.value = intent
+        val granted = deferred.await()
+        if (granted) diagnostics.recordPermissionGranted() else diagnostics.recordPermissionDenied()
+        return granted
+    }
+
     fun connect() {
         if (_uiState.value != FieldTestUiState.Idle && _uiState.value != FieldTestUiState.Failed) return
         _uiState.value = FieldTestUiState.Connecting
         viewModelScope.launch {
+            if (!ensureVpnPermission()) {
+                _uiState.value = FieldTestUiState.Failed
+                _lastReport.value = buildReport(
+                    networkType = networkTypeProvider(),
+                    gatewaysAttempted = emptyList(),
+                    finalGateway = null,
+                    finalTransportKind = null,
+                    outcome = FieldTestOutcome.FAILED,
+                    failureCategory = FieldTestFailureCategory.VPN_PERMISSION_DENIED,
+                )
+                return@launch
+            }
+
             val finalState = controller.connect()
             val networkType = networkTypeProvider()
 

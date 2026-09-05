@@ -103,6 +103,18 @@ enum class DiagnosticEventType {
     // exist in the normal debug/release compile, so these values are
     // otherwise unused there - purely additive, never a behavior change
     // for release/debug.
+    // PR #61 follow-up - a real-device incident showed the field-test build
+    // was marking Frankfurt/Stockholm "failed" within milliseconds because
+    // the Android VPN permission dialog was never actually launched (a
+    // fresh install always requires it) - see FieldTestViewModel
+    // .ensureVpnPermission's own docs. Permission is device/app-level, not
+    // gateway-specific: these are recorded ONCE, before the candidate loop,
+    // never per-candidate, so a pending/denied permission is never confused
+    // with a real AWG/network failure on either gateway.
+    FIELD_TEST_VPN_PERMISSION_REQUESTED,
+    FIELD_TEST_VPN_PERMISSION_GRANTED,
+    FIELD_TEST_VPN_PERMISSION_DENIED,
+
     FIELD_TEST_ATTEMPT_STARTED,
     FIELD_TEST_CANDIDATE_RESULT,
     FIELD_TEST_HEALTH_RESULT,

@@ -29,6 +29,18 @@ import net.pocvpn.client.vpn.isFreshHandshake
  * the handshake proof (defaults to always-true so a handshake alone is
  * already sufficient when no stronger probe is wired, but callers/tests can
  * supply a real post-handshake connectivity probe).
+ *
+ * **VPN permission is NOT checked here** (PR #61 follow-up - a real-device
+ * incident showed this same [connect] previously calling
+ * `transport.preparePermissionIntent()` per candidate and marking
+ * Frankfurt/Stockholm "failed" within milliseconds whenever Android's VPN
+ * permission was merely pending, never actually launching the system
+ * dialog). Permission is device/app-level, not gateway-specific - it is
+ * [FieldTestViewModel.ensureVpnPermission]'s job to resolve it ONCE,
+ * before this controller's [connect] is ever invoked. This controller
+ * trusts that precondition and evaluates every candidate as a real
+ * transport attempt - it never consumes a gateway candidate for a
+ * permission reason.
  */
 class FieldTestTunnelController(
     private val transportFactory: (ProductionGatewayId) -> VpnTransport,
@@ -62,12 +74,8 @@ class FieldTestTunnelController(
 
             val transport = transportFactory(candidate)
             val handshakeOk = try {
-                if (transport.preparePermissionIntent() != null) {
-                    false
-                } else {
-                    transport.connect(TransportConfig.Awg(buildFieldTestAwgConfig(gateway)))
-                    awaitUsableHandshake(transport)
-                }
+                transport.connect(TransportConfig.Awg(buildFieldTestAwgConfig(gateway)))
+                awaitUsableHandshake(transport)
             } catch (t: Throwable) {
                 false
             }

@@ -16,8 +16,17 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Always connects with a fresh handshake, or always fails to handshake, depending on [shouldHandshake]. */
-private class FixedFieldTestTransport(private val shouldHandshake: Boolean) : VpnTransport {
+/**
+ * Always connects with a fresh handshake, or always fails to handshake,
+ * depending on [shouldHandshake]. [permissionIntent] defaults to null
+ * (already granted) - PR #61 follow-up tests below set it non-null to
+ * prove [FieldTestTunnelController] no longer treats that as a reason to
+ * fail the candidate (permission gating moved to [FieldTestViewModel]).
+ */
+private class FixedFieldTestTransport(
+    private val shouldHandshake: Boolean,
+    private val permissionIntent: Intent? = null,
+) : VpnTransport {
     override val name: String = "fixed-field-test"
     override val kind: TransportKind = TransportKind.AMNEZIA_WG
     override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
@@ -27,7 +36,7 @@ private class FixedFieldTestTransport(private val shouldHandshake: Boolean) : Vp
     var connectCalled = false
         private set
 
-    override fun preparePermissionIntent(): Intent? = null
+    override fun preparePermissionIntent(): Intent? = permissionIntent
     override suspend fun connect(config: TransportConfig) {
         connectCalled = true
         if (!shouldHandshake) throw RuntimeException("simulated handshake failure")
@@ -190,5 +199,30 @@ class FieldTestTunnelControllerTest {
         val unavailable = events.last()
         assertEquals(DiagnosticEventType.FIELD_TEST_UNAVAILABLE, unavailable.type)
         assertEquals("2", unavailable.tags[FieldTestDiagnosticTags.TAG_ATTEMPTED_COUNT])
+    }
+
+    // PR #61 follow-up - the real-device incident's root cause, fixed here:
+    // this controller must evaluate a candidate as a genuine transport
+    // attempt regardless of what preparePermissionIntent() returns. VPN
+    // permission is device/app-level and is FieldTestViewModel's job to
+    // resolve BEFORE this controller's connect() is ever called (task
+    // requirement 3's own "do not consume a gateway candidate because
+    // permission is missing").
+    @Test
+    fun `permission - a non-null preparePermissionIntent never fails the candidate on its own`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val transport = FixedFieldTestTransport(shouldHandshake = true, permissionIntent = permissionIntent)
+        val controller = FieldTestTunnelController(
+            transportFactory = { transport },
+            nowProvider = { 0L },
+            delayMs = { },
+        )
+        val result = controller.connect()
+        assertTrue(
+            "a real handshake must still succeed even though preparePermissionIntent() is non-null - permission gating is not this controller's job",
+            result is FieldTestState.Protected,
+        )
+        assertEquals(ProductionGatewayId.GERMANY, (result as FieldTestState.Protected).candidate)
+        assertTrue("connect() must actually have been called on the real transport", transport.connectCalled)
     }
 }

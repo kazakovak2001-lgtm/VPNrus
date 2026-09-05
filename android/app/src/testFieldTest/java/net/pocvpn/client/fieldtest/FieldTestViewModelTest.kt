@@ -73,6 +73,11 @@ class FieldTestViewModelTest {
     private fun newViewModel(
         allHandshake: Boolean,
         uploader: FieldTestReportUploader = NoOpFieldTestReportUploader,
+        // Defaults to "already granted" (matches FixedTransport's own
+        // preparePermissionIntent() == null) - every pre-existing test
+        // below is unaffected by the PR #61 permission-gating fix unless
+        // it explicitly overrides this.
+        preparePermissionIntent: () -> Intent? = { null },
     ) = FieldTestViewModel(
         transportFactory = { FixedTransport(shouldHandshake = allHandshake) },
         appVersionName = "0.1-fieldtest",
@@ -80,6 +85,7 @@ class FieldTestViewModelTest {
         reportUploader = uploader,
         networkTypeProvider = { NetworkType.WIFI },
         nowProvider = { 0L },
+        preparePermissionIntent = preparePermissionIntent,
     )
 
     // Test A - field-test build skips activation completely: FieldTestViewModel
@@ -199,5 +205,139 @@ class FieldTestViewModelTest {
         } finally {
             dir.deleteRecursively()
         }
+    }
+
+    // --- PR #61 follow-up: real Android VPN permission flow -------------
+    // Root cause fixed here: FieldTestTunnelController used to call
+    // transport.preparePermissionIntent() PER CANDIDATE and mark it failed
+    // without ever launching the system dialog - a fresh install therefore
+    // always reported "GERMANY failed" / "STOCKHOLM failed" within
+    // milliseconds, never a real AWG/network result. Permission is now
+    // resolved exactly once, before any candidate is attempted.
+
+    // "fresh install / permission required -> dialog requested, no gateway failure recorded"
+    @Test
+    fun `permission - fresh install surfaces the system dialog and records no gateway attempt yet`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { permissionIntent })
+        vm.connect()
+
+        // The coroutine is genuinely suspended awaiting the tester's real
+        // answer - Connecting… is shown, the dialog intent is surfaced, and
+        // NEITHER gateway has been touched (task's own "never mark
+        // Frankfurt or Stockholm as failed merely because permission is
+        // pending").
+        assertEquals(FieldTestUiState.Connecting, vm.uiState.value)
+        assertEquals(permissionIntent, vm.permissionRequest.value)
+        assertNull("no report/outcome must exist while permission is merely pending", vm.lastReport.value)
+    }
+
+    // "permission granted -> automatically proceeds to Frankfurt"
+    @Test
+    fun `permission - granted automatically continues into Frankfurt with no second tap`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { permissionIntent })
+        vm.connect()
+        assertEquals(FieldTestUiState.Connecting, vm.uiState.value)
+
+        vm.onVpnPermissionResult(true)
+
+        assertNull("the dialog request must be cleared once answered", vm.permissionRequest.value)
+        assertEquals(FieldTestUiState.Protected, vm.uiState.value)
+        assertEquals(ProductionGatewayId.GERMANY, vm.lastReport.value?.finalGateway)
+    }
+
+    // "permission denied -> terminal failure with VPN_PERMISSION_DENIED"
+    @Test
+    fun `permission - denied is a terminal failure with VPN_PERMISSION_DENIED, no gateway attempted`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { permissionIntent })
+        vm.connect()
+
+        vm.onVpnPermissionResult(false)
+
+        assertEquals(FieldTestUiState.Failed, vm.uiState.value)
+        val report = vm.lastReport.value
+        assertTrue(report != null)
+        assertEquals(FieldTestOutcome.FAILED, report!!.outcome)
+        assertEquals(FieldTestFailureCategory.VPN_PERMISSION_DENIED, report.failureCategory)
+        assertTrue("permission denial must never count as an attempted gateway", report.gatewaysAttempted.isEmpty())
+        assertNull(report.finalGateway)
+    }
+
+    // "already granted -> Connect goes directly to Frankfurt"
+    @Test
+    fun `permission - already granted skips the dialog entirely and goes straight to Frankfurt`() = runTest {
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { null })
+        vm.connect()
+
+        assertNull("nothing to launch when permission is already granted", vm.permissionRequest.value)
+        assertEquals(FieldTestUiState.Protected, vm.uiState.value)
+        assertEquals(ProductionGatewayId.GERMANY, vm.lastReport.value?.finalGateway)
+    }
+
+    // Diagnostics ordering - VPN_PERMISSION_REQUESTED, then GRANTED, then (only after that) the GERMANY attempt.
+    @Test
+    fun `permission - diagnostics record requested then granted before any gateway attempt`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { permissionIntent })
+        vm.connect()
+        vm.onVpnPermissionResult(true)
+
+        val events = vm.lastReport.value!!.events
+        val requestedIndex = events.indexOfFirst { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_REQUESTED }
+        val grantedIndex = events.indexOfFirst { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_GRANTED }
+        val attemptIndex = events.indexOfFirst {
+            it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_ATTEMPT_STARTED &&
+                it.tags[FieldTestDiagnosticTags.TAG_CANDIDATE] == ProductionGatewayId.GERMANY.name
+        }
+        assertTrue(requestedIndex >= 0 && grantedIndex >= 0 && attemptIndex >= 0)
+        assertTrue("REQUESTED must precede GRANTED", requestedIndex < grantedIndex)
+        assertTrue("GRANTED must precede the GERMANY attempt", grantedIndex < attemptIndex)
+    }
+
+    // Diagnostics - a denied permission records DENIED, never a GRANTED, and never any gateway attempt event.
+    @Test
+    fun `permission - diagnostics record denied and no gateway attempt events at all`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { permissionIntent })
+        vm.connect()
+        vm.onVpnPermissionResult(false)
+
+        val events = vm.lastReport.value!!.events
+        assertTrue(events.any { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_DENIED })
+        assertTrue(events.none { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_GRANTED })
+        assertTrue(events.none { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_ATTEMPT_STARTED })
+    }
+
+    // "already granted" must never even record a REQUESTED/GRANTED event pair - nothing was ever asked.
+    @Test
+    fun `permission - already granted records no permission events at all`() = runTest {
+        val vm = newViewModel(allHandshake = true, preparePermissionIntent = { null })
+        vm.connect()
+
+        val events = vm.lastReport.value!!.events
+        assertTrue(events.none { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_REQUESTED })
+        assertTrue(events.none { it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_GRANTED })
+    }
+
+    // "Frankfurt/Stockholm fallback behavior unchanged" - once permission is granted, a Frankfurt failure still falls back to Stockholm exactly as before this fix.
+    @Test
+    fun `permission - granted then Frankfurt failure still falls back to Stockholm`() = runTest {
+        val permissionIntent = Intent("android.net.VpnService")
+        val vm = FieldTestViewModel(
+            transportFactory = { candidate -> FixedTransport(shouldHandshake = candidate == ProductionGatewayId.STOCKHOLM) },
+            appVersionName = "0.1-fieldtest",
+            appVersionCode = 1L,
+            networkTypeProvider = { NetworkType.WIFI },
+            nowProvider = { 0L },
+            preparePermissionIntent = { permissionIntent },
+        )
+        vm.connect()
+        vm.onVpnPermissionResult(true)
+
+        assertEquals(FieldTestUiState.Protected, vm.uiState.value)
+        assertEquals(ProductionGatewayId.STOCKHOLM, vm.lastReport.value?.finalGateway)
+        assertEquals(listOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM), vm.lastReport.value?.gatewaysAttempted)
     }
 }

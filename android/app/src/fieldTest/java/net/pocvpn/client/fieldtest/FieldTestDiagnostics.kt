@@ -34,8 +34,14 @@ object FieldTestDiagnosticTags {
  * own discipline but scoped to exactly what this small flow can observe.
  */
 enum class FieldTestFailureCategory {
-    /** VPN permission was not granted for this candidate. */
-    PERMISSION_DENIED,
+    /**
+     * The Android VPN permission dialog was shown and the user denied it (or
+     * dismissed it without granting). Device/app-level, not gateway-specific
+     * - this is reached BEFORE the Frankfurt/Stockholm candidate loop ever
+     * starts, so it is never confused with an actual AWG/network failure on
+     * either gateway (the real-device incident this category fixes).
+     */
+    VPN_PERMISSION_DENIED,
     /** Transport connect() threw, or no fresh AWG handshake was observed within the bounded window. */
     NO_HANDSHAKE,
     /** A fresh handshake was observed, but the post-handshake health/data-plane check failed. */
@@ -61,6 +67,20 @@ class FieldTestDiagnosticsRecorder(
         events += DiagnosticEvent(type = type, atEpochMillis = nowProvider(), tags = tags)
         while (events.size > MAX_EVENTS) events.removeAt(0)
     }
+
+    /**
+     * The Android VPN permission dialog is about to be shown - always
+     * recorded BEFORE the Frankfurt/Stockholm candidate loop starts, and
+     * always followed by exactly one of [recordPermissionGranted]/
+     * [recordPermissionDenied] before any [recordAttemptStarted] - see
+     * [FieldTestViewModel.ensureVpnPermission]'s own docs for why permission
+     * is device/app-level, checked ONCE, never per-candidate.
+     */
+    fun recordPermissionRequested() = record(DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_REQUESTED)
+
+    fun recordPermissionGranted() = record(DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_GRANTED)
+
+    fun recordPermissionDenied() = record(DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_DENIED)
 
     fun recordAttemptStarted(candidate: ProductionGatewayId, transportKind: TransportKind) {
         record(
