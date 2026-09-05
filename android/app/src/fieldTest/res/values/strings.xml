@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Overrides src/main/res/values/strings.xml's app_name for the `fieldTest`
+  build type only (task's own "make the resulting APK visibly
+  distinguishable" requirement) - the normal debug/release builds keep
+  their existing app_name untouched.
+-->
+<resources>
+    <string name="app_name">Nova VPN Field Test</string>
+</resources>
