@@ -75,13 +75,61 @@ cp -a "$GATEWAY_DIR" "$BACKUP_PATH"
 log "backed up currently-installed code to $BACKUP_PATH"
 
 # --- 2. copy new code (same rsync convention as install-ingress-role.sh) ---
+#
+# THE FIX (found live, during the first real B31 Germany deployment): a
+# plain `rsync -a --delete` here would silently overwrite gateway/config/
+# *.env with this REPOSITORY's own tracked defaults - but on a real,
+# already-deployed host those files (config/poc.env, config/xray.env,
+# config/xray-ingress.env once an ingress role exists) are NOT generic
+# templates, they are HAND-CUSTOMIZED to that host's actual real paths/
+# service names (e.g. a host installed before gateway/xray/fetch-xray-server.sh's
+# pinned-version convention existed keeps its own real XRAY_BIN_PATH/
+# XRAY_STAGING_CONFIG/SERVICE_NAME values, which do not match this
+# repository's current tracked defaults at all) - unlike config/*.env.example
+# (always safe to refresh verbatim - those are reference-only, never
+# deployed as-is) or every other file under gateway/ (application code,
+# genuinely meant to be byte-for-byte whatever this REPO_ROOT says). A
+# blind overwrite here does not fail loudly - it fails LATER, silently,
+# the next time something actually exercises the now-wrong path (found via
+# xray_reconcile.py's "staging config missing" error, not via this
+# script's own smoke test, which never happens to touch that path). So:
+# every non-example config/*.env file is preserved exactly as already
+# deployed - this script only ever SEEDS one that is missing entirely
+# (a genuinely fresh path, never previously configured), exactly like
+# install-ingress-role.sh's own "seed only if not present" discipline for
+# ingress.env.
 if command -v rsync >/dev/null 2>&1; then
-    rsync -a --delete --exclude '.git' "$REPO_ROOT/gateway/" "$GATEWAY_DIR/"
+    rsync -a --delete --exclude '.git' \
+        --include 'config/*.env.example' --exclude 'config/*.env' \
+        "$REPO_ROOT/gateway/" "$GATEWAY_DIR/"
 else
+    PRESERVE_TMP="$(mktemp -d)"
+    for existing in "$GATEWAY_DIR"/config/*.env; do
+        [ -e "$existing" ] || continue
+        case "$existing" in
+            *.env.example) continue ;;
+        esac
+        cp -a "$existing" "$PRESERVE_TMP/"
+    done
     rm -rf "$GATEWAY_DIR"
     mkdir -p "$GATEWAY_DIR"
     cp -a "$REPO_ROOT/gateway/." "$GATEWAY_DIR/"
+    for preserved in "$PRESERVE_TMP"/*; do
+        [ -e "$preserved" ] || continue
+        cp -a "$preserved" "$GATEWAY_DIR/config/$(basename "$preserved")"
+    done
+    rm -rf "$PRESERVE_TMP"
 fi
+# Seed any config/*.env that is genuinely missing (never overwrite one that
+# already exists - see the rsync exclude above for why).
+for candidate in "$REPO_ROOT"/gateway/config/*.env; do
+    [ -e "$candidate" ] || continue
+    target="$GATEWAY_DIR/config/$(basename "$candidate")"
+    if [ ! -e "$target" ]; then
+        install -m 0644 "$candidate" "$target"
+        log "seeded missing $target from the repository's own template - EDIT IT with this host's real values before relying on it"
+    fi
+done
 chown -R root:root "$GATEWAY_DIR"
 find "$GATEWAY_DIR" -type d -exec chmod 0755 {} +
 find "$GATEWAY_DIR" -type f -exec chmod 0644 {} +
