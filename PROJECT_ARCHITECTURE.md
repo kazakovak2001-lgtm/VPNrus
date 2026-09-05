@@ -2467,6 +2467,84 @@ Robolectric-backed composition-root test proving production selects the
 real implementations. Remaining gap: Frankfurt/Stockholm SSH audit
 incomplete (no working credential this session).)
 
+## Bootstrap pre-activation tunnel (B36)
+
+A fully unactivated device (no persisted profile for any gateway) cannot
+reach `/v1/activate` directly on a network that blocks direct access to
+Frankfurt/Stockholm's control-plane IPs (real Russia field-test finding -
+see `docs/B36_BOOTSTRAP_PRE_ACTIVATION_TUNNEL.md`). B36 adds a client-side-
+only, unactivated-state bootstrap tunnel used ONLY to reach that same
+control-plane before any real activation exists:
+
+```
+MainViewModel.activateDeviceViaBootstrap()
+  -> BootstrapActivationOrchestrator (single owner, task requirement 8)
+       -> BootstrapTunnelController: Frankfurt -> Stockholm, deterministic,
+          never loops past the two known candidates (BootstrapCatalog)
+       -> MainViewModel.performActivation() [the SAME code activateDevice()
+          itself calls - never duplicated]
+       -> teardown (always, success or failure) before returning
+```
+
+- **Transport is AmneziaWG, deliberately never Xray.** `buildXrayVpnPlan`
+  always calls `addDisallowedApplication(novaPackageId)` (recursion
+  prevention - the pinned Xray-core AAR exposes no protect-fd hook of its
+  own), which would ALSO exclude `ProvisioningClient`'s own in-process
+  activation HTTP calls from any Xray-backed bootstrap tunnel - the exact
+  B33-round-2 "Nova's own process is excluded from its own VPN" bug,
+  applied to bootstrap. `AmneziaWgTransport`/`GoBackend` never excludes the
+  app at all (WireGuard protects only its own outbound UDP socket
+  internally) - this is the one transport this codebase already has where
+  the bootstrap tunnel can genuinely carry the app's own control-plane
+  traffic. See `BootstrapAwgProfile.kt`'s own docs and
+  `BootstrapAwgProfileTest` for the structural proof (no app-exclusion set,
+  and the exact host `ProvisioningClient`/`ControlPlaneOriginSetBuilder`
+  dials for a gateway is a member of that gateway's own restricted
+  `AwgPeer.allowedIps`).
+- **Public bootstrap material, not a secret.** `BootstrapIdentity`'s AWG
+  keypair is the SAME for every APK install - security comes from a
+  server-side peer/firewall restriction (documented, NOT deployed by this
+  PR - see the B36 doc's own server-side plan), never from the client
+  keeping anything hidden. The checked-in keypair is a locally-generated
+  PLACEHOLDER (not a real Curve25519 pair) - a real one must be generated
+  before any server-side peer is added.
+- **Client-side routing restriction (defense in depth, not the security
+  boundary):** `AwgPeer.allowedIps` is narrowed to exactly
+  `<gateway's own public control-plane IP>/32` - never `0.0.0.0/0`. Never
+  broadens `RoutingDecisionEngine`/split-tunnel DIRECT eligibility - this
+  is a completely separate, dedicated transport instance from the normal
+  post-activation `transport`/`VpnController`.
+- **Reuses, never duplicates, the real activation subsystem.**
+  `MainViewModel.activateDevice()` was refactored (behavior-preserving) to
+  extract its full coroutine body into `private suspend fun
+  performActivation(...)` - `activateDevice()` itself is unchanged
+  (fire-and-forget wrapper), and `BootstrapActivationOrchestrator` calls
+  `performActivation` directly so it can await the REAL terminal
+  `ProvisioningUiState` (persistence, Xray/TLS provisioning, all of it)
+  before deciding to tear the bootstrap tunnel down.
+- **No second VpnController state machine.** `BootstrapTunnelController`/
+  `BootstrapActivationOrchestrator` are new, small, and deliberately
+  independent of `VpnController` - `VpnController` is only ever reachable
+  from Home, which requires a provisioned profile
+  (`net.pocvpn.client.ui.screenFor`), so it structurally never runs
+  concurrently with bootstrap.
+- **Error taxonomy fix (task requirement 10):** a new
+  `ProvisioningUiState.BootstrapUnavailable` is now distinct from
+  `Unauthorized` (real credential rejection) and from the generic `Error`
+  case. `ProductFlowPresentation.toActivationErrorText`'s pre-existing bug -
+  every non-"service unavailable" `Error` (a plain network timeout,
+  malformed response, bad request) was labeled "Invalid activation" exactly
+  like a real 401 - is fixed: only `Unauthorized` reads that way now.
+- **Status: FOUNDATION, not IMPLEMENTED.** The client-side orchestration
+  above is real and unit-tested (`BootstrapTunnelControllerTest`,
+  `BootstrapActivationOrchestratorTest`, `BootstrapAwgProfileTest` - 9
+  tests, A-I from the task spec, plus the routing-safety/no-secret-leakage
+  proofs). No server-side peer/firewall work has been done or deployed -
+  the placeholder bootstrap identity cannot complete a real handshake
+  against either production gateway today. Russia hard-whitelist bypass
+  remains UNVERIFIED; this PR proves only the client-side mechanism against
+  fakes, never a real restricted network.
+
 ---
 Last updated: 2026-09-02 (B27 - added the "CDN_FRONTED Ingress Support"
 section above: threaded B23's typed IngressKind through real candidate

@@ -112,6 +112,16 @@ fun TransportState.isConnectedOrConnecting(): Boolean = when (this) {
  * .ServiceUnavailable/BadRequest - deliberately NOT re-deriving that
  * mapping here (this file never touches provisioning logic), just
  * translating its existing output into product copy.
+ *
+ * B36 (task requirement 10) review fix - the pre-existing `Error` branch
+ * collapsed EVERY non-"service temporarily unavailable" Error (a plain
+ * network timeout, DNS failure, malformed response, bad request - none of
+ * which say anything about whether the activation CODE itself was valid)
+ * into the literal string "Invalid activation" - the exact misleading
+ * behavior this task requirement names. `Error` here now always reads as a
+ * generic, non-technical network/service sentence; only the real
+ * [ProvisioningUiState.Unauthorized] state (an actual HTTP 401 credential
+ * rejection) is ever labeled "Invalid activation".
  */
 fun ProvisioningUiState.toActivationErrorText(): String? = when (this) {
     is ProvisioningUiState.Unauthorized -> "Invalid activation"
@@ -119,7 +129,12 @@ fun ProvisioningUiState.toActivationErrorText(): String? = when (this) {
     is ProvisioningUiState.Expired -> "Activation expired"
     is ProvisioningUiState.DeviceLimitReached -> "Device limit reached"
     is ProvisioningUiState.Error ->
-        if (message == "service temporarily unavailable") "Service temporarily unavailable" else "Invalid activation"
+        if (message == "service temporarily unavailable") "Service temporarily unavailable" else "Could not complete activation - check your connection and try again"
+    // B36 - never the SAME text as Error above: a bootstrap-unavailable
+    // failure means the activation request was never even attempted (both
+    // pre-activation candidates failed to connect), which is a materially
+    // different, more actionable fact than "the request itself failed".
+    is ProvisioningUiState.BootstrapUnavailable -> "Could not reach the activation network - try a different network"
     is ProvisioningUiState.Idle, is ProvisioningUiState.Provisioning, is ProvisioningUiState.Success -> null
 }
 

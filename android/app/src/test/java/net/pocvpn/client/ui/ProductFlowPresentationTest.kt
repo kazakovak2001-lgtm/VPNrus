@@ -9,6 +9,7 @@ import net.pocvpn.client.vpn.policy.AppRoutingMode
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -103,6 +104,26 @@ class ProductFlowPresentationTest {
         )
         assertEquals(null, ProvisioningUiState.Idle.toActivationErrorText())
         assertEquals(null, ProvisioningUiState.Provisioning.toActivationErrorText())
+    }
+
+    // B36 (task requirement 10) - the fix for the misleading behavior where
+    // a generic network/malformed/bad-request Error was labeled "Invalid
+    // activation" exactly like a real credential rejection.
+    @Test
+    fun `a generic provisioning Error never reads as Invalid activation`() {
+        assertNotEquals("Invalid activation", ProvisioningUiState.Error("connection timed out").toActivationErrorText())
+        assertNotEquals("Invalid activation", ProvisioningUiState.Error("malformed response: bad json").toActivationErrorText())
+        assertNotEquals("Invalid activation", ProvisioningUiState.Error("invalid request/device").toActivationErrorText())
+        // Unauthorized alone still reads as "Invalid activation" - the one real credential rejection.
+        assertEquals("Invalid activation", ProvisioningUiState.Unauthorized.toActivationErrorText())
+    }
+
+    @Test
+    fun `bootstrap-unavailable reads distinctly from both a credential rejection and a generic error`() {
+        val bootstrapUnavailableText = ProvisioningUiState.BootstrapUnavailable.toActivationErrorText()
+        assertNotEquals("Invalid activation", bootstrapUnavailableText)
+        assertNotEquals(ProvisioningUiState.Error("connection timed out").toActivationErrorText(), bootstrapUnavailableText)
+        assertEquals(false, bootstrapUnavailableText.isNullOrBlank())
     }
 
     // --- B8G: app-session kill-switch presentation ---
