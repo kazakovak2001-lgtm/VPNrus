@@ -1,0 +1,85 @@
+#!/usr/sbin/nft -f
+#
+# B36 - ADDITIVE, SEPARATE table restricting ONLY the one shared bootstrap
+# peer (BOOTSTRAP_CLIENT_TUNNEL_IP). IDENTICAL on both gateway runtimes -
+# Frankfurt (iptables-nft `ip filter`/`ip nat`, owned by a host-local
+# awg-firewall.service) and Stockholm (this repository's own native
+# `inet pocvpn` table, gateway/nftables/pocvpn.nft.template) - this table
+# never touches, re-renders, or depends on EITHER of those; see
+# docs/B36_SERVER_DEPLOYMENT_PLAN.md and gateway/lib/bootstrap_runtime.sh
+# for the full per-host design and the netfilter hook-priority reasoning
+# that makes ONE shared template safe against both runtimes.
+#
+# Idempotent by construction, same pattern as pocvpn.nft.template: `table
+# inet __NFT_TABLE_BOOTSTRAP__` creates the table if missing (no-op if
+# already present), then `delete table` removes whatever was there, then it
+# is fully redeclared below - safe to re-run.
+#
+# Rendered by install-bootstrap-peer.sh: __NFT_TABLE_BOOTSTRAP__,
+# __BOOTSTRAP_CLIENT_IP__, __BOOTSTRAP_FORWARD_PRIORITY__,
+# __BOOTSTRAP_INPUT_PRIORITY__ (from config/bootstrap.env - the SAME values
+# install-bootstrap-peer.sh's own live verification checks against the real
+# production ruleset before this file is ever applied, never a second,
+# independently-chosen number).
+
+table inet __NFT_TABLE_BOOTSTRAP__
+delete table inet __NFT_TABLE_BOOTSTRAP__
+
+table inet __NFT_TABLE_BOOTSTRAP__ {
+    chain forward {
+        # __BOOTSTRAP_FORWARD_PRIORITY__ (lower/earlier than either
+        # production runtime's own FORWARD hook, both confirmed priority 0
+        # - see this file's header) - nftables/netfilter dispatches ALL
+        # base chains registered at a given hook, for a given packet's L3
+        # protocol, in ONE strict global priority order, regardless of
+        # which table/family/tool (native nft vs iptables-nft) registered
+        # them. A `drop` verdict reached here terminates hook processing
+        # for this packet immediately, BEFORE Frankfurt's `ip filter`
+        # FORWARD chain or Stockholm's `inet pocvpn` FORWARD chain (both
+        # matching by INTERFACE/SUBNET only, not by peer) ever get a
+        # chance to run. If this table's own hook ran at priority 0 or
+        # later instead, production's own accept rule could terminate the
+        # packet's hook traversal first, and this drop would never be
+        # reached - ordering is the entire reason this table exists
+        # separately, and is exactly what install-bootstrap-peer.sh's own
+        # verify_bootstrap_priority_precedes_production check confirms
+        # against the LIVE ruleset before this file is ever applied.
+        type filter hook forward priority __BOOTSTRAP_FORWARD_PRIORITY__; policy accept;
+
+        # The bootstrap peer's own source address (its AllowedIPs-assigned
+        # /32) may NEVER be forwarded anywhere - this is what denies it
+        # general Internet access. Every other peer/source is unaffected
+        # (falls through to production's own forward chain, unchanged).
+        ip saddr __BOOTSTRAP_CLIENT_IP__ drop
+    }
+
+    chain input {
+        # __BOOTSTRAP_INPUT_PRIORITY__ - explicit and verified live against
+        # whichever production INPUT hook exists on this host (see
+        # gateway/lib/bootstrap_runtime.sh's
+        # verify_bootstrap_input_priority_precedes_production), exactly the
+        # same reasoning as the `forward` chain above. This chain's own
+        # accept/drop pair must never depend on same-priority ("filter"/0)
+        # base-chain registration-order tie-breaking against a production
+        # INPUT chain - that ordering is not guaranteed by the netfilter
+        # core, so this table now always dispatches strictly first.
+        type filter hook input priority __BOOTSTRAP_INPUT_PRIORITY__; policy accept;
+
+        # The bootstrap peer may reach ONLY tcp/443 on this box itself (the
+        # same public nginx vhost /v1/activate, /v1/manifest, and
+        # /v1/xray-profile are already served from - see
+        # docs/B36_SERVER_DEPLOYMENT_PLAN.md's "why 443, no new listener"
+        # section). This one rule also structurally denies every other
+        # locally-bound service - SSH (22), the loopback-only pocvpn-api
+        # ports (8443/8444, unreachable over the network regardless), Xray
+        # (2053/2083), and the AWG UDP port itself is irrelevant here since
+        # this chain only inspects already-decrypted tunnel-interior
+        # traffic. Because this chain's own hook priority is now verified
+        # strictly earlier than any production INPUT hook, this drop is
+        # guaranteed to be evaluated before production's own INPUT chain
+        # for the bootstrap source's packets - independent of chain
+        # registration order.
+        ip saddr __BOOTSTRAP_CLIENT_IP__ tcp dport 443 accept
+        ip saddr __BOOTSTRAP_CLIENT_IP__ drop
+    }
+}

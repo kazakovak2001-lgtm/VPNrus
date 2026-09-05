@@ -543,6 +543,27 @@ class MainViewModel(
     // device's managed-network public key as a peer on the user's own VPS,
     // an identity-linkage bug, not a convenience).
     private val privateGatewayKeyRepository: ClientKeyRepository? = null,
+    // B36 - additive, defaults to null (same reasoning as gatewayConfigOverride/
+    // profileStore above): when non-null, this is invoked ONCE PER BOOTSTRAP
+    // CANDIDATE ATTEMPT to build a fresh [VpnTransport] for the restricted
+    // pre-activation bootstrap tunnel (task requirement 8's own "single
+    // owner" - see [net.pocvpn.client.bootstrap.BootstrapTunnelController]'s
+    // own docs). Production (the Factory below) supplies a real
+    // [net.pocvpn.client.vpn.AmneziaWgTransport] per attempt - deliberately
+    // NOT the SAME [transport] instance this ViewModel already holds for
+    // the NORMAL post-activation connection, since a bootstrap attempt and
+    // a normal connection must never share one transport's mutable state.
+    // null means "bootstrap is not wired" - [activateDeviceViaBootstrap]
+    // then reports [net.pocvpn.client.bootstrap.BootstrapActivationOutcome.BootstrapUnavailable]
+    // immediately rather than crashing, so every existing (pre-B36)
+    // construction/test is byte-for-byte unaffected.
+    private val bootstrapTransportFactory: ((net.pocvpn.client.vpn.config.ProductionGatewayId) -> VpnTransport)? = null,
+    // B36 - additive, defaults to a real, private, per-instance recorder
+    // (never null) so [bootstrapDiagnostics] always has something to read,
+    // exactly like [diagnosticsStore] above - a test can still inject its
+    // own instance to assert on recorded events directly.
+    private val bootstrapDiagnosticsRecorder: net.pocvpn.client.bootstrap.BootstrapDiagnosticsRecorder =
+        net.pocvpn.client.bootstrap.BootstrapDiagnosticsRecorder(),
 ) : ViewModel() {
 
     /**
@@ -1942,6 +1963,33 @@ class MainViewModel(
             return
         }
 
+        _provisioningState.value = ProvisioningUiState.Provisioning
+        viewModelScope.launch {
+            _provisioningState.value = performActivation(key, trimmedCredential, targetGatewayId)
+        }
+    }
+
+    /**
+     * B36 - the awaitable body of [activateDevice], extracted verbatim (same
+     * order, same side effects, same every-branch mapping) so
+     * [net.pocvpn.client.bootstrap.BootstrapActivationOrchestrator] can call
+     * it directly from its own suspend coroutine and observe the REAL
+     * terminal [ProvisioningUiState] before deciding to tear the bootstrap
+     * tunnel down - [activateDevice] itself is fire-and-forget
+     * (`viewModelScope.launch` returns immediately), which cannot be awaited
+     * by a caller that needs to know when persistence/Xray-provisioning has
+     * actually finished. [activateDevice] above is now a thin wrapper: same
+     * public signature, same validation, same Provisioning/Error-state
+     * assignment for the two early-return cases, byte-for-byte unchanged
+     * behavior for every existing caller (including the B15 additional-
+     * gateway path, which keeps calling [activateDevice] directly, never
+     * this function).
+     */
+    private suspend fun performActivation(
+        key: String,
+        trimmedCredential: String,
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    ): ProvisioningUiState {
         val client = when (targetGatewayId) {
             net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> activationClient
             net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmActivationClient
@@ -1963,10 +2011,8 @@ class MainViewModel(
             net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> stockholmEndpointId
         }
 
-        _provisioningState.value = ProvisioningUiState.Provisioning
-        viewModelScope.launch {
-            // B30 review fix (blocker 1) - the real activation network call
-            // now goes through activationResilienceCoordinator, which itself
+        // B30 review fix (blocker 1) - the real activation network call
+        // now goes through activationResilienceCoordinator, which itself
             // records ACTIVATION_STARTED/CONTROL_ORIGIN_*/ACTIVATION_SUCCEEDED/
             // ACTIVATION_FAILED (never duplicated here - see that class's own
             // docs). origins comes from ControlPlaneOriginSetBuilder -
@@ -2003,7 +2049,7 @@ class MainViewModel(
                 is net.pocvpn.client.controlplane.ActivationResilienceCoordinator.Outcome.AlreadyValidLocally ->
                     ProvisioningResult.NetworkError("activation was unexpectedly skipped")
             }
-            _provisioningState.value = when (result) {
+            val finalState: ProvisioningUiState = when (result) {
                 is ProvisioningResult.Success -> {
                     // B13 consolidated review fix (finding 1/6) - THE one
                     // place a live activation response is mapped to a real
@@ -2186,8 +2232,96 @@ class MainViewModel(
             // support bundle shows the full truth rather than a misleadingly
             // happy ACTIVATION_SUCCEEDED with no explanation for why the UI
             // state ended up on Error.
-            if (result is ProvisioningResult.Success && _provisioningState.value !is ProvisioningUiState.Success) {
+            if (result is ProvisioningResult.Success && finalState !is ProvisioningUiState.Success) {
                 supportDiagnosticsRecorder?.recordActivationFailed(net.pocvpn.client.controlplane.ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED)
+            }
+        return finalState
+    }
+
+    // --- B36: bootstrap pre-activation tunnel ---
+    // See docs/B36_BOOTSTRAP_PRE_ACTIVATION_TUNNEL.md for the full design.
+
+    /** Read-only window into the bootstrap tunnel's own lifecycle - null candidate list means "never attempted this session". */
+    val bootstrapState: StateFlow<net.pocvpn.client.bootstrap.BootstrapState>
+        get() = bootstrapTunnelController.state
+
+    /** Read-only sanitized bootstrap event log - see [net.pocvpn.client.bootstrap.BootstrapDiagnosticsRecorder]'s own docs on what it never carries. */
+    fun bootstrapDiagnostics(): List<net.pocvpn.client.diagnostics.support.DiagnosticEvent> = bootstrapDiagnosticsRecorder.snapshot()
+
+    private val bootstrapTunnelController: net.pocvpn.client.bootstrap.BootstrapTunnelController by lazy {
+        net.pocvpn.client.bootstrap.BootstrapTunnelController(
+            transportFactory = { candidate -> bootstrapTransportFactory?.invoke(candidate) ?: net.pocvpn.client.bootstrap.NoOpBootstrapTransport },
+            diagnostics = bootstrapDiagnosticsRecorder,
+        )
+    }
+
+    private val bootstrapActivationOrchestrator: net.pocvpn.client.bootstrap.BootstrapActivationOrchestrator by lazy {
+        net.pocvpn.client.bootstrap.BootstrapActivationOrchestrator(
+            tunnelController = bootstrapTunnelController,
+            hasAnyProvisionedProfile = {
+                net.pocvpn.client.vpn.config.ProductionGatewayId.entries.any { isGatewayProvisioned(it) }
+            },
+            isGatewayProvisioned = ::isGatewayProvisioned,
+            activate = { gatewayId, credential -> performActivation(requireNotNull(_publicKey.value), credential, gatewayId) },
+            diagnostics = bootstrapDiagnosticsRecorder,
+        )
+    }
+
+    /**
+     * B36 (task requirement 5) - the ONLY new entry point the mandatory
+     * first-run [net.pocvpn.client.ui.screens.ActivationScreen] should call
+     * instead of [activateDevice] directly (the SAME screen, the SAME
+     * `[activation code] [Activate]` UX - task requirement 5's own "do not
+     * introduce a new user-visible bootstrap configuration screen"). The
+     * B15 additional-gateway activation path (already-provisioned device
+     * adding a second gateway) keeps calling [activateDevice] directly,
+     * unchanged - see [net.pocvpn.client.bootstrap.BootstrapActivationOrchestrator]'s
+     * own docs for why bootstrap only ever applies to the genuinely
+     * unactivated case.
+     *
+     * Never runs bootstrap at all when a profile is already provisioned for
+     * ANY gateway (task requirement 9's case F) - delegates straight to the
+     * existing [activateDevice] in that case, so a device that already has
+     * one gateway provisioned and is only adding a second one behaves
+     * exactly as it always has.
+     */
+    fun activateDeviceViaBootstrap(activationCredential: String) {
+        val trimmedCredential = activationCredential.trim()
+        if (trimmedCredential.isEmpty()) {
+            _provisioningState.value = ProvisioningUiState.Error("activation credential is empty")
+            return
+        }
+        if (_publicKey.value == null) {
+            _provisioningState.value = ProvisioningUiState.Error("device public key not loaded yet")
+            return
+        }
+        if (net.pocvpn.client.vpn.config.ProductionGatewayId.entries.any { isGatewayProvisioned(it) }) {
+            activateDevice(trimmedCredential)
+            return
+        }
+
+        _provisioningState.value = ProvisioningUiState.Provisioning
+        viewModelScope.launch {
+            _provisioningState.value = when (
+                val outcome = bootstrapActivationOrchestrator.activateViaBootstrap(trimmedCredential)
+            ) {
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.Success -> ProvisioningUiState.Success(outcome.result)
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.AlreadyProvisioned -> {
+                    // Should be structurally unreachable (checked above), but
+                    // never silently swallowed - fall through to the real
+                    // manual flow rather than reporting a fabricated state.
+                    activateDevice(trimmedCredential)
+                    return@launch
+                }
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.BootstrapUnavailable -> ProvisioningUiState.BootstrapUnavailable
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.Unauthorized -> ProvisioningUiState.Unauthorized
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.Revoked -> ProvisioningUiState.Revoked
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.Expired -> ProvisioningUiState.Expired
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.DeviceLimitReached -> ProvisioningUiState.DeviceLimitReached
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.NetworkOrProvisioningError ->
+                    ProvisioningUiState.Error("bootstrap-assisted activation failed")
+                is net.pocvpn.client.bootstrap.BootstrapActivationOutcome.ProfilePersistFailed ->
+                    ProvisioningUiState.Error("activation succeeded but the device profile could not be saved")
             }
         }
     }
@@ -3911,6 +4045,19 @@ class MainViewModel(
                 supportDiagnosticsStore = supportDiagnosticsStore,
                 supportDiagnosticsAppVersionName = BuildConfig.VERSION_NAME,
                 supportDiagnosticsAppVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                // B36 - a FRESH AmneziaWgTransport per bootstrap attempt,
+                // deliberately never the SAME `transport` instance passed
+                // above (that one is reserved for the normal, post-
+                // activation connection - see BootstrapTunnelController's
+                // own docs on why bootstrap needs its own transport
+                // lifecycle). [candidate] is accepted but unused here: the
+                // real gateway facts are resolved from
+                // ProductionGatewayCatalog inside
+                // net.pocvpn.client.bootstrap.buildBootstrapAwgConfig itself
+                // (via the candidate id BootstrapTunnelController already
+                // threads into TransportConfig.Awg) - this factory's only
+                // job is "construct a transport", never "pick a gateway".
+                bootstrapTransportFactory = { _ -> AmneziaWgTransport(context) },
             ) as T
         }
     }

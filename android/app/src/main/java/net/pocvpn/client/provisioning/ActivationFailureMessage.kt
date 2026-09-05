@@ -23,6 +23,13 @@ internal fun friendlyActivationFailureMessage(state: ProvisioningUiState): Strin
     is ProvisioningUiState.Revoked -> "This activation code is no longer valid. Ask for a new one."
     is ProvisioningUiState.Expired -> "This activation code has expired. Ask for a new one."
     is ProvisioningUiState.DeviceLimitReached -> "This activation code has already reached its device limit."
+    // B36 (task 10) - a real, distinct copy for "we could not even reach the
+    // network to try your code" - never the SAME sentence as a credential
+    // rejection, and never silently folded into the generic Error copy
+    // below (that copy already correctly avoids the word "invalid" for this
+    // exact reason - see that branch's own docs).
+    is ProvisioningUiState.BootstrapUnavailable ->
+        "Could not reach the activation network. Try again later or on a different network."
     // B30 (task 6) - the required copy, verbatim, for every other failure
     // shape (network error, malformed response, service unavailable, bad
     // request) - deliberately the SAME single sentence regardless of which
