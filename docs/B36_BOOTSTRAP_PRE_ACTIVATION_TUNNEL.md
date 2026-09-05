@@ -179,36 +179,54 @@ report or command output.
 **Superseded by the exact, command-level plan in
 [`docs/B36_SERVER_DEPLOYMENT_PLAN.md`](B36_SERVER_DEPLOYMENT_PLAN.md)** -
 that document is now authoritative for the server-side design; this
-section is kept short and summarizes it. (History note: an earlier version
-of this section sketched the restriction using `iptables`. The repository's
-actual gateway firewall - confirmed from `gateway/provision.sh` and
-`gateway/nftables/pocvpn.nft.template`, not assumed - is **nftables**, one
-table `inet pocvpn`. The deployment plan uses nftables throughout, adding a
-second, additive table rather than editing the existing one.)
+section is kept short and summarizes it.
 
-**Minimal, reuses 100% existing primitives - no new binary, no new
-listener, no new certificate, no new public port.** The key insight: a
-bootstrap-tunneled HTTPS request to the gateway's OWN public IP is a
-**hairpin/local-delivery case** (INPUT hook, not FORWARD) - it reaches the
-already-running `nginx` vhost on port 443 through the exact same
-`/v1/activate`/`/v1/manifest`/`/v1/xray-profile` routes and the exact same
-already-valid certificate the public path already uses. No DNAT/REDIRECT,
-no new vhost, no loopback (`127.0.0.1:8443`/`8444`) exposure.
+**Correction (2026-09-05, second follow-up): Frankfurt and Stockholm do
+NOT share one identical firewall runtime** - verified directly against
+each host, not assumed. Frankfurt's existing production AWG
+forwarding/NAT is **iptables-nft** (`table ip filter`/`table ip nat`,
+owned by a host-local `awg-firewall.service` not tracked in this
+repository); Stockholm's is this repository's own **native nftables**
+`table inet pocvpn` (`gateway/nftables/pocvpn.nft.template`), applied
+directly by `provision.sh`. (An earlier version of this section had
+already corrected an even older `iptables`-only sketch to nftables, but
+still incorrectly assumed BOTH hosts ran the same native-nftables model
+Stockholm actually does - see the deployment plan's own "Correction"
+note for the full verified-fact table.)
 
-Per gateway (Frankfurt AND Stockholm), once the owner approves,
-`gateway/scripts/install-bootstrap-peer.sh` (added by this slice, NOT run):
+**Minimal, reuses 100% existing primitives on both runtimes - no new
+binary, no new listener, no new certificate, no new public port.** The key
+insight: a bootstrap-tunneled HTTPS request to the gateway's OWN public IP
+is a **hairpin/local-delivery case** (INPUT hook, not FORWARD) - it
+reaches the already-running `nginx` vhost on port 443 through the exact
+same `/v1/activate`/`/v1/manifest`/`/v1/xray-profile` routes and the exact
+same already-valid certificate the public path already uses, on EITHER
+host. No DNAT/REDIRECT, no new vhost, no loopback (`127.0.0.1:8443`/`8444`)
+exposure.
+
+Per gateway, once the owner approves,
+`gateway/scripts/install-bootstrap-peer.sh` (added by this slice, NOT run)
+**detects which of the two runtimes the host actually is** (or accepts an
+explicit `--runtime frankfurt|stockholm` override) and fails closed if it
+cannot confirm one unambiguously, then:
 
 1. Adds the ONE shared, public bootstrap AWG peer via the EXISTING
-   `add-peer.sh` (never a second peer-mutation mechanism).
-2. Applies a new, ADDITIVE nftables table (`pocvpn_bootstrap`, from
-   `gateway/nftables/pocvpn-bootstrap.nft.template`) that DROPs the
-   bootstrap peer's own source IP in the `forward` hook (denying general
-   Internet access - the existing `pocvpn` table's own forward/NAT rules
-   are scoped by interface/subnet, not by peer, so this exclusion must be
-   explicit) and allows it ONLY `tcp/443` in the `input` hook - never
-   touching the existing `pocvpn` table.
-3. Installs a small systemd unit (`nftables-pocvpn-bootstrap.service`) so
-   the restriction survives a reboot.
+   `add-peer.sh` (never a second peer-mutation mechanism) - identical on
+   both runtimes.
+2. Applies the SAME new, ADDITIVE nftables table (`pocvpn_bootstrap`, from
+   `gateway/nftables/pocvpn-bootstrap.nft.template`) on either runtime -
+   its own family (`inet`) and table name never collide with Frankfurt's
+   `ip filter`/`ip nat` or Stockholm's `inet pocvpn`. It DROPs the
+   bootstrap peer's own source IP in the `forward` hook, at priority `-5`
+   - confirmed, via a live pre-flight check against the REAL host (never
+   assumed), to run before either production runtime's own FORWARD hook
+   (both verified at priority `0`) - and allows it ONLY `tcp/443` in the
+   `input` hook. Neither production table/runtime is ever edited or
+   re-rendered.
+3. Installs a small, dedicated systemd unit
+   (`nftables-pocvpn-bootstrap.service`) so the restriction survives a
+   reboot - independent of, and never altering, Frankfurt's
+   `awg-firewall.service` or Stockholm's own persistence.
 
 A real bootstrap keypair has ALREADY been generated for this slice (Phase
 2 of the server-deployment task) and is committed as
