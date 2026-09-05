@@ -134,6 +134,22 @@ class AppConfig:
     # per request, never logs them, never returns them.
     relay_probe_hmac_secret_file: str = ""
 
+    # Russia field-test zero-touch enrollment (POST /v1/field-enroll) - see
+    # field_enrollment.py's own module docstring. Disabled by default (the
+    # empty/false defaults below), same "optional group, blank means not
+    # configured, fails closed with 503" convention as every other group in
+    # this dataclass - a normal production deployment is byte-for-byte
+    # unaffected unless an operator deliberately sets all three for a
+    # specific field-test gateway instance.
+    field_enrollment_enabled: bool = False
+    field_enrollment_max_devices: int = 0
+    # Round-2 review fix: field_enrollment.py no longer derives credentials
+    # from a server secret (see that module's own docs for why) - these
+    # name its own small, self-initializing, non-secret index file (public
+    # key -> already-issued credential/activation_id), never a secret file.
+    field_enrollment_index_path: str = ""
+    field_enrollment_index_lock_path: str = ""
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -464,6 +480,44 @@ def load_config(env=None):
         if not os.path.isfile(relay_probe_hmac_secret_file):
             raise ConfigError(f"{_ENV_PREFIX}RELAY_PROBE_HMAC_SECRET_FILE does not exist: {relay_probe_hmac_secret_file!r}")
 
+    # Field-test zero-touch enrollment - see AppConfig.field_enrollment_enabled's
+    # own docs. Explicit opt-in only: FIELD_ENROLLMENT_ENABLED must be
+    # exactly "true" (case-insensitive) - anything else (unset, "false", a
+    # typo) leaves it disabled, fail-closed, never accidentally on.
+    field_enrollment_enabled = _get(env, "FIELD_ENROLLMENT_ENABLED").lower() == "true"
+    field_enrollment_max_devices_raw = _get(env, "FIELD_ENROLLMENT_MAX_DEVICES")
+    field_enrollment_index_path = _get(env, "FIELD_ENROLLMENT_INDEX_PATH")
+    field_enrollment_index_lock_path = _get(env, "FIELD_ENROLLMENT_INDEX_LOCK_PATH") or (
+        field_enrollment_index_path + ".lock" if field_enrollment_index_path else ""
+    )
+    field_enrollment_max_devices = 0
+    if field_enrollment_max_devices_raw:
+        try:
+            field_enrollment_max_devices = int(field_enrollment_max_devices_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_MAX_DEVICES is not an integer: {field_enrollment_max_devices_raw!r}")
+
+    if field_enrollment_enabled:
+        # A separate completeness group, same "half-configured is not a
+        # safe middle ground" reasoning as every other optional group above -
+        # checked only once FIELD_ENROLLMENT_ENABLED=true, so a deployment
+        # that never touches this feature needs none of these set.
+        if not activation_store_path:
+            raise ConfigError(
+                f"{_ENV_PREFIX}FIELD_ENROLLMENT_ENABLED requires {_ENV_PREFIX}ACTIVATION_STORE_PATH "
+                "to also be set - field enrollment issues ordinary activation records"
+            )
+        if field_enrollment_max_devices < 1:
+            raise ConfigError(
+                f"{_ENV_PREFIX}FIELD_ENROLLMENT_MAX_DEVICES must be a positive integer when field enrollment is enabled"
+            )
+        if not field_enrollment_index_path:
+            raise ConfigError(
+                f"{_ENV_PREFIX}FIELD_ENROLLMENT_INDEX_PATH is required when field enrollment is enabled"
+            )
+        if not os.path.isabs(field_enrollment_index_path):
+            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_INDEX_PATH must be an absolute path: {field_enrollment_index_path!r}")
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -500,4 +554,8 @@ def load_config(env=None):
         manifest_path=manifest_path,
         static_relay_clients_file=static_relay_clients_file,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
+        field_enrollment_enabled=field_enrollment_enabled,
+        field_enrollment_max_devices=field_enrollment_max_devices,
+        field_enrollment_index_path=field_enrollment_index_path,
+        field_enrollment_index_lock_path=field_enrollment_index_lock_path,
     )

@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -543,6 +544,32 @@ class MainViewModel(
     // device's managed-network public key as a peer on the user's own VPS,
     // an identity-linkage bug, not a convenience).
     private val privateGatewayKeyRepository: ClientKeyRepository? = null,
+    // Russia field-test zero-touch enrollment - additive, defaults to the
+    // real ProvisioningClient.fieldEnroll call (same "no wiring, no
+    // behavior change unless explicitly enabled" seam as every other
+    // optional dependency above; [zeroTouchEnrollmentEnabled] below is the
+    // actual on/off switch - this seam alone does not call anything).
+    private val fieldEnrollmentClient: (publicKey: String, endpointHost: String) -> net.pocvpn.client.provisioning.FieldEnrollmentResult =
+        net.pocvpn.client.provisioning.ProvisioningClient::fieldEnroll,
+    // Defaults to an in-memory store (same "no wiring, no behavior" seam as
+    // every other store above) - production wiring is the Factory's own
+    // encrypted FileFieldCredentialStore.
+    private val fieldCredentialStore: net.pocvpn.client.provisioning.FieldCredentialStore =
+        net.pocvpn.client.provisioning.InMemoryFieldCredentialStore(),
+    // The build-time switch (BuildConfig.FIELD_ENROLLMENT_ENABLED, threaded
+    // by the Factory - see MainActivity) for the Russia field-test build
+    // ONLY. Defaults to false: an ordinary debug/release build is
+    // byte-for-byte unaffected - connect()/activateDevice()/activateIngress()
+    // keep requiring the existing manual ActivationScreen exactly as before.
+    // See ensureZeroTouchEnrollment()'s own docs for what this actually
+    // gates.
+    private val zeroTouchEnrollmentEnabled: Boolean = false,
+    // Which gateway a zero-touch field build silently enrolls/activates
+    // against - defaults to Germany (the only gateway with a currently
+    // deployed, publicly reachable /v1/field-enroll in production). A
+    // dedicated field-test deployment may override this at the Factory.
+    private val zeroTouchTargetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId =
+        net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
 ) : ViewModel() {
 
     /**
@@ -2356,24 +2383,43 @@ class MainViewModel(
             return
         }
         _ingressActivating.value = true
-        viewModelScope.launch {
-            val outcome = withContext(ioDispatcher) {
-                provisioner.ensureFreshProfile(
-                    pending.candidate.ingressEndpointId, pending.candidate.ingressBinding, pending.candidate.ingressTransport,
-                    pending.candidate.ingressKind, key, trimmedCredential,
-                )
-            }
-            _ingressActivating.value = false
-            _ingressActivationState.value = outcome
-            // pendingRelayActivation/_relayActivationNeeded were already
-            // cleared synchronously by claimPendingRelayActivation() above,
-            // at the moment this activation attempt claimed sole ownership -
-            // never redundantly re-cleared here.
-            if (outcome is net.pocvpn.client.relay.IngressActivationOutcome.Saved) {
-                attemptRelayedAttempt(pending.candidate, pending.attempts, pending.attemptedKeys, isActivationRetry = true)
-            } else {
-                attemptCombined(pending.attempts, pending.attemptedKeys)
-            }
+        viewModelScope.launch { performIngressActivation(pending, trimmedCredential, provisioner, key) }
+    }
+
+    /**
+     * The shared "actually call POST /v1/ingress-profile and resume the
+     * combined sequence accordingly" body - extracted so both the manual
+     * [activateIngress] (UI-entered credential, debug/developer builds
+     * only) AND the Russia field-test zero-touch auto-path inside
+     * [attemptRelayedAttempt] (this device's OWN already-stored
+     * field-enrollment credential, no UI at all) call the EXACT SAME
+     * provisioning/resume logic - never two independently-maintained
+     * copies. [pending]/[provisioner]/[key] are already validated non-null
+     * by both callers; [credential] is already known non-blank.
+     */
+    private suspend fun performIngressActivation(
+        pending: PendingRelayActivation,
+        credential: String,
+        provisioner: net.pocvpn.client.relay.IngressProfileProvisioner,
+        key: String,
+    ) {
+        val outcome = withContext(ioDispatcher) {
+            provisioner.ensureFreshProfile(
+                pending.candidate.ingressEndpointId, pending.candidate.ingressBinding, pending.candidate.ingressTransport,
+                pending.candidate.ingressKind, key, credential,
+            )
+        }
+        _ingressActivating.value = false
+        _ingressActivationState.value = outcome
+        // pendingRelayActivation/_relayActivationNeeded were already
+        // cleared synchronously by claimPendingRelayActivation() (the
+        // manual path) or were never set at all (the zero-touch path never
+        // pauses - see attemptRelayedAttempt's own docs) - never
+        // redundantly cleared here.
+        if (outcome is net.pocvpn.client.relay.IngressActivationOutcome.Saved) {
+            attemptRelayedAttempt(pending.candidate, pending.attempts, pending.attemptedKeys, isActivationRetry = true)
+        } else {
+            attemptCombined(pending.attempts, pending.attemptedKeys)
         }
     }
 
@@ -2421,6 +2467,14 @@ class MainViewModel(
             // permission result or async state change for that OLD request
             // must never reuse it.
             clearFailoverWatch()
+            // Russia field-test zero-touch enrollment - a no-op (returns
+            // true immediately) unless zeroTouchEnrollmentEnabled AND this
+            // device has never been activated. See ensureZeroTouchEnrollment's
+            // own docs. On failure, a simple non-technical error is already
+            // in provisioningState (the SAME state ActivationScreen's own
+            // toActivationErrorText() reads) - never proceed to an
+            // automatic gateway pick with no real device identity behind it.
+            if (!ensureZeroTouchEnrollment()) return@launch
             // B22 - dispatches on the explicit three-way authority now,
             // instead of the plain boolean - AUTO/MANUAL_MANAGED still call
             // the exact SAME pre-B22 functions, byte-for-byte, for every
@@ -2431,6 +2485,88 @@ class MainViewModel(
                 net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE -> connectPrivate()
             }
         }
+    }
+
+    /**
+     * Russia field-test zero-touch enrollment. A no-op (returns `true`
+     * immediately, calling nothing) unless BOTH [zeroTouchEnrollmentEnabled]
+     * is set (the field-test build's own Factory wiring - see
+     * MainActivity/BuildConfig.FIELD_ENROLLMENT_ENABLED) AND this device has
+     * never been activated ([profileSource] still [ProfileSource.DEV_FALLBACK] -
+     * the SAME signal [net.pocvpn.client.ui.screenFor] already uses to
+     * decide whether ActivationScreen would otherwise be mandatory). Every
+     * ordinary debug/release build call site is therefore byte-for-byte
+     * unaffected.
+     *
+     * Reuses a previously-stored field credential if one exists (an
+     * enrollment that already succeeded, e.g. on a prior Connect press that
+     * failed for an unrelated reason) - only calls POST /v1/field-enroll
+     * when [fieldCredentialStore] is genuinely empty. Then reuses the
+     * EXISTING [activateDevice] verbatim - the SAME network path,
+     * response-validation, and profile-persistence logic manual activation
+     * already goes through, never a second/parallel apply-and-persist code
+     * path - and awaits its own [provisioningState] to reach a terminal
+     * value (activateDevice sets Provisioning synchronously before
+     * launching, so this never observes a stale terminal value from a
+     * PREVIOUS unrelated attempt).
+     */
+    // `internal` (not `private`), same "tests can call this directly
+    // without driving the full connect()/Smart Connect pipeline" reasoning
+    // attemptRelayedAttempt's own docs already state.
+    internal suspend fun ensureZeroTouchEnrollment(): Boolean {
+        if (!zeroTouchEnrollmentEnabled) return true
+        if (_profileSource.value != net.pocvpn.client.vpn.config.ProfileSource.DEV_FALLBACK) return true
+
+        val key = _publicKey.value
+        if (key == null) {
+            _provisioningState.value = ProvisioningUiState.Error("device identity not ready yet")
+            return false
+        }
+
+        val endpointHost = when (zeroTouchTargetGatewayId) {
+            net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY -> net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.awg.endpointHost
+            net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM -> net.pocvpn.client.vpn.config.ProductionGatewayCatalog.STOCKHOLM.awg.endpointHost
+        }
+        val storedCredential = fieldCredentialStore.getOrNull(endpointHost)?.credential
+        val credential = storedCredential ?: run {
+            _provisioningState.value = ProvisioningUiState.Provisioning
+            val enrollResult = withContext(ioDispatcher) { fieldEnrollmentClient(key, endpointHost) }
+            when (enrollResult) {
+                is net.pocvpn.client.provisioning.FieldEnrollmentResult.Success -> {
+                    fieldCredentialStore.save(
+                        net.pocvpn.client.provisioning.FieldCredential(enrollResult.activationCredential, endpointHost),
+                    )
+                    enrollResult.activationCredential
+                }
+                // Every non-Success outcome maps to the SAME simple,
+                // non-technical banner ActivationScreen's own error mapping
+                // already produces for the equivalent /v1/activate failure -
+                // never a raw/technical message, never cryptographic or API
+                // terminology surfaced to the field tester.
+                is net.pocvpn.client.provisioning.FieldEnrollmentResult.Revoked -> {
+                    _provisioningState.value = ProvisioningUiState.Revoked
+                    return false
+                }
+                is net.pocvpn.client.provisioning.FieldEnrollmentResult.Expired -> {
+                    _provisioningState.value = ProvisioningUiState.Expired
+                    return false
+                }
+                is net.pocvpn.client.provisioning.FieldEnrollmentResult.DeviceLimitReached -> {
+                    _provisioningState.value = ProvisioningUiState.DeviceLimitReached
+                    return false
+                }
+                else -> {
+                    _provisioningState.value = ProvisioningUiState.Error("service temporarily unavailable")
+                    return false
+                }
+            }
+        }
+
+        activateDevice(credential, zeroTouchTargetGatewayId)
+        val terminal = provisioningState.first {
+            it !is ProvisioningUiState.Idle && it !is ProvisioningUiState.Provisioning
+        }
+        return terminal is ProvisioningUiState.Success
     }
 
     /**
@@ -2820,6 +2956,18 @@ class MainViewModel(
         // [buildAutoGatewayCandidates] (which stays Direct-only and
         // intentionally untouched - see that function's own docs).
         val manifestEndpoints = mergedIngressAwareEndpoints(manifestRepository?.trusted()?.endpoints.orEmpty())
+        // PR #58 field-test fix - see ingressTransportHealthFor's own docs
+        // below. Reuses the SAME, unmodified TransportHealthCalculator every
+        // other health read in this file already calls, fed outcomes
+        // filtered to ONE endpoint's own gatewayId instead of the shared,
+        // kind-wide bucket every OTHER accessor here still (correctly, for
+        // Direct) uses.
+        val ingressScopedTransportHealth = { endpointId: net.pocvpn.client.reachability.EndpointId, kind: TransportKind ->
+            net.pocvpn.client.smartconnect.TransportHealthCalculator.fromOutcomes(
+                outcomes.filter { it.gatewayId == endpointId.value },
+                kind,
+            )
+        }
         val attempts = net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
             manifestEndpoints = manifestEndpoints,
             gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
@@ -2847,11 +2995,31 @@ class MainViewModel(
                     manifestEndpoints.first { it.id == endpointId }
                 }
                 val matchedOutcome = net.pocvpn.client.reachability.EndpointOutcomeMatcher.latestMatching(outcomes, endpointId, kind)
+                // PR #58 field-test fix - matchedOutcome above is already
+                // correctly endpoint-scoped (EndpointOutcomeMatcher filters
+                // by endpointId+kind), but ReachabilityEngine.assess's OWN
+                // fallback tier (rule 5: no fresh endpoint-specific evidence
+                // -> map the passed-in transportHealth directly into this
+                // hop's own state) was still fed the SHARED, kind-wide
+                // `health.getValue(kind)` bucket for EVERY endpoint,
+                // including a relay/ingress endpoint (gateway == null) that
+                // has never been dialed yet. A different endpoint's real
+                // Direct failures for the same TransportKind (e.g. Germany's
+                // blocked Direct XRAY_REALITY port) then mapped straight
+                // into an UNRELATED ingress candidate's OWN reachability
+                // state as UNREACHABLE, tripping PathScorer's unconditional
+                // "worstHopReachability == UNREACHABLE -> ineligible" rule
+                // before CHAIN_DIRECT was ever attempted - the actual,
+                // physically observed 2026-09 Russia field-test bug (see
+                // AutoGatewaySelector.buildRelayedCandidates' own docs for
+                // the full story). An ordinary GATEWAY endpoint (gateway !=
+                // null) keeps the EXACT pre-existing shared-bucket behavior -
+                // this only changes the relay/ingress branch.
                 net.pocvpn.client.reachability.ReachabilityEngine.assess(
                     endpoint = endpoint,
                     transportKind = kind,
                     networkUsable = profile.isUsable,
-                    transportHealth = health.getValue(kind),
+                    transportHealth = if (gateway != null) health.getValue(kind) else ingressScopedTransportHealth(endpointId, kind),
                     endpointSpecificReachable = matchedOutcome?.let { it.result == ConnectionOutcomeResult.SUCCESS },
                     restrictionClass = restriction,
                     nowEpochMillis = now,
@@ -2864,6 +3032,21 @@ class MainViewModel(
             preference = userTransportPreference,
             nowEpochMillis = now,
             restrictionClass = restriction,
+            // PR #58 field-test fix - a relayed (CHAIN_DIRECT) candidate's
+            // own eligibility must never be poisoned by a DIFFERENT
+            // endpoint's Direct failures for the same TransportKind (see
+            // AutoGatewaySelector.buildRelayedCandidates' own docs for the
+            // exact physically-observed bug this closes: Germany's blocked
+            // Direct XRAY_REALITY port marked the whole XRAY_REALITY kind
+            // UNREACHABLE, which then made Stockholm's completely separate,
+            // still-open ingress XRAY_REALITY candidate ineligible too,
+            // dropping CHAIN_DIRECT out of ranking before it was ever
+            // attempted). Scoped to THIS endpoint's own recorded outcomes
+            // via ConnectionOutcome.gatewayId - already-existing, already
+            // correctly populated by VpnController.recordConnectionOutcome -
+            // then handed to the SAME, unmodified TransportHealthCalculator
+            // every other health read in this file already uses.
+            ingressTransportHealthFor = ingressScopedTransportHealth,
         )
         return CombinedAutoRankingSnapshot(restrictionClass = restriction, attempts = attempts)
     }
@@ -3077,9 +3260,63 @@ class MainViewModel(
                 // a freshly re-ranked one (task requirement G - nothing else
                 // advances the combined sequence while this is set).
                 if (!isActivationRetry && resolution.category in net.pocvpn.client.relay.RelayActivationRequest.ACTIVATION_FIXABLE_CATEGORIES) {
-                    pendingRelayActivation = PendingRelayActivation(candidate, attempts, attemptedKeys)
-                    _relayActivationNeeded.value = net.pocvpn.client.relay.RelayActivationRequest.from(plan)
-                    supportDiagnosticsRecorder?.recordRelayActivationRequired()
+                    // Russia field-test zero-touch path. Cross-host review
+                    // fix: the ingress role is a SEPARATE pocvpn-api process
+                    // with its OWN, independent activation store from
+                    // whatever gateway ensureZeroTouchEnrollment() already
+                    // activated against (see gateway/config/ingress.env.example's
+                    // own "never shared with a real gateway" docs) - a
+                    // credential minted for the gateway is meaningless here.
+                    // This device therefore field-enrolls AGAIN, separately,
+                    // against THIS candidate's own ingress control-plane
+                    // host (candidate.ingressBinding.host - the SAME host
+                    // IngressProfileProvisioner itself POSTs
+                    // /v1/ingress-profile to), reusing any credential
+                    // already stored for that exact host first. No
+                    // PendingRelayActivation is ever stored and no
+                    // _relayActivationNeeded prompt is ever shown for this
+                    // path - nothing waits on a human decision.
+                    var zeroTouchCredential: String? = null
+                    val provisioner = ingressProfileProvisioner
+                    val key = _publicKey.value
+                    if (zeroTouchEnrollmentEnabled && provisioner != null && key != null) {
+                        val ingressHost = candidate.ingressBinding.host
+                        zeroTouchCredential = fieldCredentialStore.getOrNull(ingressHost)?.credential
+                        if (zeroTouchCredential == null) {
+                            when (val enrollResult = withContext(ioDispatcher) { fieldEnrollmentClient(key, ingressHost) }) {
+                                is net.pocvpn.client.provisioning.FieldEnrollmentResult.Success -> {
+                                    fieldCredentialStore.save(
+                                        net.pocvpn.client.provisioning.FieldCredential(enrollResult.activationCredential, ingressHost),
+                                    )
+                                    zeroTouchCredential = enrollResult.activationCredential
+                                }
+                                else -> { /* zeroTouchCredential stays null - falls through below */ }
+                            }
+                        }
+                    }
+                    if (zeroTouchCredential != null && provisioner != null && key != null) {
+                        supportDiagnosticsRecorder?.recordRelayActivationRequired()
+                        _ingressActivating.value = true
+                        performIngressActivation(PendingRelayActivation(candidate, attempts, attemptedKeys), zeroTouchCredential, provisioner, key)
+                    } else if (zeroTouchEnrollmentEnabled) {
+                        // Zero-touch is enabled but no working ingress
+                        // credential could be obtained (ingress-role field
+                        // enrollment not deployed/enabled on this host,
+                        // network failure, or provisioner/publicKey not
+                        // wired) - never pause for a manual prompt: the
+                        // field build's own UI can never show one (see
+                        // AppRoot's isZeroTouchEnrollmentBuild gating), so
+                        // pausing here would strand the combined sequence
+                        // forever with nothing able to resume it. Treat
+                        // this exactly like a non-fixable category instead -
+                        // the combined sequence simply moves on.
+                        supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(resolution.category))
+                        attemptCombined(attempts, attemptedKeys)
+                    } else {
+                        pendingRelayActivation = PendingRelayActivation(candidate, attempts, attemptedKeys)
+                        _relayActivationNeeded.value = net.pocvpn.client.relay.RelayActivationRequest.from(plan)
+                        supportDiagnosticsRecorder?.recordRelayActivationRequired()
+                    }
                 } else {
                     supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(resolution.category))
                     attemptCombined(attempts, attemptedKeys)
@@ -3911,6 +4148,13 @@ class MainViewModel(
                 supportDiagnosticsStore = supportDiagnosticsStore,
                 supportDiagnosticsAppVersionName = BuildConfig.VERSION_NAME,
                 supportDiagnosticsAppVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                // Russia field-test zero-touch enrollment - BuildConfig.FIELD_ENROLLMENT_ENABLED
+                // defaults to false (see build.gradle.kts's own docs), so
+                // this constructs the real encrypted store either way but
+                // only ever calls it when the flag is actually set - byte-
+                // for-byte unaffected otherwise.
+                fieldCredentialStore = net.pocvpn.client.provisioning.FieldCredentialStoreFactory.create(context),
+                zeroTouchEnrollmentEnabled = BuildConfig.FIELD_ENROLLMENT_ENABLED,
             ) as T
         }
     }

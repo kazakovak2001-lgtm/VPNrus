@@ -172,6 +172,32 @@ def post_ingress_profile(
     return raw_request(port, "POST", "/v1/ingress-profile", headers, body)
 
 
+def post_field_enroll(
+    port,
+    body_obj=None,
+    raw_body=None,
+    content_type="application/json",
+    set_content_length=True,
+    extra_headers=None,
+):
+    """POST /v1/field-enroll (Russia field-test zero-touch enrollment) -
+    same request shape as post_activate, EXCEPT no Authorization header at
+    all (there is no credential yet - that's the point)."""
+    if raw_body is not None:
+        body = raw_body
+    else:
+        body = json.dumps({} if body_obj is None else body_obj).encode("utf-8")
+
+    headers = {}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    if set_content_length:
+        headers["Content-Length"] = str(len(body))
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "POST", "/v1/field-enroll", headers, body)
+
+
 def get_manifest(port, method="GET", extra_headers=None):
     """GET /v1/manifest (B12) - no body, no auth. `method` lets tests
     exercise the 405 path with e.g. "POST" without a second helper."""

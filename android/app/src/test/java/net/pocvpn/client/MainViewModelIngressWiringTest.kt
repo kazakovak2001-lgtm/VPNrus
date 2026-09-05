@@ -22,6 +22,10 @@ import net.pocvpn.client.reachability.SignedManifest
 import net.pocvpn.client.reachability.TrustedKeyId
 import net.pocvpn.client.provisioning.IngressProfileResult
 import net.pocvpn.client.relay.IngressActivationOutcome
+import net.pocvpn.client.smartconnect.ConnectionErrorCategory
+import net.pocvpn.client.smartconnect.ConnectionOutcome
+import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
+import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.relay.IngressProfileProvisioner
 import net.pocvpn.client.relay.InMemoryIngressProfileStore
 import net.pocvpn.client.relay.NotConfiguredRelayEndToEndProbe
@@ -81,6 +85,15 @@ private val USABLE_WIFI = net.pocvpn.client.network.NetworkProfile(
 private class IngressWiringAlwaysAutoModeStore : GatewayAutoModeStore {
     override fun read(): Boolean = true
     override fun write(auto: Boolean) {}
+}
+
+/** In-memory [ConnectionOutcomeStore] double so a test can seed real prior-attempt history. */
+private class InMemoryConnectionOutcomeStore(seed: List<ConnectionOutcome> = emptyList()) : ConnectionOutcomeStore {
+    private val outcomes = seed.toMutableList()
+    override fun recent(): List<ConnectionOutcome> = outcomes.toList()
+    override fun record(outcome: ConnectionOutcome) {
+        outcomes += outcome
+    }
 }
 
 /** Same stubbing shape MainViewModelRelayActivationTest's own suite already uses to prove the resolver execution boundary. */
@@ -186,6 +199,7 @@ class MainViewModelIngressWiringTest {
         transport: VpnTransport = FakeVpnTransport(),
         relayIngressResolver: RelayIngressResolver = NotProvisionedRelayIngressResolver,
         ingressProfileProvisioner: IngressProfileProvisioner? = null,
+        connectionOutcomeStore: ConnectionOutcomeStore? = null,
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -202,6 +216,7 @@ class MainViewModelIngressWiringTest {
         relayIngressResolver = relayIngressResolver,
         relayEndToEndProbe = NotConfiguredRelayEndToEndProbe,
         ingressProfileProvisioner = ingressProfileProvisioner,
+        connectionOutcomeStore = connectionOutcomeStore,
         ioDispatcher = testDispatcher,
     )
 
@@ -532,6 +547,66 @@ class MainViewModelIngressWiringTest {
         assertFalse(stored.isExpired(System.currentTimeMillis()))
         assertEquals(ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID, stored.ingressEndpointId)
         assertEquals(TransportKind.XRAY_REALITY, stored.transport)
+    }
+
+    // --- PR #58 field-test fix: a different endpoint's real Direct
+    // XRAY_REALITY failure history must never exclude the relay candidate ---
+
+    @Test
+    fun `the real production Stockholm CHAIN_DIRECT candidate survives combinedAutoAttempts even after Germany's own Direct XRAY_REALITY dial has failed twice`() {
+        // Reproduces the exact 2026-09 Russia field-test bug through the
+        // REAL public connectAuto()-facing pipeline (never a hand-built
+        // AutoConnectAttempt/RelayAttemptCandidate): Germany's own Direct
+        // XRAY_REALITY dial correctly recording two consecutive FAILUREs
+        // (a physically blocked port, 2053) used to flip the SHARED
+        // transportHealthFor(XRAY_REALITY) bucket to UNREACHABLE, which
+        // then made the completely separate, never-yet-dialed
+        // stockholm-ingress-1 XRAY_REALITY candidate (port 2093) ineligible
+        // too via PathScorer's own "UNREACHABLE unless a hop is confirmed
+        // REACHABLE" rule - dropping CHAIN_DIRECT out of ranking before it
+        // was ever attempted (see AutoGatewaySelector.buildRelayedCandidates'
+        // own docs for the full story).
+        val outcomeStore = InMemoryConnectionOutcomeStore(
+            seed = listOf(
+                ConnectionOutcome(
+                    transport = TransportKind.XRAY_REALITY,
+                    gatewayId = ProductionGatewayCatalog.GERMANY.endpointId.value,
+                    result = ConnectionOutcomeResult.FAILURE,
+                    handshakeDurationMs = null,
+                    errorCategory = ConnectionErrorCategory.HANDSHAKE_TIMEOUT,
+                    timestampEpochMillis = 1_000L,
+                ),
+                ConnectionOutcome(
+                    transport = TransportKind.XRAY_REALITY,
+                    gatewayId = ProductionGatewayCatalog.GERMANY.endpointId.value,
+                    result = ConnectionOutcomeResult.FAILURE,
+                    handshakeDurationMs = null,
+                    errorCategory = ConnectionErrorCategory.HANDSHAKE_TIMEOUT,
+                    timestampEpochMillis = 2_000L,
+                ),
+            ),
+        )
+        val viewModel = newViewModel(connectionOutcomeStore = outcomeStore)
+
+        // Sanity check the seeded history actually poisons the SHARED,
+        // kind-wide bucket the way the physical bug depended on - if this
+        // assertion ever stops holding, the test below would pass for the
+        // wrong reason.
+        assertEquals(
+            net.pocvpn.client.transport.TransportHealthState.UNREACHABLE,
+            viewModel.transportHealth().getValue(TransportKind.XRAY_REALITY).state,
+        )
+
+        val attempts = viewModel.combinedAutoAttempts()
+
+        val relayed = attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>()
+        val stockholmToGermany = relayed.map { it.candidate }.firstOrNull {
+            it.ingressEndpointId == ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID && it.exitEndpointId == ProductionGatewayCatalog.GERMANY.endpointId
+        }
+        assertNotNull(
+            "the Stockholm CHAIN_DIRECT candidate must survive ranking despite Germany's unrelated Direct XRAY_REALITY failures",
+            stockholmToGermany,
+        )
     }
 
     @Test

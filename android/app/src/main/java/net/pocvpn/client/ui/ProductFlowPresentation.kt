@@ -34,6 +34,20 @@ fun screenFor(profileSource: ProfileSource): AppScreen =
     if (profileSource == ProfileSource.DEV_FALLBACK) AppScreen.ACTIVATION else AppScreen.HOME
 
 /**
+ * Russia field-test zero-touch enrollment - the SAME decision as
+ * [screenFor] above, except a build with [zeroTouchEnrollmentEnabled] set
+ * NEVER shows [AppScreen.ACTIVATION]: an unprovisioned device goes straight
+ * to Home, and MainViewModel.connect()'s own ensureZeroTouchEnrollment()
+ * handles first-time activation silently the moment the tester presses
+ * Connect - see that function's own docs. `false` (the default for every
+ * ordinary debug/release build) reproduces [screenFor]'s exact behavior,
+ * byte-for-byte - this is a strict widening, never a second decision
+ * authority.
+ */
+fun screenFor(profileSource: ProfileSource, zeroTouchEnrollmentEnabled: Boolean): AppScreen =
+    if (zeroTouchEnrollmentEnabled) AppScreen.HOME else screenFor(profileSource)
+
+/**
  * B8D "CONNECTION WORDING" - truthful, non-technical status text for the
  * normal Home screen. Never reads "Protected" before TransportState
  * .Connected - that state is only reached after a real handshake was

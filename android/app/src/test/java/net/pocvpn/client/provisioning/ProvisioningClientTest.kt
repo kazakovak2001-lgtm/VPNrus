@@ -235,4 +235,80 @@ class ProvisioningClientTest {
         assertEquals("https://16.170.208.231/v1/xray-profile", request.url)
         assertEquals("tls", JSONObject(request.body).getString("transport"))
     }
+
+    // --- Russia field-test zero-touch enrollment: POST /v1/field-enroll ---
+
+    private val validFieldEnrollSuccessBody = JSONObject()
+        .put("activation_credential", "aVeryLongRandomLookingCredentialValue1234567890")
+        .put("client_tunnel_ip", "10.77.0.2")
+        .put("gateway_public_key", "9WewKC/zyUPyPnKyzaI0bZrEN2c73PqjK7f+fRXHYRU=")
+        .put("gateway_tunnel_ip", "10.77.0.1")
+        .put("endpoint_host", "152.70.43.1")
+        .put("endpoint_port", 51820)
+        .toString()
+
+    @Test
+    fun `field-enroll request carries no Authorization header at all`() {
+        val request = ProvisioningClient.buildFieldEnrollRequest(validKey, "152.70.43.1")
+        assertTrue(request.headers.keys.none { it.equals("Authorization", ignoreCase = true) })
+    }
+
+    @Test
+    fun `field-enroll request body is exactly the single public_key field`() {
+        val request = ProvisioningClient.buildFieldEnrollRequest(validKey, "152.70.43.1")
+        val parsed = JSONObject(request.body)
+        assertEquals(setOf("public_key"), parsed.keys().asSequence().toSet())
+        assertEquals(validKey, parsed.getString("public_key"))
+    }
+
+    @Test
+    fun `field-enroll request targets the given endpoint host's own field-enroll path`() {
+        val request = ProvisioningClient.buildFieldEnrollRequest(validKey, "16.170.208.231")
+        assertEquals("https://16.170.208.231/v1/field-enroll", request.url)
+    }
+
+    @Test
+    fun `field-enroll valid success body parses into Success including the new credential field`() {
+        val result = ProvisioningClient.mapFieldEnrollResponse(200, validFieldEnrollSuccessBody)
+        assertTrue(result is FieldEnrollmentResult.Success)
+        val success = result as FieldEnrollmentResult.Success
+        assertEquals("aVeryLongRandomLookingCredentialValue1234567890", success.activationCredential)
+        assertEquals("10.77.0.2", success.clientTunnelIp)
+        assertEquals("152.70.43.1", success.endpointHost)
+    }
+
+    @Test
+    fun `field-enroll success body missing the credential is rejected as malformed`() {
+        val body = JSONObject(validFieldEnrollSuccessBody).apply { remove("activation_credential") }.toString()
+        val result = ProvisioningClient.mapFieldEnrollResponse(200, body)
+        assertTrue(result is FieldEnrollmentResult.MalformedResponse)
+    }
+
+    @Test
+    fun `field-enroll 400 maps to BadRequest`() {
+        assertEquals(FieldEnrollmentResult.BadRequest, ProvisioningClient.mapFieldEnrollResponse(400, """{"error":"invalid_public_key"}"""))
+    }
+
+    @Test
+    fun `field-enroll 403 device_limit_reached maps to DeviceLimitReached`() {
+        assertEquals(
+            FieldEnrollmentResult.DeviceLimitReached,
+            ProvisioningClient.mapFieldEnrollResponse(403, """{"error":"device_limit_reached"}"""),
+        )
+    }
+
+    @Test
+    fun `field-enroll 403 revoked maps to Revoked`() {
+        assertEquals(FieldEnrollmentResult.Revoked, ProvisioningClient.mapFieldEnrollResponse(403, """{"error":"revoked"}"""))
+    }
+
+    @Test
+    fun `field-enroll 503 maps to ServiceUnavailable`() {
+        assertEquals(FieldEnrollmentResult.ServiceUnavailable, ProvisioningClient.mapFieldEnrollResponse(503, ""))
+    }
+
+    @Test
+    fun `field-enroll non-JSON success body is rejected as malformed`() {
+        assertTrue(ProvisioningClient.mapFieldEnrollResponse(200, "not json") is FieldEnrollmentResult.MalformedResponse)
+    }
 }

@@ -34,7 +34,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
+from . import activations, field_enrollment, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -45,6 +45,7 @@ _PATH_XRAY_PROFILE = "/v1/xray-profile"
 _PATH_INGRESS_PROFILE = "/v1/ingress-profile"
 _PATH_MANIFEST = "/v1/manifest"
 _PATH_RELAY_HEALTH = "/v1/relay-health"
+_PATH_FIELD_ENROLL = "/v1/field-enroll"
 
 # B26 (task B) - the same TransportKind.name strings Android's TransportKind
 # enum uses (see transport/TransportKind.kt - no custom toString(), so
@@ -168,6 +169,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_relay_health()
+            elif self.path == _PATH_FIELD_ENROLL:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_field_enroll()
             else:
                 status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
@@ -738,6 +744,125 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # succeeded: the path identity comes from the verified signature,
         # not from the request.
         payload = {"status": "ok", "path": claims.history_path_id}
+        return self._success(HTTPStatus.OK, payload)
+
+    # --- POST /v1/field-enroll (Russia field test - zero-touch enrollment) ---
+    def _handle_field_enroll(self):
+        try:
+            return self._handle_field_enroll_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_field_enroll_inner(self):
+        """See field_enrollment.py's own module docstring for the full
+        design. Unlike every other POST endpoint in this file, this one
+        takes NO Authorization/Bearer header at all - a device that calls
+        this has, by definition, no credential yet; the response mints one.
+        Fails closed with 503 unless an operator has explicitly configured
+        AND enabled this on THIS deployment instance (AppConfig.field_enrollment_enabled) -
+        every ordinary/production gateway is unaffected by this endpoint's
+        mere existence.
+        """
+        cfg = self.server.config
+        if not (cfg.field_enrollment_enabled and cfg.activation_store_path and cfg.field_enrollment_index_path):
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "field_enrollment_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        # Round-2 review fix (cap exhaustion) - a SEPARATE, much stricter
+        # limiter than the general global_limiter above, scoped to this one
+        # endpoint and applied regardless of which public key is presented.
+        # An attacker who mints unlimited public keys cannot exhaust
+        # field_enrollment_max_devices (a small number, e.g. 5) faster than
+        # this window allows - see server.py's own docs for the exact
+        # constants and rationale. Checked before body parsing: a request
+        # this endpoint would reject anyway (malformed body, invalid key)
+        # still consumes an attempt slot, since generating a fresh
+        # malformed-but-plausible request is exactly as cheap for an
+        # attacker as a well-formed one.
+        if not self.server.field_enrollment_global_limiter.allow("field-enroll"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        raw_body = self.rfile.read(content_length)
+        # Same {"public_key": "..."} body shape as /v1/peers/activate -
+        # reused verbatim, never a new request contract.
+        public_key = self._parse_and_validate_body(raw_body)
+        self._log_fields["pubkey_prefix"] = public_key[:8]
+
+        # Per-public-key limiter (a DIFFERENT limiter from per_token_limiter -
+        # there is no credential yet to key that one on) - see server.py's
+        # own docs for why this is deliberately tighter than the general
+        # per-credential rate. Kept alongside the new global limiter above -
+        # defense against one key retry-looping is a separate concern from
+        # defense against many distinct keys exhausting the device cap.
+        if not self.server.field_enrollment_limiter.allow(public_key):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        try:
+            result = field_enrollment.enroll_device(
+                public_key,
+                cfg.field_enrollment_index_path, cfg.field_enrollment_index_lock_path,
+                cfg.activation_store_path, cfg.activation_lock_path,
+                cfg.provision_script_path, cfg.subprocess_timeout_seconds,
+                cfg.field_enrollment_max_devices,
+                sudo_path=cfg.sudo_path or None,
+            )
+        except (activations.ActivationStoreError, field_enrollment.FieldEnrollmentIndexError):
+            logger.error("field_enrollment_store_error")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_store_unavailable")
+
+        self._log_fields["field_enrollment_outcome"] = result.outcome
+
+        if result.outcome == field_enrollment.INVALID_PUBLIC_KEY:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_public_key")
+        if result.outcome == field_enrollment.DEVICE_CAP_REACHED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_limit_reached")
+        if result.outcome == field_enrollment.REVOKED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+        if result.outcome == field_enrollment.EXPIRED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
+        if result.outcome == field_enrollment.DISABLED:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "field_enrollment_unavailable")
+        if result.outcome == field_enrollment.PROVISION_FAILED:
+            exc = result.provision_error
+            logger.error("field_enrollment_provision_error kind=%s", getattr(exc, "kind", "internal"))
+            if getattr(exc, "kind", None) == "exhausted":
+                raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "subnet_exhausted")
+            if getattr(exc, "kind", None) == "timeout":
+                raise _RequestError(HTTPStatus.GATEWAY_TIMEOUT, "provisioning_timeout")
+            raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+        # result.outcome == ENROLLED here. Log only the credential's DIGEST
+        # (computed from the value we are about to return, never logged
+        # itself) - same discipline every other endpoint's
+        # "activation_digest" log field already uses.
+        self._log_fields["activation_digest"] = activations.credential_digest(result.credential)[:8]
+
+        # This is the ONE response, across this entire API, that ever
+        # includes a raw activation credential - by design: the device that
+        # just called this endpoint IS the one and only party this
+        # credential was minted for, delivered once, over TLS. Every other
+        # field mirrors /v1/activate's own success payload exactly, so the
+        # client's existing response-parsing/persistence path needs no new
+        # shape beyond the one new field.
+        payload = {
+            "activation_credential": result.credential,
+            "client_tunnel_ip": result.client_tunnel_ip,
+            "gateway_public_key": cfg.gateway_public_key,
+            "gateway_tunnel_ip": cfg.gateway_tunnel_ip,
+            "endpoint_host": cfg.endpoint_host,
+            "endpoint_port": cfg.endpoint_port,
+        }
         return self._success(HTTPStatus.OK, payload)
 
     # --- GET /v1/manifest (B12) ---
