@@ -90,6 +90,22 @@ enum class DiagnosticEventType {
     // terminates through the SAME finishProtected()/finishFailed()/
     // finishDisconnected() calls every other session already uses.
     RECONNECT_INCIDENT_STARTED,
+
+    // B36 (task requirement 11) - bootstrap pre-activation tunnel events.
+    // Recorded by net.pocvpn.client.bootstrap.BootstrapDiagnosticsRecorder,
+    // a deliberately SEPARATE small recorder from SupportDiagnosticsRecorder
+    // (see that class's own docs for why) - these values are reused here,
+    // in the SAME closed vocabulary, purely so a future slice can fold
+    // bootstrap events into a real DiagnosticSession/SupportBundle without
+    // inventing a second enum.
+    BOOTSTRAP_ATTEMPT_STARTED,
+    BOOTSTRAP_CANDIDATE_CONNECT_RESULT,
+    BOOTSTRAP_BECAME_USABLE,
+    BOOTSTRAP_ACTIVATION_STARTED,
+    BOOTSTRAP_ACTIVATION_RESULT,
+    BOOTSTRAP_TEARDOWN,
+    BOOTSTRAP_UNAVAILABLE,
+    BOOTSTRAP_PROVISIONED_TRANSITION,
 }
 
 /**
@@ -140,6 +156,11 @@ enum class DiagnosticFailureReason {
     CONTROL_PLANE_TRUST_REJECTED,
     CONTROL_PLANE_REDIRECT_REJECTED,
     CONTROL_PLANE_ORIGINS_EXHAUSTED,
+
+    // B36 - every known bootstrap candidate failed to produce a usable
+    // pre-activation tunnel (see
+    // net.pocvpn.client.bootstrap.BootstrapActivationOutcome.BootstrapUnavailable).
+    BOOTSTRAP_UNAVAILABLE,
 }
 
 /** B29 - the terminal shape of one [DiagnosticSession], mirroring [net.pocvpn.client.vpn.VpnSessionHealth]'s own real terminal states (never a fourth, independently-invented state). */

@@ -211,10 +211,22 @@ fun AppRoot(
                     isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
                     onCancel = { activatingGatewayId = null; credential = "" },
                 )
+                // B36 - the mandatory first-run path routes through the
+                // bootstrap-tunnel orchestrator instead of calling
+                // activateDevice() directly: no persisted profile can exist
+                // yet here (screenFor's own ACTIVATION branch), which is
+                // exactly the case a restricted pre-activation tunnel exists
+                // for (docs/B36_BOOTSTRAP_PRE_ACTIVATION_TUNNEL.md). The
+                // additional-gateway path above (activatingGatewayId != null)
+                // deliberately keeps calling activateDevice() directly - a
+                // device reaching THAT path is already provisioned for at
+                // least one gateway, so bootstrap would refuse it anyway
+                // (see MainViewModel.activateDeviceViaBootstrap's own docs) -
+                // same UX (`[activation code] [Activate]`), no new screen.
                 screenFor(profileSource) == AppScreen.ACTIVATION -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
-                    onActivateClick = { viewModel.activateDevice(credential) },
+                    onActivateClick = { viewModel.activateDeviceViaBootstrap(credential) },
                     errorText = provisioningState.toActivationErrorText(),
                     isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
                 )
@@ -770,6 +782,7 @@ private fun provisioningDisplayText(state: ProvisioningUiState): String = when (
     is ProvisioningUiState.Revoked -> "ACTIVATION REVOKED"
     is ProvisioningUiState.Expired -> "ACTIVATION EXPIRED"
     is ProvisioningUiState.DeviceLimitReached -> "DEVICE LIMIT REACHED"
+    is ProvisioningUiState.BootstrapUnavailable -> "BOOTSTRAP UNAVAILABLE"
     is ProvisioningUiState.Error -> "ERROR - ${state.message}"
     is ProvisioningUiState.Success -> {
         val r = state.result
