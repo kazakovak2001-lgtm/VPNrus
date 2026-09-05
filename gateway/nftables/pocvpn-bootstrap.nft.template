@@ -16,10 +16,11 @@
 # is fully redeclared below - safe to re-run.
 #
 # Rendered by install-bootstrap-peer.sh: __NFT_TABLE_BOOTSTRAP__,
-# __BOOTSTRAP_CLIENT_IP__, __BOOTSTRAP_FORWARD_PRIORITY__ (from
-# config/bootstrap.env - the SAME value install-bootstrap-peer.sh's own
-# live verification checks against the real production ruleset before this
-# file is ever applied, never a second, independently-chosen number).
+# __BOOTSTRAP_CLIENT_IP__, __BOOTSTRAP_FORWARD_PRIORITY__,
+# __BOOTSTRAP_INPUT_PRIORITY__ (from config/bootstrap.env - the SAME values
+# install-bootstrap-peer.sh's own live verification checks against the real
+# production ruleset before this file is ever applied, never a second,
+# independently-chosen number).
 
 table inet __NFT_TABLE_BOOTSTRAP__
 delete table inet __NFT_TABLE_BOOTSTRAP__
@@ -53,7 +54,16 @@ table inet __NFT_TABLE_BOOTSTRAP__ {
     }
 
     chain input {
-        type filter hook input priority filter; policy accept;
+        # __BOOTSTRAP_INPUT_PRIORITY__ - explicit and verified live against
+        # whichever production INPUT hook exists on this host (see
+        # gateway/lib/bootstrap_runtime.sh's
+        # verify_bootstrap_input_priority_precedes_production), exactly the
+        # same reasoning as the `forward` chain above. This chain's own
+        # accept/drop pair must never depend on same-priority ("filter"/0)
+        # base-chain registration-order tie-breaking against a production
+        # INPUT chain - that ordering is not guaranteed by the netfilter
+        # core, so this table now always dispatches strictly first.
+        type filter hook input priority __BOOTSTRAP_INPUT_PRIORITY__; policy accept;
 
         # The bootstrap peer may reach ONLY tcp/443 on this box itself (the
         # same public nginx vhost /v1/activate, /v1/manifest, and
@@ -64,13 +74,11 @@ table inet __NFT_TABLE_BOOTSTRAP__ {
         # ports (8443/8444, unreachable over the network regardless), Xray
         # (2053/2083), and the AWG UDP port itself is irrelevant here since
         # this chain only inspects already-decrypted tunnel-interior
-        # traffic. Independent of the `forward` chain above - INPUT and
-        # FORWARD are separate hook points (this traffic is delivered
-        # locally, never forwarded - see the deployment plan's "why 443,
-        # hairpin/local-delivery" section), so this rule needs no priority
-        # coordination with production's own INPUT handling (neither
-        # gateway's tracked firewall model declares an INPUT hook at all -
-        # only FORWARD/NAT - so there is nothing to race against here).
+        # traffic. Because this chain's own hook priority is now verified
+        # strictly earlier than any production INPUT hook, this drop is
+        # guaranteed to be evaluated before production's own INPUT chain
+        # for the bootstrap source's packets - independent of chain
+        # registration order.
         ip saddr __BOOTSTRAP_CLIENT_IP__ tcp dport 443 accept
         ip saddr __BOOTSTRAP_CLIENT_IP__ drop
     }

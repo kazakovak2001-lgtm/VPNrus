@@ -6,6 +6,21 @@ go-ahead, per this repository's merge/infra-safety rule.** This plan exists
 so that approval, once given, can be carried out mechanically and reviewed
 in advance - not to authorize itself.
 
+**Correction (2026-09-05, PR #60 pre-deployment safety pass):** the earlier
+version of `install-bootstrap-peer.sh` this document described added the
+shared/public bootstrap peer BEFORE the restricted nftables table was
+confirmed live - if the nftables render/apply/persistence step failed
+after `add-peer.sh` had already succeeded, the public bootstrap peer could
+be left active with no restriction at all. The install transaction below
+is now fail-closed: the restriction is rendered, applied, and verified
+LIVE (including its own dedicated persistence unit) before the peer is
+ever added, and any failure after that point rolls back only this
+script's own dedicated state (see "Corrected install transaction" below).
+Separately, the bootstrap table's `input` chain now hooks at an explicit,
+verified `BOOTSTRAP_INPUT_PRIORITY` (same as `BOOTSTRAP_FORWARD_PRIORITY`,
+`-5`) instead of the named priority `filter` (0) - this resolves the
+previously disclosed Frankfurt-only INPUT limitation (see below).
+
 **Correction (2026-09-05 follow-up):** an earlier version of this document
 incorrectly assumed both gateways share one identical firewall/systemd
 runtime (both native nftables, both provisioned by `gateway/provision.sh`
@@ -96,6 +111,19 @@ reasoning blindly - it reads the REAL live priority from `nft list table
 it is confirmed strictly greater than `-5`, on every run, before the
 bootstrap table is ever applied.
 
+The bootstrap table's INPUT hook now uses its own explicit priority,
+**`BOOTSTRAP_INPUT_PRIORITY`** (`gateway/config/bootstrap.env`, also
+`-5`) - independent of the FORWARD value, verified the same way by
+`verify_bootstrap_input_priority_precedes_production` against whichever
+production INPUT hook exists on the host (if any - Stockholm's `inet
+pocvpn` has none, Frankfurt's `ip filter` does via iptables' own built-in
+INPUT chain). Previously this chain used the named priority `filter` (0),
+the same tie value a production INPUT hook could also use, and same-
+priority dispatch order is registration-order dependent - not something
+this repository can verify for Frankfurt's untracked
+`awg-firewall.service`. Making the priority strictly earlier and verifying
+it live removes that dependency entirely (see "RESOLVED" note below).
+
 **Table-coexistence (FORWARD):** `iptables-nft`/`iptables-restore`
 (Frankfurt's `awg-firewall.service`) only ever touches the specific tables
 it owns (`ip filter`, `ip nat`, ...) - it does not issue a global `nft
@@ -107,20 +135,21 @@ Frankfurt's actual (untracked) `awg-firewall.service` unit, so
 still present immediately after applying the bootstrap table, and refuses
 to declare success if either is missing.
 
-**KNOWN, DISCLOSED LIMITATION (INPUT, Frankfurt only):** if Frankfurt's
-real (untracked) `awg-firewall.service` ruleset already ACCEPTs
-bootstrap-sourced traffic in its own INPUT chain ahead of the bootstrap
-table's `input` chain, that table's "tcp/443 only" restriction may not
-execute for already-accepted packets - a no-op in that case, **never a
-worsening** of what the host already allowed (the bootstrap table only
-ever adds a DROP for non-443 traffic from that one source, never an
-ACCEPT). The FORWARD restriction - the actual "no general Internet access"
-boundary - is unaffected either way, since FORWARD and INPUT are separate
-hook points and Frankfurt's FORWARD shape IS fully confirmed. Given this,
-`install-bootstrap-peer.sh` prints a REQUIRED manual read-only check
-(`iptables -L INPUT -n` / `nft list ruleset`) for the operator to confirm
-before treating the tcp/443-only restriction as a hard guarantee on
-Frankfurt specifically. This is disclosed, not guessed past.
+**RESOLVED (previously a disclosed limitation, INPUT, Frankfurt only):**
+the earlier version of this table hooked `input` at priority `filter` (0)
+- the same priority Frankfurt's `ip filter` INPUT chain (created by
+iptables' own default three built-in chains) also uses, so this table's
+restriction was not guaranteed to run before it (same-priority dispatch
+falls back to registration order, which this repository cannot verify for
+Frankfurt's untracked `awg-firewall.service`). Now that the bootstrap
+table's `input` chain hooks at the explicit, live-verified
+`BOOTSTRAP_INPUT_PRIORITY` (`-5`, strictly earlier than any confirmed
+production INPUT hook), its DROP for the bootstrap source's non-443
+traffic is unconditionally dispatched first, regardless of registration
+order - no limitation genuinely remains here. `install-bootstrap-peer.sh`
+verifies this live, on every run, exactly like the FORWARD ordering, and
+refuses to apply the table if a production INPUT hook exists at a
+priority that would not be strictly later.
 
 ## Phase 2 - bootstrap client identity (unchanged from the prior slice)
 
@@ -138,6 +167,34 @@ command output, or any report.**
 
 Bootstrap peer's own fixed tunnel address (same on both gateways,
 independent subnets): `10.77.0.250`.
+
+## Corrected install transaction (PR #60)
+
+`install-bootstrap-peer.sh` runs as one fail-closed transaction, in this
+exact order:
+
+A. detect/verify the runtime and both production hook priorities (FORWARD
+   and, where one exists, INPUT) - no mutation yet.
+B. render the bootstrap nftables config.
+C. syntax-check the rendered config (`nft -c -f`), if the installed `nft`
+   supports it.
+D. apply the bootstrap nftables table (`nft -f`).
+E. verify the live table shows both expected hook priorities and both
+   restriction rules.
+F. install/enable the dedicated persistence unit.
+G. verify the persistence unit is active and the table is still live.
+H. **only then** add the shared bootstrap peer (`add-peer.sh`).
+I. verify the peer is present in both durable config and live `awg0`.
+
+If any step from D onward fails, an EXIT trap rolls back only what this
+run itself mutated - the bootstrap peer (if added), the dedicated
+`pocvpn_bootstrap` table, its rendered config file, and its systemd unit -
+and never production firewall/NAT or any other peer. The rollback is
+idempotent (safe to re-run against partially-rolled-back state). A failure
+at step A (unknown runtime, unsafe hook ordering) mutates nothing at all.
+See `gateway/scripts/install-bootstrap-peer.sh` and
+`gateway/scripts/tests/run_bootstrap_install_tests.sh` for the exact logic
+and its transactional test coverage.
 
 ## Phase 3 - exact server configuration
 
@@ -159,36 +216,47 @@ sudo ./scripts/install-bootstrap-peer.sh --runtime frankfurt
 ```
 
 Which, after verifying `ip filter`'s live FORWARD-hook priority is `0`
-(greater than `-5`), performs exactly:
+(greater than `-5`) AND its live INPUT-hook priority is also `0` (greater
+than the bootstrap table's own `-5` INPUT priority), performs exactly, IN
+THIS ORDER - restriction rendered, applied, and verified live (including
+its own persistence unit) BEFORE the peer is ever added:
 
 ```bash
-sudo ./scripts/add-peer.sh I/Kv8Kkebdtb5Rem+vdmkq0N3DK/ojQVbQWtoOFxyFE= 10.77.0.250 bootstrap
-
 sudo bash -c '
 sed -e "s/__NFT_TABLE_BOOTSTRAP__/pocvpn_bootstrap/g" \
     -e "s/__BOOTSTRAP_CLIENT_IP__/10.77.0.250/g" \
     -e "s/__BOOTSTRAP_FORWARD_PRIORITY__/-5/g" \
+    -e "s/__BOOTSTRAP_INPUT_PRIORITY__/-5/g" \
     nftables/pocvpn-bootstrap.nft.template > /etc/nftables.pocvpn-bootstrap.conf
 '
 sudo chmod 644 /etc/nftables.pocvpn-bootstrap.conf
+sudo nft -c -f /etc/nftables.pocvpn-bootstrap.conf   # syntax check, if supported
 sudo nft -f /etc/nftables.pocvpn-bootstrap.conf
+# verify: nft list table inet pocvpn_bootstrap shows both hooks + both rules
 
 sudo install -m 0644 systemd/nftables-pocvpn-bootstrap.service /etc/systemd/system/nftables-pocvpn-bootstrap.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nftables-pocvpn-bootstrap.service
+# verify: systemctl is-active nftables-pocvpn-bootstrap.service, table still present
+
+sudo ./scripts/add-peer.sh I/Kv8Kkebdtb5Rem+vdmkq0N3DK/ojQVbQWtoOFxyFE= 10.77.0.250 bootstrap
+# verify: peer present in durable config AND `awg show awg0 peers`
 ```
+
+If any step fails after the nftables table has been applied, the script's
+own rollback trap removes only the `pocvpn_bootstrap` table/config/unit it
+created (and the peer, if that step was reached) - see "Corrected install
+transaction" above. It never touches production firewall/NAT or any other
+peer, and is safe to re-run.
 
 Verification (read-only, no state change):
 
 ```bash
 sudo awg show awg0 peers                  # bootstrap public key present
-sudo nft list table inet pocvpn_bootstrap # both rules present, forward priority -5
+sudo nft list table inet pocvpn_bootstrap # both rules present, forward AND input priority -5
 sudo nft list table ip filter             # UNCHANGED - byte-for-byte identical to before
 sudo nft list table ip nat                # UNCHANGED - byte-for-byte identical to before
 sudo systemctl is-active awg-firewall.service   # still active, never touched by this script
-# REQUIRED: confirm no existing INPUT rule already accepts 10.77.0.250 ahead of the new table:
-sudo iptables -L INPUT -n
-sudo nft list ruleset
 # from a second host, through a real bootstrap tunnel handshake:
 #   https://152.70.43.1/v1/manifest  -> expect the real signed manifest (200)
 #   any other destination/port through the tunnel -> expect timeout/refused
@@ -202,15 +270,16 @@ sudo ./scripts/install-bootstrap-peer.sh --runtime stockholm
 ```
 
 Which, after verifying `inet pocvpn`'s live FORWARD-hook priority is `0`
-(greater than `-5`), performs exactly the same `add-peer.sh`/template-
-render/`nft -f`/systemd-enable sequence as Frankfurt above, against
-Stockholm's own `awg0` interface.
+(greater than `-5`) and confirming it declares no INPUT hook at all
+(nothing to race there), performs exactly the same template-render/
+`nft -c -f`/`nft -f`/verify/systemd-enable/verify/`add-peer.sh`/verify
+sequence as Frankfurt above, against Stockholm's own `awg0` interface.
 
 Verification (read-only, no state change):
 
 ```bash
 sudo awg show awg0 peers
-sudo nft list table inet pocvpn_bootstrap  # both rules present, forward priority -5
+sudo nft list table inet pocvpn_bootstrap  # both rules present, forward AND input priority -5
 sudo nft list table inet pocvpn            # UNCHANGED - byte-for-byte identical to before
 ```
 
@@ -271,8 +340,7 @@ release, remove the OLD peer/restriction only once adoption is sufficient
 ## Physical validation checklist (after the repository owner approves and applies the above)
 
 1. Run `install-bootstrap-peer.sh --runtime frankfurt` on Frankfurt,
-   verify with the read-only commands above, including the REQUIRED
-   Frankfurt-only INPUT check.
+   verify with the read-only commands above.
 2. Run `install-bootstrap-peer.sh --runtime stockholm` on Stockholm,
    verify identically (no INPUT caveat there - `pocvpn.nft.template` has
    no existing INPUT hook to race against).

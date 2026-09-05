@@ -65,22 +65,29 @@
 # repository) - install-bootstrap-peer.sh re-checks the bootstrap table's
 # presence immediately after every apply as a defensive measure.
 #
-# KNOWN, DISCLOSED LIMITATION (INPUT, Frankfurt only): the verified
-# Frankfurt facts this plan is built from name a FORWARD/NAT ruleset only -
-# no INPUT-hook rule is documented for Frankfurt's `awg-firewall.service`.
-# If that service's real (untracked) ruleset already ACCEPTs
-# awg0-sourced/bootstrap-sourced traffic in its own INPUT chain ahead of
-# this table's `input` chain, this table's own "tcp/443 only" DROP for
-# every other locally-delivered port from the bootstrap source may not
-# execute for already-accepted packets - a no-op in that case, never a
-# WORSENING of what the host already allowed (this table only ever adds a
-# DROP, never an ACCEPT, for traffic other than tcp/443). The FORWARD
-# restriction above (the actual "no general Internet access" boundary) is
-# unaffected by this either way. install-bootstrap-peer.sh prints an
-# explicit reminder to read Frankfurt's real INPUT ruleset
-# (`iptables -L INPUT -n` / `nft list ruleset`) as a manual, read-only
-# verification step before treating the tcp/443-only restriction as a hard
-# guarantee on that host specifically.
+# RESOLVED (previously a disclosed limitation, INPUT, Frankfurt only): an
+# earlier version of this table hooked `input` at nftables' named priority
+# "filter" (0) - the SAME priority as either production runtime's own
+# INPUT chain, if one exists. At equal priority, dispatch order between
+# base chains falls back to base-chain registration order, which is not
+# something this repository controls or can verify for Frankfurt's
+# untracked `awg-firewall.service` - so this table's own DROP was not
+# guaranteed to run before a same-priority production ACCEPT.
+#
+# This table's `input` chain now hooks at BOOTSTRAP_INPUT_PRIORITY
+# (config/bootstrap.env, default -5 - the same safe earlier value as
+# BOOTSTRAP_FORWARD_PRIORITY), and
+# verify_bootstrap_input_priority_precedes_production below verifies, on
+# the LIVE ruleset, that this priority is strictly earlier than any
+# production INPUT hook that exists on the host before ever applying the
+# bootstrap table. Since a lower/earlier priority is unconditionally
+# dispatched first regardless of registration order, this table's DROP is
+# now guaranteed to execute before any production INPUT chain (existing or
+# not) ever sees the bootstrap source's non-443 traffic - no limitation
+# genuinely remains here. (If a host has some OTHER, non-nftables-visible
+# mechanism intercepting the packet before the netfilter input hook at all
+# - e.g. a raw socket - no nftables-priority ordering could ever address
+# that; nothing in either verified host's facts suggests this applies.)
 
 # detect_bootstrap_firewall_runtime
 # Prints exactly one of "frankfurt-iptables-nft" / "stockholm-native-nftables"
@@ -110,23 +117,30 @@ detect_bootstrap_firewall_runtime() {
     return 1
 }
 
-# read_forward_hook_priority <family> <table>
-# Prints the live numeric FORWARD-hook priority of <family> <table>'s own
-# base chain hooked at `forward` (there must be exactly one), or returns 1
-# if it cannot be determined unambiguously (table/hook missing, more than
-# one forward hook in the table, or an unparseable priority token) - never
-# guesses a default.
-read_forward_hook_priority() {
-    local family=$1 table=$2
+# read_hook_priority <family> <table> <hook>
+# Prints the live numeric <hook>-hook priority of <family> <table>'s own
+# base chain hooked at <hook> on stdout and returns 0, if there is exactly
+# one such hook. Returns 2 (nothing printed) if <family> <table> declares
+# NO base chain at that hook at all - a legitimate, distinguishable
+# outcome (e.g. Stockholm's `inet pocvpn` has no `input` hook), never
+# treated as an error by callers. Returns 1 (nothing printed) if it cannot
+# be determined unambiguously (table missing entirely, more than one such
+# hook in the table, or an unparseable priority token) - callers MUST treat
+# 1 as fail-closed. Never guesses a default.
+read_hook_priority() {
+    local family=$1 table=$2 hook=$3
     local listing
     listing=$(nft list table "$family" "$table" 2>/dev/null) || return 1
 
     local hook_lines
-    hook_lines=$(printf '%s\n' "$listing" | grep -c 'hook forward priority')
+    hook_lines=$(printf '%s\n' "$listing" | grep -c "hook $hook priority")
+    if [ "$hook_lines" -eq 0 ]; then
+        return 2
+    fi
     [ "$hook_lines" -eq 1 ] || return 1
 
     local priority_token
-    priority_token=$(printf '%s\n' "$listing" | grep 'hook forward priority' | sed -E 's/.*hook forward priority ([^;]+);.*/\1/' | tr -d ' ')
+    priority_token=$(printf '%s\n' "$listing" | grep "hook $hook priority" | sed -E "s/.*hook $hook priority ([^;]+);.*/\1/" | tr -d ' ')
 
     if [ "$priority_token" = "filter" ]; then
         printf '0\n'
@@ -137,20 +151,113 @@ read_forward_hook_priority() {
     return 0
 }
 
+# read_forward_hook_priority <family> <table>
+# Back-compat thin wrapper around read_hook_priority for the `forward`
+# hook - see that function for the exact contract.
+read_forward_hook_priority() {
+    read_hook_priority "$1" "$2" forward
+}
+
 # verify_bootstrap_priority_precedes_production <family> <table> <bootstrap_priority>
 # Dies (fail closed) unless <family> <table>'s live FORWARD-hook priority is
 # confirmed strictly greater than <bootstrap_priority> - i.e. the bootstrap
-# table's DROP genuinely runs first for every real packet. Never assumes;
-# always reads the live ruleset via read_forward_hook_priority above.
+# table's DROP genuinely runs first for every real packet. A production
+# FORWARD hook is expected to exist on both known runtimes (this is the
+# entire boundary this table exists to race against), so an absent hook
+# (return 2) is treated the same as an unparseable one - fail closed. Never
+# assumes; always reads the live ruleset via read_hook_priority above.
 verify_bootstrap_priority_precedes_production() {
     local family=$1 table=$2 bootstrap_priority=$3
-    local production_priority
-    production_priority=$(read_forward_hook_priority "$family" "$table") \
-        || die "could not determine the live FORWARD-hook priority of $family $table - refusing to apply the bootstrap restriction without confirming ordering"
+    local production_priority rc
+    # set +e/-e around the substitution: under `set -e` (this function is
+    # always sourced into a script running with it), `var=$(cmd)` aborts
+    # the WHOLE script immediately if cmd fails, before `rc=$?` is ever
+    # reached - unlike `cmd1 || cmd2`, a bare assignment is not exempted.
+    set +e
+    production_priority=$(read_hook_priority "$family" "$table" forward)
+    rc=$?
+    set -e
+
+    if [ "$rc" -ne 0 ]; then
+        die "could not determine the live FORWARD-hook priority of $family $table - refusing to apply the bootstrap restriction without confirming ordering"
+    fi
 
     if [ "$production_priority" -le "$bootstrap_priority" ]; then
         die "unsafe ordering: $family $table's own FORWARD-hook priority ($production_priority) is not greater than the bootstrap table's priority ($bootstrap_priority) - the bootstrap DROP would not reliably run first. Refusing to apply. Investigate manually before retrying."
     fi
 
     log "verified live: $family $table FORWARD-hook priority is $production_priority (> bootstrap priority $bootstrap_priority) - bootstrap DROP is confirmed to execute first"
+}
+
+# verify_bootstrap_input_priority_precedes_production <family> <table> <bootstrap_priority>
+# Dies (fail closed) unless <family> <table>'s live INPUT-hook priority
+# (when one exists at all) is confirmed strictly greater than
+# <bootstrap_priority>. Unlike FORWARD, a production INPUT hook is NOT
+# guaranteed to exist on every known runtime (Stockholm's `inet pocvpn` has
+# none) - a genuinely absent hook (return 2) is not a race at all and is
+# logged, not treated as an error. An ambiguous/unparseable result (return
+# 1) still fails closed exactly like the FORWARD check.
+verify_bootstrap_input_priority_precedes_production() {
+    local family=$1 table=$2 bootstrap_priority=$3
+    local production_priority rc
+    # See verify_bootstrap_priority_precedes_production above for why
+    # set +e/-e is required around this substitution under `set -e`.
+    set +e
+    production_priority=$(read_hook_priority "$family" "$table" input)
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 2 ]; then
+        log "verified live: $family $table declares no INPUT hook at all - nothing to race the bootstrap table's INPUT priority $bootstrap_priority against"
+        return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
+        die "could not determine the live INPUT-hook priority of $family $table - refusing to apply the bootstrap restriction without confirming ordering"
+    fi
+
+    if [ "$production_priority" -le "$bootstrap_priority" ]; then
+        die "unsafe ordering: $family $table's own INPUT-hook priority ($production_priority) is not greater than the bootstrap table's INPUT priority ($bootstrap_priority) - the bootstrap INPUT restriction would not reliably run first. Refusing to apply. Investigate manually before retrying."
+    fi
+
+    log "verified live: $family $table INPUT-hook priority is $production_priority (> bootstrap INPUT priority $bootstrap_priority) - bootstrap INPUT restriction is confirmed to execute first"
+}
+
+# verify_bootstrap_table_live <table> <client_ip> <forward_priority> <input_priority>
+# Fail-closed post-apply check that the just-applied dedicated bootstrap
+# table is genuinely live with the exact expected hook priorities and both
+# restriction rules this table exists to enforce - never trusts `nft -f`'s
+# own exit code alone.
+verify_bootstrap_table_live() {
+    local table=$1 client_ip=$2 forward_priority=$3 input_priority=$4
+    local listing
+    listing=$(nft list table inet "$table" 2>/dev/null) \
+        || die "post-apply verification failed: inet $table table is not present immediately after applying it"
+
+    printf '%s\n' "$listing" | grep -qE "hook forward priority ${forward_priority};" \
+        || die "post-apply verification failed: inet $table forward chain does not show the expected priority $forward_priority"
+    printf '%s\n' "$listing" | grep -qE "hook input priority ${input_priority};" \
+        || die "post-apply verification failed: inet $table input chain does not show the expected priority $input_priority"
+    printf '%s\n' "$listing" | grep -qF "ip saddr $client_ip drop" \
+        || die "post-apply verification failed: inet $table forward chain is missing its 'ip saddr $client_ip drop' rule"
+    printf '%s\n' "$listing" | grep -qF "ip saddr $client_ip tcp dport 443 accept" \
+        || die "post-apply verification failed: inet $table input chain is missing its 'ip saddr $client_ip tcp dport 443 accept' rule"
+
+    log "verified live: inet $table forward(priority $forward_priority)/input(priority $input_priority) restriction rules for $client_ip are present"
+}
+
+# verify_bootstrap_peer_live <public_key> <tunnel_ip> <config_path> <interface>
+# Fail-closed post-add check that the bootstrap peer is genuinely present
+# in BOTH the durable config and the live AWG interface - never trusts
+# add-peer.sh's own exit code alone.
+verify_bootstrap_peer_live() {
+    local public_key=$1 tunnel_ip=$2 config_path=$3 interface=$4
+
+    grep -qF "PublicKey = $public_key" "$config_path" \
+        || die "post-add verification failed: bootstrap peer public key not found in durable config $config_path"
+    grep -A1 -F "PublicKey = $public_key" "$config_path" | grep -qF "AllowedIPs = $tunnel_ip/32" \
+        || die "post-add verification failed: durable config's bootstrap peer entry does not show AllowedIPs = $tunnel_ip/32"
+    awg show "$interface" peers 2>/dev/null | grep -qF "$public_key" \
+        || die "post-add verification failed: bootstrap public key not present in live 'awg show $interface peers'"
+
+    log "verified: bootstrap peer $public_key/$tunnel_ip present in both durable config ($config_path) and live $interface"
 }
