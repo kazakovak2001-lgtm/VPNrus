@@ -79,8 +79,8 @@ slice attempts.
   Frankfurt -> Stockholm fallback order (no Smart Connect scoring, per task
   scope).
 - `net.pocvpn.client.bootstrap.BootstrapIdentity` - the shared, PUBLIC
-  bootstrap AWG keypair (placeholder value - see "Trust boundary" below)
-  and this peer's own fixed tunnel address.
+  bootstrap AWG keypair (a real, freshly generated Curve25519 keypair - see
+  "Trust boundary" below) and this peer's own fixed tunnel address.
 - `net.pocvpn.client.bootstrap.buildBootstrapAwgConfig`/`bootstrapControlPlaneHost` -
   pure functions building the restricted `AwgConfig` for one gateway:
   `allowedIps = ["<gateway's own public control-plane IP>/32"]` (never
@@ -154,7 +154,7 @@ state gets its own third, distinct sentence.
 
 **The bootstrap config is public bootstrap material, not a secret.**
 Every APK ships the exact same AmneziaWG keypair
-(`BootstrapIdentity.PLACEHOLDER_PRIVATE_KEY_BASE64`) - anyone can extract
+(`BootstrapIdentity.BOOTSTRAP_PRIVATE_KEY_BASE64`) - anyone can extract
 it, exactly like every gateway's own AWG public key in
 `ProductionGatewayCatalog` is already treated as non-secret. Security must
 come from restricting what this identity can reach/do server-side, never
@@ -162,77 +162,70 @@ from assuming the APK cannot be decompiled. The normal, device-specific
 profile is still issued only after a real, successful activation - nothing
 about this slice changes who can obtain a working per-device profile.
 
-**The checked-in keypair is a locally-generated PLACEHOLDER** (32 random
-bytes each for the "private"/"public" fields, not a real derived Curve25519
-pair) - it exists only so the client-side types/tests compile and exercise
-real-shaped data. It cannot complete a real handshake against either
-gateway today, which is intentional: no server-side peer exists yet, and
-this PR does not add one. Before any real server-side work, the repository
-owner must generate a genuine keypair with the same tooling already used
-for every other AWG identity in this codebase, and replace the placeholder.
+**The checked-in keypair is now a REAL, freshly generated Curve25519/X25519
+keypair** (generated locally via Python's `cryptography` library, RFC 7748
+raw scalar/point encoding - the same wire shape `awg genkey`/`awg pubkey`
+produce), not a placeholder. It STILL cannot complete a real handshake
+against either gateway today, because no matching server-side peer exists
+yet - this slice ships the client-side plumbing plus the exact,
+not-yet-applied server-side plan (`docs/B36_SERVER_DEPLOYMENT_PLAN.md`),
+never an automatic deployment. The private key value is committed only in
+the Android source (where it is intentionally public/shipped) and in
+`gateway/config/bootstrap.env` (public key only) - never printed in any
+report or command output.
 
 ## Server-side prerequisite (NOT deployed by this PR - task requirement 13)
 
+**Superseded by the exact, command-level plan in
+[`docs/B36_SERVER_DEPLOYMENT_PLAN.md`](B36_SERVER_DEPLOYMENT_PLAN.md)** -
+that document is now authoritative for the server-side design; this
+section is kept short and summarizes it. (History note: an earlier version
+of this section sketched the restriction using `iptables`. The repository's
+actual gateway firewall - confirmed from `gateway/provision.sh` and
+`gateway/nftables/pocvpn.nft.template`, not assumed - is **nftables**, one
+table `inet pocvpn`. The deployment plan uses nftables throughout, adding a
+second, additive table rather than editing the existing one.)
+
 **Minimal, reuses 100% existing primitives - no new binary, no new
-listener, no new certificate.**
+listener, no new certificate, no new public port.** The key insight: a
+bootstrap-tunneled HTTPS request to the gateway's OWN public IP is a
+**hairpin/local-delivery case** (INPUT hook, not FORWARD) - it reaches the
+already-running `nginx` vhost on port 443 through the exact same
+`/v1/activate`/`/v1/manifest`/`/v1/xray-profile` routes and the exact same
+already-valid certificate the public path already uses. No DNAT/REDIRECT,
+no new vhost, no loopback (`127.0.0.1:8443`/`8444`) exposure.
 
-The key insight: if the bootstrap peer's own client-side `AllowedIPs` (and
-the matching server-side peer entry) is restricted to exactly
-`<gateway's own public IP>/32`, a bootstrap-tunneled HTTPS request to that
-SAME public IP is a **hairpin/local-delivery case** on the server - the
-Linux kernel delivers a packet destined to one of the box's own addresses
-locally regardless of which interface it arrived on. It reaches the
-ALREADY-RUNNING `nginx` vhost on port 443 (`listen 443 ssl default_server`,
-confirmed in both `gateway/edge/nginx-pocvpn.conf` and
-`gateway/edge/nginx-pocvpn-stockholm.conf` - no specific bind IP, so this
-already works for any locally-delivered packet) through the exact same
-`/v1/activate`/`/v1/xray-profile` routes and the exact same already-valid
-Let's Encrypt certificate the public internet path already uses. **No
-DNAT/REDIRECT trick, no new nginx vhost, no new TLS certificate, no
-loopback (`127.0.0.1:8443`/`8444`) exposure of any kind is required or
-proposed.**
+Per gateway (Frankfurt AND Stockholm), once the owner approves,
+`gateway/scripts/install-bootstrap-peer.sh` (added by this slice, NOT run):
 
-Per gateway (Frankfurt AND Stockholm), once the owner approves:
+1. Adds the ONE shared, public bootstrap AWG peer via the EXISTING
+   `add-peer.sh` (never a second peer-mutation mechanism).
+2. Applies a new, ADDITIVE nftables table (`pocvpn_bootstrap`, from
+   `gateway/nftables/pocvpn-bootstrap.nft.template`) that DROPs the
+   bootstrap peer's own source IP in the `forward` hook (denying general
+   Internet access - the existing `pocvpn` table's own forward/NAT rules
+   are scoped by interface/subnet, not by peer, so this exclusion must be
+   explicit) and allows it ONLY `tcp/443` in the `input` hook - never
+   touching the existing `pocvpn` table.
+3. Installs a small systemd unit (`nftables-pocvpn-bootstrap.service`) so
+   the restriction survives a reboot.
 
-1. **Generate one real bootstrap AWG keypair** (`awg genkey | tee
-   bootstrap.key | awg pubkey`, the same tooling already used for every
-   other AWG identity here) - replacing this PR's placeholder client-side.
-2. **Add one new WireGuard peer** on that gateway's existing AWG interface
-   (the SAME UDP port 51820 every other peer already uses - WireGuard
-   multiplexes many peers over one listening port by public key, nothing
-   new to open) for the bootstrap public key, with a small, fixed
-   `AllowedIPs` (e.g. `10.77.0.250/32`) - exactly the same shape every
-   other peer entry already has.
-3. **Add a narrow firewall rule scoped to that one peer's source tunnel
-   IP**: allow it to reach ONLY `<this gateway's own public IP>:443`
-   (`iptables -A INPUT -i <wg-iface> -s 10.77.0.250/32 -p tcp --dport 443
-   -j ACCEPT`, followed by a default DROP for that same source to
-   everything else - `iptables -A INPUT -i <wg-iface> -s 10.77.0.250/32 -j
-   DROP`). No forwarding/NAT/masquerade rule is added for this source at
-   all - it never needs to reach anything other than the box itself, so
-   general internet access is denied by omission, not by a special-case
-   block rule.
-4. **Verify, from a second host, that the bootstrap peer's tunnel cannot
-   reach anything else** (a quick `curl`/`nc` test to a few other
-   destinations through the tunnel should time out or be refused) before
-   considering this gateway's bootstrap peer live.
-5. **Rotation** (future APK release, task requirement 12): generate a NEW
-   bootstrap keypair, add it as an ADDITIONAL peer on both gateways
-   (keep the old one live), ship the new public key in a new APK release,
-   and only remove the old peer entry once adoption is sufficient - never a
-   single atomic swap that would strand already-installed APKs.
-
-**Explicitly not required by this plan:** no new service/systemd unit, no
-new public port, no new certificate, no change to `pocvpn-api`'s own
-loopback binding (`8443`/`8444` stay loopback-only, per this repository's
-existing rule), no Xray/ingress changes at all.
+A real bootstrap keypair has ALREADY been generated for this slice (Phase
+2 of the server-deployment task) and is committed as
+`BootstrapIdentity.BOOTSTRAP_PRIVATE_KEY_BASE64`/`BOOTSTRAP_PUBLIC_KEY_BASE64`
+- one shared identity, used on both gateways (see the deployment plan's
+own "one identity, not two" reasoning). Rotation procedure, exact commands,
+and rollback are all in `docs/B36_SERVER_DEPLOYMENT_PLAN.md`.
 
 ## What this PR does NOT do
 
 - Does not deploy anything to Frankfurt or Stockholm - no peer added, no
-  firewall rule applied, no infrastructure touched.
-- Does not generate or ship a real, usable bootstrap keypair - the checked-
-  in value is an inert placeholder.
+  firewall rule applied, no infrastructure touched. The install/uninstall
+  scripts and nftables template exist in the repository but have not been
+  run against either host.
+- A real bootstrap keypair now exists and is committed client-side, but it
+  is not yet USABLE - no matching server-side peer has been added to
+  either gateway, so it cannot complete a real handshake today.
 - Does not implement CDN_FRONTED/B35 work of any kind.
 - Does not change `activateDevice()`'s observable behavior for any
   existing caller (the B15 additional-gateway path, every existing test).
@@ -243,15 +236,15 @@ existing rule), no Xray/ingress changes at all.
 
 ## Remaining steps before a real APK field test
 
-1. Repository owner approves the server-side plan above (or an amended
-   version of it).
-2. Generate a real bootstrap keypair; replace `BootstrapIdentity`'s
-   placeholder constants.
-3. Apply the peer/firewall changes on Frankfurt AND Stockholm (a real
-   operator action, out of scope for this PR).
-4. Physically verify, from a real device on a real network, that a
+1. Repository owner approves `docs/B36_SERVER_DEPLOYMENT_PLAN.md` (or an
+   amended version of it).
+2. Run `gateway/scripts/install-bootstrap-peer.sh` on Frankfurt, then on
+   Stockholm (a real operator action, out of scope for this PR) - the
+   bootstrap keypair itself is already generated and committed, nothing to
+   regenerate.
+3. Physically verify, from a real device on a real network, that a
    bootstrap tunnel handshakes, that `/v1/activate` genuinely completes
    through it (not directly), and that the resulting profile persists and
    the app reaches Home normally.
-5. Only then attempt the actual restricted-Russia-network field test this
+4. Only then attempt the actual restricted-Russia-network field test this
    task exists to eventually support.

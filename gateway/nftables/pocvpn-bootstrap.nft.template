@@ -1,0 +1,59 @@
+#!/usr/sbin/nft -f
+#
+# B36 - ADDITIVE, SEPARATE table restricting ONLY the one shared bootstrap
+# peer (BOOTSTRAP_CLIENT_TUNNEL_IP). Never touches, re-renders, or depends
+# on the existing `inet __NFT_TABLE__` (pocvpn.nft.template) table that
+# governs normal peer forwarding/NAT - see
+# docs/B36_SERVER_DEPLOYMENT_PLAN.md for the full design and why this must
+# be a separate table rather than an edit to the existing one.
+#
+# Idempotent by construction, same pattern as pocvpn.nft.template: `table
+# inet __NFT_TABLE_BOOTSTRAP__` creates the table if missing (no-op if
+# already present), then `delete table` removes whatever was there, then it
+# is fully redeclared below - safe to re-run.
+#
+# Rendered by install-bootstrap-peer.sh: __NFT_TABLE_BOOTSTRAP__,
+# __BOOTSTRAP_CLIENT_IP__.
+
+table inet __NFT_TABLE_BOOTSTRAP__
+delete table inet __NFT_TABLE_BOOTSTRAP__
+
+table inet __NFT_TABLE_BOOTSTRAP__ {
+    chain forward {
+        # priority -5 (lower/earlier than the main pocvpn table's own
+        # `forward` hook at the named "filter" priority, which is 0) - a
+        # `drop` verdict reached here terminates netfilter hook processing
+        # for this packet immediately, BEFORE the main table's own
+        # `iifname awg0 oifname <egress> accept` rule (which matches by
+        # INTERFACE only, not by peer) ever gets a chance to run. If this
+        # table's own hook ran at priority filter (0) or later instead, the
+        # main table could accept-and-terminate the packet first, and this
+        # drop would never be reached - ordering is the entire point of
+        # this table existing separately.
+        type filter hook forward priority -5; policy accept;
+
+        # The bootstrap peer's own source address (its AllowedIPs-assigned
+        # /32) may NEVER be forwarded anywhere - this is what denies it
+        # general Internet access. Every other peer/source is unaffected
+        # (falls through to the main pocvpn table's own forward chain,
+        # unchanged).
+        ip saddr __BOOTSTRAP_CLIENT_IP__ drop
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+
+        # The bootstrap peer may reach ONLY tcp/443 on this box itself (the
+        # same public nginx vhost /v1/activate, /v1/manifest, and
+        # /v1/xray-profile are already served from - see
+        # docs/B36_SERVER_DEPLOYMENT_PLAN.md's "why 443, no new listener"
+        # section). This one rule also structurally denies every other
+        # locally-bound service - SSH (22), the loopback-only pocvpn-api
+        # ports (8443/8444, unreachable over the network regardless), Xray
+        # (2053/2083), and the AWG UDP port itself is irrelevant here since
+        # this chain only inspects already-decrypted tunnel-interior
+        # traffic.
+        ip saddr __BOOTSTRAP_CLIENT_IP__ tcp dport 443 accept
+        ip saddr __BOOTSTRAP_CLIENT_IP__ drop
+    }
+}

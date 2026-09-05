@@ -53,7 +53,7 @@ fun bootstrapControlPlaneHost(gateway: ProductionGatewayDescriptor): String = ga
 fun buildBootstrapAwgConfig(gateway: ProductionGatewayDescriptor): AwgConfig {
     val controlPlaneHost = bootstrapControlPlaneHost(gateway)
     return AwgConfig(
-        privateKeyBase64 = BootstrapIdentity.PLACEHOLDER_PRIVATE_KEY_BASE64,
+        privateKeyBase64 = BootstrapIdentity.BOOTSTRAP_PRIVATE_KEY_BASE64,
         localAddresses = listOf(BootstrapIdentity.CLIENT_TUNNEL_ADDRESS_CIDR),
         dnsServers = listOf("1.1.1.1", "1.0.0.1"),
         listenPort = null,

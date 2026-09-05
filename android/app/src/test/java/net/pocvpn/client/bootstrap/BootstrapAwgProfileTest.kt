@@ -77,7 +77,7 @@ class BootstrapAwgProfileTest {
         // already-public catalog facts and the shared bootstrap identity).
         for (gateway in ProductionGatewayCatalog.all) {
             val config = buildBootstrapAwgConfig(gateway)
-            assertEquals(BootstrapIdentity.PLACEHOLDER_PRIVATE_KEY_BASE64, config.privateKeyBase64)
+            assertEquals(BootstrapIdentity.BOOTSTRAP_PRIVATE_KEY_BASE64, config.privateKeyBase64)
             assertNotEquals(listOf("0.0.0.0/0", "::/0"), config.peer.allowedIps)
         }
     }

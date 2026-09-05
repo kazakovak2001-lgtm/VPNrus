@@ -1,0 +1,24 @@
+# B36 - reapplies ONLY the additive pocvpn_bootstrap nftables table on
+# boot. Deliberately a SEPARATE unit from awg-poc.service: this table's
+# rules are plain packet-filter matches on the bootstrap peer's tunnel IP -
+# they do not require awg0 to already exist to load correctly, and do not
+# need to be torn down/recreated when awg-poc.service itself restarts.
+#
+# Installed/enabled by install-bootstrap-peer.sh, never provision.sh -
+# provision.sh's own idempotence guarantees are untouched by this file.
+[Unit]
+Description=B36 bootstrap-peer nftables restriction (pocvpn_bootstrap table)
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.pocvpn-bootstrap.conf
+# No ExecStop: `delete table inet pocvpn_bootstrap` is issued by
+# uninstall-bootstrap-peer.sh (rollback), never automatically on service
+# stop - a stopped/disabled unit must not silently remove a still-desired
+# restriction.
+
+[Install]
+WantedBy=multi-user.target
