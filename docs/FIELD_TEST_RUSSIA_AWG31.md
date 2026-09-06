@@ -38,6 +38,54 @@ protection) connects where the prior profile did not.
   peer if wrong. An isolated interface removes that risk: only this one
   field-test peer is at stake.
 
+## Firewall model (corrected after senior review)
+
+The isolated `awg-ft31` interface gets its own NAT-only nftables table
+(`inet pocvpn-ft31`, `nat postrouting` hook, `policy accept`) - it
+deliberately declares **no** `forward`/filter base chain. A separate
+`forward` chain with its own policy (drop or otherwise) at the same hook as
+production's forwarding chain would NOT be isolated: netfilter evaluates
+every base chain registered at a hook, across every nftables table and
+legacy iptables-nft compat rules, for every packet - an ACCEPT verdict in
+one chain never makes a DROP verdict (or a policy drop) in another base
+chain at the same hook irrelevant. The first version of this template got
+this wrong (see PR review) - fixed by removing the `forward` chain entirely
+and instead inserting exactly two narrowly-scoped, tagged (`b37-ft31`)
+ACCEPT rules directly into each host's OWN, already-verified, real
+production forwarding path:
+
+| Host | Real production forwarding backend | Where the 2 b37-ft31 rules go |
+|---|---|---|
+| Frankfurt | `iptables-nft` (legacy iptables syntax, nft_tables backend), `FORWARD` chain, awg0/ens3 accepts + a final REJECT/DROP | Inserted at the TOP of `FORWARD` via `iptables -I FORWARD 1 ...` (an ACCEPT for non-overlapping `awg-ft31`/`ens3` traffic is behaviorally identical wherever it sits before the final reject) |
+| Stockholm | native nftables, `inet pocvpn` table, `forward` chain, `policy drop` | Inserted directly into the EXISTING `inet pocvpn forward` chain via `nft insert rule` |
+
+`gateway/lib/ft31_forward_rules.sh` implements this: `ft31_verify_runtime`
+fails closed (dies, zero mutation) unless the LIVE runtime actually matches
+every expected fact for the declared `--host` (egress interface name,
+firewall backend, existing awg0 rule presence, terminal reject/policy
+drop) - never trusts the host argument alone. `provision-ft31.sh` snapshots
+the full ruleset before and after mutation and dies if any pre-existing
+rule was removed or reordered relative to the others (only additions are
+ever possible). `rollback-ft31.sh` removes only the two `b37-ft31`-tagged
+rules (found by exact spec/comment match) and verifies the post-rollback
+ruleset is an exact subset of the pre-rollback one, in the same order.
+
+## Secret handling (corrected after senior review)
+
+The server's own `awg-ft31` private key and the shared `HeaderProtectionKey`
+are generated ON EACH SERVER by `provision-ft31.sh` itself, via `awg
+genkey`, at deploy time - never accepted as a script input, never echoed to
+stdout, never written to shell history, never passed as a literal
+command-line argument. Only the derived PUBLIC key is printed (non-secret).
+`HeaderProtectionKey` has no public half (it is shared-secret material, not
+a keypair) - the operator retrieves it themselves, directly from that
+server's own `/etc/amnezia/amneziawg/awg-ft31.conf` (`sudo grep
+'^HeaderProtectionKey' ...`), and pastes it into
+`FieldTestAwg31GatewayCatalog.kt` before rebuilding the field-test APK -
+never relayed through Claude, a report, a ticket, or a log. The placeholder
+values currently committed in `FieldTestAwg31GatewayCatalog.kt`
+(`REPLACE_BEFORE_DEPLOY_...`) are deliberately not valid key material.
+
 ## What this is (delta over docs/FIELD_TEST_RUSSIA.md)
 
 - Same `fieldTest` build type, same UX, same Frankfurt-first/Stockholm-
@@ -95,20 +143,31 @@ CLIENT_TUNNEL_ADDRESS_CIDR         = 10.77.31.2/32
 
 ## Server-side setup (NOT YET APPLIED - requires owner approval)
 
-See the B37 task report for the exact `provision-ft31.sh` invocation per
-gateway (server private key / HeaderProtectionKey are real, freshly
-generated values reported there only, never committed to this repository).
+```bash
+cd /opt/pocvpn/gateway
+sudo FT31_CLIENT_PUBLIC_KEY=<this build's public key> \
+     FT31_CLIENT_TUNNEL_IP=10.77.31.2 \
+     ./provision-ft31.sh frankfurt   # or: stockholm
+```
+
+No private key or `HeaderProtectionKey` is ever passed in - both are
+generated locally on that server by the script itself (see "Secret
+handling" above). The run prints the server's own public key at the end;
+copy it into `FieldTestAwg31GatewayCatalog.kt`, retrieve
+`HeaderProtectionKey` yourself directly from that server's config file, and
+rebuild the APK before this build can actually handshake.
 
 ### Rollback (either host)
 
 ```bash
 cd /opt/pocvpn/gateway
-sudo ./rollback-ft31.sh
+sudo ./rollback-ft31.sh frankfurt   # or: stockholm
 ```
 
-Stops/disables `awg-poc-ft31.service`, deletes the isolated `inet
-pocvpn-ft31` nftables table, archives (never deletes outright)
-`/etc/amnezia/amneziawg/awg-ft31.conf`. Never touches `awg0`,
+Removes the two `b37-ft31` FORWARD accept rules from that host's real
+production forwarding path, stops/disables `awg-poc-ft31.service`, deletes
+the isolated `inet pocvpn-ft31` NAT table, archives (never deletes
+outright) `/etc/amnezia/amneziawg/awg-ft31.conf`. Never touches `awg0`,
 `awg-poc.service`, or `inet pocvpn`.
 
 ## What this explicitly does NOT do

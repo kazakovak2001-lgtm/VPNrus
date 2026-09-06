@@ -43,14 +43,20 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
  *   already committed in `ProductionGatewayCatalog` (non-secret, same
  *   posture that file documents for gateway public keys).
  * - [AwgGatewayConnection.serverPublicKeyBase64]/the `HeaderProtectionKey`
- *   below are REAL, freshly generated X25519/random 32-byte keys generated
- *   the same way [FieldTestAwg31Identity]'s client key was (Python
- *   `cryptography`, RFC 7748 raw encoding - the same wire shape
- *   `awg genkey`/`awg pubkey` produce), NOT placeholders - but the matching
- *   PRIVATE halves are not committed here (never committed to git, same
- *   posture as every other server private key in this repo - see the B37
- *   task report for the exact, not-yet-applied `awg-ft31.conf` deployment
- *   commands that carry them).
+ *   below are DELIBERATE PLACEHOLDERS, not real key material (senior-review
+ *   correction: an earlier version of this file committed real-looking
+ *   pre-generated server keys whose PRIVATE halves were then exposed in a
+ *   task report - those values must never be used and are not reused here).
+ *   `gateway/provision-ft31.sh` now generates the server's own private key
+ *   AND `HeaderProtectionKey` locally on each VPS via `awg genkey`, at
+ *   deploy time, and never prints/logs/echoes them - only the derived
+ *   PUBLIC key is printed (safe, non-secret). Before this build can
+ *   actually handshake, an operator must: (1) run `provision-ft31.sh` on
+ *   each gateway, (2) copy that run's printed public key into
+ *   [GERMANY]/[STOCKHOLM] below, (3) retrieve `HeaderProtectionKey`
+ *   THEMSELVES directly from that server's own
+ *   `/etc/amnezia/amneziawg/awg-ft31.conf` (never relayed through Claude,
+ *   a report, or a chat) and paste it in, then rebuild this APK.
  * - The junk/padding/magic-header values (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`)
  *   are the ORIGINAL POC-01 profile declared in
  *   `gateway/config/awg-profile.env` (not the live-drifted values
@@ -106,11 +112,11 @@ object FieldTestAwg31GatewayCatalog {
         awg = AwgGatewayConnection(
             endpointHost = "152.70.43.1",
             endpointPort = FIELD_TEST_PORT,
-            serverPublicKeyBase64 = "8BcUTaT7bNtj2yBie55/JvjCTyN/WWyusuAO3DpujCo=",
+            serverPublicKeyBase64 = "REPLACE_BEFORE_DEPLOY_FRANKFURT_AWG31_SERVER_PUBLIC_KEY",
             gatewayTunnelIp = "10.77.31.1",
         ),
         awgProfile = FIELD_TEST_PROFILE_BASE.copy(
-            headerProtectionKeyBase64 = "WG34LjocwsgXzyzJ1qa6ebvCTmmAEwVPJ7pbxiWXdWA=",
+            headerProtectionKeyBase64 = "REPLACE_BEFORE_DEPLOY_FRANKFURT_AWG31_HEADER_PROTECTION_KEY",
         ),
     )
 
@@ -123,11 +129,11 @@ object FieldTestAwg31GatewayCatalog {
         awg = AwgGatewayConnection(
             endpointHost = "16.170.208.231",
             endpointPort = FIELD_TEST_PORT,
-            serverPublicKeyBase64 = "+IQC4V9RVrLkjJ+PSGJN4HwtfZK8TqekKKqic0vHcyU=",
+            serverPublicKeyBase64 = "REPLACE_BEFORE_DEPLOY_STOCKHOLM_AWG31_SERVER_PUBLIC_KEY",
             gatewayTunnelIp = "10.77.31.1",
         ),
         awgProfile = FIELD_TEST_PROFILE_BASE.copy(
-            headerProtectionKeyBase64 = "2JsP+5LZgiF/L7NZ3NrKN6dP9UxxK+/simxOyoBt72Y=",
+            headerProtectionKeyBase64 = "REPLACE_BEFORE_DEPLOY_STOCKHOLM_AWG31_HEADER_PROTECTION_KEY",
         ),
     )
 
