@@ -303,6 +303,38 @@ if verify "$PRE" "$POST"; then pass "sanity: pure addition-only change -> PASS";
 
 rm -f "$PRE" "$POST"
 
+# --- Regression tests G-I: ft31_verify_rollback_exact (A3) ----------------
+# The OLD rollback check (ft31_verify_no_unrelated_change run in reverse) was
+# mathematically vacuous for a removal-only operation: ANY subset of removed
+# lines from PRE is trivially an ordered subsequence of PRE, so it could
+# never have caught an unrelated production rule disappearing during
+# rollback. These tests exercise the real bug scenario directly.
+verify_rollback() { run_lib "$(make_fixture frankfurt)" "ft31_verify_rollback_exact $1 $2" >/dev/null 2>&1; }
+
+# G. Exactly the b37-ft31-tagged rule removed, nothing else -> PASS.
+PRE=$(mktemp); POST=$(mktemp)
+printf -- '-A FORWARD -i awg0 -o ens3 -j ACCEPT\n-A FORWARD -i awg-ft31 -o ens3 -m comment --comment b37-ft31 -j ACCEPT\n-A FORWARD -j REJECT\n' > "$PRE"
+printf -- '-A FORWARD -i awg0 -o ens3 -j ACCEPT\n-A FORWARD -j REJECT\n' > "$POST"
+if verify_rollback "$PRE" "$POST"; then pass "G: exact removal of only the b37-ft31-tagged rule passes"; else fail "G: removing exactly the b37-ft31-tagged rule must pass verification"; fi
+
+# H. THE BUG SCENARIO: rollback removes an UNRELATED production rule instead
+# of (in addition to) the intended one - PRE = [awg0-accept, b37-ft31-rule,
+# REJECT], buggy POST = [b37-ft31-rule, REJECT] (awg0-accept vanished
+# instead). This is still a valid ordered subsequence of PRE (the old check
+# would have passed it) but must FAIL under the exact-expected-state check.
+PRE=$(mktemp); POST=$(mktemp)
+printf -- '-A FORWARD -i awg0 -o ens3 -j ACCEPT\n-A FORWARD -i awg-ft31 -o ens3 -m comment --comment b37-ft31 -j ACCEPT\n-A FORWARD -j REJECT\n' > "$PRE"
+printf -- '-A FORWARD -i awg-ft31 -o ens3 -m comment --comment b37-ft31 -j ACCEPT\n-A FORWARD -j REJECT\n' > "$POST"
+if verify_rollback "$PRE" "$POST"; then fail "H: an unrelated production rule disappearing during rollback MUST be caught (this is the exact A3 regression scenario)"; else pass "H: an unrelated production rule disappearing during rollback is caught"; fi
+
+# I. b37-ft31 rule NOT actually removed (rollback no-op'd) -> must FAIL too.
+PRE=$(mktemp); POST=$(mktemp)
+printf -- '-A FORWARD -i awg0 -o ens3 -j ACCEPT\n-A FORWARD -i awg-ft31 -o ens3 -m comment --comment b37-ft31 -j ACCEPT\n-A FORWARD -j REJECT\n' > "$PRE"
+cp "$PRE" "$POST"
+if verify_rollback "$PRE" "$POST"; then fail "I: a rollback that left the b37-ft31 rule in place must be caught"; else pass "I: a no-op rollback (b37-ft31 rule still present) is caught"; fi
+
+rm -f "$PRE" "$POST"
+
 echo
 echo "== $PASSES passed, $FAILURES failed =="
 [ "$FAILURES" -eq 0 ]

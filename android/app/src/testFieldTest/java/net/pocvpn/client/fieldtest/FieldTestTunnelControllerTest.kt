@@ -1,6 +1,7 @@
 package net.pocvpn.client.fieldtest
 
 import android.content.Intent
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
@@ -293,5 +294,117 @@ class FieldTestTunnelControllerTest {
         controller.connect()
         val expectedPolls = (FieldTestTunnelController.HANDSHAKE_TIMEOUT_MS / FieldTestTunnelController.HANDSHAKE_POLL_INTERVAL_MS).toInt() + 1
         assertEquals("must poll the full bounded window, never fewer (fake early failure) or more (unbounded)", expectedPolls, statsCalls)
+    }
+
+    // --- senior-review pass regression tests --------------------------------
+
+    // C1 - resetAfterFailure() lets a fresh connect() actually run after Failed,
+    // instead of connect() silently no-op'ing and returning the stale Failed state.
+    @Test
+    fun `C1 - resetAfterFailure allows a genuinely fresh connect attempt after Failed`() = runTest {
+        var handshakeSucceeds = false
+        val attempts = mutableListOf<ProductionGatewayId>()
+        val controller = FieldTestTunnelController(
+            transportFactory = { candidate -> attempts += candidate; FixedFieldTestTransport(shouldHandshake = handshakeSucceeds) },
+            nowProvider = { 0L },
+            delayMs = { },
+        )
+        val firstResult = controller.connect()
+        assertTrue(firstResult is FieldTestState.Failed)
+        assertEquals(2, attempts.size)
+
+        // Without resetAfterFailure, connect() would immediately return the
+        // SAME stale Failed state below with zero new attempts - this is
+        // exactly the C1 bug.
+        val stuckResult = controller.connect()
+        assertEquals("connect() must refuse to run again while stuck in Failed", firstResult, stuckResult)
+        assertEquals("a stuck connect() call must not attempt any new candidate", 2, attempts.size)
+
+        controller.resetAfterFailure()
+        handshakeSucceeds = true
+        val secondResult = controller.connect()
+        assertTrue("a fresh connect() after reset must actually run and can now succeed", secondResult is FieldTestState.Protected)
+        assertEquals("resetAfterFailure must cause a REAL new Frankfurt attempt, not merely flip a flag", 3, attempts.size)
+    }
+
+    // C3 - Unsupported/NotImplemented/Unavailable stats must never be treated as a successful handshake.
+    @Test
+    fun `C3 - Unsupported and NotImplemented stats never count as a successful handshake`() = runTest {
+        for (fakeStats in listOf(TransportStats.Unsupported, TransportStats.NotImplemented)) {
+            val transport = object : VpnTransport {
+                override val name = "stats-$fakeStats"
+                override val kind = TransportKind.AMNEZIA_WG
+                override val capabilities = TransportCapabilities.amneziaWg()
+                override fun preparePermissionIntent(): Intent? = null
+                override suspend fun connect(config: TransportConfig) {}
+                override suspend fun disconnect() {}
+                override fun observeState() = MutableStateFlow<TransportState>(TransportState.Connected)
+                override suspend fun stats(): TransportStats = fakeStats
+            }
+            val controller = FieldTestTunnelController(
+                transportFactory = { transport },
+                candidates = listOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
+                nowProvider = { 0L },
+                delayMs = { },
+            )
+            val result = controller.connect()
+            assertTrue(
+                "TransportStats.$fakeStats must never be treated as a real handshake proof (task C3)",
+                result is FieldTestState.Failed,
+            )
+        }
+    }
+
+    // C4 - a local transport startup/config error (TransportState.Error right after connect())
+    // must fail fast, never be indistinguishable from a real 8-second handshake timeout.
+    @Test
+    fun `C4 - a TransportState Error right after connect fails without waiting the full handshake timeout`() = runTest {
+        var statsCallCount = 0
+        var delayCallCount = 0
+        val transport = object : VpnTransport {
+            override val name = "config-error"
+            override val kind = TransportKind.AMNEZIA_WG
+            override val capabilities = TransportCapabilities.amneziaWg()
+            override fun preparePermissionIntent(): Intent? = null
+            override suspend fun connect(config: TransportConfig) {
+                // Mirrors AmneziaWgTransport.connect() catching its own
+                // internal failure and exposing it via state, never throwing.
+            }
+            override suspend fun disconnect() {}
+            override fun observeState(): Flow<TransportState> = MutableStateFlow(TransportState.Error("simulated config parse failure"))
+            override suspend fun stats(): TransportStats { statsCallCount++; return TransportStats.Unavailable }
+        }
+        val controller = FieldTestTunnelController(
+            transportFactory = { transport },
+            candidates = listOf(ProductionGatewayId.GERMANY),
+            nowProvider = { 0L },
+            delayMs = { delayCallCount++ },
+        )
+        val result = controller.connect()
+        assertTrue(result is FieldTestState.Failed)
+        assertEquals("a TransportState.Error must be detected immediately, never after polling stats()", 0, statsCallCount)
+        assertEquals("a TransportState.Error must never wait through the handshake poll loop", 0, delayCallCount)
+    }
+
+    // C5 - a genuine coroutine cancellation must propagate, never be swallowed as a gateway failure.
+    @Test(expected = CancellationException::class)
+    fun `C5 - CancellationException from transport connect propagates instead of being reported as a failure`() = runTest {
+        val transport = object : VpnTransport {
+            override val name = "cancelling"
+            override val kind = TransportKind.AMNEZIA_WG
+            override val capabilities = TransportCapabilities.amneziaWg()
+            override fun preparePermissionIntent(): Intent? = null
+            override suspend fun connect(config: TransportConfig) {
+                throw CancellationException("simulated cancellation")
+            }
+            override suspend fun disconnect() {}
+            override fun observeState(): Flow<TransportState> = MutableStateFlow(TransportState.Disconnected)
+        }
+        val controller = FieldTestTunnelController(
+            transportFactory = { transport },
+            nowProvider = { 0L },
+            delayMs = { },
+        )
+        controller.connect()
     }
 }

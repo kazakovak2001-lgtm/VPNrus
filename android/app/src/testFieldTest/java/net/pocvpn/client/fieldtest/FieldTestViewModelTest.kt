@@ -9,6 +9,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
@@ -70,6 +71,18 @@ class FieldTestViewModelTest {
         kotlinx.coroutines.Dispatchers.resetMain()
     }
 
+    private val fakeWifiProfile = NetworkProfile(
+        type = NetworkType.WIFI,
+        validatedInternet = true,
+        metered = false,
+        roaming = false,
+        captivePortal = false,
+        ipv4Available = true,
+        ipv6Available = false,
+        vpnActive = null,
+        generation = 0,
+    )
+
     private fun newViewModel(
         allHandshake: Boolean,
         uploader: FieldTestReportUploader = NoOpFieldTestReportUploader,
@@ -78,14 +91,21 @@ class FieldTestViewModelTest {
         // below is unaffected by the PR #61 permission-gating fix unless
         // it explicitly overrides this.
         preparePermissionIntent: () -> Intent? = { null },
+        // C2 fix: production defaults to a REAL network probe
+        // (FieldTestViewModel.probeDataPlane) - unit tests substitute a
+        // deterministic fake here instead of performing real network I/O,
+        // same discipline as every other externally-real dependency
+        // (transport/network/clock) this test already fakes.
+        healthCheckOverride: (suspend (net.pocvpn.client.vpn.VpnTransport) -> Boolean)? = { true },
     ) = FieldTestViewModel(
         transportFactory = { FixedTransport(shouldHandshake = allHandshake) },
         appVersionName = "0.1-fieldtest",
         appVersionCode = 1L,
         reportUploader = uploader,
-        networkTypeProvider = { NetworkType.WIFI },
+        networkProfileProvider = { fakeWifiProfile },
         nowProvider = { 0L },
         preparePermissionIntent = preparePermissionIntent,
+        healthCheckOverride = healthCheckOverride,
     )
 
     // Test A - field-test build skips activation completely: FieldTestViewModel
@@ -125,7 +145,10 @@ class FieldTestViewModelTest {
         assertTrue(report != null)
         assertEquals(FieldTestOutcome.FAILED, report!!.outcome)
         assertNull(report.finalGateway)
-        assertEquals(FieldTestFailureCategory.ALL_CANDIDATES_EXHAUSTED, report.failureCategory)
+        // D3 fix: no candidate ever produced a handshake here (FixedTransport
+        // throws on connect()), so the top-level category is now the more
+        // specific NO_HANDSHAKE, not the old blanket ALL_CANDIDATES_EXHAUSTED.
+        assertEquals(FieldTestFailureCategory.NO_HANDSHAKE, report.failureCategory)
     }
 
     // Reporting requirement - a successful connection triggers report upload AFTER tunnel establishment.
@@ -343,9 +366,10 @@ class FieldTestViewModelTest {
             transportFactory = { candidate -> FixedTransport(shouldHandshake = candidate == ProductionGatewayId.STOCKHOLM) },
             appVersionName = "0.1-fieldtest",
             appVersionCode = 1L,
-            networkTypeProvider = { NetworkType.WIFI },
+            networkProfileProvider = { fakeWifiProfile },
             nowProvider = { 0L },
             preparePermissionIntent = { permissionIntent },
+            healthCheckOverride = { true },
         )
         vm.connect()
         vm.onVpnPermissionResult(true)

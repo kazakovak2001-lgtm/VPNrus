@@ -179,3 +179,86 @@ outright) `/etc/amnezia/amneziawg/awg-ft31.conf`. Never touches `awg0`,
   or the production `inet pocvpn` nftables table on either gateway.
 - Does not deploy anything server-side by itself - the commands in the task
   report are reported only, per this repository's merge/infra-safety rule.
+
+## PREDEPLOY GATE (senior-review pass, B37 correctness audit) - hard blockers
+
+`provision-ft31.sh` can only prove the LOCAL host firewall/NAT/systemd state
+is correct. It cannot see, and does not attempt to fabricate, either
+cloud-provider's ingress control plane. **Both of the following must be
+confirmed TRUE, on the real host/console, before any real-world test
+attempt is meaningful** - until then this field test's status is
+**NO-GO**, regardless of what the local script reports:
+
+1. **Frankfurt (Oracle Cloud)** - the VCN security list / NSG attached to
+   this instance's subnet must allow inbound **UDP 51821** from `0.0.0.0/0`
+   (or at minimum from the field-test device's expected egress range).
+   Verify in the OCI console (Networking -> Virtual Cloud Networks -> the
+   instance's subnet -> Security Lists/Network Security Groups) - never
+   inferred from the host's own `iptables`/`nft` state, which this script
+   already verifies separately and which says nothing about the provider's
+   own edge firewall.
+2. **Stockholm (AWS)** - the EC2 Security Group (and any NACL) attached to
+   this instance must allow inbound **UDP 51821** from `0.0.0.0/0` (or the
+   expected range). Verify in the EC2 console (Security Groups / Network
+   ACLs) - same reasoning as above.
+
+Neither of these can be verified or changed by any script in this
+repository, and none should ever be mutated automatically (this repo's own
+merge rule: never allocate/change cloud infrastructure without explicit
+owner approval). Confirm both manually, then re-state GO/NO-GO explicitly.
+
+### Host-level UDP 51821 INPUT (in addition to the provider gate above)
+
+The local FORWARD-path additions this script makes (see
+`lib/ft31_forward_rules.sh`) let traffic that already reached the host be
+forwarded into `awg-ft31` - they say nothing about whether inbound UDP
+51821 packets are accepted by the host's own INPUT chain in the first
+place. Before deploying, separately audit each host's live INPUT
+chain/policy (`iptables -S INPUT` on Frankfurt / `nft list chain inet
+pocvpn input` or equivalent on Stockholm, read-only) for whether a new
+port needs an explicit allow, exactly as already required for the existing
+production `51820` listener - add a narrowly-scoped, `b37-ft31`-tagged
+INPUT rule only if that audit shows one is actually needed, following the
+same fail-closed preflight discipline as the FORWARD rules; do not add one
+speculatively, and do not weaken any other INPUT rule/policy.
+
+## Distinguishing a REAL AWG 3.1 block from a mundane reachability/config
+## problem (task E1) - read this BEFORE calling a failed attempt "blocked"
+
+The legacy field test used UDP 51820; this one uses **51821 AND** the full
+AWG 3.1 parameter set. A failure on this build proves NOTHING about AWG 3.1
+specifically unless the server side can show WHERE in the pipeline the
+attempt actually stopped. After any real attempt, gather this evidence on
+the gateway (read-only, no payload/secret logging):
+
+1. **Did any UDP packet reach port 51821 at all?**
+   - Frankfurt: `sudo iptables -L INPUT -v -n | grep 51821` (packet counter
+     increasing across attempts) or a brief, bounded
+     `sudo timeout 30 tcpdump -ni ens3 udp port 51821 -c 5` (counts/headers
+     only - never `-A`/payload capture).
+   - Stockholm: `sudo nft list chain inet pocvpn-ft31 postrouting` packet
+     counters (add `counter` to the rule first if not already present) or
+     the same bounded `tcpdump -ni ens5 udp port 51821 -c 5`.
+   - Zero packets ever seen -> **reachability/provider/port-filtering
+     problem** (go re-check the PREDEPLOY GATE above first) - NOT evidence
+     of protocol detection.
+2. **Did packets arrive but no valid AWG handshake completed?**
+   - `sudo awg show awg-ft31` on the gateway, before/after an attempt -
+     `latest handshake` staying absent/stale despite (1) showing packets
+     arriving -> **protocol/config/handshake problem** (verify the profile
+     in `config/awg-ft31-profile.env` matches `FieldTestAwg31GatewayCatalog.kt`
+     exactly, and that the correct `HeaderProtectionKey` was pasted in).
+3. **Did the handshake succeed but the client's own health/data-plane probe
+   still failed?**
+   - `sudo awg show awg-ft31` shows a fresh handshake, but the client
+     report's `outcome` is `FAILED` with `failureCategory=HEALTH_CHECK_FAILED`
+     -> **forwarding/NAT/DNS/Internet problem** on the gateway
+     (`nft list table inet pocvpn-ft31`, confirm `masquerade` and the two
+     `b37-ft31` FORWARD rules are present via
+     `iptables -S FORWARD`/`nft list chain inet pocvpn forward`), not a
+     protocol-detection result either.
+
+**Only a case that clears (1) and (2) but is then reproducibly blocked
+in a way that isn't (3) is any kind of evidence toward "AWG 3.1 was
+detected/blocked"** - and even then, a single field test is anecdotal, not
+proof.

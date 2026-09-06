@@ -37,7 +37,25 @@ STUB
 #!/usr/bin/env bash
 if [ "$1" = "route" ] && [ "$2" = "show" ] && [ "$3" = "default" ]; then
     echo "default via 10.0.0.1 dev ens3 proto dhcp"
+    exit 0
 fi
+if [ "$1" = "route" ] && [ "$2" = "show" ]; then
+    # No pre-existing route for the B37 subnet in this hermetic fixture.
+    exit 0
+fi
+if [ "$1" = "link" ] && [ "$2" = "show" ]; then
+    # No pre-existing interface by this name - real `ip link show <iface>`
+    # exits non-zero (with stderr) when the interface does not exist.
+    exit 1
+fi
+exit 0
+STUB
+    cat > "$root/bin/ss" <<'STUB'
+#!/usr/bin/env bash
+# No listeners in this hermetic fixture - header line only, same shape as
+# real `ss -uln` with nothing bound.
+echo "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port"
+exit 0
 STUB
     cat > "$root/bin/flock" <<'STUB'
 #!/usr/bin/env bash
@@ -178,7 +196,12 @@ case "\$1" in
     disable)
         if [ "\$2" = "--now" ]; then rm -f "\$STATE/.enabled" "\$STATE/.active"; exit 0; fi
         rm -f "\$STATE/.enabled"; exit 0 ;;
-    start) touch "\$STATE/.active"; exit 0 ;;
+    start)
+        if [ -f "\$STATE/.fail_start" ]; then
+            echo "systemctl: simulated failure starting service" >&2
+            exit 1
+        fi
+        touch "\$STATE/.active"; exit 0 ;;
     stop) rm -f "\$STATE/.active"; exit 0 ;;
 esac
 exit 0
@@ -186,6 +209,7 @@ STUB
     chmod +x "$root/bin/"*
 
     if [ "${1:-}" = "--pre-existing" ]; then
+        FT31_TEST_HARNESS_MODE=1 \
         FT31_TEST_CONFIG_DIR="$root/etc/amnezia" \
         FT31_TEST_IP_FORWARD_PROC="$root/ip_forward" \
         FT31_TEST_SYSTEMD_UNIT_DIR="$root/systemd" \
@@ -200,6 +224,7 @@ STUB
 
 run_provision() {
     local root=$1; shift
+    FT31_TEST_HARNESS_MODE=1 \
     FT31_TEST_CONFIG_DIR="$root/etc/amnezia" \
     FT31_TEST_IP_FORWARD_PROC="$root/ip_forward" \
     FT31_TEST_SYSTEMD_UNIT_DIR="$root/systemd" \
@@ -296,7 +321,13 @@ else
 fi
 rm -rf "$ROOT"
 
-# --- F: pre-existing B37 state survives a LATER run's failure untouched ---
+# --- F: pre-existing, UNCHANGED B37 state survives a later idempotent rerun,
+# and that rerun now SUCCEEDS without re-mutating anything (senior-review
+# requirement A2: exact-match pre-existing state is left untouched, not
+# blindly re-applied - so a rerun no longer even calls `nft -f`/`install` for
+# NAT/systemd when the on-disk state already matches byte-for-byte; forcing
+# nft -f to fail on such a rerun must have NO EFFECT, because the fail-closed
+# match check means nft -f is never invoked at all this time).
 ROOT=$(make_env --pre-existing)
 if [ ! -f "$ROOT/etc/amnezia/awg-ft31.conf" ]; then
     fail "F setup: pre-existing deploy did not actually create a config - test setup is broken"
@@ -304,43 +335,86 @@ else
     PRE_CONFIG_CONTENT=$(cat "$ROOT/etc/amnezia/awg-ft31.conf")
     PRE_ENABLED=$([ -f "$ROOT/state/.enabled" ] && echo yes || echo no)
     PRE_ACTIVE=$([ -f "$ROOT/state/.active" ] && echo yes || echo no)
-    PRE_NAT=$([ -f "$ROOT/state/.nat_exists" ] && echo yes || echo no)
     PRE_FORWARD_COUNT=$(grep -c "awg-ft31" "$ROOT/etc/forward_rules")
 
-    # Now force a SECOND run (rules/config/peer/NAT/service all already
-    # exist and are correctly detected as pre-existing) to fail at the very
-    # last step - a NEW, never-existed condition: fail on the first -I call
-    # this time would be a no-op (rule already present, add is idempotent),
-    # so instead force nft -f to fail on this rerun to prove pre-existing
-    # NAT is untouched even though this run's own (redundant, idempotent)
-    # nft -f invocation reports failure.
     touch "$ROOT/state/.fail_nft_f"
     if run_provision "$ROOT" >/dev/null 2>&1; then
-        fail "F: expected the second run to fail (nft -f forced to fail)"
+        pass "F: idempotent rerun of unchanged pre-existing B37 state succeeds (nft -f is never invoked, so its forced failure has no effect)"
     else
-        pass "F: second run correctly failed"
+        fail "F: expected an idempotent rerun of exactly-matching pre-existing state to succeed"
     fi
 
     if [ -f "$ROOT/etc/amnezia/awg-ft31.conf" ] && [ "$(cat "$ROOT/etc/amnezia/awg-ft31.conf")" = "$PRE_CONFIG_CONTENT" ]; then
         pass "F: pre-existing config from the earlier successful run is untouched"
     else
-        fail "F: a later run's failure must never remove/alter an earlier successful run's config"
+        fail "F: a later idempotent rerun must never remove/alter an earlier successful run's config"
     fi
     if [ "$([ -f "$ROOT/state/.enabled" ] && echo yes || echo no)" = "$PRE_ENABLED" ] && [ "$([ -f "$ROOT/state/.active" ] && echo yes || echo no)" = "$PRE_ACTIVE" ]; then
         pass "F: pre-existing service enabled/active state is untouched"
     else
-        fail "F: a later run's failure must never change an earlier run's already-correct service state"
+        fail "F: a later idempotent rerun must never change an earlier run's already-correct service state"
     fi
     if [ -f "$ROOT/state/.nat_exists" ]; then
-        pass "F: pre-existing NAT table is untouched (NOT removed, even though this rerun's own nft -f reported failure)"
+        pass "F: pre-existing NAT table is untouched"
     else
-        fail "F: a later run's failure must never remove a pre-existing NAT table"
+        fail "F: a later idempotent rerun must never remove a pre-existing NAT table"
     fi
     if [ "$(grep -c "awg-ft31" "$ROOT/etc/forward_rules")" -eq "$PRE_FORWARD_COUNT" ]; then
         pass "F: pre-existing FORWARD rules are untouched"
     else
-        fail "F: a later run's failure must never remove pre-existing FORWARD rules"
+        fail "F: a later idempotent rerun must never remove pre-existing FORWARD rules"
     fi
+fi
+rm -rf "$ROOT"
+
+# --- G: DIFFERING pre-existing NAT config fails closed, zero mutation -----
+# (senior-review requirement A2: unexpected/unowned or changed pre-existing
+# B37 state must never be silently overwritten).
+ROOT=$(make_env --pre-existing)
+echo "# unexpected drifted content, not what this run would render" >> "$ROOT/nftables.pocvpn-ft31.conf"
+DRIFTED_CONTENT=$(cat "$ROOT/nftables.pocvpn-ft31.conf")
+if run_provision "$ROOT" >/dev/null 2>&1; then
+    fail "G: expected provision-ft31.sh to fail closed when the existing NAT config differs from the desired render"
+else
+    pass "G: provision-ft31.sh correctly failed closed (differing pre-existing NAT config)"
+fi
+if [ "$(cat "$ROOT/nftables.pocvpn-ft31.conf")" = "$DRIFTED_CONTENT" ]; then
+    pass "G: the differing pre-existing NAT config was left completely untouched (zero mutation)"
+else
+    fail "G: a differing pre-existing NAT config must never be mutated by a fail-closed check"
+fi
+rm -rf "$ROOT"
+
+# --- H: DIFFERING pre-existing systemd unit fails closed, zero mutation ---
+ROOT=$(make_env --pre-existing)
+echo "# unexpected hand-edited unit content" >> "$ROOT/systemd/awg-poc-ft31.service"
+DRIFTED_UNIT=$(cat "$ROOT/systemd/awg-poc-ft31.service")
+if run_provision "$ROOT" >/dev/null 2>&1; then
+    fail "H: expected provision-ft31.sh to fail closed when the existing systemd unit differs from the repo's own unit file"
+else
+    pass "H: provision-ft31.sh correctly failed closed (differing pre-existing systemd unit)"
+fi
+if [ "$(cat "$ROOT/systemd/awg-poc-ft31.service")" = "$DRIFTED_UNIT" ]; then
+    pass "H: the differing pre-existing systemd unit was left completely untouched (zero mutation)"
+else
+    fail "H: a differing pre-existing systemd unit must never be mutated by a fail-closed check"
+fi
+rm -rf "$ROOT"
+
+# --- I: FT31_TEST_* overrides are refused without FT31_TEST_HARNESS_MODE=1
+# (senior-review requirement F2: a real deploy environment leaking a stale
+# FT31_TEST_* var must never silently redirect a real run).
+ROOT=$(make_env)
+if FT31_TEST_CONFIG_DIR="$ROOT/etc/amnezia" \
+   FT31_TEST_IP_FORWARD_PROC="$ROOT/ip_forward" \
+   FT31_TEST_SYSTEMD_UNIT_DIR="$ROOT/systemd" \
+   FT31_TEST_NFTABLES_CONF_PATH="$ROOT/nftables.pocvpn-ft31.conf" \
+   PATH="$ROOT/bin:$PATH" \
+   FT31_CLIENT_PUBLIC_KEY="$CLIENT_PUBKEY" FT31_CLIENT_TUNNEL_IP=10.77.31.2 \
+   bash "$GATEWAY_DIR/provision-ft31.sh" frankfurt >/dev/null 2>&1; then
+    fail "I: expected provision-ft31.sh to refuse FT31_TEST_* overrides without FT31_TEST_HARNESS_MODE=1"
+else
+    pass "I: provision-ft31.sh correctly refused FT31_TEST_* overrides without FT31_TEST_HARNESS_MODE=1"
 fi
 rm -rf "$ROOT"
 

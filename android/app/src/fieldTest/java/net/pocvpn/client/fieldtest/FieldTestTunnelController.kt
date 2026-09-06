@@ -1,11 +1,14 @@
 package net.pocvpn.client.fieldtest
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportStats
+import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
@@ -97,7 +100,26 @@ class FieldTestTunnelController(
             val transport = transportFactory(candidate)
             val handshakeOk = try {
                 transport.connect(TransportConfig.Awg(buildFieldTestAwgConfig(gateway)))
-                awaitUsableHandshake(transport)
+                // C4 - AmneziaWgTransport.connect() catches its OWN internal
+                // exceptions (config parse failure, backend startup error)
+                // and exposes them as TransportState.Error instead of
+                // throwing - so without this check, a malformed key/config
+                // would silently fall through into an 8-SECOND handshake
+                // poll and get mislabeled as a plain network/handshake
+                // timeout, never as the local startup error it actually
+                // was. Checked immediately, before ever polling stats().
+                val postConnectState = transport.observeState().first()
+                if (postConnectState is TransportState.Error) {
+                    diagnostics?.recordTransportError(candidate)
+                    false
+                } else {
+                    awaitUsableHandshake(transport)
+                }
+            } catch (c: CancellationException) {
+                // C5 - a cancelled coroutine (e.g. the screen closing mid-
+                // attempt) is not a gateway/network failure and must not be
+                // reported, retried, or counted as one - propagate it.
+                throw c
             } catch (t: Throwable) {
                 false
             }
@@ -106,6 +128,8 @@ class FieldTestTunnelController(
             val healthy = if (handshakeOk) {
                 val result = try {
                     healthCheck(transport)
+                } catch (c: CancellationException) {
+                    throw c
                 } catch (t: Throwable) {
                     false
                 }
@@ -140,6 +164,34 @@ class FieldTestTunnelController(
         _state.value = FieldTestState.Idle
     }
 
+    /**
+     * Resets a terminal [FieldTestState.Failed] back to [FieldTestState.Idle]
+     * so the NEXT [connect] call actually runs a fresh Frankfurt -> Stockholm
+     * attempt (task requirement C1) - [connect] itself refuses to run at all
+     * unless [state] is already [FieldTestState.Idle], so without this a
+     * caller's "Retry" button would only ever reset ITS OWN UI state while
+     * this controller stayed stuck in [FieldTestState.Failed] forever,
+     * silently no-oping every subsequent [connect] call. A no-op (never
+     * throws, never touches [activeTransport]) unless currently
+     * [FieldTestState.Failed] - never call this from [FieldTestState
+     * .Connecting]/[FieldTestState.Protected] (use [disconnect] instead,
+     * which already tears down the live transport those states may hold).
+     */
+    fun resetAfterFailure() {
+        if (_state.value is FieldTestState.Failed) {
+            _state.value = FieldTestState.Idle
+        }
+    }
+
+    // C3 - this field test exists SPECIFICALLY to prove a real, fresh AWG
+    // handshake happened. TransportStats.Unsupported/NotImplemented/
+    // Unavailable are all "this transport could not tell us" signals, never
+    // "the handshake succeeded" - treating them as success (the original
+    // bug) would let a broken/unwired stats() path silently report a fully
+    // fake PROTECTED outcome. Only an actual TransportStats.Counters entry
+    // whose lastHandshakeEpochMillis is fresh (later than attemptStart) is
+    // ever treated as success; every other outcome keeps polling until the
+    // bounded timeout, then correctly returns false (no handshake proven).
     private suspend fun awaitUsableHandshake(transport: VpnTransport): Boolean {
         val attemptStart = nowProvider()
         val maxPolls = (HANDSHAKE_TIMEOUT_MS / HANDSHAKE_POLL_INTERVAL_MS).toInt()
@@ -148,8 +200,7 @@ class FieldTestTunnelController(
                 is TransportStats.Counters -> {
                     if (isFreshHandshake(stats.lastHandshakeEpochMillis, attemptStart)) return true
                 }
-                TransportStats.Unsupported, TransportStats.NotImplemented -> return true
-                TransportStats.Unavailable -> Unit
+                TransportStats.Unsupported, TransportStats.NotImplemented, TransportStats.Unavailable -> Unit
             }
             if (pollIndex < maxPolls) delayMs(HANDSHAKE_POLL_INTERVAL_MS)
         }

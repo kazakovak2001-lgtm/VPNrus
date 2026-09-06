@@ -133,6 +133,14 @@ class FieldTestDiagnosticsRecorder(
         )
     }
 
+    /** B37 (task C4) - a local transport startup/config error was detected right after connect(), distinct from a genuine handshake timeout - see [FieldTestTunnelController]'s own docs. */
+    fun recordTransportError(candidate: ProductionGatewayId) {
+        record(
+            DiagnosticEventType.FIELD_TEST_TRANSPORT_ERROR,
+            mapOf(FieldTestDiagnosticTags.TAG_CANDIDATE to candidate.name),
+        )
+    }
+
     fun recordHealthResult(candidate: ProductionGatewayId, healthy: Boolean) {
         record(
             DiagnosticEventType.FIELD_TEST_HEALTH_RESULT,

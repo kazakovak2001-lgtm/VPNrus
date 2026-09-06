@@ -9,11 +9,18 @@ import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
  * Pure/no Android dependency, unit-testable on the JVM - same discipline as
  * [net.pocvpn.client.bootstrap.buildBootstrapAwgConfig].
  *
- * Unlike the B36 bootstrap profile, this is a NORMAL, full-tunnel config
- * ([AwgPeer.allowedIps] defaults to `0.0.0.0/0`/`::/0`) - this build exists
- * specifically to test whether the real data plane can carry general
- * Internet traffic, not merely reach one control-plane host. No B36
- * restricted-bootstrap semantics are created or reused here.
+ * Unlike the B36 bootstrap profile, this is a NORMAL, full-tunnel config -
+ * this build exists specifically to test whether the real data plane can
+ * carry general Internet traffic, not merely reach one control-plane host.
+ * No B36 restricted-bootstrap semantics are created or reused here.
+ *
+ * B37 senior-review pass (task E2) - [AwgPeer.allowedIps] is set explicitly
+ * to `0.0.0.0/0` ONLY (never the shared default's `::/0` IPv6 route too):
+ * the B37 server side (provision-ft31.sh / pocvpn-ft31.nft.template) is
+ * IPv4-only (NAT/masquerade rules are IPv4-only, no IPv6 server path exists
+ * or has been validated), so routing the field-test client's IPv6 traffic
+ * into this tunnel would silently blackhole it - never claim IPv6
+ * full-tunnel support this build does not actually provide.
  *
  * B37 - [gateway] is now always resolved from
  * [FieldTestAwg31GatewayCatalog], never [net.pocvpn.client.vpn.config.ProductionGatewayCatalog]
@@ -36,9 +43,13 @@ fun buildFieldTestAwgConfig(gateway: ProductionGatewayDescriptor): AwgConfig =
             publicKeyBase64 = gateway.awg.serverPublicKeyBase64,
             endpointHost = gateway.awg.endpointHost,
             endpointPort = gateway.awg.endpointPort,
-            // Default AwgPeer.allowedIps (0.0.0.0/0, ::/0) - deliberate:
-            // this is a real, full-tunnel VPN data-plane test, not a
-            // restricted control-plane-only path.
+            // IPv4-only (task E2) - see this file's own top-level docs: the
+            // B37 server side has no IPv6 NAT/forwarding path, so the
+            // shared AwgPeer default of also routing ::/0 into this tunnel
+            // would silently blackhole the field-test device's IPv6
+            // traffic. Still a real, full-tunnel test of general IPv4
+            // Internet traffic, not a restricted control-plane-only path.
+            allowedIps = listOf("0.0.0.0/0"),
         ),
         includedApplications = emptySet(),
         excludedApplications = emptySet(),

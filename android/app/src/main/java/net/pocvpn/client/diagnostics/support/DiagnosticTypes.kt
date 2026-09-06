@@ -122,6 +122,14 @@ enum class DiagnosticEventType {
     FIELD_TEST_UNAVAILABLE,
     FIELD_TEST_REPORT_UPLOAD_ATTEMPTED,
     FIELD_TEST_REPORT_UPLOAD_RESULT,
+
+    // B37 senior-review pass (task C4) - a local transport startup/config
+    // error (malformed key, backend init failure - AmneziaWgTransport.connect()
+    // catches these itself and exposes TransportState.Error rather than
+    // throwing) must be distinguishable from a genuine handshake timeout,
+    // never silently folded into the same FIELD_TEST_CANDIDATE_RESULT=false
+    // signal after a full 8-second wait that never actually happened.
+    FIELD_TEST_TRANSPORT_ERROR,
 }
 
 /**

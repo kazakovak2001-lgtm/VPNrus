@@ -5,13 +5,19 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import java.net.InetSocketAddress
+import java.net.Socket
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.network.NetworkProfile
-import net.pocvpn.client.network.NetworkType
+import net.pocvpn.client.network.currentNetworkProfileSnapshot
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RestrictionClassifier
 import net.pocvpn.client.smartconnect.RestrictionEvidence
@@ -62,7 +68,17 @@ class FieldTestViewModel(
     private val appVersionName: String,
     private val appVersionCode: Long,
     private val reportUploader: FieldTestReportUploader = NoOpFieldTestReportUploader,
-    private val networkTypeProvider: () -> NetworkType = { NetworkType.OTHER },
+    /**
+     * B37 senior-review pass (task D1/D2) - a REAL, synchronous underlying-
+     * network read ([currentNetworkProfileSnapshot]), never a stub. Must be
+     * called BEFORE [controller]'s candidate loop starts (see [connect]) so
+     * it reflects the network truthfully in place BEFORE this build's own
+     * full-tunnel VPN attempt can change what `activeNetwork` even reports -
+     * never inferred from whether that attempt went on to succeed.
+     * Returns [NetworkProfile.unavailable] (never a guess) when no real
+     * evidence is available.
+     */
+    private val networkProfileProvider: () -> NetworkProfile,
     private val nowProvider: () -> Long = System::currentTimeMillis,
     /**
      * Device/app-level VPN permission check, resolved once per [connect]
@@ -74,9 +90,22 @@ class FieldTestViewModel(
      * because asking requires SOME transport instance to exist.
      */
     private val preparePermissionIntent: () -> Intent? = { transportFactory(ProductionGatewayId.GERMANY).preparePermissionIntent() },
+    /**
+     * C2 fix - null (the production default) means "use the real
+     * [probeDataPlane] bounded post-handshake connectivity check" (never
+     * the old constant-true stub). Overridable purely so tests can
+     * substitute a deterministic fake instead of performing real network
+     * I/O against a JVM unit test - production code (this class's own
+     * [Factory]) never overrides it. A Kotlin primary-constructor default
+     * parameter cannot itself reference an instance method like
+     * [probeDataPlane] (only [effectiveHealthCheck] below, a regular
+     * property initializer, can), hence the null-then-fallback shape here.
+     */
+    private val healthCheckOverride: (suspend (VpnTransport) -> Boolean)? = null,
 ) : ViewModel() {
 
     private val diagnostics = FieldTestDiagnosticsRecorder(nowProvider)
+    private val effectiveHealthCheck: suspend (VpnTransport) -> Boolean = healthCheckOverride ?: { probeDataPlane() }
 
     /**
      * B37 - the ONE line that switches this build from the legacy AWG
@@ -92,6 +121,12 @@ class FieldTestViewModel(
         nowProvider = nowProvider,
         gatewayLookup = FieldTestAwg31GatewayCatalog::byId,
         awgGeneration = AwgGeneration.AWG_3_1,
+        // C2 fix: a real, bounded, post-handshake data-plane probe - NOT the
+        // constant `{ true }` default (which reported PROTECTED on a bare
+        // handshake alone, never actually proving the data plane carries
+        // traffic). See [probeDataPlane]'s own docs for exactly what this
+        // does and does not prove.
+        healthCheck = effectiveHealthCheck,
     )
 
     private val _uiState = MutableStateFlow<FieldTestUiState>(FieldTestUiState.Idle)
@@ -141,11 +176,27 @@ class FieldTestViewModel(
     fun connect() {
         if (_uiState.value != FieldTestUiState.Idle && _uiState.value != FieldTestUiState.Failed) return
         _uiState.value = FieldTestUiState.Connecting
+        // C1 fix: FieldTestTunnelController.connect() itself refuses to run
+        // unless its OWN internal state is Idle - after a Failed run, only
+        // resetting THIS ViewModel's uiState (the old retry() behavior)
+        // left the controller stuck in FieldTestState.Failed forever, so
+        // every subsequent connect() silently no-op'd and returned the SAME
+        // stale Failed state without ever attempting a new candidate. Reset
+        // it here, unconditionally, right before every connect() attempt -
+        // a no-op when the controller is already Idle (the normal
+        // first-ever-attempt case), so this is safe on every call path.
+        controller.resetAfterFailure()
+        // D1/D2 fix: read the REAL underlying network exactly once, HERE,
+        // before this build's own full-tunnel VPN attempt can change what
+        // the OS reports as the active network - never after the attempt
+        // settles (which is what the pre-existing code did), and never
+        // inferred from whether the attempt went on to succeed.
+        val preConnectNetworkProfile = networkProfileProvider()
         viewModelScope.launch {
             if (!ensureVpnPermission()) {
                 _uiState.value = FieldTestUiState.Failed
                 _lastReport.value = buildReport(
-                    networkType = networkTypeProvider(),
+                    networkProfile = preConnectNetworkProfile,
                     gatewaysAttempted = emptyList(),
                     finalGateway = null,
                     finalTransportKind = null,
@@ -156,13 +207,12 @@ class FieldTestViewModel(
             }
 
             val finalState = controller.connect()
-            val networkType = networkTypeProvider()
 
             when (finalState) {
                 is FieldTestState.Protected -> {
                     _uiState.value = FieldTestUiState.Protected
                     val report = buildReport(
-                        networkType = networkType,
+                        networkProfile = preConnectNetworkProfile,
                         gatewaysAttempted = attemptedFrom(finalState.candidate),
                         finalGateway = finalState.candidate,
                         finalTransportKind = TransportKind.AMNEZIA_WG,
@@ -178,13 +228,31 @@ class FieldTestViewModel(
                 }
                 is FieldTestState.Failed -> {
                     _uiState.value = FieldTestUiState.Failed
+                    // D3 fix: distinguish "no candidate ever produced a
+                    // handshake" from "at least one candidate handshook but
+                    // then failed its post-handshake health/data-plane
+                    // check" - collapsing every failure shape into
+                    // ALL_CANDIDATES_EXHAUSTED (the old behavior) discarded
+                    // real, already-recorded diagnosis. The exact per-
+                    // candidate reason remains available in full in
+                    // diagnostics.snapshot() regardless (recordCandidateResult/
+                    // recordHealthResult/recordTransportError, each keyed by
+                    // candidate) - this is the coarser TOP-LEVEL summary.
+                    val anyHandshakeSucceeded = diagnostics.snapshot().any {
+                        it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_HEALTH_RESULT
+                    }
+                    val failureCategory = if (anyHandshakeSucceeded) {
+                        FieldTestFailureCategory.HEALTH_CHECK_FAILED
+                    } else {
+                        FieldTestFailureCategory.NO_HANDSHAKE
+                    }
                     val report = buildReport(
-                        networkType = networkType,
+                        networkProfile = preConnectNetworkProfile,
                         gatewaysAttempted = finalState.attempted,
                         finalGateway = null,
                         finalTransportKind = null,
                         outcome = FieldTestOutcome.FAILED,
-                        failureCategory = FieldTestFailureCategory.ALL_CANDIDATES_EXHAUSTED,
+                        failureCategory = failureCategory,
                     )
                     _lastReport.value = report
                 }
@@ -193,11 +261,64 @@ class FieldTestViewModel(
         }
     }
 
-    /** Lets the tester retry after a failure - same [connect] entry point, a fresh attempt from Idle. */
+    /** Lets the tester retry after a failure - same [connect] entry point, which now (C1) also resets [controller]'s own internal state, so this is a genuinely fresh Frankfurt -> Stockholm attempt, not a stale no-op. */
     fun retry() {
         if (_uiState.value == FieldTestUiState.Failed) {
             _uiState.value = FieldTestUiState.Idle
             connect()
+        }
+    }
+
+    /**
+     * B37 senior-review pass (task C2/C3) - the field test's real post-
+     * handshake data-plane confidence check, wired as [controller]'s
+     * `healthCheck` above. Opens a plain bounded TCP connection to one of
+     * two well-known public IPs on port 443 - deliberately NOT anything
+     * that depends on this app's own activation/control-plane API (task
+     * requirement), and deliberately a raw [Socket] rather than an HTTP
+     * client so there is no DNS resolution step to confound "did the tunnel
+     * carry traffic" with "did DNS work".
+     *
+     * Why this is expected to actually go THROUGH the tunnel, not around
+     * it: this field-test build's own transport
+     * ([AmneziaWgTransport]/[buildFieldTestAwgConfig]) never calls
+     * `excludedApplications`/`includedApplications` to exclude this app's
+     * own UID from the VPN, and never calls `VpnService.protect(socket)` on
+     * a socket this class opens (that API exists only for a VPN
+     * implementation to protect ITS OWN control-channel socket from a
+     * routing loop - this probe is application code, not the transport
+     * implementation, so it is never called here) - Android routes a VPN
+     * app's own non-protected sockets through its own tun interface by
+     * default once the tunnel is up, the same as every other app's traffic.
+     *
+     * Honest limitation, reported rather than hidden: this reasoning has
+     * NOT been confirmed against real on-device packet capture in this
+     * pass (task requirement: "do not claim server runtime verification
+     * that was not actually performed" - the same discipline applies here).
+     * If a future device test shows this probe can succeed even with the
+     * tunnel down (i.e. it is silently bypassing the VPN), that is a
+     * correctness bug in THIS probe and must be fixed before trusting a
+     * PROTECTED result from it.
+     */
+    private suspend fun probeDataPlane(): Boolean {
+        val targets = listOf("1.1.1.1" to 443, "8.8.8.8" to 443)
+        return withContext(Dispatchers.IO) {
+            for ((host, port) in targets) {
+                val ok = try {
+                    withTimeoutOrNull(DATA_PLANE_PROBE_TIMEOUT_MS) {
+                        Socket().use { socket ->
+                            socket.connect(InetSocketAddress(host, port), DATA_PLANE_PROBE_TIMEOUT_MS.toInt())
+                        }
+                        true
+                    } ?: false
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    false
+                }
+                if (ok) return@withContext true
+            }
+            false
         }
     }
 
@@ -224,7 +345,7 @@ class FieldTestViewModel(
     }
 
     private fun buildReport(
-        networkType: NetworkType,
+        networkProfile: NetworkProfile,
         gatewaysAttempted: List<ProductionGatewayId>,
         finalGateway: ProductionGatewayId?,
         finalTransportKind: TransportKind?,
@@ -243,18 +364,19 @@ class FieldTestViewModel(
         // guess). gatewayHttpsReachable/diverseInternetReachable are not
         // probed by this small flow - null, matching classify()'s own
         // "unknown until observed" contract.
+        //
+        // D2 fix: [networkProfile] is REAL, pre-connect evidence
+        // ([FieldTestViewModel.connect]'s own `preConnectNetworkProfile`,
+        // see [currentNetworkProfileSnapshot]) - never synthesized from
+        // whether this run's OWN VPN attempt went on to succeed (the
+        // original bug: `validatedInternet = outcome == PROTECTED` made a
+        // VPN failure look identical to "ordinary Internet doesn't work",
+        // even when the underlying network was completely fine and only
+        // THIS field-test tunnel failed to come up). vpnActive still
+        // correctly reflects THIS run's own outcome (that part is genuinely
+        // about the tunnel, not the underlying network).
         val evidence = RestrictionEvidence(
-            networkProfile = NetworkProfile(
-                type = networkType,
-                validatedInternet = outcome == FieldTestOutcome.PROTECTED,
-                metered = false,
-                roaming = null,
-                captivePortal = null,
-                ipv4Available = true,
-                ipv6Available = false,
-                vpnActive = outcome == FieldTestOutcome.PROTECTED,
-                generation = 0,
-            ),
+            networkProfile = networkProfile.copy(vpnActive = outcome == FieldTestOutcome.PROTECTED),
             transportState = if (outcome == FieldTestOutcome.PROTECTED) TransportState.Connected else TransportState.HandshakeFailed,
             awgHandshakeFresh = outcome == FieldTestOutcome.PROTECTED,
             gatewayHttpsReachable = null,
@@ -266,7 +388,7 @@ class FieldTestViewModel(
             appVersionName = appVersionName,
             appVersionCode = appVersionCode,
             generatedAtEpochMillis = nowProvider(),
-            networkType = networkType,
+            networkType = networkProfile.type,
             routingMode = RoutingMode.FULL_VPN,
             restrictionClass = restrictionClass,
             gatewaysAttempted = gatewaysAttempted,
@@ -277,6 +399,10 @@ class FieldTestViewModel(
             failureCategory = failureCategory,
             events = diagnostics.snapshot(),
         ).sanitizedForExport()
+    }
+
+    private companion object {
+        const val DATA_PLANE_PROBE_TIMEOUT_MS = 4_000L
     }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {
@@ -299,6 +425,7 @@ class FieldTestViewModel(
                 transportFactory = { AmneziaWgTransport(application) },
                 appVersionName = versionName,
                 appVersionCode = versionCode,
+                networkProfileProvider = { currentNetworkProfileSnapshot(application) },
             ) as T
         }
     }

@@ -280,3 +280,44 @@ ft31_verify_no_unrelated_change() {
     fi
     log "post-deploy verification: every pre-existing rule still occurs, in the same relative order (an exact ordered subsequence of the new ruleset) - nothing unrelated was removed, reordered, or changed"
 }
+
+# ft31_verify_rollback_exact <pre_snapshot_file> <post_snapshot_file>
+#
+# senior-review correction (A3): rollback-ft31.sh previously reused
+# ft31_verify_no_unrelated_change in the "reverse" direction (checking that
+# POST is an ordered subsequence of PRE) as its own safety net. That check is
+# MATHEMATICALLY VACUOUS for a removal-only operation: since rollback only
+# ever DELETES lines from PRE, the resulting POST is *by construction*
+# always an ordered subsequence of PRE, no matter WHICH lines were deleted -
+# deleting an unrelated production rule instead of (or in addition to) the
+# intended b37-ft31 rule(s) would still pass that check every single time.
+# Concretely: PRE = [A, B, C] (B = an unrelated production rule), a buggy
+# rollback that removes B instead of the intended C-only target produces
+# POST = [A, C] - still a valid ordered subsequence of [A, B, C] - so the old
+# check could never have caught this class of bug.
+#
+# This check instead proves the actual, sufficient property: POST must equal
+# PRE with ONLY the exact b37-ft31-tagged line(s) removed - nothing else
+# added, removed, or reordered. Every rule this task ever adds carries the
+# literal "$FT31_FW_MARKER" comment/marker (see ft31_add_rule_to_ft31/
+# ft31_add_rule_from_ft31 - both the frankfurt `-m comment --comment
+# b37-ft31` and stockholm `comment "b37-ft31"` forms embed this exact
+# string), and nothing else in either host's real ruleset dump is expected
+# to ever contain it, so filtering PRE for lines NOT containing that marker
+# computes the exact expected POST-rollback state deterministically, without
+# needing to reconstruct either backend's exact rule-dump syntax by hand.
+ft31_verify_rollback_exact() {
+    local pre_file=$1 post_file=$2
+    local expected_file
+    expected_file=$(mktemp)
+    grep -vF "$FT31_FW_MARKER" "$pre_file" > "$expected_file"
+    if ! diff -q "$expected_file" "$post_file" >/dev/null 2>&1; then
+        local diff_output
+        diff_output=$(diff -u "$expected_file" "$post_file" 2>&1 || true)
+        rm -f "$expected_file"
+        die "rollback verification FAILED: post-rollback ruleset is NOT exactly pre-rollback minus only the $FT31_FW_MARKER-tagged rule(s) - at least one unrelated rule was also removed, reordered, or changed (or a b37-ft31 rule was NOT actually removed). Diff (expected vs actual):
+$diff_output"
+    fi
+    rm -f "$expected_file"
+    log "rollback verification: post-rollback ruleset is EXACTLY pre-rollback minus only the $FT31_FW_MARKER-tagged rule(s) - no unrelated rule was removed, reordered, or changed"
+}

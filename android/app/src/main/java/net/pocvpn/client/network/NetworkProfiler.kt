@@ -109,6 +109,44 @@ internal data class RawNetworkSignals(
     val dnsServerAddresses: List<String> = emptyList(),
 )
 
+/**
+ * B37 senior-review pass (task D1/D2) - a one-shot, SYNCHRONOUS real network
+ * read (no callback/lifecycle needed), for callers that need a truthful
+ * underlying-network snapshot taken at one specific instant (e.g. the field
+ * test's own report, which must capture this BEFORE the VPN tunnel comes up
+ * - see [net.pocvpn.client.fieldtest.FieldTestViewModel.connect] - never
+ * infer network type/validation from whether the VPN attempt itself
+ * succeeded, and never keep [NetworkProfiler]'s own start()/stop() lifecycle
+ * running just for one point-in-time read). Reuses the EXACT SAME
+ * [buildNetworkProfile] pure mapping [NetworkProfiler.emit] uses, from a
+ * synchronous [ConnectivityManager.getNetworkCapabilities]/[getLinkProperties]
+ * read of the CURRENT default network instead of a registered callback.
+ * Returns [NetworkProfile.unavailable] (never a guess) if there is no active
+ * network or its capabilities cannot be read.
+ */
+fun currentNetworkProfileSnapshot(context: Context): NetworkProfile {
+    val connectivityManager = context.applicationContext.getSystemService(ConnectivityManager::class.java)
+        ?: return NetworkProfile.unavailable(0)
+    val network = connectivityManager.activeNetwork ?: return NetworkProfile.unavailable(0)
+    val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return NetworkProfile.unavailable(0)
+    val linkProperties = connectivityManager.getLinkProperties(network)
+    val linkAddresses = linkProperties?.linkAddresses.orEmpty()
+    val signals = RawNetworkSignals(
+        hasWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+        hasCellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+        hasEthernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+        validatedInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+        notMetered = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
+        notRoaming = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING),
+        captivePortal = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL),
+        hasIpv4Address = linkAddresses.any { it.address is Inet4Address },
+        hasIpv6Address = linkAddresses.any { it.address is Inet6Address },
+        isVpnTransport = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
+        dnsServerAddresses = linkProperties?.dnsServers.orEmpty().map { it.hostAddress ?: "" }.filter { it.isNotEmpty() },
+    )
+    return buildNetworkProfile(signals, 0)
+}
+
 internal fun buildNetworkProfile(signals: RawNetworkSignals, generation: Long): NetworkProfile {
     val type = when {
         signals.hasWifi -> NetworkType.WIFI
