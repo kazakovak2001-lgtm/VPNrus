@@ -1,0 +1,32 @@
+# B37 - isolated AWG 3.1 field-test interface unit, separate from
+# awg-poc.service (production awg0). Never enabled/disabled/restarted as a
+# side effect of any awg-poc.service operation - a completely independent
+# unit pointed at a different interface name.
+#
+# senior-review correction (real Frankfurt preflight evidence): the prior
+# static awg-poc-ft31.service hardcoded /usr/local/bin/awg{,-quick} - the
+# verified live Frankfurt host installs these at /usr/bin instead (built/
+# packaged there, not via this repo's own build-awg.sh convention). A
+# hardcoded path is a blind assumption either way. This is now a TEMPLATE:
+# provision-ft31.sh resolves the real, live `command -v awg`/`command -v
+# awg-quick` absolute paths at preflight time (failing closed if either is
+# missing or not executable) and renders them in here as __AWG_BIN__/
+# __AWG_QUICK_BIN__ - so the rendered unit always matches whatever this
+# specific host's own verified runtime actually provides, on Frankfurt,
+# Stockholm, or any future host, without a second hardcoded guess.
+[Unit]
+Description=AmneziaWG 3.1 FIELD TEST gateway (awg-ft31) via awg-quick(8) - B37, disposable
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=__AWG_QUICK_BIN__ up awg-ft31
+ExecStop=__AWG_QUICK_BIN__ down awg-ft31
+ExecReload=/bin/bash -c 'exec __AWG_BIN__ syncconf awg-ft31 <(exec __AWG_QUICK_BIN__ strip awg-ft31)'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

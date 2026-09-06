@@ -23,6 +23,103 @@
 
 FT31_FW_MARKER="b37-ft31"
 
+# The isolated field-test UDP port - kept as a lib-local constant (same
+# convention as FT31_FW_MARKER above and the hardcoded "awg-ft31" interface
+# name used throughout this file) rather than threaded in from
+# provision-ft31.sh's own FT31_LISTEN_PORT, since this file already hardcodes
+# every other B37-specific fact. MUST stay in sync with provision-ft31.sh's
+# FT31_LISTEN_PORT=51821 if that ever changes.
+FT31_INPUT_PORT=51821
+
+# --- Host INPUT rule (senior-review pass: real Frankfurt preflight evidence)
+#
+# Real, verified Frankfurt facts (read-only SSH diagnosis, not assumed):
+# INPUT already ACCEPTs UDP 51820 (production awg0) and ends in a terminal
+# REJECT - there is NO existing UDP 51821 ACCEPT, so inbound B37 traffic
+# would be silently rejected by INPUT regardless of anything this file's
+# FORWARD-rule functions do (FORWARD only decides whether an already-
+# INPUT-accepted/locally-destined packet gets forwarded onward - it has no
+# say over whether the packet reaches this host's own listening socket in
+# the first place).
+#
+# Stockholm's own live INPUT model has NOT been read-only-diagnosed the same
+# way (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE) - every function
+# below is Frankfurt-only BY DESIGN, and deliberately refuses (fails closed,
+# zero mutation) rather than guessing for any other host, exactly the same
+# discipline as ft31_verify_runtime's own per-host case statement.
+
+# ft31_input_rule_present <host> - true (0) only if the exact b37-ft31 INPUT
+# ACCEPT rule already exists. Always false for a host with no audited INPUT
+# model (never dies - "not present" is the correct, safe answer for a
+# presence CHECK; ft31_add_input_rule is the one that fails closed on an
+# unaudited host, since only an ADD needs to refuse to guess).
+ft31_input_rule_present() {
+    local host=$1
+    case "$host" in
+        frankfurt)
+            iptables -C INPUT -p udp --dport "$FT31_INPUT_PORT" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# _ft31_frankfurt_input_reject_line_number - internal helper. Returns (on
+# stdout) the 1-indexed position, AMONG "-A INPUT ..." rules only (i.e. the
+# same numbering `iptables -I INPUT <N>` expects - the chain's own `-P INPUT
+# ...` policy line is not itself a numbered rule and is excluded), of the
+# chain's terminal REJECT/DROP rule. Fails closed (die) unless there is
+# EXACTLY ONE REJECT/DROP rule in INPUT and it is the LAST rule - this file
+# must never guess an insertion point in an unexpected/drifted chain shape.
+_ft31_frankfurt_input_reject_line_number() {
+    local rules line idx=0 reject_count=0 reject_line=0
+    rules=$(iptables -S INPUT 2>/dev/null | grep '^-A INPUT ' || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        idx=$((idx + 1))
+        if printf '%s' "$line" | grep -qE -- '-j (REJECT|DROP)'; then
+            reject_count=$((reject_count + 1))
+            reject_line=$idx
+        fi
+    done <<< "$rules"
+    [ "$reject_count" -eq 1 ] || die "runtime mismatch: frankfurt INPUT chain does not have exactly one terminal REJECT/DROP rule (found $reject_count) - refusing to guess where to insert the b37-ft31 INPUT rule"
+    [ "$reject_line" -eq "$idx" ] || die "runtime mismatch: frankfurt INPUT chain's REJECT/DROP rule is not the LAST rule (found at position $reject_line of $idx) - refusing to insert before an unexpected chain shape"
+    printf '%s' "$reject_line"
+}
+
+# ft31_add_input_rule <host> - idempotent; inserts the b37-ft31 INPUT ACCEPT
+# rule immediately before the chain's terminal REJECT/DROP (so it stays
+# ahead of the final verdict, without disturbing the relative order or
+# position of any other existing rule, including the pre-existing UDP 51820
+# ACCEPT). Fails closed (die, zero mutation) for any host with no audited
+# INPUT model - never a blind guess for Stockholm or any future host.
+ft31_add_input_rule() {
+    local host=$1
+    ft31_input_rule_present "$host" && return 0
+    case "$host" in
+        frankfurt)
+            local reject_line
+            reject_line=$(_ft31_frankfurt_input_reject_line_number)
+            iptables -I INPUT "$reject_line" -p udp --dport "$FT31_INPUT_PORT" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT
+            ;;
+        *)
+            die "ft31_add_input_rule: no audited host INPUT model for '$host' - refusing to guess an INPUT rule (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE)"
+            ;;
+    esac
+}
+
+# ft31_remove_input_rule <host> - removes exactly the b37-ft31 INPUT ACCEPT
+# rule (no-op, exit 0, if already absent or the host has no INPUT model at
+# all - there is nothing of ours to remove either way).
+ft31_remove_input_rule() {
+    local host=$1
+    case "$host" in
+        frankfurt)
+            iptables -D INPUT -p udp --dport "$FT31_INPUT_PORT" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null || true
+            ;;
+        *) : ;;
+    esac
+}
+
 # ft31_snapshot_ruleset <host> <out_file>
 # Captures the CURRENT, full forwarding ruleset for the given host's real
 # backend, verbatim - used both as the preflight evidence and as the
@@ -79,6 +176,15 @@ ft31_verify_runtime() {
             printf '%s' "$forward_rules" | grep -q -- '-o ens3' || die "runtime mismatch: --host frankfurt expects an existing FORWARD rule on ens3 (production awg0 egress) - refusing to mutate any firewall rule"
             last_action=$(printf '%s\n' "$forward_rules" | tail -1)
             printf '%s' "$last_action" | grep -qE -- '-j (REJECT|DROP)' || die "runtime mismatch: --host frankfurt expects a terminal REJECT/DROP in FORWARD - refusing to mutate any firewall rule"
+            # Real Frankfurt preflight evidence (senior-review pass): INPUT
+            # must also have a single terminal REJECT/DROP as its LAST rule -
+            # _ft31_frankfurt_input_reject_line_number (used by
+            # ft31_add_input_rule below) relies on exactly this shape to know
+            # where "immediately before the terminal REJECT" actually is;
+            # checked here too so a malformed/unexpected INPUT chain is
+            # reported at preflight, before any mutation, not only when the
+            # INPUT-rule step itself is reached.
+            _ft31_frankfurt_input_reject_line_number >/dev/null
             ;;
         stockholm)
             [ "$egress_iface" = "ens5" ] || die "runtime mismatch: --host stockholm expects egress ens5, detected '$egress_iface' - refusing to mutate any firewall rule"

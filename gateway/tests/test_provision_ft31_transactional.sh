@@ -113,10 +113,14 @@ ETC="$root/etc"
 STATE="$root/state"
 echo "iptables \$*" >> "\$STATE/calls.log"
 if [ "\$1" = "--version" ]; then echo "iptables v1.8.9 (nf_tables)"; exit 0; fi
-if [ "\$1" = "-S" ] && [ "\$2" = "FORWARD" ]; then cat "\$ETC/forward_rules" 2>/dev/null; exit 0; fi
+_ft31_chain_file() { [ "\$1" = "INPUT" ] && echo "\$ETC/input_rules" || echo "\$ETC/forward_rules"; }
+if [ "\$1" = "-S" ]; then
+    cat "\$(_ft31_chain_file "\$2")" 2>/dev/null
+    exit 0
+fi
 if [ "\$1" = "-C" ]; then
-    shift 2
-    grep -qF -- "\$*" "\$ETC/forward_rules" 2>/dev/null && exit 0
+    chain=\$2; shift 2
+    grep -qF -- "\$*" "\$(_ft31_chain_file "\$chain")" 2>/dev/null && exit 0
     exit 1
 fi
 if [ "\$1" = "-I" ]; then
@@ -128,14 +132,25 @@ if [ "\$1" = "-I" ]; then
         exit 1
     fi
     chain=\$2; pos=\$3; shift 3
-    { echo "-A \$chain \$*"; cat "\$ETC/forward_rules" 2>/dev/null; } > "\$ETC/forward_rules.tmp"
-    mv "\$ETC/forward_rules.tmp" "\$ETC/forward_rules"
+    file=\$(_ft31_chain_file "\$chain")
+    fail_input_at=\$(cat "\$STATE/.fail_iptables_input_insert" 2>/dev/null || echo 0)
+    if [ "\$chain" = "INPUT" ] && [ "\$fail_input_at" = "1" ]; then
+        echo "iptables: simulated failure inserting into INPUT" >&2
+        exit 1
+    fi
+    awk -v pos="\$pos" -v newline="-A \$chain \$*" '
+        NR == pos { print newline }
+        { print }
+        END { if (pos > NR) print newline }
+    ' "\$file" > "\$file.tmp"
+    mv "\$file.tmp" "\$file"
     exit 0
 fi
 if [ "\$1" = "-D" ]; then
     chain=\$2; shift 2
-    grep -vF -- "-A \$chain \$*" "\$ETC/forward_rules" 2>/dev/null > "\$ETC/forward_rules.tmp" || true
-    mv "\$ETC/forward_rules.tmp" "\$ETC/forward_rules"
+    file=\$(_ft31_chain_file "\$chain")
+    grep -vF -- "-A \$chain \$*" "\$file" 2>/dev/null > "\$file.tmp" || true
+    mv "\$file.tmp" "\$file"
     exit 0
 fi
 exit 0
@@ -145,9 +160,16 @@ STUB
 -A FORWARD -i ens3 -o awg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A FORWARD -j REJECT --reject-with icmp-port-unreachable
 FIXTURE
+    # Real verified Frankfurt INPUT facts (senior-review pass): UDP 51820
+    # ACCEPT (production awg0), terminal REJECT - no UDP 51821 rule yet.
+    cat > "$root/etc/input_rules" <<'FIXTURE'
+-A INPUT -p udp --dport 51820 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-port-unreachable
+FIXTURE
     cat > "$root/bin/iptables-save" <<STUB
 #!/usr/bin/env bash
-cat "$root/etc/forward_rules"
+cat "$root/etc/input_rules" 2>/dev/null
+cat "$root/etc/forward_rules" 2>/dev/null
 STUB
     cat > "$root/bin/nft" <<STUB
 #!/usr/bin/env bash
@@ -415,6 +437,101 @@ if FT31_TEST_CONFIG_DIR="$ROOT/etc/amnezia" \
     fail "I: expected provision-ft31.sh to refuse FT31_TEST_* overrides without FT31_TEST_HARNESS_MODE=1"
 else
     pass "I: provision-ft31.sh correctly refused FT31_TEST_* overrides without FT31_TEST_HARNESS_MODE=1"
+fi
+rm -rf "$ROOT"
+
+# --- J: real binary-path resolution (senior-review pass: real Frankfurt
+# preflight evidence) - the rendered systemd unit must use THIS host's own
+# resolved `command -v awg`/`command -v awg-quick` absolute paths (here:
+# under the fixture's $ROOT/bin, standing in for the verified real
+# Frankfurt facts of /usr/bin, NOT the previously-hardcoded /usr/local/bin)
+# -----------------------------------------------------------------------
+ROOT=$(make_env)
+run_provision "$ROOT" >/dev/null 2>&1
+UNIT_CONTENT=$(cat "$ROOT/systemd/awg-poc-ft31.service")
+if printf '%s' "$UNIT_CONTENT" | grep -qF "$ROOT/bin/awg-quick up awg-ft31" && \
+   printf '%s' "$UNIT_CONTENT" | grep -qF "$ROOT/bin/awg-quick down awg-ft31" && \
+   printf '%s' "$UNIT_CONTENT" | grep -qF "$ROOT/bin/awg syncconf"; then
+    pass "J: the rendered B37 unit uses this host's own resolved (non-/usr/local) AWG binary paths"
+else
+    fail "J: expected the rendered unit to reference $ROOT/bin/awg{,-quick} - got: $UNIT_CONTENT"
+fi
+# Only the [Service] Exec* directives matter here - the template's own
+# comments legitimately mention the OLD /usr/local/bin assumption (to
+# explain why this is now a template at all), so checking the whole file
+# would false-positive on that prose, not on any actual directive.
+if ! printf '%s' "$UNIT_CONTENT" | grep '^Exec' | grep -q "/usr/local/bin"; then
+    pass "J: the rendered unit's Exec* directives never fall back to the old hardcoded /usr/local/bin path"
+else
+    fail "J: the rendered unit's Exec* directives must never contain a hardcoded /usr/local/bin path"
+fi
+rm -rf "$ROOT"
+
+# --- K: /usr/local/bin absence does not break deployment - every fixture in
+# this entire test file only ever provides awg/awg-quick under $ROOT/bin
+# (standing in for the verified real Frankfurt /usr/bin, never /usr/local/bin
+# at all) and provisioning still succeeds end-to-end via real `command -v`
+# resolution, never a blind hardcoded assumption.
+ROOT=$(make_env)
+if run_provision "$ROOT" >/dev/null 2>&1; then
+    pass "K: provisioning succeeds with AWG binaries resolved from PATH, with no /usr/local/bin present anywhere in this fixture"
+else
+    fail "K: provisioning must not depend on a hardcoded /usr/local/bin path existing"
+fi
+rm -rf "$ROOT"
+
+# --- L: the b37-ft31 host INPUT rule is inserted before the terminal
+# REJECT during a real end-to-end run, and the pre-existing production UDP
+# 51820 ACCEPT rule is untouched -----------------------------------------
+ROOT=$(make_env)
+run_provision "$ROOT" >/dev/null 2>&1
+INPUT_RULES=$(cat "$ROOT/etc/input_rules")
+if [ "$(printf '%s\n' "$INPUT_RULES" | wc -l)" -eq 3 ] && \
+   printf '%s\n' "$INPUT_RULES" | sed -n '1p' | grep -q -- "--dport 51820" && \
+   printf '%s\n' "$INPUT_RULES" | sed -n '2p' | grep -q -- "--dport 51821.*b37-ft31" && \
+   printf '%s\n' "$INPUT_RULES" | sed -n '3p' | grep -q -- "-j REJECT"; then
+    pass "L: a real end-to-end run inserts the b37-ft31 INPUT rule immediately before the terminal REJECT"
+else
+    fail "L: expected [51820 ACCEPT, b37-ft31 51821 ACCEPT, REJECT] in that order after a full run, got: $INPUT_RULES"
+fi
+rm -rf "$ROOT"
+
+# --- M: repeated end-to-end runs never duplicate the INPUT rule -----------
+ROOT=$(make_env)
+run_provision "$ROOT" >/dev/null 2>&1
+run_provision "$ROOT" >/dev/null 2>&1
+COUNT=$(grep -c -- "b37-ft31" "$ROOT/etc/input_rules")
+[ "$COUNT" -eq 1 ] && pass "M: a repeated end-to-end run never duplicates the INPUT rule" || fail "M: expected exactly 1 b37-ft31 INPUT rule after two runs, found $COUNT"
+rm -rf "$ROOT"
+
+# --- N: a failure AFTER the INPUT rule is inserted (the new, final step)
+# rolls the INPUT rule back too, restoring the exact pre-run INPUT state -
+# proves the INPUT rule participates in the SAME transactional model as the
+# FORWARD rules, not a bolted-on afterthought.
+ROOT=$(make_env)
+PRE_INPUT=$(cat "$ROOT/etc/input_rules")
+if FT31_TEST_FAIL_AFTER_INPUT_RULE=1 run_provision "$ROOT" >/dev/null 2>&1; then
+    fail "N: expected provision-ft31.sh to fail when the post-INPUT-rule hook fires"
+else
+    pass "N: provision-ft31.sh correctly failed (post-INPUT-rule hook)"
+fi
+if [ "$(cat "$ROOT/etc/input_rules")" = "$PRE_INPUT" ]; then
+    pass "N: a failure after INPUT-rule insertion restores the exact pre-run INPUT state (rule rolled back)"
+else
+    fail "N: the INPUT rule must be rolled back on a failure occurring after it was inserted - got: $(cat "$ROOT/etc/input_rules")"
+fi
+rm -rf "$ROOT"
+
+# --- O: a full successful run leaves every OTHER production INPUT rule
+# byte-for-byte intact (only the b37-ft31 rule is new) --------------------
+ROOT=$(make_env)
+PRE_INPUT=$(cat "$ROOT/etc/input_rules")
+run_provision "$ROOT" >/dev/null 2>&1
+POST_INPUT_NON_B37=$(grep -v "b37-ft31" "$ROOT/etc/input_rules")
+if [ "$POST_INPUT_NON_B37" = "$PRE_INPUT" ]; then
+    pass "O: every pre-existing production INPUT rule remains byte-for-byte intact after a full successful run"
+else
+    fail "O: production INPUT rules must remain byte-for-byte intact - expected: $PRE_INPUT - got (minus b37-ft31): $POST_INPUT_NON_B37"
 fi
 rm -rf "$ROOT"
 

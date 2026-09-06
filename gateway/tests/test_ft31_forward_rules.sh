@@ -50,26 +50,37 @@ if [ "\$1" = "--version" ]; then
     echo "iptables v1.8.9 (nf_tables)"
     exit 0
 fi
-if [ "\$1" = "-S" ] && [ "\$2" = "FORWARD" ]; then
-    cat "\$ETC/forward_rules" 2>/dev/null
+_ft31_chain_file() { [ "\$1" = "INPUT" ] && echo "\$ETC/input_rules" || echo "\$ETC/forward_rules"; }
+if [ "\$1" = "-S" ]; then
+    cat "\$(_ft31_chain_file "\$2")" 2>/dev/null
     exit 0
 fi
 if [ "\$1" = "-C" ]; then
-    shift 2
+    chain=\$2; shift 2
     spec="\$*"
-    grep -qF -- "\$spec" "\$ETC/forward_rules" 2>/dev/null && exit 0
+    grep -qF -- "\$spec" "\$(_ft31_chain_file "\$chain")" 2>/dev/null && exit 0
     exit 1
 fi
 if [ "\$1" = "-I" ]; then
     chain=\$2; pos=\$3; shift 3
-    { echo "-A \$chain \$*"; cat "\$ETC/forward_rules" 2>/dev/null; } > "\$ETC/forward_rules.tmp"
-    mv "\$ETC/forward_rules.tmp" "\$ETC/forward_rules"
+    file=\$(_ft31_chain_file "\$chain")
+    if [ "\$chain" = "INPUT" ] && [ -f "\$ETC/.fail_input_insert" ]; then
+        echo "iptables: simulated failure inserting into INPUT" >&2
+        exit 1
+    fi
+    awk -v pos="\$pos" -v newline="-A \$chain \$*" '
+        NR == pos { print newline }
+        { print }
+        END { if (pos > NR) print newline }
+    ' "\$file" > "\$file.tmp"
+    mv "\$file.tmp" "\$file"
     exit 0
 fi
 if [ "\$1" = "-D" ]; then
     chain=\$2; shift 2
-    grep -vF -- "-A \$chain \$*" "\$ETC/forward_rules" 2>/dev/null > "\$ETC/forward_rules.tmp" || true
-    mv "\$ETC/forward_rules.tmp" "\$ETC/forward_rules"
+    file=\$(_ft31_chain_file "\$chain")
+    grep -vF -- "-A \$chain \$*" "\$file" 2>/dev/null > "\$file.tmp" || true
+    mv "\$file.tmp" "\$file"
     exit 0
 fi
 exit 0
@@ -79,6 +90,12 @@ STUB
 -A FORWARD -i awg0 -o ens3 -j ACCEPT
 -A FORWARD -i ens3 -o awg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A FORWARD -j REJECT --reject-with icmp-port-unreachable
+FIXTURE
+    # Real verified Frankfurt INPUT facts (senior-review pass): UDP 51820
+    # ACCEPT (production awg0), terminal REJECT - no UDP 51821 rule yet.
+    cat > "$root/etc/input_rules" <<'FIXTURE'
+-A INPUT -p udp --dport 51820 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-port-unreachable
 FIXTURE
 
     # --- nft (Stockholm fixture) ---
@@ -334,6 +351,68 @@ cp "$PRE" "$POST"
 if verify_rollback "$PRE" "$POST"; then fail "I: a rollback that left the b37-ft31 rule in place must be caught"; else pass "I: a no-op rollback (b37-ft31 rule still present) is caught"; fi
 
 rm -f "$PRE" "$POST"
+
+# --- Regression tests: host INPUT rule (senior-review pass, real Frankfurt
+# preflight evidence) -------------------------------------------------------
+
+# J. The b37-ft31 INPUT rule is inserted immediately BEFORE the terminal
+# REJECT, and the pre-existing UDP 51820 ACCEPT rule is left untouched.
+ROOT=$(make_fixture frankfurt)
+run_lib "$ROOT" 'ft31_add_input_rule frankfurt' >/dev/null 2>&1
+INPUT_RULES=$(cat "$ROOT/etc/input_rules")
+if [ "$(printf '%s\n' "$INPUT_RULES" | wc -l)" -eq 3 ] && \
+   printf '%s\n' "$INPUT_RULES" | sed -n '1p' | grep -q -- "--dport 51820" && \
+   printf '%s\n' "$INPUT_RULES" | sed -n '2p' | grep -q -- "--dport 51821.*b37-ft31" && \
+   printf '%s\n' "$INPUT_RULES" | sed -n '3p' | grep -q -- "-j REJECT"; then
+    pass "J: b37-ft31 INPUT rule inserted immediately before the terminal REJECT, production 51820 rule untouched"
+else
+    fail "J: expected exactly [51820 ACCEPT, b37-ft31 51821 ACCEPT, REJECT] in that order, got: $INPUT_RULES"
+fi
+rm -rf "$ROOT"
+
+# K. Idempotent - re-running does not duplicate the INPUT rule.
+ROOT=$(make_fixture frankfurt)
+run_lib "$ROOT" 'ft31_add_input_rule frankfurt' >/dev/null 2>&1
+run_lib "$ROOT" 'ft31_add_input_rule frankfurt' >/dev/null 2>&1
+COUNT=$(grep -c -- "b37-ft31" "$ROOT/etc/input_rules")
+[ "$COUNT" -eq 1 ] && pass "K: re-running ft31_add_input_rule is idempotent (no duplicate)" || fail "K: expected exactly 1 b37-ft31 INPUT rule, found $COUNT"
+rm -rf "$ROOT"
+
+# L. Rollback removes ONLY the b37-ft31 INPUT rule - the production UDP
+# 51820 ACCEPT and the terminal REJECT survive byte-for-byte.
+ROOT=$(make_fixture frankfurt)
+run_lib "$ROOT" 'ft31_add_input_rule frankfurt' >/dev/null 2>&1
+run_lib "$ROOT" 'ft31_remove_input_rule frankfurt' >/dev/null 2>&1
+if ! grep -q -- "b37-ft31" "$ROOT/etc/input_rules" && \
+   grep -q -- "--dport 51820" "$ROOT/etc/input_rules" && \
+   grep -q -- "-j REJECT" "$ROOT/etc/input_rules" && \
+   [ "$(wc -l < "$ROOT/etc/input_rules")" -eq 2 ]; then
+    pass "L: rollback removes only the b37-ft31 INPUT rule, production 51820/REJECT survive intact"
+else
+    fail "L: rollback of the INPUT rule must leave exactly the original 2 production INPUT rules"
+fi
+rm -rf "$ROOT"
+
+# M. Unknown/unaudited host (e.g. stockholm) fails closed - zero mutation,
+# never a guessed INPUT rule.
+ROOT=$(make_fixture stockholm)
+if run_lib "$ROOT" 'ft31_add_input_rule stockholm' >/dev/null 2>&1; then
+    fail "M: ft31_add_input_rule must fail closed for a host with no audited INPUT model"
+else
+    pass "M: ft31_add_input_rule fails closed for stockholm (no audited INPUT model yet)"
+fi
+rm -rf "$ROOT"
+
+# N. An unexpected INPUT chain shape (no terminal REJECT/DROP at all) fails
+# closed before any mutation - ft31_verify_runtime itself must catch this.
+ROOT=$(make_fixture frankfurt)
+printf -- '-A INPUT -p udp --dport 51820 -j ACCEPT\n' > "$ROOT/etc/input_rules"
+if run_lib "$ROOT" 'ft31_verify_runtime frankfurt ens3' >/dev/null 2>&1; then
+    fail "N: a frankfurt INPUT chain with no terminal REJECT/DROP must fail closed at preflight"
+else
+    pass "N: an INPUT chain with no terminal REJECT/DROP fails closed at preflight"
+fi
+rm -rf "$ROOT"
 
 echo
 echo "== $PASSES passed, $FAILURES failed =="

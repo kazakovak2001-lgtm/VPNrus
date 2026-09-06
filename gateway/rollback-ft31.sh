@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # B37 (senior-review correction) - full rollback of the isolated AWG 3.1
 # field-test interface (awg-ft31), including the two b37-ft31-tagged
-# FORWARD accept rules provision-ft31.sh added to the host's REAL
-# production forwarding path. Removes ONLY B37 state - never touches
-# awg0, awg-poc.service, the production `inet pocvpn` forward chain's
-# other rules/policy, or any other pre-existing rule.
+# FORWARD accept rules AND (Frankfurt only - see ft31_forward_rules.sh's
+# own docs) the b37-ft31-tagged host INPUT accept rule provision-ft31.sh
+# added to the host's REAL production firewall. Removes ONLY B37 state -
+# never touches awg0, awg-poc.service, the production `inet pocvpn` forward
+# chain's other rules/policy, or any other pre-existing rule.
 #
 #   sudo ./rollback-ft31.sh <frankfurt|stockholm>
 set -euo pipefail
@@ -31,6 +32,12 @@ ft31_snapshot_ruleset "$FT31_HOST" "$PRE_SNAPSHOT"
 
 log "removing b37-ft31 FORWARD accept rules from the production forwarding path (if present)"
 ft31_remove_forward_rules "$FT31_HOST" "$EGRESS_IFACE"
+
+# Host INPUT rule (senior-review pass: real Frankfurt preflight evidence) -
+# ft31_remove_input_rule is a no-op for any host with no audited INPUT model
+# (currently only frankfurt has one), so this is safe to call unconditionally.
+log "removing b37-ft31 host INPUT rule (if present)"
+ft31_remove_input_rule "$FT31_HOST"
 
 log "stopping/disabling awg-poc-ft31.service"
 systemctl disable --now awg-poc-ft31.service 2>/dev/null || true

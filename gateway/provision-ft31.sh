@@ -95,8 +95,21 @@ NFTABLES_CONF_PATH="${FT31_TEST_NFTABLES_CONF_PATH:-/etc/nftables.pocvpn-ft31.co
 FT31_SERVICE_UNIT_PATH="$SYSTEMD_UNIT_DIR/awg-poc-ft31.service"
 FT31_CONFIG_PATH="$CONFIG_DIR/$FT31_CONFIG_FILE"
 
-command -v awg >/dev/null && command -v awg-quick >/dev/null || \
+# Resolve the REAL, live absolute binary paths (senior-review pass: real
+# Frankfurt preflight evidence found the verified host installs these at
+# /usr/bin, never the /usr/local/bin this script previously hardcoded into
+# the systemd unit - a second hardcoded guess would just move the same bug).
+# `command -v` resolves whatever this host's own PATH/package manager
+# actually put there; failing closed on either being missing/non-executable
+# means the rendered unit (step 4) can never end up pointing at a path that
+# does not truly exist on this host.
+AWG_BIN=$(command -v awg 2>/dev/null || true)
+AWG_QUICK_BIN=$(command -v awg-quick 2>/dev/null || true)
+[ -n "$AWG_BIN" ] && [ -n "$AWG_QUICK_BIN" ] || \
     die "amneziawg-tools not found - run provision.sh (production awg0) on this host first"
+[ -x "$AWG_BIN" ] || die "resolved awg binary '$AWG_BIN' is not executable - refusing to render a systemd unit pointing at it"
+[ -x "$AWG_QUICK_BIN" ] || die "resolved awg-quick binary '$AWG_QUICK_BIN' is not executable - refusing to render a systemd unit pointing at it"
+log "resolved live AWG binaries: awg=$AWG_BIN awg-quick=$AWG_QUICK_BIN"
 [ "$(cat "$IP_FORWARD_PROC" 2>/dev/null || echo 0)" = "1" ] || \
     die "IPv4 forwarding is not enabled - run provision.sh (production awg0) on this host first"
 
@@ -121,7 +134,7 @@ _ft31_test_fail_if() {
     [ -z "$value" ] || die "test-injected failure via $var_name (failure-injection test only - never set outside a test harness)"
 }
 
-log "step 0/5: preflight - verifying $FT31_HOST's live firewall runtime matches its expected production facts"
+log "step 0/6: preflight - verifying $FT31_HOST's live firewall runtime matches its expected production facts"
 ft31_verify_runtime "$FT31_HOST" "$EGRESS_IFACE"
 
 # --- Preflight collision checks (senior-review requirement A6) -----------
@@ -179,7 +192,14 @@ ft31_rule_to_ft31_present "$FT31_HOST" "$EGRESS_IFACE" && FT31_PRE_RULE_TO_FT31_
 FT31_PRE_RULE_FROM_FT31_EXISTS=false
 ft31_rule_from_ft31_present "$FT31_HOST" "$EGRESS_IFACE" && FT31_PRE_RULE_FROM_FT31_EXISTS=true
 
-log "pre-mutation B37 state observed: config=$FT31_PRE_CONFIG_EXISTS peer=$FT31_PRE_PEER_EXISTS nat=$FT31_PRE_NAT_EXISTS service_file=$FT31_PRE_SERVICE_FILE_EXISTS service_enabled=$FT31_PRE_SERVICE_ENABLED service_active=$FT31_PRE_SERVICE_ACTIVE rule_to=$FT31_PRE_RULE_TO_FT31_EXISTS rule_from=$FT31_PRE_RULE_FROM_FT31_EXISTS"
+# Host INPUT rule (senior-review pass: real Frankfurt preflight evidence).
+# ft31_input_rule_present is always false for a host with no audited INPUT
+# model (currently only frankfurt) - never dies, so this observation is safe
+# to take unconditionally for every host.
+FT31_PRE_INPUT_RULE_EXISTS=false
+ft31_input_rule_present "$FT31_HOST" && FT31_PRE_INPUT_RULE_EXISTS=true
+
+log "pre-mutation B37 state observed: config=$FT31_PRE_CONFIG_EXISTS peer=$FT31_PRE_PEER_EXISTS nat=$FT31_PRE_NAT_EXISTS service_file=$FT31_PRE_SERVICE_FILE_EXISTS service_enabled=$FT31_PRE_SERVICE_ENABLED service_active=$FT31_PRE_SERVICE_ACTIVE rule_to=$FT31_PRE_RULE_TO_FT31_EXISTS rule_from=$FT31_PRE_RULE_FROM_FT31_EXISTS input_rule=$FT31_PRE_INPUT_RULE_EXISTS"
 
 # --- Failure trap: re-observes CURRENT state and reconciles it back to ----
 # the pre-mutation observations above - never removes anything that was
@@ -209,6 +229,15 @@ ft31_rollback_this_invocation() {
     if [ "$FT31_PRE_RULE_FROM_FT31_EXISTS" = false ] && ft31_rule_from_ft31_present "$FT31_HOST" "$EGRESS_IFACE"; then
         ft31_remove_rule_from_ft31 "$FT31_HOST" "$EGRESS_IFACE"
         log "  rolled back: egress -> awg-ft31 FORWARD rule (did not exist before this run)"
+    fi
+
+    # Host INPUT rule (senior-review pass: real Frankfurt preflight
+    # evidence) - same observed-pre-state-vs-observed-current-state model as
+    # the FORWARD rules above. ft31_input_rule_present is always false for a
+    # host with no audited INPUT model, so this never fires for one.
+    if [ "$FT31_PRE_INPUT_RULE_EXISTS" = false ] && ft31_input_rule_present "$FT31_HOST"; then
+        ft31_remove_input_rule "$FT31_HOST"
+        log "  rolled back: b37-ft31 host INPUT rule (did not exist before this run)"
     fi
 
     # systemd - reconcile file existence, enabled, and active state
@@ -292,7 +321,7 @@ ft31_rollback_this_invocation() {
 }
 trap ft31_rollback_this_invocation EXIT
 
-log "step 1/5: isolated awg-ft31 interface config"
+log "step 1/6: isolated awg-ft31 interface config"
 install -d -m 0700 "$CONFIG_DIR"
 if [ "$FT31_PRE_CONFIG_EXISTS" = true ]; then
     log "existing config found at $FT31_CONFIG_PATH - leaving server identity/HeaderProtectionKey untouched"
@@ -333,7 +362,7 @@ else
     unset FT31_SERVER_PRIVATE_KEY FT31_HEADER_PROTECTION_KEY
 fi
 
-log "step 2/5: field-test peer"
+log "step 2/6: field-test peer"
 CONFIG_FILE=$FT31_CONFIG_FILE
 INTERFACE_NAME=$FT31_INTERFACE_NAME
 AWG_SUBNET_CIDR=$FT31_SUBNET_CIDR
@@ -368,7 +397,7 @@ else
 fi
 _ft31_test_fail_if FT31_TEST_FAIL_AFTER_PEER
 
-log "step 3/5: isolated NAT (inet pocvpn-ft31, no forward/filter chain - see this table's own docs)"
+log "step 3/6: isolated NAT (inet pocvpn-ft31, no forward/filter chain - see this table's own docs)"
 # Fail-closed on pre-existing, differing B37 state (senior-review requirement
 # A2): render the desired config to a TEMP file first, never straight over
 # the real path, so an already-live table (FT31_PRE_NAT_EXISTS) is never
@@ -396,25 +425,36 @@ fi
 rm -f "$FT31_NAT_RENDERED"
 _ft31_test_fail_if FT31_TEST_FAIL_AFTER_NAT
 
-log "step 4/5: systemd service"
-# Same fail-closed policy as NAT above (senior-review requirement A2): a
-# pre-existing unit file is compared byte-for-byte against the source unit
-# in this repo before any install - matching state is left untouched,
-# differing state fails closed rather than being silently replaced.
+log "step 4/6: systemd service"
+# Same fail-closed policy as NAT above (senior-review requirement A2), now
+# against a RENDERED unit (senior-review pass: real Frankfurt preflight
+# evidence) using this host's own resolved AWG_BIN/AWG_QUICK_BIN - a
+# pre-existing unit file is compared byte-for-byte against what would be
+# rendered today before any install; matching state is left untouched,
+# differing state fails closed rather than being silently replaced (this
+# also correctly catches a host whose AWG binaries moved/changed path since
+# the unit was first installed).
+FT31_SERVICE_UNIT_RENDERED=$(mktemp)
+render_template "$SCRIPT_DIR/systemd/awg-poc-ft31.service.template" \
+    "AWG_BIN=$AWG_BIN" \
+    "AWG_QUICK_BIN=$AWG_QUICK_BIN" \
+    > "$FT31_SERVICE_UNIT_RENDERED"
 if [ "$FT31_PRE_SERVICE_FILE_EXISTS" = true ]; then
-    if cmp -s "$SCRIPT_DIR/systemd/awg-poc-ft31.service" "$FT31_SERVICE_UNIT_PATH"; then
-        log "existing $FT31_SERVICE_UNIT_PATH already matches the desired B37 unit exactly - leaving untouched"
+    if cmp -s "$FT31_SERVICE_UNIT_RENDERED" "$FT31_SERVICE_UNIT_PATH"; then
+        log "existing $FT31_SERVICE_UNIT_PATH already matches the desired B37 unit exactly (including resolved binary paths) - leaving untouched"
     else
-        die "runtime mismatch: $FT31_SERVICE_UNIT_PATH already exists but does not exactly match the desired B37 unit (gateway/systemd/awg-poc-ft31.service) - refusing to overwrite unrecognized/differing pre-existing B37 state. Investigate manually before retrying."
+        rm -f "$FT31_SERVICE_UNIT_RENDERED"
+        die "runtime mismatch: $FT31_SERVICE_UNIT_PATH already exists but does not exactly match the unit this host's own resolved AWG_BIN/AWG_QUICK_BIN would render (gateway/systemd/awg-poc-ft31.service.template) - refusing to overwrite unrecognized/differing pre-existing B37 state. Investigate manually before retrying."
     fi
 else
-    install -m 0644 "$SCRIPT_DIR/systemd/awg-poc-ft31.service" "$FT31_SERVICE_UNIT_PATH"
+    install -m 0644 "$FT31_SERVICE_UNIT_RENDERED" "$FT31_SERVICE_UNIT_PATH"
 fi
+rm -f "$FT31_SERVICE_UNIT_RENDERED"
 systemctl daemon-reload
 # B37 disposable-field-test policy (senior-review requirement B3): this unit
 # is deliberately only STARTED, never enabled across reboot. The two
 # required FORWARD accept rules this script adds directly into each host's
-# real production forwarding path (step 5/5) are NOT reapplied at boot by
+# real production forwarding path (step 5/6) are NOT reapplied at boot by
 # anything - if the service auto-started after a reboot with those firewall
 # rules gone, the field-test interface would come up with no route out,
 # a confusing half-working state for a supposedly-disposable test. Requiring
@@ -425,11 +465,27 @@ systemctl daemon-reload
 systemctl start awg-poc-ft31.service
 _ft31_test_fail_if FT31_TEST_FAIL_AFTER_SERVICE
 
-log "step 5/5: FORWARD accept rules in the REAL production forwarding path ($FT31_HOST)"
+log "step 5/6: FORWARD accept rules in the REAL production forwarding path ($FT31_HOST)"
 ft31_add_rule_to_ft31 "$FT31_HOST" "$EGRESS_IFACE"
 _ft31_test_fail_if FT31_TEST_FAIL_AFTER_FIRST_FORWARD_RULE
 ft31_add_rule_from_ft31 "$FT31_HOST" "$EGRESS_IFACE"
 log "b37-ft31 FORWARD accept rules present on $FT31_HOST"
+
+log "step 6/6: host INPUT rule for UDP $FT31_LISTEN_PORT (senior-review pass: real Frankfurt preflight evidence)"
+# Real Frankfurt facts: INPUT ACCEPTs UDP 51820 (production) and ends in a
+# terminal REJECT - there is NO existing UDP 51821 ACCEPT, so without this,
+# inbound B37 traffic would never reach the FORWARD rules above at all.
+# Frankfurt-only by design (ft31_add_input_rule fails closed for any other
+# host) - Stockholm's own live INPUT model has not been read-only-diagnosed
+# yet (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE), so this step
+# is skipped there rather than guessing.
+if [ "$FT31_HOST" = frankfurt ]; then
+    ft31_add_input_rule "$FT31_HOST"
+    log "b37-ft31 host INPUT rule present on $FT31_HOST"
+else
+    log "  [skipped] no audited host INPUT model for $FT31_HOST yet - see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE before assuming inbound UDP $FT31_LISTEN_PORT reaches this host at all"
+fi
+_ft31_test_fail_if FT31_TEST_FAIL_AFTER_INPUT_RULE
 
 POST_SNAPSHOT=$(mktemp)
 ft31_snapshot_ruleset "$FT31_HOST" "$POST_SNAPSHOT"
@@ -438,8 +494,30 @@ rm -f "$PRE_SNAPSHOT" "$POST_SNAPSHOT"
 
 log "post-deploy verification:"
 ft31_verify_runtime "$FT31_HOST" "$EGRESS_IFACE" && log "  [ok] existing production awg0/FORWARD facts for $FT31_HOST are still intact"
+# Production awg0 remains up - checked by INTERFACE existence, deliberately
+# never by a specific systemd unit name: the repo's own provision.sh assumes
+# `awg-poc.service`, but real Frankfurt preflight evidence shows the live
+# host's actual production unit is `awg-quick@awg0.service` instead (a
+# drift between this repo's assumption and the real deployed host this task
+# does not fix, since fixing production's own provisioning is out of this
+# B37 field-test PR's scope) - `ip link show awg0` is true regardless of
+# which unit (or none) currently owns the interface.
+ip link show awg0 >/dev/null 2>&1 && log "  [ok] production awg0 interface is still up"
 ft31_forward_rules_present "$FT31_HOST" "$EGRESS_IFACE" && log "  [ok] b37-ft31 FORWARD accept rules are present"
+if [ "$FT31_HOST" = frankfurt ]; then
+    ft31_input_rule_present "$FT31_HOST" && log "  [ok] b37-ft31 host INPUT rule is present"
+fi
 FT31_NAT_OUTPUT=$(nft list table inet pocvpn-ft31 2>/dev/null || true)
 printf '%s' "$FT31_NAT_OUTPUT" | grep -q masquerade && log "  [ok] b37-ft31 NAT (masquerade) is present"
+ip link show "$FT31_INTERFACE_NAME" >/dev/null 2>&1 && log "  [ok] $FT31_INTERFACE_NAME interface exists"
+if command -v ss >/dev/null 2>&1; then
+    ss -uln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]$FT31_LISTEN_PORT\$" \
+        && log "  [ok] UDP $FT31_LISTEN_PORT is listening" \
+        || log "  [warn] UDP $FT31_LISTEN_PORT does not appear to be listening yet - awg-quick may still be starting, check 'sudo awg show $FT31_INTERFACE_NAME'"
+fi
+FT31_PEERS_OUTPUT=$(awg show "$FT31_INTERFACE_NAME" peers 2>/dev/null || true)
+printf '%s\n' "$FT31_PEERS_OUTPUT" | grep -qxF "$FT31_CLIENT_PUBLIC_KEY" \
+    && log "  [ok] expected client peer is present on $FT31_INTERFACE_NAME" \
+    || log "  [warn] expected client peer not yet visible on $FT31_INTERFACE_NAME - check 'sudo awg show $FT31_INTERFACE_NAME'"
 
 log "done. verify: sudo awg show $FT31_INTERFACE_NAME"

@@ -180,6 +180,24 @@ outright) `/etc/amnezia/amneziawg/awg-ft31.conf`. Never touches `awg0`,
 - Does not deploy anything server-side by itself - the commands in the task
   report are reported only, per this repository's merge/infra-safety rule.
 
+## AWG binary path resolution (senior-review pass, real Frankfurt preflight
+## evidence) - applies to BOTH hosts, not hardcoded per-host
+
+Real, verified Frankfurt facts: `awg`/`awg-quick`/`amneziawg-go` live at
+`/usr/bin`, NOT `/usr/local/bin` (the path this repo's own `build-awg.sh`
+convention installs to, and what the B37 systemd unit previously hardcoded).
+`provision-ft31.sh` now resolves the live `command -v awg`/`command -v
+awg-quick` absolute paths itself, at preflight time on whichever host it
+actually runs on, and renders `systemd/awg-poc-ft31.service.template` with
+those exact resolved paths - failing closed if either binary is missing or
+not executable. This is host-agnostic BY DESIGN: it needed no Frankfurt-
+specific branch, and needs none for Stockholm either. **Stockholm's own real
+binary path has NOT been separately verified** (no read-only SSH diagnosis
+performed for Stockholm yet) - do not assume it matches Frankfurt's
+`/usr/bin` OR this repo's own `/usr/local/bin` convention; the runtime
+discovery above resolves whatever is actually true there when the script is
+actually run.
+
 ## PREDEPLOY GATE (senior-review pass, B37 correctness audit) - hard blockers
 
 `provision-ft31.sh` can only prove the LOCAL host firewall/NAT/systemd state
@@ -213,14 +231,29 @@ The local FORWARD-path additions this script makes (see
 `lib/ft31_forward_rules.sh`) let traffic that already reached the host be
 forwarded into `awg-ft31` - they say nothing about whether inbound UDP
 51821 packets are accepted by the host's own INPUT chain in the first
-place. Before deploying, separately audit each host's live INPUT
-chain/policy (`iptables -S INPUT` on Frankfurt / `nft list chain inet
-pocvpn input` or equivalent on Stockholm, read-only) for whether a new
-port needs an explicit allow, exactly as already required for the existing
-production `51820` listener - add a narrowly-scoped, `b37-ft31`-tagged
-INPUT rule only if that audit shows one is actually needed, following the
-same fail-closed preflight discipline as the FORWARD rules; do not add one
-speculatively, and do not weaken any other INPUT rule/policy.
+place.
+
+**Frankfurt: implemented and verified against the real, read-only-diagnosed
+facts** (INPUT already ACCEPTs UDP 51820 and ends in a terminal REJECT, with
+no existing UDP 51821 rule) - `provision-ft31.sh` now adds exactly one
+`b37-ft31`-tagged `ACCEPT` rule for UDP 51821, inserted immediately before
+the terminal REJECT, preflight-gated (fails closed if the INPUT chain does
+not have exactly one terminal REJECT/DROP as its last rule), participating
+in the SAME observed-pre-state/observed-current-state transactional
+rollback model as the FORWARD rules (`lib/ft31_forward_rules.sh`'s
+`ft31_add_input_rule`/`ft31_remove_input_rule`/`ft31_input_rule_present`).
+`rollback-ft31.sh` removes exactly this rule and nothing else.
+
+**Stockholm: NOT implemented** - its live INPUT chain/policy has not been
+read-only-diagnosed the same way (`nft list chain inet pocvpn input` or
+equivalent has not been run against the real host). `ft31_add_input_rule`
+deliberately fails closed (dies, zero mutation) for any host other than
+`frankfurt` rather than guessing. Before a real Stockholm deploy: run that
+read-only audit, and only then decide whether Stockholm needs an equivalent
+rule and add a host-specific case to `ft31_add_input_rule`/
+`ft31_input_rule_present`/`ft31_remove_input_rule` following the exact same
+fail-closed, marker-tagged discipline as Frankfurt's - never add one
+speculatively, and never weaken any other INPUT rule/policy.
 
 ## Distinguishing a REAL AWG 3.1 block from a mundane reachability/config
 ## problem (task E1) - read this BEFORE calling a failed attempt "blocked"
