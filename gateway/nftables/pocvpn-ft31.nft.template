@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+#
+# B37 - Scope: forwarding + NAT for the ISOLATED AWG 3.1 field-test tunnel
+# ONLY, in its OWN table (inet pocvpn-ft31) - completely separate from the
+# production `inet pocvpn` table (see pocvpn.nft.template). Never touches
+# any other nftables table, the production awg0 forward/NAT rules, or the
+# host's existing firewall - only adds, never flushes unrelated rules.
+#
+# Idempotent by construction, same pattern as pocvpn.nft.template.
+#
+# Rendered by provision-ft31.sh: __AWG_FT31_IFACE__, __EGRESS_IFACE__, __AWG_FT31_SUBNET__.
+
+table inet pocvpn-ft31
+delete table inet pocvpn-ft31
+
+table inet pocvpn-ft31 {
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+
+        ct state established,related accept
+
+        iifname "__AWG_FT31_IFACE__" oifname "__EGRESS_IFACE__" accept
+        iifname "__EGRESS_IFACE__" oifname "__AWG_FT31_IFACE__" accept
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+
+        ip saddr __AWG_FT31_SUBNET__ oifname "__EGRESS_IFACE__" masquerade
+    }
+}

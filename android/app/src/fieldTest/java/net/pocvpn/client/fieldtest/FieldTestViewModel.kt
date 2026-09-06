@@ -77,10 +77,21 @@ class FieldTestViewModel(
 ) : ViewModel() {
 
     private val diagnostics = FieldTestDiagnosticsRecorder(nowProvider)
+
+    /**
+     * B37 - the ONE line that switches this build from the legacy AWG
+     * profile to the real, isolated AWG 3.1 field-test profile
+     * ([FieldTestAwg31GatewayCatalog]/[AwgGeneration.AWG_3_1]). Frankfurt-
+     * first/Stockholm-fallback, handshake proof, and health check are all
+     * unchanged - only WHICH interface/port/profile each candidate resolves
+     * to is different (see [FieldTestTunnelController]'s own docs).
+     */
     private val controller = FieldTestTunnelController(
         transportFactory = transportFactory,
         diagnostics = diagnostics,
         nowProvider = nowProvider,
+        gatewayLookup = FieldTestAwg31GatewayCatalog::byId,
+        awgGeneration = AwgGeneration.AWG_3_1,
     )
 
     private val _uiState = MutableStateFlow<FieldTestUiState>(FieldTestUiState.Idle)
@@ -220,6 +231,10 @@ class FieldTestViewModel(
         outcome: FieldTestOutcome,
         failureCategory: FieldTestFailureCategory,
     ): FieldTestReport {
+        // B37 - every report this build produces identifies itself as the
+        // real AWG 3.1 field test (task requirement A/G) - see this class's
+        // own `controller` wiring, the ONE place that actually selects the
+        // AWG generation exercised.
         // Reuses the app's REAL restriction-classification logic (task
         // requirement: "restriction/network classification already produced
         // by the app") - RestrictionClassifier.classify is a pure function,
@@ -257,6 +272,7 @@ class FieldTestViewModel(
             gatewaysAttempted = gatewaysAttempted,
             finalGateway = finalGateway,
             finalTransportKind = finalTransportKind,
+            awgGeneration = AwgGeneration.AWG_3_1,
             outcome = outcome,
             failureCategory = failureCategory,
             events = diagnostics.snapshot(),

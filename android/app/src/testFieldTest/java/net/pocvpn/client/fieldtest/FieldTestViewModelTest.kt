@@ -170,7 +170,11 @@ class FieldTestViewModelTest {
         assertTrue(report!!.events.isNotEmpty())
     }
 
-    // No secrets in serialized diagnostic output - the report's JSON never contains this build's own embedded private key, public key, or tunnel address.
+    // No secrets in serialized diagnostic output - the report's JSON never contains this build's own private key, tunnel address, or (B37) HeaderProtectionKey.
+    // Endpoint HOST is deliberately NOT asserted absent here (B37 task requirement 4/G: diagnostics must be able to
+    // distinguish "endpoint" - see TAG_ENDPOINT_HOST) - a gateway's public IP is already non-secret (committed in
+    // FieldTestAwg31GatewayCatalog/ProductionGatewayCatalog, same posture as its public key) and the candidate name
+    // (GERMANY/STOCKHOLM) already identifies which gateway was used, so withholding the IP added no real protection.
     @Test
     fun `no secrets in serialized diagnostic output`() = runTest {
         val vm = newViewModel(allHandshake = true)
@@ -179,8 +183,18 @@ class FieldTestViewModelTest {
         assertFalse(json.contains(FieldTestIdentity.FIELD_TEST_PRIVATE_KEY_BASE64))
         assertFalse(json.contains(FieldTestIdentity.FIELD_TEST_PUBLIC_KEY_BASE64))
         assertFalse(json.contains(FieldTestIdentity.CLIENT_TUNNEL_ADDRESS_CIDR))
-        assertFalse(json.contains("152.70.43.1"))
-        assertFalse(json.contains("16.170.208.231"))
+        assertFalse(json.contains(FieldTestAwg31Identity.FIELD_TEST_AWG31_PRIVATE_KEY_BASE64))
+        assertFalse(json.contains(FieldTestAwg31Identity.CLIENT_TUNNEL_ADDRESS_CIDR))
+        assertFalse(json.contains(FieldTestAwg31GatewayCatalog.GERMANY.awgProfile.headerProtectionKeyBase64!!))
+        assertFalse(json.contains(FieldTestAwg31GatewayCatalog.STOCKHOLM.awgProfile.headerProtectionKeyBase64!!))
+    }
+
+    // Test A (B37) - a real Connect through this ViewModel's actual wiring reports AWG_3_1, never AWG_LEGACY.
+    @Test
+    fun `B37 A - successful connect reports AWG_3_1 generation, not legacy`() = runTest {
+        val vm = newViewModel(allHandshake = true)
+        vm.connect()
+        assertEquals(AwgGeneration.AWG_3_1, vm.lastReport.value?.awgGeneration)
     }
 
     // Test G - the field-test profile can never be stored as a normal provisioned production profile:

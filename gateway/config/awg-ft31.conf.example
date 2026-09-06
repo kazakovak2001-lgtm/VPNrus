@@ -1,0 +1,42 @@
+# B37 - template only, placeholders, no real secrets. provision-ft31.sh
+# renders the real file to /etc/amnezia/amneziawg/awg-ft31.conf (mode 600,
+# root:root), which is never committed.
+#
+# Isolated AWG 3.1 field-test interface - completely SEPARATE from the
+# production awg0.conf (different interface name, port, subnet, keypair,
+# and this is the ONLY interface HeaderProtectionKey is enabled on - see
+# FieldTestAwg31GatewayCatalog.kt's own docs for why).
+#
+# __SERVER_PRIVATE_KEY__ and __HEADER_PROTECTION_KEY__ are supplied by the
+# operator at deploy time (FT31_SERVER_PRIVATE_KEY / FT31_HEADER_PROTECTION_KEY
+# env vars to provision-ft31.sh) - pre-generated off-VPS this one time only
+# because the Android client must be built with the matching public key
+# BEFORE this interface is ever deployed (see the B37 task report).
+
+[Interface]
+PrivateKey = __SERVER_PRIVATE_KEY__
+Address = __GATEWAY_TUNNEL_IP__/__GATEWAY_TUNNEL_PREFIX__
+ListenPort = __LISTEN_PORT__
+Jc = __AWG_FT31_JC__
+Jmin = __AWG_FT31_JMIN__
+Jmax = __AWG_FT31_JMAX__
+S1 = __AWG_FT31_S1__
+S2 = __AWG_FT31_S2__
+S3 = __AWG_FT31_S3__
+S4 = __AWG_FT31_S4__
+H1 = __AWG_FT31_H1__
+H2 = __AWG_FT31_H2__
+H3 = __AWG_FT31_H3__
+H4 = __AWG_FT31_H4__
+I1 = __AWG_FT31_I1__
+I2 = __AWG_FT31_I2__
+I3 = __AWG_FT31_I3__
+I4 = __AWG_FT31_I4__
+I5 = __AWG_FT31_I5__
+HeaderProtectionKey = __HEADER_PROTECTION_KEY__
+ContentPaddingAddition = __AWG_FT31_CONTENT_PADDING_ADDITION__
+RandomTrailers = __AWG_FT31_RANDOM_TRAILERS__
+DisableCookies = __AWG_FT31_DISABLE_COOKIES__
+
+# --- PEERS BEGIN --- (managed by scripts/add-peer.sh via CONFIG_FILE=awg-ft31.conf; do not hand-edit below this line)
+# --- PEERS END ---

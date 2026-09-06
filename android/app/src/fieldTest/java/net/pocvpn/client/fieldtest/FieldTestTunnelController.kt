@@ -8,6 +8,7 @@ import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
+import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.isFreshHandshake
@@ -50,6 +51,20 @@ class FieldTestTunnelController(
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
     /** Runs only after a fresh handshake is observed - the extra data-plane confidence check (task's own "health/data-plane proof"). Defaults to always-healthy (handshake alone suffices) when no stronger probe is supplied. */
     private val healthCheck: suspend (VpnTransport) -> Boolean = { true },
+    /**
+     * B37 - resolves which [ProductionGatewayDescriptor] (host/port/pubkey/
+     * AWG profile) each candidate actually connects to. Defaults to
+     * [ProductionGatewayCatalog] (the PRE-B37 legacy behavior, on the
+     * shared production `awg0` interface) purely so every pre-existing test
+     * in this file keeps working unchanged; [FieldTestViewModel] overrides
+     * this with [FieldTestAwg31GatewayCatalog]`::byId` for the real B37
+     * field-test build, since that is the ONLY thing that actually changes
+     * which AWG generation gets exercised - never a second copy of the
+     * Frankfurt/Stockholm-first fallback logic below.
+     */
+    private val gatewayLookup: (ProductionGatewayId) -> ProductionGatewayDescriptor = ProductionGatewayCatalog::byId,
+    /** B37 - which AWG generation [gatewayLookup] actually resolves to, purely for diagnostics labeling (see [AwgGeneration]'s own docs) - never affects connection behavior. */
+    private val awgGeneration: AwgGeneration = AwgGeneration.AWG_LEGACY,
 ) {
     private val _state = MutableStateFlow<FieldTestState>(FieldTestState.Idle)
     val state: StateFlow<FieldTestState> = _state.asStateFlow()
@@ -69,8 +84,15 @@ class FieldTestTunnelController(
         for (candidate in candidates) {
             attempted += candidate
             _state.value = FieldTestState.Connecting(candidate)
-            val gateway = ProductionGatewayCatalog.byId(candidate)
-            diagnostics?.recordAttemptStarted(candidate, TransportKind.AMNEZIA_WG)
+            val gateway = gatewayLookup(candidate)
+            diagnostics?.recordAttemptStarted(
+                candidate,
+                TransportKind.AMNEZIA_WG,
+                awgGeneration,
+                gateway.awg.endpointHost,
+                gateway.awg.endpointPort,
+                HANDSHAKE_TIMEOUT_MS,
+            )
 
             val transport = transportFactory(candidate)
             val handshakeOk = try {

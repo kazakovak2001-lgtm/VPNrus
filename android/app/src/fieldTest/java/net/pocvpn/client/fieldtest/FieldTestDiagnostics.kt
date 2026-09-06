@@ -26,7 +26,27 @@ object FieldTestDiagnosticTags {
     const val TAG_SUCCESS = "success"
     const val TAG_ATTEMPTED_COUNT = "attempted_count"
     const val TAG_STAGE = "stage"
+    /** B37 - distinguishes this run's actual AWG generation. Never a private detail: just an enum name, see [AwgGeneration]. */
+    const val TAG_AWG_GENERATION = "awg_generation"
+    /** B37 - the gateway's own public endpoint host, exactly as already committed non-secret in the gateway catalogs (same posture as the gateway's own public key). */
+    const val TAG_ENDPOINT_HOST = "endpoint_host"
+    /** B37 - the UDP port attempted (51820 production `awg0`, 51821 isolated `awg-ft31`) - lets a report distinguish which server-side interface was actually reached. */
+    const val TAG_ENDPOINT_PORT = "endpoint_port"
+    /** B37 - the bounded handshake-wait window this attempt used, in milliseconds (task requirement: diagnostics must be able to distinguish a real timeout from a fake instant success). */
+    const val TAG_HANDSHAKE_TIMEOUT_MS = "handshake_timeout_ms"
 }
+
+/**
+ * B37 - which AmneziaWG parameter generation this field-test run actually
+ * negotiated with. [AWG_3_1] is the ONLY generation [FieldTestTunnelController]
+ * exercises as of B37 (see [FieldTestAwg31GatewayCatalog]) - [AWG_LEGACY] is
+ * kept only as a closed, named alternative so a serialized report's
+ * [FieldTestDiagnosticTags.TAG_AWG_GENERATION] value is self-describing
+ * (task requirement A: "FIELD_TEST_ONLY really selects AWG 3.1, not
+ * legacy AWG" - a report that could only ever say one thing would not
+ * actually prove this).
+ */
+enum class AwgGeneration { AWG_LEGACY, AWG_3_1 }
 
 /**
  * The closed, sanitized failure taxonomy this field test can report -
@@ -82,12 +102,23 @@ class FieldTestDiagnosticsRecorder(
 
     fun recordPermissionDenied() = record(DiagnosticEventType.FIELD_TEST_VPN_PERMISSION_DENIED)
 
-    fun recordAttemptStarted(candidate: ProductionGatewayId, transportKind: TransportKind) {
+    fun recordAttemptStarted(
+        candidate: ProductionGatewayId,
+        transportKind: TransportKind,
+        awgGeneration: AwgGeneration,
+        endpointHost: String,
+        endpointPort: Int,
+        handshakeTimeoutMs: Long,
+    ) {
         record(
             DiagnosticEventType.FIELD_TEST_ATTEMPT_STARTED,
             mapOf(
                 FieldTestDiagnosticTags.TAG_CANDIDATE to candidate.name,
                 FieldTestDiagnosticTags.TAG_TRANSPORT_KIND to transportKind.name,
+                FieldTestDiagnosticTags.TAG_AWG_GENERATION to awgGeneration.name,
+                FieldTestDiagnosticTags.TAG_ENDPOINT_HOST to endpointHost,
+                FieldTestDiagnosticTags.TAG_ENDPOINT_PORT to endpointPort.toString(),
+                FieldTestDiagnosticTags.TAG_HANDSHAKE_TIMEOUT_MS to handshakeTimeoutMs.toString(),
             ),
         )
     }
@@ -160,6 +191,8 @@ data class FieldTestReport(
     val gatewaysAttempted: List<ProductionGatewayId>,
     val finalGateway: ProductionGatewayId?,
     val finalTransportKind: TransportKind?,
+    /** B37 - which AmneziaWG parameter generation this run actually attempted (task requirement: a report must be able to distinguish AWG_3_1 from AWG_LEGACY, not merely say "AmneziaWG"). */
+    val awgGeneration: AwgGeneration,
     val outcome: FieldTestOutcome,
     val failureCategory: FieldTestFailureCategory,
     val events: List<DiagnosticEvent>,
@@ -196,6 +229,7 @@ fun FieldTestReport.toJson(): String {
     root.put("gatewaysAttempted", attemptedArray)
     root.put("finalGateway", finalGateway?.name ?: JSONObject.NULL)
     root.put("finalTransportKind", finalTransportKind?.name ?: JSONObject.NULL)
+    root.put("awgGeneration", awgGeneration.name)
     root.put("outcome", outcome.name)
     root.put("failureCategory", failureCategory.name)
     val eventsArray = JSONArray()

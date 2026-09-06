@@ -10,6 +10,7 @@ import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
+import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.config.TransportConfig
 import org.junit.Assert.assertEquals
@@ -224,5 +225,73 @@ class FieldTestTunnelControllerTest {
         )
         assertEquals(ProductionGatewayId.GERMANY, (result as FieldTestState.Protected).candidate)
         assertTrue("connect() must actually have been called on the real transport", transport.connectCalled)
+    }
+
+    // --- B37: AWG 3.1 generation selection -------------------------------
+
+    // Test A - when wired with FieldTestAwg31GatewayCatalog (the real FieldTestViewModel wiring), diagnostics
+    // report AWG_3_1, the isolated port, and the isolated gateway - never the legacy defaults.
+    @Test
+    fun `B37 A - awg31 gatewayLookup plus awgGeneration records AWG_3_1 with the isolated endpoint-port`() = runTest {
+        val diagnostics = FieldTestDiagnosticsRecorder(nowProvider = { 0L })
+        val controller = FieldTestTunnelController(
+            transportFactory = { FixedFieldTestTransport(shouldHandshake = true) },
+            diagnostics = diagnostics,
+            nowProvider = { 0L },
+            delayMs = { },
+            gatewayLookup = FieldTestAwg31GatewayCatalog::byId,
+            awgGeneration = AwgGeneration.AWG_3_1,
+        )
+        controller.connect()
+        val attempt = diagnostics.snapshot().first { it.type == DiagnosticEventType.FIELD_TEST_ATTEMPT_STARTED }
+        assertEquals(AwgGeneration.AWG_3_1.name, attempt.tags[FieldTestDiagnosticTags.TAG_AWG_GENERATION])
+        assertEquals(FieldTestAwg31GatewayCatalog.FIELD_TEST_PORT.toString(), attempt.tags[FieldTestDiagnosticTags.TAG_ENDPOINT_PORT])
+        assertEquals(FieldTestAwg31GatewayCatalog.GERMANY.awg.endpointHost, attempt.tags[FieldTestDiagnosticTags.TAG_ENDPOINT_HOST])
+    }
+
+    // Test A (negative half) - the default gatewayLookup/awgGeneration (unchanged pre-B37 behavior) records
+    // AWG_LEGACY and the production port - proves the two generations are genuinely distinguishable, not just a label.
+    @Test
+    fun `B37 A - default wiring (no override) records AWG_LEGACY with the production endpoint-port`() = runTest {
+        val diagnostics = FieldTestDiagnosticsRecorder(nowProvider = { 0L })
+        val controller = FieldTestTunnelController(
+            transportFactory = { FixedFieldTestTransport(shouldHandshake = true) },
+            diagnostics = diagnostics,
+            nowProvider = { 0L },
+            delayMs = { },
+        )
+        controller.connect()
+        val attempt = diagnostics.snapshot().first { it.type == DiagnosticEventType.FIELD_TEST_ATTEMPT_STARTED }
+        assertEquals(AwgGeneration.AWG_LEGACY.name, attempt.tags[FieldTestDiagnosticTags.TAG_AWG_GENERATION])
+        assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointPort.toString(), attempt.tags[FieldTestDiagnosticTags.TAG_ENDPOINT_PORT])
+    }
+
+    // Test E - a candidate that never produces a fresh handshake is bounded by exactly
+    // HANDSHAKE_TIMEOUT_MS / HANDSHAKE_POLL_INTERVAL_MS polls - never an instant fake failure/success.
+    @Test
+    fun `E - handshake timeout polls a bounded, real number of times before giving up`() = runTest {
+        var statsCalls = 0
+        val transport = object : VpnTransport {
+            override val name = "poll-count-probe"
+            override val kind = TransportKind.AMNEZIA_WG
+            override val capabilities = TransportCapabilities.amneziaWg()
+            override fun preparePermissionIntent(): Intent? = null
+            override suspend fun connect(config: TransportConfig) {}
+            override suspend fun disconnect() {}
+            override fun observeState() = MutableStateFlow<TransportState>(TransportState.Connected)
+            override suspend fun stats(): TransportStats {
+                statsCalls++
+                return TransportStats.Unavailable
+            }
+        }
+        val controller = FieldTestTunnelController(
+            transportFactory = { transport },
+            candidates = listOf(ProductionGatewayId.GERMANY),
+            nowProvider = { 0L },
+            delayMs = { },
+        )
+        controller.connect()
+        val expectedPolls = (FieldTestTunnelController.HANDSHAKE_TIMEOUT_MS / FieldTestTunnelController.HANDSHAKE_POLL_INTERVAL_MS).toInt() + 1
+        assertEquals("must poll the full bounded window, never fewer (fake early failure) or more (unbounded)", expectedPolls, statsCalls)
     }
 }
