@@ -240,27 +240,60 @@ else
 fi
 rm -rf "$ROOT"
 
-# --- Test: ft31_verify_no_unrelated_change catches a removed/reordered rule
+# --- Regression tests A-F: ft31_verify_no_unrelated_change must be a REAL
+# ordered-subsequence check, not a `grep -Fxf` line-membership filter (the
+# senior-review-found bug: membership-only would keep EVERY POST occurrence
+# of a line whose exact text recurs among genuinely NEW content - braces,
+# "policy accept;", etc are common in an nftables dump - producing a false
+# failure on a perfectly safe additive change, or worse, failing to notice
+# that a duplicate original line was actually removed/changed). Each check
+# below runs against a fixture ($ROOT) purely so run_lib's stub PATH is
+# available - none of these mutate any stub state, they call the verifier
+# directly on hand-built PRE/POST files.
+verify() { run_lib "$(make_fixture frankfurt)" "ft31_verify_no_unrelated_change $1 $2" >/dev/null 2>&1; }
+
+# A. A brace that also recurs in new content must not be mistaken for a
+# removal - PRE's own "}" is still present (the first one), new content
+# (with its own nested braces) is appended after.
 PRE=$(mktemp); POST=$(mktemp)
+printf 'table inet pocvpn {\n    chain forward {\n    }\n}\n' > "$PRE"
+printf 'table inet pocvpn {\n    chain forward {\n    }\n}\ntable inet pocvpn-ft31 {\n    chain postrouting {\n    }\n}\n' > "$POST"
+if verify "$PRE" "$POST"; then pass "A: PRE's own closing braces still present amid new, brace-heavy content -> PASS"; else fail "A: a brace that also recurs in new content must not be mistaken for a removed PRE line"; fi
+
+# B. PRE has a genuine duplicate line, POST adds ANOTHER occurrence of that
+# same text (as new content) - must still PASS, since both original
+# duplicates are still present, in order, and the addition is just extra.
+printf 'accept\naccept\nz\n' > "$PRE"
+printf 'accept\naccept\naccept\nz\n' > "$POST"
+if verify "$PRE" "$POST"; then pass "B: PRE's duplicate lines both still present plus a new extra duplicate -> PASS"; else fail "B: an added duplicate of an already-duplicated PRE line must not be mistaken for a change"; fi
+
+# C. Remove ONE of the two original duplicates - must FAIL (this is exactly
+# what a `grep -Fxf` membership filter would miss: "accept" is still a
+# member of POST, but PRE needed it TWICE and POST only has it once).
+printf 'accept\naccept\nz\n' > "$PRE"
+printf 'accept\nz\n' > "$POST"
+if verify "$PRE" "$POST"; then fail "C: removing one of two original duplicate lines must be caught"; else pass "C: removing one of two original duplicate lines is caught"; fi
+
+# D. Reorder two distinct original rules - must FAIL.
+printf 'rule-A\nrule-B\nrule-C\n' > "$PRE"
+printf 'rule-B\nrule-A\nrule-C\n' > "$POST"
+if verify "$PRE" "$POST"; then fail "D: reordering two distinct original rules must be caught"; else pass "D: reordering two distinct original rules is caught"; fi
+
+# E. Change the text of one original rule - must FAIL.
+printf 'rule-A\nrule-B\nrule-C\n' > "$PRE"
+printf 'rule-A\nrule-B-CHANGED\nrule-C\n' > "$POST"
+if verify "$PRE" "$POST"; then fail "E: changing one original rule's text must be caught"; else pass "E: changing one original rule's text is caught"; fi
+
+# F. Insert arbitrary new rules BETWEEN original rules - must PASS.
+printf 'rule-A\nrule-B\nrule-C\n' > "$PRE"
+printf 'rule-A\nnew-1\nnew-2\nrule-B\nnew-3\nrule-C\n' > "$POST"
+if verify "$PRE" "$POST"; then pass "F: new rules inserted between original rules, order preserved -> PASS"; else fail "F: inserting new rules between original rules must not be flagged"; fi
+
+# Sanity: a plain addition-only change still passes (already-established behavior).
 printf 'a\nb\nc\n' > "$PRE"
 printf 'a\nb\nc\nd\n' > "$POST"
-if run_lib "$(make_fixture frankfurt)" "ft31_verify_no_unrelated_change $PRE $POST" >/dev/null 2>&1; then
-    pass "no-unrelated-change check passes when every pre-existing line survives, in order, plus an addition"
-else
-    fail "an addition-only change must still pass the no-unrelated-change check"
-fi
-printf 'a\nc\n' > "$POST"
-if run_lib "$(make_fixture frankfurt)" "ft31_verify_no_unrelated_change $PRE $POST" >/dev/null 2>&1; then
-    fail "a removed pre-existing rule (b missing) must be caught"
-else
-    pass "no-unrelated-change check catches a removed pre-existing rule"
-fi
-printf 'b\na\nc\n' > "$POST"
-if run_lib "$(make_fixture frankfurt)" "ft31_verify_no_unrelated_change $PRE $POST" >/dev/null 2>&1; then
-    fail "a reordered set of pre-existing rules must be caught"
-else
-    pass "no-unrelated-change check catches reordered pre-existing rules"
-fi
+if verify "$PRE" "$POST"; then pass "sanity: pure addition-only change -> PASS"; else fail "sanity: an addition-only change must still pass"; fi
+
 rm -f "$PRE" "$POST"
 
 echo

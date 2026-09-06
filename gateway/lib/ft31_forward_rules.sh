@@ -26,7 +26,28 @@ FT31_FW_MARKER="b37-ft31"
 # ft31_snapshot_ruleset <host> <out_file>
 # Captures the CURRENT, full forwarding ruleset for the given host's real
 # backend, verbatim - used both as the preflight evidence and as the
-# "before" half of the post-deploy no-unrelated-rule-changed proof.
+# "before"/"after" halves of the post-deploy no-unrelated-rule-changed
+# proof (ft31_verify_no_unrelated_change).
+#
+# Volatile-field audit (senior-review requirement): neither invocation used
+# here includes any field that mutates on its own between two snapshots
+# taken moments apart with no intervening rule change:
+#   - `iptables-save` NEVER includes packet/byte counters in its output
+#     (those only appear with `iptables -L -v`/`-c`, neither used here) -
+#     `iptables-save -t filter` output is pure, deterministic rule-spec
+#     text, byte-for-byte stable across repeated calls when nothing changed.
+#   - `nft list ruleset` (WITHOUT the `-a`/`--handle` flag - deliberately
+#     never passed here, unlike ft31_verify_runtime's own `-a` calls, which
+#     are used only for one-shot inspection, never for a snapshot that gets
+#     diffed) omits rule handles; and none of this repo's own nftables
+#     rules/templates (pocvpn.nft.template, pocvpn-ft31.nft.template, or
+#     the rules ft31_add_forward_rules inserts) declare an explicit
+#     `counter` statement, so no packet/byte counter output appears either.
+# Both snapshots are therefore stable and safe to compare byte-for-byte
+# (via the ordered-subsequence check below) with no canonicalization step
+# needed - and this function must keep NOT passing `-a`/`-c`/`-v` if that
+# stays true; revisit this audit note first if either invocation ever
+# changes.
 ft31_snapshot_ruleset() {
     local host=$1 out_file=$2
     case "$host" in
@@ -144,20 +165,42 @@ ft31_remove_forward_rules() {
 }
 
 # ft31_verify_no_unrelated_change <pre_snapshot_file> <post_snapshot_file>
-# Proves every line present before mutation is STILL present, in the same
-# relative order, after mutation (i.e. nothing removed or reordered - only
-# additions are possible). Dies loudly if that does not hold.
+# Proves PRE occurs as an ORDERED SUBSEQUENCE of POST - i.e. every PRE line,
+# in the same relative order, including duplicates by exact multiplicity and
+# position, still occurs somewhere in POST (insertions anywhere are fine;
+# a removal, a reorder, or a changed line is not). Dies loudly if that does
+# not hold.
+#
+# senior-review correction: the original version of this function used
+# `grep -Fxf pre post | diff pre -` - that is a LINE-MEMBERSHIP filter, not
+# an ordered-subsequence check, and is wrong wherever PRE contains a line
+# whose exact text also appears among the NEW lines POST-only introduces
+# (e.g. a bare `}` closing brace, or "policy accept;" - both common,
+# expected text in an nftables ruleset dump). `grep -Fxf` would keep EVERY
+# such POST occurrence (old and new alike), not just the one that
+# corresponds to the original PRE line, so a purely-additive, perfectly
+# safe change could produce more matching lines than PRE has, making the
+# `diff` fail and reporting a false "unrelated rule removed/reordered"
+# AFTER real mutations (config/peer/NAT/systemd/FORWARD-rule insertion)
+# had already happened - see provision-ft31.sh's own failure/rollback
+# handling for how that specific failure mode is now made safe regardless.
+#
+# This implementation instead does a real sequential single-pass scan:
+# walk POST top to bottom, and whenever the current POST line exactly
+# equals the NEXT still-unconsumed PRE line, advance the PRE pointer.
+# Success requires every PRE line to have been consumed, in order, by the
+# time POST is exhausted - this is the standard subsequence-matching
+# algorithm and handles duplicate lines correctly by construction (each
+# PRE line, duplicate or not, is only ever matched against the POST
+# occurrence reached by the scan at that point, never any other).
 ft31_verify_no_unrelated_change() {
     local pre_file=$1 post_file=$2
-    local filtered
-    filtered=$(mktemp)
-    # Keep only the POST lines that also occur in PRE, in POST's own order -
-    # this is the subsequence PRE must appear as, unchanged, for "nothing
-    # removed or reordered" to hold.
-    grep -Fxf "$pre_file" "$post_file" > "$filtered" || true
-    if ! diff -q "$pre_file" "$filtered" >/dev/null 2>&1; then
-        die "post-deploy verification FAILED: at least one pre-existing firewall rule was removed or reordered relative to the others - see $pre_file vs $post_file (no further B37 action taken; investigate before retrying)"
+    if ! awk '
+        NR == FNR { pre[FNR] = $0; pre_count = FNR; next }
+        { if (idx < pre_count && $0 == pre[idx + 1]) idx++ }
+        END { exit (idx == pre_count) ? 0 : 1 }
+    ' "$pre_file" "$post_file"; then
+        die "post-deploy verification FAILED: at least one pre-existing firewall rule was removed, reordered, or changed relative to the others - see $pre_file vs $post_file (investigate before retrying - see provision-ft31.sh's own failure/rollback handling for what state this invocation itself may have left behind)"
     fi
-    rm -f "$filtered"
-    log "post-deploy verification: every pre-existing rule is still present, in the same relative order - nothing unrelated was removed or reordered"
+    log "post-deploy verification: every pre-existing rule still occurs, in the same relative order (an exact ordered subsequence of the new ruleset) - nothing unrelated was removed, reordered, or changed"
 }

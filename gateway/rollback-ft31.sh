@@ -52,15 +52,14 @@ rm -f /etc/amnezia/amneziawg/.provision-ft31.lock
 
 POST_SNAPSHOT=$(mktemp)
 ft31_snapshot_ruleset "$FT31_HOST" "$POST_SNAPSHOT"
-# Rollback direction: POST must be a SUBSET of PRE (things were removed, not
-# added) with every remaining line in its original relative order - i.e.
-# PRE filtered down to POST's own lines must equal POST verbatim.
-FILTERED=$(mktemp)
-grep -Fxf "$POST_SNAPSHOT" "$PRE_SNAPSHOT" > "$FILTERED" || true
-if ! diff -q "$FILTERED" "$POST_SNAPSHOT" >/dev/null 2>&1; then
-    die "rollback verification FAILED: a rule remains that was not in the pre-rollback ruleset, or ordering changed unexpectedly - see $PRE_SNAPSHOT vs $POST_SNAPSHOT"
-fi
+# Rollback direction is the MIRROR of provision-ft31.sh's own check: POST
+# must be an ordered subsequence of PRE (only removals are expected, in the
+# same relative order, never an addition or reorder) - reuses the SAME real
+# sequential-scan subsequence verifier as provision-ft31.sh (see that
+# function's own docs for why a grep -Fxf line-membership filter is wrong
+# here), just with the two snapshots swapped.
+ft31_verify_no_unrelated_change "$POST_SNAPSHOT" "$PRE_SNAPSHOT"
 log "rollback verification: every remaining rule already existed before rollback, in the same relative order - only b37-ft31 state was removed"
-rm -f "$PRE_SNAPSHOT" "$POST_SNAPSHOT" "$FILTERED"
+rm -f "$PRE_SNAPSHOT" "$POST_SNAPSHOT"
 
 log "done. production awg0/awg-poc.service and every other production firewall rule were never touched by this script."

@@ -62,6 +62,63 @@ command -v awg >/dev/null && command -v awg-quick >/dev/null || \
 EGRESS_IFACE=$(detect_egress_interface)
 [ -n "$EGRESS_IFACE" ] || die "could not detect a default-route egress interface"
 
+# Failure/rollback safety (senior-review requirement 4): each flag below is
+# set to true ONLY once THIS invocation itself creates the corresponding
+# piece of state (never merely reconciles/reapplies state that already
+# existed BEFORE this run - see each flag's own pre-existence check right
+# before it is set). If any later step fails (this script runs under
+# `set -e`, so any failing command triggers this trap on exit), only the
+# state THIS invocation actually created is undone, in the reverse order it
+# was created, before exiting non-zero - a successful EARLIER run's B37
+# state is never touched by a LATER run's failure, and production awg0 is
+# never touched by any path through this trap.
+#
+# Residual limitation, reported rather than hidden: this trap runs on any
+# normal bash error exit (`set -e`, or an explicit `die`), but cannot run
+# if the process is killed uncatchably (`kill -9`, a host power loss, an
+# OOM-kill) mid-script - such an event can still leave partial B37 state.
+# Re-running this same script afterwards is safe (every step here is
+# idempotent/pre-existence-checked) and will either complete the deploy or
+# report the same failure again; `rollback-ft31.sh` remains the manual,
+# always-safe way to fully remove all B37 state regardless of how it was
+# left.
+CREATED_CONFIG=false
+ADDED_PEER=false
+NAT_INSTALLED_THIS_RUN=false
+SERVICE_ENABLED_THIS_RUN=false
+ADDED_FORWARD_RULES=false
+
+ft31_rollback_this_invocation() {
+    local exit_code=$?
+    if [ "$exit_code" -eq 0 ]; then return 0; fi
+    log "provision-ft31.sh FAILED (exit $exit_code) - rolling back ONLY the state THIS invocation itself created (never a prior successful run's B37 state, never awg0)"
+    if [ "$ADDED_FORWARD_RULES" = true ]; then
+        ft31_remove_forward_rules "$FT31_HOST" "$EGRESS_IFACE" || true
+        log "  rolled back: this run's b37-ft31 FORWARD accept rules"
+    fi
+    if [ "$SERVICE_ENABLED_THIS_RUN" = true ]; then
+        systemctl disable --now awg-poc-ft31.service 2>/dev/null || true
+        rm -f /etc/systemd/system/awg-poc-ft31.service
+        systemctl daemon-reload 2>/dev/null || true
+        log "  rolled back: this run's awg-poc-ft31.service"
+    fi
+    if [ "$NAT_INSTALLED_THIS_RUN" = true ]; then
+        nft delete table inet pocvpn-ft31 2>/dev/null || true
+        rm -f /etc/nftables.pocvpn-ft31.conf
+        log "  rolled back: this run's isolated NAT table"
+    fi
+    if [ "$ADDED_PEER" = true ]; then
+        mutate_remove_peer "$FT31_CLIENT_PUBLIC_KEY" 2>/dev/null || true
+        log "  rolled back: this run's field-test peer entry"
+    fi
+    if [ "$CREATED_CONFIG" = true ]; then
+        rm -f "$FT31_CONFIG_PATH"
+        log "  rolled back: this run's freshly-generated awg-ft31.conf (server private key/HeaderProtectionKey discarded, never persisted elsewhere)"
+    fi
+    log "rollback of this invocation's own state complete - no half-deployed B37 state left behind by this run"
+}
+trap ft31_rollback_this_invocation EXIT
+
 log "step 0/5: preflight - verifying $FT31_HOST's live firewall runtime matches its expected production facts"
 ft31_verify_runtime "$FT31_HOST" "$EGRESS_IFACE"
 
@@ -109,6 +166,7 @@ else
     log "Paste it directly into FieldTestAwg31GatewayCatalog.kt's headerProtectionKeyBase64 for this gateway."
     log "Never paste it into chat, a ticket, a commit message, or any log."
     unset FT31_SERVER_PRIVATE_KEY FT31_HEADER_PROTECTION_KEY
+    CREATED_CONFIG=true
 fi
 
 log "step 2/5: field-test peer"
@@ -124,23 +182,39 @@ if grep -qF "PublicKey = $FT31_CLIENT_PUBLIC_KEY" "$FT31_CONFIG_PATH" 2>/dev/nul
     log "field-test peer already present - leaving it untouched"
 else
     mutate_add_peer "$FT31_CLIENT_PUBLIC_KEY" "$FT31_CLIENT_TUNNEL_IP" "field-test-awg31"
+    ADDED_PEER=true
 fi
 
 log "step 3/5: isolated NAT (inet pocvpn-ft31, no forward/filter chain - see this table's own docs)"
+# Pre-existence check BEFORE mutating - `nft -f` below unconditionally
+# (re)declares this table regardless, so whether ITS rollback is safe on a
+# later failure depends on whether it existed before THIS run touched it
+# (see NAT_INSTALLED_THIS_RUN's own docs at the top of this file).
+NAT_PRE_EXISTED=false
+nft list table inet pocvpn-ft31 >/dev/null 2>&1 && NAT_PRE_EXISTED=true
 render_template "$SCRIPT_DIR/nftables/pocvpn-ft31.nft.template" \
     "EGRESS_IFACE=$EGRESS_IFACE" \
     "AWG_FT31_SUBNET=$FT31_SUBNET_CIDR" \
     > /etc/nftables.pocvpn-ft31.conf
 chmod 644 /etc/nftables.pocvpn-ft31.conf
 nft -f /etc/nftables.pocvpn-ft31.conf
+[ "$NAT_PRE_EXISTED" = false ] && NAT_INSTALLED_THIS_RUN=true
 
 log "step 4/5: systemd service"
+SERVICE_PRE_EXISTED=false
+[ -f /etc/systemd/system/awg-poc-ft31.service ] && SERVICE_PRE_EXISTED=true
 install -m 0644 "$SCRIPT_DIR/systemd/awg-poc-ft31.service" /etc/systemd/system/awg-poc-ft31.service
 systemctl daemon-reload
 systemctl enable --now awg-poc-ft31.service
+[ "$SERVICE_PRE_EXISTED" = false ] && SERVICE_ENABLED_THIS_RUN=true
 
 log "step 5/5: FORWARD accept rules in the REAL production forwarding path ($FT31_HOST)"
-ft31_add_forward_rules "$FT31_HOST" "$EGRESS_IFACE"
+if ft31_forward_rules_present "$FT31_HOST" "$EGRESS_IFACE"; then
+    log "b37-ft31 FORWARD rules already present - leaving them untouched"
+else
+    ft31_add_forward_rules "$FT31_HOST" "$EGRESS_IFACE"
+    ADDED_FORWARD_RULES=true
+fi
 
 POST_SNAPSHOT=$(mktemp)
 ft31_snapshot_ruleset "$FT31_HOST" "$POST_SNAPSHOT"
