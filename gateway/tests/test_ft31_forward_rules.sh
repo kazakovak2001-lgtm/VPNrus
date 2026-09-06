@@ -103,8 +103,15 @@ if [ "\$1" = "-a" ] && [ "\$2" = "list" ] && [ "\$3" = "chain" ]; then
     exit 0
 fi
 if [ "\$1" = "insert" ] && [ "\$2" = "rule" ]; then
-    n=\$(( \$(wc -l < "\$ETC/ft31_forward_rules" 2>/dev/null || echo 0) + 1 ))
-    echo "        ... comment \"b37-ft31\" # handle \$n" >> "\$ETC/ft31_forward_rules"
+    # Real nft syntax is always "... forward iifname <V1> oifname <V2> ..." -
+    # \$6/\$7/\$8/\$9 are always "iifname" <V1> "oifname" <V2> regardless of
+    # what follows (accept vs "ct state established,related accept"), same
+    # as the real ft31_add_rule_to_ft31/ft31_add_rule_from_ft31 callers.
+    iif="\$7"; oif="\$9"
+    LAST_HANDLE_FILE="\$ETC/.last_handle"
+    n=\$(( \$(cat "\$LAST_HANDLE_FILE" 2>/dev/null || echo 0) + 1 ))
+    echo "\$n" > "\$LAST_HANDLE_FILE"
+    echo "        iifname \"\$iif\" oifname \"\$oif\" accept comment \"b37-ft31\" # handle \$n" >> "\$ETC/ft31_forward_rules"
     exit 0
 fi
 if [ "\$1" = "delete" ] && [ "\$2" = "rule" ]; then

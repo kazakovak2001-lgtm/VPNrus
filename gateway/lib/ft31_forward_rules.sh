@@ -96,48 +96,137 @@ ft31_verify_runtime() {
     log "runtime verified: --host $host matches its expected, already-live production firewall facts"
 }
 
-# ft31_forward_rules_present <host> <egress_iface>
-# Idempotency probe - true (0) only when BOTH b37-ft31 rules already exist.
-ft31_forward_rules_present() {
+# --- Per-rule granular presence/add/remove (senior-review requirement:
+# transactional ownership must be based on OBSERVED pre-state vs OBSERVED
+# current state per RULE, not on whether a two-command function returned
+# success - `ft31_add_forward_rules` issues TWO separate mutating commands;
+# if the first succeeds and the second fails, the combined function exits
+# non-zero having still changed live state, and a caller that only sets an
+# ownership flag after the WHOLE function returns would wrongly believe
+# nothing was added. Every caller that needs correct rollback ownership
+# (provision-ft31.sh) must observe each rule's presence independently,
+# both before mutating and again on failure, and act only on the
+# per-rule delta - never on the combined function's own exit status.
+
+# ft31_rule_to_ft31_present <host> <egress_iface> - the awg-ft31 -> egress rule.
+ft31_rule_to_ft31_present() {
     local host=$1 egress_iface=$2
     case "$host" in
         frankfurt)
-            iptables -C FORWARD -i awg-ft31 -o "$egress_iface" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null &&
-            iptables -C FORWARD -i "$egress_iface" -o awg-ft31 -m state --state ESTABLISHED,RELATED -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null
+            iptables -C FORWARD -i awg-ft31 -o "$egress_iface" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null
             ;;
         stockholm)
-            local chain_output marker_count
+            local chain_output
             chain_output=$(nft -a list chain inet pocvpn forward 2>/dev/null || true)
-            marker_count=$(printf '%s' "$chain_output" | grep -c "comment \"$FT31_FW_MARKER\"" || true)
-            [ "$marker_count" -eq 2 ]
+            printf '%s' "$chain_output" | grep -qF "iifname \"awg-ft31\" oifname \"$egress_iface\""
             ;;
         *) return 1 ;;
     esac
+}
+
+# ft31_rule_from_ft31_present <host> <egress_iface> - the egress -> awg-ft31 established/related rule.
+ft31_rule_from_ft31_present() {
+    local host=$1 egress_iface=$2
+    case "$host" in
+        frankfurt)
+            iptables -C FORWARD -i "$egress_iface" -o awg-ft31 -m state --state ESTABLISHED,RELATED -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null
+            ;;
+        stockholm)
+            local chain_output
+            chain_output=$(nft -a list chain inet pocvpn forward 2>/dev/null || true)
+            printf '%s' "$chain_output" | grep -qF "iifname \"$egress_iface\" oifname \"awg-ft31\""
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# ft31_add_rule_to_ft31 / ft31_add_rule_from_ft31 <host> <egress_iface>
+# Each inserts exactly ONE rule, idempotently. Kept as single-command-per-
+# call operations deliberately, so a caller tracking per-rule ownership
+# never has to guess which half of a combined function actually landed.
+ft31_add_rule_to_ft31() {
+    local host=$1 egress_iface=$2
+    ft31_rule_to_ft31_present "$host" "$egress_iface" && return 0
+    case "$host" in
+        frankfurt) iptables -I FORWARD 1 -i awg-ft31 -o "$egress_iface" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT ;;
+        stockholm) nft insert rule inet pocvpn forward iifname "awg-ft31" oifname "$egress_iface" accept comment "$FT31_FW_MARKER" ;;
+    esac
+}
+ft31_add_rule_from_ft31() {
+    local host=$1 egress_iface=$2
+    ft31_rule_from_ft31_present "$host" "$egress_iface" && return 0
+    case "$host" in
+        frankfurt) iptables -I FORWARD 1 -i "$egress_iface" -o awg-ft31 -m state --state ESTABLISHED,RELATED -m comment --comment "$FT31_FW_MARKER" -j ACCEPT ;;
+        stockholm) nft insert rule inet pocvpn forward iifname "$egress_iface" oifname "awg-ft31" ct state established,related accept comment "$FT31_FW_MARKER" ;;
+    esac
+}
+
+# ft31_remove_rule_to_ft31 / ft31_remove_rule_from_ft31 <host> <egress_iface>
+# Removes exactly ONE rule (no-op, exit 0, if already absent).
+ft31_remove_rule_to_ft31() {
+    local host=$1 egress_iface=$2
+    case "$host" in
+        frankfurt)
+            iptables -D FORWARD -i awg-ft31 -o "$egress_iface" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null || true
+            ;;
+        stockholm)
+            local h
+            h=$(_ft31_handle_for_rule "$egress_iface" "\"awg-ft31\" oifname \"$egress_iface\"")
+            [ -n "$h" ] && nft delete rule inet pocvpn forward handle "$h" 2>/dev/null || true
+            ;;
+    esac
+}
+ft31_remove_rule_from_ft31() {
+    local host=$1 egress_iface=$2
+    case "$host" in
+        frankfurt)
+            iptables -D FORWARD -i "$egress_iface" -o awg-ft31 -m state --state ESTABLISHED,RELATED -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null || true
+            ;;
+        stockholm)
+            local h
+            h=$(_ft31_handle_for_rule "$egress_iface" "\"$egress_iface\" oifname \"awg-ft31\"")
+            [ -n "$h" ] && nft delete rule inet pocvpn forward handle "$h" 2>/dev/null || true
+            ;;
+    esac
+}
+
+# _ft31_handle_for_rule <egress_iface> <iifname/oifname substring> - internal,
+# Stockholm-only helper: finds the nft rule handle for the b37-ft31 rule
+# whose iifname/oifname text matches, without assuming it is the only
+# b37-ft31-tagged rule present (a partial-failure state may have only one
+# of the two rules, or the other rule from an unrelated direction).
+_ft31_handle_for_rule() {
+    local egress_iface=$1 iface_pattern=$2
+    local chain_output
+    chain_output=$(nft -a list chain inet pocvpn forward 2>/dev/null || true)
+    printf '%s' "$chain_output" | grep -F "iifname $iface_pattern" | grep -F "comment \"$FT31_FW_MARKER\"" | sed -n 's/.*# handle \([0-9]\+\).*/\1/p' | head -1
+}
+
+# ft31_forward_rules_present <host> <egress_iface>
+# Idempotency probe - true (0) only when BOTH b37-ft31 rules already exist.
+# Kept for rollback-ft31.sh's own full-teardown use (that script's job is
+# unconditional removal regardless of provenance, not partial-failure
+# reconciliation) - provision-ft31.sh's own trap uses the per-rule
+# functions above instead, precisely so a partial two-rule failure is
+# tracked correctly (see this file's own top-level docs on that point).
+ft31_forward_rules_present() {
+    local host=$1 egress_iface=$2
+    ft31_rule_to_ft31_present "$host" "$egress_iface" && ft31_rule_from_ft31_present "$host" "$egress_iface"
 }
 
 # ft31_add_forward_rules <host> <egress_iface>
 # Adds EXACTLY two narrowly-scoped accept rules (awg-ft31 -> egress, and
 # egress -> awg-ft31 established/related) into the host's REAL production
 # forwarding path. Idempotent - a rerun with the rules already present is
-# a no-op, never a duplicate insert.
+# a no-op, never a duplicate insert. Kept as a convenience wrapper for
+# rollback-ft31.sh/tests that want "both rules" as one call - see the
+# per-rule functions above for callers that need correct partial-failure
+# rollback ownership.
 ft31_add_forward_rules() {
     local host=$1 egress_iface=$2
-    if ft31_forward_rules_present "$host" "$egress_iface"; then
-        log "b37-ft31 forward rules already present on $host - leaving them untouched"
-        return 0
-    fi
-    case "$host" in
-        frankfurt)
-            iptables -I FORWARD 1 -i "$egress_iface" -o awg-ft31 -m state --state ESTABLISHED,RELATED -m comment --comment "$FT31_FW_MARKER" -j ACCEPT
-            iptables -I FORWARD 1 -i awg-ft31 -o "$egress_iface" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT
-            log "inserted 2 b37-ft31 ACCEPT rules at the top of FORWARD (iptables-nft) - every existing rule, including the final REJECT/DROP, is otherwise unchanged and unmoved in relative order"
-            ;;
-        stockholm)
-            nft insert rule inet pocvpn forward iifname "awg-ft31" oifname "$egress_iface" accept comment "$FT31_FW_MARKER"
-            nft insert rule inet pocvpn forward iifname "$egress_iface" oifname "awg-ft31" ct state established,related accept comment "$FT31_FW_MARKER"
-            log "inserted 2 b37-ft31 ACCEPT rules into the existing 'inet pocvpn forward' chain - policy remains drop, every other rule is otherwise unchanged"
-            ;;
-    esac
+    ft31_add_rule_to_ft31 "$host" "$egress_iface"
+    ft31_add_rule_from_ft31 "$host" "$egress_iface"
+    log "b37-ft31 FORWARD accept rules present on $host (production egress: $egress_iface) - every pre-existing rule is otherwise unchanged"
 }
 
 # ft31_remove_forward_rules <host> <egress_iface>
@@ -146,22 +235,9 @@ ft31_add_forward_rules() {
 # the rules are already absent (no-op).
 ft31_remove_forward_rules() {
     local host=$1 egress_iface=$2
-    case "$host" in
-        frankfurt)
-            iptables -D FORWARD -i awg-ft31 -o "$egress_iface" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null || true
-            iptables -D FORWARD -i "$egress_iface" -o awg-ft31 -m state --state ESTABLISHED,RELATED -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null || true
-            log "removed b37-ft31 FORWARD rules (if present) - every other FORWARD rule is untouched"
-            ;;
-        stockholm)
-            local handle chain_output handles
-            chain_output=$(nft -a list chain inet pocvpn forward 2>/dev/null || true)
-            handles=$(printf '%s' "$chain_output" | grep -F "comment \"$FT31_FW_MARKER\"" | sed -n 's/.*# handle \([0-9]\+\).*/\1/p')
-            for handle in $handles; do
-                nft delete rule inet pocvpn forward handle "$handle" 2>/dev/null || true
-            done
-            log "removed b37-ft31 FORWARD rules (if present) - the 'inet pocvpn forward' chain and every other rule in it are otherwise untouched"
-            ;;
-    esac
+    ft31_remove_rule_to_ft31 "$host" "$egress_iface"
+    ft31_remove_rule_from_ft31 "$host" "$egress_iface"
+    log "removed b37-ft31 FORWARD rules (if present) - every other FORWARD rule is untouched"
 }
 
 # ft31_verify_no_unrelated_change <pre_snapshot_file> <post_snapshot_file>

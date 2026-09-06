@@ -21,6 +21,21 @@
 #   HeaderProtectionKey yourself, directly from this server's own config
 #   file, for pasting into the Android build (never through this script,
 #   never through a chat/ticket/log).
+#
+# Transactional ownership model (senior-review requirement - read before
+# touching the trap below): ownership of what to roll back on failure is
+# decided by OBSERVING live state, twice - once BEFORE any mutation begins
+# (captured into the FT31_PRE_* variables below), and again INSIDE the trap
+# if something fails (the FT31_PRE_* variables are compared against
+# freshly re-observed CURRENT state at that moment). This is deliberately
+# NOT "set a flag to true after each mutating command returns success" -
+# several of the steps below issue MORE THAN ONE mutating command (most
+# notably the two separate FORWARD-rule inserts), so a command can partially
+# succeed and then the overall step can still fail; a flag set only after
+# the WHOLE step returns would then wrongly believe nothing happened and
+# leave the first, already-applied half behind. Observing actual state
+# before and (again) after is correct regardless of exactly which command
+# inside a step failed, or how many of them ran.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,70 +69,42 @@ FT31_SUBNET_CIDR=10.77.31.0/24
 FT31_GATEWAY_TUNNEL_IP=10.77.31.1
 FT31_GATEWAY_TUNNEL_PREFIX=24
 
+# Test-only path overrides (senior-review requirement: failure-injection
+# tests must exercise THIS actual script, not a reimplementation of its
+# logic - these absolute system paths are the only thing standing in the
+# way of running it against an isolated temp root). Every var defaults to
+# the exact real production path when unset, so normal/real invocations are
+# completely unaffected - `FT31_TEST_*` is deliberately named to make clear
+# these are never meant to be set outside a test harness.
+CONFIG_DIR="${FT31_TEST_CONFIG_DIR:-/etc/amnezia/amneziawg}"
+IP_FORWARD_PROC="${FT31_TEST_IP_FORWARD_PROC:-/proc/sys/net/ipv4/ip_forward}"
+SYSTEMD_UNIT_DIR="${FT31_TEST_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+NFTABLES_CONF_PATH="${FT31_TEST_NFTABLES_CONF_PATH:-/etc/nftables.pocvpn-ft31.conf}"
+FT31_SERVICE_UNIT_PATH="$SYSTEMD_UNIT_DIR/awg-poc-ft31.service"
+FT31_CONFIG_PATH="$CONFIG_DIR/$FT31_CONFIG_FILE"
+
 command -v awg >/dev/null && command -v awg-quick >/dev/null || \
     die "amneziawg-tools not found - run provision.sh (production awg0) on this host first"
-[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = "1" ] || \
+[ "$(cat "$IP_FORWARD_PROC" 2>/dev/null || echo 0)" = "1" ] || \
     die "IPv4 forwarding is not enabled - run provision.sh (production awg0) on this host first"
 
 EGRESS_IFACE=$(detect_egress_interface)
 [ -n "$EGRESS_IFACE" ] || die "could not detect a default-route egress interface"
 
-# Failure/rollback safety (senior-review requirement 4): each flag below is
-# set to true ONLY once THIS invocation itself creates the corresponding
-# piece of state (never merely reconciles/reapplies state that already
-# existed BEFORE this run - see each flag's own pre-existence check right
-# before it is set). If any later step fails (this script runs under
-# `set -e`, so any failing command triggers this trap on exit), only the
-# state THIS invocation actually created is undone, in the reverse order it
-# was created, before exiting non-zero - a successful EARLIER run's B37
-# state is never touched by a LATER run's failure, and production awg0 is
-# never touched by any path through this trap.
-#
-# Residual limitation, reported rather than hidden: this trap runs on any
-# normal bash error exit (`set -e`, or an explicit `die`), but cannot run
-# if the process is killed uncatchably (`kill -9`, a host power loss, an
-# OOM-kill) mid-script - such an event can still leave partial B37 state.
-# Re-running this same script afterwards is safe (every step here is
-# idempotent/pre-existence-checked) and will either complete the deploy or
-# report the same failure again; `rollback-ft31.sh` remains the manual,
-# always-safe way to fully remove all B37 state regardless of how it was
-# left.
-CREATED_CONFIG=false
-ADDED_PEER=false
-NAT_INSTALLED_THIS_RUN=false
-SERVICE_ENABLED_THIS_RUN=false
-ADDED_FORWARD_RULES=false
-
-ft31_rollback_this_invocation() {
-    local exit_code=$?
-    if [ "$exit_code" -eq 0 ]; then return 0; fi
-    log "provision-ft31.sh FAILED (exit $exit_code) - rolling back ONLY the state THIS invocation itself created (never a prior successful run's B37 state, never awg0)"
-    if [ "$ADDED_FORWARD_RULES" = true ]; then
-        ft31_remove_forward_rules "$FT31_HOST" "$EGRESS_IFACE" || true
-        log "  rolled back: this run's b37-ft31 FORWARD accept rules"
-    fi
-    if [ "$SERVICE_ENABLED_THIS_RUN" = true ]; then
-        systemctl disable --now awg-poc-ft31.service 2>/dev/null || true
-        rm -f /etc/systemd/system/awg-poc-ft31.service
-        systemctl daemon-reload 2>/dev/null || true
-        log "  rolled back: this run's awg-poc-ft31.service"
-    fi
-    if [ "$NAT_INSTALLED_THIS_RUN" = true ]; then
-        nft delete table inet pocvpn-ft31 2>/dev/null || true
-        rm -f /etc/nftables.pocvpn-ft31.conf
-        log "  rolled back: this run's isolated NAT table"
-    fi
-    if [ "$ADDED_PEER" = true ]; then
-        mutate_remove_peer "$FT31_CLIENT_PUBLIC_KEY" 2>/dev/null || true
-        log "  rolled back: this run's field-test peer entry"
-    fi
-    if [ "$CREATED_CONFIG" = true ]; then
-        rm -f "$FT31_CONFIG_PATH"
-        log "  rolled back: this run's freshly-generated awg-ft31.conf (server private key/HeaderProtectionKey discarded, never persisted elsewhere)"
-    fi
-    log "rollback of this invocation's own state complete - no half-deployed B37 state left behind by this run"
+# Test-only failure-injection hooks (senior-review requirement: prove the
+# trap's rollback ownership is based on OBSERVED state, not on whether a
+# step's own command happened to return success - each hook below fires
+# ONLY when its named env var is explicitly set, which a real invocation
+# never does; every hook is a no-op by default). Each is placed right
+# after the state-changing action it names, simulating "this step's own
+# mutation actually landed, but something failed before the step as a
+# whole would have returned success" - exactly the class of partial
+# failure a plain "set a flag after the command returns" model gets wrong.
+_ft31_test_fail_if() {
+    local var_name=$1
+    local value="${!var_name:-}"
+    [ -z "$value" ] || die "test-injected failure via $var_name (failure-injection test only - never set outside a test harness)"
 }
-trap ft31_rollback_this_invocation EXIT
 
 log "step 0/5: preflight - verifying $FT31_HOST's live firewall runtime matches its expected production facts"
 ft31_verify_runtime "$FT31_HOST" "$EGRESS_IFACE"
@@ -126,11 +113,132 @@ PRE_SNAPSHOT=$(mktemp)
 ft31_snapshot_ruleset "$FT31_HOST" "$PRE_SNAPSHOT"
 log "captured pre-mutation firewall snapshot ($PRE_SNAPSHOT) for the post-deploy no-unrelated-change proof"
 
+# --- Observe EVERY B37-relevant pre-state, BEFORE any mutation below ------
+# (senior-review requirement 1-5: ownership of what the trap rolls back is
+# decided from these observations vs a second observation taken again
+# inside the trap, never from "did the mutating command return success").
+FT31_PRE_CONFIG_EXISTS=false
+[ -f "$FT31_CONFIG_PATH" ] && FT31_PRE_CONFIG_EXISTS=true
+
+FT31_PRE_PEER_EXISTS=false
+if [ "$FT31_PRE_CONFIG_EXISTS" = true ] && grep -qF "PublicKey = $FT31_CLIENT_PUBLIC_KEY" "$FT31_CONFIG_PATH" 2>/dev/null; then
+    FT31_PRE_PEER_EXISTS=true
+fi
+
+FT31_PRE_NAT_EXISTS=false
+nft list table inet pocvpn-ft31 >/dev/null 2>&1 && FT31_PRE_NAT_EXISTS=true
+
+FT31_PRE_SERVICE_FILE_EXISTS=false
+[ -f "$FT31_SERVICE_UNIT_PATH" ] && FT31_PRE_SERVICE_FILE_EXISTS=true
+FT31_PRE_SERVICE_ENABLED=false
+systemctl is-enabled awg-poc-ft31.service >/dev/null 2>&1 && FT31_PRE_SERVICE_ENABLED=true
+FT31_PRE_SERVICE_ACTIVE=false
+systemctl is-active awg-poc-ft31.service >/dev/null 2>&1 && FT31_PRE_SERVICE_ACTIVE=true
+
+FT31_PRE_RULE_TO_FT31_EXISTS=false
+ft31_rule_to_ft31_present "$FT31_HOST" "$EGRESS_IFACE" && FT31_PRE_RULE_TO_FT31_EXISTS=true
+FT31_PRE_RULE_FROM_FT31_EXISTS=false
+ft31_rule_from_ft31_present "$FT31_HOST" "$EGRESS_IFACE" && FT31_PRE_RULE_FROM_FT31_EXISTS=true
+
+log "pre-mutation B37 state observed: config=$FT31_PRE_CONFIG_EXISTS peer=$FT31_PRE_PEER_EXISTS nat=$FT31_PRE_NAT_EXISTS service_file=$FT31_PRE_SERVICE_FILE_EXISTS service_enabled=$FT31_PRE_SERVICE_ENABLED service_active=$FT31_PRE_SERVICE_ACTIVE rule_to=$FT31_PRE_RULE_TO_FT31_EXISTS rule_from=$FT31_PRE_RULE_FROM_FT31_EXISTS"
+
+# --- Failure trap: re-observes CURRENT state and reconciles it back to ----
+# the pre-mutation observations above - never removes anything that was
+# already there before this invocation started, regardless of which
+# individual command inside a step actually failed.
+#
+# Residual limitation, reported rather than hidden: this trap runs on any
+# normal bash error exit (`set -e`, or an explicit `die`), but cannot run
+# if the process is killed uncatchably (`kill -9`, a host power loss, an
+# OOM-kill) mid-script - such an event can still leave partial B37 state.
+# Re-running this same script afterwards is safe (every step is
+# idempotent/pre-existence-checked) and will either complete the deploy or
+# report the same failure again; `rollback-ft31.sh` remains the manual,
+# always-safe way to fully remove all B37 state regardless of how it was
+# left.
+ft31_rollback_this_invocation() {
+    local exit_code=$?
+    if [ "$exit_code" -eq 0 ]; then return 0; fi
+    log "provision-ft31.sh FAILED (exit $exit_code) - reconciling live state back to what existed before this invocation (never touching state that already existed, never touching awg0)"
+
+    # FORWARD rules - each of the two rules is reconciled INDEPENDENTLY, so
+    # a partial failure (one inserted, the other not) is handled correctly.
+    if [ "$FT31_PRE_RULE_TO_FT31_EXISTS" = false ] && ft31_rule_to_ft31_present "$FT31_HOST" "$EGRESS_IFACE"; then
+        ft31_remove_rule_to_ft31 "$FT31_HOST" "$EGRESS_IFACE"
+        log "  rolled back: awg-ft31 -> egress FORWARD rule (did not exist before this run)"
+    fi
+    if [ "$FT31_PRE_RULE_FROM_FT31_EXISTS" = false ] && ft31_rule_from_ft31_present "$FT31_HOST" "$EGRESS_IFACE"; then
+        ft31_remove_rule_from_ft31 "$FT31_HOST" "$EGRESS_IFACE"
+        log "  rolled back: egress -> awg-ft31 FORWARD rule (did not exist before this run)"
+    fi
+
+    # systemd - reconcile file existence, enabled, and active state
+    # independently; `systemctl enable --now` is not assumed atomic.
+    local now_service_active=false now_service_enabled=false now_service_file_exists=false
+    [ -f "$FT31_SERVICE_UNIT_PATH" ] && now_service_file_exists=true
+    systemctl is-enabled awg-poc-ft31.service >/dev/null 2>&1 && now_service_enabled=true
+    systemctl is-active awg-poc-ft31.service >/dev/null 2>&1 && now_service_active=true
+
+    if [ "$FT31_PRE_SERVICE_FILE_EXISTS" = false ]; then
+        # Did not exist before -> fully tear down whatever exists now.
+        if [ "$now_service_active" = true ] || [ "$now_service_enabled" = true ] || [ "$now_service_file_exists" = true ]; then
+            systemctl disable --now awg-poc-ft31.service 2>/dev/null || true
+            rm -f "$FT31_SERVICE_UNIT_PATH"
+            systemctl daemon-reload 2>/dev/null || true
+            log "  rolled back: awg-poc-ft31.service (unit file did not exist before this run)"
+        fi
+    else
+        # Existed before - restore the EXACT enabled/active combination it
+        # had, never remove the unit file itself.
+        if [ "$FT31_PRE_SERVICE_ACTIVE" = true ] && [ "$now_service_active" = false ]; then
+            systemctl start awg-poc-ft31.service 2>/dev/null || true
+            log "  restored: awg-poc-ft31.service active state (was active before this run)"
+        elif [ "$FT31_PRE_SERVICE_ACTIVE" = false ] && [ "$now_service_active" = true ]; then
+            systemctl stop awg-poc-ft31.service 2>/dev/null || true
+            log "  restored: awg-poc-ft31.service inactive state (was inactive before this run)"
+        fi
+        if [ "$FT31_PRE_SERVICE_ENABLED" = true ] && [ "$now_service_enabled" = false ]; then
+            systemctl enable awg-poc-ft31.service 2>/dev/null || true
+            log "  restored: awg-poc-ft31.service enabled state (was enabled before this run)"
+        elif [ "$FT31_PRE_SERVICE_ENABLED" = false ] && [ "$now_service_enabled" = true ]; then
+            systemctl disable awg-poc-ft31.service 2>/dev/null || true
+            log "  restored: awg-poc-ft31.service disabled state (was disabled before this run)"
+        fi
+    fi
+
+    # NAT - remove only if it did not exist before AND exists now,
+    # regardless of whether `nft -f` itself reported success or failure.
+    if [ "$FT31_PRE_NAT_EXISTS" = false ] && nft list table inet pocvpn-ft31 >/dev/null 2>&1; then
+        nft delete table inet pocvpn-ft31 2>/dev/null || true
+        rm -f "$NFTABLES_CONF_PATH"
+        log "  rolled back: isolated NAT table (did not exist before this run)"
+    fi
+
+    # Peer - remove only if it did not exist before AND exists now. Must
+    # happen BEFORE the config-file removal below (removing a peer requires
+    # the config file it lives in to still exist).
+    if [ "$FT31_PRE_PEER_EXISTS" = false ] && [ -f "$FT31_CONFIG_PATH" ] && grep -qF "PublicKey = $FT31_CLIENT_PUBLIC_KEY" "$FT31_CONFIG_PATH" 2>/dev/null; then
+        CONFIG_FILE=$FT31_CONFIG_FILE
+        INTERFACE_NAME=$FT31_INTERFACE_NAME
+        mutate_remove_peer "$FT31_CLIENT_PUBLIC_KEY" 2>/dev/null || true
+        log "  rolled back: this run's field-test peer entry (did not exist before this run)"
+    fi
+
+    # Config file - remove only if it did not exist before AND exists now
+    # (covers a render/chmod/chown failure partway through creating it,
+    # not merely "the whole step returned non-zero").
+    if [ "$FT31_PRE_CONFIG_EXISTS" = false ] && [ -f "$FT31_CONFIG_PATH" ]; then
+        rm -f "$FT31_CONFIG_PATH"
+        log "  rolled back: this run's freshly-generated awg-ft31.conf (did not exist before this run; server private key/HeaderProtectionKey discarded, never persisted elsewhere)"
+    fi
+
+    log "rollback of this invocation's own state complete - no half-deployed B37 state left behind by this run, no pre-existing B37 state touched"
+}
+trap ft31_rollback_this_invocation EXIT
+
 log "step 1/5: isolated awg-ft31 interface config"
-CONFIG_DIR=/etc/amnezia/amneziawg
-FT31_CONFIG_PATH="$CONFIG_DIR/$FT31_CONFIG_FILE"
 install -d -m 0700 "$CONFIG_DIR"
-if [ -f "$FT31_CONFIG_PATH" ]; then
+if [ "$FT31_PRE_CONFIG_EXISTS" = true ]; then
     log "existing config found at $FT31_CONFIG_PATH - leaving server identity/HeaderProtectionKey untouched"
 else
     # Generated HERE, on this host, via `awg genkey` - held only in shell
@@ -158,6 +266,7 @@ else
         > "$FT31_CONFIG_PATH"
     chmod 600 "$FT31_CONFIG_PATH"
     chown root:root "$FT31_CONFIG_PATH"
+    _ft31_test_fail_if FT31_TEST_FAIL_AFTER_CONFIG
 
     log "server public key (safe to share/paste into FieldTestAwg31GatewayCatalog.kt): $FT31_SERVER_PUBLIC_KEY"
     log "HeaderProtectionKey is NOT printed here (secret, shared-key material)."
@@ -166,7 +275,6 @@ else
     log "Paste it directly into FieldTestAwg31GatewayCatalog.kt's headerProtectionKeyBase64 for this gateway."
     log "Never paste it into chat, a ticket, a commit message, or any log."
     unset FT31_SERVER_PRIVATE_KEY FT31_HEADER_PROTECTION_KEY
-    CREATED_CONFIG=true
 fi
 
 log "step 2/5: field-test peer"
@@ -178,43 +286,44 @@ ip_in_cidr "$FT31_CLIENT_TUNNEL_IP" "$AWG_SUBNET_CIDR" || die "$FT31_CLIENT_TUNN
 LOCK_FILE="$CONFIG_DIR/.provision-ft31.lock"
 exec 9>"$LOCK_FILE"
 flock -x 9
-if grep -qF "PublicKey = $FT31_CLIENT_PUBLIC_KEY" "$FT31_CONFIG_PATH" 2>/dev/null; then
+if [ "$FT31_PRE_PEER_EXISTS" = true ]; then
     log "field-test peer already present - leaving it untouched"
 else
     mutate_add_peer "$FT31_CLIENT_PUBLIC_KEY" "$FT31_CLIENT_TUNNEL_IP" "field-test-awg31"
-    ADDED_PEER=true
+    # CRITICAL: mutate_add_peer (lib/peer_mutations.sh) sets its own
+    # `trap ... EXIT` internally for its own tmp-file cleanup, then clears
+    # it with `trap - EXIT` once it succeeds - bash traps are GLOBAL to the
+    # shell, not scoped to the function that set them, so that silently
+    # wipes out ft31_rollback_this_invocation's own registration too. Every
+    # call to mutate_add_peer/mutate_remove_peer in this script MUST be
+    # followed by re-registering our own trap, or a failure anywhere AFTER
+    # that call would roll back NOTHING at all - found by this file's own
+    # failure-injection integration tests (test E originally exposed this:
+    # the trap never even ran after a post-peer-add failure).
+    trap ft31_rollback_this_invocation EXIT
 fi
+_ft31_test_fail_if FT31_TEST_FAIL_AFTER_PEER
 
 log "step 3/5: isolated NAT (inet pocvpn-ft31, no forward/filter chain - see this table's own docs)"
-# Pre-existence check BEFORE mutating - `nft -f` below unconditionally
-# (re)declares this table regardless, so whether ITS rollback is safe on a
-# later failure depends on whether it existed before THIS run touched it
-# (see NAT_INSTALLED_THIS_RUN's own docs at the top of this file).
-NAT_PRE_EXISTED=false
-nft list table inet pocvpn-ft31 >/dev/null 2>&1 && NAT_PRE_EXISTED=true
 render_template "$SCRIPT_DIR/nftables/pocvpn-ft31.nft.template" \
     "EGRESS_IFACE=$EGRESS_IFACE" \
     "AWG_FT31_SUBNET=$FT31_SUBNET_CIDR" \
-    > /etc/nftables.pocvpn-ft31.conf
-chmod 644 /etc/nftables.pocvpn-ft31.conf
-nft -f /etc/nftables.pocvpn-ft31.conf
-[ "$NAT_PRE_EXISTED" = false ] && NAT_INSTALLED_THIS_RUN=true
+    > "$NFTABLES_CONF_PATH"
+chmod 644 "$NFTABLES_CONF_PATH"
+nft -f "$NFTABLES_CONF_PATH"
+_ft31_test_fail_if FT31_TEST_FAIL_AFTER_NAT
 
 log "step 4/5: systemd service"
-SERVICE_PRE_EXISTED=false
-[ -f /etc/systemd/system/awg-poc-ft31.service ] && SERVICE_PRE_EXISTED=true
-install -m 0644 "$SCRIPT_DIR/systemd/awg-poc-ft31.service" /etc/systemd/system/awg-poc-ft31.service
+install -m 0644 "$SCRIPT_DIR/systemd/awg-poc-ft31.service" "$FT31_SERVICE_UNIT_PATH"
 systemctl daemon-reload
 systemctl enable --now awg-poc-ft31.service
-[ "$SERVICE_PRE_EXISTED" = false ] && SERVICE_ENABLED_THIS_RUN=true
+_ft31_test_fail_if FT31_TEST_FAIL_AFTER_SERVICE
 
 log "step 5/5: FORWARD accept rules in the REAL production forwarding path ($FT31_HOST)"
-if ft31_forward_rules_present "$FT31_HOST" "$EGRESS_IFACE"; then
-    log "b37-ft31 FORWARD rules already present - leaving them untouched"
-else
-    ft31_add_forward_rules "$FT31_HOST" "$EGRESS_IFACE"
-    ADDED_FORWARD_RULES=true
-fi
+ft31_add_rule_to_ft31 "$FT31_HOST" "$EGRESS_IFACE"
+_ft31_test_fail_if FT31_TEST_FAIL_AFTER_FIRST_FORWARD_RULE
+ft31_add_rule_from_ft31 "$FT31_HOST" "$EGRESS_IFACE"
+log "b37-ft31 FORWARD accept rules present on $FT31_HOST"
 
 POST_SNAPSHOT=$(mktemp)
 ft31_snapshot_ruleset "$FT31_HOST" "$POST_SNAPSHOT"
