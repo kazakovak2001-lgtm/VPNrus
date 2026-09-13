@@ -28,7 +28,7 @@ classification `UNKNOWN` until stronger evidence is available.
   synchronized target-specific server capture.
 - Later synchronized v2 attempts ended with `NO_HANDSHAKE` for both gateways.
   At Frankfurt, an outer-interface capture matched each report's attempt
-  time and showed eight incoming UDP 51821 packets, no outgoing response,
+  time and showed incoming UDP 51821 records, no outgoing response,
   and no new `awg-ft31` peer handshake. An inner-interface capture during
   the last attempt saw zero packets for the three TCP probe targets, as
   expected without a handshake. The UDP socket was listening, the INPUT
@@ -38,15 +38,55 @@ classification `UNKNOWN` until stronger evidence is available.
 - A local Android phone running the same v2 APK reached `Protected`; the
   Frankfurt peer recorded a matching fresh handshake and bidirectional UDP
   data. Its test app was then disconnected and force-stopped before the final
-  Russian attempt, which still failed. This rules out an active local test
-  app as the explanation for that attempt, but does not establish a cause
-  in the Russian network.
+  Russian attempt, which still failed. This excludes concurrent traffic from
+  that local app, but DOES NOT exclude persistent per-peer handshake replay
+  state left by the earlier local connection (see below).
 
 Do not label B37 merge-ready or claim AWG 3.1 bypasses Russian restrictions
 from these reports. A next controlled test should record the server's reason
 for accepting or rejecting the initiation, then capture the three VPN-bound
 targets if a handshake completes. `INTERNET_NOT_VALIDATED`/`UNKNOWN` in the
 reports do not by themselves identify carrier filtering or DPI.
+
+### Process-level diagnostic preparation (2026-09-13)
+
+Read-only inspection of Frankfurt found RX checksumming and generic receive
+offload (GRO) enabled, with zero kernel UDP `InCsumErrors` and `InErrors`.
+Consequently, the eight tcpdump records observed in earlier attempts must
+not be treated as eight original wire datagrams; coalescing can affect
+lengths and checksum annotations. A tcpdump `bad udp cksum` annotation alone
+does not establish corruption or a kernel drop. The installed AWG source's
+`conn/bind_std.go` explicitly splits coalesced receive messages.
+
+The installed AWG source at `cf9d2dd202821301f7039093b0a1b3d4b574c47c`
+provides useful verbose log categories in `device/receive.go` and
+`device/noise-protocol.go`: unknown message type, invalid MAC1, invalid
+initiation, handshake replay/flood, and accepted initiation/response.
+Unknown types are expected for intentional junk packets; their presence
+alone is not a failure diagnosis.
+
+Both test installations currently share the same peer private key. The
+server retains a last-accepted initiation timestamp PER PEER and rejects a
+non-newer timestamp. Disconnecting or force-stopping the other phone does
+not clear this state. Clock differences between the phones are therefore an
+unresolved confounder. Compare phone/server clocks and avoid alternating
+devices with this shared identity when testing; distinct provisioned test
+identities are preferable for independent controls.
+
+The next measurement must use `awg-poc-ft31.service` (the actual Frankfurt
+unit, not `awg-quick@awg-ft31`). `LOG_LEVEL=verbose` is read at process startup;
+enabling it requires restarting ONLY this isolated test service. Verify
+normalized runtime/disk AWG configuration equality without printing keys,
+preserve the interface MTU, and schedule automatic restoration before
+enabling a temporary runtime systemd drop-in. Match report times to sanitized
+log categories and capture target-specific TCP metadata only if the handshake
+completes. A service restart also resets peer replay/session state, so any
+improvement after restart must not be attributed solely to networking.
+
+This diagnostic logging setup was verified locally on the server and then
+restored because the remote tester was unavailable. No Russian attempt was
+performed with verbose logging during that window; no process-level rejection
+reason has yet been established.
 
 ## Why
 
