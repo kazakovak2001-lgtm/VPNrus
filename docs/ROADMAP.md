@@ -290,7 +290,11 @@ TCP data-plane probe is required for `Protected`. The report records each
 probe target and keeps handshake success distinct from health failure. The
 v2 APK explicitly binds every probe socket to its own VPN Network and fails
 closed if that network is unavailable; earlier APKs did not prove this route.
-Local Android build/unit tests and gateway fixture tests pass. A Czech Wi-Fi
-device attempt reached `Protected`; the intended restricted-network test in
-Russia and its report remain outstanding, so B37 does not yet prove that
-AWG 3.1 works there. See `docs/FIELD_TEST_RUSSIA_AWG31.md`.
+Local Android build/unit tests and gateway fixture tests pass. A Czech device
+reached `Protected` with the v2 APK. Russian cellular v2 field tests have now
+been run: one Frankfurt handshake succeeded but all three VPN-bound TCP probes
+timed out; later attempts delivered UDP packets to Frankfurt without a server
+response or a completed handshake. Stockholm also failed to handshake in
+those later reports. The cause remains undetermined, and B37 does not prove
+that AWG 3.1 works on the tested Russian cellular network. See
+`docs/FIELD_TEST_RUSSIA_AWG31.md` for the synchronized evidence.

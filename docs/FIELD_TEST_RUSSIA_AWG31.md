@@ -18,6 +18,36 @@ Use **Disconnect** on the test screen to release the tunnel. A failed health
 check retains the successful handshake in the report but leaves restriction
 classification `UNKNOWN` until stronger evidence is available.
 
+## Field evidence (2026-09-13; B37 remains unverified in Russia)
+
+- On the tested Russian cellular connection, a v2 report recorded a fresh
+  Frankfurt handshake, followed by timeouts for all three VPN-bound TCP 443
+  targets (`GATEWAY`, `CLOUDFLARE`, `GOOGLE`). Stockholm then failed its
+  handshake. This proves neither working internet access through the tunnel
+  nor where the post-handshake packets were lost; that attempt had no
+  synchronized target-specific server capture.
+- Later synchronized v2 attempts ended with `NO_HANDSHAKE` for both gateways.
+  At Frankfurt, an outer-interface capture matched each report's attempt
+  time and showed eight incoming UDP 51821 packets, no outgoing response,
+  and no new `awg-ft31` peer handshake. An inner-interface capture during
+  the last attempt saw zero packets for the three TCP probe targets, as
+  expected without a handshake. The UDP socket was listening, the INPUT
+  accept rule was present, and the checked AWG profile parameters matched
+  the client. The server may still reject an invalid initiation; these
+  observations do not identify why it remained silent.
+- A local Android phone running the same v2 APK reached `Protected`; the
+  Frankfurt peer recorded a matching fresh handshake and bidirectional UDP
+  data. Its test app was then disconnected and force-stopped before the final
+  Russian attempt, which still failed. This rules out an active local test
+  app as the explanation for that attempt, but does not establish a cause
+  in the Russian network.
+
+Do not label B37 merge-ready or claim AWG 3.1 bypasses Russian restrictions
+from these reports. A next controlled test should record the server's reason
+for accepting or rejecting the initiation, then capture the three VPN-bound
+targets if a handshake completes. `INTERNET_NOT_VALIDATED`/`UNKNOWN` in the
+reports do not by themselves identify carrier filtering or DPI.
+
 ## Why
 
 The B36 field-test APK (docs/FIELD_TEST_RUSSIA.md) proved registration/
