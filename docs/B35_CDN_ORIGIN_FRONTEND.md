@@ -47,6 +47,15 @@ and streaming behavior must still pass the B35 end-to-end data-plane test.
 TCP/2100 is private loopback plumbing. Do not add a cloud firewall,
 security-group, nftables, or public nginx listener for it.
 
+Public TCP/443 also requires an origin-access boundary for the tunnel path.
+`/nova-xhttp/` must accept requests only from the selected CDN's current,
+official origin-source CIDRs, or from an equivalent authenticated-origin
+mechanism supported by that provider. The example nginx configuration is
+fail-closed: it contains `REPLACE_WITH_CDN_SOURCE_CIDR` followed by
+`deny all;`. Duplicate the `allow` directive for every required provider
+source range before deployment. Do not substitute client/eyeball address
+ranges for CDN origin-source ranges.
+
 ## Truth boundary
 
 A successful nginx syntax check, DNS resolution, TLS handshake, TCP/443

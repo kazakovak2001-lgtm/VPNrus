@@ -19,6 +19,7 @@ class CdnOriginNginxTemplateTests(unittest.TestCase):
             "REPLACE_WITH_ORIGIN_CERTIFICATE_FILE",
             "REPLACE_WITH_ORIGIN_PRIVATE_KEY_FILE",
             "REPLACE_WITH_ORIGIN_HOST_HEADER",
+            "REPLACE_WITH_CDN_SOURCE_CIDR",
         ):
             self.assertIn(placeholder, self.text)
 
@@ -33,6 +34,19 @@ class CdnOriginNginxTemplateTests(unittest.TestCase):
     def test_xray_backend_port_is_never_a_public_nginx_listener(self):
         self.assertNotRegex(self.text, re.compile(r"listen\s+(?:\[::\]:|0\.0\.0\.0:)?2100\b"))
         self.assertNotIn("listen 2100", self.text)
+
+    def test_xhttp_origin_is_fail_closed_to_cdn_source_networks(self):
+        self.assertIn(
+            "allow REPLACE_WITH_CDN_SOURCE_CIDR;",
+            self.text,
+        )
+        self.assertRegex(
+            self.text,
+            re.compile(
+                r"allow REPLACE_WITH_CDN_SOURCE_CIDR;\s*deny all;",
+                re.MULTILINE,
+            ),
+        )
 
     def test_first_slice_allows_only_packet_up_http_methods(self):
         self.assertRegex(

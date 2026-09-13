@@ -36,6 +36,17 @@ server {
     # This literal first-slice path MUST equal the signed provider profile's
     # xhttp.path and NOVA_INGRESS_XHTTP_PATH.
     location ^~ /nova-xhttp/ {
+        # SECURITY BOUNDARY:
+        # The tunnel origin must not be reachable directly from arbitrary
+        # Internet clients. Replace this placeholder with an official/current
+        # source CIDR published by the selected CDN. Duplicate the allow line
+        # for every required CDN source range. The final deny is mandatory.
+        #
+        # Leaving the placeholder unchanged intentionally makes nginx -t fail,
+        # preventing accidental deployment of an unrestricted origin.
+        allow REPLACE_WITH_CDN_SOURCE_CIDR;
+        deny all;
+
         # First executable server slice is packet-up + POST. Packet-up uses
         # GET for the downstream request and POST for uplink packets.
         limit_except GET POST {
