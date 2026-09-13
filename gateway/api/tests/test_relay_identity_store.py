@@ -165,6 +165,38 @@ class RelayIdentityStoreTests(unittest.TestCase):
             self.assertEqual(after, before)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics")
+    def test_upsert_refuses_special_permission_bits_without_mutating_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "static-clients.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[]\n")
+
+            os.chmod(path, 0o2640)
+
+            actual_mode = os.stat(path).st_mode & 0o7777
+            if actual_mode != 0o2640:
+                self.skipTest(
+                    f"filesystem did not preserve setgid test mode: {oct(actual_mode)}"
+                )
+
+            with open(path, "rb") as handle:
+                before = handle.read()
+
+            with self.assertRaises(store_module.RelayIdentityStoreError):
+                store_module.upsert(
+                    path,
+                    "relay-a",
+                    "relay:a",
+                    _UUID_A,
+                )
+
+            with open(path, "rb") as handle:
+                after = handle.read()
+
+            self.assertEqual(after, before)
+            self.assertEqual(os.stat(path).st_mode & 0o7777, 0o2640)
+
     def test_file_is_never_world_readable(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "static-clients.json")

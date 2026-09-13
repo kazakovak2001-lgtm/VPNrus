@@ -94,10 +94,11 @@ def _write_entries(path, entries):
     its operator-established access metadata.
 
     New files default to restrictive 0600. For an existing store, only
-    0600 and 0640 are accepted and its uid/gid/mode are preserved across
-    the atomic inode replacement. This keeps an operator-owned
-    root:pocvpn-api 0640 production store readable by pocvpn-api without
-    granting the service write access.
+    exact 0600 and 0640 permission modes are accepted; special permission
+    bits are rejected. Its uid/gid/mode are preserved across the atomic
+    inode replacement. This keeps an operator-owned root:pocvpn-api 0640
+    production store readable by pocvpn-api without granting the service
+    write access.
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
@@ -109,7 +110,7 @@ def _write_entries(path, entries):
 
     prior_mode = None
     if prior_stat is not None:
-        prior_mode = prior_stat.st_mode & 0o777
+        prior_mode = prior_stat.st_mode & 0o7777
         if prior_mode not in (0o600, 0o640):
             raise RelayIdentityStoreError(
                 f"refusing to replace {path}: existing mode "

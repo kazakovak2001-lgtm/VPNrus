@@ -95,9 +95,11 @@ Fill in `NOVA_INGRESS_UPSTREAM_HOST`/`PORT`/`TRANSPORT`/`SERVER_NAME`/
 STATIC_CLIENTS="<this EXIT's POCVPN_API_STATIC_RELAY_CLIENTS_FILE>"
 
 # Operator owns/writes this trust store. pocvpn-api reads it during every
-# Xray render, so establish root:pocvpn-api 0640 before the first apply.
+# Xray render. Converge the dedicated parent directory for both new and
+# existing stores so group-read access is actually traversable.
+sudo install -d -o root -g pocvpn-api -m 0750 "$(dirname "$STATIC_CLIENTS")"
+
 if [ ! -e "$STATIC_CLIENTS" ]; then
-    sudo install -d -o root -g pocvpn-api -m 0750 "$(dirname "$STATIC_CLIENTS")"
     printf '[]\n' | sudo install \
         -o root -g pocvpn-api -m 0640 \
         /dev/stdin "$STATIC_CLIENTS"
