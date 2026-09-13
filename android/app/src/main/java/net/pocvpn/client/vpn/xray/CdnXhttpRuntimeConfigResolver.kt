@@ -22,7 +22,10 @@ enum class CdnXhttpRuntimeFailure {
     CREDENTIAL_SHAPE_INVALID,
     DATA_PLANE_BINDING_MISMATCH,
     SIGNED_TLS_POLICY_MISMATCH,
+    XHTTP_MODE_NOT_EXECUTABLE,
+    XHTTP_UPLINK_METHOD_NOT_EXECUTABLE,
     MULTI_ALPN_NOT_EXECUTABLE,
+    HTTP3_DIAL_NOT_BOUNDED,
     REQUEST_BODY_LIMIT_UNREPRESENTABLE,
     PADDING_NONE_UNREPRESENTABLE,
     RENDER_CONFIG_INVALID,
@@ -74,6 +77,21 @@ object CdnXhttpRuntimeConfigResolver {
             )
         }
 
+        // B35's first deployable origin slice is intentionally narrower than
+        // the general signed metadata model. Do not render a future mode/method
+        // merely because pinned Xray can parse it: the server/nginx contract in
+        // this slice is packet-up + POST only.
+        if (provider.xhttp.mode != CdnXhttpMode.PACKET_UP) {
+            return CdnXhttpRuntimeResolution.Rejected(
+                CdnXhttpRuntimeFailure.XHTTP_MODE_NOT_EXECUTABLE,
+            )
+        }
+        if (provider.xhttp.uplinkHttpMethod != CdnUplinkHttpMethod.POST) {
+            return CdnXhttpRuntimeResolution.Rejected(
+                CdnXhttpRuntimeFailure.XHTTP_UPLINK_METHOD_NOT_EXECUTABLE,
+            )
+        }
+
         val credential = ingressProfile.tlsProfile
             ?: return CdnXhttpRuntimeResolution.Rejected(
                 CdnXhttpRuntimeFailure.CREDENTIAL_SHAPE_INVALID,
@@ -102,6 +120,14 @@ object CdnXhttpRuntimeConfigResolver {
         if (provider.tls.alpn.size != 1) {
             return CdnXhttpRuntimeResolution.Rejected(
                 CdnXhttpRuntimeFailure.MULTI_ALPN_NOT_EXECUTABLE,
+            )
+        }
+        // The current Nova patch bounds TCP/TLS/REALITY establishment through
+        // dialContext. Xray's H3 path uses a separate QUIC Dial callback and is
+        // therefore not covered by that 5s bound yet.
+        if (provider.tls.alpn.single() == "h3") {
+            return CdnXhttpRuntimeResolution.Rejected(
+                CdnXhttpRuntimeFailure.HTTP3_DIAL_NOT_BOUNDED,
             )
         }
         if (provider.requests.maxRequestBodyBytes !in 1..Int.MAX_VALUE.toLong()) {

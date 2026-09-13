@@ -174,7 +174,7 @@ class IngressProfileProvisionerTest {
             supportedExits = setOf(exitId),
             minimumClientVersionCode = 1,
             minimumXrayCoreVersion = "26.7.28",
-            requiredClientCapabilities = setOf("xhttp", "cdn-profile-v1"),
+            requiredClientCapabilities = setOf("xhttp", "cdn-profile-v2"),
         )
         val xhttpBinding =
             EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example.org", 443)

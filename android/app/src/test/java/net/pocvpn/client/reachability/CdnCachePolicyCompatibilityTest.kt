@@ -44,7 +44,7 @@ class CdnCachePolicyCompatibilityTest {
         supportedExits = setOf(exit),
         minimumClientVersionCode = 1,
         minimumXrayCoreVersion = "26.7.28",
-        requiredClientCapabilities = setOf("cdn-profile-v1", "xhttp"),
+        requiredClientCapabilities = setOf("cdn-profile-v2", "xhttp"),
     )
 
     private fun binding(cachePolicy: CdnCachePolicy) =
@@ -55,7 +55,7 @@ class CdnCachePolicyCompatibilityTest {
     private val runtime = CdnClientRuntimeCapabilities(
         clientVersionCode = 1,
         xrayCoreVersion = "26.7.28",
-        clientCapabilities = setOf("cdn-profile-v1", "xhttp"),
+        clientCapabilities = setOf("cdn-profile-v2", "xhttp"),
         xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
         uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
         paddingPlacements = setOf(CdnPaddingPlacement.QUERY),

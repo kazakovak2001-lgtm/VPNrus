@@ -16,7 +16,7 @@ class CdnProviderCapabilityProfileTest {
         requests = CdnRequestPolicy("origin.example.org", CdnCachePolicy.BYPASS_REQUIRED, true, 1048576, 30000),
         supportedExits = setOf(EndpointId("exit-b"), EndpointId("exit-a")),
         minimumClientVersionCode = 1, minimumXrayCoreVersion = "25.8.3",
-        requiredClientCapabilities = setOf("xhttp", "cdn-profile-v1"),
+        requiredClientCapabilities = setOf("xhttp", "cdn-profile-v2"),
     )
 
     private fun binding() = EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example.org", 443,
@@ -25,7 +25,7 @@ class CdnProviderCapabilityProfileTest {
     private fun runtime() = CdnClientRuntimeCapabilities(
         clientVersionCode = 1,
         xrayCoreVersion = "25.8.3",
-        clientCapabilities = setOf("xhttp", "cdn-profile-v1"),
+        clientCapabilities = setOf("xhttp", "cdn-profile-v2"),
         xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
         uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
         paddingPlacements = setOf(CdnPaddingPlacement.QUERY),
@@ -54,7 +54,7 @@ class CdnProviderCapabilityProfileTest {
     }
 
 
-    @Test fun `control plane authority is signed and required by profile version one`() {
+    @Test fun `control plane authority is signed and required by profile version two`() {
         val original = binding().withCdnProviderProfile(profile())
         val rotated = binding().withCdnProviderProfile(
             profile().copy(hosts = profile().hosts.copy(controlPlaneHostname = "control-2.example.org")),
@@ -69,7 +69,7 @@ class CdnProviderCapabilityProfileTest {
         )
     }
 
-    @Test fun `profile version one is valid only on XRAY_XHTTP CDN bindings`() {
+    @Test fun `profile version two is valid only on XRAY_XHTTP CDN bindings`() {
         val encoded = binding().withCdnProviderProfile(profile()).metadata.getValue("cdnProviderProfile")
         for (kind in listOf(TransportKind.TLS_TCP, TransportKind.QUIC, TransportKind.XRAY_REALITY)) {
             val wrong = EndpointTransportBinding(kind, "edge.example.org", 443)
@@ -135,7 +135,7 @@ class CdnProviderCapabilityProfileTest {
     }
 
     @Test fun `unknown version is distinct and malformed versions never coerce`() {
-        assertEquals(CdnProviderProfileReadResult.UnsupportedVersion, mutate { it.put("version", 2) }.cdnProviderProfile())
+        assertEquals(CdnProviderProfileReadResult.UnsupportedVersion, mutate { it.put("version", 3) }.cdnProviderProfile())
         for (v in listOf<Any>("1", true, 1.5, JSONObject.NULL)) {
             assertEquals(CdnProviderProfileReadResult.Invalid, mutate { it.put("version", v) }.cdnProviderProfile())
         }
@@ -224,7 +224,7 @@ class CdnProviderCapabilityProfileTest {
         assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_INVALID),
             binding().copy(metadata = binding().metadata + ("cdnProviderProfile" to "{broken")).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
         assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_VERSION_UNSUPPORTED),
-            mutate { it.put("version", 2) }.cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+            mutate { it.put("version", 3) }.cdnClientCompatibility(EndpointId("exit-a"), runtime()))
     }
 
     private fun manifest(b: EndpointTransportBinding) = EndpointManifest(1, 1000, 2000,

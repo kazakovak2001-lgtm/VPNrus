@@ -587,13 +587,13 @@ class AutoGatewaySelectorTest {
         supportedExits = setOf(exitId),
         minimumClientVersionCode = 1,
         minimumXrayCoreVersion = "25.8.3",
-        requiredClientCapabilities = setOf("cdn-profile-v1", "xhttp"),
+        requiredClientCapabilities = setOf("cdn-profile-v2", "xhttp"),
     )
 
     private fun compatibleCdnRuntime() = CdnClientRuntimeCapabilities(
         clientVersionCode = 1,
         xrayCoreVersion = "25.8.3",
-        clientCapabilities = setOf("cdn-profile-v1", "xhttp"),
+        clientCapabilities = setOf("cdn-profile-v2", "xhttp"),
         xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
         uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
         paddingPlacements = setOf(CdnPaddingPlacement.QUERY),

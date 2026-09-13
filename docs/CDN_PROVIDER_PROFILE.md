@@ -6,7 +6,7 @@ whether this local client and pinned Xray core may even present the
 `CDN_FRONTED` binding as a relayed candidate. This is still not a deployed
 transport or evidence of reachability.
 
-The profile is stored as version 1 JSON in the existing transport binding's
+The profile is stored as version 2 JSON in the existing transport binding's
 `cdnProviderProfile` metadata string. `withCdnProviderProfile` requires an
 explicit `CDN_FRONTED` **XRAY_XHTTP** binding whose host matches the client-facing hostname.
 It preserves unrelated metadata. Objects and sets are written in deterministic
@@ -40,7 +40,7 @@ be inferred from the CDN edge or origin, and a control-plane response never
 becomes authority for the data plane: Android must still cross-check the
 returned edge host/port against the signed `EndpointTransportBinding`.
 
-Profile v1 is valid only on `XRAY_XHTTP`. Copying the same metadata to
+Profile v2 is valid only on `XRAY_XHTTP`. Copying the same metadata to
 `TLS_TCP`, `XRAY_REALITY`, `QUIC`, or another transport is rejected fail-closed.
 
 `cdnProviderProfile()` returns `Missing`, `Invalid`, `UnsupportedVersion`, or
@@ -59,14 +59,18 @@ ingress-kind bindings keep their existing behavior. A `CDN_FRONTED` binding
 with missing, malformed, unsupported-version, or locally incompatible profile
 is excluded before scoring, rather than silently downgraded.
 
-No consumer applies these fields to Xray, provisions CDN infrastructure, or
-promotes a candidate to Protected in this slice. The selector gate is a
-compatibility filter, not a scorer: measured health must continue to come from
-existing reachability/history and relay proof mechanisms, never a provider's
-declaration in signed metadata.
+The B35 foundation includes a resolver/renderer that can turn a compatible,
+already-signed profile plus the persisted per-device UUID into a validated Xray
+wire configuration. It is still not a live transport: `XRAY_XHTTP` remains
+`NOT_IMPLEMENTED`, and no Smart Connect/runtime executor consumes that rendered
+configuration. The selector gate remains a compatibility filter, not a scorer:
+measured health must continue to come from existing reachability/history and
+relay proof mechanisms, never a provider's declaration in signed metadata.
 
-Next steps are to wire real runtime capability values from the shipped client
-and vendored Xray-core build, validate those values against an actual provider
-deployment, apply the profile to Xray configuration, and integrate the result
-with the existing end-to-end relay proof. No Russia reachability claim follows
-from this model, selector gate, or unit tests.
+The first executable server slice is intentionally narrower than the general
+metadata model: only `PACKET_UP` + `POST` with bounded H1/H2 connection setup is
+accepted by the runtime resolver. H3 is rejected until its QUIC establishment
+path has the same bounded-dial guarantee. Next steps are deployment-specific CDN
+validation, wiring real runtime capability values, live executor integration,
+and end-to-end relay proof validation. No Russia reachability claim follows from
+this model, resolver, selector gate, or unit tests.

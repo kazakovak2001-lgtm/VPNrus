@@ -6,7 +6,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 
 private const val CDN_PROFILE_KEY = "cdnProviderProfile"
-private const val CDN_PROFILE_VERSION = 1L
+private const val CDN_PROFILE_VERSION = 2L
 private const val MAX_PROFILE_BYTES = 4096 // Existing manifest string-field limit.
 
 sealed interface CdnProviderProfileReadResult {

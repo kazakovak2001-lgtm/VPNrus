@@ -81,14 +81,24 @@ def device_binding(device_public_key):
     return hashlib.sha256(device_public_key.encode("utf-8")).hexdigest()[:16]
 
 
+def _canonicalize_secret(secret):
+    """Normalize operator text-file line endings without stripping arbitrary
+    leading/space bytes from the HMAC key."""
+    if not isinstance(secret, (bytes, bytearray)):
+        return None
+    normalized = bytes(secret).rstrip(b"\r\n")
+    return normalized if len(normalized) >= 16 else None
+
+
 def mint(secret, history_path_id, device_public_key, issued_at_epoch_seconds, ttl_seconds):
     """Mint a fresh token bound to `history_path_id` and `device_public_key`,
-    expiring `ttl_seconds` after `issued_at_epoch_seconds`. `secret` is raw
-    bytes (the caller reads it from the shared secret file transiently -
-    never holds it beyond one mint() call, same discipline as every other
-    secret-file read in this package)."""
-    if not isinstance(secret, (bytes, bytearray)) or len(secret) < 16:
-        raise ValueError("secret must be at least 16 raw bytes")
+    expiring `ttl_seconds` after `issued_at_epoch_seconds`. `secret` is the
+    byte content of the shared operator secret file. A trailing CR/LF is
+    canonicalized so a file written with a normal text newline and the same
+    file installed with `echo -n` produce the same HMAC key."""
+    normalized_secret = _canonicalize_secret(secret)
+    if normalized_secret is None:
+        raise ValueError("secret must contain at least 16 bytes after line-ending normalization")
     if not history_path_id:
         raise ValueError("history_path_id must not be blank")
     if ttl_seconds <= 0:
@@ -102,7 +112,7 @@ def mint(secret, history_path_id, device_public_key, issued_at_epoch_seconds, tt
         "exp": int(issued_at_epoch_seconds) + int(ttl_seconds),
     }
     payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    signature = hmac.new(bytes(secret), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    signature = hmac.new(normalized_secret, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{signature}"
 
 
@@ -112,7 +122,8 @@ def verify(secret, token, now_epoch_seconds):
     issued implausibly far in the future (beyond a small clock-skew
     allowance). Returns ProbeTokenClaims on success. The caller maps every
     ProbeTokenError to the SAME 401 response - see module docstring."""
-    if not isinstance(secret, (bytes, bytearray)) or len(secret) < 16:
+    normalized_secret = _canonicalize_secret(secret)
+    if normalized_secret is None:
         raise ProbeTokenError("server misconfiguration: probe secret too short")
     if not token or token.count(".") != 1:
         raise ProbeTokenError("malformed token")
@@ -123,7 +134,7 @@ def verify(secret, token, now_epoch_seconds):
     if not all(c in "0123456789abcdef" for c in signature.lower()) or len(signature) != 64:
         raise ProbeTokenError("malformed signature")
 
-    expected_signature = hmac.new(bytes(secret), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    expected_signature = hmac.new(normalized_secret, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected_signature, signature.lower()):
         raise ProbeTokenError("signature mismatch")
 
