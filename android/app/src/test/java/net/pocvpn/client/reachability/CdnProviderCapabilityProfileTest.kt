@@ -22,6 +22,21 @@ class CdnProviderCapabilityProfileTest {
     private fun binding() = EndpointTransportBinding(TransportKind.QUIC, "edge.example.org", 443,
         mapOf("unrelated" to "preserved")).withIngressKind(IngressKind.CDN_FRONTED)
 
+    private fun runtime() = CdnClientRuntimeCapabilities(
+        clientVersionCode = 1,
+        xrayCoreVersion = "25.8.3",
+        clientCapabilities = setOf("xhttp", "cdn-profile-v1"),
+        xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
+        uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
+        paddingPlacements = setOf(CdnPaddingPlacement.QUERY),
+        tlsFingerprints = setOf("chrome"),
+        alpn = setOf("h2"),
+        minimumTlsVersions = setOf(CdnMinimumTlsVersion.TLS_1_3),
+        supportsStreaming = true,
+        maxRequestBodyBytes = 1048576,
+        maxRequestTimeoutMillis = 30000,
+    )
+
     private fun mutate(change: (JSONObject) -> Unit): EndpointTransportBinding {
         val b = binding().withCdnProviderProfile(profile())
         val json = JSONObject(b.metadata.getValue("cdnProviderProfile"))
@@ -131,6 +146,31 @@ class CdnProviderCapabilityProfileTest {
         val p = profile().copy(xhttp = profile().xhttp.copy(headers = headers))
         headers["Authorization"] = "not-a-real-credential"
         assertThrows(IllegalArgumentException::class.java) { binding().withCdnProviderProfile(p) }
+    }
+
+    @Test fun `client compatibility requires profile exit client core and transport capabilities`() {
+        val compatible = binding().withCdnProviderProfile(profile()).cdnClientCompatibility(EndpointId("exit-a"), runtime())
+        assertTrue(compatible is CdnClientCompatibility.Compatible)
+
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.EXIT_NOT_SUPPORTED),
+            binding().withCdnProviderProfile(profile()).cdnClientCompatibility(EndpointId("exit-c"), runtime()))
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.CLIENT_VERSION_TOO_OLD),
+            binding().withCdnProviderProfile(profile().copy(minimumClientVersionCode = 2)).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.XRAY_CORE_TOO_OLD),
+            binding().withCdnProviderProfile(profile().copy(minimumXrayCoreVersion = "25.8.4")).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.CLIENT_CAPABILITY_MISSING),
+            binding().withCdnProviderProfile(profile().copy(requiredClientCapabilities = setOf("xhttp", "future-cap"))).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.TLS_FINGERPRINT_UNSUPPORTED),
+            binding().withCdnProviderProfile(profile().copy(tls = profile().tls.copy(clientFingerprint = "firefox"))).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+    }
+
+    @Test fun `missing malformed and unsupported profile versions are fail closed before compatibility`() {
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_MISSING),
+            binding().cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_INVALID),
+            binding().copy(metadata = binding().metadata + ("cdnProviderProfile" to "{broken")).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+        assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_VERSION_UNSUPPORTED),
+            mutate { it.put("version", 2) }.cdnClientCompatibility(EndpointId("exit-a"), runtime()))
     }
 
     private fun manifest(b: EndpointTransportBinding) = EndpointManifest(1, 1000, 2000,

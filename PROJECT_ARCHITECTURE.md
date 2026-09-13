@@ -1439,10 +1439,16 @@ exact remaining physical-deployment sequence (human-approval-gated).
 
 The CDN provider capability profile is a typed, versioned description in the
 existing signed `EndpointTransportBinding.metadata` map (`cdnProviderProfile`).
-Its codec validates fields and the CDN binding/public-host match; it does not
-verify signatures, gate runtime capabilities, or establish reachability. No
-manifest binary-schema change or provider-specific routing branch is introduced.
-Credentials remain outside metadata. See `docs/CDN_PROVIDER_PROFILE.md`.
+Its codec validates fields and the CDN binding/public-host match; the separate
+`CdnClientCapabilityPolicy` then gates `CDN_FRONTED` relay candidates against
+local client version, pinned Xray-core version, required client capability
+labels, XHTTP mode/method/padding support, TLS version/fingerprint/ALPN support,
+request bounds, streaming support, and the declared supported exit id. This is
+a fail-closed client/core compatibility gate only: it does not verify
+signatures, establish reachability, deploy a provider, or prove the data plane.
+No manifest binary-schema change or provider-specific routing branch is
+introduced. Credentials remain outside metadata. See
+`docs/CDN_PROVIDER_PROFILE.md`.
 
 Threads B23's `IngressKind` (`DIRECT_IP`/`CDN_FRONTED`) - a real type since
 B23, but never consumed anywhere until now - through real candidate
