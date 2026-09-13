@@ -235,4 +235,61 @@ class ProvisioningClientTest {
         assertEquals("https://16.170.208.231/v1/xray-profile", request.url)
         assertEquals("tls", JSONObject(request.body).getString("transport"))
     }
+
+    @Test
+    fun `XHTTP ingress request targets signed control plane and names xhttp explicitly`() {
+        val request = ProvisioningClient.buildIngressProfileRequest(
+            validKey, "cred", "control.example.org", IngressProfileTransport.XHTTP,
+        )
+        assertEquals("https://control.example.org/v1/ingress-profile", request.url)
+        assertEquals("xhttp", JSONObject(request.body).getString("transport"))
+    }
+
+    @Test
+    fun `XHTTP ingress response accepts identity plus pinned edge coordinates only`() {
+        val body = JSONObject()
+            .put("ingress_endpoint_id", "cdn-ingress-1")
+            .put("ingress_kind", "CDN_FRONTED")
+            .put("transport", "xhttp")
+            .put("server_address", "edge.example.org")
+            .put("server_port", 443)
+            .put("uuid", "11111111-1111-1111-1111-111111111111")
+            .put("profile_version", 1)
+            .put("issued_at", 1000L)
+            .put("expires_at", JSONObject.NULL)
+            .put("probe_url", "https://exit.example.org/v1/relay-health")
+            .put("probe_token", "opaque")
+            .toString()
+
+        val result = ProvisioningClient.mapIngressProfileResponse(200, body)
+        assertTrue(result is IngressProfileResult.Success)
+        val success = result as IngressProfileResult.Success
+        assertEquals(IngressProfileTransport.XHTTP, success.transport)
+        assertEquals("edge.example.org", success.serverAddress)
+        assertEquals("", success.serverName)
+        assertEquals("", success.fingerprint)
+    }
+
+    @Test
+    fun `XHTTP ingress response rejects unsigned TLS policy injection`() {
+        val body = JSONObject()
+            .put("ingress_endpoint_id", "cdn-ingress-1")
+            .put("ingress_kind", "CDN_FRONTED")
+            .put("transport", "xhttp")
+            .put("server_address", "edge.example.org")
+            .put("server_port", 443)
+            .put("uuid", "11111111-1111-1111-1111-111111111111")
+            .put("server_name", "unsigned.example.org")
+            .put("profile_version", 1)
+            .put("issued_at", 1000L)
+            .put("expires_at", JSONObject.NULL)
+            .put("probe_url", "https://exit.example.org/v1/relay-health")
+            .put("probe_token", "opaque")
+            .toString()
+
+        assertTrue(
+            ProvisioningClient.mapIngressProfileResponse(200, body)
+                is IngressProfileResult.MalformedResponse,
+        )
+    }
 }

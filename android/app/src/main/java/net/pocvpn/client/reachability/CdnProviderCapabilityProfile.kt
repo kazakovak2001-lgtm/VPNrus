@@ -25,18 +25,32 @@ data class CdnProviderCapabilityProfile(
         require(minimumXrayCoreVersion.matches(Regex("[0-9]{1,8}\\.[0-9]{1,8}\\.[0-9]{1,8}")))
         require(requiredClientCapabilities.size in 1..16)
         require(requiredClientCapabilities.all { it.matches(Regex("[a-z][a-z0-9._-]{0,63}")) })
+        if (xhttp.mode == CdnXhttpMode.STREAM_UP || xhttp.mode == CdnXhttpMode.STREAM_ONE) {
+            require(requests.streamingSupported)
+        }
     }
 }
 
-/** All four names are explicit; origin identities must never be substituted for the public edge. */
+/**
+ * Every network authority is explicit. [controlPlaneHostname] is used only
+ * for authenticated provisioning/profile retrieval; it is neither the CDN
+ * edge nor the origin.
+ */
 data class CdnHostnames(
     val clientFacingHostname: String,
     val cdnTechnicalHostname: String,
     val originHostname: String,
     val originTlsServerName: String,
+    val controlPlaneHostname: String,
 ) {
     init {
-        listOf(clientFacingHostname, cdnTechnicalHostname, originHostname, originTlsServerName)
+        listOf(
+            clientFacingHostname,
+            cdnTechnicalHostname,
+            originHostname,
+            originTlsServerName,
+            controlPlaneHostname,
+        )
             .forEach(::requireCdnHostname)
     }
 }
@@ -59,10 +73,24 @@ data class CdnXhttpPolicy(
     val extraParameters: Map<String, String>,
 ) {
     init {
-        require(path.length in 1..512 && path.startsWith('/') && !path.startsWith("//"))
+        // Pinned Xray-core normalizes the default session/sequence path under
+        // a trailing-slash base path. Require the signed value to already be
+        // in that exact form so CDN/nginx routing cannot drift from runtime.
+        require(path.length in 1..512 && path.startsWith('/') && !path.startsWith("//") && path.endsWith('/'))
         require(path.all { it.code in 33..126 } && '?' !in path && '#' !in path && '\\' !in path)
-        require(paddingMinBytes in 0..65536 && paddingMaxBytes in paddingMinBytes..65536)
-        require(paddingPlacement != CdnPaddingPlacement.NONE || paddingMaxBytes == 0)
+        // v26.7.28 rejects a present xPaddingBytes range with a non-positive
+        // endpoint. NONE remains a valid declarative profile value for future
+        // runtimes, but the current v26.7.28 client compatibility/runtime
+        // resolver rejects it because omitted xPaddingBytes normalizes to
+        // 100..1000 rather than disabling padding.
+        when (paddingPlacement) {
+            CdnPaddingPlacement.NONE -> require(paddingMinBytes == 0 && paddingMaxBytes == 0)
+            CdnPaddingPlacement.HEADER,
+            CdnPaddingPlacement.QUERY,
+            -> require(paddingMinBytes in 1..65536 && paddingMaxBytes in paddingMinBytes..65536)
+        }
+        // Exact pinned-core cross-field rule.
+        require(uplinkHttpMethod != CdnUplinkHttpMethod.GET || mode == CdnXhttpMode.PACKET_UP)
         listOf(queryParameters, headers, extraParameters).forEach(::requireCdnParameters)
         require(headers.keys.map { it.lowercase(java.util.Locale.ROOT) }.toSet().size == headers.size)
         // Credentials/framing/host identity belong to their own trusted configuration boundary.

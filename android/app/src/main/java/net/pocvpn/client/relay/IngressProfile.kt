@@ -102,7 +102,9 @@ data class IngressClientProfile(
 
     private fun structurallyValid(): Boolean = when (transport) {
         TransportKind.XRAY_REALITY -> realityProfile != null && tlsProfile == null
-        TransportKind.TLS_TCP -> tlsProfile != null && realityProfile == null
+        TransportKind.TLS_TCP,
+        TransportKind.XRAY_XHTTP,
+        -> tlsProfile != null && realityProfile == null
         else -> false
     }
 

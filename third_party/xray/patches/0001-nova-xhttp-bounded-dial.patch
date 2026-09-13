@@ -1,0 +1,129 @@
+diff --git a/transport/internet/splithttp/dialer.go b/transport/internet/splithttp/dialer.go
+index 7e249ee..690de2f 100644
+--- a/transport/internet/splithttp/dialer.go
++++ b/transport/internet/splithttp/dialer.go
+@@ -41,6 +41,17 @@ type dialerConf struct {
+ 	*internet.MemoryStreamConfig
+ }
+ 
++// XHTTP deliberately detaches request cancellation for long-lived streams.
++// Bound only creation of a NEW transport connection so a peer that accepts
++// TCP and then stalls TLS/REALITY cannot park the Android attempt forever.
++// Once this function returns a live connection, stream lifetime semantics
++// remain exactly those of upstream v26.7.28.
++const novaXhttpDialTimeout = 5 * time.Second
++
++func withXhttpDialTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
++	return context.WithTimeout(ctx, timeout)
++}
++
+ var (
+ 	globalDialerMap    map[dialerConf]*XmuxManager
+ 	globalDialerAccess sync.Mutex
+@@ -66,7 +77,10 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 	transportConfig := streamSettings.ProtocolSettings.(*Config)
+ 
+ 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
+-		conn, err := internet.DialSystem(ctxInner, dest, streamSettings.SocketSettings)
++		dialCtx, cancel := withXhttpDialTimeout(ctxInner, novaXhttpDialTimeout)
++		defer cancel()
++
++		conn, err := internet.DialSystem(dialCtx, dest, streamSettings.SocketSettings)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -81,13 +95,19 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
+ 		}
+ 
+ 		if realityConfig != nil {
+-			return reality.UClient(conn, realityConfig, ctxInner, dest)
++			realityConn, err := reality.UClient(conn, realityConfig, dialCtx, dest)
++			if err != nil {
++				conn.Close()
++				return nil, err
++			}
++			return realityConn, nil
+ 		}
+ 
+ 		if gotlsConfig != nil {
+ 			if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
+ 				conn = tls.UClient(conn, gotlsConfig, fingerprint)
+-				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
++				if err := conn.(*tls.UConn).HandshakeContext(dialCtx); err != nil {
++					conn.Close()
+ 					return nil, err
+ 				}
+ 			} else {
+diff --git a/transport/internet/splithttp/nova_dial_timeout_test.go b/transport/internet/splithttp/nova_dial_timeout_test.go
+new file mode 100644
+index 0000000..43f9097
+--- /dev/null
++++ b/transport/internet/splithttp/nova_dial_timeout_test.go
+@@ -0,0 +1,67 @@
++package splithttp
++
++import (
++	"context"
++	gotls "crypto/tls"
++	stdnet "net"
++	"testing"
++	"time"
++
++	xraytls "github.com/xtls/xray-core/transport/internet/tls"
++)
++
++func TestNovaXhttpDialTimeoutInterruptsStalledUTlsHandshake(t *testing.T) {
++	clientSide, peerSide := stdnet.Pipe()
++	defer peerSide.Close()
++
++	fingerprint := xraytls.GetFingerprint("chrome")
++	if fingerprint == nil {
++		t.Fatal("chrome fingerprint unavailable")
++	}
++
++	wrapped := xraytls.UClient(
++		clientSide,
++		&gotls.Config{
++			ServerName:         "example.com",
++			InsecureSkipVerify: true,
++		},
++		fingerprint,
++	)
++	conn, ok := wrapped.(*xraytls.UConn)
++	if !ok {
++		t.Fatalf("unexpected TLS client type %T", wrapped)
++	}
++	defer conn.Close()
++
++	parent := context.WithoutCancel(context.Background())
++	ctx, cancel := withXhttpDialTimeout(parent, 50*time.Millisecond)
++	defer cancel()
++
++	started := time.Now()
++	err := conn.HandshakeContext(ctx)
++	elapsed := time.Since(started)
++
++	if err == nil {
++		t.Fatal("stalled TLS peer unexpectedly completed a handshake")
++	}
++	if elapsed > time.Second {
++		t.Fatalf("stalled handshake outlived bounded dial context: %s", elapsed)
++	}
++}
++
++func TestNovaXhttpDialTimeoutPreservesEarlierParentDeadline(t *testing.T) {
++	parent, parentCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer parentCancel()
++
++	ctx, cancel := withXhttpDialTimeout(parent, 5*time.Second)
++	defer cancel()
++
++	parentDeadline, parentOK := parent.Deadline()
++	childDeadline, childOK := ctx.Deadline()
++	if !parentOK || !childOK {
++		t.Fatal("both parent and bounded child must carry deadlines")
++	}
++	if childDeadline.After(parentDeadline) {
++		t.Fatalf("child deadline %s extended earlier parent deadline %s", childDeadline, parentDeadline)
++	}
++}

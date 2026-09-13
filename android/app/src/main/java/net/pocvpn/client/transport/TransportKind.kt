@@ -13,4 +13,6 @@ enum class TransportKind {
     XRAY_REALITY,
     QUIC,
     TLS_TCP,
+    /** VLESS over Xray XHTTP; deliberately distinct from generic TLS_TCP. */
+    XRAY_XHTTP,
 }

@@ -66,6 +66,21 @@ def build_tls_config(ingress_config):
     )
 
 
+def build_xhttp_config(ingress_config):
+    if not ingress_config.ingress_xhttp_server_port:
+        return None
+    return ingress_renderer.XhttpOriginInboundConfig(
+        listen_port=ingress_config.ingress_xhttp_server_port,
+        host=ingress_config.ingress_xhttp_host,
+        path=ingress_config.ingress_xhttp_path,
+        mode=ingress_config.ingress_xhttp_mode,
+        max_each_post_bytes=ingress_config.ingress_xhttp_max_each_post_bytes,
+        padding_placement=ingress_config.ingress_xhttp_padding_placement,
+        padding_min_bytes=ingress_config.ingress_xhttp_padding_min_bytes,
+        padding_max_bytes=ingress_config.ingress_xhttp_padding_max_bytes,
+    )
+
+
 def build_upstream_config(ingress_config):
     """The ONE place this process reads the ingress->exit relay UUID file's
     contents (task requirement H) - transient, never assigned to a
@@ -116,11 +131,18 @@ def _write_last_activated_hash(path, sha256_hex):
 def _render_candidate(ingress_config):
     reality = build_reality_config(ingress_config)
     tls = build_tls_config(ingress_config)
+    xhttp = build_xhttp_config(ingress_config)
     upstream = build_upstream_config(ingress_config)
     activations_data = activations.read_store_shared(ingress_config.activation_store_path, ingress_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(ingress_config.xray_store_path, ingress_config.xray_lock_path)
     config_dict = ingress_renderer.render_ingress_server_config(
-        activations_data, xray_data, reality, upstream, tls=tls, flow=ingress_config.ingress_flow,
+        activations_data,
+        xray_data,
+        reality,
+        upstream,
+        tls=tls,
+        flow=ingress_config.ingress_flow,
+        xhttp=xhttp,
     )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()

@@ -2,9 +2,10 @@ package net.pocvpn.client.vpn.xray
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 
 /**
- * Pure renderer: [XrayVlessRealityConfig]/[XrayVlessTlsConfig] -> the exact
+ * Pure renderer: [XrayVlessRealityConfig]/[XrayVlessTlsConfig]/[XrayVlessXhttpConfig] -> the exact
  * Xray core JSON config this adapter starts CoreController.startLoop(...)
  * with. Every key name here was verified against the pinned xray-core
  * v26.7.28 source (not assumed from documentation) - see
@@ -49,6 +50,7 @@ object XrayConfigRenderer {
     private const val TUN_INBOUND_TAG = "nova-tun-in"
     private const val VLESS_OUTBOUND_TAG = "nova-vless-reality-out"
     private const val VLESS_TLS_OUTBOUND_TAG = "nova-vless-tls-out"
+    private const val VLESS_XHTTP_OUTBOUND_TAG = "nova-vless-xhttp-out"
     private const val TUN_INTERFACE_NAME = "nova-xray-tun"
 
     fun render(config: XrayVlessRealityConfig): String {
@@ -65,6 +67,19 @@ object XrayConfigRenderer {
         root.put("log", JSONObject().put("loglevel", "warning"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessTlsOutbound(config)))
+        return root.toString()
+    }
+
+    /**
+     * B35 renderer foundation. Registration/execution remains fail-closed
+     * elsewhere until the patched core, provider deployment and data-plane
+     * proof are all present.
+     */
+    fun render(config: XrayVlessXhttpConfig): String {
+        val root = JSONObject()
+        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
+        root.put("outbounds", JSONArray().put(renderVlessXhttpOutbound(config)))
         return root.toString()
     }
 
@@ -140,4 +155,68 @@ object XrayConfigRenderer {
             .put("settings", settings)
             .put("streamSettings", streamSettings)
     }
+
+    private fun renderVlessXhttpOutbound(config: XrayVlessXhttpConfig): JSONObject {
+        val user = JSONObject()
+            .put("id", config.uuid)
+            .put("encryption", "none")
+
+        val vnext = JSONObject()
+            .put("address", config.server)
+            .put("port", config.serverPort)
+            .put("users", JSONArray().put(user))
+
+        val tlsSettings = JSONObject()
+            .put("serverName", config.tlsServerName)
+            .put("fingerprint", config.fingerprint)
+            .put("minVersion", config.minimumTlsVersion.wireValue)
+            .put("alpn", JSONArray().put(config.alpn))
+            .put("allowInsecure", false)
+
+        val xhttpSettings = JSONObject()
+            .put("host", config.xhttpHost)
+            .put("path", renderXhttpPathAndQuery(config))
+            .put("mode", config.mode.wireValue)
+            .put("uplinkHTTPMethod", config.uplinkHttpMethod.wireValue)
+            .put("scMaxEachPostBytes", config.maxEachPostBytes)
+            .put("headers", JSONObject().apply {
+                    config.headers.toSortedMap().forEach { (key, value) ->
+                        put(key, value)
+                    }
+                })
+
+        // Always explicit. v26.7.28 treats omitted/zero xPaddingBytes as
+        // its own 100..1000 default, so omission could never mean "NONE".
+        xhttpSettings
+            .put("xPaddingBytes", renderXhttpRange(config.paddingMinBytes, config.paddingMaxBytes))
+            .put("xPaddingObfsMode", true)
+            .put("xPaddingPlacement", config.paddingPlacement.wireValue)
+            .put("xPaddingMethod", "repeat-x")
+
+        val streamSettings = JSONObject()
+            .put("network", "xhttp")
+            .put("security", "tls")
+            .put("tlsSettings", tlsSettings)
+            .put("xhttpSettings", xhttpSettings)
+
+        return JSONObject()
+            .put("tag", VLESS_XHTTP_OUTBOUND_TAG)
+            .put("protocol", "vless")
+            .put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
+            .put("streamSettings", streamSettings)
+    }
+
+    private fun renderXhttpPathAndQuery(config: XrayVlessXhttpConfig): String {
+        if (config.queryParameters.isEmpty()) return config.xhttpPath
+        val query = config.queryParameters.toSortedMap().entries.joinToString("&") { (key, value) ->
+            "${encodeXhttpQueryComponent(key)}=${encodeXhttpQueryComponent(value)}"
+        }
+        return "${config.xhttpPath}?$query"
+    }
+
+    private fun encodeXhttpQueryComponent(value: String): String =
+        URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
+
+    private fun renderXhttpRange(from: Int, to: Int): Any =
+        if (from == to) from else "$from-$to"
 }

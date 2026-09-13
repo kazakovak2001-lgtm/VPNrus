@@ -1,0 +1,90 @@
+# B35 FOUNDATION ONLY - operator-controlled CDN origin frontend.
+#
+# DO NOT install verbatim. Replace every REPLACE_WITH_* value and validate
+# with `nginx -t` before deployment.
+#
+# Data plane:
+#   Android -> operator CDN edge -> HTTPS origin nginx
+#           -> 127.0.0.1:2100 -> Xray XHTTP inbound -> authenticated EXIT
+#
+# The Xray backend is loopback-only. There must be NO cloud
+# firewall/security-group rule exposing TCP/2100.
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name REPLACE_WITH_ORIGIN_TLS_SERVER_NAME;
+
+    server_tokens off;
+
+    ssl_certificate     REPLACE_WITH_ORIGIN_CERTIFICATE_FILE;
+    ssl_certificate_key REPLACE_WITH_ORIGIN_PRIVATE_KEY_FILE;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    access_log /var/log/nginx/pocvpn-cdn-origin-access.log combined;
+    error_log  /var/log/nginx/pocvpn-cdn-origin-error.log warn;
+
+    # Optional ordinary first-party content. The tunnel is not a catch-all.
+    root /var/www/pocvpn-cdn-origin;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # Prefix, not exact match: pinned Xray v26.7.28 defaults session and
+    # sequence placement to "path" and appends them below this base path.
+    # This literal first-slice path MUST equal the signed provider profile's
+    # xhttp.path and NOVA_INGRESS_XHTTP_PATH.
+    location ^~ /nova-xhttp/ {
+        # SECURITY BOUNDARY:
+        # The tunnel origin must not be reachable directly from arbitrary
+        # Internet clients. Replace this placeholder with an official/current
+        # source CIDR published by the selected CDN. Duplicate the allow line
+        # for every required CDN source range. The final deny is mandatory.
+        #
+        # Leaving the placeholder unchanged intentionally makes nginx -t fail,
+        # preventing accidental deployment of an unrestricted origin.
+        allow REPLACE_WITH_CDN_SOURCE_CIDR;
+        deny all;
+
+        # First executable server slice is packet-up + POST. Packet-up uses
+        # GET for the downstream request and POST for uplink packets.
+        limit_except GET POST {
+            deny all;
+        }
+
+        # No URI part after the upstream address. nginx therefore preserves
+        # /nova-xhttp/<session>/<seq> exactly for Xray.
+        proxy_pass http://127.0.0.1:2100;
+        proxy_http_version 1.1;
+
+        # Fixed operator-controlled Host, never copied from the untrusted
+        # incoming Host. MUST equal NOVA_INGRESS_XHTTP_HOST and the signed
+        # provider profile's requests.originHostHeader deployment value.
+        proxy_set_header Host REPLACE_WITH_ORIGIN_HOST_HEADER;
+        proxy_set_header Connection "";
+
+        # Do not turn a live XHTTP tunnel into a cacheable web object.
+        # These directives govern this origin nginx. The selected CDN's own
+        # cache behavior still requires real provider validation.
+        proxy_cache off;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        add_header Cache-Control "no-store" always;
+
+        # Stream both directions rather than accumulating a tunnel request
+        # or response in nginx.
+        proxy_request_buffering off;
+        proxy_buffering off;
+
+        # Edge ceiling only. Xray independently enforces the signed/provider
+        # packet ceiling through scMaxEachPostBytes. Keep this >= the
+        # deployed NOVA_INGRESS_XHTTP_MAX_EACH_POST_BYTES.
+        client_max_body_size 1m;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        # Inactivity timeout, not a total VPN-session lifetime.
+        proxy_read_timeout 10m;
+    }
+}

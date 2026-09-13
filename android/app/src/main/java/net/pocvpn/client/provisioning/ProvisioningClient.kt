@@ -143,14 +143,36 @@ object ProvisioningClient {
      * decides whether/how to save a [IngressProfileResult.Success] into
      * [net.pocvpn.client.relay.IngressProfileStore].
      */
-    fun fetchIngressProfile(publicKey: String, bearerToken: String, endpointHost: String, useTls: Boolean): IngressProfileResult =
-        executeIngressProfile(
-            if (useTls) {
-                buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost).copy(url = "https://$endpointHost/v1/ingress-profile")
-            } else {
-                buildXrayProfileRequest(publicKey, bearerToken, endpointHost).copy(url = "https://$endpointHost/v1/ingress-profile")
-            },
-        )
+    fun fetchIngressProfile(
+        publicKey: String,
+        bearerToken: String,
+        controlPlaneHost: String,
+        transport: IngressProfileTransport,
+    ): IngressProfileResult =
+        executeIngressProfile(buildIngressProfileRequest(publicKey, bearerToken, controlPlaneHost, transport))
+
+    internal fun buildIngressProfileRequest(
+        publicKey: String,
+        bearerToken: String,
+        controlPlaneHost: String,
+        transport: IngressProfileTransport,
+    ): OutgoingRequest = when (transport) {
+        IngressProfileTransport.REALITY ->
+            buildXrayProfileRequest(publicKey, bearerToken, controlPlaneHost)
+                .copy(url = "https://$controlPlaneHost/v1/ingress-profile")
+        IngressProfileTransport.TLS ->
+            buildXrayTlsProfileRequest(publicKey, bearerToken, controlPlaneHost)
+                .copy(url = "https://$controlPlaneHost/v1/ingress-profile")
+        IngressProfileTransport.XHTTP ->
+            OutgoingRequest(
+                url = "https://$controlPlaneHost/v1/ingress-profile",
+                headers = authHeaders(bearerToken),
+                body = JSONObject()
+                    .put("public_key", publicKey)
+                    .put("transport", transport.wireValue)
+                    .toString(),
+            )
+    }
 
     private fun executeIngressProfile(request: OutgoingRequest): IngressProfileResult =
         executeGeneric(request, IngressProfileResult::NetworkError, ::mapIngressProfileResponse)
@@ -209,6 +231,13 @@ object ProvisioningClient {
             net.pocvpn.client.reachability.IngressKind.entries.firstOrNull { it.name == ingressKindRaw }
                 ?: return IngressProfileResult.MalformedResponse("ingress_kind not recognized: $ingressKindRaw")
         }
+        val isRealityShaped = json.has("flow") || json.has("reality_public_key") || json.has("short_id")
+        val transport = if (json.has("transport") && !json.isNull("transport")) {
+            IngressProfileTransport.fromWireValue(json.optString("transport", ""))
+                ?: return IngressProfileResult.MalformedResponse("transport not recognized")
+        } else {
+            if (isRealityShaped) IngressProfileTransport.REALITY else IngressProfileTransport.TLS
+        }
 
         if (ingressEndpointId.isBlank()) {
             return IngressProfileResult.MalformedResponse("ingress_endpoint_id missing or blank")
@@ -222,12 +251,7 @@ object ProvisioningClient {
         if (!UUID_REGEX.matches(uuid)) {
             return IngressProfileResult.MalformedResponse("uuid missing or not a well-formed UUID")
         }
-        if (serverName.isBlank()) {
-            return IngressProfileResult.MalformedResponse("server_name missing or blank")
-        }
-        if (fingerprint.isBlank()) {
-            return IngressProfileResult.MalformedResponse("fingerprint missing or blank")
-        }
+
         if (profileVersion < 0) {
             return IngressProfileResult.MalformedResponse("profile_version missing")
         }
@@ -241,21 +265,37 @@ object ProvisioningClient {
             return IngressProfileResult.MalformedResponse("probe_token missing")
         }
 
-        // TLS responses carry no flow/realityPublicKey/shortId at all (see
-        // handler.py's own transport-shaped payload) - only validate those
-        // three when the caller actually asked for REALITY (useTls=false),
-        // exactly mirroring parseXrayProfileSuccessBody/parseXrayTlsProfileSuccessBody's
-        // own split, just folded into one response shape here since a
-        // single ingress-profile response always carries exactly the
-        // fields its own transport implies.
-        val isRealityShaped = json.has("flow") || json.has("reality_public_key") || json.has("short_id")
-        if (isRealityShaped) {
-            if (flow.isBlank()) return IngressProfileResult.MalformedResponse("flow missing or blank")
-            if (!REALITY_KEY_REGEX.matches(realityPublicKey)) {
-                return IngressProfileResult.MalformedResponse("reality_public_key missing or not a well-formed public key")
+        when (transport) {
+            IngressProfileTransport.REALITY -> {
+                if (!isRealityShaped) return IngressProfileResult.MalformedResponse("REALITY response carries no REALITY fields")
+                if (serverName.isBlank()) return IngressProfileResult.MalformedResponse("server_name missing or blank")
+                if (fingerprint.isBlank()) return IngressProfileResult.MalformedResponse("fingerprint missing or blank")
+                if (flow.isBlank()) return IngressProfileResult.MalformedResponse("flow missing or blank")
+                if (!REALITY_KEY_REGEX.matches(realityPublicKey)) {
+                    return IngressProfileResult.MalformedResponse("reality_public_key missing or not a well-formed public key")
+                }
+                if (!SHORT_ID_REGEX.matches(shortId)) {
+                    return IngressProfileResult.MalformedResponse("short_id missing or not well-formed hex")
+                }
             }
-            if (!SHORT_ID_REGEX.matches(shortId)) {
-                return IngressProfileResult.MalformedResponse("short_id missing or not well-formed hex")
+            IngressProfileTransport.TLS -> {
+                if (isRealityShaped) return IngressProfileResult.MalformedResponse("TLS response carries REALITY fields")
+                if (serverName.isBlank()) return IngressProfileResult.MalformedResponse("server_name missing or blank")
+                if (fingerprint.isBlank()) return IngressProfileResult.MalformedResponse("fingerprint missing or blank")
+            }
+            IngressProfileTransport.XHTTP -> {
+                if (ingressKind != net.pocvpn.client.reachability.IngressKind.CDN_FRONTED) {
+                    return IngressProfileResult.MalformedResponse("XHTTP response is not CDN_FRONTED")
+                }
+                if (isRealityShaped) return IngressProfileResult.MalformedResponse("XHTTP response carries REALITY fields")
+                val allowedKeys = setOf(
+                    "ingress_endpoint_id", "ingress_kind", "transport",
+                    "server_address", "server_port", "uuid", "profile_version",
+                    "issued_at", "expires_at", "probe_url", "probe_token",
+                )
+                if (json.keys().asSequence().toSet() != allowedKeys) {
+                    return IngressProfileResult.MalformedResponse("XHTTP response contains unexpected policy fields")
+                }
             }
         }
 
@@ -271,6 +311,7 @@ object ProvisioningClient {
             realityPublicKey = realityPublicKey.ifBlank { null },
             shortId = shortId.ifBlank { null },
             isRealityShaped = isRealityShaped,
+            transport = transport,
             profileVersion = profileVersion,
             issuedAtEpochSeconds = issuedAt,
             expiresAtEpochSeconds = expiresAt,

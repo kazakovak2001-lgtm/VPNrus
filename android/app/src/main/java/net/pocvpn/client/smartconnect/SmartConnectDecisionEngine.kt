@@ -25,6 +25,8 @@ object SmartConnectDecisionEngine {
         TransportKind.AMNEZIA_WG,
         TransportKind.QUIC,
         TransportKind.XRAY_REALITY,
+        // Foundation only: remains NOT_IMPLEMENTED until real XHTTP execution is wired.
+        TransportKind.XRAY_XHTTP,
         TransportKind.TLS_TCP,
     )
 

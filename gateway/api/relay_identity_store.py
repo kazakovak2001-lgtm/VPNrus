@@ -90,28 +90,70 @@ def load_static_clients(path):
 
 
 def _write_entries(path, entries):
-    """Atomic write, restrictive 0600 (a vless_uuid is exactly as secret as
-    any other client's - never world-readable), same mkstemp/replace
-    discipline as activations._atomic_write_store."""
+    """Atomically write the static relay trust store without destroying
+    its operator-established access metadata.
+
+    New files default to restrictive 0600. For an existing store, only
+    exact 0600 and 0640 permission modes are accepted; special permission
+    bits are rejected. Its uid/gid/mode are preserved across the atomic
+    inode replacement. This keeps an operator-owned root:pocvpn-api 0640
+    production store readable by pocvpn-api without granting the service
+    write access.
+    """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
+
+    try:
+        prior_stat = os.stat(path)
+    except FileNotFoundError:
+        prior_stat = None
+
+    prior_mode = None
+    if prior_stat is not None:
+        prior_mode = prior_stat.st_mode & 0o7777
+        if prior_mode not in (0o600, 0o640):
+            raise RelayIdentityStoreError(
+                f"refusing to replace {path}: existing mode "
+                f"{oct(prior_mode)} is not 0o600 or 0o640"
+            )
+
     canonical = sorted(entries, key=lambda e: e["activation_id"])
-    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".relay-identities.", suffix=".tmp")
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=".relay-identities.",
+        suffix=".tmp",
+    )
+
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(canonical, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_path, 0o600)
+
+        if prior_stat is None:
+            os.chmod(tmp_path, 0o600)
+        else:
+            tmp_stat = os.stat(tmp_path)
+            if (
+                tmp_stat.st_uid != prior_stat.st_uid
+                or tmp_stat.st_gid != prior_stat.st_gid
+            ):
+                os.chown(
+                    tmp_path,
+                    prior_stat.st_uid,
+                    prior_stat.st_gid,
+                )
+            os.chmod(tmp_path, prior_mode)
+
         os.replace(tmp_path, path)
+
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
-
 
 def upsert(path, activation_id, device_public_key, vless_uuid):
     """Idempotent: applying the SAME (activation_id, device_public_key,

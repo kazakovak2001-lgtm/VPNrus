@@ -274,12 +274,21 @@ class ConcurrencyTests(ActivationTestBase):
         decisions = []
         decisions_lock = threading.Lock()
         start_barrier = threading.Barrier(2)
+        decision_barrier = threading.Barrier(2)
 
         def attempt():
             start_barrier.wait(timeout=10)
             decision = activations_module.decide_and_bind(credential, self.key_a, self.store_path, self.lock_path)
             with decisions_lock:
                 decisions.append(decision)
+
+            # Keep the first reservation present until BOTH racing calls
+            # have completed decide_and_bind(). Without this barrier, the
+            # BOUND_NEW owner may roll back before its peer has decided,
+            # turning this test into two sequential BOUND_NEW attempts
+            # instead of the same-key race it is intended to prove.
+            decision_barrier.wait(timeout=10)
+
             if decision.reservation_id:
                 # This thread owns the reservation - simulate its
                 # provisioning FAILING and rolling back.

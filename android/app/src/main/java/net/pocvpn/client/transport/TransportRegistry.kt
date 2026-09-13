@@ -51,6 +51,11 @@ class TransportRegistry private constructor(
                     capabilities = TransportCapabilities.notImplemented(),
                 ),
                 TransportDescriptor(
+                    kind = TransportKind.XRAY_XHTTP,
+                    status = TransportStatus.NOT_IMPLEMENTED,
+                    capabilities = TransportCapabilities.notImplemented(),
+                ),
+                TransportDescriptor(
                     kind = TransportKind.QUIC,
                     status = TransportStatus.NOT_IMPLEMENTED,
                     capabilities = TransportCapabilities.notImplemented(),

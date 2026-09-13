@@ -2,9 +2,22 @@ package net.pocvpn.client.relay
 
 import kotlinx.coroutines.runBlocking
 import net.pocvpn.client.provisioning.IngressProfileResult
+import net.pocvpn.client.provisioning.IngressProfileTransport
+import net.pocvpn.client.reachability.CdnCachePolicy
+import net.pocvpn.client.reachability.CdnHostnames
+import net.pocvpn.client.reachability.CdnMinimumTlsVersion
+import net.pocvpn.client.reachability.CdnPaddingPlacement
+import net.pocvpn.client.reachability.CdnProviderCapabilityProfile
+import net.pocvpn.client.reachability.CdnRequestPolicy
+import net.pocvpn.client.reachability.CdnTlsPolicy
+import net.pocvpn.client.reachability.CdnUplinkHttpMethod
+import net.pocvpn.client.reachability.CdnXhttpMode
+import net.pocvpn.client.reachability.CdnXhttpPolicy
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
+import net.pocvpn.client.reachability.withCdnProviderProfile
+import net.pocvpn.client.reachability.withIngressKind
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -119,6 +132,120 @@ class IngressProfileProvisionerTest {
 
         assertTrue(outcome is IngressActivationOutcome.UnsupportedTransport)
         assertTrue("must fail before ever making a network call", !called)
+    }
+
+    @Test
+    fun `XRAY_XHTTP fetches from signed control plane and persists signed edge policy`() = runBlocking {
+        val exitId = EndpointId("exit-a")
+        val cdnProfile = CdnProviderCapabilityProfile(
+            provider = "provider-a",
+            asn = 64512,
+            hosts = CdnHostnames(
+                "edge.example.org",
+                "technical.example.org",
+                "origin.example.org",
+                "origin.example.org",
+                "control.example.org",
+            ),
+            xhttp = CdnXhttpPolicy(
+                CdnXhttpMode.PACKET_UP,
+                "/xhttp/",
+                CdnUplinkHttpMethod.POST,
+                CdnPaddingPlacement.QUERY,
+                1,
+                64,
+                emptyMap(),
+                emptyMap(),
+                emptyMap(),
+            ),
+            tls = CdnTlsPolicy(
+                CdnMinimumTlsVersion.TLS_1_3,
+                setOf("h2"),
+                "signed-sni.example.org",
+                "chrome",
+            ),
+            requests = CdnRequestPolicy(
+                "origin.example.org",
+                CdnCachePolicy.BYPASS_REQUIRED,
+                true,
+                524288,
+                30000,
+            ),
+            supportedExits = setOf(exitId),
+            minimumClientVersionCode = 1,
+            minimumXrayCoreVersion = "26.7.28",
+            requiredClientCapabilities = setOf("xhttp", "cdn-profile-v2"),
+        )
+        val xhttpBinding =
+            EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example.org", 443)
+                .withIngressKind(IngressKind.CDN_FRONTED)
+                .withCdnProviderProfile(cdnProfile)
+
+        var requestedHost: String? = null
+        var requestedTransport: IngressProfileTransport? = null
+        val store = InMemoryIngressProfileStore()
+        val provisioner = IngressProfileProvisioner(
+            store,
+            fetchIngressProfile = { _, _, host, transport ->
+                requestedHost = host
+                requestedTransport = transport
+                successResult(
+                    ingressKind = IngressKind.CDN_FRONTED,
+                    serverAddress = "edge.example.org",
+                    serverPort = 443,
+                    isRealityShaped = false,
+                ).copy(
+                    transport = IngressProfileTransport.XHTTP,
+                    serverName = "",
+                    fingerprint = "",
+                )
+            },
+        )
+
+        val outcome = provisioner.provision(
+            endpointId,
+            xhttpBinding,
+            TransportKind.XRAY_XHTTP,
+            IngressKind.CDN_FRONTED,
+            "pubkey",
+            "cred",
+        )
+
+        assertTrue(outcome is IngressActivationOutcome.Saved)
+        assertEquals("control.example.org", requestedHost)
+        assertEquals(IngressProfileTransport.XHTTP, requestedTransport)
+        val saved = store.getProfileOrNull(endpointId)!!
+        assertEquals(xhttpBinding, saved.ingressBinding)
+        assertEquals("edge.example.org", saved.tlsProfile?.server)
+        assertEquals("signed-sni.example.org", saved.tlsProfile?.serverName)
+        assertEquals("chrome", saved.tlsProfile?.fingerprint)
+    }
+
+    @Test
+    fun `XRAY_XHTTP missing signed profile fails before network`() = runBlocking {
+        var called = false
+        val provisioner = IngressProfileProvisioner(
+            InMemoryIngressProfileStore(),
+            fetchIngressProfile = { _, _, _, _ ->
+                called = true
+                successResult()
+            },
+        )
+        val xhttpBinding =
+            EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example.org", 443)
+                .withIngressKind(IngressKind.CDN_FRONTED)
+
+        val outcome = provisioner.provision(
+            endpointId,
+            xhttpBinding,
+            TransportKind.XRAY_XHTTP,
+            IngressKind.CDN_FRONTED,
+            "pubkey",
+            "cred",
+        )
+
+        assertTrue(outcome is IngressActivationOutcome.Mismatched)
+        assertFalse(called)
     }
 
     // --- ensureFreshProfile: the bounded refresh policy (task E) ---

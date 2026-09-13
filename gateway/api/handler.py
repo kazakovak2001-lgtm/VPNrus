@@ -52,7 +52,11 @@ _PATH_RELAY_HEALTH = "/v1/relay-health"
 # is what lets ingress_config.py compute a historyPathId that matches
 # PathCandidate.Relayed.historyPathId byte-for-byte without either side
 # depending on the other's source.
-_TRANSPORT_KIND_NAMES = {"reality": "XRAY_REALITY", "tls": "TLS_TCP"}
+_TRANSPORT_KIND_NAMES = {
+    "reality": "XRAY_REALITY",
+    "tls": "TLS_TCP",
+    "xhttp": "XRAY_XHTTP",
+}
 _MAX_BODY_BYTES = 1024
 _MAX_MANIFEST_BYTES = 1_000_000
 _BEARER_PREFIX = "Bearer "
@@ -568,13 +572,27 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         credential = self._require_bearer_token()
 
         raw_body = self.rfile.read(content_length)
-        public_key, transport = self._parse_and_validate_xray_profile_body(raw_body)
+        public_key, transport = self._parse_and_validate_xray_profile_body(
+            raw_body,
+            allowed_transports=("reality", "tls", "xhttp"),
+        )
         self._log_fields["pubkey_prefix"] = public_key[:8]
         self._log_fields["ingress_transport"] = transport
         self._log_fields["ingress_endpoint_id"] = ingress_cfg.ingress_endpoint_id
 
         if transport == "tls" and not ingress_cfg.ingress_tls_server_port:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_tls_not_configured")
+
+        if transport == "xhttp" and (
+            ingress_cfg.ingress_kind != "cdn_fronted"
+            or not ingress_cfg.ingress_xhttp_client_host
+            or not ingress_cfg.ingress_xhttp_client_port
+            or not ingress_cfg.ingress_xhttp_server_port
+        ):
+            raise _RequestError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "ingress_xhttp_not_configured",
+            )
 
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
@@ -624,7 +642,15 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             else None
         )
 
-        if transport == "tls":
+        if transport == "xhttp":
+            payload = {
+                "ingress_endpoint_id": ingress_cfg.ingress_endpoint_id,
+                "transport": "xhttp",
+                "server_address": ingress_cfg.ingress_xhttp_client_host,
+                "server_port": ingress_cfg.ingress_xhttp_client_port,
+                "uuid": identity_outcome.vless_uuid,
+            }
+        elif transport == "tls":
             payload = {
                 "ingress_endpoint_id": ingress_cfg.ingress_endpoint_id,
                 "server_address": ingress_cfg.ingress_endpoint_host,
@@ -666,12 +692,13 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # (HttpRelayEndToEndProbe.probe: `body.contains(plan.historyPathId)`).
         exit_transport_name = _TRANSPORT_KIND_NAMES[ingress_cfg.ingress_upstream_transport]
         history_path_id = (
-            f"{ingress_cfg.ingress_endpoint_id}:{_TRANSPORT_KIND_NAMES[transport]}->"
+            f"{ingress_cfg.ingress_endpoint_id}:{ingress_cfg.ingress_kind.upper()}:"
+            f"{_TRANSPORT_KIND_NAMES[transport]}->"
             f"{ingress_cfg.ingress_exit_endpoint_id}:{exit_transport_name}"
         )
         try:
             with open(ingress_cfg.ingress_probe_hmac_secret_file, "rb") as handle:
-                probe_secret = handle.read().strip()
+                probe_secret = handle.read()
             probe_token = relay_probe_token.mint(
                 probe_secret, history_path_id, public_key, issued_at_epoch_seconds, ingress_cfg.ingress_probe_ttl_seconds,
             )
@@ -723,7 +750,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
         try:
             with open(self.server.config.relay_probe_hmac_secret_file, "rb") as handle:
-                secret = handle.read().strip()
+                secret = handle.read()
             claims = relay_probe_token.verify(secret, token, int(time.time()))
         except (OSError, relay_probe_token.ProbeTokenError):
             raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
@@ -844,7 +871,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
         return public_key
 
-    def _parse_and_validate_xray_profile_body(self, raw_body):
+    def _parse_and_validate_xray_profile_body(
+        self,
+        raw_body,
+        allowed_transports=("reality", "tls"),
+    ):
         """B8O2 - /v1/xray-profile's own body shape: {"public_key": "..."}
         (required, same validation as every other endpoint) plus an OPTIONAL
         {"transport": "reality"|"tls"} - defaulting to "reality" when absent
@@ -867,7 +898,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_public_key")
 
         transport = parsed.get("transport", "reality")
-        if transport not in ("reality", "tls"):
+        if transport not in allowed_transports:
             raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
 
         return public_key, transport

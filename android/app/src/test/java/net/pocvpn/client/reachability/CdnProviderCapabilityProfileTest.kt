@@ -8,24 +8,24 @@ import org.junit.Test
 class CdnProviderCapabilityProfileTest {
     private fun profile() = CdnProviderCapabilityProfile(
         provider = "example-provider", asn = 64512,
-        hosts = CdnHostnames("edge.example.org", "edge.cdn.example.org", "origin.example.org", "tls.origin.example.org"),
+        hosts = CdnHostnames("edge.example.org", "edge.cdn.example.org", "origin.example.org", "tls.origin.example.org", "control.example.org"),
         xhttp = CdnXhttpPolicy(CdnXhttpMode.PACKET_UP, "/tunnel/", CdnUplinkHttpMethod.POST,
-            CdnPaddingPlacement.QUERY, 0, 64, mapOf("padding" to "bounded"),
+            CdnPaddingPlacement.QUERY, 1, 64, mapOf("padding" to "bounded"),
             mapOf("User-Agent" to "Nova-test"), mapOf("policy" to "test-only")),
         tls = CdnTlsPolicy(CdnMinimumTlsVersion.TLS_1_3, setOf("h2"), "edge.example.org", "chrome"),
         requests = CdnRequestPolicy("origin.example.org", CdnCachePolicy.BYPASS_REQUIRED, true, 1048576, 30000),
         supportedExits = setOf(EndpointId("exit-b"), EndpointId("exit-a")),
         minimumClientVersionCode = 1, minimumXrayCoreVersion = "25.8.3",
-        requiredClientCapabilities = setOf("xhttp", "cdn-profile-v1"),
+        requiredClientCapabilities = setOf("xhttp", "cdn-profile-v2"),
     )
 
-    private fun binding() = EndpointTransportBinding(TransportKind.QUIC, "edge.example.org", 443,
+    private fun binding() = EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example.org", 443,
         mapOf("unrelated" to "preserved")).withIngressKind(IngressKind.CDN_FRONTED)
 
     private fun runtime() = CdnClientRuntimeCapabilities(
         clientVersionCode = 1,
         xrayCoreVersion = "25.8.3",
-        clientCapabilities = setOf("xhttp", "cdn-profile-v1"),
+        clientCapabilities = setOf("xhttp", "cdn-profile-v2"),
         xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
         uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
         paddingPlacements = setOf(CdnPaddingPlacement.QUERY),
@@ -50,6 +50,59 @@ class CdnProviderCapabilityProfileTest {
         assertEquals("preserved", b.metadata["unrelated"])
         assertEquals(IngressKind.CDN_FRONTED, b.ingressKind())
         assertEquals("origin.example.org", (b.cdnProviderProfile() as CdnProviderProfileReadResult.Parsed).profile.hosts.originHostname)
+        assertEquals("control.example.org", (b.cdnProviderProfile() as CdnProviderProfileReadResult.Parsed).profile.hosts.controlPlaneHostname)
+    }
+
+
+    @Test fun `control plane authority is signed and required by profile version two`() {
+        val original = binding().withCdnProviderProfile(profile())
+        val rotated = binding().withCdnProviderProfile(
+            profile().copy(hosts = profile().hosts.copy(controlPlaneHostname = "control-2.example.org")),
+        )
+        assertFalse(
+            ManifestCanonicalizer.canonicalBytes(manifest(original))
+                .contentEquals(ManifestCanonicalizer.canonicalBytes(manifest(rotated))),
+        )
+        assertEquals(
+            CdnProviderProfileReadResult.Invalid,
+            mutate { it.getJSONObject("hosts").remove("controlPlaneHostname") }.cdnProviderProfile(),
+        )
+    }
+
+    @Test fun `profile version two is valid only on XRAY_XHTTP CDN bindings`() {
+        val encoded = binding().withCdnProviderProfile(profile()).metadata.getValue("cdnProviderProfile")
+        for (kind in listOf(TransportKind.TLS_TCP, TransportKind.QUIC, TransportKind.XRAY_REALITY)) {
+            val wrong = EndpointTransportBinding(kind, "edge.example.org", 443)
+                .withIngressKind(IngressKind.CDN_FRONTED)
+            assertThrows(IllegalArgumentException::class.java) { wrong.withCdnProviderProfile(profile()) }
+            assertEquals(
+                CdnProviderProfileReadResult.Invalid,
+                wrong.copy(metadata = wrong.metadata + ("cdnProviderProfile" to encoded)).cdnProviderProfile(),
+            )
+        }
+    }
+
+    @Test fun `GET uplink is accepted only for packet-up`() {
+        assertEquals(
+            CdnUplinkHttpMethod.GET,
+            profile().xhttp.copy(uplinkHttpMethod = CdnUplinkHttpMethod.GET).uplinkHttpMethod,
+        )
+        for (mode in listOf(CdnXhttpMode.AUTO, CdnXhttpMode.STREAM_UP, CdnXhttpMode.STREAM_ONE)) {
+            assertThrows(IllegalArgumentException::class.java) {
+                profile().xhttp.copy(mode = mode, uplinkHttpMethod = CdnUplinkHttpMethod.GET)
+            }
+        }
+    }
+
+    @Test fun `streaming XHTTP modes require provider streaming support`() {
+        for (mode in listOf(CdnXhttpMode.STREAM_UP, CdnXhttpMode.STREAM_ONE)) {
+            assertThrows(IllegalArgumentException::class.java) {
+                profile().copy(
+                    xhttp = profile().xhttp.copy(mode = mode),
+                    requests = profile().requests.copy(streamingSupported = false),
+                )
+            }
+        }
     }
 
     @Test fun `legacy binding is missing not invalid and its canonical bytes are unchanged`() {
@@ -82,7 +135,7 @@ class CdnProviderCapabilityProfileTest {
     }
 
     @Test fun `unknown version is distinct and malformed versions never coerce`() {
-        assertEquals(CdnProviderProfileReadResult.UnsupportedVersion, mutate { it.put("version", 2) }.cdnProviderProfile())
+        assertEquals(CdnProviderProfileReadResult.UnsupportedVersion, mutate { it.put("version", 3) }.cdnProviderProfile())
         for (v in listOf<Any>("1", true, 1.5, JSONObject.NULL)) {
             assertEquals(CdnProviderProfileReadResult.Invalid, mutate { it.put("version", v) }.cdnProviderProfile())
         }
@@ -113,6 +166,7 @@ class CdnProviderCapabilityProfileTest {
     @Test fun `hostname URL path and header injection are rejected`() {
         for (host in listOf("https://edge.example.org", "edge.example.org:443", "*.example.org", "a..org", "127.0.0.1", "a\r\nb.org")) {
             assertThrows(IllegalArgumentException::class.java) { profile().hosts.copy(clientFacingHostname = host) }
+            assertThrows(IllegalArgumentException::class.java) { profile().hosts.copy(controlPlaneHostname = host) }
         }
         for (path in listOf("relative", "//other.example.org/", "/path?token=x", "/path#fragment", "/a\r\nb")) {
             assertThrows(IllegalArgumentException::class.java) { profile().xhttp.copy(path = path) }
@@ -170,7 +224,7 @@ class CdnProviderCapabilityProfileTest {
         assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_INVALID),
             binding().copy(metadata = binding().metadata + ("cdnProviderProfile" to "{broken")).cdnClientCompatibility(EndpointId("exit-a"), runtime()))
         assertEquals(CdnClientCompatibility.Incompatible(CdnClientCompatibilityFailure.PROFILE_VERSION_UNSUPPORTED),
-            mutate { it.put("version", 2) }.cdnClientCompatibility(EndpointId("exit-a"), runtime()))
+            mutate { it.put("version", 3) }.cdnClientCompatibility(EndpointId("exit-a"), runtime()))
     }
 
     private fun manifest(b: EndpointTransportBinding) = EndpointManifest(1, 1000, 2000,
