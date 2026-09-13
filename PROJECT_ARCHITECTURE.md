@@ -1437,6 +1437,13 @@ exact remaining physical-deployment sequence (human-approval-gated).
 
 ## CDN_FRONTED Ingress Support (B27) - FOUNDATION
 
+The CDN provider capability profile is a typed, versioned description in the
+existing signed `EndpointTransportBinding.metadata` map (`cdnProviderProfile`).
+Its codec validates fields and the CDN binding/public-host match; it does not
+verify signatures, gate runtime capabilities, or establish reachability. No
+manifest binary-schema change or provider-specific routing branch is introduced.
+Credentials remain outside metadata. See `docs/CDN_PROVIDER_PROFILE.md`.
+
 Threads B23's `IngressKind` (`DIRECT_IP`/`CDN_FRONTED`) - a real type since
 B23, but never consumed anywhere until now - through real candidate
 construction, execution, and provisioning, so both ingress strategies can
