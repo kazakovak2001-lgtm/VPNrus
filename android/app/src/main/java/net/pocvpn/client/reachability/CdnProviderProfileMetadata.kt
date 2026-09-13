@@ -19,7 +19,11 @@ sealed interface CdnProviderProfileReadResult {
 /** Parse only; this is neither a signature verifier nor a runtime capability/reachability gate. */
 fun EndpointTransportBinding.cdnProviderProfile(): CdnProviderProfileReadResult {
     val raw = metadata[CDN_PROFILE_KEY] ?: return CdnProviderProfileReadResult.Missing
-    if (ingressKind() != IngressKind.CDN_FRONTED || raw.toByteArray(Charsets.UTF_8).size > MAX_PROFILE_BYTES) {
+    if (
+        kind != net.pocvpn.client.transport.TransportKind.XRAY_XHTTP ||
+        ingressKind() != IngressKind.CDN_FRONTED ||
+        raw.toByteArray(Charsets.UTF_8).size > MAX_PROFILE_BYTES
+    ) {
         return CdnProviderProfileReadResult.Invalid
     }
     return try {
@@ -40,6 +44,7 @@ fun EndpointTransportBinding.cdnProviderProfile(): CdnProviderProfileReadResult 
 
 /** Preserves unrelated metadata and the existing signed manifest schema. New content still needs signing. */
 fun EndpointTransportBinding.withCdnProviderProfile(profile: CdnProviderCapabilityProfile): EndpointTransportBinding {
+    require(kind == net.pocvpn.client.transport.TransportKind.XRAY_XHTTP)
     require(ingressKind() == IngressKind.CDN_FRONTED)
     require(host.equals(profile.hosts.clientFacingHostname, ignoreCase = true))
     val encoded = encodeProfile(profile)
@@ -59,6 +64,7 @@ private fun encodeProfile(p: CdnProviderCapabilityProfile): String {
             "cdnTechnicalHostname" to p.hosts.cdnTechnicalHostname,
             "originHostname" to p.hosts.originHostname,
             "originTlsServerName" to p.hosts.originTlsServerName,
+            "controlPlaneHostname" to p.hosts.controlPlaneHostname,
         ),
         "xhttp" to mapOf(
             "mode" to p.xhttp.mode.name, "path" to p.xhttp.path,
@@ -100,7 +106,13 @@ private fun decodeProfile(j: JSONObject): CdnProviderCapabilityProfile {
     j.requireFields("version", "provider", "asn", "hosts", "xhttp", "tls", "requests", "supportedExits",
         "minimumClientVersionCode", "minimumXrayCoreVersion", "requiredClientCapabilities")
     val h = j.getJSONObject("hosts").apply {
-        requireFields("clientFacingHostname", "cdnTechnicalHostname", "originHostname", "originTlsServerName")
+        requireFields(
+            "clientFacingHostname",
+            "cdnTechnicalHostname",
+            "originHostname",
+            "originTlsServerName",
+            "controlPlaneHostname",
+        )
     }
     val x = j.getJSONObject("xhttp").apply {
         requireFields("mode", "path", "uplinkHttpMethod", "paddingPlacement", "paddingMinBytes", "paddingMaxBytes",
@@ -114,8 +126,13 @@ private fun decodeProfile(j: JSONObject): CdnProviderCapabilityProfile {
     }
     return CdnProviderCapabilityProfile(
         provider = j.string("provider"), asn = j.integer("asn"),
-        hosts = CdnHostnames(h.string("clientFacingHostname"), h.string("cdnTechnicalHostname"),
-            h.string("originHostname"), h.string("originTlsServerName")),
+        hosts = CdnHostnames(
+            h.string("clientFacingHostname"),
+            h.string("cdnTechnicalHostname"),
+            h.string("originHostname"),
+            h.string("originTlsServerName"),
+            h.string("controlPlaneHostname"),
+        ),
         xhttp = CdnXhttpPolicy(
             CdnXhttpMode.valueOf(x.string("mode")), x.string("path"),
             CdnUplinkHttpMethod.valueOf(x.string("uplinkHttpMethod")),

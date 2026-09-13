@@ -58,7 +58,7 @@ class SmartConnectDecisionEngineTest {
         assertTrue(decision is TransportSelectionDecision.SelectTransport)
         val selected = (decision as TransportSelectionDecision.SelectTransport).kind
         assertEquals(TransportKind.AMNEZIA_WG, selected)
-        assertTrue(selected != TransportKind.XRAY_REALITY && selected != TransportKind.QUIC && selected != TransportKind.TLS_TCP)
+        assertTrue(selected != TransportKind.XRAY_REALITY && selected != TransportKind.XRAY_XHTTP && selected != TransportKind.QUIC && selected != TransportKind.TLS_TCP)
     }
 
     @Test
@@ -71,10 +71,26 @@ class SmartConnectDecisionEngineTest {
 
     @Test
     fun `manual selection of a NOT_IMPLEMENTED transport is blocked, never faked`() {
-        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.QUIC, TransportKind.TLS_TCP)) {
+        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.XRAY_XHTTP, TransportKind.QUIC, TransportKind.TLS_TCP)) {
             val decision = SmartConnectDecisionEngine.decide(usableProfile(), registryWithAwg, UserTransportPreference.Manual(kind))
             assertEquals("manual $kind must be blocked", TransportSelectionDecision.UserPolicyBlocked, decision)
         }
+    }
+
+
+    @Test
+    fun `preferred order explicitly contains every transport kind including XHTTP`() {
+        assertEquals(TransportKind.entries.toSet(), SmartConnectDecisionEngine.PREFERRED_ORDER.toSet())
+        assertEquals(
+            listOf(
+                TransportKind.AMNEZIA_WG,
+                TransportKind.QUIC,
+                TransportKind.XRAY_REALITY,
+                TransportKind.XRAY_XHTTP,
+                TransportKind.TLS_TCP,
+            ),
+            SmartConnectDecisionEngine.PREFERRED_ORDER,
+        )
     }
 
     @Test

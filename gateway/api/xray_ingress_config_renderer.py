@@ -33,6 +33,13 @@ from . import xray_config_renderer as base
 _SUPPORTED_UPSTREAM_TRANSPORTS = ("reality", "tls")
 _REALITY_PUBLIC_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,16}$")
+_XHTTP_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?=.*[A-Za-z])"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+_SUPPORTED_XHTTP_ORIGIN_MODES = ("packet-up",)
+_SUPPORTED_XHTTP_PADDING_PLACEMENTS = ("header", "query")
 # B31C - same pinned constant as ingress_config.py's own
 # _SUPPORTED_UPSTREAM_FLOWS (that module's docstring has the full "why") -
 # duplicated here deliberately: this renderer is called directly by tests
@@ -91,6 +98,32 @@ class UpstreamExitConfig:
         self.short_id = short_id
         self.sni = sni
         self.flow = flow
+
+
+class XhttpOriginInboundConfig:
+    """Private CDN-origin XHTTP backend. Listen address is intentionally not configurable."""
+
+    def __init__(
+        self,
+        listen_port,
+        host,
+        path,
+        mode,
+        max_each_post_bytes,
+        padding_placement,
+        padding_min_bytes,
+        padding_max_bytes,
+        inbound_tag="nova-client-xhttp-in",
+    ):
+        self.listen_port = listen_port
+        self.host = host
+        self.path = path
+        self.mode = mode
+        self.max_each_post_bytes = max_each_post_bytes
+        self.padding_placement = padding_placement
+        self.padding_min_bytes = padding_min_bytes
+        self.padding_max_bytes = padding_max_bytes
+        self.inbound_tag = inbound_tag
 
 
 def _validate_upstream(upstream):
@@ -164,7 +197,69 @@ def _render_upstream_outbound(upstream):
     }
 
 
-def render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=None, flow=""):
+def _validate_xhttp_origin(xhttp):
+    if not (1 <= xhttp.listen_port <= 65535):
+        raise IngressConfigRenderError("invalid XHTTP origin listen_port")
+    if not xhttp.host or not _XHTTP_HOST_RE.match(xhttp.host):
+        raise IngressConfigRenderError("XHTTP origin host must be an ASCII DNS hostname")
+    if (
+        not xhttp.path
+        or not xhttp.path.startswith("/")
+        or xhttp.path.startswith("//")
+        or not xhttp.path.endswith("/")
+        or "?" in xhttp.path
+        or "#" in xhttp.path
+        or "\\" in xhttp.path
+        or any(ord(ch) < 33 or ord(ch) > 126 for ch in xhttp.path)
+    ):
+        raise IngressConfigRenderError("XHTTP origin path must be a normalized trailing-slash ASCII path")
+    if xhttp.mode not in _SUPPORTED_XHTTP_ORIGIN_MODES:
+        raise IngressConfigRenderError(
+            f"XHTTP origin mode must be one of {_SUPPORTED_XHTTP_ORIGIN_MODES}"
+        )
+    if not (1 <= xhttp.max_each_post_bytes <= 2_147_483_647):
+        raise IngressConfigRenderError("XHTTP max_each_post_bytes must be a positive int32")
+    if xhttp.padding_placement not in _SUPPORTED_XHTTP_PADDING_PLACEMENTS:
+        raise IngressConfigRenderError(
+            "XHTTP padding must be explicit header/query; pinned core cannot represent disabled padding"
+        )
+    if not (1 <= xhttp.padding_min_bytes <= xhttp.padding_max_bytes <= 65536):
+        raise IngressConfigRenderError("XHTTP padding range must be positive and bounded")
+
+
+def _render_xhttp_origin_inbound(clients, xhttp):
+    xhttp_settings = {
+        "host": xhttp.host,
+        "path": xhttp.path,
+        "mode": xhttp.mode,
+        "scMaxEachPostBytes": xhttp.max_each_post_bytes,
+        "xPaddingBytes": (
+            xhttp.padding_min_bytes
+            if xhttp.padding_min_bytes == xhttp.padding_max_bytes
+            else f"{xhttp.padding_min_bytes}-{xhttp.padding_max_bytes}"
+        ),
+        "xPaddingObfsMode": True,
+        "xPaddingPlacement": xhttp.padding_placement,
+        "xPaddingMethod": "repeat-x",
+    }
+    return {
+        "tag": xhttp.inbound_tag,
+        "listen": "127.0.0.1",
+        "port": xhttp.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": base._vless_clients(clients, flow=None),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "none",
+            "xhttpSettings": xhttp_settings,
+        },
+    }
+
+
+def render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=None, flow="", xhttp=None):
     """B24 - the real ingress relay config: the SAME client-facing
     inbound(s) `xray_config_renderer.render_server_config` already produces
     (identity/authorization reuse - task requirement 7/8, never a second/
@@ -187,6 +282,8 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
     base._validate_reality_server_config(reality)
     if tls is not None:
         base._validate_tls_server_config(tls)
+    if xhttp is not None:
+        _validate_xhttp_origin(xhttp)
     _validate_upstream(upstream)
 
     clients = base._active_clients(activations_data, xray_data)
@@ -196,6 +293,9 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
     if tls is not None:
         inbounds.append(base._render_tls_inbound(clients, tls))
         inbound_tags.append(tls.inbound_tag)
+    if xhttp is not None:
+        inbounds.append(_render_xhttp_origin_inbound(clients, xhttp))
+        inbound_tags.append(xhttp.inbound_tag)
 
     return {
         "log": {"loglevel": "warning"},
@@ -210,7 +310,7 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
     }
 
 
-def render_ingress_server_config_redacted(activations_data, xray_data, reality, upstream, tls=None, flow=""):
+def render_ingress_server_config_redacted(activations_data, xray_data, reality, upstream, tls=None, flow="", xhttp=None):
     """Same as [render_ingress_server_config] but with every secret value
     replaced by a fixed placeholder - the ONLY form of the rendered config
     that may ever be logged, diffed in an error message, or otherwise
@@ -222,7 +322,7 @@ def render_ingress_server_config_redacted(activations_data, xray_data, reality, 
     this module introduces) - REALITY's own `publicKey`/`shortId` for the
     upstream are NOT secrets (a public key and a non-secret short id, by
     design of the REALITY protocol itself) and are left as-is."""
-    full = render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=tls, flow=flow)
+    full = render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=tls, flow=flow, xhttp=xhttp)
     full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     for user in full["outbounds"][0]["settings"]["vnext"][0]["users"]:
         user["id"] = "<redacted>"

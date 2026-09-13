@@ -8,7 +8,7 @@ transport or evidence of reachability.
 
 The profile is stored as version 1 JSON in the existing transport binding's
 `cdnProviderProfile` metadata string. `withCdnProviderProfile` requires an
-explicit `CDN_FRONTED` binding whose host matches the client-facing hostname.
+explicit `CDN_FRONTED` **XRAY_XHTTP** binding whose host matches the client-facing hostname.
 It preserves unrelated metadata. Objects and sets are written in deterministic
 order, within the existing 4096-byte metadata value and 64-entry limits.
 The manifest binary format and existing signed bootstrap bytes do not change.
@@ -18,8 +18,9 @@ the existing operator workflow; parsing metadata is not signature verification.
 The model distinguishes:
 
 - Provider identifier and a positive 32-bit ASN, with no built-in provider list.
-- Client-facing hostname, CDN technical hostname, origin hostname, and origin
-  TLS server name. TLS client SNI and the origin Host header are explicit too.
+- Client-facing hostname, CDN technical hostname, origin hostname, origin TLS
+  server name, and a distinct signed control-plane hostname. TLS client SNI
+  and the origin Host header are explicit too.
 - XHTTP mode, path, uplink method, padding placement/range, non-secret query
   parameters, headers, and additional descriptive parameters.
 - Minimum TLS version, ALPN requirements, and a declared client fingerprint.
@@ -33,6 +34,14 @@ query parameters have their own field. Parameters are bounded and reject
 control characters; reserved credential, Host, and framing headers are rejected.
 All metadata must remain non-secret: credentials belong in existing encrypted
 profile stores, including when an operator chooses names for extra parameters.
+
+`controlPlaneHostname` is a signed provisioning authority only. It must never
+be inferred from the CDN edge or origin, and a control-plane response never
+becomes authority for the data plane: Android must still cross-check the
+returned edge host/port against the signed `EndpointTransportBinding`.
+
+Profile v1 is valid only on `XRAY_XHTTP`. Copying the same metadata to
+`TLS_TCP`, `XRAY_REALITY`, `QUIC`, or another transport is rejected fail-closed.
 
 `cdnProviderProfile()` returns `Missing`, `Invalid`, `UnsupportedVersion`, or
 `Parsed`. Missing metadata leaves legacy direct-IP bindings untouched. Required

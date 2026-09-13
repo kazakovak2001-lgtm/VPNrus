@@ -2,6 +2,17 @@ package net.pocvpn.client.provisioning
 
 import net.pocvpn.client.reachability.IngressKind
 
+enum class IngressProfileTransport(val wireValue: String) {
+    REALITY("reality"),
+    TLS("tls"),
+    XHTTP("xhttp");
+
+    companion object {
+        fun fromWireValue(value: String): IngressProfileTransport? =
+            entries.firstOrNull { it.wireValue == value }
+    }
+}
+
 /**
  * B26 (task D) - the outcome of one POST /v1/ingress-profile attempt.
  * Mirrors [XrayProfileResult]'s own shape/reasoning (a distinct wire shape
@@ -38,6 +49,10 @@ sealed class IngressProfileResult {
         val expiresAtEpochSeconds: Long?,
         val probeUrl: String,
         val probeToken: String,
+        // Additive B35 field intentionally LAST to preserve pre-B35
+        // positional constructor calls.
+        val transport: IngressProfileTransport =
+            if (isRealityShaped) IngressProfileTransport.REALITY else IngressProfileTransport.TLS,
     ) : IngressProfileResult()
 
     /** HTTP 401 - unknown/invalid bearer/activation credential. */

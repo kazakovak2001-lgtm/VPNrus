@@ -6,28 +6,31 @@ WRAPPER_COMMIT=c634d1baea97e94320c0bf6a9cf637369c4f11d4
 WRAPPER_COMMIT_DATE=2026-08-20T07:16:03Z
 WRAPPER_LICENSE=LGPL-3.0
 
-# AndroidLibXrayLite's own go.mod pins this exact xray-core commit transitively -
-# recorded here for audit visibility only; the build does not fetch it directly.
+# AndroidLibXrayLite's own go.mod pins this exact xray-core commit transitively.
+# B35 rebuilds that same commit with a tracked, checksummed project patchset.
 XRAY_CORE_REPO=https://github.com/XTLS/Xray-core.git
 XRAY_CORE_TAG=v26.7.28
 XRAY_CORE_COMMIT=5ca6f4b7d4dc20a881d4330e498892697627ec0c
 XRAY_CORE_LICENSE=MPL-2.0
+XRAY_CORE_PATCHSET=nova-b35-xhttp-dial-bound-v1
+XRAY_CORE_PATCH_0001=patches/0001-nova-xhttp-bounded-dial.patch
+XRAY_CORE_PATCH_0001_SHA256=114a7abed6b3b9b6490d1f9740b62b84f3a82df9cf77d45bbc35559e13697445
+XRAY_CORE_PATCH_0001_REASON=project:B35-XHTTP-stalled-dial-bound
 
 GO_VERSION_REQUIRED=1.26
 ANDROID_API_LEVEL=24
 # Upstream golang.org/x/mobile/cmd/gomobile - deliberately NOT a fork (see the
 # comparison doc: sing-box requires its own gomobile fork, this path does not).
 GOMOBILE_SOURCE=golang.org/x/mobile/cmd/gomobile
+# Exact golang.org/x/mobile revision already pinned by WRAPPER_COMMIT's go.mod.
+GOMOBILE_VERSION=v0.0.0-20260709172247-6129f5bee9d5
 
 # Checksum/provenance strategy:
 # 1. WRAPPER_COMMIT above is verified by the build script (git rev-parse HEAD
 #    must match exactly, same pattern as third_party/build-tunnel-wsl.sh's
 #    AmneziaWG pin check) - a moved/force-pushed tag or branch cannot silently
 #    substitute different wrapper code.
-# 2. The exact xray-core dependency content is verified automatically by Go's
-#    own module system: AndroidLibXrayLite's committed go.sum records a
-#    cryptographic hash for every dependency (including xray-core) at
-#    WRAPPER_COMMIT; `go mod verify`/an unmodified `go build` refuses to use
-#    a dependency whose downloaded content does not match go.sum. This is
-#    the SAME assurance level `go.sum` gives any Go build - not a
-#    project-specific mechanism.
+# 2. The build checks out XRAY_CORE_COMMIT directly, verifies HEAD, verifies
+#    the tracked patch SHA-256 above, then requires `git apply --check`.
+# 3. The wrapper uses a local go.mod replace only inside the disposable build
+#    checkout. `go mod verify` still verifies every non-replaced dependency.

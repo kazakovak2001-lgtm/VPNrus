@@ -155,7 +155,7 @@ tasks.matching { it.name.startsWith("pre") && it.name.endsWith("Build") }
 // first app build that touches NovaXrayVpnService/VlessRealityTransport.
 // This is an isolated adapter shell (B8K1B) - XRAY_REALITY stays
 // NOT_IMPLEMENTED in TransportRegistry regardless of this AAR's presence.
-val xrayAar = file("libs/libv2ray-androidlibxraylite-c634d1b.aar")
+val xrayAar = file("libs/libv2ray-androidlibxraylite-c634d1b-nova-b35xhttp1.aar")
 
 tasks.register("checkXrayAar") {
     doFirst {

@@ -67,6 +67,7 @@ enum class CdnClientCompatibilityFailure {
     TLS_FINGERPRINT_UNSUPPORTED,
     ALPN_UNSUPPORTED,
     STREAMING_UNSUPPORTED,
+    CACHE_POLICY_UNSAFE,
     REQUEST_BODY_TOO_LARGE,
     REQUEST_TIMEOUT_TOO_LARGE,
 }
@@ -101,11 +102,19 @@ private fun CdnProviderCapabilityProfile.compatibilityWith(
     if (!runtime.clientCapabilities.containsAll(requiredClientCapabilities)) return incompatible(CdnClientCompatibilityFailure.CLIENT_CAPABILITY_MISSING)
     if (xhttp.mode !in runtime.xhttpModes) return incompatible(CdnClientCompatibilityFailure.XHTTP_MODE_UNSUPPORTED)
     if (xhttp.uplinkHttpMethod !in runtime.uplinkHttpMethods) return incompatible(CdnClientCompatibilityFailure.HTTP_METHOD_UNSUPPORTED)
+    // Pinned Xray-core v26.7.28 normalizes omitted/zero xPaddingBytes to
+    // 100..1000. It therefore cannot truthfully execute a signed NONE policy.
+    if (xhttp.paddingPlacement == CdnPaddingPlacement.NONE) {
+        return incompatible(CdnClientCompatibilityFailure.PADDING_UNSUPPORTED)
+    }
     if (xhttp.paddingPlacement !in runtime.paddingPlacements) return incompatible(CdnClientCompatibilityFailure.PADDING_UNSUPPORTED)
     if (tls.minimumVersion !in runtime.minimumTlsVersions) return incompatible(CdnClientCompatibilityFailure.TLS_VERSION_UNSUPPORTED)
     if (tls.clientFingerprint !in runtime.tlsFingerprints) return incompatible(CdnClientCompatibilityFailure.TLS_FINGERPRINT_UNSUPPORTED)
     if (tls.alpn.intersect(runtime.alpn).isEmpty()) return incompatible(CdnClientCompatibilityFailure.ALPN_UNSUPPORTED)
     if (requests.streamingSupported && !runtime.supportsStreaming) return incompatible(CdnClientCompatibilityFailure.STREAMING_UNSUPPORTED)
+    if (requests.cachePolicy != CdnCachePolicy.BYPASS_REQUIRED) {
+        return incompatible(CdnClientCompatibilityFailure.CACHE_POLICY_UNSAFE)
+    }
     if (requests.maxRequestBodyBytes > runtime.maxRequestBodyBytes) return incompatible(CdnClientCompatibilityFailure.REQUEST_BODY_TOO_LARGE)
     if (requests.requestTimeoutMillis > runtime.maxRequestTimeoutMillis) return incompatible(CdnClientCompatibilityFailure.REQUEST_TIMEOUT_TOO_LARGE)
     return CdnClientCompatibility.Compatible(this)

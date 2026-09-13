@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,7 @@ for _path in (_GATEWAY_DIR, _THIS_DIR):
         sys.path.insert(0, _path)
 
 from api import activations as activations_module
+from api import relay_probe_token
 from _fixtures import RunningServer, make_app_config, make_ingress_config, make_public_key, set_plan, write_fake_provision_script
 from _http import post_activate, post_ingress_profile
 
@@ -130,6 +132,111 @@ class IngressProfileEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         payload = json.loads(body)
         self.assertEqual(payload["ingress_kind"], "CDN_FRONTED")
+
+
+    def test_xhttp_profile_returns_uuid_and_public_cdn_binding_without_route_policy(self):
+        self.ingress_cfg = make_ingress_config(
+            self._tmp.name,
+            ingress_kind="cdn_fronted",
+            ingress_xhttp_client_host="edge.example.org",
+            ingress_xhttp_client_port=443,
+            ingress_xhttp_server_port=2100,
+            ingress_xhttp_host="origin.example.org",
+            ingress_xhttp_path="/nova-xhttp/",
+            ingress_xhttp_mode="packet-up",
+            ingress_xhttp_max_each_post_bytes=524288,
+            ingress_xhttp_padding_placement="query",
+            ingress_xhttp_padding_min_bytes=1,
+            ingress_xhttp_padding_max_bytes=64,
+        )
+        self.app_config = make_app_config(
+            self._tmp.name, self.app_config.provision_script_path,
+            activation_store_path=self.ingress_cfg.activation_store_path,
+            activation_lock_path=self.ingress_cfg.activation_lock_path,
+        )
+        self.server.close()
+        self.server = RunningServer(self.app_config, ingress_config=self.ingress_cfg)
+        _activation_id, credential = activations_module.issue_activation(
+            self.ingress_cfg.activation_store_path,
+            self.ingress_cfg.activation_lock_path,
+            max_devices=1,
+        )
+        status, _headers, body = post_ingress_profile(
+            self.server.port,
+            credential=credential,
+            body_obj={"public_key": self.key_a, "transport": "xhttp"},
+        )
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        self.assertEqual("xhttp", payload["transport"])
+        self.assertEqual("CDN_FRONTED", payload["ingress_kind"])
+        self.assertEqual("edge.example.org", payload["server_address"])
+        self.assertEqual(443, payload["server_port"])
+        for forbidden in ("server_name", "fingerprint", "flow", "reality_public_key", "short_id"):
+            self.assertNotIn(forbidden, payload)
+
+        with open(self.ingress_cfg.ingress_probe_hmac_secret_file, "rb") as handle:
+            secret = handle.read().strip()
+        claims = relay_probe_token.verify(secret, payload["probe_token"], int(time.time()))
+        exit_transport = (
+            "XRAY_REALITY"
+            if self.ingress_cfg.ingress_upstream_transport == "reality"
+            else "TLS_TCP"
+        )
+        self.assertEqual(
+            f"{self.ingress_cfg.ingress_endpoint_id}:CDN_FRONTED:XRAY_XHTTP->"
+            f"{self.ingress_cfg.ingress_exit_endpoint_id}:{exit_transport}",
+            claims.history_path_id,
+        )
+
+    def test_xhttp_profile_fails_closed_when_public_binding_exists_but_backend_is_disabled(self):
+        self.ingress_cfg = make_ingress_config(
+            self._tmp.name,
+            ingress_kind="cdn_fronted",
+            ingress_xhttp_client_host="edge.example.org",
+            ingress_xhttp_client_port=443,
+        )
+        self.app_config = make_app_config(
+            self._tmp.name, self.app_config.provision_script_path,
+            activation_store_path=self.ingress_cfg.activation_store_path,
+            activation_lock_path=self.ingress_cfg.activation_lock_path,
+        )
+        self.server.close()
+        self.server = RunningServer(self.app_config, ingress_config=self.ingress_cfg)
+        _activation_id, credential = activations_module.issue_activation(
+            self.ingress_cfg.activation_store_path,
+            self.ingress_cfg.activation_lock_path,
+            max_devices=1,
+        )
+        status, _headers, body = post_ingress_profile(
+            self.server.port,
+            credential=credential,
+            body_obj={"public_key": self.key_a, "transport": "xhttp"},
+        )
+        self.assertEqual(503, status)
+        self.assertIn(b"ingress_xhttp_not_configured", body)
+
+    def test_xhttp_profile_fails_closed_without_public_cdn_binding(self):
+        self.ingress_cfg = make_ingress_config(self._tmp.name, ingress_kind="cdn_fronted")
+        self.app_config = make_app_config(
+            self._tmp.name, self.app_config.provision_script_path,
+            activation_store_path=self.ingress_cfg.activation_store_path,
+            activation_lock_path=self.ingress_cfg.activation_lock_path,
+        )
+        self.server.close()
+        self.server = RunningServer(self.app_config, ingress_config=self.ingress_cfg)
+        _activation_id, credential = activations_module.issue_activation(
+            self.ingress_cfg.activation_store_path,
+            self.ingress_cfg.activation_lock_path,
+            max_devices=1,
+        )
+        status, _headers, body = post_ingress_profile(
+            self.server.port,
+            credential=credential,
+            body_obj={"public_key": self.key_a, "transport": "xhttp"},
+        )
+        self.assertEqual(503, status)
+        self.assertIn(b"ingress_xhttp_not_configured", body)
 
     def test_device_never_activated_against_this_ingress_is_forbidden(self):
         status, _headers, body = post_ingress_profile(self.server.port, credential="unknown-credential", body_obj={"public_key": self.key_a})

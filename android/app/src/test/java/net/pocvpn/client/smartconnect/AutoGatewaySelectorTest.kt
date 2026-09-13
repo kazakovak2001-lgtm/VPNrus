@@ -555,7 +555,7 @@ class AutoGatewaySelectorTest {
         cdnRuntimeCapabilities: CdnClientRuntimeCapabilities = compatibleCdnRuntime(),
     ) = AutoGatewaySelector.buildRelayedCandidates(
         manifestEndpoints = manifestEndpoints,
-        registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+        registryFor = { multiTransportRegistry(TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP) },
         reachabilityFor = reachabilityFor,
         transportHealthFor = transportHealthFor,
         historyFor = { _, _ -> null },
@@ -563,20 +563,20 @@ class AutoGatewaySelectorTest {
     )
 
     private fun cdnBinding(host: String, exitId: EndpointId = germanyId): EndpointTransportBinding =
-        EndpointTransportBinding(TransportKind.TLS_TCP, host, 443)
+        EndpointTransportBinding(TransportKind.XRAY_XHTTP, host, 443)
             .withIngressKind(IngressKind.CDN_FRONTED)
             .withCdnProviderProfile(cdnProfile(host, exitId))
 
     private fun cdnProfile(host: String, exitId: EndpointId = germanyId) = CdnProviderCapabilityProfile(
         provider = "example-provider",
         asn = 64512,
-        hosts = CdnHostnames(host, "edge-cdn.example.org", "origin.example.org", "origin-tls.example.org"),
+        hosts = CdnHostnames(host, "edge-cdn.example.org", "origin.example.org", "origin-tls.example.org", "control.example.org"),
         xhttp = CdnXhttpPolicy(
             mode = CdnXhttpMode.PACKET_UP,
             path = "/xhttp/",
             uplinkHttpMethod = CdnUplinkHttpMethod.POST,
             paddingPlacement = CdnPaddingPlacement.QUERY,
-            paddingMinBytes = 0,
+            paddingMinBytes = 1,
             paddingMaxBytes = 64,
             queryParameters = emptyMap(),
             headers = emptyMap(),
@@ -611,7 +611,7 @@ class AutoGatewaySelectorTest {
         assertEquals(1, candidates.size)
         assertEquals(ingressEndpoint.id, candidates.first().ingressEndpointId)
         assertEquals(exitEndpoint.id, candidates.first().exitEndpointId)
-        assertEquals(TransportKind.TLS_TCP, candidates.first().ingressTransport)
+        assertEquals(TransportKind.XRAY_XHTTP, candidates.first().ingressTransport)
         assertEquals(TransportKind.AMNEZIA_WG, candidates.first().exitTransport)
         // B27 - the candidate's own ingressKind is copied straight off the
         // manifest binding's own withIngressKind(CDN_FRONTED) metadata.
@@ -650,7 +650,7 @@ class AutoGatewaySelectorTest {
     @Test
     fun `CDN_FRONTED ingress without a signed provider profile is excluded fail closed`() {
         val noProfile = ingressEndpoint.copy(
-            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "edge-no-profile.example.org", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+            transports = listOf(EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge-no-profile.example.org", 443).withIngressKind(IngressKind.CDN_FRONTED)),
         )
 
         assertTrue(buildRelayedDefault(manifestEndpoints = listOf(noProfile, exitEndpoint)).isEmpty())
@@ -681,8 +681,13 @@ class AutoGatewaySelectorTest {
 
     @Test
     fun `B27 review fix - the SAME ingress endpoint+transport reclassified from DIRECT_IP to CDN_FRONTED produces a different historyPathId`() {
-        val directCandidate = buildRelayedDefault(manifestEndpoints = listOf(directIpIngressEndpoint, exitEndpoint)).single()
-        val reclassified = directIpIngressEndpoint.copy(
+        val directXhttp = directIpIngressEndpoint.copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge-reclassified.example.org", 443),
+            ),
+        )
+        val directCandidate = buildRelayedDefault(manifestEndpoints = listOf(directXhttp, exitEndpoint)).single()
+        val reclassified = directXhttp.copy(
             transports = listOf(cdnBinding("edge-reclassified.example.org")),
         )
         val cdnCandidate = buildRelayedDefault(manifestEndpoints = listOf(reclassified, exitEndpoint)).single()
@@ -700,24 +705,29 @@ class AutoGatewaySelectorTest {
         // A caller's own recorded evidence store, keyed by the EXACT
         // historyPathId string a real PathHistoryStore would use - only
         // the DIRECT_IP-shaped key has any evidence at all.
-        val directHistoryPathId = "${directIpIngressEndpoint.id.value}:${IngressKind.DIRECT_IP}:TLS_TCP->${exitEndpoint.id.value}:AMNEZIA_WG"
+        val directHistoryPathId = "${directIpIngressEndpoint.id.value}:${IngressKind.DIRECT_IP}:XRAY_XHTTP->${exitEndpoint.id.value}:AMNEZIA_WG"
         val richPositiveHistory = PathHistoryEntry(successCount = 20, failureCount = 0, lastOutcomeEpochMillis = 0L, lastOutcomeSuccess = true)
         val historyFor: (String, TransportKind) -> PathHistoryEntry? = { pathId, _ -> if (pathId == directHistoryPathId) richPositiveHistory else null }
 
-        val reclassifiedToCdn = directIpIngressEndpoint.copy(
+        val directXhttp = directIpIngressEndpoint.copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge-reclassified.example.org", 443),
+            ),
+        )
+        val reclassifiedToCdn = directXhttp.copy(
             transports = listOf(cdnBinding("edge-reclassified.example.org")),
         )
 
         val directCandidates = AutoGatewaySelector.buildRelayedCandidates(
-            manifestEndpoints = listOf(directIpIngressEndpoint, exitEndpoint),
-            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            manifestEndpoints = listOf(directXhttp, exitEndpoint),
+            registryFor = { healthyRegistry(TransportKind.XRAY_XHTTP) },
             reachabilityFor = { id, kind -> relayReachable(id, kind) },
             transportHealthFor = { healthy() },
             historyFor = historyFor,
         )
         val cdnCandidates = AutoGatewaySelector.buildRelayedCandidates(
             manifestEndpoints = listOf(reclassifiedToCdn, exitEndpoint),
-            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            registryFor = { healthyRegistry(TransportKind.XRAY_XHTTP) },
             reachabilityFor = { id, kind -> relayReachable(id, kind) },
             transportHealthFor = { healthy() },
             historyFor = historyFor,
@@ -863,17 +873,17 @@ class AutoGatewaySelectorTest {
         )
         val relayed = AutoGatewaySelector.buildRelayedCandidates(
             manifestEndpoints = listOf(ingressEndpoint, exitTwoTransports),
-            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            registryFor = { healthyRegistry(TransportKind.XRAY_XHTTP) },
             reachabilityFor = { id, kind -> relayReachable(id, kind) },
             transportHealthFor = { healthy() },
             historyFor = { _, _ -> null },
-            preference = UserTransportPreference.Manual(TransportKind.TLS_TCP),
+            preference = UserTransportPreference.Manual(TransportKind.XRAY_XHTTP),
             cdnRuntimeCapabilities = compatibleCdnRuntime(),
         )
-        // The single ingress transport (TLS_TCP) matches the pin, so both of
+        // The single ingress transport (XRAY_XHTTP) matches the pin, so both of
         // the exit's own transports remain viable - the pin never touches exitTransport.
         assertEquals(2, relayed.size)
-        assertTrue(relayed.all { it.ingressTransport == TransportKind.TLS_TCP })
+        assertTrue(relayed.all { it.ingressTransport == TransportKind.XRAY_XHTTP })
         assertEquals(setOf(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP), relayed.map { it.exitTransport }.toSet())
     }
 
@@ -885,7 +895,7 @@ class AutoGatewaySelectorTest {
         assertEquals(ingressEndpoint.transports.single(), candidate.ingressBinding)
         assertEquals("edge.example.org", candidate.ingressBinding.host)
         assertEquals(443, candidate.ingressBinding.port)
-        assertEquals(TransportKind.TLS_TCP, candidate.ingressBinding.kind)
+        assertEquals(TransportKind.XRAY_XHTTP, candidate.ingressBinding.kind)
     }
 
     @Test
@@ -955,7 +965,7 @@ class AutoGatewaySelectorTest {
         )
         val relayed = AutoGatewaySelector.buildRelayedCandidates(
             manifestEndpoints = listOf(ingressEndpoint, exitTwoTransports),
-            registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
+            registryFor = { healthyRegistry(TransportKind.XRAY_XHTTP) },
             reachabilityFor = { id, kind -> relayReachable(id, kind) },
             transportHealthFor = { healthy() },
             historyFor = { _, _ -> null },
@@ -968,7 +978,7 @@ class AutoGatewaySelectorTest {
 
         // Both share the SAME ingress binding (the ingress transport never changed)...
         assertEquals(viaAwgExit.ingressBinding, viaTlsExit.ingressBinding)
-        assertEquals(TransportKind.TLS_TCP, viaAwgExit.ingressBinding.kind)
+        assertEquals(TransportKind.XRAY_XHTTP, viaAwgExit.ingressBinding.kind)
         // ...but each pins its OWN distinct exit binding, independent of the ingress hop.
         assertTrue(viaAwgExit.exitBinding != viaTlsExit.exitBinding)
         assertEquals(TransportKind.AMNEZIA_WG, viaAwgExit.exitBinding.kind)
@@ -990,7 +1000,7 @@ class AutoGatewaySelectorTest {
         gatewayFactsFor = { catalogById[it] },
         provisioned = { it in provisioned },
         clientTunnelIp = { if (it in provisioned) "10.77.0.5" else null },
-        registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP) },
+        registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP) },
         xrayAvailableFor = { false },
         xrayTlsAvailableFor = { false },
         reachabilityFor = reachabilityFor,

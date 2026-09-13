@@ -43,6 +43,15 @@ _SUPPORTED_UPSTREAM_FLOWS = ("xtls-rprx-vision",)
 # convention) and upper-cased only at the HTTP response boundary
 # (handler.py) to match the client's exact enum constant names.
 _SUPPORTED_INGRESS_KINDS = ("direct_ip", "cdn_fronted")
+_DNS_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?=.*[A-Za-z])"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+
+
+_SUPPORTED_XHTTP_ORIGIN_MODES = ("packet-up",)
+_SUPPORTED_XHTTP_PADDING_PLACEMENTS = ("header", "query")
 
 
 class IngressConfigError(Exception):
@@ -75,6 +84,20 @@ class IngressAppConfig:
     ingress_tls_fingerprint: str = ""
     ingress_tls_cert_file: str = ""
     ingress_tls_key_file: str = ""
+
+    # --- B35 public CDN data-plane binding ---
+    ingress_xhttp_client_host: str = ""
+    ingress_xhttp_client_port: int = 0
+
+    # --- B35 private XHTTP origin backend ---
+    ingress_xhttp_server_port: int = 0
+    ingress_xhttp_host: str = ""
+    ingress_xhttp_path: str = ""
+    ingress_xhttp_mode: str = ""
+    ingress_xhttp_max_each_post_bytes: int = 0
+    ingress_xhttp_padding_placement: str = ""
+    ingress_xhttp_padding_min_bytes: int = 0
+    ingress_xhttp_padding_max_bytes: int = 0
 
     # --- ingress -> exit upstream relay identity (task H - NEVER returned to a client) ---
     ingress_upstream_host: str = ""
@@ -217,6 +240,180 @@ def load_ingress_config(env=None):
         if not (1 <= tls_server_port <= 65535):
             raise IngressConfigError(f"{_ENV_PREFIX}TLS_SERVER_PORT out of range: {tls_server_port}")
 
+    xhttp_client_host = _get(env, "XHTTP_CLIENT_HOST")
+    xhttp_client_port_raw = _get(env, "XHTTP_CLIENT_PORT")
+    xhttp_client_port = 0
+
+    if bool(xhttp_client_host) != bool(xhttp_client_port_raw):
+        raise IngressConfigError(
+            f"{_ENV_PREFIX}XHTTP_CLIENT_HOST and "
+            f"{_ENV_PREFIX}XHTTP_CLIENT_PORT must be configured together"
+        )
+
+    if xhttp_client_host:
+        if ingress_kind != "cdn_fronted":
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_CLIENT_* requires "
+                f"{_ENV_PREFIX}KIND=cdn_fronted"
+            )
+
+        if not _DNS_HOSTNAME_RE.match(xhttp_client_host):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_CLIENT_HOST must be an ASCII DNS hostname"
+            )
+
+        try:
+            xhttp_client_port = int(xhttp_client_port_raw)
+        except ValueError as exc:
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_CLIENT_PORT is not an integer"
+            ) from exc
+
+        if not (1 <= xhttp_client_port <= 65535):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_CLIENT_PORT out of range: "
+                f"{xhttp_client_port}"
+            )
+
+    xhttp_origin_names = (
+        "XHTTP_SERVER_PORT",
+        "XHTTP_HOST",
+        "XHTTP_PATH",
+        "XHTTP_MODE",
+        "XHTTP_MAX_EACH_POST_BYTES",
+        "XHTTP_PADDING_PLACEMENT",
+        "XHTTP_PADDING_MIN_BYTES",
+        "XHTTP_PADDING_MAX_BYTES",
+    )
+
+    xhttp_origin_raw = {
+        name: _get(env, name)
+        for name in xhttp_origin_names
+    }
+
+    xhttp_server_port = 0
+    xhttp_host = ""
+    xhttp_path = ""
+    xhttp_mode = ""
+    xhttp_max_each_post_bytes = 0
+    xhttp_padding_placement = ""
+    xhttp_padding_min_bytes = 0
+    xhttp_padding_max_bytes = 0
+
+    if any(xhttp_origin_raw.values()):
+        if ingress_kind != "cdn_fronted":
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP origin backend requires "
+                f"{_ENV_PREFIX}KIND=cdn_fronted"
+            )
+
+        if not xhttp_client_host or not xhttp_client_port:
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_CLIENT_HOST/PORT are required "
+                "with the XHTTP origin backend"
+            )
+
+        missing = [
+            name
+            for name, value in xhttp_origin_raw.items()
+            if not value
+        ]
+
+        if missing:
+            raise IngressConfigError(
+                "incomplete XHTTP origin backend configuration: "
+                + ", ".join(missing)
+            )
+
+        try:
+            xhttp_server_port = int(
+                xhttp_origin_raw["XHTTP_SERVER_PORT"]
+            )
+            xhttp_max_each_post_bytes = int(
+                xhttp_origin_raw["XHTTP_MAX_EACH_POST_BYTES"]
+            )
+            xhttp_padding_min_bytes = int(
+                xhttp_origin_raw["XHTTP_PADDING_MIN_BYTES"]
+            )
+            xhttp_padding_max_bytes = int(
+                xhttp_origin_raw["XHTTP_PADDING_MAX_BYTES"]
+            )
+        except ValueError as exc:
+            raise IngressConfigError(
+                "XHTTP origin numeric fields must be integers"
+            ) from exc
+
+        if not (1 <= xhttp_server_port <= 65535):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_SERVER_PORT out of range"
+            )
+
+        xhttp_host = xhttp_origin_raw["XHTTP_HOST"]
+
+        if not _DNS_HOSTNAME_RE.match(xhttp_host):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_HOST must be an ASCII DNS hostname"
+            )
+
+        xhttp_path = xhttp_origin_raw["XHTTP_PATH"]
+
+        if (
+            not xhttp_path.startswith("/")
+            or xhttp_path.startswith("//")
+            or not xhttp_path.endswith("/")
+            or "?" in xhttp_path
+            or "#" in xhttp_path
+            or "\\" in xhttp_path
+            or any(
+                ord(ch) < 33 or ord(ch) > 126
+                for ch in xhttp_path
+            )
+        ):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_PATH must be a normalized "
+                "trailing-slash ASCII path"
+            )
+
+        xhttp_mode = xhttp_origin_raw["XHTTP_MODE"].lower()
+
+        if xhttp_mode not in _SUPPORTED_XHTTP_ORIGIN_MODES:
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_MODE must be one of "
+                f"{_SUPPORTED_XHTTP_ORIGIN_MODES}"
+            )
+
+        if not (
+            1 <= xhttp_max_each_post_bytes <= 2_147_483_647
+        ):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_MAX_EACH_POST_BYTES "
+                "must be a positive int32"
+            )
+
+        xhttp_padding_placement = (
+            xhttp_origin_raw["XHTTP_PADDING_PLACEMENT"].lower()
+        )
+
+        if (
+            xhttp_padding_placement
+            not in _SUPPORTED_XHTTP_PADDING_PLACEMENTS
+        ):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP_PADDING_PLACEMENT "
+                f"must be one of "
+                f"{_SUPPORTED_XHTTP_PADDING_PLACEMENTS}"
+            )
+
+        if not (
+            1
+            <= xhttp_padding_min_bytes
+            <= xhttp_padding_max_bytes
+            <= 65536
+        ):
+            raise IngressConfigError(
+                f"{_ENV_PREFIX}XHTTP padding range must be "
+                "positive and bounded"
+            )
     upstream_host = require("UPSTREAM_HOST")
     try:
         upstream_port = int(require("UPSTREAM_PORT"))
@@ -318,6 +515,16 @@ def load_ingress_config(env=None):
         ingress_tls_fingerprint=_get(env, "TLS_FINGERPRINT"),
         ingress_tls_cert_file=_get(env, "TLS_CERT_FILE"),
         ingress_tls_key_file=_get(env, "TLS_KEY_FILE"),
+        ingress_xhttp_client_host=xhttp_client_host,
+        ingress_xhttp_client_port=xhttp_client_port,
+        ingress_xhttp_server_port=xhttp_server_port,
+        ingress_xhttp_host=xhttp_host,
+        ingress_xhttp_path=xhttp_path,
+        ingress_xhttp_mode=xhttp_mode,
+        ingress_xhttp_max_each_post_bytes=xhttp_max_each_post_bytes,
+        ingress_xhttp_padding_placement=xhttp_padding_placement,
+        ingress_xhttp_padding_min_bytes=xhttp_padding_min_bytes,
+        ingress_xhttp_padding_max_bytes=xhttp_padding_max_bytes,
         ingress_upstream_host=upstream_host,
         ingress_upstream_port=upstream_port,
         ingress_upstream_transport=upstream_transport,

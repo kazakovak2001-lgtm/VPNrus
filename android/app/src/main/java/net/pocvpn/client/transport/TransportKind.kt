@@ -11,6 +11,8 @@ package net.pocvpn.client.transport
 enum class TransportKind {
     AMNEZIA_WG,
     XRAY_REALITY,
+    /** VLESS over Xray XHTTP; deliberately distinct from generic TLS_TCP. */
     QUIC,
     TLS_TCP,
+    XRAY_XHTTP,
 }

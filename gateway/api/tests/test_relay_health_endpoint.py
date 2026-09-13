@@ -53,7 +53,13 @@ class RelayHealthDirectTokenTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.secret_path = make_relay_probe_hmac_secret_file(self._tmp.name)
+        # Regression: raw binary secret deliberately starts/ends with
+        # whitespace bytes. Readers must preserve those bytes exactly.
+        boundary_secret = b"\x0a" + (b"A" * 30) + b"\x0d"
+        self.secret_path = make_relay_probe_hmac_secret_file(
+            self._tmp.name,
+            content=boundary_secret,
+        )
         with open(self.secret_path, "rb") as handle:
             self.secret = handle.read()
         script_path = write_fake_provision_script(self._tmp.name)
@@ -150,7 +156,7 @@ class RelayHealthRealIngressRoundTripTests(unittest.TestCase):
         self.assertIn("/v1/relay-health", payload["probe_url"])
 
         expected_path = (
-            f"{self.ingress_cfg.ingress_endpoint_id}:XRAY_REALITY->"
+            f"{self.ingress_cfg.ingress_endpoint_id}:DIRECT_IP:XRAY_REALITY->"
             f"{self.ingress_cfg.ingress_exit_endpoint_id}:XRAY_REALITY"
         )
 

@@ -19,9 +19,9 @@ class TransportRegistryTest {
     }
 
     @Test
-    fun `defaults registers XRay QUIC and TLS_TCP as NOT_IMPLEMENTED`() {
+    fun `defaults registers XRay transports QUIC and TLS_TCP as NOT_IMPLEMENTED`() {
         val registry = TransportRegistry.defaults { FakeVpnTransport() }
-        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.QUIC, TransportKind.TLS_TCP)) {
+        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.XRAY_XHTTP, TransportKind.QUIC, TransportKind.TLS_TCP)) {
             val descriptor = registry.descriptorFor(kind)
             assertNotNull("expected a descriptor for $kind", descriptor)
             assertEquals("$kind must be NOT_IMPLEMENTED", TransportStatus.NOT_IMPLEMENTED, descriptor!!.status)
@@ -38,6 +38,7 @@ class TransportRegistryTest {
     fun `createTransport returns null for a NOT_IMPLEMENTED transport - never a fake instance`() {
         val registry = TransportRegistry.defaults { FakeVpnTransport() }
         assertNull(registry.createTransport(TransportKind.XRAY_REALITY))
+        assertNull(registry.createTransport(TransportKind.XRAY_XHTTP))
         assertNull(registry.createTransport(TransportKind.QUIC))
         assertNull(registry.createTransport(TransportKind.TLS_TCP))
     }
@@ -91,6 +92,6 @@ class TransportRegistryTest {
     fun `all() lists every registered kind regardless of status`() {
         val registry = TransportRegistry.defaults { FakeVpnTransport() }
         assertEquals(TransportKind.entries.toSet(), registry.all().map { it.kind }.toSet())
-        assertTrue(registry.all().size == 4)
+        assertTrue(registry.all().size == 5)
     }
 }

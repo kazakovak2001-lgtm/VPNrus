@@ -6,10 +6,13 @@ import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.provisioning.IngressProfileResult
+import net.pocvpn.client.provisioning.IngressProfileTransport
 import net.pocvpn.client.provisioning.ProvisioningClient
+import net.pocvpn.client.reachability.CdnProviderProfileReadResult
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
+import net.pocvpn.client.reachability.cdnProviderProfile
 import net.pocvpn.client.transport.TransportKind
 
 /**
@@ -35,7 +38,7 @@ class IngressProfileProvisioner(
     private val store: IngressProfileStore,
     // Additive seam, same reasoning as XrayProfileProvisioner's own
     // fetchXrayProfile param: defaults to the real network call.
-    private val fetchIngressProfile: (publicKey: String, activationCredential: String, endpointHost: String, useTls: Boolean) -> IngressProfileResult =
+    private val fetchIngressProfile: (publicKey: String, activationCredential: String, controlPlaneHost: String, transport: IngressProfileTransport) -> IngressProfileResult =
         ProvisioningClient::fetchIngressProfile,
     private val nowProvider: () -> Long = System::currentTimeMillis,
     // B30 (task 4/8) - additive nullable collaborator, same convention as
@@ -58,14 +61,30 @@ class IngressProfileProvisioner(
         publicKey: String,
         activationCredential: String,
     ): IngressActivationOutcome {
-        val useTls = when (ingressTransport) {
-            TransportKind.TLS_TCP -> true
-            TransportKind.XRAY_REALITY -> false
+        val requestedTransport = when (ingressTransport) {
+            TransportKind.XRAY_REALITY -> IngressProfileTransport.REALITY
+            TransportKind.TLS_TCP -> IngressProfileTransport.TLS
+            TransportKind.XRAY_XHTTP -> IngressProfileTransport.XHTTP
             else -> return IngressActivationOutcome.UnsupportedTransport
         }
 
+        val signedXhttpProfile = if (requestedTransport == IngressProfileTransport.XHTTP) {
+            if (ingressKind != IngressKind.CDN_FRONTED) {
+                return IngressActivationOutcome.Mismatched("XRAY_XHTTP requires CDN_FRONTED ingress kind")
+            }
+            when (val read = ingressBinding.cdnProviderProfile()) {
+                is CdnProviderProfileReadResult.Parsed -> read.profile
+                else -> return IngressActivationOutcome.Mismatched(
+                    "XRAY_XHTTP binding has no valid signed CDN provider profile",
+                )
+            }
+        } else {
+            null
+        }
+        val controlPlaneHost = signedXhttpProfile?.hosts?.controlPlaneHostname ?: ingressBinding.host
+
         diagnosticsRecorder?.recordProfileFetchStarted()
-        val result = fetchIngressProfile(publicKey, activationCredential, ingressBinding.host, useTls)
+        val result = fetchIngressProfile(publicKey, activationCredential, controlPlaneHost, requestedTransport)
 
         // B30 (task 4/9) - one pinned-fact mismatch check below can still
         // return early past this point (a Mismatched outcome), which is why
@@ -101,13 +120,21 @@ class IngressProfileProvisioner(
                         "response declares ingress kind ${result.ingressKind}, expected $ingressKind - refusing a frontend/origin/backend mismatch",
                     )
                 }
-                if (useTls && result.isRealityShaped) {
+                if (result.transport != requestedTransport) {
                     diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.MALFORMED_RESPONSE)
-                    return IngressActivationOutcome.Mismatched("requested TLS but response carries REALITY-shaped fields")
+                    return IngressActivationOutcome.Mismatched(
+                        "requested ${requestedTransport.wireValue} but response declared ${result.transport.wireValue}",
+                    )
                 }
-                if (!useTls && !result.isRealityShaped) {
+                if (requestedTransport == IngressProfileTransport.REALITY && !result.isRealityShaped) {
                     diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.MALFORMED_RESPONSE)
                     return IngressActivationOutcome.Mismatched("requested REALITY but response carries no REALITY fields")
+                }
+                if (requestedTransport != IngressProfileTransport.REALITY && result.isRealityShaped) {
+                    diagnosticsRecorder?.recordProfileFetchFailed(ControlPlaneFailureReason.MALFORMED_RESPONSE)
+                    return IngressActivationOutcome.Mismatched(
+                        "requested ${requestedTransport.wireValue} but response carries REALITY-shaped fields",
+                    )
                 }
 
                 val profile = IngressClientProfile(
@@ -118,7 +145,7 @@ class IngressProfileProvisioner(
                     // against result.ingressKind above), never re-derived
                     // from ingressBinding's own metadata.
                     ingressKind = ingressKind,
-                    realityProfile = if (!useTls) {
+                    realityProfile = if (requestedTransport == IngressProfileTransport.REALITY) {
                         XrayProfile(
                             server = result.serverAddress,
                             serverPort = result.serverPort,
@@ -132,13 +159,16 @@ class IngressProfileProvisioner(
                     } else {
                         null
                     },
-                    tlsProfile = if (useTls) {
+                    tlsProfile = if (
+                        requestedTransport == IngressProfileTransport.TLS ||
+                        requestedTransport == IngressProfileTransport.XHTTP
+                    ) {
                         XrayTlsProfile(
                             server = result.serverAddress,
                             serverPort = result.serverPort,
                             uuid = result.uuid,
-                            serverName = result.serverName,
-                            fingerprint = result.fingerprint,
+                            serverName = signedXhttpProfile?.tls?.clientServerName ?: result.serverName,
+                            fingerprint = signedXhttpProfile?.tls?.clientFingerprint ?: result.fingerprint,
                         )
                     } else {
                         null

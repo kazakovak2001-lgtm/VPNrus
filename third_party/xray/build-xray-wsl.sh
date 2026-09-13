@@ -15,16 +15,45 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/VERSION"
 
 WORK=~/build/androidlibxraylite
+CORE_WORK=~/build/xray-core-nova
 ANDROID_HOME=~/android-sdk
+PATCH_FILE="$HERE/$XRAY_CORE_PATCH_0001"
 
-if [ ! -d "$WORK" ]; then
-    mkdir -p ~/build
+mkdir -p ~/build
+
+if [ ! -d "$CORE_WORK/.git" ]; then
+    git clone "$XRAY_CORE_REPO" "$CORE_WORK"
+fi
+
+cd "$CORE_WORK"
+git fetch -q
+git checkout -q "$XRAY_CORE_COMMIT"
+git reset --hard -q "$XRAY_CORE_COMMIT"
+git clean -fdx -q
+
+actual_core_sha=$(git rev-parse HEAD)
+if [ "$actual_core_sha" != "$XRAY_CORE_COMMIT" ]; then
+    echo "ERROR: xray-core resolved to $actual_core_sha, expected $XRAY_CORE_COMMIT" >&2
+    exit 1
+fi
+
+echo "$XRAY_CORE_PATCH_0001_SHA256  $PATCH_FILE" | sha256sum -c -
+git apply --check "$PATCH_FILE"
+git apply "$PATCH_FILE"
+
+go test ./transport/internet/splithttp \
+    -run '^TestNovaXhttpDialTimeout' \
+    -count=1
+
+if [ ! -d "$WORK/.git" ]; then
     git clone "$WRAPPER_REPO" "$WORK"
 fi
 
 cd "$WORK"
 git fetch -q
 git checkout -q "$WRAPPER_COMMIT"
+git reset --hard -q "$WRAPPER_COMMIT"
+git clean -fdx -q
 
 actual_sha=$(git rev-parse HEAD)
 if [ "$actual_sha" != "$WRAPPER_COMMIT" ]; then
@@ -40,20 +69,27 @@ go version | grep -q "go${GO_VERSION_REQUIRED%%.*}\." || {
     echo "WARNING: expected a go${GO_VERSION_REQUIRED} toolchain, found: $(go version)" >&2
 }
 
-# gomobile init/build resolve dependencies via go.sum, which cryptographically
-# pins the exact xray-core content this commit's go.mod references (see
-# VERSION's own "Checksum/provenance strategy" note) - no separate manual
-# xray-core clone/checkout is needed or performed here.
-go install golang.org/x/mobile/cmd/gomobile@latest
-go install golang.org/x/mobile/cmd/gobind@latest
+# Build the pinned wrapper against the separately verified/patched copy of
+# the exact pinned xray-core commit. This modifies only the disposable build
+# checkout; VERSION + the tracked patch remain the repository authority.
+go mod edit -replace="github.com/xtls/xray-core=$CORE_WORK"
+
+go install golang.org/x/mobile/cmd/gomobile@"$GOMOBILE_VERSION"
+go install golang.org/x/mobile/cmd/gobind@"$GOMOBILE_VERSION"
+
 gomobile init
 
 go mod tidy -v
+go mod verify
 
-gomobile bind -v -androidapi "$ANDROID_API_LEVEL" -trimpath \
+gomobile bind -v \
+    -androidapi "$ANDROID_API_LEVEL" \
+    -trimpath \
     -ldflags='-s -w -buildid= -checklinkname=0' \
     ./
 
 OUT="$WORK/libv2ray.aar"
+
 echo "Built: $OUT"
-echo "Copy this file into android/app/libs/ for the app module to consume it (once a real Kotlin adapter exists - see docs/B8K0_RUNTIME_AUDIT.md)."
+echo "Patchset: $XRAY_CORE_PATCHSET"
+echo "Copy this file into android/app/libs/libv2ray-androidlibxraylite-c634d1b-nova-b35xhttp1.aar"

@@ -89,6 +89,39 @@ class IngressConfigTests(unittest.TestCase):
             cfg = ingress_config_module.load_ingress_config(env=env)
             self.assertEqual(cfg.ingress_kind, "cdn_fronted")
 
+    def test_xhttp_public_binding_is_all_or_nothing_and_cdn_only(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(
+                tmp_dir,
+                NOVA_INGRESS_KIND="cdn_fronted",
+                NOVA_INGRESS_XHTTP_CLIENT_HOST="edge.example.org",
+                NOVA_INGRESS_XHTTP_CLIENT_PORT="443",
+            )
+
+            cfg = ingress_config_module.load_ingress_config(env=env)
+
+            self.assertEqual(
+                "edge.example.org",
+                cfg.ingress_xhttp_client_host,
+            )
+            self.assertEqual(443, cfg.ingress_xhttp_client_port)
+
+            partial = dict(env)
+            partial.pop("NOVA_INGRESS_XHTTP_CLIENT_PORT")
+
+            with self.assertRaises(
+                ingress_config_module.IngressConfigError
+            ):
+                ingress_config_module.load_ingress_config(env=partial)
+
+            direct = dict(env)
+            direct["NOVA_INGRESS_KIND"] = "direct_ip"
+
+            with self.assertRaises(
+                ingress_config_module.IngressConfigError
+            ):
+                ingress_config_module.load_ingress_config(env=direct)
+
     def test_ingress_kind_is_case_insensitive(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             env = _valid_env(tmp_dir, NOVA_INGRESS_KIND="CDN_FRONTED")
@@ -209,6 +242,96 @@ class IngressConfigTests(unittest.TestCase):
             self.assertEqual(cfg.ingress_flow, "xtls-rprx-vision")
             self.assertEqual(cfg.ingress_upstream_flow, "xtls-rprx-vision")
 
+
+    def test_xhttp_origin_backend_is_all_or_nothing_and_requires_public_binding(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            origin_only = _valid_env(
+                tmp_dir,
+                NOVA_INGRESS_KIND="cdn_fronted",
+                NOVA_INGRESS_XHTTP_SERVER_PORT="2100",
+            )
+            with self.assertRaises(
+                ingress_config_module.IngressConfigError
+            ):
+                ingress_config_module.load_ingress_config(
+                    env=origin_only
+                )
+
+            complete = _valid_env(
+                tmp_dir,
+                NOVA_INGRESS_KIND="cdn_fronted",
+                NOVA_INGRESS_XHTTP_CLIENT_HOST="edge.example.org",
+                NOVA_INGRESS_XHTTP_CLIENT_PORT="443",
+                NOVA_INGRESS_XHTTP_SERVER_PORT="2100",
+                NOVA_INGRESS_XHTTP_HOST="origin.example.org",
+                NOVA_INGRESS_XHTTP_PATH="/nova-xhttp/",
+                NOVA_INGRESS_XHTTP_MODE="packet-up",
+                NOVA_INGRESS_XHTTP_MAX_EACH_POST_BYTES="524288",
+                NOVA_INGRESS_XHTTP_PADDING_PLACEMENT="query",
+                NOVA_INGRESS_XHTTP_PADDING_MIN_BYTES="1",
+                NOVA_INGRESS_XHTTP_PADDING_MAX_BYTES="64",
+            )
+
+            cfg = ingress_config_module.load_ingress_config(
+                env=complete
+            )
+
+            self.assertEqual(
+                2100,
+                cfg.ingress_xhttp_server_port,
+            )
+            self.assertEqual(
+                "origin.example.org",
+                cfg.ingress_xhttp_host,
+            )
+            self.assertEqual(
+                "/nova-xhttp/",
+                cfg.ingress_xhttp_path,
+            )
+            self.assertEqual(
+                "packet-up",
+                cfg.ingress_xhttp_mode,
+            )
+            self.assertEqual(
+                524288,
+                cfg.ingress_xhttp_max_each_post_bytes,
+            )
+
+    def test_xhttp_origin_rejects_streaming_invalid_path_and_disabled_padding(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = _valid_env(
+                tmp_dir,
+                NOVA_INGRESS_KIND="cdn_fronted",
+                NOVA_INGRESS_XHTTP_CLIENT_HOST="edge.example.org",
+                NOVA_INGRESS_XHTTP_CLIENT_PORT="443",
+                NOVA_INGRESS_XHTTP_SERVER_PORT="2100",
+                NOVA_INGRESS_XHTTP_HOST="origin.example.org",
+                NOVA_INGRESS_XHTTP_PATH="/nova-xhttp/",
+                NOVA_INGRESS_XHTTP_MODE="packet-up",
+                NOVA_INGRESS_XHTTP_MAX_EACH_POST_BYTES="524288",
+                NOVA_INGRESS_XHTTP_PADDING_PLACEMENT="query",
+                NOVA_INGRESS_XHTTP_PADDING_MIN_BYTES="1",
+                NOVA_INGRESS_XHTTP_PADDING_MAX_BYTES="64",
+            )
+
+            for mutation in (
+                {"NOVA_INGRESS_XHTTP_MODE": "stream-up"},
+                {"NOVA_INGRESS_XHTTP_PATH": "/nova-xhttp"},
+                {
+                    "NOVA_INGRESS_XHTTP_PADDING_PLACEMENT": "none",
+                    "NOVA_INGRESS_XHTTP_PADDING_MIN_BYTES": "0",
+                    "NOVA_INGRESS_XHTTP_PADDING_MAX_BYTES": "0",
+                },
+            ):
+                bad = dict(base)
+                bad.update(mutation)
+
+                with self.assertRaises(
+                    ingress_config_module.IngressConfigError
+                ):
+                    ingress_config_module.load_ingress_config(
+                        env=bad
+                    )
 
 if __name__ == "__main__":
     unittest.main()
