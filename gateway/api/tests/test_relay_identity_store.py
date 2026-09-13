@@ -118,6 +118,53 @@ class RelayIdentityStoreTests(unittest.TestCase):
             with self.assertRaises(store_module.RelayIdentityStoreError):
                 store_module.load_static_clients(path)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics")
+    def test_upsert_preserves_existing_secure_mode_and_owner(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "static-clients.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[]\n")
+            os.chmod(path, 0o640)
+
+            before = os.stat(path)
+
+            store_module.upsert(
+                path,
+                "relay-a",
+                "relay:a",
+                _UUID_A,
+            )
+
+            after = os.stat(path)
+            self.assertEqual(after.st_mode & 0o777, 0o640)
+            self.assertEqual(after.st_uid, before.st_uid)
+            self.assertEqual(after.st_gid, before.st_gid)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission semantics")
+    def test_upsert_refuses_unexpected_existing_mode_without_mutating_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "static-clients.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[]\n")
+            os.chmod(path, 0o644)
+
+            with open(path, "rb") as handle:
+                before = handle.read()
+
+            with self.assertRaises(store_module.RelayIdentityStoreError):
+                store_module.upsert(
+                    path,
+                    "relay-a",
+                    "relay:a",
+                    _UUID_A,
+                )
+
+            with open(path, "rb") as handle:
+                after = handle.read()
+
+            self.assertEqual(after, before)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+
     def test_file_is_never_world_readable(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "static-clients.json")

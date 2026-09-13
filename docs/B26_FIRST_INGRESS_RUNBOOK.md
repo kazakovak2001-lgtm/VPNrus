@@ -92,8 +92,21 @@ Fill in `NOVA_INGRESS_UPSTREAM_HOST`/`PORT`/`TRANSPORT`/`SERVER_NAME`/
 
 ```bash
 # on the EXIT host:
-python3 gateway/tools/apply_relay_upstream_identity.py apply \
-    --static-clients-file <this EXIT's POCVPN_API_STATIC_RELAY_CLIENTS_FILE> \
+STATIC_CLIENTS="<this EXIT's POCVPN_API_STATIC_RELAY_CLIENTS_FILE>"
+
+# Operator owns/writes this trust store. pocvpn-api reads it during every
+# Xray render, so establish root:pocvpn-api 0640 before the first apply.
+if [ ! -e "$STATIC_CLIENTS" ]; then
+    sudo install -d -o root -g pocvpn-api -m 0750 "$(dirname "$STATIC_CLIENTS")"
+    printf '[]\n' | sudo install \
+        -o root -g pocvpn-api -m 0640 \
+        /dev/stdin "$STATIC_CLIENTS"
+fi
+sudo chown root:pocvpn-api "$STATIC_CLIENTS"
+sudo chmod 0640 "$STATIC_CLIENTS"
+
+sudo python3 gateway/tools/apply_relay_upstream_identity.py apply \
+    --static-clients-file "$STATIC_CLIENTS" \
     --exit-fragment-file /tmp/exit-fragment.json
 # copy the SAME probe-hmac-secret.txt contents (byte-for-byte) to this
 # EXIT's own POCVPN_API_RELAY_PROBE_HMAC_SECRET_FILE path, then:
