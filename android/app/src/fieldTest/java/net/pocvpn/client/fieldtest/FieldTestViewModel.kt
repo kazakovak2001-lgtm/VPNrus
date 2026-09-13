@@ -175,6 +175,7 @@ class FieldTestViewModel(
 
     fun connect() {
         if (_uiState.value != FieldTestUiState.Idle && _uiState.value != FieldTestUiState.Failed) return
+        diagnostics.clear()
         _uiState.value = FieldTestUiState.Connecting
         // C1 fix: FieldTestTunnelController.connect() itself refuses to run
         // unless its OWN internal state is Idle - after a Failed run, only

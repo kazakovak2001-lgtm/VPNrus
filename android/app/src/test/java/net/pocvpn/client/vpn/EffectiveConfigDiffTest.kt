@@ -3,7 +3,6 @@ package net.pocvpn.client.vpn
 import net.pocvpn.client.vpn.config.AwgConfig
 import net.pocvpn.client.vpn.config.AwgConfigMapper
 import net.pocvpn.client.vpn.config.AwgPeer
-import net.pocvpn.client.vpn.config.BuildConfigGatewaySource
 import net.pocvpn.client.vpn.config.DefaultGatewayConfigurationRepository
 import net.pocvpn.client.vpn.config.GatewayConfigSource
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -167,13 +166,11 @@ class EffectiveConfigDiffTest {
     }
 
     @Test
-    fun `real BuildConfigGatewaySource now yields full-tunnel AllowedIPs (B8B3B fix, not the fake fixture above)`() {
-        // Reads the ACTUAL compiled-in gateway-dev.properties value via the
-        // real production wiring (Factory uses MutableGatewayConfigSource(
-        // BuildConfigGatewaySource) exactly like this) - proves the stale
-        // WSL-local "10.77.0.0/24" override is gone from this worktree's
-        // gateway-dev.properties, not just demonstrated against a fake source.
-        val source = MutableGatewayConfigSource(BuildConfigGatewaySource)
+    fun `full-tunnel defaults survive production repository wiring without a local properties file`() {
+        // The local gateway-dev.properties file is gitignored and may not
+        // exist in a clean checkout. Exercise the repository with a complete,
+        // versioned fixture instead of depending on one developer's machine.
+        val source = MutableGatewayConfigSource(WorkingDevSource())
         val configured = DefaultGatewayConfigurationRepository(source).get() as GatewayConfiguration.Configured
         assertEquals(listOf("0.0.0.0/0", "::/0"), configured.allowedIps)
     }

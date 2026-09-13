@@ -151,6 +151,33 @@ class FieldTestViewModelTest {
         assertEquals(FieldTestFailureCategory.NO_HANDSHAKE, report.failureCategory)
     }
 
+    @Test
+    fun `retry report only uses the new attempt's handshake evidence`() = runTest {
+        var transportCount = 0
+        val vm = FieldTestViewModel(
+            transportFactory = {
+                transportCount++
+                FixedTransport(shouldHandshake = transportCount <= 2)
+            },
+            appVersionName = "0.1-fieldtest",
+            appVersionCode = 1L,
+            networkProfileProvider = { fakeWifiProfile },
+            nowProvider = { 0L },
+            preparePermissionIntent = { null },
+            healthCheckOverride = { false },
+        )
+
+        vm.connect()
+        assertEquals(FieldTestFailureCategory.HEALTH_CHECK_FAILED, vm.lastReport.value?.failureCategory)
+
+        vm.retry()
+        val report = vm.lastReport.value!!
+        assertEquals(FieldTestFailureCategory.NO_HANDSHAKE, report.failureCategory)
+        assertTrue(report.events.none {
+            it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_HEALTH_RESULT
+        })
+    }
+
     // Reporting requirement - a successful connection triggers report upload AFTER tunnel establishment.
     @Test
     fun `reporting - successful connection triggers upload attempt after Protected`() = runTest {

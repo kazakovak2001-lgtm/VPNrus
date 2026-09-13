@@ -170,6 +170,9 @@ class FieldTestDiagnosticsRecorder(
     @Synchronized
     fun snapshot(): List<DiagnosticEvent> = events.toList()
 
+    @Synchronized
+    fun clear() = events.clear()
+
     private companion object {
         const val MAX_EVENTS = 200
     }
