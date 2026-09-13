@@ -260,7 +260,7 @@ ft31_rule_to_ft31_present() {
         stockholm)
             local chain_output
             chain_output=$(nft -a list chain inet pocvpn forward 2>/dev/null || true)
-            printf '%s' "$chain_output" | grep -qF "iifname \"awg-ft31\" oifname \"$egress_iface\""
+            printf '%s\n' "$chain_output" | grep -F "iifname \"awg-ft31\" oifname \"$egress_iface\" accept comment \"$FT31_FW_MARKER\"" >/dev/null
             ;;
         *) return 1 ;;
     esac
@@ -276,7 +276,7 @@ ft31_rule_from_ft31_present() {
         stockholm)
             local chain_output
             chain_output=$(nft -a list chain inet pocvpn forward 2>/dev/null || true)
-            printf '%s' "$chain_output" | grep -qF "iifname \"$egress_iface\" oifname \"awg-ft31\""
+            printf '%s\n' "$chain_output" | grep -F "iifname \"$egress_iface\" oifname \"awg-ft31\" ct state established,related accept comment \"$FT31_FW_MARKER\"" >/dev/null
             ;;
         *) return 1 ;;
     esac

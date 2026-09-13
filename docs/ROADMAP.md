@@ -281,3 +281,14 @@ Do not cite any UNVERIFIED row above as if it were proven. Each becomes
 VERIFIED only when its corresponding gate (B8B/B9/B10) produces real
 on-the-wire evidence, the same way B8A did for the local handshake and
 B10-1 did for the five rows above.
+
+## B37 isolated AWG 3.1 field test (verification pending)
+
+The separate `fieldTest` APK and `awg-ft31` gateway setup are implemented.
+Frankfurt/Stockholm use dedicated UDP 51821 peers; a fresh handshake plus
+TCP data-plane probe is required for `Protected`. The report records each
+probe target and keeps handshake success distinct from health failure.
+Local Android build/unit tests and gateway fixture tests pass. A Czech Wi-Fi
+device attempt reached `Protected`; the intended restricted-network test in
+Russia and its report remain outstanding, so B37 does not yet prove that
+AWG 3.1 works there. See `docs/FIELD_TEST_RUSSIA_AWG31.md`.

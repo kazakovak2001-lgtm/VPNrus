@@ -135,7 +135,9 @@ if [ "\$1" = "insert" ] && [ "\$2" = "rule" ]; then
     LAST_HANDLE_FILE="\$ETC/.last_handle"
     n=\$(( \$(cat "\$LAST_HANDLE_FILE" 2>/dev/null || echo 0) + 1 ))
     echo "\$n" > "\$LAST_HANDLE_FILE"
-    echo "        iifname \"\$iif\" oifname \"\$oif\" accept comment \"b37-ft31\" # handle \$n" >> "\$ETC/ft31_forward_rules"
+    state_clause=""
+    if [[ " \$* " == *" established,related "* ]]; then state_clause="ct state established,related "; fi
+    echo "        iifname \"\$iif\" oifname \"\$oif\" \${state_clause}accept comment \"b37-ft31\" # handle \$n" >> "\$ETC/ft31_forward_rules"
     exit 0
 fi
 if [ "\$1" = "delete" ] && [ "\$2" = "rule" ]; then
@@ -445,6 +447,16 @@ if run_lib "$ROOT" 'ft31_verify_runtime frankfurt ens3' >/dev/null 2>&1; then
     fail "N: a frankfurt INPUT chain with no terminal REJECT/DROP must fail closed at preflight"
 else
     pass "N: an INPUT chain with no terminal REJECT/DROP fails closed at preflight"
+fi
+rm -rf "$ROOT"
+
+# O. Interface-matching but untagged or non-ACCEPT rules are not our rules.
+ROOT=$(make_fixture stockholm)
+printf 'iifname "awg-ft31" oifname "ens5" drop # handle 91\n' > "$ROOT/etc/ft31_forward_rules"
+if run_lib "$ROOT" 'ft31_rule_to_ft31_present stockholm ens5' >/dev/null 2>&1; then
+    fail "O: a matching DROP rule must not count as the B37 ACCEPT rule"
+else
+    pass "O: Stockholm ignores a matching DROP rule without the B37 marker"
 fi
 rm -rf "$ROOT"
 

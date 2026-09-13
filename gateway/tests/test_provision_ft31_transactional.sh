@@ -535,6 +535,32 @@ else
 fi
 rm -rf "$ROOT"
 
+# --- P: a disk-only NAT config must never be overwritten or removed -----
+ROOT=$(make_env)
+printf '# pre-existing unrelated config\n' > "$ROOT/nftables.pocvpn-ft31.conf"
+if run_provision "$ROOT" >/dev/null 2>&1; then
+    fail "P: differing disk-only NAT config must fail closed"
+elif [ "$(cat "$ROOT/nftables.pocvpn-ft31.conf")" = '# pre-existing unrelated config' ]; then
+    pass "P: differing disk-only NAT config survives failed provisioning unchanged"
+else
+    fail "P: rollback changed a pre-existing disk-only NAT config"
+fi
+rm -rf "$ROOT"
+
+# --- Q: matching disk-only NAT config is reused, never owned by rollback --
+ROOT=$(make_env --pre-existing)
+PRE_NAT_FILE=$(cat "$ROOT/nftables.pocvpn-ft31.conf")
+rm -f "$ROOT/state/.nat_exists"
+touch "$ROOT/state/.fail_nft_f"
+if run_provision "$ROOT" >/dev/null 2>&1; then
+    fail "Q: simulated nft reload failure must fail provisioning"
+elif [ "$(cat "$ROOT/nftables.pocvpn-ft31.conf")" = "$PRE_NAT_FILE" ] && [ ! -f "$ROOT/state/.nat_exists" ]; then
+    pass "Q: matching disk-only NAT config survives a failed reapply; only newly-created live table rolls back"
+else
+    fail "Q: matching pre-existing disk-only NAT config was changed or live table leaked"
+fi
+rm -rf "$ROOT"
+
 echo
 echo "== $PASSES passed, $FAILURES failed =="
 [ "$FAILURES" -eq 0 ]

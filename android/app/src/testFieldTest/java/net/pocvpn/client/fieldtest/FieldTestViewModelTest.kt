@@ -5,6 +5,8 @@ import java.nio.file.Files
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -169,6 +171,7 @@ class FieldTestViewModelTest {
 
         vm.connect()
         assertEquals(FieldTestFailureCategory.HEALTH_CHECK_FAILED, vm.lastReport.value?.failureCategory)
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.UNKNOWN, vm.lastReport.value?.restrictionClass)
 
         vm.retry()
         val report = vm.lastReport.value!!
@@ -176,6 +179,52 @@ class FieldTestViewModelTest {
         assertTrue(report.events.none {
             it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_HEALTH_RESULT
         })
+    }
+
+    @Test
+    fun `probe records all three targets even when the first succeeds`() = runTest {
+        val visited = mutableListOf<String>()
+        val vm = FieldTestViewModel(
+            transportFactory = { FixedTransport(shouldHandshake = true) },
+            appVersionName = "0.1-fieldtest",
+            appVersionCode = 1L,
+            networkProfileProvider = { fakeWifiProfile },
+            nowProvider = { 0L },
+            preparePermissionIntent = { null },
+            probeTargetOverride = { host -> visited += host; visited.size == 1 },
+        )
+        vm.connect()
+        val report = vm.lastReport.filterNotNull().first()
+        val results = report.events.filter {
+            it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_PROBE_TARGET_RESULT
+        }
+        assertEquals(FieldTestOutcome.PROTECTED, report.outcome)
+        assertEquals(3, visited.size)
+        assertEquals(listOf("GATEWAY", "CLOUDFLARE", "GOOGLE"), results.map {
+            it.tags[FieldTestDiagnosticTags.TAG_PROBE_TARGET]
+        })
+        assertEquals(listOf("true", "false", "false"), results.map {
+            it.tags[FieldTestDiagnosticTags.TAG_SUCCESS]
+        })
+    }
+
+    @Test
+    fun `disconnect releases a protected field-test tunnel`() = runTest {
+        val transport = FixedTransport(shouldHandshake = true)
+        val vm = FieldTestViewModel(
+            transportFactory = { transport },
+            appVersionName = "0.1-fieldtest",
+            appVersionCode = 1L,
+            networkProfileProvider = { fakeWifiProfile },
+            nowProvider = { 0L },
+            preparePermissionIntent = { null },
+            healthCheckOverride = { _, _ -> true },
+        )
+        vm.connect()
+        assertEquals(FieldTestUiState.Protected, vm.uiState.value)
+        vm.disconnect()
+        assertEquals(FieldTestUiState.Idle, vm.uiState.value)
+        assertEquals(TransportState.Disconnected, transport.observeState().first())
     }
 
     // Reporting requirement - a successful connection triggers report upload AFTER tunnel establishment.

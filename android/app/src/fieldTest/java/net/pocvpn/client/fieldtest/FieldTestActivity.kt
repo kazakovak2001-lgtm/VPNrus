@@ -127,6 +127,10 @@ private fun FieldTestScreen(
                 Text(text = if (uiState is FieldTestUiState.Failed) "Retry" else "Connect")
             }
 
+            if (uiState is FieldTestUiState.Protected || uiState is FieldTestUiState.Connecting) {
+                Button(onClick = { viewModel.disconnect() }) { Text("Disconnect") }
+            }
+
             androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(8.dp))
 
             Text(

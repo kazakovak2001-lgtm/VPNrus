@@ -6,6 +6,13 @@ host; inspect each host before provisioning or rollback. Supersedes
 exercises - that document's UX/routing/diagnostics description is still
 accurate, only the AWG identity/gateway/profile changed.
 
+The app probes the gateway public IP, 1.1.1.1 and 8.8.8.8 on TCP 443 after
+each fresh handshake. Its report records a separate closed-label result for
+each target (`GATEWAY`, `CLOUDFLARE`, `GOOGLE`) and succeeds if any responds.
+Use **Disconnect** on the test screen to release the tunnel. A failed health
+check retains the successful handshake in the report but leaves restriction
+classification `UNKNOWN` until stronger evidence is available.
+
 ## Why
 
 The B36 field-test APK (docs/FIELD_TEST_RUSSIA.md) proved registration/
@@ -289,7 +296,10 @@ the gateway (read-only, no payload/secret logging):
    still failed?**
    - `sudo awg show awg-ft31` shows a fresh handshake, but the client
      report's `outcome` is `FAILED` with `failureCategory=HEALTH_CHECK_FAILED`
-     -> **forwarding/NAT/DNS/Internet problem** on the gateway
+     -> inspect the report's per-target probe results first. If `GATEWAY`
+     succeeds but both public targets fail, investigate gateway egress or
+     those destinations; if all fail, investigate the tunnel data path. These
+     raw-IP TCP probes do not test DNS. Check gateway forwarding/NAT
      (`nft list table inet pocvpn-ft31`, confirm `masquerade` and the two
      `b37-ft31` FORWARD rules are present via
      `iptables -S FORWARD`/`nft list chain inet pocvpn forward`), not a

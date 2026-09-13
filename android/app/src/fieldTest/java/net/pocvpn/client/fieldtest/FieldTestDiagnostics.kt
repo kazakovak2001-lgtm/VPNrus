@@ -34,7 +34,11 @@ object FieldTestDiagnosticTags {
     const val TAG_ENDPOINT_PORT = "endpoint_port"
     /** B37 - the bounded handshake-wait window this attempt used, in milliseconds (task requirement: diagnostics must be able to distinguish a real timeout from a fake instant success). */
     const val TAG_HANDSHAKE_TIMEOUT_MS = "handshake_timeout_ms"
+    const val TAG_PROBE_TARGET = "probe_target"
 }
+
+/** Closed labels keep probe diagnostics useful without recording arbitrary destinations. */
+enum class FieldTestProbeTarget { GATEWAY, CLOUDFLARE, GOOGLE }
 
 /**
  * B37 - which AmneziaWG parameter generation this field-test run actually
@@ -147,6 +151,17 @@ class FieldTestDiagnosticsRecorder(
             mapOf(
                 FieldTestDiagnosticTags.TAG_CANDIDATE to candidate.name,
                 FieldTestDiagnosticTags.TAG_SUCCESS to healthy.toString(),
+            ),
+        )
+    }
+
+    fun recordProbeTargetResult(candidate: ProductionGatewayId, target: FieldTestProbeTarget, success: Boolean) {
+        record(
+            DiagnosticEventType.FIELD_TEST_PROBE_TARGET_RESULT,
+            mapOf(
+                FieldTestDiagnosticTags.TAG_CANDIDATE to candidate.name,
+                FieldTestDiagnosticTags.TAG_PROBE_TARGET to target.name,
+                FieldTestDiagnosticTags.TAG_SUCCESS to success.toString(),
             ),
         )
     }

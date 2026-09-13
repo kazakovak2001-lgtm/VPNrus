@@ -16,6 +16,7 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.config.TransportConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -387,8 +388,9 @@ class FieldTestTunnelControllerTest {
     }
 
     // C5 - a genuine coroutine cancellation must propagate, never be swallowed as a gateway failure.
-    @Test(expected = CancellationException::class)
+    @Test
     fun `C5 - CancellationException from transport connect propagates instead of being reported as a failure`() = runTest {
+        var disconnected = false
         val transport = object : VpnTransport {
             override val name = "cancelling"
             override val kind = TransportKind.AMNEZIA_WG
@@ -397,7 +399,7 @@ class FieldTestTunnelControllerTest {
             override suspend fun connect(config: TransportConfig) {
                 throw CancellationException("simulated cancellation")
             }
-            override suspend fun disconnect() {}
+            override suspend fun disconnect() { disconnected = true }
             override fun observeState(): Flow<TransportState> = MutableStateFlow(TransportState.Disconnected)
         }
         val controller = FieldTestTunnelController(
@@ -405,6 +407,12 @@ class FieldTestTunnelControllerTest {
             nowProvider = { 0L },
             delayMs = { },
         )
-        controller.connect()
+        try {
+            controller.connect()
+            fail("cancellation must propagate")
+        } catch (_: CancellationException) {
+            assertTrue("cancelled attempt must release its transport", disconnected)
+            assertEquals(FieldTestState.Idle, controller.state.value)
+        }
     }
 }

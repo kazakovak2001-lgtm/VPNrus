@@ -9,7 +9,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -103,11 +106,12 @@ class FieldTestViewModel(
      * property initializer, can), hence the null-then-fallback shape here.
      */
     private val healthCheckOverride: (suspend (VpnTransport, ProductionGatewayDescriptor) -> Boolean)? = null,
+    private val probeTargetOverride: (suspend (String) -> Boolean)? = null,
 ) : ViewModel() {
 
     private val diagnostics = FieldTestDiagnosticsRecorder(nowProvider)
     private val effectiveHealthCheck: suspend (VpnTransport, ProductionGatewayDescriptor) -> Boolean =
-        healthCheckOverride ?: { _, gateway -> probeDataPlane(gateway.awg.endpointHost) }
+        healthCheckOverride ?: { _, gateway -> probeDataPlane(gateway.id, gateway.awg.endpointHost) }
 
     /**
      * B37 - the ONE line that switches this build from the legacy AWG
@@ -130,6 +134,7 @@ class FieldTestViewModel(
         // does and does not prove.
         healthCheck = effectiveHealthCheck,
     )
+    private var connectJob: Job? = null
 
     private val _uiState = MutableStateFlow<FieldTestUiState>(FieldTestUiState.Idle)
     val uiState: StateFlow<FieldTestUiState> = _uiState.asStateFlow()
@@ -170,7 +175,12 @@ class FieldTestViewModel(
         val deferred = CompletableDeferred<Boolean>()
         pendingPermissionResult = deferred
         _permissionRequest.value = intent
-        val granted = deferred.await()
+        val granted = try {
+            deferred.await()
+        } finally {
+            if (pendingPermissionResult === deferred) pendingPermissionResult = null
+            _permissionRequest.value = null
+        }
         if (granted) diagnostics.recordPermissionGranted() else diagnostics.recordPermissionDenied()
         return granted
     }
@@ -195,7 +205,7 @@ class FieldTestViewModel(
         // settles (which is what the pre-existing code did), and never
         // inferred from whether the attempt went on to succeed.
         val preConnectNetworkProfile = networkProfileProvider()
-        viewModelScope.launch {
+        connectJob = viewModelScope.launch {
             if (!ensureVpnPermission()) {
                 _uiState.value = FieldTestUiState.Failed
                 _lastReport.value = buildReport(
@@ -264,6 +274,30 @@ class FieldTestViewModel(
         }
     }
 
+    /** Waits for cancellation cleanup before permitting another attempt. */
+    fun disconnect() {
+        if (_uiState.value == FieldTestUiState.Idle) return
+        _uiState.value = FieldTestUiState.Connecting
+        val previous = connectJob
+        viewModelScope.launch {
+            previous?.cancelAndJoin()
+            controller.disconnect()
+            _uiState.value = FieldTestUiState.Idle
+        }
+    }
+
+    override fun onCleared() {
+        val previous = connectJob
+        previous?.cancel()
+        // viewModelScope is cancelled during clearing, so cleanup needs its own
+        // short-lived scope to release an already-protected VPN session.
+        CoroutineScope(Dispatchers.Main).launch {
+            previous?.join()
+            controller.disconnect()
+        }
+        super.onCleared()
+    }
+
     /** Lets the tester retry after a failure - same [connect] entry point, which now (C1) also resets [controller]'s own internal state, so this is a genuinely fresh Frankfurt -> Stockholm attempt, not a stale no-op. */
     fun retry() {
         if (_uiState.value == FieldTestUiState.Failed) {
@@ -308,7 +342,7 @@ class FieldTestViewModel(
      * [gatewayEndpointHost] - the SAME gateway's own public IP this attempt
      * just handshook with (it already runs nginx on :443 for
      * Xray/REALITY, verified read-only on both hosts) - tried FIRST,
-     * before the two third-party targets. This exists to disambiguate two
+     * followed by both third-party targets. Every result is recorded. This disambiguates two
      * different failure classes a Russia field-test report cannot tell
      * apart on its own: if the gateway-self target ALSO fails alongside
      * 1.1.1.1/8.8.8.8, the problem is on the client<->gateway path itself
@@ -317,25 +351,35 @@ class FieldTestViewModel(
      * problem is specific to reaching those two well-known IPs beyond the
      * gateway (their own blocking, unrelated to this tunnel).
      */
-    private suspend fun probeDataPlane(gatewayEndpointHost: String): Boolean {
-        val targets = listOf(gatewayEndpointHost to 443, "1.1.1.1" to 443, "8.8.8.8" to 443)
+    private suspend fun probeDataPlane(candidate: ProductionGatewayId, gatewayEndpointHost: String): Boolean {
+        val targets = listOf(
+            FieldTestProbeTarget.GATEWAY to gatewayEndpointHost,
+            FieldTestProbeTarget.CLOUDFLARE to "1.1.1.1",
+            FieldTestProbeTarget.GOOGLE to "8.8.8.8",
+        )
         return withContext(Dispatchers.IO) {
-            for ((host, port) in targets) {
+            var anySucceeded = false
+            for ((target, host) in targets) {
                 val ok = try {
                     withTimeoutOrNull(DATA_PLANE_PROBE_TIMEOUT_MS) {
-                        Socket().use { socket ->
-                            socket.connect(InetSocketAddress(host, port), DATA_PLANE_PROBE_TIMEOUT_MS.toInt())
+                        if (probeTargetOverride != null) {
+                            probeTargetOverride.invoke(host)
+                        } else {
+                            Socket().use { socket ->
+                                socket.connect(InetSocketAddress(host, 443), DATA_PLANE_PROBE_TIMEOUT_MS.toInt())
+                            }
+                            true
                         }
-                        true
                     } ?: false
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {
                     false
                 }
-                if (ok) return@withContext true
+                diagnostics.recordProbeTargetResult(candidate, target, ok)
+                anySucceeded = anySucceeded || ok
             }
-            false
+            anySucceeded
         }
     }
 
@@ -394,11 +438,17 @@ class FieldTestViewModel(
         // about the tunnel, not the underlying network).
         val evidence = RestrictionEvidence(
             networkProfile = networkProfile.copy(vpnActive = outcome == FieldTestOutcome.PROTECTED),
-            transportState = if (outcome == FieldTestOutcome.PROTECTED) TransportState.Connected else TransportState.HandshakeFailed,
-            awgHandshakeFresh = outcome == FieldTestOutcome.PROTECTED,
+            transportState = if (outcome == FieldTestOutcome.PROTECTED) TransportState.Connected else TransportState.Disconnected,
+            awgHandshakeFresh = outcome == FieldTestOutcome.PROTECTED || failureCategory == FieldTestFailureCategory.HEALTH_CHECK_FAILED,
             gatewayHttpsReachable = null,
         )
-        val restrictionClass: RestrictionClass = RestrictionClassifier.classify(evidence)
+        // A fresh handshake proves UDP reachability, but failed data-plane
+        // probes do not establish that the network is unrestricted.
+        val restrictionClass: RestrictionClass = if (failureCategory == FieldTestFailureCategory.HEALTH_CHECK_FAILED) {
+            RestrictionClass.UNKNOWN
+        } else {
+            RestrictionClassifier.classify(evidence)
+        }
 
         return FieldTestReport(
             buildLabel = FieldTestBuildInfo.BUILD_LABEL,

@@ -179,6 +179,8 @@ fi
 
 FT31_PRE_NAT_EXISTS=false
 nft list table inet pocvpn-ft31 >/dev/null 2>&1 && FT31_PRE_NAT_EXISTS=true
+FT31_PRE_NAT_FILE_EXISTS=false
+{ [ -e "$NFTABLES_CONF_PATH" ] || [ -L "$NFTABLES_CONF_PATH" ]; } && FT31_PRE_NAT_FILE_EXISTS=true
 
 FT31_PRE_SERVICE_FILE_EXISTS=false
 [ -f "$FT31_SERVICE_UNIT_PATH" ] && FT31_PRE_SERVICE_FILE_EXISTS=true
@@ -287,7 +289,7 @@ ft31_rollback_this_invocation() {
             nft delete table inet pocvpn-ft31 2>/dev/null || true
             log "  rolled back: isolated NAT table (did not exist before this run)"
         fi
-        if [ -f "$NFTABLES_CONF_PATH" ]; then
+        if [ "$FT31_PRE_NAT_FILE_EXISTS" = false ] && [ -f "$NFTABLES_CONF_PATH" ]; then
             rm -f "$NFTABLES_CONF_PATH"
             log "  rolled back: this run's rendered $NFTABLES_CONF_PATH (did not exist before this run)"
         fi
@@ -357,7 +359,7 @@ else
     log "HeaderProtectionKey is NOT printed here (secret, shared-key material)."
     log "Retrieve it YOURSELF, directly from this server, when you are ready to build the field-test APK:"
     log "    sudo grep '^HeaderProtectionKey' $FT31_CONFIG_PATH"
-    log "Paste it directly into FieldTestAwg31GatewayCatalog.kt's headerProtectionKeyBase64 for this gateway."
+    log "Store it in gitignored android/app/gateway-dev.properties as fieldTestFrankfurtHeaderProtectionKey or fieldTestStockholmHeaderProtectionKey for this host; never edit the tracked gateway catalog."
     log "Never paste it into chat, a ticket, a commit message, or any log."
     unset FT31_SERVER_PRIVATE_KEY FT31_HEADER_PROTECTION_KEY
 fi
@@ -410,13 +412,18 @@ render_template "$SCRIPT_DIR/nftables/pocvpn-ft31.nft.template" \
     "EGRESS_IFACE=$EGRESS_IFACE" \
     "AWG_FT31_SUBNET=$FT31_SUBNET_CIDR" \
     > "$FT31_NAT_RENDERED"
-if [ "$FT31_PRE_NAT_EXISTS" = true ]; then
-    if [ -f "$NFTABLES_CONF_PATH" ] && cmp -s "$FT31_NAT_RENDERED" "$NFTABLES_CONF_PATH"; then
-        log "existing $NFTABLES_CONF_PATH already matches the desired B37 NAT config exactly - leaving untouched"
-    else
+if [ "$FT31_PRE_NAT_FILE_EXISTS" = true ]; then
+    if [ ! -f "$NFTABLES_CONF_PATH" ] || ! cmp -s "$FT31_NAT_RENDERED" "$NFTABLES_CONF_PATH"; then
         rm -f "$FT31_NAT_RENDERED"
-        die "runtime mismatch: inet pocvpn-ft31 (or $NFTABLES_CONF_PATH) already exists but does not exactly match the desired B37 NAT config - refusing to overwrite unrecognized/differing pre-existing B37 state. Investigate manually (compare against gateway/nftables/pocvpn-ft31.nft.template) before retrying."
+        die "runtime mismatch: pre-existing $NFTABLES_CONF_PATH differs from the desired B37 NAT config - refusing to overwrite it"
     fi
+    log "existing $NFTABLES_CONF_PATH already matches the desired B37 NAT config exactly - leaving untouched"
+    if [ "$FT31_PRE_NAT_EXISTS" = false ]; then
+        nft -f "$NFTABLES_CONF_PATH"
+    fi
+elif [ "$FT31_PRE_NAT_EXISTS" = true ]; then
+    rm -f "$FT31_NAT_RENDERED"
+    die "runtime mismatch: live inet pocvpn-ft31 exists without its expected config file - refusing to guess ownership"
 else
     mv "$FT31_NAT_RENDERED" "$NFTABLES_CONF_PATH"
     chmod 644 "$NFTABLES_CONF_PATH"

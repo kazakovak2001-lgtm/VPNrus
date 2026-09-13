@@ -1,6 +1,8 @@
 package net.pocvpn.client.fieldtest
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -127,6 +129,7 @@ class FieldTestTunnelController(
                 // C5 - a cancelled coroutine (e.g. the screen closing mid-
                 // attempt) is not a gateway/network failure and must not be
                 // reported, retried, or counted as one - propagate it.
+                abortCancelledAttempt(transport)
                 throw c
             } catch (t: Throwable) {
                 false
@@ -137,6 +140,7 @@ class FieldTestTunnelController(
                 val result = try {
                     healthCheck(transport, gateway)
                 } catch (c: CancellationException) {
+                    abortCancelledAttempt(transport)
                     throw c
                 } catch (t: Throwable) {
                     false
@@ -170,6 +174,13 @@ class FieldTestTunnelController(
             activeTransport = null
         }
         _state.value = FieldTestState.Idle
+    }
+
+    private suspend fun abortCancelledAttempt(transport: VpnTransport) {
+        withContext(NonCancellable) {
+            runCatching { transport.disconnect() }
+            _state.value = FieldTestState.Idle
+        }
     }
 
     /**
