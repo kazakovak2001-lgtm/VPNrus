@@ -9,6 +9,11 @@ accurate, only the AWG identity/gateway/profile changed.
 The app probes the gateway public IP, 1.1.1.1 and 8.8.8.8 on TCP 443 after
 each fresh handshake. Its report records a separate closed-label result for
 each target (`GATEWAY`, `CLOUDFLARE`, `GOOGLE`) and succeeds if any responds.
+Since the v2 field-test APK, each socket is explicitly bound to the Android
+VPN Network with the assigned 10.77.31.2 address; if that Network is absent,
+the report records `FIELD_TEST_PROBE_VPN_UNAVAILABLE` and cannot become
+`PROTECTED` based on a direct, off-tunnel TCP connection. The report's
+`appVersionName` must end in `-FIELD_TEST_ONLY-v2` for this guarantee.
 Use **Disconnect** on the test screen to release the tunnel. A failed health
 check retains the successful handshake in the report but leaves restriction
 classification `UNKNOWN` until stronger evidence is available.

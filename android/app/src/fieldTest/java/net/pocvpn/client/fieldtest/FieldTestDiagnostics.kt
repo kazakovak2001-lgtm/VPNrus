@@ -166,6 +166,13 @@ class FieldTestDiagnosticsRecorder(
         )
     }
 
+    fun recordProbeVpnUnavailable(candidate: ProductionGatewayId) {
+        record(
+            DiagnosticEventType.FIELD_TEST_PROBE_VPN_UNAVAILABLE,
+            mapOf(FieldTestDiagnosticTags.TAG_CANDIDATE to candidate.name),
+        )
+    }
+
     fun recordBecameProtected(candidate: ProductionGatewayId) {
         record(DiagnosticEventType.FIELD_TEST_BECAME_PROTECTED, mapOf(FieldTestDiagnosticTags.TAG_CANDIDATE to candidate.name))
     }

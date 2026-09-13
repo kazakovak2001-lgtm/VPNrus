@@ -2,6 +2,11 @@ package net.pocvpn.client.fieldtest
 
 import android.content.Intent
 import java.nio.file.Files
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketAddress
+import javax.net.SocketFactory
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -225,6 +230,57 @@ class FieldTestViewModelTest {
         vm.disconnect()
         assertEquals(FieldTestUiState.Idle, vm.uiState.value)
         assertEquals(TransportState.Disconnected, transport.observeState().first())
+    }
+
+    @Test
+    fun `missing VPN network never counts a handshake as Protected`() = runTest {
+        val vm = FieldTestViewModel(
+            transportFactory = { FixedTransport(shouldHandshake = true) },
+            appVersionName = "0.1-fieldtest",
+            appVersionCode = 1L,
+            networkProfileProvider = { fakeWifiProfile },
+            nowProvider = { 0L },
+            preparePermissionIntent = { null },
+            healthCheckOverride = null,
+            vpnSocketFactoryProvider = { null },
+        )
+        vm.connect()
+        val report = vm.lastReport.value!!
+        assertEquals(FieldTestOutcome.FAILED, report.outcome)
+        assertEquals(FieldTestFailureCategory.HEALTH_CHECK_FAILED, report.failureCategory)
+        assertEquals(2, report.events.count {
+            it.type == net.pocvpn.client.diagnostics.support.DiagnosticEventType.FIELD_TEST_PROBE_VPN_UNAVAILABLE
+        })
+    }
+
+    @Test
+    fun `probe sockets are created by the selected VPN network factory`() = runTest {
+        val destinations = mutableListOf<String>()
+        val factory = object : SocketFactory() {
+            override fun createSocket(): Socket = object : Socket() {
+                override fun connect(endpoint: SocketAddress, timeout: Int) {
+                    destinations += (endpoint as InetSocketAddress).hostString
+                }
+            }
+            override fun createSocket(host: String, port: Int): Socket = error("unexpected socket path")
+            override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket = error("unexpected socket path")
+            override fun createSocket(host: InetAddress, port: Int): Socket = error("unexpected socket path")
+            override fun createSocket(host: InetAddress, port: Int, localHost: InetAddress, localPort: Int): Socket = error("unexpected socket path")
+        }
+        val vm = FieldTestViewModel(
+            transportFactory = { FixedTransport(shouldHandshake = true) },
+            appVersionName = "0.1-fieldtest",
+            appVersionCode = 1L,
+            networkProfileProvider = { fakeWifiProfile },
+            nowProvider = { 0L },
+            preparePermissionIntent = { null },
+            healthCheckOverride = null,
+            vpnSocketFactoryProvider = { factory },
+        )
+        vm.connect()
+        val report = vm.lastReport.filterNotNull().first()
+        assertEquals(FieldTestOutcome.PROTECTED, report.outcome)
+        assertEquals(listOf("152.70.43.1", "1.1.1.1", "8.8.8.8"), destinations)
     }
 
     // Reporting requirement - a successful connection triggers report upload AFTER tunnel establishment.

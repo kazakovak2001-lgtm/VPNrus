@@ -2,11 +2,13 @@ package net.pocvpn.client.fieldtest
 
 import android.app.Application
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import java.net.InetSocketAddress
-import java.net.Socket
+import javax.net.SocketFactory
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -107,6 +109,7 @@ class FieldTestViewModel(
      */
     private val healthCheckOverride: (suspend (VpnTransport, ProductionGatewayDescriptor) -> Boolean)? = null,
     private val probeTargetOverride: (suspend (String) -> Boolean)? = null,
+    private val vpnSocketFactoryProvider: () -> SocketFactory? = { null },
 ) : ViewModel() {
 
     private val diagnostics = FieldTestDiagnosticsRecorder(nowProvider)
@@ -309,33 +312,19 @@ class FieldTestViewModel(
     /**
      * B37 senior-review pass (task C2/C3) - the field test's real post-
      * handshake data-plane confidence check, wired as [controller]'s
-     * `healthCheck` above. Opens a plain bounded TCP connection to one of
+     * `healthCheck` above. Opens bounded TCP connections to the gateway and
      * two well-known public IPs on port 443 - deliberately NOT anything
      * that depends on this app's own activation/control-plane API (task
-     * requirement), and deliberately a raw [Socket] rather than an HTTP
+     * requirement), and deliberately raw sockets rather than an HTTP
      * client so there is no DNS resolution step to confound "did the tunnel
      * carry traffic" with "did DNS work".
      *
-     * Why this is expected to actually go THROUGH the tunnel, not around
-     * it: this field-test build's own transport
-     * ([AmneziaWgTransport]/[buildFieldTestAwgConfig]) never calls
-     * `excludedApplications`/`includedApplications` to exclude this app's
-     * own UID from the VPN, and never calls `VpnService.protect(socket)` on
-     * a socket this class opens (that API exists only for a VPN
-     * implementation to protect ITS OWN control-channel socket from a
-     * routing loop - this probe is application code, not the transport
-     * implementation, so it is never called here) - Android routes a VPN
-     * app's own non-protected sockets through its own tun interface by
-     * default once the tunnel is up, the same as every other app's traffic.
-     *
-     * Honest limitation, reported rather than hidden: this reasoning has
-     * NOT been confirmed against real on-device packet capture in this
-     * pass (task requirement: "do not claim server runtime verification
-     * that was not actually performed" - the same discipline applies here).
-     * If a future device test shows this probe can succeed even with the
-     * tunnel down (i.e. it is silently bypassing the VPN), that is a
-     * correctness bug in THIS probe and must be fixed before trusting a
-     * PROTECTED result from it.
+     * A synchronized Russia capture saw other app traffic in awg-ft31 but
+     * none of this app's three probe destinations. A plain Socket therefore
+     * cannot prove that the probe traversed the VPN on that device. The
+     * production provider below finds this field-test tunnel by its assigned
+     * address, and each probe socket is explicitly bound to that Network.
+     * Missing VPN network fails closed and is recorded separately.
      */
     /**
      * Bounded post-handshake data-plane probe (B37 Russia diagnostic pass).
@@ -352,6 +341,15 @@ class FieldTestViewModel(
      * gateway (their own blocking, unrelated to this tunnel).
      */
     private suspend fun probeDataPlane(candidate: ProductionGatewayId, gatewayEndpointHost: String): Boolean {
+        val socketFactory = if (probeTargetOverride != null) null else try {
+            vpnSocketFactoryProvider()
+        } catch (_: Throwable) {
+            null
+        }
+        if (probeTargetOverride == null && socketFactory == null) {
+            diagnostics.recordProbeVpnUnavailable(candidate)
+            return false
+        }
         val targets = listOf(
             FieldTestProbeTarget.GATEWAY to gatewayEndpointHost,
             FieldTestProbeTarget.CLOUDFLARE to "1.1.1.1",
@@ -365,7 +363,7 @@ class FieldTestViewModel(
                         if (probeTargetOverride != null) {
                             probeTargetOverride.invoke(host)
                         } else {
-                            Socket().use { socket ->
+                            socketFactory!!.createSocket().use { socket ->
                                 socket.connect(InetSocketAddress(host, 443), DATA_PLANE_PROBE_TIMEOUT_MS.toInt())
                             }
                             true
@@ -500,6 +498,15 @@ class FieldTestViewModel(
                 appVersionName = versionName,
                 appVersionCode = versionCode,
                 networkProfileProvider = { currentNetworkProfileSnapshot(application) },
+                vpnSocketFactoryProvider = {
+                    val manager = application.getSystemService(ConnectivityManager::class.java)
+                    manager.allNetworks.firstOrNull { network ->
+                        manager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
+                            manager.getLinkProperties(network)?.linkAddresses?.any { address ->
+                                address.address.hostAddress == FieldTestAwg31Identity.CLIENT_TUNNEL_ADDRESS_CIDR.substringBefore('/')
+                            } == true
+                    }?.socketFactory
+                },
             ) as T
         }
     }

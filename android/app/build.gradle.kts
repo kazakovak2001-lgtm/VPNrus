@@ -119,7 +119,7 @@ android {
         create("fieldTest") {
             initWith(getByName("debug"))
             applicationIdSuffix = ".fieldtest"
-            versionNameSuffix = "-FIELD_TEST_ONLY"
+            versionNameSuffix = "-FIELD_TEST_ONLY-v2"
             isDebuggable = true
             // No dedicated release-signing mechanism exists in this
             // repository (no signingConfigs block, no committed keystore) -
