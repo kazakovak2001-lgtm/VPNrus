@@ -235,9 +235,14 @@ def evaluate_static_contract(env, nginx_text):
         bool(access_rules) and access_rules[-1] == ("deny", "all"),
     ))
 
+    # nginx `satisfy` is inherited from the enclosing server scope.
+    # This file is the dedicated CDN-origin config, so fail closed on
+    # `satisfy any` anywhere in it rather than inspecting only the XHTTP
+    # location block. Otherwise server-scoped auth_basic could satisfy the
+    # inherited access policy and bypass the location's CDN CIDR allowlist.
     checks.append(Check(
         "satisfy-any bypass is absent",
-        not bool(re.search(r"(?m)^\s*satisfy\s+any\s*;", block)),
+        not bool(re.search(r"(?m)^\s*satisfy\s+any\s*;", nginx_text)),
     ))
 
     checks.append(Check(

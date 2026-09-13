@@ -182,6 +182,18 @@ class CdnOriginPreflightTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("satisfy-any bypass is absent", result.stdout)
 
+    def test_server_scoped_satisfy_any_is_rejected_before_inheritance(self):
+        nginx = VALID_NGINX.replace(
+            "    server_name origin.example.net;\n",
+            '    server_name origin.example.net;\n'
+            '    satisfy any;\n'
+            '    auth_basic "alternative access path";\n'
+            '    auth_basic_user_file /etc/nginx/htpasswd;\n',
+        )
+        result = self._run(nginx_text=nginx)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("satisfy-any bypass is absent", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
