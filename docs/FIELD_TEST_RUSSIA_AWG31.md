@@ -1,6 +1,7 @@
 # B37 - Russia field-test build, AWG 3.1 generation (FIELD_TEST_ONLY)
 
-**Nothing server-side in this document has been applied.** Supersedes
+This document describes the isolated setup, not the current state of either
+host; inspect each host before provisioning or rollback. Supersedes
 `docs/FIELD_TEST_RUSSIA.md` for the actual AWG generation this build now
 exercises - that document's UX/routing/diagnostics description is still
 accurate, only the AWG identity/gateway/profile changed.
@@ -79,12 +80,14 @@ stdout, never written to shell history, never passed as a literal
 command-line argument. Only the derived PUBLIC key is printed (non-secret).
 `HeaderProtectionKey` has no public half (it is shared-secret material, not
 a keypair) - the operator retrieves it themselves, directly from that
-server's own `/etc/amnezia/amneziawg/awg-ft31.conf` (`sudo grep
-'^HeaderProtectionKey' ...`), and pastes it into
-`FieldTestAwg31GatewayCatalog.kt` before rebuilding the field-test APK -
-never relayed through Claude, a report, a ticket, or a log. The placeholder
-values currently committed in `FieldTestAwg31GatewayCatalog.kt`
-(`REPLACE_BEFORE_DEPLOY_...`) are deliberately not valid key material.
+server's own `/etc/amnezia/amneziawg/awg-ft31.conf` and places it only in
+gitignored `android/app/gateway-dev.properties`, using
+`fieldTestFrankfurtHeaderProtectionKey` or
+`fieldTestStockholmHeaderProtectionKey` as appropriate, before rebuilding
+the field-test APK. Never relay the key through a task report, ticket, or log.
+The public server keys remain in `FieldTestAwg31GatewayCatalog.kt`.
+`assembleFieldTest` checks that both local keys decode to 32 bytes and
+refuses to package an APK if either is absent or malformed.
 
 ## What this is (delta over docs/FIELD_TEST_RUSSIA.md)
 
@@ -141,7 +144,7 @@ CLIENT_TUNNEL_ADDRESS_CIDR         = 10.77.31.2/32
 (Private key embedded in the disposable APK - see
 `FieldTestAwg31Identity.kt`; same non-secrecy posture as B36.)
 
-## Server-side setup (NOT YET APPLIED - requires owner approval)
+## Server-side setup (only after checking the host's current state)
 
 ```bash
 cd /opt/pocvpn/gateway
@@ -153,9 +156,9 @@ sudo FT31_CLIENT_PUBLIC_KEY=<this build's public key> \
 No private key or `HeaderProtectionKey` is ever passed in - both are
 generated locally on that server by the script itself (see "Secret
 handling" above). The run prints the server's own public key at the end;
-copy it into `FieldTestAwg31GatewayCatalog.kt`, retrieve
-`HeaderProtectionKey` yourself directly from that server's config file, and
-rebuild the APK before this build can actually handshake.
+copy it into `FieldTestAwg31GatewayCatalog.kt` if it differs, put the
+`HeaderProtectionKey` in the ignored local properties file as described
+above, and rebuild the APK before this build can actually handshake.
 
 ### Rollback (either host)
 
@@ -244,16 +247,16 @@ rollback model as the FORWARD rules (`lib/ft31_forward_rules.sh`'s
 `ft31_add_input_rule`/`ft31_remove_input_rule`/`ft31_input_rule_present`).
 `rollback-ft31.sh` removes exactly this rule and nothing else.
 
-**Stockholm: NOT implemented** - its live INPUT chain/policy has not been
-read-only-diagnosed the same way (`nft list chain inet pocvpn input` or
-equivalent has not been run against the real host). `ft31_add_input_rule`
-deliberately fails closed (dies, zero mutation) for any host other than
-`frankfurt` rather than guessing. Before a real Stockholm deploy: run that
-read-only audit, and only then decide whether Stockholm needs an equivalent
-rule and add a host-specific case to `ft31_add_input_rule`/
-`ft31_input_rule_present`/`ft31_remove_input_rule` following the exact same
-fail-closed, marker-tagged discipline as Frankfurt's - never add one
-speculatively, and never weaken any other INPUT rule/policy.
+**Stockholm: implemented (B37 Stockholm fix pass, real evidence)** - live,
+read-only-diagnosed facts: `iptables -S INPUT` is exactly `-P INPUT ACCEPT`
+(zero explicit rules), and the `inet pocvpn` table's own nftables INPUT hook
+is likewise `policy accept` with no rules. Host-level INPUT is not this
+host's inbound gate at all - unlike Frankfurt, no b37-ft31 ACCEPT rule is
+needed or added; `ft31_add_input_rule`/`ft31_input_rule_present` verify this
+exact shape and fail closed if it ever drifts, rather than assuming it.
+Inbound UDP 51821 reaching this host at all is still gated only by the AWS
+Security Group (see the PREDEPLOY GATE above - this script cannot see or
+mutate it).
 
 ## Distinguishing a REAL AWG 3.1 block from a mundane reachability/config
 ## problem (task E1) - read this BEFORE calling a failed attempt "blocked"
@@ -280,7 +283,8 @@ the gateway (read-only, no payload/secret logging):
      `latest handshake` staying absent/stale despite (1) showing packets
      arriving -> **protocol/config/handshake problem** (verify the profile
      in `config/awg-ft31-profile.env` matches `FieldTestAwg31GatewayCatalog.kt`
-     exactly, and that the correct `HeaderProtectionKey` was pasted in).
+     exactly, and that the correct `HeaderProtectionKey` was supplied by
+     the ignored local properties file).
 3. **Did the handshake succeed but the client's own health/data-plane probe
    still failed?**
    - `sudo awg show awg-ft31` shows a fresh handshake, but the client

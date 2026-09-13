@@ -37,7 +37,21 @@ fun buildFieldTestAwgConfig(gateway: ProductionGatewayDescriptor): AwgConfig =
         localAddresses = listOf(FieldTestAwg31Identity.CLIENT_TUNNEL_ADDRESS_CIDR),
         dnsServers = listOf("1.1.1.1", "1.0.0.1"),
         listenPort = null,
-        mtu = null,
+        // B37 Russia field-test diagnostic pass: a Russia field-test report
+        // showed AWG 3.1 handshake succeeding on BOTH gateways but the
+        // post-handshake health probe timing out on both, reported
+        // networkType=CELLULAR. The default (library) MTU (~1420) does not
+        // account for real cellular path MTU (often <1400 under CGNAT/VoLTE
+        // encapsulation) PLUS this profile's own ContentPaddingAddition
+        // ("0-64" extra bytes on every DATA packet, never on the small
+        // fixed-size handshake packets) - together a very plausible
+        // black-hole: handshake fits, padded data packets don't, and
+        // fragmentation-needed ICMP is commonly dropped on
+        // censored/NATed mobile paths, so there is no fallback signal at
+        // all. 1280 is the conservative floor safe on effectively any real
+        // path (IPv6 minimum MTU) while this is diagnosed further via the
+        // health-probe/gateway-capture changes below.
+        mtu = 1280,
         profile = gateway.awgProfile,
         peer = AwgPeer(
             publicKeyBase64 = gateway.awg.serverPublicKeyBase64,

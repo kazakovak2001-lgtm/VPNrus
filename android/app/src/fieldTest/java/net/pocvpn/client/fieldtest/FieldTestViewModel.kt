@@ -25,6 +25,7 @@ import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.AmneziaWgTransport
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
+import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.policy.RoutingMode
 
@@ -101,11 +102,12 @@ class FieldTestViewModel(
      * [probeDataPlane] (only [effectiveHealthCheck] below, a regular
      * property initializer, can), hence the null-then-fallback shape here.
      */
-    private val healthCheckOverride: (suspend (VpnTransport) -> Boolean)? = null,
+    private val healthCheckOverride: (suspend (VpnTransport, ProductionGatewayDescriptor) -> Boolean)? = null,
 ) : ViewModel() {
 
     private val diagnostics = FieldTestDiagnosticsRecorder(nowProvider)
-    private val effectiveHealthCheck: suspend (VpnTransport) -> Boolean = healthCheckOverride ?: { probeDataPlane() }
+    private val effectiveHealthCheck: suspend (VpnTransport, ProductionGatewayDescriptor) -> Boolean =
+        healthCheckOverride ?: { _, gateway -> probeDataPlane(gateway.awg.endpointHost) }
 
     /**
      * B37 - the ONE line that switches this build from the legacy AWG
@@ -301,8 +303,22 @@ class FieldTestViewModel(
      * correctness bug in THIS probe and must be fixed before trusting a
      * PROTECTED result from it.
      */
-    private suspend fun probeDataPlane(): Boolean {
-        val targets = listOf("1.1.1.1" to 443, "8.8.8.8" to 443)
+    /**
+     * Bounded post-handshake data-plane probe (B37 Russia diagnostic pass).
+     * [gatewayEndpointHost] - the SAME gateway's own public IP this attempt
+     * just handshook with (it already runs nginx on :443 for
+     * Xray/REALITY, verified read-only on both hosts) - tried FIRST,
+     * before the two third-party targets. This exists to disambiguate two
+     * different failure classes a Russia field-test report cannot tell
+     * apart on its own: if the gateway-self target ALSO fails alongside
+     * 1.1.1.1/8.8.8.8, the problem is on the client<->gateway path itself
+     * (MTU black hole or DPI flow throttling) - if gateway-self SUCCEEDS
+     * but the two public IPs fail, the tunnel's data plane is fine and the
+     * problem is specific to reaching those two well-known IPs beyond the
+     * gateway (their own blocking, unrelated to this tunnel).
+     */
+    private suspend fun probeDataPlane(gatewayEndpointHost: String): Boolean {
+        val targets = listOf(gatewayEndpointHost to 443, "1.1.1.1" to 443, "8.8.8.8" to 443)
         return withContext(Dispatchers.IO) {
             for ((host, port) in targets) {
                 val ok = try {
@@ -403,7 +419,14 @@ class FieldTestViewModel(
     }
 
     private companion object {
-        const val DATA_PLANE_PROBE_TIMEOUT_MS = 4_000L
+        // B37 Russia diagnostic pass: was 4_000L. A Russia field-test report
+        // showed both probe targets timing out at exactly this bound (2 x
+        // 4s back-to-back), consistent with either a hard drop OR a slow
+        // retransmit/recovery that a longer window would have let through -
+        // widened so the next report can actually tell those apart, at the
+        // cost of a longer worst-case field-test attempt (acceptable for a
+        // diagnostic build).
+        const val DATA_PLANE_PROBE_TIMEOUT_MS = 6_000L
     }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {

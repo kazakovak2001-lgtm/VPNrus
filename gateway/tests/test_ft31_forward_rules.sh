@@ -91,12 +91,19 @@ STUB
 -A FORWARD -i ens3 -o awg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A FORWARD -j REJECT --reject-with icmp-port-unreachable
 FIXTURE
-    # Real verified Frankfurt INPUT facts (senior-review pass): UDP 51820
-    # ACCEPT (production awg0), terminal REJECT - no UDP 51821 rule yet.
-    cat > "$root/etc/input_rules" <<'FIXTURE'
+    if [ "$profile" = "stockholm" ]; then
+        # Real verified Stockholm INPUT facts (B37 Stockholm fix pass):
+        # policy ACCEPT, zero explicit rules - `iptables -S INPUT` prints
+        # exactly this one line.
+        printf -- '-P INPUT ACCEPT\n' > "$root/etc/input_rules"
+    else
+        # Real verified Frankfurt INPUT facts (senior-review pass): UDP 51820
+        # ACCEPT (production awg0), terminal REJECT - no UDP 51821 rule yet.
+        cat > "$root/etc/input_rules" <<'FIXTURE'
 -A INPUT -p udp --dport 51820 -j ACCEPT
 -A INPUT -j REJECT --reject-with icmp-port-unreachable
 FIXTURE
+    fi
 
     # --- nft (Stockholm fixture) ---
     cat > "$root/bin/nft" <<STUB
@@ -393,13 +400,40 @@ else
 fi
 rm -rf "$ROOT"
 
-# M. Unknown/unaudited host (e.g. stockholm) fails closed - zero mutation,
-# never a guessed INPUT rule.
+# M. Stockholm's audited INPUT model (policy ACCEPT, zero rules) is
+# verified and satisfied WITHOUT adding any rule - zero mutation (no b37-ft31
+# rule is needed there; see lib/ft31_forward_rules.sh's own top-level docs).
 ROOT=$(make_fixture stockholm)
 if run_lib "$ROOT" 'ft31_add_input_rule stockholm' >/dev/null 2>&1; then
-    fail "M: ft31_add_input_rule must fail closed for a host with no audited INPUT model"
+    pass "M: ft31_add_input_rule succeeds for stockholm (audited default-accept INPUT already satisfies it)"
 else
-    pass "M: ft31_add_input_rule fails closed for stockholm (no audited INPUT model yet)"
+    fail "M: ft31_add_input_rule should succeed (verify-only, no-op) for stockholm's real audited INPUT shape"
+fi
+if [ "$(cat "$ROOT/etc/input_rules")" = "-P INPUT ACCEPT" ] && ! grep -q '\-I \|\-D ' "$ROOT/etc/calls.log"; then
+    pass "M: stockholm INPUT made ZERO mutation (still exactly '-P INPUT ACCEPT', no -I/-D ever called)"
+else
+    fail "M: stockholm ft31_add_input_rule must never mutate INPUT - nothing to add there"
+fi
+rm -rf "$ROOT"
+
+# M2. A DRIFTED Stockholm INPUT shape (no longer policy-ACCEPT/zero-rules)
+# fails closed rather than guessing whether a rule is still needed.
+ROOT=$(make_fixture stockholm)
+printf -- '-P INPUT ACCEPT\n-A INPUT -p tcp --dport 22 -j ACCEPT\n' > "$ROOT/etc/input_rules"
+if run_lib "$ROOT" 'ft31_add_input_rule stockholm' >/dev/null 2>&1; then
+    fail "M2: a drifted stockholm INPUT shape (no longer bare policy-ACCEPT) must fail closed"
+else
+    pass "M2: a drifted stockholm INPUT shape fails closed rather than guessing"
+fi
+rm -rf "$ROOT"
+
+# M3. An unknown/unaudited host (e.g. paris) still fails closed - zero
+# mutation, never a guessed INPUT rule.
+ROOT=$(make_fixture stockholm)
+if run_lib "$ROOT" 'ft31_add_input_rule paris' >/dev/null 2>&1; then
+    fail "M3: ft31_add_input_rule must fail closed for a host with no audited INPUT model"
+else
+    pass "M3: ft31_add_input_rule fails closed for an unaudited host ('paris')"
 fi
 rm -rf "$ROOT"
 

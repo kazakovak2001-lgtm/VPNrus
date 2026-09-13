@@ -52,8 +52,16 @@ class FieldTestTunnelController(
     private val diagnostics: FieldTestDiagnosticsRecorder? = null,
     private val nowProvider: () -> Long = System::currentTimeMillis,
     private val delayMs: suspend (Long) -> Unit = { delay(it) },
-    /** Runs only after a fresh handshake is observed - the extra data-plane confidence check (task's own "health/data-plane proof"). Defaults to always-healthy (handshake alone suffices) when no stronger probe is supplied. */
-    private val healthCheck: suspend (VpnTransport) -> Boolean = { true },
+    /**
+     * Runs only after a fresh handshake is observed - the extra data-plane
+     * confidence check (task's own "health/data-plane proof"). Defaults to
+     * always-healthy (handshake alone suffices) when no stronger probe is
+     * supplied. Receives the candidate's own [ProductionGatewayDescriptor]
+     * (B37 Russia diagnostic pass) so a real probe can include the
+     * gateway's OWN public endpoint as a target, not only third-party IPs -
+     * see [FieldTestViewModel.probeDataPlane]'s own docs for why.
+     */
+    private val healthCheck: suspend (VpnTransport, ProductionGatewayDescriptor) -> Boolean = { _, _ -> true },
     /**
      * B37 - resolves which [ProductionGatewayDescriptor] (host/port/pubkey/
      * AWG profile) each candidate actually connects to. Defaults to
@@ -127,7 +135,7 @@ class FieldTestTunnelController(
 
             val healthy = if (handshakeOk) {
                 val result = try {
-                    healthCheck(transport)
+                    healthCheck(transport, gateway)
                 } catch (c: CancellationException) {
                     throw c
                 } catch (t: Throwable) {

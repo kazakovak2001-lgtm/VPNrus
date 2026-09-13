@@ -96,7 +96,7 @@ class FieldTestViewModelTest {
         // deterministic fake here instead of performing real network I/O,
         // same discipline as every other externally-real dependency
         // (transport/network/clock) this test already fakes.
-        healthCheckOverride: (suspend (net.pocvpn.client.vpn.VpnTransport) -> Boolean)? = { true },
+        healthCheckOverride: (suspend (net.pocvpn.client.vpn.VpnTransport, net.pocvpn.client.vpn.config.ProductionGatewayDescriptor) -> Boolean)? = { _, _ -> true },
     ) = FieldTestViewModel(
         transportFactory = { FixedTransport(shouldHandshake = allHandshake) },
         appVersionName = "0.1-fieldtest",
@@ -164,7 +164,7 @@ class FieldTestViewModelTest {
             networkProfileProvider = { fakeWifiProfile },
             nowProvider = { 0L },
             preparePermissionIntent = { null },
-            healthCheckOverride = { false },
+            healthCheckOverride = { _, _ -> false },
         )
 
         vm.connect()
@@ -235,8 +235,12 @@ class FieldTestViewModelTest {
         assertFalse(json.contains(FieldTestIdentity.CLIENT_TUNNEL_ADDRESS_CIDR))
         assertFalse(json.contains(FieldTestAwg31Identity.FIELD_TEST_AWG31_PRIVATE_KEY_BASE64))
         assertFalse(json.contains(FieldTestAwg31Identity.CLIENT_TUNNEL_ADDRESS_CIDR))
-        assertFalse(json.contains(FieldTestAwg31GatewayCatalog.GERMANY.awgProfile.headerProtectionKeyBase64!!))
-        assertFalse(json.contains(FieldTestAwg31GatewayCatalog.STOCKHOLM.awgProfile.headerProtectionKeyBase64!!))
+        listOf(
+            FieldTestAwg31GatewayCatalog.GERMANY.awgProfile.headerProtectionKeyBase64,
+            FieldTestAwg31GatewayCatalog.STOCKHOLM.awgProfile.headerProtectionKeyBase64,
+        ).filterNotNull().filter { it.isNotBlank() }.forEach { key ->
+            assertFalse(json.contains(key))
+        }
     }
 
     // Test A (B37) - a real Connect through this ViewModel's actual wiring reports AWG_3_1, never AWG_LEGACY.
@@ -396,7 +400,7 @@ class FieldTestViewModelTest {
             networkProfileProvider = { fakeWifiProfile },
             nowProvider = { 0L },
             preparePermissionIntent = { permissionIntent },
-            healthCheckOverride = { true },
+            healthCheckOverride = { _, _ -> true },
         )
         vm.connect()
         vm.onVpnPermissionResult(true)

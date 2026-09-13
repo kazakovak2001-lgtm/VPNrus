@@ -1,5 +1,6 @@
 package net.pocvpn.client.fieldtest
 
+import net.pocvpn.client.BuildConfig
 import net.pocvpn.client.vpn.config.AwgGatewayConnection
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
@@ -42,21 +43,11 @@ import net.pocvpn.client.vpn.config.ProductionGatewayId
  * - [ProductionGatewayDescriptor.awg.endpointHost] is the SAME real host IP
  *   already committed in `ProductionGatewayCatalog` (non-secret, same
  *   posture that file documents for gateway public keys).
- * - [AwgGatewayConnection.serverPublicKeyBase64]/the `HeaderProtectionKey`
- *   below are DELIBERATE PLACEHOLDERS, not real key material (senior-review
- *   correction: an earlier version of this file committed real-looking
- *   pre-generated server keys whose PRIVATE halves were then exposed in a
- *   task report - those values must never be used and are not reused here).
- *   `gateway/provision-ft31.sh` now generates the server's own private key
- *   AND `HeaderProtectionKey` locally on each VPS via `awg genkey`, at
- *   deploy time, and never prints/logs/echoes them - only the derived
- *   PUBLIC key is printed (safe, non-secret). Before this build can
- *   actually handshake, an operator must: (1) run `provision-ft31.sh` on
- *   each gateway, (2) copy that run's printed public key into
- *   [GERMANY]/[STOCKHOLM] below, (3) retrieve `HeaderProtectionKey`
- *   THEMSELVES directly from that server's own
- *   `/etc/amnezia/amneziawg/awg-ft31.conf` (never relayed through Claude,
- *   a report, or a chat) and paste it in, then rebuild this APK.
+ * - [AwgGatewayConnection.serverPublicKeyBase64] is the public key of each
+ *   isolated server interface. The corresponding shared
+ *   `HeaderProtectionKey` is supplied at build time from gitignored
+ *   `android/app/gateway-dev.properties` into fieldTest BuildConfig only.
+ *   It is never committed or sent through a task report.
  * - The junk/padding/magic-header values (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`)
  *   are the ORIGINAL POC-01 profile declared in
  *   `gateway/config/awg-profile.env` (not the live-drifted values
@@ -112,11 +103,11 @@ object FieldTestAwg31GatewayCatalog {
         awg = AwgGatewayConnection(
             endpointHost = "152.70.43.1",
             endpointPort = FIELD_TEST_PORT,
-            serverPublicKeyBase64 = "REPLACE_BEFORE_DEPLOY_FRANKFURT_AWG31_SERVER_PUBLIC_KEY",
+            serverPublicKeyBase64 = "JWDNIR515f5KqgOZLVIW2cwmr09xRhBKuc7iRBX3NUs=",
             gatewayTunnelIp = "10.77.31.1",
         ),
         awgProfile = FIELD_TEST_PROFILE_BASE.copy(
-            headerProtectionKeyBase64 = "REPLACE_BEFORE_DEPLOY_FRANKFURT_AWG31_HEADER_PROTECTION_KEY",
+            headerProtectionKeyBase64 = BuildConfig.FIELD_TEST_FRANKFURT_HPK,
         ),
     )
 
@@ -129,11 +120,11 @@ object FieldTestAwg31GatewayCatalog {
         awg = AwgGatewayConnection(
             endpointHost = "16.170.208.231",
             endpointPort = FIELD_TEST_PORT,
-            serverPublicKeyBase64 = "REPLACE_BEFORE_DEPLOY_STOCKHOLM_AWG31_SERVER_PUBLIC_KEY",
+            serverPublicKeyBase64 = "sMr1oZlA9jRHnwZnEo2Ks8i7r/uBC3LDPe1K7ozMKxI=",
             gatewayTunnelIp = "10.77.31.1",
         ),
         awgProfile = FIELD_TEST_PROFILE_BASE.copy(
-            headerProtectionKeyBase64 = "REPLACE_BEFORE_DEPLOY_STOCKHOLM_AWG31_HEADER_PROTECTION_KEY",
+            headerProtectionKeyBase64 = BuildConfig.FIELD_TEST_STOCKHOLM_HPK,
         ),
     )
 

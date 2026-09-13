@@ -94,7 +94,7 @@ class FieldTestTunnelControllerTest {
             transportFactory = { FixedFieldTestTransport(shouldHandshake = true) },
             nowProvider = { 0L },
             delayMs = { },
-            healthCheck = { healthCheckCalled = true; true },
+            healthCheck = { _, _ -> healthCheckCalled = true; true },
         )
         val result = controller.connect()
         assertTrue(result is FieldTestState.Protected)
@@ -109,7 +109,7 @@ class FieldTestTunnelControllerTest {
             transportFactory = { candidate -> attempted += candidate; FixedFieldTestTransport(shouldHandshake = true) },
             nowProvider = { 0L },
             delayMs = { },
-            healthCheck = { false },
+            healthCheck = { _, _ -> false },
         )
         val result = controller.connect()
         assertTrue(result is FieldTestState.Failed)

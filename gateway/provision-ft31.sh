@@ -471,20 +471,15 @@ _ft31_test_fail_if FT31_TEST_FAIL_AFTER_FIRST_FORWARD_RULE
 ft31_add_rule_from_ft31 "$FT31_HOST" "$EGRESS_IFACE"
 log "b37-ft31 FORWARD accept rules present on $FT31_HOST"
 
-log "step 6/6: host INPUT rule for UDP $FT31_LISTEN_PORT (senior-review pass: real Frankfurt preflight evidence)"
-# Real Frankfurt facts: INPUT ACCEPTs UDP 51820 (production) and ends in a
-# terminal REJECT - there is NO existing UDP 51821 ACCEPT, so without this,
-# inbound B37 traffic would never reach the FORWARD rules above at all.
-# Frankfurt-only by design (ft31_add_input_rule fails closed for any other
-# host) - Stockholm's own live INPUT model has not been read-only-diagnosed
-# yet (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE), so this step
-# is skipped there rather than guessing.
-if [ "$FT31_HOST" = frankfurt ]; then
-    ft31_add_input_rule "$FT31_HOST"
-    log "b37-ft31 host INPUT rule present on $FT31_HOST"
-else
-    log "  [skipped] no audited host INPUT model for $FT31_HOST yet - see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE before assuming inbound UDP $FT31_LISTEN_PORT reaches this host at all"
-fi
+log "step 6/6: host INPUT for UDP $FT31_LISTEN_PORT (both hosts now have an audited INPUT model - see lib/ft31_forward_rules.sh)"
+# Frankfurt: INPUT ACCEPTs UDP 51820 (production) and ends in a terminal
+# REJECT - a b37-ft31 ACCEPT rule must be inserted ahead of it.
+# Stockholm: INPUT policy is already ACCEPT with zero explicit rules (real,
+# read-only-diagnosed evidence) - ft31_add_input_rule verifies this and adds
+# nothing, since nothing is needed. Both cases are handled by the single
+# call below; any future host with no audited model still fails closed.
+ft31_add_input_rule "$FT31_HOST"
+log "b37-ft31 host INPUT requirement satisfied on $FT31_HOST"
 _ft31_test_fail_if FT31_TEST_FAIL_AFTER_INPUT_RULE
 
 POST_SNAPSHOT=$(mktemp)
@@ -504,9 +499,7 @@ ft31_verify_runtime "$FT31_HOST" "$EGRESS_IFACE" && log "  [ok] existing product
 # which unit (or none) currently owns the interface.
 ip link show awg0 >/dev/null 2>&1 && log "  [ok] production awg0 interface is still up"
 ft31_forward_rules_present "$FT31_HOST" "$EGRESS_IFACE" && log "  [ok] b37-ft31 FORWARD accept rules are present"
-if [ "$FT31_HOST" = frankfurt ]; then
-    ft31_input_rule_present "$FT31_HOST" && log "  [ok] b37-ft31 host INPUT rule is present"
-fi
+ft31_input_rule_present "$FT31_HOST" && log "  [ok] b37-ft31 host INPUT requirement is satisfied"
 FT31_NAT_OUTPUT=$(nft list table inet pocvpn-ft31 2>/dev/null || true)
 printf '%s' "$FT31_NAT_OUTPUT" | grep -q masquerade && log "  [ok] b37-ft31 NAT (masquerade) is present"
 ip link show "$FT31_INTERFACE_NAME" >/dev/null 2>&1 && log "  [ok] $FT31_INTERFACE_NAME interface exists"

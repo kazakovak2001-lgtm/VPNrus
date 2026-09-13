@@ -42,15 +42,30 @@ FT31_INPUT_PORT=51821
 # say over whether the packet reaches this host's own listening socket in
 # the first place).
 #
-# Stockholm's own live INPUT model has NOT been read-only-diagnosed the same
-# way (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE) - every function
-# below is Frankfurt-only BY DESIGN, and deliberately refuses (fails closed,
-# zero mutation) rather than guessing for any other host, exactly the same
+# Stockholm's own live INPUT model WAS read-only-diagnosed (B37 Stockholm
+# fix pass, real evidence): `iptables -S INPUT` is exactly `-P INPUT ACCEPT`
+# with zero explicit rules, and the `inet pocvpn` nftables table's own INPUT
+# hook (`chain INPUT { type filter hook input priority filter; policy
+# accept; }`, no rules) is likewise wide open - host-level INPUT filtering is
+# not this host's inbound gate at all (AWS Security Groups are, per
+# docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE, which this script cannot
+# see or mutate). Unlike Frankfurt (an explicit ACCEPT rule must be inserted
+# before a terminal REJECT), Stockholm needs NO rule added - the existing
+# default-accept policy already lets UDP 51821 reach the host's own socket.
+# `ft31_add_input_rule` for stockholm therefore only VERIFIES this fact
+# (fails closed if the live chain shape ever drifts from exactly this) and
+# adds nothing - there is no b37-ft31-tagged INPUT rule to insert or later
+# remove on this host, by design, not by oversight.
+#
+# Any FUTURE host with neither Frankfurt's nor Stockholm's audited shape
+# still fails closed (zero mutation) rather than guessing, exactly the same
 # discipline as ft31_verify_runtime's own per-host case statement.
 
-# ft31_input_rule_present <host> - true (0) only if the exact b37-ft31 INPUT
-# ACCEPT rule already exists. Always false for a host with no audited INPUT
-# model (never dies - "not present" is the correct, safe answer for a
+# ft31_input_rule_present <host> - true (0) if either (a) the exact b37-ft31
+# INPUT ACCEPT rule already exists (frankfurt), or (b) the host's own
+# INPUT policy is already default-accept with zero rules, so no b37-ft31
+# rule is needed at all (stockholm). Always false for a host with no audited
+# INPUT model (never dies - "not present" is the correct, safe answer for a
 # presence CHECK; ft31_add_input_rule is the one that fails closed on an
 # unaudited host, since only an ADD needs to refuse to guess).
 ft31_input_rule_present() {
@@ -59,8 +74,22 @@ ft31_input_rule_present() {
         frankfurt)
             iptables -C INPUT -p udp --dport "$FT31_INPUT_PORT" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT 2>/dev/null
             ;;
+        stockholm)
+            _ft31_stockholm_input_is_default_accept
+            ;;
         *) return 1 ;;
     esac
+}
+
+# _ft31_stockholm_input_is_default_accept - internal helper. True (0) only
+# if `iptables -S INPUT` is EXACTLY the single line `-P INPUT ACCEPT` (no
+# explicit rules at all) - the real, verified Stockholm shape. Any other
+# shape (an explicit rule present, or a non-ACCEPT policy) is NOT this
+# audited case and must not be assumed safe.
+_ft31_stockholm_input_is_default_accept() {
+    local rules
+    rules=$(iptables -S INPUT 2>/dev/null || true)
+    [ "$rules" = "-P INPUT ACCEPT" ]
 }
 
 # _ft31_frankfurt_input_reject_line_number - internal helper. Returns (on
@@ -86,12 +115,15 @@ _ft31_frankfurt_input_reject_line_number() {
     printf '%s' "$reject_line"
 }
 
-# ft31_add_input_rule <host> - idempotent; inserts the b37-ft31 INPUT ACCEPT
-# rule immediately before the chain's terminal REJECT/DROP (so it stays
-# ahead of the final verdict, without disturbing the relative order or
-# position of any other existing rule, including the pre-existing UDP 51820
-# ACCEPT). Fails closed (die, zero mutation) for any host with no audited
-# INPUT model - never a blind guess for Stockholm or any future host.
+# ft31_add_input_rule <host> - idempotent; for frankfurt, inserts the
+# b37-ft31 INPUT ACCEPT rule immediately before the chain's terminal
+# REJECT/DROP (so it stays ahead of the final verdict, without disturbing
+# the relative order or position of any other existing rule, including the
+# pre-existing UDP 51820 ACCEPT). For stockholm, VERIFIES the live INPUT
+# chain is still the audited default-accept/zero-rules shape and adds
+# nothing (see this file's own top-level docs - there is genuinely no rule
+# to add there). Fails closed (die, zero mutation) for any host with no
+# audited INPUT model - never a blind guess for any future host.
 ft31_add_input_rule() {
     local host=$1
     ft31_input_rule_present "$host" && return 0
@@ -101,6 +133,9 @@ ft31_add_input_rule() {
             reject_line=$(_ft31_frankfurt_input_reject_line_number)
             iptables -I INPUT "$reject_line" -p udp --dport "$FT31_INPUT_PORT" -m comment --comment "$FT31_FW_MARKER" -j ACCEPT
             ;;
+        stockholm)
+            die "runtime mismatch: --host stockholm expects INPUT policy ACCEPT with zero explicit rules (the audited shape) but the live chain has drifted from that - refusing to guess an INPUT rule (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE and this file's own top-level docs)"
+            ;;
         *)
             die "ft31_add_input_rule: no audited host INPUT model for '$host' - refusing to guess an INPUT rule (see docs/FIELD_TEST_RUSSIA_AWG31.md's PREDEPLOY GATE)"
             ;;
@@ -108,8 +143,9 @@ ft31_add_input_rule() {
 }
 
 # ft31_remove_input_rule <host> - removes exactly the b37-ft31 INPUT ACCEPT
-# rule (no-op, exit 0, if already absent or the host has no INPUT model at
-# all - there is nothing of ours to remove either way).
+# rule (no-op, exit 0, if already absent or the host has no b37-ft31 INPUT
+# rule to begin with - stockholm never gets one, by design; see this file's
+# own top-level docs).
 ft31_remove_input_rule() {
     local host=$1
     case "$host" in

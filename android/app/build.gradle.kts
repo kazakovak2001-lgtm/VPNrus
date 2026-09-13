@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.util.Base64
 
 plugins {
     id("com.android.application")
@@ -127,6 +128,10 @@ android {
             // build, never a fabricated/ad-hoc signing setup.
             signingConfig = signingConfigs.getByName("debug")
             buildConfigField("boolean", "FIELD_TEST_ONLY", "true")
+            // The isolated AWG 3.1 shared keys are injected only into this
+            // disposable variant from gitignored gateway-dev.properties.
+            buildConfigField("String", "FIELD_TEST_FRANKFURT_HPK", "\"${gatewayDevProp("fieldTestFrankfurtHeaderProtectionKey")}\"")
+            buildConfigField("String", "FIELD_TEST_STOCKHOLM_HPK", "\"${gatewayDevProp("fieldTestStockholmHeaderProtectionKey")}\"")
         }
     }
 
@@ -252,4 +257,20 @@ dependencies {
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+}
+
+// A source checkout without operator-local keys can compile and run unit
+// tests, but must never produce an apparently usable field-test APK.
+val verifyFieldTestGatewayKeys = tasks.register("verifyFieldTestGatewayKeys") {
+    doLast {
+        for (name in listOf("fieldTestFrankfurtHeaderProtectionKey", "fieldTestStockholmHeaderProtectionKey")) {
+            val decoded = runCatching { Base64.getDecoder().decode(gatewayDevProp(name)) }.getOrNull()
+            require(decoded?.size == 32) {
+                "Missing or invalid $name in gitignored android/app/gateway-dev.properties"
+            }
+        }
+    }
+}
+tasks.matching { it.name == "packageFieldTest" }.configureEach {
+    dependsOn(verifyFieldTestGatewayKeys)
 }
