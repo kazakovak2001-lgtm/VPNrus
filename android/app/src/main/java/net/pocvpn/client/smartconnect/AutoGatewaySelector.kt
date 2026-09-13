@@ -11,6 +11,10 @@ import net.pocvpn.client.reachability.PathCandidateBuilder
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
 import net.pocvpn.client.reachability.ReachabilityState
+import net.pocvpn.client.reachability.CdnClientCompatibility
+import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
+import net.pocvpn.client.reachability.cdnClientCompatibility
+import net.pocvpn.client.reachability.ingressKind
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportHealth
 import net.pocvpn.client.transport.TransportHealthState
@@ -406,6 +410,7 @@ object AutoGatewaySelector {
         historyFor: (String, TransportKind) -> PathHistoryEntry?,
         preference: UserTransportPreference = UserTransportPreference.Auto,
         nowEpochMillis: Long = Long.MAX_VALUE,
+        cdnRuntimeCapabilities: CdnClientRuntimeCapabilities = CdnClientRuntimeCapabilities.unsupported(),
     ): List<RelayAttemptCandidate> {
         val byId = manifestEndpoints.associateBy { it.id }
         val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
@@ -421,6 +426,7 @@ object AutoGatewaySelector {
                     val ingressKind = ingressBinding.kind
                     exit.transports.forEach { exitBinding ->
                         val exitKind = exitBinding.kind
+                        if (!isIngressClientCompatible(ingressBinding, exit.id, cdnRuntimeCapabilities)) return@forEach
                         val candidate = PathCandidateBuilder.buildRelayed(
                             ingress = ingress,
                             exit = exit,
@@ -479,6 +485,17 @@ object AutoGatewaySelector {
                 historyPathId = candidate.historyPathId,
             )
         }
+    }
+
+    private fun isIngressClientCompatible(
+        ingressBinding: EndpointTransportBinding,
+        exitEndpointId: EndpointId,
+        cdnRuntimeCapabilities: CdnClientRuntimeCapabilities,
+    ): Boolean = when (ingressBinding.ingressKind()) {
+        null,
+        IngressKind.DIRECT_IP -> true
+        IngressKind.CDN_FRONTED ->
+            ingressBinding.cdnClientCompatibility(exitEndpointId, cdnRuntimeCapabilities) is CdnClientCompatibility.Compatible
     }
 
     /**
@@ -559,6 +576,7 @@ object AutoGatewaySelector {
         preference: UserTransportPreference = UserTransportPreference.Auto,
         nowEpochMillis: Long = Long.MAX_VALUE,
         restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
+        cdnRuntimeCapabilities: CdnClientRuntimeCapabilities = CdnClientRuntimeCapabilities.unsupported(),
     ): List<AutoConnectAttempt> {
         val direct = buildCandidates(
             manifestEndpoints, gatewayFactsFor, provisioned, clientTunnelIp, registryFor,
@@ -567,7 +585,7 @@ object AutoGatewaySelector {
         )
         val relayed = buildRelayedCandidates(
             manifestEndpoints, registryFor, reachabilityFor, transportHealthFor, historyFor,
-            preference, nowEpochMillis,
+            preference, nowEpochMillis, cdnRuntimeCapabilities,
         )
         val directAllowed = restrictionClass != RestrictionClass.POSSIBLE_HARD_WHITELIST || relayed.isNotEmpty()
         val combined: List<AutoConnectAttempt> =

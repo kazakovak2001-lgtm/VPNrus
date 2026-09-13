@@ -5,9 +5,21 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointReachability
 import net.pocvpn.client.reachability.EndpointRole
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.CdnCachePolicy
+import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
+import net.pocvpn.client.reachability.CdnHostnames
+import net.pocvpn.client.reachability.CdnMinimumTlsVersion
+import net.pocvpn.client.reachability.CdnPaddingPlacement
+import net.pocvpn.client.reachability.CdnProviderCapabilityProfile
+import net.pocvpn.client.reachability.CdnRequestPolicy
+import net.pocvpn.client.reachability.CdnTlsPolicy
+import net.pocvpn.client.reachability.CdnUplinkHttpMethod
+import net.pocvpn.client.reachability.CdnXhttpMode
+import net.pocvpn.client.reachability.CdnXhttpPolicy
 import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.withIngressKind
+import net.pocvpn.client.reachability.withCdnProviderProfile
 import net.pocvpn.client.reachability.ReachabilityEvidenceSummary
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.transport.TransportCapabilities
@@ -515,7 +527,7 @@ class AutoGatewaySelectorTest {
         roles = setOf(EndpointRole.INGRESS),
         region = "ru",
         provider = "operator-a",
-        transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.50", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+        transports = listOf(cdnBinding("edge.example.org")),
         relayTo = germanyId,
     )
 
@@ -540,12 +552,57 @@ class AutoGatewaySelectorTest {
         manifestEndpoints: List<EndpointDescriptor> = listOf(ingressEndpoint, exitEndpoint),
         reachabilityFor: (EndpointId, TransportKind) -> EndpointReachability = { id, kind -> relayReachable(id, kind) },
         transportHealthFor: (TransportKind) -> TransportHealth = { healthy() },
+        cdnRuntimeCapabilities: CdnClientRuntimeCapabilities = compatibleCdnRuntime(),
     ) = AutoGatewaySelector.buildRelayedCandidates(
         manifestEndpoints = manifestEndpoints,
         registryFor = { healthyRegistry(TransportKind.TLS_TCP) },
         reachabilityFor = reachabilityFor,
         transportHealthFor = transportHealthFor,
         historyFor = { _, _ -> null },
+        cdnRuntimeCapabilities = cdnRuntimeCapabilities,
+    )
+
+    private fun cdnBinding(host: String, exitId: EndpointId = germanyId): EndpointTransportBinding =
+        EndpointTransportBinding(TransportKind.TLS_TCP, host, 443)
+            .withIngressKind(IngressKind.CDN_FRONTED)
+            .withCdnProviderProfile(cdnProfile(host, exitId))
+
+    private fun cdnProfile(host: String, exitId: EndpointId = germanyId) = CdnProviderCapabilityProfile(
+        provider = "example-provider",
+        asn = 64512,
+        hosts = CdnHostnames(host, "edge-cdn.example.org", "origin.example.org", "origin-tls.example.org"),
+        xhttp = CdnXhttpPolicy(
+            mode = CdnXhttpMode.PACKET_UP,
+            path = "/xhttp/",
+            uplinkHttpMethod = CdnUplinkHttpMethod.POST,
+            paddingPlacement = CdnPaddingPlacement.QUERY,
+            paddingMinBytes = 0,
+            paddingMaxBytes = 64,
+            queryParameters = emptyMap(),
+            headers = emptyMap(),
+            extraParameters = emptyMap(),
+        ),
+        tls = CdnTlsPolicy(CdnMinimumTlsVersion.TLS_1_3, setOf("h2"), host, "chrome"),
+        requests = CdnRequestPolicy("origin.example.org", CdnCachePolicy.BYPASS_REQUIRED, true, 1048576, 30000),
+        supportedExits = setOf(exitId),
+        minimumClientVersionCode = 1,
+        minimumXrayCoreVersion = "25.8.3",
+        requiredClientCapabilities = setOf("cdn-profile-v1", "xhttp"),
+    )
+
+    private fun compatibleCdnRuntime() = CdnClientRuntimeCapabilities(
+        clientVersionCode = 1,
+        xrayCoreVersion = "25.8.3",
+        clientCapabilities = setOf("cdn-profile-v1", "xhttp"),
+        xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
+        uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
+        paddingPlacements = setOf(CdnPaddingPlacement.QUERY),
+        tlsFingerprints = setOf("chrome"),
+        alpn = setOf("h2"),
+        minimumTlsVersions = setOf(CdnMinimumTlsVersion.TLS_1_3),
+        supportsStreaming = true,
+        maxRequestBodyBytes = 1048576,
+        maxRequestTimeoutMillis = 30000,
     )
 
     @Test
@@ -582,6 +639,24 @@ class AutoGatewaySelectorTest {
     }
 
     @Test
+    fun `CDN_FRONTED ingress is excluded until local client and core capabilities satisfy its profile`() {
+        val compatible = buildRelayedDefault()
+        val unsupported = buildRelayedDefault(cdnRuntimeCapabilities = CdnClientRuntimeCapabilities.unsupported())
+
+        assertEquals(1, compatible.size)
+        assertTrue(unsupported.isEmpty())
+    }
+
+    @Test
+    fun `CDN_FRONTED ingress without a signed provider profile is excluded fail closed`() {
+        val noProfile = ingressEndpoint.copy(
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "edge-no-profile.example.org", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+        )
+
+        assertTrue(buildRelayedDefault(manifestEndpoints = listOf(noProfile, exitEndpoint)).isEmpty())
+    }
+
+    @Test
     fun `DIRECT_IP and CDN_FRONTED ingress candidates coexist in one ranked list, each keeping its own pinned kind`() {
         val candidates = buildRelayedDefault(manifestEndpoints = listOf(directIpIngressEndpoint, ingressEndpoint, exitEndpoint))
 
@@ -608,7 +683,7 @@ class AutoGatewaySelectorTest {
     fun `B27 review fix - the SAME ingress endpoint+transport reclassified from DIRECT_IP to CDN_FRONTED produces a different historyPathId`() {
         val directCandidate = buildRelayedDefault(manifestEndpoints = listOf(directIpIngressEndpoint, exitEndpoint)).single()
         val reclassified = directIpIngressEndpoint.copy(
-            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.51", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+            transports = listOf(cdnBinding("edge-reclassified.example.org")),
         )
         val cdnCandidate = buildRelayedDefault(manifestEndpoints = listOf(reclassified, exitEndpoint)).single()
 
@@ -630,7 +705,7 @@ class AutoGatewaySelectorTest {
         val historyFor: (String, TransportKind) -> PathHistoryEntry? = { pathId, _ -> if (pathId == directHistoryPathId) richPositiveHistory else null }
 
         val reclassifiedToCdn = directIpIngressEndpoint.copy(
-            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "203.0.113.51", 443).withIngressKind(IngressKind.CDN_FRONTED)),
+            transports = listOf(cdnBinding("edge-reclassified.example.org")),
         )
 
         val directCandidates = AutoGatewaySelector.buildRelayedCandidates(
@@ -646,6 +721,7 @@ class AutoGatewaySelectorTest {
             reachabilityFor = { id, kind -> relayReachable(id, kind) },
             transportHealthFor = { healthy() },
             historyFor = historyFor,
+            cdnRuntimeCapabilities = compatibleCdnRuntime(),
         )
 
         // The DIRECT_IP candidate's own historyPathId genuinely matches the
@@ -792,6 +868,7 @@ class AutoGatewaySelectorTest {
             transportHealthFor = { healthy() },
             historyFor = { _, _ -> null },
             preference = UserTransportPreference.Manual(TransportKind.TLS_TCP),
+            cdnRuntimeCapabilities = compatibleCdnRuntime(),
         )
         // The single ingress transport (TLS_TCP) matches the pin, so both of
         // the exit's own transports remain viable - the pin never touches exitTransport.
@@ -806,7 +883,7 @@ class AutoGatewaySelectorTest {
     fun `RelayAttemptCandidate exposes the exact ingress binding selected at candidate-build time`() {
         val candidate = buildRelayedDefault().single()
         assertEquals(ingressEndpoint.transports.single(), candidate.ingressBinding)
-        assertEquals("203.0.113.50", candidate.ingressBinding.host)
+        assertEquals("edge.example.org", candidate.ingressBinding.host)
         assertEquals(443, candidate.ingressBinding.port)
         assertEquals(TransportKind.TLS_TCP, candidate.ingressBinding.kind)
     }
@@ -839,7 +916,7 @@ class AutoGatewaySelectorTest {
         // manifest refresh mid-attempt. This must never be able to reach
         // back into `original` and change what it reports.
         val rotatedIngress = ingressEndpoint.copy(
-            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "198.51.100.9", 9443).withIngressKind(IngressKind.DIRECT_IP)),
+            transports = listOf(EndpointTransportBinding(TransportKind.TLS_TCP, "edge-rotated.example.org", 9443).withIngressKind(IngressKind.DIRECT_IP)),
         )
         val rotatedExit = exitEndpoint.copy(
             transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "198.51.100.10", 51821)),
@@ -857,12 +934,12 @@ class AutoGatewaySelectorTest {
         // to prove the fix, not merely that the type is immutable).
         assertEquals(originalIngressBinding, original.ingressBinding)
         assertEquals(originalExitBinding, original.exitBinding)
-        assertEquals("203.0.113.50", original.ingressBinding.host)
+        assertEquals("edge.example.org", original.ingressBinding.host)
         assertEquals(ProductionGatewayCatalog.GERMANY.awg.endpointHost, original.exitBinding.host)
 
         // The REBUILT candidate correctly reflects the rotated facts - proving
         // the rotation itself was real and the original genuinely didn't see it.
-        assertEquals("198.51.100.9", rebuilt.ingressBinding.host)
+        assertEquals("edge-rotated.example.org", rebuilt.ingressBinding.host)
         assertEquals("198.51.100.10", rebuilt.exitBinding.host)
         assertTrue(original.ingressBinding != rebuilt.ingressBinding)
         assertTrue(original.exitBinding != rebuilt.exitBinding)
@@ -882,6 +959,7 @@ class AutoGatewaySelectorTest {
             reachabilityFor = { id, kind -> relayReachable(id, kind) },
             transportHealthFor = { healthy() },
             historyFor = { _, _ -> null },
+            cdnRuntimeCapabilities = compatibleCdnRuntime(),
         )
         assertEquals(2, relayed.size)
 
@@ -906,6 +984,7 @@ class AutoGatewaySelectorTest {
         transportHealthFor: (TransportKind) -> TransportHealth = { healthy() },
         provisioned: Set<ProductionGatewayId> = setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
         restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
+        cdnRuntimeCapabilities: CdnClientRuntimeCapabilities = compatibleCdnRuntime(),
     ) = AutoGatewaySelector.buildCombinedAttempts(
         manifestEndpoints = manifestEndpoints,
         gatewayFactsFor = { catalogById[it] },
@@ -918,6 +997,7 @@ class AutoGatewaySelectorTest {
         transportHealthFor = transportHealthFor,
         historyFor = { _, _ -> null },
         restrictionClass = restrictionClass,
+        cdnRuntimeCapabilities = cdnRuntimeCapabilities,
     )
 
     /** Task requirement A - combined ranking returns ONE immutable executable attempt type covering both shapes. */

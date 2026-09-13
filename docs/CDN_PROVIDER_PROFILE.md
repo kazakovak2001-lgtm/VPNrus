@@ -1,8 +1,10 @@
 # CDN provider capability profile
 
 `CdnProviderCapabilityProfile` describes an operator's declared CDN/XHTTP
-constraints. It is a foundation for future CDN activation and capability
-gating, not a deployed transport or evidence of reachability.
+constraints. It is paired with `CdnClientCapabilityPolicy`, which decides
+whether this local client and pinned Xray core may even present the
+`CDN_FRONTED` binding as a relayed candidate. This is still not a deployed
+transport or evidence of reachability.
 
 The profile is stored as version 1 JSON in the existing transport binding's
 `cdnProviderProfile` metadata string. `withCdnProviderProfile` requires an
@@ -33,20 +35,29 @@ All metadata must remain non-secret: credentials belong in existing encrypted
 profile stores, including when an operator chooses names for extra parameters.
 
 `cdnProviderProfile()` returns `Missing`, `Invalid`, `UnsupportedVersion`, or
-`Parsed`. Missing metadata leaves legacy bindings untouched. Required fields,
-types, enum values, bounds, and host/kind binding are validated. Unknown policy
-fields are rejected in this version rather than silently ignored. A parsed
-profile has NOT passed a client capability check, exit topology validation,
-provider compatibility test, or an end-to-end data-plane probe.
+`Parsed`. Missing metadata leaves legacy direct-IP bindings untouched. Required
+fields, types, enum values, bounds, and host/kind binding are validated.
+Unknown policy fields are rejected in this version rather than silently
+ignored.
 
-No consumer applies these fields to Xray, changes path ranking, provisions
-CDN infrastructure, or promotes a candidate to Protected in this slice.
-`UNSUPPORTED`/`UNKNOWN` cache policy and unmet requirements remain descriptive;
-future execution must reject incompatible profiles explicitly. Measured health
-must continue to come from existing reachability/history and relay proof
-mechanisms, never a provider's declaration in signed metadata.
+`cdnClientCompatibility()` checks the parsed profile against the local runtime:
+supported exit id, minimum client version, minimum Xray-core version, required
+client capability labels, XHTTP mode/method/padding support, TLS
+version/fingerprint/ALPN support, streaming support, request body bound, and
+request timeout bound. `AutoGatewaySelector.buildRelayedCandidates()` applies
+this gate only for `IngressKind.CDN_FRONTED`; `DIRECT_IP` and legacy/null
+ingress-kind bindings keep their existing behavior. A `CDN_FRONTED` binding
+with missing, malformed, unsupported-version, or locally incompatible profile
+is excluded before scoring, rather than silently downgraded.
 
-Next steps are to implement client/core capability gating, validate against a
-pinned Xray version, and integrate the model with actual provider deployment
-and the existing end-to-end relay proof. No Russia reachability claim follows
-from this model or its unit tests.
+No consumer applies these fields to Xray, provisions CDN infrastructure, or
+promotes a candidate to Protected in this slice. The selector gate is a
+compatibility filter, not a scorer: measured health must continue to come from
+existing reachability/history and relay proof mechanisms, never a provider's
+declaration in signed metadata.
+
+Next steps are to wire real runtime capability values from the shipped client
+and vendored Xray-core build, validate those values against an actual provider
+deployment, apply the profile to Xray configuration, and integrate the result
+with the existing end-to-end relay proof. No Russia reachability claim follows
+from this model, selector gate, or unit tests.
