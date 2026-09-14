@@ -206,29 +206,36 @@ def load_ingress_config(env=None):
     if ingress_kind not in _SUPPORTED_INGRESS_KINDS:
         raise IngressConfigError(f"{_ENV_PREFIX}KIND must be one of {_SUPPORTED_INGRESS_KINDS}: {ingress_kind_raw!r}")
 
-    reality_private_key_file = require("REALITY_PRIVATE_KEY_FILE")
-    if not os.path.isabs(reality_private_key_file):
-        raise IngressConfigError(f"{_ENV_PREFIX}REALITY_PRIVATE_KEY_FILE must be an absolute path")
-    if not os.path.isfile(reality_private_key_file):
-        raise IngressConfigError(f"{_ENV_PREFIX}REALITY_PRIVATE_KEY_FILE does not exist: {reality_private_key_file!r}")
-
-    try:
-        server_port = int(require("SERVER_PORT"))
-    except ValueError as exc:
-        raise IngressConfigError(f"{_ENV_PREFIX}SERVER_PORT is not an integer") from exc
-    if not (1 <= server_port <= 65535):
-        raise IngressConfigError(f"{_ENV_PREFIX}SERVER_PORT out of range: {server_port}")
-
-    server_name = require("SERVER_NAME")
-    dest = require("DEST")
-    short_id = require("SHORT_ID")
-    if not _SHORT_ID_RE.match(short_id) or len(short_id) % 2 != 0:
-        raise IngressConfigError(f"{_ENV_PREFIX}SHORT_ID is malformed: {short_id!r}")
-    fingerprint = require("FINGERPRINT")
-    reality_public_key = require("REALITY_PUBLIC_KEY")
-    if not _REALITY_PUBLIC_KEY_RE.match(reality_public_key):
-        raise IngressConfigError(f"{_ENV_PREFIX}REALITY_PUBLIC_KEY is not a well-formed X25519 base64url key")
+    reality_names = ("REALITY_PRIVATE_KEY_FILE", "SERVER_PORT", "SERVER_NAME", "DEST", "SHORT_ID", "FINGERPRINT", "REALITY_PUBLIC_KEY")
+    has_reality = any(_get(env, name) for name in reality_names)
+    if ingress_kind == "direct_ip" or has_reality:
+        reality_private_key_file = require("REALITY_PRIVATE_KEY_FILE")
+        if not os.path.isabs(reality_private_key_file):
+            raise IngressConfigError(f"{_ENV_PREFIX}REALITY_PRIVATE_KEY_FILE must be an absolute path")
+        if not os.path.isfile(reality_private_key_file):
+            raise IngressConfigError(f"{_ENV_PREFIX}REALITY_PRIVATE_KEY_FILE does not exist: {reality_private_key_file!r}")
+        try:
+            server_port = int(require("SERVER_PORT"))
+        except ValueError as exc:
+            raise IngressConfigError(f"{_ENV_PREFIX}SERVER_PORT is not an integer") from exc
+        if not (1 <= server_port <= 65535):
+            raise IngressConfigError(f"{_ENV_PREFIX}SERVER_PORT out of range: {server_port}")
+        server_name = require("SERVER_NAME")
+        dest = require("DEST")
+        short_id = require("SHORT_ID")
+        if not _SHORT_ID_RE.match(short_id) or len(short_id) % 2 != 0:
+            raise IngressConfigError(f"{_ENV_PREFIX}SHORT_ID is malformed: {short_id!r}")
+        fingerprint = require("FINGERPRINT")
+        reality_public_key = require("REALITY_PUBLIC_KEY")
+        if not _REALITY_PUBLIC_KEY_RE.match(reality_public_key):
+            raise IngressConfigError(f"{_ENV_PREFIX}REALITY_PUBLIC_KEY is not a well-formed X25519 base64url key")
+    else:
+        reality_private_key_file = ""
+        server_port = 0
+        server_name = dest = short_id = fingerprint = reality_public_key = ""
     flow = _get(env, "FLOW")
+    if flow and not has_reality:
+        raise IngressConfigError(f"{_ENV_PREFIX}FLOW requires a REALITY inbound")
 
     tls_server_port_raw = _get(env, "TLS_SERVER_PORT")
     tls_server_port = 0
@@ -414,6 +421,8 @@ def load_ingress_config(env=None):
                 f"{_ENV_PREFIX}XHTTP padding range must be "
                 "positive and bounded"
             )
+    if not server_port and not tls_server_port and not xhttp_server_port:
+        raise IngressConfigError("ingress must configure at least one client-facing inbound")
     upstream_host = require("UPSTREAM_HOST")
     try:
         upstream_port = int(require("UPSTREAM_PORT"))

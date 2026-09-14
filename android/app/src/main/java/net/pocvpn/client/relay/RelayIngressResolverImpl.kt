@@ -6,6 +6,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.VlessRealityTransport
 import net.pocvpn.client.vpn.VlessTlsTransport
+import net.pocvpn.client.vpn.VlessXhttpTransport
 
 /**
  * B25 (task F) - the real, production-capable [RelayIngressResolver]:
@@ -94,6 +95,19 @@ class RelayIngressResolverImpl(
                 RelayIngressResolution.Resolved(
                     transport = VlessTlsTransport(context),
                     kind = TransportKind.TLS_TCP,
+                    profile = profile,
+                )
+            }
+            TransportKind.XRAY_XHTTP -> {
+                profile.tlsProfile
+                    ?: return RelayIngressResolution.NotProvisioned(
+                        RelayFailureCategory.PROFILE_MISMATCH,
+                        "profile declares XRAY_XHTTP but carries no tlsProfile",
+                    )
+
+                RelayIngressResolution.Resolved(
+                    transport = VlessXhttpTransport(context),
+                    kind = TransportKind.XRAY_XHTTP,
                     profile = profile,
                 )
             }

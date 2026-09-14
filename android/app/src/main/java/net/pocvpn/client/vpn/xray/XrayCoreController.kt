@@ -261,6 +261,7 @@ class XrayCoreController(
         // "opaque caller-supplied action" shape [RemoteConfirmationContext
         // .Relayed] already established.
         onRelayHealthLost: suspend () -> Unit = {},
+        xhttpConfig: XrayVlessXhttpConfig? = null,
     ): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
@@ -285,6 +286,22 @@ class XrayCoreController(
                         is XrayTlsRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
                         is XrayTlsRuntimeResolution.Ready ->
                             ReadyToStart(buildXrayVpnPlan(resolution.config, novaPackageId, routingMode), resolution.renderedConfig, resolution.config.server)
+                    }
+                }
+                TransportKind.XRAY_XHTTP -> {
+                    val config = xhttpConfig
+                        ?: return XrayCoreStartOutcome.Rejected("XHTTP runtime config not supplied")
+
+                    when (val validated = validateXrayVlessXhttpConfig(config)) {
+                        is XrayXhttpConfigValidationResult.Invalid ->
+                            return XrayCoreStartOutcome.Rejected("XHTTP runtime config invalid")
+
+                        is XrayXhttpConfigValidationResult.Valid ->
+                            ReadyToStart(
+                                buildXrayVpnPlan(validated.config, novaPackageId, routingMode),
+                                XrayConfigRenderer.render(validated.config),
+                                validated.config.server,
+                            )
                     }
                 }
                 TransportKind.XRAY_REALITY -> {

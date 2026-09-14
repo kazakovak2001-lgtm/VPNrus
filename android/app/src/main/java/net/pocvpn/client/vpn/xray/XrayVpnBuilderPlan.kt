@@ -84,3 +84,22 @@ fun buildXrayVpnPlan(
     dnsServers = config.dnsServers,
     disallowedApplications = setOf(novaPackageId),
 )
+
+/** B35 - XHTTP uses the same Android TUN/routing plan as REALITY/TLS. */
+fun buildXrayVpnPlan(
+    config: XrayVlessXhttpConfig,
+    novaPackageId: String,
+    routingMode: RoutingMode = RoutingMode.FULL_VPN,
+    restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
+): XrayVpnBuilderPlan = XrayVpnBuilderPlan(
+    mtu = config.mtu,
+    tunLocalAddressIpv4 = config.tunLocalAddressIpv4,
+    tunLocalPrefixLengthIpv4 = config.tunLocalPrefixLengthIpv4,
+    routesIpv4 = RoutingDecisionEngine.resolveIpv4Routes(
+        listOf("0.0.0.0/0"),
+        routingMode,
+        restrictionClass,
+    ),
+    dnsServers = config.dnsServers,
+    disallowedApplications = setOf(novaPackageId),
+)

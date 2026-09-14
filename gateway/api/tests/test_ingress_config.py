@@ -63,6 +63,29 @@ def _valid_env(tmp_dir, **overrides):
 
 
 class IngressConfigTests(unittest.TestCase):
+    def test_xhttp_only_ingress_has_no_extra_reality_listener(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env = _valid_env(tmp_dir, NOVA_INGRESS_KIND="cdn_fronted",
+                             NOVA_INGRESS_XHTTP_CLIENT_HOST="edge.example.org",
+                             NOVA_INGRESS_XHTTP_CLIENT_PORT="443",
+                             NOVA_INGRESS_XHTTP_SERVER_PORT="2100",
+                             NOVA_INGRESS_XHTTP_HOST="edge.example.org",
+                             NOVA_INGRESS_XHTTP_PATH="/nova-xhttp/",
+                             NOVA_INGRESS_XHTTP_MODE="packet-up",
+                             NOVA_INGRESS_XHTTP_MAX_EACH_POST_BYTES="524288",
+                             NOVA_INGRESS_XHTTP_PADDING_PLACEMENT="query",
+                             NOVA_INGRESS_XHTTP_PADDING_MIN_BYTES="1",
+                             NOVA_INGRESS_XHTTP_PADDING_MAX_BYTES="64")
+            for name in ("REALITY_PRIVATE_KEY_FILE", "SERVER_PORT", "SERVER_NAME", "DEST",
+                         "SHORT_ID", "FINGERPRINT", "REALITY_PUBLIC_KEY"):
+                env.pop("NOVA_INGRESS_" + name)
+            cfg = ingress_config_module.load_ingress_config(env=env)
+            self.assertEqual(0, cfg.ingress_server_port)
+            self.assertEqual(2100, cfg.ingress_xhttp_server_port)
+            env.pop("NOVA_INGRESS_XHTTP_SERVER_PORT")
+            with self.assertRaises(ingress_config_module.IngressConfigError):
+                ingress_config_module.load_ingress_config(env=env)
+
     def test_no_ingress_vars_set_returns_none(self):
         self.assertIsNone(ingress_config_module.load_ingress_config(env={}))
 

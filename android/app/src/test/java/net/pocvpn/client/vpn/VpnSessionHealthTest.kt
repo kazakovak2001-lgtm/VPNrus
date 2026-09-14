@@ -1,5 +1,7 @@
 package net.pocvpn.client.vpn
 
+import net.pocvpn.client.relay.IngressClientProfile
+import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.relay.RelayedExecutionPlan
 import net.pocvpn.client.relay.VpnAttemptContext
@@ -28,6 +30,24 @@ class VpnSessionHealthTest {
         exitTransport = TransportKind.AMNEZIA_WG,
         historyPathId = "ru-ingress-1:XRAY_REALITY->germany:AMNEZIA_WG",
     )
+private val profile = IngressClientProfile(
+    ingressEndpointId = plan.ingressEndpointId,
+    ingressBinding = plan.ingressBinding,
+    transport = plan.ingressTransport,
+    ingressKind = plan.ingressKind,
+    realityProfile = XrayProfile(
+        server = "203.0.113.50",
+        serverPort = 443,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        flow = "",
+        serverName = "example.com",
+        fingerprint = "chrome",
+        realityPublicKey = "A".repeat(43),
+        shortId = "ab",
+    ),
+    profileVersion = 1,
+    issuedAtEpochMillis = 1L,
+)
 
     // --- M#1 - Direct TransportState.Connected behavior is unchanged ---
 
@@ -41,7 +61,10 @@ class VpnSessionHealthTest {
 
     @Test
     fun `Relayed Connected with no reported stage is RelayHandshake, never Protected`() {
-        val health = computeSessionHealth(TransportState.Connected, VpnAttemptContext.Relayed(plan), null)
+        val health = computeSessionHealth(TransportState.Connected, VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = profile,
+), null)
         assertEquals(VpnSessionHealth.RelayHandshake(RelayReadinessStage.INGRESS_HANDSHAKE_OK), health)
     }
 
@@ -52,7 +75,10 @@ class VpnSessionHealthTest {
             RelayReadinessStage.INGRESS_HANDSHAKE_OK,
             RelayReadinessStage.UPSTREAM_EXIT_HANDSHAKE_OK,
         ).forEach { stage ->
-            val health = computeSessionHealth(TransportState.Connected, VpnAttemptContext.Relayed(plan), stage)
+            val health = computeSessionHealth(TransportState.Connected, VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = profile,
+), stage)
             assertEquals(VpnSessionHealth.RelayHandshake(stage), health)
         }
     }
@@ -61,7 +87,10 @@ class VpnSessionHealthTest {
 
     @Test
     fun `Relayed Connected at END_TO_END_DATA_PLANE_OK is RelayProtected`() {
-        val health = computeSessionHealth(TransportState.Connected, VpnAttemptContext.Relayed(plan), RelayReadinessStage.END_TO_END_DATA_PLANE_OK)
+        val health = computeSessionHealth(TransportState.Connected, VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = profile,
+), RelayReadinessStage.END_TO_END_DATA_PLANE_OK)
         assertEquals(VpnSessionHealth.RelayProtected, health)
     }
 
@@ -76,7 +105,10 @@ class VpnSessionHealthTest {
         nonConnected.forEach { state ->
             assertEquals(
                 computeSessionHealth(state, VpnAttemptContext.Direct, null),
-                computeSessionHealth(state, VpnAttemptContext.Relayed(plan), RelayReadinessStage.END_TO_END_DATA_PLANE_OK),
+                computeSessionHealth(state, VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = profile,
+), RelayReadinessStage.END_TO_END_DATA_PLANE_OK),
             )
         }
     }

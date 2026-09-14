@@ -1,0 +1,27 @@
+[Unit]
+Description=Nova Xray VLESS/XHTTP ingress relay (loopback-only)
+After=network.target
+
+[Service]
+Type=simple
+User=nova-xray-ingress
+Group=nova-xray-ingress
+ExecStart=/opt/pocvpn/xray/v26.7.28/xray run -config /etc/nova-xray-xhttp-ingress/config.json
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/nova-xray-xhttp-ingress /opt/pocvpn/xray
+
+[Install]
+WantedBy=multi-user.target

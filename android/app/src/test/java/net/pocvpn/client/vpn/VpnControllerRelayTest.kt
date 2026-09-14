@@ -21,6 +21,8 @@ import net.pocvpn.client.vpn.config.GatewayConfiguration
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import net.pocvpn.client.relay.IngressClientProfile
+import net.pocvpn.client.identity.XrayProfile
 
 /**
  * B25 - proves task A (typed attempt identity pinned through VpnController),
@@ -71,6 +73,24 @@ private fun relayedPlan() = RelayedExecutionPlan(
     exitTransport = TransportKind.AMNEZIA_WG,
     historyPathId = "ru-ingress-1:XRAY_REALITY->germany:AMNEZIA_WG",
 )
+private fun relayedProfile(plan: RelayedExecutionPlan) = IngressClientProfile(
+    ingressEndpointId = plan.ingressEndpointId,
+    ingressBinding = plan.ingressBinding,
+    transport = plan.ingressTransport,
+    ingressKind = plan.ingressKind,
+    realityProfile = XrayProfile(
+        server = "203.0.113.50",
+        serverPort = 443,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        flow = "",
+        serverName = "example.com",
+        fingerprint = "chrome",
+        realityPublicKey = "A".repeat(43),
+        shortId = "ab",
+    ),
+    profileVersion = 1,
+    issuedAtEpochMillis = 1L,
+)
 
 class VpnControllerRelayTest {
 
@@ -115,7 +135,10 @@ class VpnControllerRelayTest {
                 transport = xrayTransport,
                 kind = TransportKind.XRAY_REALITY,
                 endpointId = plan.ingressEndpointId,
-                attemptContext = VpnAttemptContext.Relayed(plan),
+                attemptContext = VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = relayedProfile(plan),
+),
             ),
         )
         runCurrent()
@@ -153,7 +176,10 @@ class VpnControllerRelayTest {
                 transport = xrayTransport,
                 kind = TransportKind.XRAY_REALITY,
                 endpointId = plan.ingressEndpointId,
-                attemptContext = VpnAttemptContext.Relayed(plan),
+                attemptContext = VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = relayedProfile(plan),
+),
             ),
         )
         runCurrent()
@@ -232,7 +258,10 @@ class VpnControllerRelayTest {
                 transport = throwingTransport,
                 kind = TransportKind.XRAY_REALITY,
                 endpointId = plan.ingressEndpointId,
-                attemptContext = VpnAttemptContext.Relayed(plan),
+                attemptContext = VpnAttemptContext.Relayed(
+    plan = plan,
+    profile = relayedProfile(plan),
+),
             ),
         )
         runCurrent()

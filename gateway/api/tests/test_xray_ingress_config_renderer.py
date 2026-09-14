@@ -76,6 +76,21 @@ class IngressRendererTestBase(unittest.TestCase):
 
 
 class ClientAuthorizationReuseTests(IngressRendererTestBase):
+    def test_xhttp_only_ingress_reuses_authorization_without_reality_listener(self):
+        activations_data, xray_data = self._activations_and_xray()
+        xhttp = renderer_module.XhttpOriginInboundConfig(
+            listen_port=2100, host="edge.example.org", path="/nova-xhttp/",
+            mode="packet-up", max_each_post_bytes=524288,
+            padding_placement="query", padding_min_bytes=1, padding_max_bytes=64,
+        )
+        config = renderer_module.render_ingress_server_config(
+            activations_data, xray_data, None, self.upstream_reality, xhttp=xhttp,
+        )
+        self.assertEqual(["127.0.0.1"], [inbound["listen"] for inbound in config["inbounds"]])
+        self.assertEqual([self.uuid_a], [client["id"] for client in config["inbounds"][0]["settings"]["clients"]])
+        self.assertEqual([xhttp.inbound_tag], config["routing"]["rules"][0]["inboundTag"])
+        self.assertEqual(["vless"], [outbound["protocol"] for outbound in config["outbounds"]])
+
     """Task requirement 8 - ingress authorization reuses per-device identity, never a second/open system."""
 
     def test_only_active_clients_from_activations_appear_in_the_inbound(self):

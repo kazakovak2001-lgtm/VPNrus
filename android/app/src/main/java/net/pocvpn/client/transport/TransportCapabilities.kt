@@ -82,6 +82,22 @@ data class TransportCapabilities(
             maturity = TransportMaturity.EXPERIMENTAL,
         )
 
+        /** B35 - executable VLESS/XHTTP CDN-fronted adapter shell. */
+        fun xrayXhttpAdapterShell(): TransportCapabilities = TransportCapabilities(
+            usesUdp = false,
+            usesTcp = true,
+            supportsPort443 = true,
+            supportsObfuscation = true,
+            suitableForRestrictiveNetworks = true,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.EXPERIMENTAL,
+        )
+
         /**
          * B8O2 - VlessTlsTransport/NovaXrayVpnService (TLS/TCP fallback) as
          * an isolated adapter shell: real code exists (config validation/

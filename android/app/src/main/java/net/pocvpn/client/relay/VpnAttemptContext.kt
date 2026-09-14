@@ -22,5 +22,8 @@ package net.pocvpn.client.relay
  */
 sealed class VpnAttemptContext {
     object Direct : VpnAttemptContext()
-    data class Relayed(val plan: RelayedExecutionPlan) : VpnAttemptContext()
+    data class Relayed(
+    val plan: RelayedExecutionPlan,
+    val profile: IngressClientProfile,
+) : VpnAttemptContext()
 }

@@ -176,7 +176,7 @@ class IngressProfileEndpointTests(unittest.TestCase):
             self.assertNotIn(forbidden, payload)
 
         with open(self.ingress_cfg.ingress_probe_hmac_secret_file, "rb") as handle:
-            secret = handle.read().strip()
+            secret = handle.read()
         claims = relay_probe_token.verify(secret, payload["probe_token"], int(time.time()))
         exit_transport = (
             "XRAY_REALITY"

@@ -1,0 +1,28 @@
+[Unit]
+Description=pocvpn localhost provisioning API - isolated XHTTP ingress
+After=network.target
+
+[Service]
+Type=simple
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+EnvironmentFile=/etc/pocvpn/ingress-xhttp.env
+ExecStart=/usr/bin/python3 -m api.server
+Restart=on-failure
+RestartSec=2
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectSystem=strict
+# Entitlement/activation records and their lock are deliberately shared with
+# the existing direct ingress; per-transport Xray identity and config are not.
+ReadWritePaths=/var/lib/pocvpn-provision-ingress /var/lib/pocvpn-provision-xhttp-ingress /etc/nova-xray-xhttp-ingress
+
+[Install]
+WantedBy=multi-user.target

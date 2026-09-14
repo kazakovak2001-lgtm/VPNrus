@@ -1,0 +1,111 @@
+{
+  "manifestVersion": 3,
+  "issuedAtEpochMillis": 1789377862369,
+  "expiresAtEpochMillis": 1804929862369,
+  "signingKeyId": "prod-manifest-key-2026-09-14",
+  "endpoints": [
+    {
+      "id": "frankfurt",
+      "roleOrdinals": [
+        1,
+        2
+      ],
+      "region": "Germany / Frankfurt",
+      "provider": "Oracle Cloud",
+      "asn": null,
+      "transports": [
+        {
+          "kindOrdinal": 0,
+          "host": "152.70.43.1",
+          "port": 51820,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 1,
+          "host": "152.70.43.1",
+          "port": 2053,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 3,
+          "host": "152.70.43.1",
+          "port": 2083,
+          "metadata": {}
+        }
+      ],
+      "relayTo": null
+    },
+    {
+      "id": "stockholm",
+      "roleOrdinals": [
+        1,
+        2
+      ],
+      "region": "Sweden / Stockholm",
+      "provider": "AWS",
+      "asn": null,
+      "transports": [
+        {
+          "kindOrdinal": 0,
+          "host": "16.170.208.231",
+          "port": 51820,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 1,
+          "host": "16.170.208.231",
+          "port": 2053,
+          "metadata": {}
+        },
+        {
+          "kindOrdinal": 3,
+          "host": "16.170.208.231",
+          "port": 2083,
+          "metadata": {}
+        }
+      ],
+      "relayTo": null
+    },
+    {
+      "id": "stockholm-ingress-1",
+      "roleOrdinals": [
+        0
+      ],
+      "region": "Sweden / Stockholm",
+      "provider": "AWS",
+      "asn": null,
+      "transports": [
+        {
+          "kindOrdinal": 1,
+          "host": "16.170.208.231",
+          "port": 2093,
+          "metadata": {
+            "ingressKind": "DIRECT_IP"
+          }
+        }
+      ],
+      "relayTo": "frankfurt"
+    },
+    {
+      "id": "stockholm-xhttp-ingress-1",
+      "roleOrdinals": [
+        0
+      ],
+      "region": "Sweden / Stockholm",
+      "provider": "AWS / Cloudflare",
+      "asn": null,
+      "transports": [
+        {
+          "kindOrdinal": 4,
+          "host": "edge-sthlm.aknova.pp.ua",
+          "port": 443,
+          "metadata": {
+            "ingressKind": "CDN_FRONTED",
+            "cdnProviderProfile": "{\"asn\":13335,\"hosts\":{\"cdnTechnicalHostname\":\"edge-sthlm.aknova.pp.ua\",\"clientFacingHostname\":\"edge-sthlm.aknova.pp.ua\",\"controlPlaneHostname\":\"control.aknova.pp.ua\",\"originHostname\":\"origin-sthlm.aknova.pp.ua\",\"originTlsServerName\":\"edge-sthlm.aknova.pp.ua\"},\"minimumClientVersionCode\":1,\"minimumXrayCoreVersion\":\"26.7.28\",\"provider\":\"Cloudflare\",\"requests\":{\"cachePolicy\":\"BYPASS_REQUIRED\",\"maxRequestBodyBytes\":524288,\"originHostHeader\":\"edge-sthlm.aknova.pp.ua\",\"requestTimeoutMillis\":30000,\"streamingSupported\":true},\"requiredClientCapabilities\":[\"xhttp\",\"cdn-profile-v2\"],\"supportedExits\":[\"frankfurt\"],\"tls\":{\"alpn\":[\"h2\"],\"clientFingerprint\":\"chrome\",\"clientServerName\":\"edge-sthlm.aknova.pp.ua\",\"minimumVersion\":\"TLS_1_3\"},\"version\":2,\"xhttp\":{\"extraParameters\":{},\"headers\":{},\"mode\":\"PACKET_UP\",\"paddingMaxBytes\":64,\"paddingMinBytes\":1,\"paddingPlacement\":\"QUERY\",\"path\":\"/nova-xhttp/\",\"queryParameters\":{},\"uplinkHttpMethod\":\"POST\"}}"
+          }
+        }
+      ],
+      "relayTo": "frankfurt"
+    }
+  ]
+}

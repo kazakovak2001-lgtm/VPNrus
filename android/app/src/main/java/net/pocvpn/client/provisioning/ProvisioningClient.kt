@@ -166,7 +166,7 @@ object ProvisioningClient {
         IngressProfileTransport.XHTTP ->
             OutgoingRequest(
                 url = "https://$controlPlaneHost/v1/ingress-profile",
-                headers = authHeaders(bearerToken),
+                headers = authHeaders(bearerToken) + ("X-Ingress-Transport" to "xhttp"),
                 body = JSONObject()
                     .put("public_key", publicKey)
                     .put("transport", transport.wireValue)

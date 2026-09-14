@@ -37,6 +37,8 @@ import java.util.Base64
 object EmbeddedBootstrapManifest {
 
     const val TRUSTED_KEY_ID = "prod-manifest-key-2026-09-01"
+    const val B35_SIGNING_KEY_ID = "prod-manifest-key-2026-09-14"
+    private const val B35_PUBLIC_KEY_BASE64 = "uLUd4zaRNPxI858n3I03DXT4zBkXvJ5B2duow4eaiYM="
 
     private const val BOOTSTRAP_PUBLIC_KEY_BASE64 = "yvxGVezkV5tkkzcQVf975mSDY9xYh72eOLOMwSFy+aw="
 
@@ -47,7 +49,10 @@ object EmbeddedBootstrapManifest {
         "dSxFo1//e7N290TWUZg6JOa+MOo5I2aZxQEBMWYGxMVsQshliebHrog2mc4HGROzfv4e7Eo6bO8omA953jVCCw=="
 
     fun trustAnchors(): ManifestTrustAnchors = FixedManifestTrustAnchors(
-        mapOf(TrustedKeyId(TRUSTED_KEY_ID) to Base64.getDecoder().decode(BOOTSTRAP_PUBLIC_KEY_BASE64)),
+        mapOf(
+            TrustedKeyId(TRUSTED_KEY_ID) to Base64.getDecoder().decode(BOOTSTRAP_PUBLIC_KEY_BASE64),
+            TrustedKeyId(B35_SIGNING_KEY_ID) to Base64.getDecoder().decode(B35_PUBLIC_KEY_BASE64),
+        ),
     )
 
     fun signedManifest(): SignedManifest {

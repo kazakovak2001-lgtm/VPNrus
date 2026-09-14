@@ -239,7 +239,36 @@ class NovaXrayVpnService : VpnService() {
                 XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "relay data-plane health check failed"))
                 stopSelf()
             }
-            when (val outcome = lifecycleCoordinator.start(endpointId, kind, routingMode, confirmationContext, onRelayHealthLost)) {
+            val xhttpConfig =
+                if (kind == TransportKind.XRAY_XHTTP) {
+                    XhttpSessionConfigStore.consume(sessionId)
+                } else {
+                    null
+                }
+
+            if (kind == TransportKind.XRAY_XHTTP && xhttpConfig == null) {
+                Log.e(TAG, "refusing to start: XHTTP runtime config missing")
+                XrayRuntimeState.publish(
+                    XrayRuntimeEvent.Failed(
+                        sessionId,
+                        "XHTTP runtime config missing",
+                    ),
+                )
+                stopSelf()
+                return@launch
+            }
+
+            when (
+                val outcome =
+                    lifecycleCoordinator.start(
+                        endpointId = endpointId,
+                        kind = kind,
+                        routingMode = routingMode,
+                        confirmationContext = confirmationContext,
+                        onRelayHealthLost = onRelayHealthLost,
+                        xhttpConfig = xhttpConfig,
+                    )
+            ) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
