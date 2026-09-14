@@ -90,6 +90,38 @@ enum class DiagnosticEventType {
     // terminates through the SAME finishProtected()/finishFailed()/
     // finishDisconnected() calls every other session already uses.
     RECONNECT_INCIDENT_STARTED,
+
+    // Russia field-test build (FIELD_TEST_ONLY, disposable diagnostic APK -
+    // see android/app/src/fieldTest and docs/FIELD_TEST_RUSSIA.md).
+    // Recorded by net.pocvpn.client.fieldtest.FieldTestDiagnosticsRecorder,
+    // a small, purpose-built recorder mirroring
+    // net.pocvpn.client.bootstrap.BootstrapDiagnosticsRecorder's own
+    // "separate from SupportDiagnosticsRecorder" reasoning (this build has
+    // no activation/RestrictionClassifier pipeline wired ahead of connect
+    // either) - reused here, in the SAME closed vocabulary, so nothing
+    // about this file's own shape is duplicated. This build type does not
+    // exist in the normal debug/release compile, so these values are
+    // otherwise unused there - purely additive, never a behavior change
+    // for release/debug.
+    // PR #61 follow-up - a real-device incident showed the field-test build
+    // was marking Frankfurt/Stockholm "failed" within milliseconds because
+    // the Android VPN permission dialog was never actually launched (a
+    // fresh install always requires it) - see FieldTestViewModel
+    // .ensureVpnPermission's own docs. Permission is device/app-level, not
+    // gateway-specific: these are recorded ONCE, before the candidate loop,
+    // never per-candidate, so a pending/denied permission is never confused
+    // with a real AWG/network failure on either gateway.
+    FIELD_TEST_VPN_PERMISSION_REQUESTED,
+    FIELD_TEST_VPN_PERMISSION_GRANTED,
+    FIELD_TEST_VPN_PERMISSION_DENIED,
+
+    FIELD_TEST_ATTEMPT_STARTED,
+    FIELD_TEST_CANDIDATE_RESULT,
+    FIELD_TEST_HEALTH_RESULT,
+    FIELD_TEST_BECAME_PROTECTED,
+    FIELD_TEST_UNAVAILABLE,
+    FIELD_TEST_REPORT_UPLOAD_ATTEMPTED,
+    FIELD_TEST_REPORT_UPLOAD_RESULT,
 }
 
 /**
