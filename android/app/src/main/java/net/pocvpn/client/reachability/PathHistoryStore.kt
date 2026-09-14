@@ -128,7 +128,11 @@ class FilePathHistoryStore(
                 val version = input.readInt()
                 if (version != FORMAT_VERSION) return LinkedHashMap()
                 val count = input.readInt()
-                if (count !in 0..MAX_PLAUSIBLE_COUNT) return LinkedHashMap()
+                // B39 - persisted data must obey the CURRENT runtime bound as
+                // well as the wire-format plausibility bound. Rejecting an
+                // older/oversized file is fail-neutral and avoids allocating
+                // a 100k-entry cache merely because its count is parseable.
+                if (count !in 0..MAX_PLAUSIBLE_COUNT || count > maxEntries) return LinkedHashMap()
                 val map = LinkedHashMap<Key, PathHistoryEntry>()
                 repeat(count) {
                     val entry = readEntryOrNull(input) ?: return LinkedHashMap()

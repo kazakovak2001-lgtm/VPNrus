@@ -58,6 +58,28 @@ class PathHistoryStoreTest {
     }
 
     @Test
+    fun `reload rejects persisted data larger than the current maxEntries bound`() {
+        val dir = tempFolder.newFolder()
+        val writer = FilePathHistoryStore(dir, maxEntries = 3)
+        repeat(3) { index -> writer.record("fp-$index", "gw", TransportKind.AMNEZIA_WG, success = true, nowEpochMillis = index.toLong()) }
+
+        val reopenedWithSmallerBound = FilePathHistoryStore(dir, maxEntries = 2)
+        assertNull(reopenedWithSmallerBound.get("fp-0", "gw", TransportKind.AMNEZIA_WG))
+        assertNull(reopenedWithSmallerBound.get("fp-1", "gw", TransportKind.AMNEZIA_WG))
+        assertNull(reopenedWithSmallerBound.get("fp-2", "gw", TransportKind.AMNEZIA_WG))
+    }
+
+    @Test
+    fun `negative persisted count fails neutral`() {
+        val dir = tempFolder.newFolder()
+        java.io.DataOutputStream(java.io.File(dir, "path_history.bin").outputStream()).use { output ->
+            output.writeInt(2)
+            output.writeInt(-1)
+        }
+        assertNull(FilePathHistoryStore(dir).get("fp-1", "gw", TransportKind.AMNEZIA_WG))
+    }
+
+    @Test
     fun `a corrupted store file is treated as empty, not a crash`() {
         val dir = tempFolder.newFolder()
         java.io.File(dir, "path_history.bin").writeBytes(byteArrayOf(9, 9, 9))
