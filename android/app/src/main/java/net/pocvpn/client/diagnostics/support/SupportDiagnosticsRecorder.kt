@@ -1,6 +1,7 @@
 package net.pocvpn.client.diagnostics.support
 
 import net.pocvpn.client.controlplane.ControlPlaneFailureReason
+import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
@@ -8,6 +9,7 @@ import net.pocvpn.client.relay.RelayFailureCategory
 import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.TransportFailureKind
 import net.pocvpn.client.vpn.config.GatewaySelectionMode
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.policy.RoutingMode
@@ -138,7 +140,9 @@ class SupportDiagnosticsRecorder(
             DiagnosticEventType.RELAY_END_TO_END_PROOF_RESULT,
             buildMap {
                 put(TAG_SUCCESS, success.toString())
-                category?.let { put(TAG_FAILURE_REASON, mapRelayFailureCategoryToFailureReason(it).name) }
+                category?.let {
+                    put(TAG_FAILURE_REASON, mapRelayFailureForPath(it, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind).name)
+                }
             },
         )
     }
@@ -155,6 +159,10 @@ class SupportDiagnosticsRecorder(
     fun recordPathFailed(reason: DiagnosticFailureReason) =
         record(DiagnosticEventType.PATH_FAILED, mapOf(TAG_FAILURE_REASON to reason.name))
 
+    /** B36: same B29 event, using the currently pinned attempt's path/transport. */
+    fun recordRelayPathFailed(category: RelayFailureCategory) =
+        recordPathFailed(mapRelayFailureForPath(category, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind))
+
     /** NON-TERMINAL - see [recordPathFailed]'s own docs; a control-plane exchange (e.g. one relay activation network call) failed, but the combined sequence may still continue with a different candidate. */
     fun recordControlPlaneFailure(reason: DiagnosticFailureReason) =
         record(DiagnosticEventType.CONTROL_PLANE_FAILURE, mapOf(TAG_FAILURE_REASON to reason.name))
@@ -167,6 +175,16 @@ class SupportDiagnosticsRecorder(
 
     /** TERMINAL - the whole connect() request ends in failure, for [reason] - see [recordPathFailed]'s own docs for the non-terminal, per-candidate counterpart. */
     fun finishFailed(reason: DiagnosticFailureReason) = finish(DiagnosticOutcome.FAILED, reason)
+
+    /** B36: preserve generic failure mapping unless a typed CDN/XHTTP fact exists. */
+    fun finishFailedFromTransport(error: VpnError?, failureKind: TransportFailureKind?) {
+        val pathKind = open?.selectedPathKind ?: PathKind.NONE
+        val transportKind = open?.selectedTransportKind
+        val reason = mapTransportFailureForPath(failureKind, pathKind, transportKind)
+            ?: error?.let(::mapVpnErrorToFailureReason)
+            ?: DiagnosticFailureReason.INTERNAL_ERROR
+        finishFailed(reason)
+    }
 
     /** TERMINAL - records [DiagnosticEventType.VPN_PROTECTED] (also, redundantly per requirement B's own vocabulary, [DiagnosticEventType.PATH_SUCCEEDED]) and finishes the session as [DiagnosticOutcome.PROTECTED]. */
     fun finishProtected() {

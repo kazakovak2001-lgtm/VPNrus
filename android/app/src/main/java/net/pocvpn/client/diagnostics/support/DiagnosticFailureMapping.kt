@@ -6,6 +6,8 @@ import net.pocvpn.client.reachability.ManifestSource
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
 import net.pocvpn.client.smartconnect.RestrictionClass
+import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.TransportFailureKind
 
 /**
  * B29 (task C) - pure mapping from every real, existing outcome type this
@@ -44,6 +46,34 @@ fun mapRelayFailureCategoryToFailureReason(category: RelayFailureCategory): Diag
     RelayFailureCategory.PROFILE_EXPIRED -> DiagnosticFailureReason.INGRESS_PROFILE_REQUIRED
     RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED -> DiagnosticFailureReason.CONTROL_PLANE_UNREACHABLE
 }
+
+/** A failed ingress handshake does not reveal which CDN/origin hop failed. */
+fun mapRelayFailureForPath(
+    category: RelayFailureCategory,
+    pathKind: PathKind,
+    transportKind: TransportKind?,
+): DiagnosticFailureReason =
+    if (pathKind == PathKind.CHAIN_CDN && transportKind == TransportKind.XRAY_XHTTP) {
+        when (category) {
+            RelayFailureCategory.INGRESS_HANDSHAKE_FAILED -> DiagnosticFailureReason.XHTTP_HANDSHAKE_FAILURE
+            // This category comes from HttpRelayEndToEndProbe's out-of-band
+            // control-plane check; it is not an in-tunnel data-plane proof.
+            RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED -> DiagnosticFailureReason.RELAY_PROOF_FAILURE
+            else -> mapRelayFailureCategoryToFailureReason(category)
+        }
+    } else {
+        mapRelayFailureCategoryToFailureReason(category)
+    }
+
+/** Xray's native, in-tunnel remote confirmation failed after local core start. */
+fun mapTransportFailureForPath(
+    failure: TransportFailureKind?,
+    pathKind: PathKind,
+    transportKind: TransportKind?,
+): DiagnosticFailureReason? =
+    if (failure == TransportFailureKind.REMOTE_UNCONFIRMED &&
+        pathKind == PathKind.CHAIN_CDN && transportKind == TransportKind.XRAY_XHTTP
+    ) DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE else null
 
 /** Returns null for [IngressActivationOutcome.Saved] (not a failure). */
 fun mapIngressActivationOutcomeToFailureReason(outcome: IngressActivationOutcome): DiagnosticFailureReason? = when (outcome) {

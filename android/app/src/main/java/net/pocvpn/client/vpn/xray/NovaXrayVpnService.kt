@@ -17,6 +17,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.TransportFailureKind
 import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
@@ -293,7 +294,13 @@ class NovaXrayVpnService : VpnService() {
                     // docs) - a real, distinct terminal failure, never
                     // reported as Started/Connected.
                     Log.w(TAG, "Xray core started locally but remote connectivity never confirmed: ${outcome.reason}")
-                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    XrayRuntimeState.publish(
+                        XrayRuntimeEvent.Failed(
+                            sessionId,
+                            outcome.reason,
+                            if (kind == TransportKind.XRAY_XHTTP) TransportFailureKind.REMOTE_UNCONFIRMED else null,
+                        ),
+                    )
                     stopSelf()
                 }
                 is XrayCoreStartOutcome.Started -> {

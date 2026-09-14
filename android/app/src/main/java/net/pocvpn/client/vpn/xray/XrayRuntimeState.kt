@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn.xray
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import net.pocvpn.client.vpn.TransportFailureKind
 
 /**
  * B8I7 - one real Xray core/tunnel lifecycle event, published ONLY by
@@ -20,7 +21,11 @@ sealed class XrayRuntimeEvent {
     abstract val sessionId: Long
 
     data class Started(override val sessionId: Long) : XrayRuntimeEvent()
-    data class Failed(override val sessionId: Long, val reason: String) : XrayRuntimeEvent()
+    data class Failed(
+        override val sessionId: Long,
+        val reason: String,
+        val failureKind: TransportFailureKind? = null,
+    ) : XrayRuntimeEvent()
     data class Stopped(override val sessionId: Long) : XrayRuntimeEvent()
 }
 

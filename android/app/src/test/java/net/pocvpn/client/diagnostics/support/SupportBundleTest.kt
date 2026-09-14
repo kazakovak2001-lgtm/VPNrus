@@ -14,6 +14,25 @@ import org.junit.Test
 /** B29 (task H/K) - buildSupportBundle()/toJson(): sanitization pass, deterministic/bounded serialization, no secrets survive export. */
 class SupportBundleTest {
 
+    @Test
+    fun `CDN failure label does not weaken export redaction for URL and token data`() {
+        val sentinels = listOf(
+            "https://edge.example.org/nova-xhttp/?session=private",
+            "Bearer verySecretProbeToken1234567890",
+            "11111111-2222-3333-4444-555555555555",
+        )
+        val sessions = sentinels.mapIndexed { index, secret ->
+            sessionWithTag(secret).copy(
+                sessionId = "cdn-session-$index",
+                selectedTransportKind = TransportKind.XRAY_XHTTP,
+                failureReason = DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE,
+            )
+        }
+        val json = buildSupportBundle(sessions, "1.0", 1L, nowEpochMillis = 5_000L).toJson()
+        assertTrue(json.contains("DATA_PLANE_PROOF_FAILURE"))
+        sentinels.forEach { assertFalse(json.contains(it)) }
+    }
+
     private fun sessionWithTag(secretTagValue: String) = DiagnosticSession(
         sessionId = "11111111-1111-1111-1111-111111111111",
         startedAtEpochMillis = 1_000L,

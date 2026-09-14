@@ -196,7 +196,7 @@ internal fun xrayTransportStateFor(event: XrayRuntimeEvent?, sessionId: Long): T
     if (event == null || event.sessionId != sessionId) return null
     return when (event) {
         is XrayRuntimeEvent.Started -> TransportState.Connected
-        is XrayRuntimeEvent.Failed -> TransportState.Error(event.reason)
+        is XrayRuntimeEvent.Failed -> TransportState.Error(event.reason, failureKind = event.failureKind)
         is XrayRuntimeEvent.Stopped -> TransportState.Disconnected
     }
 }

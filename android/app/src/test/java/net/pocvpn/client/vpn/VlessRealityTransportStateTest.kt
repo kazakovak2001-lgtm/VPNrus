@@ -28,6 +28,16 @@ class VlessRealityTransportStateTest {
     }
 
     @Test
+    fun `typed remote confirmation failure follows only the matching Xray session`() {
+        val event = XrayRuntimeEvent.Failed(5L, "remote unconfirmed", TransportFailureKind.REMOTE_UNCONFIRMED)
+        assertEquals(
+            TransportState.Error("remote unconfirmed", failureKind = TransportFailureKind.REMOTE_UNCONFIRMED),
+            xrayTransportStateFor(event, sessionId = 5L),
+        )
+        assertNull(xrayTransportStateFor(event, sessionId = 6L))
+    }
+
+    @Test
     fun `a Stopped event for the current session becomes Disconnected`() {
         assertEquals(TransportState.Disconnected, xrayTransportStateFor(XrayRuntimeEvent.Stopped(5L), sessionId = 5L))
     }
