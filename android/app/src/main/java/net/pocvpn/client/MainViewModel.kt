@@ -1482,6 +1482,7 @@ class MainViewModel(
     // changed control-plane-side in that instant) and is exactly the
     // "fetch storm" this guard exists to prevent.
     private val manifestRefreshMutex = Mutex()
+    private val manifestRefreshGeneration = net.pocvpn.client.reachability.GenerationFence()
 
     // B17 - purely observational record of the last refreshManifest() outcome,
     // for diagnostics/physical-validation only (see AppRoot's
@@ -1512,9 +1513,14 @@ class MainViewModel(
      */
     suspend fun refreshManifest(): net.pocvpn.client.reachability.MultiOriginRefreshResult? {
         val client = manifestDistributionClient ?: return null
+        // Invalidate any older in-flight callback before the mutex decision:
+        // a newer refresh request must fence an older completion even when
+        // this request is itself skipped as already in flight.
+        val generation = manifestRefreshGeneration.begin()
         if (!manifestRefreshMutex.tryLock()) return null
         return try {
             client.refresh().also { result ->
+                if (!manifestRefreshGeneration.isCurrent(generation)) return@also
                 val perOriginText = result.perOrigin.joinToString("; ") { "${it.origin.id}=${it.outcome.kind}" }.ifEmpty { "no origins configured" }
                 val finalText = when (val outcome = result.finalOutcome) {
                     is net.pocvpn.client.reachability.ManifestUpdateResult.Accepted -> "accepted version ${outcome.manifest.manifestVersion}"
