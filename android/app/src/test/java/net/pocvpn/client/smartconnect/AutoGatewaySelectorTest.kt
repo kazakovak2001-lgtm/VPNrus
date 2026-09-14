@@ -772,6 +772,21 @@ class AutoGatewaySelectorTest {
     }
 
     @Test
+    fun `B41 duplicate authorized route emits one deterministic candidate`() {
+        val candidates = buildRelayedDefault(manifestEndpoints = listOf(ingressEndpoint, ingressEndpoint, exitEndpoint))
+        assertEquals(1, candidates.size)
+        assertEquals("ru-ingress-1", candidates.single().ingressEndpointId.value)
+        assertEquals(germanyId, candidates.single().exitEndpointId)
+    }
+
+    @Test
+    fun `B41 candidate enumeration is stable when manifest order changes`() {
+        val forward = buildRelayedDefault(manifestEndpoints = listOf(ingressEndpoint, exitEndpoint)).map { it.historyPathId }
+        val reversed = buildRelayedDefault(manifestEndpoints = listOf(exitEndpoint, ingressEndpoint)).map { it.historyPathId }
+        assertEquals(forward, reversed)
+    }
+
+    @Test
     fun `an endpoint with no INGRESS role is never treated as a relay entrypoint`() {
         assertTrue(buildRelayedDefault(manifestEndpoints = listOf(exitEndpoint)).isEmpty())
     }

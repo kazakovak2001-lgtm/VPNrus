@@ -158,7 +158,7 @@ object AutoGatewaySelector {
         )
 
         val prepared = mutableListOf<Prepared>()
-        eligible.forEach { (gateway, manifestEndpoint) ->
+        eligible.sortedBy { it.second.id.value }.forEach { (gateway, manifestEndpoint) ->
             // Local per-device profile availability gates WHICH of the
             // manifest's declared transport bindings this device can
             // actually use today (task requirement 7) - the manifest
@@ -178,11 +178,14 @@ object AutoGatewaySelector {
             val registry = registryFor(gateway.endpointId)
             endpoint.transports
                 .filter { pinnedKind == null || it.kind == pinnedKind }
+                .sortedBy { it.kind.ordinal }
                 .forEach { binding ->
                     val kind = binding.kind
                     val candidate = PathCandidateBuilder.buildDirect(endpoint, kind, reachabilityFor(gateway.endpointId, kind)) ?: return@forEach
                     val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
-                    prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(candidate.historyPathId, kind))
+                    if (prepared.size < MAX_SYNTHESIZED_CANDIDATES) {
+                        prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(candidate.historyPathId, kind))
+                    }
                 }
         }
 
@@ -407,15 +410,15 @@ object AutoGatewaySelector {
             val history: PathHistoryEntry?,
         )
         val prepared = mutableListOf<PreparedRelayed>()
-        manifestEndpoints.forEach { ingress ->
+        manifestEndpoints.sortedBy { it.id.value }.forEach { ingress ->
             if (EndpointRole.INGRESS !in ingress.roles) return@forEach
             val exit = ingress.relayTo?.let { byId[it] } ?: return@forEach
             val registry = registryFor(ingress.id)
-            ingress.transports
+            ingress.transports.sortedBy { it.kind.ordinal }
                 .filter { pinnedKind == null || it.kind == pinnedKind }
                 .forEach { ingressBinding ->
                     val ingressKind = ingressBinding.kind
-                    exit.transports.forEach { exitBinding ->
+                    exit.transports.sortedBy { it.kind.ordinal }.forEach { exitBinding ->
                         val exitKind = exitBinding.kind
                         if (!isIngressClientCompatible(ingressBinding, exit.id, cdnRuntimeCapabilities)) return@forEach
                         val candidate = PathCandidateBuilder.buildRelayed(
@@ -427,7 +430,8 @@ object AutoGatewaySelector {
                             exitReachability = reachabilityFor(exit.id, exitKind),
                         ) ?: return@forEach
                         val capabilities = registry.descriptorFor(ingressKind)?.capabilities ?: TransportCapabilities.notImplemented()
-                        prepared += PreparedRelayed(
+                        if (prepared.none { it.candidate.id == candidate.id } && prepared.size < MAX_SYNTHESIZED_CANDIDATES) {
+                            prepared += PreparedRelayed(
                             candidate = candidate,
                             registry = registry,
                             capabilities = capabilities,
@@ -438,7 +442,8 @@ object AutoGatewaySelector {
                             // score against.
                             health = transportHealthFor(ingressKind),
                             history = historyFor(candidate.historyPathId, ingressKind),
-                        )
+                            )
+                        }
                     }
                 }
         }
@@ -485,6 +490,9 @@ object AutoGatewaySelector {
         IngressKind.CDN_FRONTED ->
             ingressBinding.cdnClientCompatibility(exitEndpointId, cdnRuntimeCapabilities) is CdnClientCompatibility.Compatible
     }
+
+    /** B41 - hard client-side bound for explicitly authorized executable paths. */
+    private const val MAX_SYNTHESIZED_CANDIDATES = 256
 
     /**
      * B24 - ONE combined, executable attempt: either a [DirectAttempt] or a
