@@ -183,7 +183,7 @@ object AutoGatewaySelector {
                     val kind = binding.kind
                     val candidate = PathCandidateBuilder.buildDirect(endpoint, kind, reachabilityFor(gateway.endpointId, kind)) ?: return@forEach
                     val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
-                    if (prepared.size < MAX_SYNTHESIZED_CANDIDATES) {
+                    if (prepared.none { it.candidate.id == candidate.id } && prepared.size < MAX_SYNTHESIZED_CANDIDATES) {
                         prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(candidate.historyPathId, kind))
                     }
                 }
