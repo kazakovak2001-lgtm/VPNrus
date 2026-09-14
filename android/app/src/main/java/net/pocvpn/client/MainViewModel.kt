@@ -1835,10 +1835,11 @@ class MainViewModel(
                             }
                         }
                         is net.pocvpn.client.vpn.VpnSessionHealth.Failed -> {
-                            val mapped = diagnosticsStore.snapshot.value.lastError
-                                ?.let { net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(it) }
-                                ?: net.pocvpn.client.diagnostics.support.DiagnosticFailureReason.INTERNAL_ERROR
-                            supportDiagnosticsRecorder.finishFailed(mapped)
+                            val transportFailure = (controller.state.value as? net.pocvpn.client.vpn.TransportState.Error)?.failureKind
+                            supportDiagnosticsRecorder.finishFailedFromTransport(
+                                diagnosticsStore.snapshot.value.lastError,
+                                transportFailure,
+                            )
                         }
                         is net.pocvpn.client.vpn.VpnSessionHealth.Idle ->
                             if (previousHealth !is net.pocvpn.client.vpn.VpnSessionHealth.Idle) supportDiagnosticsRecorder.finishDisconnected()
@@ -3100,7 +3101,7 @@ class MainViewModel(
                     _relayActivationNeeded.value = net.pocvpn.client.relay.RelayActivationRequest.from(plan)
                     supportDiagnosticsRecorder?.recordRelayActivationRequired()
                 } else {
-                    supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(resolution.category))
+                    supportDiagnosticsRecorder?.recordRelayPathFailed(resolution.category)
                     attemptCombined(attempts, attemptedKeys)
                 }
             }
@@ -3474,7 +3475,7 @@ class MainViewModel(
                             }
                             is net.pocvpn.client.relay.RelayProbeResult.Failure -> {
                                 supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category)
-                                supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(probeResult.category))
+                                supportDiagnosticsRecorder?.recordRelayPathFailed(probeResult.category)
                                 recordRelayOutcome(
                                     relayPlan,
                                     net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
@@ -3516,7 +3517,7 @@ class MainViewModel(
                     val error = diagnosticsStore.snapshot.value.lastError
                     val eligible = net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy.isEligibleForNextCandidate(state, error)
                     if (!eligible) return@collect
-                    supportDiagnosticsRecorder?.recordPathFailed(net.pocvpn.client.diagnostics.support.mapRelayFailureCategoryToFailureReason(net.pocvpn.client.relay.RelayFailureCategory.INGRESS_HANDSHAKE_FAILED))
+                    supportDiagnosticsRecorder?.recordRelayPathFailed(net.pocvpn.client.relay.RelayFailureCategory.INGRESS_HANDSHAKE_FAILED)
                     recordRelayOutcome(
                         relayPlan,
                         net.pocvpn.client.relay.RelayAttemptOutcome.Failure(

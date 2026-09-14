@@ -1,5 +1,6 @@
 package net.pocvpn.client.diagnostics.support
 
+import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
@@ -7,6 +8,7 @@ import net.pocvpn.client.relay.RelayFailureCategory
 import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.TransportFailureKind
 import net.pocvpn.client.vpn.config.GatewaySelectionMode
 import net.pocvpn.client.vpn.policy.RoutingMode
 import org.junit.Assert.assertEquals
@@ -314,6 +316,41 @@ class SupportDiagnosticsRecorderTest {
         val original = sessions.last()
         assertEquals(DiagnosticOutcome.PROTECTED, original.outcome)
         assertTrue(original.events.none { it.type == DiagnosticEventType.RECONNECT_INCIDENT_STARTED })
+    }
+
+    @Test
+    fun `CDN XHTTP failure events reuse the B29 session and export only closed labels`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP)
+        recorder.recordRelayPathFailed(RelayFailureCategory.INGRESS_HANDSHAKE_FAILED)
+        recorder.recordRelayEndToEndProofResult(false, RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED)
+        recorder.finishFailedFromTransport(VpnError.HandshakeTimeout, TransportFailureKind.REMOTE_UNCONFIRMED)
+        val session = store.recent().single()
+        assertEquals(DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE, session.failureReason)
+        assertEquals("XHTTP_HANDSHAKE_FAILURE", session.events.first { it.type == DiagnosticEventType.PATH_FAILED }.tags["failureReason"])
+        assertEquals("RELAY_PROOF_FAILURE", session.events.first { it.type == DiagnosticEventType.RELAY_END_TO_END_PROOF_RESULT }.tags["failureReason"])
+        val exported = buildSupportBundle(listOf(session), "1.2.3", 42L, nowEpochMillis = System.currentTimeMillis() + 1_000L).toJson()
+        assertTrue(exported.contains("DATA_PLANE_PROOF_FAILURE"))
+        assertFalse(exported.contains("edge-sthlm"))
+        assertFalse(exported.contains("Bearer"))
+    }
+
+    @Test
+    fun `non CDN and non XHTTP sessions keep their existing terminal mapping`() {
+        for ((path, kind) in listOf(
+            PathKind.DIRECT to TransportKind.AMNEZIA_WG,
+            PathKind.CHAIN_DIRECT to TransportKind.XRAY_REALITY,
+            PathKind.CHAIN_CDN to TransportKind.TLS_TCP,
+        )) {
+            val store = InMemoryDiagnosticSessionStore()
+            val recorder = newRecorder(store)
+            recorder.startSession(context())
+            recorder.recordCandidateAttemptStarted(path, kind)
+            recorder.finishFailedFromTransport(VpnError.HandshakeTimeout, TransportFailureKind.REMOTE_UNCONFIRMED)
+            assertEquals(DiagnosticFailureReason.PROTOCOL_OR_TRANSPORT_BLOCKED, store.recent().single().failureReason)
+        }
     }
 
     private fun fakeProfile(): net.pocvpn.client.relay.IngressClientProfile = net.pocvpn.client.relay.IngressClientProfile(

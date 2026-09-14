@@ -11,7 +11,21 @@ import net.pocvpn.client.identity.FileXrayProfileStore
 import net.pocvpn.client.identity.SecureXrayProfileRepository
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.diagnostics.support.DiagnosticFailureReason
+import net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore
+import net.pocvpn.client.diagnostics.support.PathKind
+import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
+import net.pocvpn.client.diagnostics.support.buildSupportBundle
+import net.pocvpn.client.diagnostics.support.toJson
+import net.pocvpn.client.network.NetworkType
+import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.TransportFailureKind
+import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.xrayTransportStateFor
+import net.pocvpn.client.vpn.config.GatewaySelectionMode
+import net.pocvpn.client.vpn.policy.RoutingMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -205,6 +219,65 @@ class XrayCoreControllerRelayHealthWatchdogTest {
         val callsBeforeMoreTime = runtime.measureDelayCallCount
         advanceTimeBy(60_000L); runCurrent()
         assertEquals("watchdog must not keep polling after its own teardown", callsBeforeMoreTime, runtime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `XHTTP watchdog terminal callback reaches the existing support bundle as data plane proof failure`() = runTest {
+        val runtime = QueuedXrayCoreRuntime().apply {
+            enqueue(true)  // initial in-tunnel confirmation: Connected
+            enqueue(false) // watchdog miss 1
+            enqueue(false) // watchdog miss 2: terminal threshold
+        }
+        val harness = Harness(runtime, probeScope = this, repository = newRepository())
+        val sessionId = 9_001L
+        val config = XrayVlessXhttpConfig(
+            server = "edge.example.org", serverPort = 443,
+            uuid = "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            tlsServerName = "edge.example.org", fingerprint = "chrome",
+            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3, alpn = "h2",
+            xhttpHost = "edge.example.org", xhttpPath = "/nova-xhttp/",
+            queryParameters = emptyMap(), headers = emptyMap(),
+            mode = XrayXhttpMode.PACKET_UP, uplinkHttpMethod = XrayXhttpUplinkHttpMethod.POST,
+            maxEachPostBytes = 524288, paddingPlacement = XrayXhttpPaddingPlacement.QUERY,
+            paddingMinBytes = 1, paddingMaxBytes = 64,
+        )
+        val started = harness.controller.requestStart(
+            kind = TransportKind.XRAY_XHTTP,
+            xhttpConfig = config,
+            confirmationContext = RemoteConfirmationContext.Relayed(exitProbeHost),
+            // Same production publisher NovaXrayVpnService's watchdog callback invokes.
+            onRelayHealthLost = { XrayRuntimeState.publishRelayHealthLost(sessionId, TransportKind.XRAY_XHTTP) },
+        )
+        assertEquals(XrayCoreStartOutcome.Started, started)
+        advanceTimeBy(20_000L); runCurrent()
+        assertEquals(0, runtime.stopLoopCallCount)
+        advanceTimeBy(20_000L); runCurrent()
+        assertEquals(1, runtime.stopLoopCallCount)
+        assertEquals(1, harness.closeTunCallCount)
+
+        val event = XrayRuntimeState.events.value as XrayRuntimeEvent.Failed
+        assertEquals(sessionId, event.sessionId)
+        assertEquals(TransportFailureKind.RELAY_DATA_PLANE_LOST, event.failureKind)
+        val state = xrayTransportStateFor(event, sessionId) as TransportState.Error
+        assertEquals(TransportFailureKind.RELAY_DATA_PLANE_LOST, state.failureKind)
+
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(store, "test", 1L)
+        recorder.startSession(SupportDiagnosticsRecorder.StartContext(
+            networkType = NetworkType.WIFI, networkValidatedInternet = true,
+            networkCaptivePortal = false, networkIpv4Available = true, networkIpv6Available = false,
+            networkFingerprintId = null, rawRestrictionClass = RestrictionClass.UNKNOWN,
+            stabilizedRestrictionClass = RestrictionClass.UNKNOWN,
+            routingMode = RoutingMode.FULL_VPN, gatewaySelectionMode = GatewaySelectionMode.AUTO,
+        ))
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP)
+        recorder.finishFailedFromTransport(VpnError.HandshakeTimeout, state.failureKind)
+        val incident = store.recent().single()
+        assertEquals(DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE, incident.failureReason)
+        val json = buildSupportBundle(listOf(incident), "test", 1L, System.currentTimeMillis() + 1_000L).toJson()
+        assertTrue(json.contains("DATA_PLANE_PROOF_FAILURE"))
+        assertTrue(!json.contains(config.uuid))
+        assertTrue(!json.contains(config.server))
     }
 
     @Test

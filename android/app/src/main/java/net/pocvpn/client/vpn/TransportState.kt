@@ -1,5 +1,11 @@
 package net.pocvpn.client.vpn
 
+/** Non-secret failure fact from the existing transport lifecycle, for diagnostics only. */
+enum class TransportFailureKind {
+    REMOTE_UNCONFIRMED,
+    RELAY_DATA_PLANE_LOST,
+}
+
 /** Observable state of a VpnTransport. Transport-agnostic - no AWG-specific detail here. */
 sealed class TransportState {
     object Disconnected : TransportState()
@@ -7,7 +13,11 @@ sealed class TransportState {
     object Connected : TransportState()
     object Disconnecting : TransportState()
     data class Reconnecting(val attempt: Int) : TransportState()
-    data class Error(val message: String, val cause: Throwable? = null) : TransportState()
+    data class Error(
+        val message: String,
+        val cause: Throwable? = null,
+        val failureKind: TransportFailureKind? = null,
+    ) : TransportState()
 
     /**
      * B8B3D - the transport/VpnService started (interface up, possibly TX>0)

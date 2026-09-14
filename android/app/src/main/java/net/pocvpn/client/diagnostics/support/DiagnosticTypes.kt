@@ -140,6 +140,21 @@ enum class DiagnosticFailureReason {
     CONTROL_PLANE_TRUST_REJECTED,
     CONTROL_PLANE_REDIRECT_REJECTED,
     CONTROL_PLANE_ORIGINS_EXHAUSTED,
+
+    // B36: closed CDN/XHTTP vocabulary. A value is emitted only where a
+    // typed runtime signal distinguishes it; unobservable origin/HTTP causes
+    // remain available for future instrumentation, never guessed from text.
+    CDN_DNS_FAILURE,
+    CDN_TLS_FAILURE,
+    CDN_METHOD_REJECTED,
+    CDN_RATE_LIMITED,
+    CDN_TIMEOUT,
+    CDN_ORIGIN_UNREACHABLE,
+    ORIGIN_TLS_FAILURE,
+    ORIGIN_PROXY_FAILURE,
+    XHTTP_HANDSHAKE_FAILURE,
+    RELAY_PROOF_FAILURE,
+    DATA_PLANE_PROOF_FAILURE,
 }
 
 /** B29 - the terminal shape of one [DiagnosticSession], mirroring [net.pocvpn.client.vpn.VpnSessionHealth]'s own real terminal states (never a fourth, independently-invented state). */
