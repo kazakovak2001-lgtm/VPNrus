@@ -25,6 +25,14 @@ class SignedTransportProfileTest {
     }
 
     @Test
+    fun `invalid signed CDN profile fails closed`() {
+        val binding = EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example", 443)
+            .withIngressKind(IngressKind.CDN_FRONTED)
+            .copy(metadata = mapOf("ingressKind" to IngressKind.CDN_FRONTED.name, "cdnProviderProfile" to "{\"version\":2}"))
+        assertEquals(SignedTransportProfileReadResult.Invalid, binding.signedTransportProfile(endpointId))
+    }
+
+    @Test
     fun `typed CDN profile is bound to the exact endpoint identity supplied by caller`() {
         val profile = CdnProviderCapabilityProfileTestFixtures.profile()
         val binding = CdnProviderCapabilityProfileTestFixtures.binding().withCdnProviderProfile(profile)
