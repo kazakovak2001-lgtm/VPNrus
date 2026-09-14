@@ -1,0 +1,41 @@
+#!/usr/sbin/nft -f
+#
+# B37 (corrected after senior review) - NAT ONLY for the isolated AWG 3.1
+# field-test subnet. This table deliberately declares NO `forward`/filter
+# base chain: netfilter evaluates EVERY base chain registered at a given
+# hook (forward included), across every nftables table AND legacy
+# iptables-nft compat rules that apply to that hook - an ACCEPT verdict in
+# one base chain does NOT make a policy-drop verdict in another base chain
+# at the same hook irrelevant. A separate `forward` chain with
+# `policy drop` here would therefore silently drop unrelated production
+# traffic that this chain's own narrow accept rules do not match (the
+# CRITICAL bug in the original version of this file) - on Stockholm it
+# would race the existing `inet pocvpn forward` chain's own policy drop
+# for every packet not matching THIS table's own two rules (including
+# production awg0 traffic); on Frankfurt it would drop packets forwarded
+# via the production iptables-nft FORWARD chain for the same reason.
+#
+# `nat postrouting` base chains do not have this hazard: this hook's
+# chains only ever ADD an accept/masquerade outcome for packets they
+# explicitly match (`ip saddr __AWG_FT31_SUBNET__ ...`) and this chain's
+# own `policy accept` leaves every other packet's verdict exactly as every
+# OTHER postrouting chain (including production NAT) already decided -
+# see gateway/provision-ft31.sh's own docs for where the actual
+# awg-ft31<->egress FORWARD accept rules are added instead (directly into
+# each host's REAL, already-verified production forwarding path, never a
+# second competing base chain).
+#
+# Idempotent by construction, same pattern as pocvpn.nft.template.
+#
+# Rendered by provision-ft31.sh: __EGRESS_IFACE__, __AWG_FT31_SUBNET__.
+
+table inet pocvpn-ft31
+delete table inet pocvpn-ft31
+
+table inet pocvpn-ft31 {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+
+        ip saddr __AWG_FT31_SUBNET__ oifname "__EGRESS_IFACE__" masquerade
+    }
+}

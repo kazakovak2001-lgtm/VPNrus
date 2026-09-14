@@ -7,6 +7,20 @@ the whole ROADMAP. Update it only when stable architecture actually changes (a n
 boundary, a new gateway, a genuinely cross-cutting refactor) - not for every slice,
 and not for ROADMAP status-only edits.
 
+## Isolated AWG 3.1 field test
+
+The `fieldTest` Android variant has its own activity, peer identity and
+gateway catalog; it does not route through production activation or change
+the normal debug/release variants. It attempts Frankfurt then Stockholm on
+the dedicated `awg-ft31` interface and UDP 51821. A fresh handshake and a
+successful TCP data-plane probe are both required for `Protected`; reports
+retain each probe target's result and distinguish handshake from health
+failure. Probes use sockets explicitly bound to this tunnel's Android VPN
+Network; an unavailable VPN Network fails closed rather than proving health
+through an unrelated path. Gateway provisioning adds only B37-owned service, NAT, INPUT and
+FORWARD state. Its rollback preserves all pre-existing state, including a
+disk-only NAT config when no live nft table exists.
+
 ## Reachability / Smart Connect pipeline (fixed order, do not reorder or bypass)
 
 ```
