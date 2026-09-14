@@ -193,4 +193,34 @@ class RestrictionClassifierTest {
         )
         assertEquals(expected, fieldNames)
     }
+
+    @Test
+    fun `B40 assessment exposes bounded uncertainty without changing classification authority`() {
+        val assessment = RestrictionClassifier.assess(
+            evidence(gatewayHttpsReachable = false, awgHandshakeFresh = false, diverseInternetReachable = false),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, assessment.classification)
+        assertEquals(RestrictionEvidenceQuality.HIGH, assessment.evidenceQuality)
+        assertEquals(RestrictionContradictionState.NONE, assessment.contradictionState)
+        assertTrue(RestrictionEvidenceReason.GATEWAY_HTTPS_FAILED in assessment.reasons)
+    }
+
+    @Test
+    fun `B40 stale and contradictory observations lower assessment quality`() {
+        val assessment = RestrictionClassifier.assess(
+            evidence(awgHandshakeFresh = true, gatewayHttpsReachable = false, gatewayProbeEpochMillis = 0L),
+            nowEpochMillis = RestrictionClassifier.DEFAULT_STALE_AFTER_MILLIS + 1L,
+        )
+        assertEquals(RestrictionClass.NO_RESTRICTION_OBSERVED, assessment.classification)
+        assertEquals(RestrictionEvidenceQuality.INSUFFICIENT, assessment.evidenceQuality)
+        assertTrue(RestrictionEvidenceReason.EVIDENCE_STALE in assessment.reasons)
+    }
+
+    @Test
+    fun `B40 assessment remains neutral when evidence is absent`() {
+        val assessment = RestrictionClassifier.assess(evidence())
+        assertEquals(RestrictionClass.UNKNOWN, assessment.classification)
+        assertEquals(RestrictionEvidenceQuality.INSUFFICIENT, assessment.evidenceQuality)
+        assertTrue(RestrictionEvidenceReason.EVIDENCE_INCOMPLETE in assessment.reasons)
+    }
 }

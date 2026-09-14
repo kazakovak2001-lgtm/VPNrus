@@ -75,6 +75,27 @@ data class RestrictionEvidence(
     val diverseProbeEpochMillis: Long? = null,
 )
 
+/** B40 - qualitative strength of the currently supplied evidence. This is
+ * deliberately not a probability and is never used as a second routing
+ * authority. */
+enum class RestrictionEvidenceQuality { HIGH, MEDIUM, LOW, INSUFFICIENT }
+
+enum class RestrictionContradictionState { NONE, PRESENT }
+
+enum class RestrictionEvidenceReason {
+    NETWORK_ABSENT, CAPTIVE_PORTAL_PRESENT, ACTIVE_RECONNECT,
+    FRESH_AWG_SUCCESS, INTERNET_NOT_VALIDATED, GATEWAY_HTTPS_FAILED,
+    DIVERSE_REACHABILITY_FAILED, DIVERSE_REACHABILITY_SUCCEEDED,
+    AWG_FAILED, EVIDENCE_STALE, EVIDENCE_INCOMPLETE, EVIDENCE_CONTRADICTORY,
+}
+
+data class RestrictionAssessment(
+    val classification: RestrictionClass,
+    val evidenceQuality: RestrictionEvidenceQuality,
+    val contradictionState: RestrictionContradictionState,
+    val reasons: Set<RestrictionEvidenceReason>,
+)
+
 /**
  * B8J - THE ONE place restriction evidence becomes a RestrictionClass. Pure
  * and deterministic - no I/O, no probing, no VpnController/VpnTransport
@@ -111,6 +132,39 @@ object RestrictionClassifier {
 
     /** B28 - same 30-minute window ReachabilityEngine.DEFAULT_STALE_AFTER_MILLIS already uses - not a shared constant (this object stays self-contained/pure with no cross-module dependency), but a deliberately identical value so the two staleness disciplines feel like ONE consistent policy, not two independently-tuned ones. */
     const val DEFAULT_STALE_AFTER_MILLIS: Long = 30 * 60 * 1000L
+
+    /** B40 - additive assessment view over the same single classify() authority. */
+    fun assess(evidence: RestrictionEvidence, nowEpochMillis: Long = Long.MAX_VALUE, staleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS): RestrictionAssessment {
+        val classification = classify(evidence, nowEpochMillis, staleAfterMillis)
+        val reasons = linkedSetOf<RestrictionEvidenceReason>()
+        val gatewayFresh = freshOrTrusted(evidence.gatewayHttpsReachable, evidence.gatewayProbeEpochMillis, nowEpochMillis, staleAfterMillis)
+        val diverseFresh = freshOrTrusted(evidence.diverseInternetReachable, evidence.diverseProbeEpochMillis, nowEpochMillis, staleAfterMillis)
+        if (evidence.networkProfile.type == NetworkType.NONE) reasons += RestrictionEvidenceReason.NETWORK_ABSENT
+        if (evidence.networkProfile.captivePortal == true) reasons += RestrictionEvidenceReason.CAPTIVE_PORTAL_PRESENT
+        if (evidence.transportState is TransportState.Reconnecting) reasons += RestrictionEvidenceReason.ACTIVE_RECONNECT
+        if (evidence.awgHandshakeFresh == true) reasons += RestrictionEvidenceReason.FRESH_AWG_SUCCESS
+        if (!evidence.networkProfile.validatedInternet) reasons += RestrictionEvidenceReason.INTERNET_NOT_VALIDATED
+        if (gatewayFresh == false) reasons += RestrictionEvidenceReason.GATEWAY_HTTPS_FAILED
+        if (diverseFresh == false) reasons += RestrictionEvidenceReason.DIVERSE_REACHABILITY_FAILED
+        if (diverseFresh == true) reasons += RestrictionEvidenceReason.DIVERSE_REACHABILITY_SUCCEEDED
+        if (evidence.awgHandshakeFresh == false) reasons += RestrictionEvidenceReason.AWG_FAILED
+        if ((evidence.gatewayHttpsReachable != null && gatewayFresh == null) || (evidence.diverseInternetReachable != null && diverseFresh == null)) {
+            reasons += RestrictionEvidenceReason.EVIDENCE_STALE
+        }
+        if (gatewayFresh == null || diverseFresh == null || (classification == RestrictionClass.UNKNOWN && evidence.awgHandshakeFresh == null)) {
+            reasons += RestrictionEvidenceReason.EVIDENCE_INCOMPLETE
+        }
+        val contradiction = evidence.awgHandshakeFresh == true && gatewayFresh == false || gatewayFresh == true && diverseFresh == false
+        if (contradiction) reasons += RestrictionEvidenceReason.EVIDENCE_CONTRADICTORY
+        val quality = when {
+            classification == RestrictionClass.UNKNOWN || reasons.contains(RestrictionEvidenceReason.EVIDENCE_INCOMPLETE) -> RestrictionEvidenceQuality.INSUFFICIENT
+            contradiction -> RestrictionEvidenceQuality.LOW
+            classification == RestrictionClass.POSSIBLE_HARD_WHITELIST && gatewayFresh != null && diverseFresh != null -> RestrictionEvidenceQuality.HIGH
+            evidence.awgHandshakeFresh != null || gatewayFresh != null || diverseFresh != null -> RestrictionEvidenceQuality.MEDIUM
+            else -> RestrictionEvidenceQuality.LOW
+        }
+        return RestrictionAssessment(classification, quality, if (contradiction) RestrictionContradictionState.PRESENT else RestrictionContradictionState.NONE, reasons)
+    }
 
     /**
      * B28 - [nowEpochMillis]/[staleAfterMillis] add explicit, time-bound
