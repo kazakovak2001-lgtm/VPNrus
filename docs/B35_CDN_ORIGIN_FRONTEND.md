@@ -1,6 +1,6 @@
 # B35 CDN origin frontend
 
-Status: **FOUNDATION / NOT DEPLOYED / NOT RUSSIA-VERIFIED**.
+Status: **STOCKHOLM DEPLOYED / SERVER-SIDE RELAY VERIFIED / NOT ANDROID OR RUSSIA-VERIFIED**. See [B35 Stockholm rollout](B35_STOCKHOLM_XHTTP_ROLLOUT_2026-09-14.md).
 
 The origin path is intentionally split into three authorities:
 

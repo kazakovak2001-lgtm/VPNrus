@@ -1,0 +1,11 @@
+#!/bin/bash
+# Fixed, zero-argument privilege boundary for the isolated XHTTP ingress.
+set -euo pipefail
+readonly ACTIVATE_SCRIPT="/opt/pocvpn/gateway/scripts/xray-activate.sh"
+readonly INGRESS_ENV_FILE="/opt/pocvpn/gateway/config/xray-xhttp-ingress.env"
+if [ "$#" -ne 0 ]; then
+    echo "usage: nova-xray-xhttp-ingress-reload (no arguments)" >&2
+    exit 2
+fi
+exec /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C \
+    XRAY_ACTIVATE_ENV_FILE="$INGRESS_ENV_FILE" "$ACTIVATE_SCRIPT"

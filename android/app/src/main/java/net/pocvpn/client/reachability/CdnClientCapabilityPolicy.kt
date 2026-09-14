@@ -33,6 +33,9 @@ data class CdnClientRuntimeCapabilities(
         require(maxRequestTimeoutMillis >= 0)
     }
 
+    /** The production executor is audited only for this exact XHTTP capability set. */
+    fun isPinnedXhttpExecutable(): Boolean = this == pinnedXhttp(clientVersionCode)
+
     companion object {
         /** Conservative default: a caller must opt in with measured local runtime support. */
         fun unsupported(): CdnClientRuntimeCapabilities = CdnClientRuntimeCapabilities(
@@ -49,6 +52,22 @@ data class CdnClientRuntimeCapabilities(
             maxRequestBodyBytes = 0,
             maxRequestTimeoutMillis = 0,
         )
+
+        fun pinnedXhttp(clientVersionCode: Long): CdnClientRuntimeCapabilities =
+            CdnClientRuntimeCapabilities(
+                clientVersionCode = clientVersionCode,
+                xrayCoreVersion = "26.7.28",
+                clientCapabilities = setOf("xhttp", "cdn-profile-v2"),
+                xhttpModes = setOf(CdnXhttpMode.PACKET_UP),
+                uplinkHttpMethods = setOf(CdnUplinkHttpMethod.POST),
+                paddingPlacements = setOf(CdnPaddingPlacement.QUERY),
+                tlsFingerprints = setOf("chrome"),
+                alpn = setOf("h2"),
+                minimumTlsVersions = setOf(CdnMinimumTlsVersion.TLS_1_3),
+                supportsStreaming = true,
+                maxRequestBodyBytes = 524_288,
+                maxRequestTimeoutMillis = 30_000,
+            )
     }
 }
 

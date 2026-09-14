@@ -580,6 +580,9 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         self._log_fields["ingress_transport"] = transport
         self._log_fields["ingress_endpoint_id"] = ingress_cfg.ingress_endpoint_id
 
+        if transport == "reality" and not ingress_cfg.ingress_server_port:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_reality_not_configured")
+
         if transport == "tls" and not ingress_cfg.ingress_tls_server_port:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_tls_not_configured")
 

@@ -683,6 +683,31 @@ class MainViewModelTest {
         assertEquals(0, transport.disconnectCallCount)
     }
 
+    @Test
+    fun `XHTTP registry requires executable transport and pinned runtime`() = runTest {
+        val xhttp = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        fun model(runtime: net.pocvpn.client.reachability.CdnClientRuntimeCapabilities, executor: net.pocvpn.client.vpn.VpnTransport?) = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            cdnRuntimeCapabilities = runtime,
+            xrayXhttpTransport = executor,
+        )
+        val pinned = net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(1)
+        val ready = model(pinned, xhttp).buildTransportRegistry()
+        assertEquals(TransportStatus.AVAILABLE, ready.descriptorFor(TransportKind.XRAY_XHTTP)?.status)
+        assertEquals(xhttp, ready.createTransport(TransportKind.XRAY_XHTTP))
+        val unsupported = model(net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.unsupported(), xhttp).buildTransportRegistry()
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, unsupported.descriptorFor(TransportKind.XRAY_XHTTP)?.status)
+        assertNull(unsupported.createTransport(TransportKind.XRAY_XHTTP))
+        val broadened = model(pinned.copy(alpn = setOf("h2", "h3")), xhttp).buildTransportRegistry()
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, broadened.descriptorFor(TransportKind.XRAY_XHTTP)?.status)
+        assertNull(broadened.createTransport(TransportKind.XRAY_XHTTP))
+        assertNull(model(pinned, null).buildTransportRegistry().descriptorFor(TransportKind.XRAY_XHTTP))
+    }
+
     // --- B8I7: production Xray registration + trustworthy Xray connection-state signal ---
 
     @Test

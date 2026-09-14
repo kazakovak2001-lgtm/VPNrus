@@ -372,6 +372,11 @@ class MainViewModel(
     private val supportDiagnosticsStore: net.pocvpn.client.diagnostics.support.DiagnosticSessionStore? = null,
     private val supportDiagnosticsAppVersionName: String = "unknown",
     private val supportDiagnosticsAppVersionCode: Long = 0L,
+    // B35 Android execution - one shared authority for CDN/XHTTP runtime
+    // capabilities. Production Factory will opt in explicitly; all existing
+    // tests and legacy callers remain fail-closed by default.
+    private val cdnRuntimeCapabilities: net.pocvpn.client.reachability.CdnClientRuntimeCapabilities =
+        net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.unsupported(),
     // B8K4B - additive, defaults to null (same reasoning as gatewayConfigOverride/
     // profileStore above): when non-null, activateDevice() below fetches and
     // persists an Xray VLESS+REALITY profile immediately after a successful
@@ -403,6 +408,7 @@ class MainViewModel(
     // deliberately untouched) - see docs/ROADMAP.md's TLS/TCP fallback row.
     private val xrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
     private val xrayTlsTransport: VpnTransport? = null,
+    private val xrayXhttpTransport: VpnTransport? = null,
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
     // B13 consolidated review fix - additive, defaults to null (same "no
     // wiring, no behavior" seam as every other optional dependency above).
@@ -890,6 +896,7 @@ class MainViewModel(
         xrayTlsProfileRepositoryResolver = xrayTlsProfileRepositoryResolver,
         relayXrayProfileRepositoryResolver = relayXrayProfileRepositoryResolver,
         relayXrayTlsProfileRepositoryResolver = relayXrayTlsProfileRepositoryResolver,
+        cdnRuntimeCapabilities = cdnRuntimeCapabilities,
         // B13 - the SAME pathHistoryStore/fingerprintKeyProvider instances
         // reachabilityDiagnostics() below already reads (never a second,
         // independently-constructed pair) - this is the live-connect-path
@@ -1074,6 +1081,17 @@ class MainViewModel(
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
                 capabilities = if (available) xrayTls.capabilities else TransportCapabilities.notImplemented(),
                 factory = if (available) ({ xrayTls }) else null,
+            )
+        }
+        val xhttp = xrayXhttpTransport
+        if (xhttp != null) {
+            val available = cdnRuntimeCapabilities.isPinnedXhttpExecutable() &&
+                xhttp.kind == TransportKind.XRAY_XHTTP
+            descriptors += TransportDescriptor(
+                kind = TransportKind.XRAY_XHTTP,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) xhttp.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ xhttp }) else null,
             )
         }
         return TransportRegistry.build(descriptors)
@@ -2828,6 +2846,7 @@ class MainViewModel(
             registryFor = { endpointId -> buildTransportRegistry(endpointId) },
             xrayAvailableFor = ::isXrayAvailableFor,
             xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
+            cdnRuntimeCapabilities = cdnRuntimeCapabilities,
             reachabilityFor = { endpointId, kind ->
                 // B24 - relay endpoint ids (an INGRESS/EXIT the manifest
                 // names but that has no ProductionGatewayCatalog entry -
@@ -3103,7 +3122,10 @@ class MainViewModel(
                     val orchResolution = orchestrator.resolve(
                         decision,
                         plan.ingressEndpointId,
-                        attemptContext = net.pocvpn.client.relay.VpnAttemptContext.Relayed(plan),
+                        attemptContext = net.pocvpn.client.relay.VpnAttemptContext.Relayed(
+                            plan = plan,
+                            profile = resolution.profile,
+                        ),
                     )
                 ) {
                     is TransportOrchestrator.Resolution.Resolved -> {
@@ -3363,7 +3385,7 @@ class MainViewModel(
                         // to the pre-round-2 real end-to-end
                         // [relayEndToEndProbe.probe] gate below, unchanged.
                         val xrayNativeConfirmationAlreadyProvedDataPlane =
-                            attempt.initialKind == TransportKind.XRAY_REALITY || attempt.initialKind == TransportKind.TLS_TCP
+                            attempt.initialKind == TransportKind.XRAY_REALITY || attempt.initialKind == TransportKind.TLS_TCP || attempt.initialKind == TransportKind.XRAY_XHTTP
                         if (xrayNativeConfirmationAlreadyProvedDataPlane) {
                             controller.reportRelayStage(net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK)
                             supportDiagnosticsRecorder?.recordDataPlaneReadinessResult(net.pocvpn.client.relay.RelayReadinessStage.INGRESS_HANDSHAKE_OK)
@@ -3760,6 +3782,10 @@ class MainViewModel(
                 appVersionName = BuildConfig.VERSION_NAME,
                 appVersionCode = BuildConfig.VERSION_CODE.toLong(),
             )
+            val cdnRuntimeCapabilities =
+                net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(
+                    clientVersionCode = BuildConfig.VERSION_CODE.toLong(),
+                )
             val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
             val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore, supportDiagnosticsRecorder)
 
@@ -3818,6 +3844,7 @@ class MainViewModel(
                     HttpsGatewayReachabilityProbe(urlString = "https://captive.apple.com/hotspot-detect.html"),
                     HttpsGatewayReachabilityProbe(urlString = "https://detectportal.firefox.com/success.txt"),
                 ),
+                cdnRuntimeCapabilities = cdnRuntimeCapabilities,
                 xrayProfileProvisioner = XrayProfileProvisioner(
                     xrayProfileRepository,
                     gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
@@ -3848,6 +3875,7 @@ class MainViewModel(
                     gatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
+                xrayXhttpTransport = net.pocvpn.client.vpn.VlessXhttpTransport(context),
                 xrayTlsTransport = VlessTlsTransport(context) { id ->
                     if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayTlsProfileRepository else XrayTlsProfileRepositoryFactory.create(context, id)
                 },

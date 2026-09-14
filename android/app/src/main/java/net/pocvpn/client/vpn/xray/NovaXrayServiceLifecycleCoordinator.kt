@@ -76,8 +76,15 @@ class NovaXrayServiceLifecycleCoordinator(
         routingMode: RoutingMode = RoutingMode.FULL_VPN,
         confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
         onRelayHealthLost: suspend () -> Unit = {},
+        xhttpConfig: XrayVlessXhttpConfig? = null,
     ): XrayCoreStartOutcome = mutex.withLock {
-        selectControllerLocked(endpointId).requestStart(kind, routingMode, confirmationContext, onRelayHealthLost)
+        selectControllerLocked(endpointId).requestStart(
+            kind,
+            routingMode,
+            confirmationContext,
+            onRelayHealthLost,
+            xhttpConfig,
+        )
     }
 
     /**

@@ -279,17 +279,23 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
     task requirement L's own "cannot generate an unauthenticated/open
     relay").
     """
-    base._validate_reality_server_config(reality)
+    if reality is not None:
+        base._validate_reality_server_config(reality)
     if tls is not None:
         base._validate_tls_server_config(tls)
     if xhttp is not None:
         _validate_xhttp_origin(xhttp)
+    if reality is None and tls is None and xhttp is None:
+        raise IngressConfigRenderError("at least one client-facing inbound is required")
     _validate_upstream(upstream)
 
     clients = base._active_clients(activations_data, xray_data)
 
-    inbounds = [base._render_reality_inbound(clients, reality, flow)]
-    inbound_tags = [reality.inbound_tag]
+    inbounds = []
+    inbound_tags = []
+    if reality is not None:
+        inbounds.append(base._render_reality_inbound(clients, reality, flow))
+        inbound_tags.append(reality.inbound_tag)
     if tls is not None:
         inbounds.append(base._render_tls_inbound(clients, tls))
         inbound_tags.append(tls.inbound_tag)
@@ -323,7 +329,8 @@ def render_ingress_server_config_redacted(activations_data, xray_data, reality, 
     upstream are NOT secrets (a public key and a non-secret short id, by
     design of the REALITY protocol itself) and are left as-is."""
     full = render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=tls, flow=flow, xhttp=xhttp)
-    full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
+    if reality is not None:
+        full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     for user in full["outbounds"][0]["settings"]["vnext"][0]["users"]:
         user["id"] = "<redacted>"
     return full

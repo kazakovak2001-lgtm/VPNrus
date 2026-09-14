@@ -92,6 +92,15 @@ sealed class TransportConfig {
         val relayExitProbeHost: String? = null,
     ) : TransportConfig()
 
+    /** B35 - validated VLESS/XHTTP CDN-fronted execution config. */
+    data class XrayXhttp(
+        val config: net.pocvpn.client.vpn.xray.XrayVlessXhttpConfig,
+        val endpointId: EndpointId = EndpointId(ProductionGateway.ID),
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+        val isRelayed: Boolean = true,
+        val relayExitProbeHost: String? = null,
+    ) : TransportConfig()
+
     /** B8O2/B13/B18-2/B33 - the TLS/TCP counterpart of [Xray], including the same [endpointId]/[routingMode]/[isRelayed]/[relayExitProbeHost] threading - see those fields' own docs. */
     data class XrayTls(
         val config: net.pocvpn.client.vpn.xray.XrayVlessTlsConfig,

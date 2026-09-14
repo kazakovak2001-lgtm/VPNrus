@@ -1,0 +1,12 @@
+# B35 Stockholm XHTTP rollout — 2026-09-14
+
+Status: deployed and server-side relay verified; Android device and restricted-network verification pending.
+
+- Existing direct ingress `stockholm-ingress-1` remains on TCP/2093 with its original Xray and API services. The new `stockholm-xhttp-ingress-1` has separate identity/config stores, Xray service, and API on loopback TCP/8445. Both use the existing activation entitlement store and relay to the Frankfurt EXIT.
+- Public data-plane binding: `edge-sthlm.aknova.pp.ua:443`, Cloudflare-proxied. Cloudflare actually sends SNI and HTTP Host `edge-sthlm.aknova.pp.ua` to Stockholm. `origin-sthlm.aknova.pp.ua` is DNS-only and is not the active Cloudflare origin authority for this route. The origin certificate is a Let's Encrypt certificate for `edge-sthlm.aknova.pp.ua`.
+- nginx serves only the `/nova-xhttp/` prefix to `127.0.0.1:2100`, with the 22 official Cloudflare IPv4/IPv6 source CIDRs and a final `deny all`. The Xray backend listens only on IPv4 loopback. A direct non-Cloudflare request to the tunnel path returned 403.
+- The control-plane URL remains `https://control.aknova.pp.ua/v1/ingress-profile`. The Android XHTTP request carries `X-Ingress-Transport: xhttp`; nginx routes only that value to the isolated API on 8445 and sends all other values to the existing direct ingress API on 8444. Both APIs still validate the bearer credential and request body. An authenticated XHTTP issuance returned HTTP 200 with the expected ingress ID, public binding, transport, and relay probe token. The temporary activation was revoked.
+- Signed manifest v3 is in `gateway/tools/production_manifest_2026-09-14_v3.json` and `gateway/tools/endpoint-manifest-2026-09-14-v3.bin`. It adds both existing direct and new CDN ingress routes without removing direct gateway transports. Both production manifest endpoints returned the same SHA-256: `9c4ebbd19b90759256cb8890d7412bb7ca01e531ac12e609d23b967be3992ebb`. The v3 signing key is stored outside the repository; Android trusts its public key alongside the earlier bootstrap key. The dynamic per-device API response is authenticated and checked against signed manifest facts; it is not independently signed.
+- A disposable Xray 26.7.28 client on Stockholm connected through the public Cloudflare edge and observed EXIT IP `152.70.43.1` via `https://api.ipify.org`. This verifies the server-side relay path, not physical Android or Russia reachability.
+
+Do not mark B35 live-verified until a physical Android device uses this route and the full traffic/exit-IP proof succeeds.

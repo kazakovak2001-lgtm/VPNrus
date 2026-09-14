@@ -1,0 +1,5 @@
+Cmnd_Alias NOVA_XRAY_XHTTP_INGRESS_RELOAD = /usr/local/libexec/nova-xray-xhttp-ingress-reload
+Defaults!NOVA_XRAY_XHTTP_INGRESS_RELOAD env_reset
+Defaults!NOVA_XRAY_XHTTP_INGRESS_RELOAD !env_keep
+Defaults!NOVA_XRAY_XHTTP_INGRESS_RELOAD secure_path="/usr/local/bin:/usr/bin:/bin"
+pocvpn-api ALL=(root) NOPASSWD: NOVA_XRAY_XHTTP_INGRESS_RELOAD

@@ -23,6 +23,20 @@ import java.nio.file.Files
  */
 class XrayCoreControllerTest {
 
+    private val xhttpConfig = XrayVlessXhttpConfig(
+        server = "edge.aknova.pp.ua", serverPort = 443,
+        uuid = "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        tlsServerName = "edge.aknova.pp.ua", fingerprint = "chrome",
+        minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3, alpn = "h2",
+        xhttpHost = "edge.aknova.pp.ua", xhttpPath = "/nova-xhttp/",
+        queryParameters = emptyMap(), headers = emptyMap(),
+        mode = XrayXhttpMode.PACKET_UP,
+        uplinkHttpMethod = XrayXhttpUplinkHttpMethod.POST,
+        maxEachPostBytes = 524288,
+        paddingPlacement = XrayXhttpPaddingPlacement.QUERY,
+        paddingMinBytes = 1, paddingMaxBytes = 64,
+    )
+
     private val validProfile = XrayProfile(
         server = "152.70.43.1",
         serverPort = 443,
@@ -36,6 +50,40 @@ class XrayCoreControllerTest {
 
     private fun newRepository(): SecureXrayProfileRepository =
         SecureXrayProfileRepository(FileXrayProfileStore(Files.createTempDirectory("xray-controller-test").toFile()), FakeAesGcmKeyEncryptor())
+
+    @Test
+    fun `XHTTP config reaches core without a Reality or TLS repository profile`() = runBlocking {
+        val harness = Harness(newRepository(), establishedFd = 7)
+
+        val outcome = harness.controller.requestStart(
+            kind = TransportKind.XRAY_XHTTP,
+            xhttpConfig = xhttpConfig,
+        )
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, harness.establishTunCallCount)
+        assertEquals(1, harness.coreRuntime.startLoopCallCount)
+        assertEquals(7, harness.coreRuntime.lastStartedTunFd)
+        assertEquals(XrayConfigRenderer.render(xhttpConfig), harness.coreRuntime.lastStartedConfigContent)
+    }
+
+    @Test
+    fun `XHTTP missing or invalid config never establishes tun or starts core`() = runBlocking {
+        val harness = Harness(newRepository())
+        assertEquals(
+            XrayCoreStartOutcome.Rejected("XHTTP runtime config not supplied"),
+            harness.controller.requestStart(kind = TransportKind.XRAY_XHTTP),
+        )
+        assertEquals(
+            XrayCoreStartOutcome.Rejected("XHTTP runtime config invalid"),
+            harness.controller.requestStart(
+                kind = TransportKind.XRAY_XHTTP,
+                xhttpConfig = xhttpConfig.copy(serverPort = 0),
+            ),
+        )
+        assertEquals(0, harness.establishTunCallCount)
+        assertEquals(0, harness.coreRuntime.startLoopCallCount)
+    }
 
     private class Harness(
         repository: SecureXrayProfileRepository,

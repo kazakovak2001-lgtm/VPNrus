@@ -43,6 +43,8 @@ class ActivationResult:
 
 
 def build_reality_config(ingress_config):
+    if not ingress_config.ingress_server_port:
+        return None
     with open(ingress_config.ingress_reality_private_key_file, "r", encoding="utf-8") as handle:
         private_key = handle.read().strip()
     from . import xray_config_renderer as base

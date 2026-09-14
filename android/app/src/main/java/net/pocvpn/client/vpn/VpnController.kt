@@ -22,6 +22,7 @@ import net.pocvpn.client.identity.XrayProfileRepositoryResolver
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver
 import net.pocvpn.client.network.NetworkProfile
+import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
 import net.pocvpn.client.reachability.CoarseNetworkSignals
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
@@ -199,6 +200,11 @@ class VpnController(
     // independent lookup.
     private val relayXrayProfileRepositoryResolver: XrayProfileRepositoryResolver? = null,
     private val relayXrayTlsProfileRepositoryResolver: XrayTlsProfileRepositoryResolver? = null,
+    // B35 Android execution - one authoritative local runtime capability
+    // snapshot shared with candidate eligibility. Conservative default keeps
+    // every legacy/test caller fail-closed for CDN-fronted XHTTP.
+    private val cdnRuntimeCapabilities: CdnClientRuntimeCapabilities =
+        CdnClientRuntimeCapabilities.unsupported(),
     // B13 - additive, defaults to null (same reasoning as connectionOutcomeStore
     // above): with any of the three below missing, recordPathHistory() is a
     // no-op - real live-wiring is opt-in per the SAME "no wiring, no
@@ -245,6 +251,7 @@ class VpnController(
         // [relayXrayProfileRepositoryResolver]/[relayXrayTlsProfileRepositoryResolver].
         if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null || relayXrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
         if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null || relayXrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
+        if (cdnRuntimeCapabilities.isPinnedXhttpExecutable()) add(TransportKind.XRAY_XHTTP)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -477,7 +484,7 @@ class VpnController(
                 // (VpnController.doConnectAttempt) is completely unaffected,
                 // this only ever fires for an XRAY_REALITY/TLS_TCP transport.
                 if (transportState is TransportState.Error &&
-                    (newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP)
+                    (newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP || newTransport.kind == TransportKind.XRAY_XHTTP)
                 ) {
                     diagnostics.recordError(VpnError.HandshakeTimeout)
                 }
@@ -1106,6 +1113,36 @@ class VpnController(
                     )
                 }
             }
+            TransportKind.XRAY_XHTTP -> {
+                val context = pendingAttemptContext as? VpnAttemptContext.Relayed
+                    ?: throw XrayProfileNotReadyException(
+                        "XHTTP requires a relayed attempt context",
+                    )
+
+                when (
+                    val resolution =
+                        net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver.resolve(
+                            ingressProfile = context.profile,
+                            exitEndpointId = context.plan.exitEndpointId,
+                            runtime = cdnRuntimeCapabilities,
+                        )
+                ) {
+                    is net.pocvpn.client.vpn.xray.CdnXhttpRuntimeResolution.Rejected ->
+                        throw XrayProfileNotReadyException(
+                            "XHTTP runtime rejected: ${resolution.reason}",
+                        )
+
+                    is net.pocvpn.client.vpn.xray.CdnXhttpRuntimeResolution.Ready ->
+                        TransportConfig.XrayXhttp(
+                            config = resolution.config,
+                            endpointId = pendingConnectEndpointId,
+                            routingMode = routingMode,
+                            isRelayed = true,
+                            relayExitProbeHost = context.plan.exitBinding.host,
+                        )
+                }
+            }
+
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")
         }
 

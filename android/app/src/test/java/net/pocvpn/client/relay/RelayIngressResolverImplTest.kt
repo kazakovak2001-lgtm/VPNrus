@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.test.runTest
 import net.pocvpn.client.identity.XrayProfile
+import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
@@ -42,7 +43,7 @@ class RelayIngressResolverImplTest {
     private val pinnedBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "16.170.208.231", 2093)
     private val exitBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "152.70.43.1", 443)
 
-    private fun plan(binding: EndpointTransportBinding = pinnedBinding, transport: TransportKind = TransportKind.XRAY_REALITY) =
+    private fun plan(binding: EndpointTransportBinding = pinnedBinding, transport: TransportKind = TransportKind.XRAY_REALITY, ingressKind: IngressKind = IngressKind.DIRECT_IP) =
         RelayedExecutionPlan.from(
             AutoGatewaySelector.RelayAttemptCandidate(
                 ingressEndpointId = ingressId,
@@ -51,12 +52,12 @@ class RelayIngressResolverImplTest {
                 exitTransport = TransportKind.XRAY_REALITY,
                 ingressBinding = binding,
                 exitBinding = exitBinding,
-                ingressKind = IngressKind.DIRECT_IP,
+                ingressKind = ingressKind,
                 ingressRegion = "Stockholm",
                 exitRegion = "Frankfurt",
                 score = 1_000L,
                 reasons = listOf("test"),
-                historyPathId = "${ingressId.value}:DIRECT_IP:$transport->frankfurt:XRAY_REALITY",
+                historyPathId = "${ingressId.value}:$ingressKind:$transport->frankfurt:XRAY_REALITY",
             ),
         )
 
@@ -67,6 +68,33 @@ class RelayIngressResolverImplTest {
 
     private fun newResolver(store: IngressProfileStore, nowProvider: () -> Long = System::currentTimeMillis) =
         RelayIngressResolverImpl(ApplicationProvider.getApplicationContext<Context>(), store, nowProvider)
+
+    @Test
+    fun `XHTTP resolves to real transport using exact ingress profile without TLS repository write`() = runTest {
+        val binding = EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.aknova.pp.ua", 443)
+        val profile = IngressClientProfile(
+            ingressEndpointId = ingressId, ingressBinding = binding,
+            transport = TransportKind.XRAY_XHTTP, ingressKind = IngressKind.CDN_FRONTED,
+            tlsProfile = XrayTlsProfile(
+                server = binding.host, serverPort = binding.port,
+                uuid = "11111111-1111-1111-1111-111111111111",
+                serverName = binding.host, fingerprint = "chrome",
+            ),
+            profileVersion = 1, issuedAtEpochMillis = 1,
+        )
+        val store = InMemoryIngressProfileStore()
+        store.saveProfile(profile)
+
+        val resolution = newResolver(store).resolve(
+            plan(binding, TransportKind.XRAY_XHTTP, IngressKind.CDN_FRONTED),
+        )
+
+        assertTrue(resolution is RelayIngressResolution.Resolved)
+        val resolved = resolution as RelayIngressResolution.Resolved
+        assertEquals(TransportKind.XRAY_XHTTP, resolved.kind)
+        assertTrue(resolved.transport is net.pocvpn.client.vpn.VlessXhttpTransport)
+        assertEquals(profile, resolved.profile)
+    }
 
     @Test
     fun `no stored profile resolves to NotProvisioned PROFILE_NOT_PROVISIONED`() = runTest {
