@@ -14,7 +14,14 @@ object PathDiversity {
     private fun signature(candidate: PathCandidate): Signature? {
         val domains = candidate.hops.map { it.binding.failureDomains() }
         if (domains.any { !it.isCompleteForNonCdnPath }) return null
-        if (candidate is PathCandidate.Relayed && candidate.ingressKind == IngressKind.CDN_FRONTED && domains.first().cdn == null) return null
+        val ingressCdn = when (candidate) {
+            is PathCandidate.Direct -> null
+            is PathCandidate.Relayed -> if (candidate.ingressKind == IngressKind.CDN_FRONTED) {
+                domains.first().cdn ?: return null
+            } else {
+                null
+            }
+        }
         return Signature(buildSet {
             domains.forEach {
                 add(FailureDomainToken(FailureDomainKind.OPERATOR, requireNotNull(it.operator)))
@@ -22,7 +29,7 @@ object PathDiversity {
                 add(FailureDomainToken(FailureDomainKind.REGION, requireNotNull(it.region)))
                 add(FailureDomainToken(FailureDomainKind.CONTROL_PLANE, requireNotNull(it.controlPlane)))
             }
-            domains.first().cdn?.let { add(FailureDomainToken(FailureDomainKind.CDN, it)) }
+            ingressCdn?.let { add(FailureDomainToken(FailureDomainKind.CDN, it)) }
         })
     }
 

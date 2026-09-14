@@ -23,6 +23,20 @@ class PathDiversityTest {
         return requireNotNull(PathCandidateBuilder.buildDirect(endpoint, TransportKind.XRAY_REALITY, reach(endpoint.id)))
     }
 
+    private fun relayed(id: String, ingressKind: IngressKind, ingressDomains: InfrastructureFailureDomains): PathCandidate.Relayed {
+        val ingress = EndpointDescriptor(EndpointId("ingress-$id"), setOf(EndpointRole.INGRESS), "display", "display",
+            transports = listOf(EndpointTransportBinding(TransportKind.XRAY_XHTTP, "test.invalid", 443)
+                .withIngressKind(ingressKind).withFailureDomains(ingressDomains)), relayTo = EndpointId("exit-$id"))
+        val exit = EndpointDescriptor(EndpointId("exit-$id"), setOf(EndpointRole.EXIT), "display", "display",
+            transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "test.invalid", 51820)
+                .withFailureDomains(domains("exit"))))
+        return requireNotNull(PathCandidateBuilder.buildRelayed(ingress, exit, TransportKind.XRAY_XHTTP, TransportKind.AMNEZIA_WG,
+            EndpointReachability(ingress.id, TransportKind.XRAY_XHTTP, ReachabilityState.REACHABLE,
+                evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, null, true, true, RestrictionClass.UNKNOWN)),
+            EndpointReachability(exit.id, TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE,
+                evidence = ReachabilityEvidenceSummary(TransportHealthState.HEALTHY, null, true, true, RestrictionClass.UNKNOWN))))
+    }
+
     @Test fun `only a candidate with a unique fully trusted domain receives the bounded preference`() {
         val a = direct("a", domains("one")); val b = direct("b", domains("one")); val c = direct("c", domains("two"))
         assertEquals(setOf(c.id), PathDiversity.independentlyDiverseCandidateIds(listOf(a, b, c)))
@@ -47,6 +61,36 @@ class PathDiversityTest {
         val first = direct("first", domains("same"))
         val second = direct("second", domains("same"))
         assertTrue(PathDiversity.independentlyDiverseCandidateIds(listOf(first, second)).isEmpty())
+    }
+
+    @Test fun `direct path ignores injected CDN metadata`() {
+        val withCdn = direct("with-cdn", domains("same", "injected"))
+        val withoutCdn = direct("without-cdn", domains("same"))
+        assertEquals(
+            PathDiversity.independentlyDiverseCandidateIds(listOf(withCdn, withoutCdn)),
+            PathDiversity.independentlyDiverseCandidateIds(listOf(direct("with-cdn", domains("same")), direct("without-cdn", domains("same")))),
+        )
+    }
+
+    @Test fun `direct IP relay ignores injected CDN metadata`() {
+        val withCdn = relayed("with-cdn", IngressKind.DIRECT_IP, domains("ingress", "injected"))
+        val withoutCdn = relayed("without-cdn", IngressKind.DIRECT_IP, domains("ingress"))
+        assertEquals(
+            PathDiversity.independentlyDiverseCandidateIds(listOf(withCdn, withoutCdn)),
+            PathDiversity.independentlyDiverseCandidateIds(listOf(relayed("with-cdn", IngressKind.DIRECT_IP, domains("ingress")), relayed("without-cdn", IngressKind.DIRECT_IP, domains("ingress")))),
+        )
+    }
+
+    @Test fun `CDN relay requires ingress CDN and correlates or separates CDN IDs`() {
+        val missing = relayed("missing", IngressKind.CDN_FRONTED, domains("ingress"))
+        val sameA = relayed("same-a", IngressKind.CDN_FRONTED, domains("ingress", "cdn-shared"))
+        val sameB = relayed("same-b", IngressKind.CDN_FRONTED, domains("ingress", "cdn-shared"))
+        assertTrue(PathDiversity.independentlyDiverseCandidateIds(listOf(missing, sameA)).isEmpty())
+        assertTrue(PathDiversity.independentlyDiverseCandidateIds(listOf(sameA, sameB)).isEmpty())
+
+        val differentA = relayed("different-a", IngressKind.CDN_FRONTED, domains("ingress", "cdn-a"))
+        val differentB = relayed("different-b", IngressKind.CDN_FRONTED, domains("ingress", "cdn-b"))
+        assertEquals(setOf(differentA.id, differentB.id), PathDiversity.independentlyDiverseCandidateIds(listOf(differentA, differentB)))
     }
 
     @Test fun `withFailureDomains clears stale nullable domains and preserves unrelated metadata`() {
