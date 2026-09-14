@@ -54,6 +54,13 @@ private const val FAILURE_DOMAIN_NETWORK_KEY = "failureDomain.network"
 private const val FAILURE_DOMAIN_REGION_KEY = "failureDomain.region"
 private const val FAILURE_DOMAIN_CDN_KEY = "failureDomain.cdn"
 private const val FAILURE_DOMAIN_CONTROL_PLANE_KEY = "failureDomain.controlPlane"
+private val FAILURE_DOMAIN_METADATA_KEYS = setOf(
+    FAILURE_DOMAIN_OPERATOR_KEY,
+    FAILURE_DOMAIN_NETWORK_KEY,
+    FAILURE_DOMAIN_REGION_KEY,
+    FAILURE_DOMAIN_CDN_KEY,
+    FAILURE_DOMAIN_CONTROL_PLANE_KEY,
+)
 
 /** Opaque, signed equality label; it is deliberately not a provider name, ASN, hostname, or IP address. */
 data class FailureDomainId(val value: String) {
@@ -132,7 +139,8 @@ fun EndpointTransportBinding.withFailureDomains(domains: InfrastructureFailureDo
         FAILURE_DOMAIN_CDN_KEY to domains.cdn,
         FAILURE_DOMAIN_CONTROL_PLANE_KEY to domains.controlPlane,
     ).mapNotNull { (key, value) -> value?.let { key to it.value } }.toMap()
-    return copy(metadata = metadata + updates)
+    val withoutOldDomains = metadata.filterKeys { it !in FAILURE_DOMAIN_METADATA_KEYS }
+    return copy(metadata = withoutOldDomains + updates)
 }
 
 /**

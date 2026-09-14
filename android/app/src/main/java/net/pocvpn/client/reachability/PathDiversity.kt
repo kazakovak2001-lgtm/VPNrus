@@ -7,15 +7,22 @@ package net.pocvpn.client.reachability
  * independent alternative.
  */
 object PathDiversity {
-    private data class Signature(val values: Set<FailureDomainId>)
+    private enum class FailureDomainKind { OPERATOR, NETWORK, REGION, CDN, CONTROL_PLANE }
+    private data class FailureDomainToken(val kind: FailureDomainKind, val id: FailureDomainId)
+    private data class Signature(val values: Set<FailureDomainToken>)
 
     private fun signature(candidate: PathCandidate): Signature? {
         val domains = candidate.hops.map { it.binding.failureDomains() }
         if (domains.any { !it.isCompleteForNonCdnPath }) return null
         if (candidate is PathCandidate.Relayed && candidate.ingressKind == IngressKind.CDN_FRONTED && domains.first().cdn == null) return null
         return Signature(buildSet {
-            domains.forEach { add(requireNotNull(it.operator)); add(requireNotNull(it.network)); add(requireNotNull(it.region)); add(requireNotNull(it.controlPlane)) }
-            domains.first().cdn?.let(::add)
+            domains.forEach {
+                add(FailureDomainToken(FailureDomainKind.OPERATOR, requireNotNull(it.operator)))
+                add(FailureDomainToken(FailureDomainKind.NETWORK, requireNotNull(it.network)))
+                add(FailureDomainToken(FailureDomainKind.REGION, requireNotNull(it.region)))
+                add(FailureDomainToken(FailureDomainKind.CONTROL_PLANE, requireNotNull(it.controlPlane)))
+            }
+            domains.first().cdn?.let { add(FailureDomainToken(FailureDomainKind.CDN, it)) }
         })
     }
 
