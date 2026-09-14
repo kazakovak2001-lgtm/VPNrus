@@ -166,4 +166,26 @@ class PathHistoryStoreTest {
         assertEquals(true, store.get("network-a", "ingress1->exit1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
         assertEquals(false, store.get("network-b", "ingress1->exit1", TransportKind.TLS_TCP)!!.lastOutcomeSuccess)
     }
+
+    @Test
+    fun `invalid or oversized memory keys fail neutral and do not create entries`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder())
+        store.record("", "path", TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
+        store.record("network", "", TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
+        store.record("network", "x".repeat(513), TransportKind.TLS_TCP, success = false, nowEpochMillis = 1L)
+        assertNull(store.get("", "path", TransportKind.TLS_TCP))
+        assertNull(store.get("network", "", TransportKind.TLS_TCP))
+        assertNull(store.get("network", "x".repeat(513), TransportKind.TLS_TCP))
+    }
+
+    @Test
+    fun `outcome counters saturate instead of growing without bound`() {
+        val store = FilePathHistoryStore(tempFolder.newFolder())
+        repeat(1_025) {
+            store.record("network", "path", TransportKind.TLS_TCP, success = false, nowEpochMillis = it.toLong())
+        }
+        val entry = store.get("network", "path", TransportKind.TLS_TCP)!!
+        assertEquals(1_024, entry.failureCount)
+        assertEquals(1_024, entry.consecutiveFailures)
+    }
 }

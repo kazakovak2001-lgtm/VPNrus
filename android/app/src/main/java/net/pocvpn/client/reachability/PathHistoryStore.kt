@@ -51,6 +51,14 @@ interface PathHistoryStore {
     fun record(networkFingerprint: String, pathId: String, transport: TransportKind, success: Boolean, nowEpochMillis: Long)
 }
 
+/** B39 - the complete local memory identity: approved opaque network context,
+ * logical executable path identity, and the concrete transport. */
+data class NetworkPathMemoryKey(
+    val networkFingerprintId: String,
+    val historyPathId: String,
+    val transport: TransportKind,
+)
+
 /**
  * File-backed, bounded (see [maxEntries]) local store. Eviction is
  * least-recently-updated first once the bound is hit - a device that visits
@@ -69,20 +77,23 @@ class FilePathHistoryStore(
 
     @Volatile private var cached: LinkedHashMap<Key, PathHistoryEntry> = readFromDisk()
 
-    override fun get(networkFingerprint: String, pathId: String, transport: TransportKind): PathHistoryEntry? =
-        cached[Key(networkFingerprint, pathId, transport.ordinal)]
+    override fun get(networkFingerprint: String, pathId: String, transport: TransportKind): PathHistoryEntry? {
+        if (!validKey(networkFingerprint, pathId)) return null
+        return cached[Key(networkFingerprint, pathId, transport.ordinal)]
+    }
 
     override fun record(networkFingerprint: String, pathId: String, transport: TransportKind, success: Boolean, nowEpochMillis: Long) {
+        if (!validKey(networkFingerprint, pathId)) return
         synchronized(lock) {
             val key = Key(networkFingerprint, pathId, transport.ordinal)
             val existing = cached[key]
             val updated = PathHistoryEntry(
-                successCount = (existing?.successCount ?: 0) + if (success) 1 else 0,
-                failureCount = (existing?.failureCount ?: 0) + if (success) 0 else 1,
+                successCount = ((existing?.successCount ?: 0) + if (success) 1 else 0).coerceAtMost(MAX_COUNTER),
+                failureCount = ((existing?.failureCount ?: 0) + if (success) 0 else 1).coerceAtMost(MAX_COUNTER),
                 lastOutcomeEpochMillis = nowEpochMillis,
                 lastOutcomeSuccess = success,
                 // B19 - the RECENT streak: cleared by any success, otherwise incremented.
-                consecutiveFailures = if (success) 0 else (existing?.consecutiveFailures ?: 0) + 1,
+                consecutiveFailures = if (success) 0 else ((existing?.consecutiveFailures ?: 0) + 1).coerceAtMost(MAX_COUNTER),
             )
             // Copy-on-write, not an in-place mutation of the shared `cached`
             // map: [get] deliberately reads `cached` without taking [lock]
@@ -105,6 +116,10 @@ class FilePathHistoryStore(
             cached = newCache
         }
     }
+
+    private fun validKey(fingerprint: String, pathId: String): Boolean =
+        fingerprint.isNotBlank() && fingerprint.length <= MAX_STRING_LEN &&
+            pathId.isNotBlank() && pathId.length <= MAX_STRING_LEN
 
     private fun readFromDisk(): LinkedHashMap<Key, PathHistoryEntry> {
         if (!file.exists()) return LinkedHashMap()
@@ -138,6 +153,7 @@ class FilePathHistoryStore(
         val lastOutcomeEpochMillis = input.readLong()
         val lastOutcomeSuccess = input.readBoolean()
         val consecutiveFailures = input.readInt()
+        if (successCount !in 0..MAX_COUNTER || failureCount !in 0..MAX_COUNTER || consecutiveFailures !in 0..MAX_COUNTER) return null
         return Key(fingerprint, pathId, transportOrdinal) to
             PathHistoryEntry(successCount, failureCount, lastOutcomeEpochMillis, lastOutcomeSuccess, consecutiveFailures)
     }
@@ -198,5 +214,6 @@ class FilePathHistoryStore(
         // field, so widening it never breaks decoding an existing file.
         const val MAX_STRING_LEN = 512
         const val MAX_PLAUSIBLE_COUNT = 100_000
+        const val MAX_COUNTER = 1_024
     }
 }
