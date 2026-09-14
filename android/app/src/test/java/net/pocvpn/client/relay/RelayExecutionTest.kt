@@ -147,6 +147,25 @@ class RelayExecutionTest {
 
 class HttpRelayEndToEndProbeTest {
 
+    @Test
+    fun `real probe HTTP boundary carries closed DNS TLS and timeout facts without changing relay category`() = runTest {
+        for ((failure, kind) in listOf(
+            java.net.UnknownHostException("tls timeout") to RelayProbeFailureKind.DNS_RESOLUTION_FAILED,
+            javax.net.ssl.SSLHandshakeException("dns") to RelayProbeFailureKind.TLS_HANDSHAKE_FAILED,
+            java.net.SocketTimeoutException("unrelated") to RelayProbeFailureKind.REQUEST_TIMED_OUT,
+        )) {
+            val probe = HttpRelayEndToEndProbe(openConnection = { url -> object : java.net.HttpURLConnection(url) {
+                override fun connect() = Unit
+                override fun disconnect() = Unit
+                override fun usingProxy() = false
+                override fun getResponseCode(): Int = throw failure
+            } })
+            val result = probe.probeProfile(fakeIngressClientProfile(plan())) as RelayProbeResult.Failure
+            assertEquals(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, result.category)
+            assertEquals(kind, result.failureKind)
+        }
+    }
+
     private fun plan(historyPathId: String = "ingress-1:XRAY_REALITY->exit-1:AMNEZIA_WG") = RelayedExecutionPlan(
         ingressEndpointId = EndpointId("ingress-1"),
         ingressBinding = EndpointTransportBinding(TransportKind.XRAY_REALITY, "203.0.113.50", 2093),

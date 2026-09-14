@@ -3423,7 +3423,7 @@ class MainViewModel(
                                         is net.pocvpn.client.relay.RelayProbeResult.Success ->
                                             supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = true, category = null)
                                         is net.pocvpn.client.relay.RelayProbeResult.Failure ->
-                                            supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category)
+                                            supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category, failureKind = probeResult.failureKind)
                                     }
                                 }
                             }
@@ -3474,8 +3474,8 @@ class MainViewModel(
                                 // "settled, nothing left to watch" case).
                             }
                             is net.pocvpn.client.relay.RelayProbeResult.Failure -> {
-                                supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category)
-                                supportDiagnosticsRecorder?.recordRelayPathFailed(probeResult.category)
+                                supportDiagnosticsRecorder?.recordRelayEndToEndProofResult(success = false, category = probeResult.category, failureKind = probeResult.failureKind)
+                                supportDiagnosticsRecorder?.recordRelayPathFailed(probeResult.category, probeResult.failureKind)
                                 recordRelayOutcome(
                                     relayPlan,
                                     net.pocvpn.client.relay.RelayAttemptOutcome.Failure(

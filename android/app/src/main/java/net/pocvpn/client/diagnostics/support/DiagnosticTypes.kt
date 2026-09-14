@@ -155,6 +155,11 @@ enum class DiagnosticFailureReason {
     XHTTP_HANDSHAKE_FAILURE,
     RELAY_PROOF_FAILURE,
     DATA_PLANE_PROOF_FAILURE,
+
+    // B37: the existing out-of-band relay-health HTTPS probe, not CDN or in-tunnel Xray.
+    RELAY_PROBE_DNS_FAILURE,
+    RELAY_PROBE_TLS_FAILURE,
+    RELAY_PROBE_TIMEOUT,
 }
 
 /** B29 - the terminal shape of one [DiagnosticSession], mirroring [net.pocvpn.client.vpn.VpnSessionHealth]'s own real terminal states (never a fourth, independently-invented state). */

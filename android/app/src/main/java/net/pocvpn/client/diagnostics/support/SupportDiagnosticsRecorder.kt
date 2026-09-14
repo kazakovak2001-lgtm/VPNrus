@@ -6,6 +6,7 @@ import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
+import net.pocvpn.client.relay.RelayProbeFailureKind
 import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
@@ -69,6 +70,7 @@ class SupportDiagnosticsRecorder(
     ) {
         var selectedPathKind: PathKind = PathKind.NONE
         var selectedTransportKind: TransportKind? = null
+        var typedProbeFailureReason: DiagnosticFailureReason? = null
         val events = mutableListOf<DiagnosticEvent>()
     }
 
@@ -107,6 +109,7 @@ class SupportDiagnosticsRecorder(
     fun recordCandidateAttemptStarted(pathKind: PathKind, transportKind: TransportKind) {
         open?.selectedPathKind = pathKind
         open?.selectedTransportKind = transportKind
+        open?.typedProbeFailureReason = null
         record(DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED, mapOf(TAG_PATH_KIND to pathKind.name, TAG_TRANSPORT_KIND to transportKind.name))
     }
 
@@ -135,13 +138,13 @@ class SupportDiagnosticsRecorder(
         )
     }
 
-    fun recordRelayEndToEndProofResult(success: Boolean, category: RelayFailureCategory?) {
+    fun recordRelayEndToEndProofResult(success: Boolean, category: RelayFailureCategory?, failureKind: RelayProbeFailureKind? = null) {
         record(
             DiagnosticEventType.RELAY_END_TO_END_PROOF_RESULT,
             buildMap {
                 put(TAG_SUCCESS, success.toString())
                 category?.let {
-                    put(TAG_FAILURE_REASON, mapRelayFailureForPath(it, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind).name)
+                    put(TAG_FAILURE_REASON, mapRelayProbeFailureForPath(it, failureKind, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind).name)
                 }
             },
         )
@@ -160,8 +163,13 @@ class SupportDiagnosticsRecorder(
         record(DiagnosticEventType.PATH_FAILED, mapOf(TAG_FAILURE_REASON to reason.name))
 
     /** B36: same B29 event, using the currently pinned attempt's path/transport. */
-    fun recordRelayPathFailed(category: RelayFailureCategory) =
-        recordPathFailed(mapRelayFailureForPath(category, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind))
+    fun recordRelayPathFailed(category: RelayFailureCategory, failureKind: RelayProbeFailureKind? = null) {
+        val reason = mapRelayProbeFailureForPath(category, failureKind, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind)
+        if (failureKind != null && reason != mapRelayFailureForPath(category, open?.selectedPathKind ?: PathKind.NONE, open?.selectedTransportKind)) {
+            open?.typedProbeFailureReason = reason
+        }
+        recordPathFailed(reason)
+    }
 
     /** NON-TERMINAL - see [recordPathFailed]'s own docs; a control-plane exchange (e.g. one relay activation network call) failed, but the combined sequence may still continue with a different candidate. */
     fun recordControlPlaneFailure(reason: DiagnosticFailureReason) =
@@ -174,13 +182,18 @@ class SupportDiagnosticsRecorder(
     }
 
     /** TERMINAL - the whole connect() request ends in failure, for [reason] - see [recordPathFailed]'s own docs for the non-terminal, per-candidate counterpart. */
-    fun finishFailed(reason: DiagnosticFailureReason) = finish(DiagnosticOutcome.FAILED, reason)
+    fun finishFailed(reason: DiagnosticFailureReason) = finish(
+        DiagnosticOutcome.FAILED,
+        if (reason == DiagnosticFailureReason.NO_CANDIDATE || reason == DiagnosticFailureReason.INTERNAL_ERROR || reason == DiagnosticFailureReason.GATEWAY_UNREACHABLE)
+            open?.typedProbeFailureReason ?: reason else reason,
+    )
 
     /** B36: preserve generic failure mapping unless a typed CDN/XHTTP fact exists. */
     fun finishFailedFromTransport(error: VpnError?, failureKind: TransportFailureKind?) {
         val pathKind = open?.selectedPathKind ?: PathKind.NONE
         val transportKind = open?.selectedTransportKind
         val reason = mapTransportFailureForPath(failureKind, pathKind, transportKind)
+            ?: open?.typedProbeFailureReason
             ?: error?.let(::mapVpnErrorToFailureReason)
             ?: DiagnosticFailureReason.INTERNAL_ERROR
         finishFailed(reason)
