@@ -122,6 +122,46 @@ class AutoGatewaySelectorTest {
     }
 
     @Test
+    fun `B41 duplicate direct endpoint descriptors produce one logical candidate`() {
+        val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY)
+        val candidates = buildDefault(manifestEndpoints = listOf(germany, germany))
+        assertEquals(1, candidates.size)
+        assertEquals(ProductionGatewayId.GERMANY, candidates.single().gatewayId)
+    }
+
+    @Test
+    fun `B41 duplicate identical direct bindings across descriptors produce one candidate`() {
+        val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY)
+        val duplicateBindingDescriptor = germany.copy(transports = listOf(germany.transports.single()))
+        val candidates = buildDefault(manifestEndpoints = listOf(germany, duplicateBindingDescriptor))
+        assertEquals(1, candidates.size)
+    }
+
+    @Test
+    fun `B41 duplicate direct inputs do not consume capacity before a distinct candidate`() {
+        val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY)
+        val candidates = buildDefault(manifestEndpoints = List(300) { germany } + manifestEndpointFor(ProductionGatewayCatalog.STOCKHOLM))
+        assertEquals(setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM), candidates.map { it.gatewayId }.toSet())
+    }
+
+    @Test
+    fun `B41 genuinely different transports remain distinct direct candidates`() {
+        val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, "gw.example", 51820),
+                EndpointTransportBinding(TransportKind.TLS_TCP, "gw.example", 443),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(germany), gatewayFactsFor = { catalogById[it] },
+            provisioned = { true }, clientTunnelIp = { "10.77.0.5" }, registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP) },
+            xrayAvailableFor = { false }, xrayTlsAvailableFor = { true }, reachabilityFor = { id, kind -> reachable(id, kind) },
+            transportHealthFor = { healthy() }, historyFor = { _, _ -> null },
+        )
+        assertEquals(setOf(TransportKind.AMNEZIA_WG, TransportKind.TLS_TCP), candidates.map { it.transport }.toSet())
+    }
+
+    @Test
     fun `unprovisioned gateway is excluded entirely`() {
         val candidates = buildDefault(provisioned = setOf(ProductionGatewayId.GERMANY))
         assertEquals(listOf(ProductionGatewayId.GERMANY), candidates.map { it.gatewayId })
@@ -769,6 +809,21 @@ class AutoGatewaySelectorTest {
     fun `an ingress absent a relayTo target never produces a candidate`() {
         val orphanIngress = ingressEndpoint.copy(relayTo = null)
         assertTrue(buildRelayedDefault(manifestEndpoints = listOf(orphanIngress, exitEndpoint)).isEmpty())
+    }
+
+    @Test
+    fun `B41 duplicate authorized route emits one deterministic candidate`() {
+        val candidates = buildRelayedDefault(manifestEndpoints = listOf(ingressEndpoint, ingressEndpoint, exitEndpoint))
+        assertEquals(1, candidates.size)
+        assertEquals("ru-ingress-1", candidates.single().ingressEndpointId.value)
+        assertEquals(germanyId, candidates.single().exitEndpointId)
+    }
+
+    @Test
+    fun `B41 candidate enumeration is stable when manifest order changes`() {
+        val forward = buildRelayedDefault(manifestEndpoints = listOf(ingressEndpoint, exitEndpoint)).map { it.historyPathId }
+        val reversed = buildRelayedDefault(manifestEndpoints = listOf(exitEndpoint, ingressEndpoint)).map { it.historyPathId }
+        assertEquals(forward, reversed)
     }
 
     @Test
