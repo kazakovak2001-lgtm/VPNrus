@@ -49,6 +49,31 @@ enum class IngressKind { DIRECT_IP, CDN_FRONTED }
 
 /** B23 - the reserved [EndpointTransportBinding.metadata] key [ingressKind]/[withIngressKind] read/write - never touched directly by callers. */
 private const val INGRESS_KIND_METADATA_KEY = "ingressKind"
+private const val FAILURE_DOMAIN_OPERATOR_KEY = "failureDomain.operator"
+private const val FAILURE_DOMAIN_NETWORK_KEY = "failureDomain.network"
+private const val FAILURE_DOMAIN_REGION_KEY = "failureDomain.region"
+private const val FAILURE_DOMAIN_CDN_KEY = "failureDomain.cdn"
+private const val FAILURE_DOMAIN_CONTROL_PLANE_KEY = "failureDomain.controlPlane"
+
+/** Opaque, signed equality label; it is deliberately not a provider name, ASN, hostname, or IP address. */
+data class FailureDomainId(val value: String) {
+    init {
+        require(value.length in 1..64 && value.all { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }) {
+            "invalid failure-domain identifier"
+        }
+    }
+}
+
+/** Correlation labels only. Missing or malformed labels are unknown, never evidence of independence. */
+data class InfrastructureFailureDomains(
+    val operator: FailureDomainId?,
+    val network: FailureDomainId?,
+    val region: FailureDomainId?,
+    val cdn: FailureDomainId?,
+    val controlPlane: FailureDomainId?,
+) {
+    val isCompleteForNonCdnPath: Boolean get() = operator != null && network != null && region != null && controlPlane != null
+}
 
 /**
  * One transport this endpoint can be reached over, and the connection
@@ -86,6 +111,29 @@ fun EndpointTransportBinding.ingressKind(): IngressKind? =
 /** B23 - returns a copy of this binding with [kind] recorded as its [IngressKind] (see [ingressKind]'s own docs). */
 fun EndpointTransportBinding.withIngressKind(kind: IngressKind): EndpointTransportBinding =
     copy(metadata = metadata + (INGRESS_KIND_METADATA_KEY to kind.name))
+
+fun EndpointTransportBinding.failureDomains(): InfrastructureFailureDomains {
+    fun domain(key: String): FailureDomainId? = metadata[key]?.let { raw -> runCatching { FailureDomainId(raw) }.getOrNull() }
+    return InfrastructureFailureDomains(
+        operator = domain(FAILURE_DOMAIN_OPERATOR_KEY),
+        network = domain(FAILURE_DOMAIN_NETWORK_KEY),
+        region = domain(FAILURE_DOMAIN_REGION_KEY),
+        cdn = domain(FAILURE_DOMAIN_CDN_KEY),
+        controlPlane = domain(FAILURE_DOMAIN_CONTROL_PLANE_KEY),
+    )
+}
+
+/** Writes only opaque IDs into metadata, which existing manifest canonicalization already signs. */
+fun EndpointTransportBinding.withFailureDomains(domains: InfrastructureFailureDomains): EndpointTransportBinding {
+    val updates = mapOf(
+        FAILURE_DOMAIN_OPERATOR_KEY to domains.operator,
+        FAILURE_DOMAIN_NETWORK_KEY to domains.network,
+        FAILURE_DOMAIN_REGION_KEY to domains.region,
+        FAILURE_DOMAIN_CDN_KEY to domains.cdn,
+        FAILURE_DOMAIN_CONTROL_PLANE_KEY to domains.controlPlane,
+    ).mapNotNull { (key, value) -> value?.let { key to it.value } }.toMap()
+    return copy(metadata = metadata + updates)
+}
 
 /**
  * Everything the reachability fabric can know about one endpoint. Deliberately
