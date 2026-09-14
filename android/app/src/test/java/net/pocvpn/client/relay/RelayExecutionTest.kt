@@ -152,6 +152,7 @@ class HttpRelayEndToEndProbeTest {
         for ((failure, kind) in listOf(
             java.net.UnknownHostException("tls timeout") to RelayProbeFailureKind.DNS_RESOLUTION_FAILED,
             javax.net.ssl.SSLHandshakeException("dns") to RelayProbeFailureKind.TLS_HANDSHAKE_FAILED,
+            javax.net.ssl.SSLException("handshake failed") to null,
             java.net.SocketTimeoutException("unrelated") to RelayProbeFailureKind.REQUEST_TIMED_OUT,
         )) {
             val probe = HttpRelayEndToEndProbe(openConnection = { url -> object : java.net.HttpURLConnection(url) {

@@ -253,7 +253,7 @@ enum class RelayProbeFailureKind { DNS_RESOLUTION_FAILED, TLS_HANDSHAKE_FAILED, 
 
 internal fun relayProbeFailureKindFor(error: java.io.IOException): RelayProbeFailureKind? = when (error) {
     is java.net.UnknownHostException -> RelayProbeFailureKind.DNS_RESOLUTION_FAILED
-    is javax.net.ssl.SSLException -> RelayProbeFailureKind.TLS_HANDSHAKE_FAILED
+    is javax.net.ssl.SSLHandshakeException -> RelayProbeFailureKind.TLS_HANDSHAKE_FAILED
     is java.net.SocketTimeoutException -> RelayProbeFailureKind.REQUEST_TIMED_OUT
     else -> null
 }
