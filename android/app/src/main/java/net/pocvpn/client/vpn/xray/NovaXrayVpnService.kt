@@ -237,7 +237,7 @@ class NovaXrayVpnService : VpnService() {
             // startRelayHealthWatchdog docs) - never before.
             val onRelayHealthLost: suspend () -> Unit = {
                 Log.w(TAG, "relay health watchdog: consecutive probe failures exceeded threshold, session torn down")
-                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "relay data-plane health check failed"))
+                XrayRuntimeState.publishRelayHealthLost(sessionId, kind)
                 stopSelf()
             }
             val xhttpConfig =

@@ -71,7 +71,7 @@ fun mapTransportFailureForPath(
     pathKind: PathKind,
     transportKind: TransportKind?,
 ): DiagnosticFailureReason? =
-    if (failure == TransportFailureKind.REMOTE_UNCONFIRMED &&
+    if ((failure == TransportFailureKind.REMOTE_UNCONFIRMED || failure == TransportFailureKind.RELAY_DATA_PLANE_LOST) &&
         pathKind == PathKind.CHAIN_CDN && transportKind == TransportKind.XRAY_XHTTP
     ) DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE else null
 

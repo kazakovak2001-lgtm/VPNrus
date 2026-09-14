@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn.xray
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.TransportFailureKind
 
 /**
@@ -48,5 +49,16 @@ object XrayRuntimeState {
     /** Call ONLY from NovaXrayVpnService's own lifecycle - never fabricated elsewhere. */
     fun publish(event: XrayRuntimeEvent) {
         _events.value = event
+    }
+
+    /** The watchdog calls back only after tearing down a previously Connected relay. */
+    internal fun publishRelayHealthLost(sessionId: Long, kind: TransportKind) {
+        publish(
+            XrayRuntimeEvent.Failed(
+                sessionId,
+                "relay data-plane health check failed",
+                if (kind == TransportKind.XRAY_XHTTP) TransportFailureKind.RELAY_DATA_PLANE_LOST else null,
+            ),
+        )
     }
 }

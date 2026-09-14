@@ -1,7 +1,10 @@
 package net.pocvpn.client.vpn
 
 /** Non-secret failure fact from the existing transport lifecycle, for diagnostics only. */
-enum class TransportFailureKind { REMOTE_UNCONFIRMED }
+enum class TransportFailureKind {
+    REMOTE_UNCONFIRMED,
+    RELAY_DATA_PLANE_LOST,
+}
 
 /** Observable state of a VpnTransport. Transport-agnostic - no AWG-specific detail here. */
 sealed class TransportState {

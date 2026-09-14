@@ -21,7 +21,11 @@ class CdnXhttpDiagnosticMappingTest {
             mapRelayFailureForPath(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP))
         assertEquals(DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE,
             mapTransportFailureForPath(TransportFailureKind.REMOTE_UNCONFIRMED, PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP))
+        assertEquals(DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE,
+            mapTransportFailureForPath(TransportFailureKind.RELAY_DATA_PLANE_LOST, PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP))
         assertNull(mapTransportFailureForPath(TransportFailureKind.REMOTE_UNCONFIRMED, PathKind.DIRECT, TransportKind.XRAY_REALITY))
+        assertNull(mapTransportFailureForPath(TransportFailureKind.RELAY_DATA_PLANE_LOST, PathKind.CHAIN_DIRECT, TransportKind.XRAY_REALITY))
+        assertNull(mapTransportFailureForPath(TransportFailureKind.RELAY_DATA_PLANE_LOST, PathKind.CHAIN_CDN, TransportKind.TLS_TCP))
         assertNull(mapTransportFailureForPath(null, PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP))
     }
 
