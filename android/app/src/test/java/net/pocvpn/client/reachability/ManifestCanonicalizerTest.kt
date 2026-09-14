@@ -82,6 +82,14 @@ class ManifestCanonicalizerTest {
         assertEquals(changed, ManifestCanonicalizer.decode(ManifestCanonicalizer.canonicalBytes(changed)))
     }
 
+    @Test
+    fun `operational disable state is covered by existing canonical signed payload`() {
+        val active = sampleManifest()
+        val disabled = active.copy(endpoints = active.endpoints.map { it.withOperationalState(EndpointOperationalState.DISABLED) })
+        org.junit.Assert.assertFalse(ManifestCanonicalizer.canonicalBytes(active).contentEquals(ManifestCanonicalizer.canonicalBytes(disabled)))
+        assertEquals(disabled, ManifestCanonicalizer.decode(ManifestCanonicalizer.canonicalBytes(disabled)))
+    }
+
     // --- Decode-ambiguity regression tests: hand-crafted bytes a real signer
     // would never legitimately produce (Kotlin's Set/Map types make these
     // shapes unconstructable), but which a corrupted/malicious byte stream

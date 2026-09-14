@@ -26,6 +26,7 @@ data class EndpointManifest(
         require(distinctIds.size == distinctIds.toSet().size) { "EndpointManifest contains a duplicate EndpointId" }
         val ids = distinctIds.toSet()
         endpoints.forEach { e ->
+            e.operationalState()
             e.relayTo?.let { require(it in ids) { "EndpointDescriptor ${e.id.value} relays to unknown endpoint ${it.value}" } }
         }
     }

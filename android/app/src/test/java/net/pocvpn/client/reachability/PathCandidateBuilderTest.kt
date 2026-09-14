@@ -60,6 +60,14 @@ class PathCandidateBuilderTest {
     }
 
     @Test
+    fun `disabled endpoint cannot produce direct or relayed candidates`() {
+        val disabledGateway = gateway.withOperationalState(EndpointOperationalState.DISABLED)
+        assertEquals(null, PathCandidateBuilder.buildDirect(disabledGateway, TransportKind.AMNEZIA_WG, reach(disabledGateway.id, TransportKind.AMNEZIA_WG)))
+        val disabledIngress = ingress.withOperationalState(EndpointOperationalState.DISABLED)
+        assertEquals(null, PathCandidateBuilder.buildRelayed(disabledIngress, exit, TransportKind.TLS_TCP, TransportKind.AMNEZIA_WG, reach(disabledIngress.id, TransportKind.TLS_TCP), reach(exit.id, TransportKind.AMNEZIA_WG)))
+    }
+
+    @Test
     fun `buildRelayed produces an INGRESS then EXIT chain when the manifest names that relationship`() {
         val candidate = PathCandidateBuilder.buildRelayed(
             ingress, exit, TransportKind.TLS_TCP, TransportKind.AMNEZIA_WG,

@@ -47,8 +47,12 @@ enum class EndpointRole {
  */
 enum class IngressKind { DIRECT_IP, CDN_FRONTED }
 
+/** Signed topology state. Missing state is legacy ACTIVE for pre-B44 manifests. */
+enum class EndpointOperationalState { ACTIVE, DISABLED, RETIRED }
+
 /** B23 - the reserved [EndpointTransportBinding.metadata] key [ingressKind]/[withIngressKind] read/write - never touched directly by callers. */
 private const val INGRESS_KIND_METADATA_KEY = "ingressKind"
+private const val OPERATIONAL_STATE_METADATA_KEY = "endpointOperationalState"
 private const val FAILURE_DOMAIN_OPERATOR_KEY = "failureDomain.operator"
 private const val FAILURE_DOMAIN_NETWORK_KEY = "failureDomain.network"
 private const val FAILURE_DOMAIN_REGION_KEY = "failureDomain.region"
@@ -118,6 +122,20 @@ fun EndpointTransportBinding.ingressKind(): IngressKind? =
 /** B23 - returns a copy of this binding with [kind] recorded as its [IngressKind] (see [ingressKind]'s own docs). */
 fun EndpointTransportBinding.withIngressKind(kind: IngressKind): EndpointTransportBinding =
     copy(metadata = metadata + (INGRESS_KIND_METADATA_KEY to kind.name))
+
+fun EndpointDescriptor.operationalState(): EndpointOperationalState {
+    val declared = transports.mapNotNull { it.metadata[OPERATIONAL_STATE_METADATA_KEY] }.toSet()
+    if (declared.isEmpty()) return EndpointOperationalState.ACTIVE
+    require(declared.size == 1) { "conflicting endpoint operational states" }
+    return EndpointOperationalState.entries.firstOrNull { it.name == declared.single() }
+        ?: throw IllegalArgumentException("unsupported endpoint operational state")
+}
+
+fun EndpointDescriptor.isOperationallyActive(): Boolean = operationalState() == EndpointOperationalState.ACTIVE
+
+/** Stores the state in signed binding metadata so legacy canonical bytes remain unchanged. */
+fun EndpointDescriptor.withOperationalState(state: EndpointOperationalState): EndpointDescriptor =
+    copy(transports = transports.map { it.copy(metadata = it.metadata + (OPERATIONAL_STATE_METADATA_KEY to state.name)) })
 
 fun EndpointTransportBinding.failureDomains(): InfrastructureFailureDomains {
     fun domain(key: String): FailureDomainId? = metadata[key]?.let { raw -> runCatching { FailureDomainId(raw) }.getOrNull() }

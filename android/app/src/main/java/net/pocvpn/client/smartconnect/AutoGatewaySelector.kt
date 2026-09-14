@@ -16,6 +16,7 @@ import net.pocvpn.client.reachability.CdnClientCompatibility
 import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
 import net.pocvpn.client.reachability.cdnClientCompatibility
 import net.pocvpn.client.reachability.ingressKind
+import net.pocvpn.client.reachability.isOperationallyActive
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportHealth
 import net.pocvpn.client.transport.TransportHealthState
@@ -411,8 +412,10 @@ object AutoGatewaySelector {
         )
         val prepared = mutableListOf<PreparedRelayed>()
         manifestEndpoints.sortedBy { it.id.value }.forEach { ingress ->
+            if (!ingress.isOperationallyActive()) return@forEach
             if (EndpointRole.INGRESS !in ingress.roles) return@forEach
             val exit = ingress.relayTo?.let { byId[it] } ?: return@forEach
+            if (!exit.isOperationallyActive()) return@forEach
             val registry = registryFor(ingress.id)
             ingress.transports.sortedBy { it.kind.ordinal }
                 .filter { pinnedKind == null || it.kind == pinnedKind }

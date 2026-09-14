@@ -27,6 +27,28 @@ class EndpointTest {
     }
 
     @Test
+    fun `missing operational state is legacy active and signed disabled state is not active`() {
+        val active = EndpointDescriptor(EndpointId("e1"), setOf(EndpointRole.GATEWAY), "eu", "acme", transports = listOf(binding()))
+        val disabled = active.withOperationalState(EndpointOperationalState.DISABLED)
+        assertEquals(EndpointOperationalState.ACTIVE, active.operationalState())
+        assertFalse(disabled.isOperationallyActive())
+    }
+
+    @Test
+    fun `unknown or conflicting operational state fails closed`() {
+        val unknown = EndpointDescriptor(EndpointId("e1"), setOf(EndpointRole.GATEWAY), "eu", "acme", transports = listOf(binding().copy(metadata = mapOf("endpointOperationalState" to "FUTURE"))))
+        assertThrows(IllegalArgumentException::class.java) { unknown.operationalState() }
+        val conflicting = EndpointDescriptor(
+            EndpointId("e1"), setOf(EndpointRole.GATEWAY), "eu", "acme",
+            transports = listOf(
+                binding(TransportKind.AMNEZIA_WG).copy(metadata = mapOf("endpointOperationalState" to "ACTIVE")),
+                binding(TransportKind.TLS_TCP).copy(metadata = mapOf("endpointOperationalState" to "DISABLED")),
+            ),
+        )
+        assertThrows(IllegalArgumentException::class.java) { conflicting.operationalState() }
+    }
+
+    @Test
     fun `malformed endpoint - no roles - is rejected`() {
         assertThrows(IllegalArgumentException::class.java) {
             EndpointDescriptor(EndpointId("e1"), emptySet(), "eu", "acme", transports = listOf(binding()))
