@@ -27,7 +27,7 @@ import net.pocvpn.client.transport.TransportStatus
  *         - latencyPenalty (capped at 50)  (small - measured latency only)
  *         - recentFailurePenalty (capped at 80, summed across hops)
  *         - cooldownPenalty (capped at 60) (B19 - bounded, time-decaying, this-network failure streak)
- *         + diversityBonus (capped at 5)   (smallest - provider/ASN spread)
+ *         + diversityBonus (capped at 5)   (smallest - signed failure-domain spread)
  *
  * Each tier's weight is strictly larger than the sum of EVERY weight below
  * it, verified per tier (not just eyeballed) against each factor's actual

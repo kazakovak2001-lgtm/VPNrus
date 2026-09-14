@@ -8,6 +8,7 @@ import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.IngressKind
 import net.pocvpn.client.reachability.PathCandidate
 import net.pocvpn.client.reachability.PathCandidateBuilder
+import net.pocvpn.client.reachability.PathDiversity
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
 import net.pocvpn.client.reachability.ReachabilityState
@@ -154,7 +155,6 @@ object AutoGatewaySelector {
             val capabilities: TransportCapabilities,
             val transportHealth: TransportHealth,
             val history: PathHistoryEntry?,
-            val diversityKey: String,
         )
 
         val prepared = mutableListOf<Prepared>()
@@ -176,35 +176,19 @@ object AutoGatewaySelector {
             if (availableTransports.isEmpty()) return@forEach
             val endpoint = manifestEndpoint.copy(transports = availableTransports)
             val registry = registryFor(gateway.endpointId)
-            // B19 - the manifest's OWN provider/ASN (never the catalog's,
-            // and never a fabricated preference) - prefers ASN when the
-            // manifest names one (a strictly finer-grained signal than
-            // provider name alone), falling back to provider.
-            val diversityKey = endpoint.asn?.toString() ?: endpoint.provider
             endpoint.transports
                 .filter { pinnedKind == null || it.kind == pinnedKind }
                 .forEach { binding ->
                     val kind = binding.kind
                     val candidate = PathCandidateBuilder.buildDirect(endpoint, kind, reachabilityFor(gateway.endpointId, kind)) ?: return@forEach
                     val capabilities = registry.descriptorFor(kind)?.capabilities ?: TransportCapabilities.notImplemented()
-                    prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(candidate.historyPathId, kind), diversityKey)
+                    prepared += Prepared(gateway, binding, candidate, registry, capabilities, transportHealthFor(kind), historyFor(candidate.historyPathId, kind))
                 }
         }
 
-        // B19 - "troubled" providers/ASNs: ones this same batch already has
-        // fresh negative evidence for (degraded/unreachable transport
-        // health, a degraded/unreachable reachability read, or an active
-        // this-network failure streak). A candidate whose OWN provider/ASN
-        // is troubled never gets its own bonus (diversifying AWAY FROM
-        // yourself makes no sense); a candidate on a clean provider/ASN gets
-        // the bonus only when a genuinely troubled alternative exists
-        // elsewhere in this batch - never an identical bonus handed to
-        // every candidate regardless of the batch's actual composition.
-        val troubledDiversityKeys = prepared.filter { p ->
-            p.transportHealth.state == TransportHealthState.DEGRADED || p.transportHealth.state == TransportHealthState.UNREACHABLE ||
-                p.candidate.hops.any { it.reachability.state == ReachabilityState.DEGRADED || it.reachability.state == ReachabilityState.UNREACHABLE } ||
-                (p.history?.consecutiveFailures ?: 0) > 0
-        }.map { it.diversityKey }.toSet()
+        // B38: generic, signed failure-domain correlation is a final bounded
+        // tie-break only. Unknown/legacy metadata earns no preference.
+        val diversityPreferredIds = PathDiversity.independentlyDiverseCandidateIds(prepared.map { it.candidate })
 
         // Keyed by PathCandidate.Direct.id ("direct:<transport>:<endpointId>") -
         // already unique per (gateway, transport) pair, so this survives
@@ -216,7 +200,7 @@ object AutoGatewaySelector {
         // (see snapshotFor's own docs - the B17-2 runtime-authority fix).
         val scoredByCandidateId = LinkedHashMap<String, Triple<ProductionGatewayDescriptor, EndpointTransportBinding, PathScorer.PathScoreResult>>()
         prepared.forEach { p ->
-            val diverse = troubledDiversityKeys.isNotEmpty() && p.diversityKey !in troubledDiversityKeys
+            val diverse = p.candidate.id in diversityPreferredIds
             val result = PathScorer.score(
                 candidate = p.candidate,
                 registry = p.registry,
@@ -415,7 +399,14 @@ object AutoGatewaySelector {
         val byId = manifestEndpoints.associateBy { it.id }
         val pinnedKind = (preference as? UserTransportPreference.Manual)?.kind
 
-        val scored = mutableListOf<Pair<PathScorer.PathScoreResult, PathCandidate.Relayed>>()
+        data class PreparedRelayed(
+            val candidate: PathCandidate.Relayed,
+            val registry: TransportRegistry,
+            val capabilities: TransportCapabilities,
+            val health: TransportHealth,
+            val history: PathHistoryEntry?,
+        )
+        val prepared = mutableListOf<PreparedRelayed>()
         manifestEndpoints.forEach { ingress ->
             if (EndpointRole.INGRESS !in ingress.roles) return@forEach
             val exit = ingress.relayTo?.let { byId[it] } ?: return@forEach
@@ -436,7 +427,7 @@ object AutoGatewaySelector {
                             exitReachability = reachabilityFor(exit.id, exitKind),
                         ) ?: return@forEach
                         val capabilities = registry.descriptorFor(ingressKind)?.capabilities ?: TransportCapabilities.notImplemented()
-                        val result = PathScorer.score(
+                        prepared += PreparedRelayed(
                             candidate = candidate,
                             registry = registry,
                             capabilities = capabilities,
@@ -445,21 +436,18 @@ object AutoGatewaySelector {
                             // client never dials the exit directly, so there is no local
                             // TransportRegistry/TransportHealth entry for exitTransport to
                             // score against.
-                            transportHealth = transportHealthFor(ingressKind),
+                            health = transportHealthFor(ingressKind),
                             history = historyFor(candidate.historyPathId, ingressKind),
-                            // B23 - no per-candidate diversity reference exists here either,
-                            // same deliberate omission [MainViewModel.reachabilityDiagnostics]
-                            // already documents for the identical reason (PathScorer's own
-                            // parameter stays real/tested - see PathScorerTest - only this
-                            // call site has nothing meaningful to diff against yet).
-                            diverseProviderOrAsnSeenElsewhere = false,
-                            nowEpochMillis = nowEpochMillis,
                         )
-                        if (result.eligible) scored += result to candidate
                     }
                 }
         }
 
+        val diversityPreferredIds = PathDiversity.independentlyDiverseCandidateIds(prepared.map { it.candidate })
+        val scored = prepared.map { p ->
+            PathScorer.score(p.candidate, p.registry, p.capabilities, p.health, p.history,
+                diverseProviderOrAsnSeenElsewhere = p.candidate.id in diversityPreferredIds, nowEpochMillis = nowEpochMillis) to p.candidate
+        }.filter { it.first.eligible }
         return PathScorer.rank(scored.map { it.first }).mapNotNull { result ->
             val (_, candidate) = scored.first { it.first === result }
             RelayAttemptCandidate(

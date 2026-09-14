@@ -17,8 +17,11 @@ import net.pocvpn.client.reachability.CdnUplinkHttpMethod
 import net.pocvpn.client.reachability.CdnXhttpMode
 import net.pocvpn.client.reachability.CdnXhttpPolicy
 import net.pocvpn.client.reachability.IngressKind
+import net.pocvpn.client.reachability.FailureDomainId
+import net.pocvpn.client.reachability.InfrastructureFailureDomains
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.withIngressKind
+import net.pocvpn.client.reachability.withFailureDomains
 import net.pocvpn.client.reachability.withCdnProviderProfile
 import net.pocvpn.client.reachability.ReachabilityEvidenceSummary
 import net.pocvpn.client.reachability.ReachabilityState
@@ -435,9 +438,9 @@ class AutoGatewaySelectorTest {
     // --- B19: diversity bonus is a real per-candidate signal, never an identical batch-wide bonus ---
 
     @Test
-    fun `a candidate on a clean provider gets the diversity bonus only when a troubled provider exists in the batch`() {
-        // GERMANY (Oracle Cloud) is made UNREACHABLE/DEGRADED - a genuinely troubled provider;
-        // STOCKHOLM (AWS eu-north-1) is clean and should pick up the bonus.
+    fun `legacy provider metadata never creates a diversity bonus`() {
+        // B38 no longer derives routing facts from provider names or ASN.
+        // These legacy manifest fixtures omit signed opaque failure domains.
         val candidates = AutoGatewaySelector.buildCandidates(
             manifestEndpoints = bothManifestEndpoints,
             gatewayFactsFor = { catalogById[it] },
@@ -455,7 +458,21 @@ class AutoGatewaySelectorTest {
             historyFor = { _, _ -> null },
         )
         val stockholm = candidates.first { it.gatewayId == ProductionGatewayId.STOCKHOLM }
-        assertTrue("expected a diversity-bonus reason for the clean provider: ${stockholm.reasons}", stockholm.reasons.any { it.startsWith("diversityBonus") })
+        assertFalse("legacy metadata must not create a diversity bonus: ${stockholm.reasons}", stockholm.reasons.any { it.startsWith("diversityBonus") })
+    }
+
+    @Test
+    fun `opaque binding failure domains activate only the existing bounded Auto tie break`() {
+        fun domains(id: String) = InfrastructureFailureDomains(
+            FailureDomainId("op-$id"), FailureDomainId("net-$id"), FailureDomainId("region-$id"), null, FailureDomainId("control-$id"),
+        )
+        val endpoints = bothManifestEndpoints.mapIndexed { index, endpoint ->
+            endpoint.copy(transports = endpoint.transports.map { it.withFailureDomains(domains("$index")) })
+        }
+        val candidates = buildDefault(manifestEndpoints = endpoints)
+        assertTrue(candidates.all { candidate -> candidate.reasons.any { it.startsWith("diversityBonus") } })
+        // Both paths are otherwise equal, so existing deterministic ordering remains.
+        assertEquals(ProductionGatewayId.GERMANY, candidates.first().gatewayId)
     }
 
     @Test

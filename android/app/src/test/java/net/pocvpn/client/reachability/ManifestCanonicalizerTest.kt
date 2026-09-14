@@ -69,6 +69,19 @@ class ManifestCanonicalizerTest {
         org.junit.Assert.assertFalse(a.contentEquals(b))
     }
 
+    @Test
+    fun `failure domain metadata is covered by existing canonical signed payload`() {
+        val base = sampleManifest()
+        val domains = InfrastructureFailureDomains(
+            FailureDomainId("op-test"), FailureDomainId("net-test"), FailureDomainId("region-test"), null, FailureDomainId("control-test"),
+        )
+        val changed = base.copy(endpoints = base.endpoints.map { endpoint ->
+            endpoint.copy(transports = endpoint.transports.map { it.withFailureDomains(domains) })
+        })
+        org.junit.Assert.assertFalse(ManifestCanonicalizer.canonicalBytes(base).contentEquals(ManifestCanonicalizer.canonicalBytes(changed)))
+        assertEquals(changed, ManifestCanonicalizer.decode(ManifestCanonicalizer.canonicalBytes(changed)))
+    }
+
     // --- Decode-ambiguity regression tests: hand-crafted bytes a real signer
     // would never legitimately produce (Kotlin's Set/Map types make these
     // shapes unconstructable), but which a corrupted/malicious byte stream
