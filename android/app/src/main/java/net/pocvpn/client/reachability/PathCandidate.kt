@@ -131,6 +131,7 @@ object PathCandidateBuilder {
 
     /** Client -> [gateway], directly. Requires [gateway] to hold GATEWAY or EXIT (a lone endpoint acting as both) and support [transport]. */
     fun buildDirect(gateway: EndpointDescriptor, transport: TransportKind, reachability: EndpointReachability): PathCandidate.Direct? {
+        if (!gateway.isOperationallyActive()) return null
         if (EndpointRole.GATEWAY !in gateway.roles && EndpointRole.EXIT !in gateway.roles) return null
         val binding = gateway.bindingFor(transport) ?: return null
         require(reachability.endpointId == gateway.id && reachability.transportKind == transport) {
@@ -159,6 +160,7 @@ object PathCandidateBuilder {
         ingressReachability: EndpointReachability,
         exitReachability: EndpointReachability,
     ): PathCandidate.Relayed? {
+        if (!ingress.isOperationallyActive() || !exit.isOperationallyActive()) return null
         if (EndpointRole.INGRESS !in ingress.roles) return null
         if (EndpointRole.EXIT !in exit.roles && EndpointRole.GATEWAY !in exit.roles) return null
         if (ingress.relayTo != exit.id) return null
