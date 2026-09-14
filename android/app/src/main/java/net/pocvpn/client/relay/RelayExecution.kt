@@ -241,7 +241,21 @@ object NotProvisionedRelayIngressResolver : RelayIngressResolver {
  */
 sealed class RelayProbeResult {
     object Success : RelayProbeResult()
-    data class Failure(val category: RelayFailureCategory, val detail: String? = null) : RelayProbeResult()
+    data class Failure(
+        val category: RelayFailureCategory,
+        val detail: String? = null,
+        val failureKind: RelayProbeFailureKind? = null,
+    ) : RelayProbeResult()
+}
+
+/** Closed facts from the existing out-of-band relay-health HTTPS request. Never describes a CDN hop. */
+enum class RelayProbeFailureKind { DNS_RESOLUTION_FAILED, TLS_HANDSHAKE_FAILED, REQUEST_TIMED_OUT }
+
+internal fun relayProbeFailureKindFor(error: java.io.IOException): RelayProbeFailureKind? = when (error) {
+    is java.net.UnknownHostException -> RelayProbeFailureKind.DNS_RESOLUTION_FAILED
+    is javax.net.ssl.SSLHandshakeException -> RelayProbeFailureKind.TLS_HANDSHAKE_FAILED
+    is java.net.SocketTimeoutException -> RelayProbeFailureKind.REQUEST_TIMED_OUT
+    else -> null
 }
 
 /**
@@ -326,6 +340,7 @@ object NotConfiguredRelayEndToEndProbe : RelayEndToEndProbe {
 class HttpRelayEndToEndProbe(
     private val connectTimeoutMillis: Int = 5_000,
     private val readTimeoutMillis: Int = 5_000,
+    private val openConnection: (java.net.URL) -> java.net.HttpURLConnection = { it.openConnection() as java.net.HttpURLConnection },
 ) : RelayEndToEndProbe {
     override suspend fun probe(plan: RelayedExecutionPlan, profile: IngressClientProfile): RelayProbeResult =
         when (val result = fetch(profile)) {
@@ -364,8 +379,8 @@ class HttpRelayEndToEndProbe(
 
     private sealed class FetchResult {
         data class Success(val body: String) : FetchResult()
-        data class Failure(val category: RelayFailureCategory, val detail: String?) : FetchResult() {
-            val asRelayProbeResult: RelayProbeResult get() = RelayProbeResult.Failure(category, detail)
+        data class Failure(val category: RelayFailureCategory, val detail: String?, val failureKind: RelayProbeFailureKind? = null) : FetchResult() {
+            val asRelayProbeResult: RelayProbeResult get() = RelayProbeResult.Failure(category, detail, failureKind)
         }
     }
 
@@ -377,7 +392,7 @@ class HttpRelayEndToEndProbe(
             if (url.protocol != "https") {
                 return FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, "refusing a non-HTTPS probe URL")
             }
-            val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
+            val connection = openConnection(url).apply {
                 requestMethod = "GET"
                 connectTimeout = connectTimeoutMillis
                 readTimeout = readTimeoutMillis
@@ -395,10 +410,8 @@ class HttpRelayEndToEndProbe(
             } finally {
                 connection.disconnect()
             }
-        } catch (e: java.net.SocketTimeoutException) {
-            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
         } catch (e: java.io.IOException) {
-            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName)
+            FetchResult.Failure(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, e.javaClass.simpleName, relayProbeFailureKindFor(e))
         } catch (e: Exception) {
             FetchResult.Failure(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, e.javaClass.simpleName)
         }

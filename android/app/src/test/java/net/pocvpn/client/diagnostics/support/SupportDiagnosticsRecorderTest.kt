@@ -5,6 +5,7 @@ import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
+import net.pocvpn.client.relay.RelayProbeFailureKind
 import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
@@ -24,6 +25,67 @@ import org.junit.Test
  * (never re-deriving anything itself).
  */
 class SupportDiagnosticsRecorderTest {
+
+    @Test
+    fun `typed out of band probe failures survive generic terminal error and export without raw detail`() {
+        for ((kind, reason) in listOf(
+            RelayProbeFailureKind.DNS_RESOLUTION_FAILED to DiagnosticFailureReason.RELAY_PROBE_DNS_FAILURE,
+            RelayProbeFailureKind.TLS_HANDSHAKE_FAILED to DiagnosticFailureReason.RELAY_PROBE_TLS_FAILURE,
+            RelayProbeFailureKind.REQUEST_TIMED_OUT to DiagnosticFailureReason.RELAY_PROBE_TIMEOUT,
+        )) {
+            val store = InMemoryDiagnosticSessionStore()
+            val recorder = newRecorder(store)
+            recorder.startSession(context())
+            recorder.recordCandidateAttemptStarted(PathKind.CHAIN_DIRECT, TransportKind.XRAY_REALITY)
+            recorder.recordRelayEndToEndProofResult(false, RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, kind)
+            recorder.recordRelayPathFailed(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, kind)
+            recorder.finishFailedFromTransport(VpnError.NoCandidateAvailable, null)
+            val session = store.recent().single()
+            assertEquals(reason, session.failureReason)
+            assertTrue(session.events.any { it.tags.values.contains(reason.name) })
+            val json = buildSupportBundle(listOf(session), "1.0", 1L, 5_000L).toJson()
+            assertTrue(json.contains(reason.name))
+            assertFalse(json.contains("relay.example"))
+        }
+    }
+
+    @Test
+    fun `typed probe facts never become CDN labels and reset with next attempt`() {
+        for ((path, transport, expected) in listOf(
+            Triple(PathKind.DIRECT, TransportKind.AMNEZIA_WG, DiagnosticFailureReason.NO_CANDIDATE),
+            Triple(PathKind.CHAIN_DIRECT, TransportKind.XRAY_REALITY, DiagnosticFailureReason.RELAY_PROBE_DNS_FAILURE),
+            Triple(PathKind.CHAIN_DIRECT, TransportKind.TLS_TCP, DiagnosticFailureReason.RELAY_PROBE_DNS_FAILURE),
+        )) {
+            val store = InMemoryDiagnosticSessionStore()
+            val recorder = newRecorder(store)
+            recorder.startSession(context())
+            recorder.recordCandidateAttemptStarted(path, transport)
+            recorder.recordRelayPathFailed(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, RelayProbeFailureKind.DNS_RESOLUTION_FAILED)
+            recorder.finishFailedFromTransport(VpnError.NoCandidateAvailable, null)
+            assertEquals(expected, store.recent().single().failureReason)
+        }
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP)
+        recorder.recordRelayPathFailed(RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, RelayProbeFailureKind.DNS_RESOLUTION_FAILED)
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG)
+        recorder.finishFailedFromTransport(VpnError.NoCandidateAvailable, null)
+        assertEquals(DiagnosticFailureReason.NO_CANDIDATE, store.recent().single().failureReason)
+    }
+
+    @Test
+    fun `XHTTP observational probe records typed event without overriding native terminal fact`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP)
+        recorder.recordRelayEndToEndProofResult(false, RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE, RelayProbeFailureKind.DNS_RESOLUTION_FAILED)
+        recorder.finishFailedFromTransport(VpnError.HandshakeTimeout, TransportFailureKind.REMOTE_UNCONFIRMED)
+        val session = store.recent().single()
+        assertEquals(DiagnosticFailureReason.DATA_PLANE_PROOF_FAILURE, session.failureReason)
+        assertTrue(session.events.any { it.tags.values.contains(DiagnosticFailureReason.RELAY_PROBE_DNS_FAILURE.name) })
+    }
 
     private fun context(
         raw: RestrictionClass = RestrictionClass.UNKNOWN,

@@ -5,6 +5,7 @@ import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.reachability.ManifestSource
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
+import net.pocvpn.client.relay.RelayProbeFailureKind
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.TransportFailureKind
@@ -64,6 +65,24 @@ fun mapRelayFailureForPath(
     } else {
         mapRelayFailureCategoryToFailureReason(category)
     }
+
+/** A probe's typed IOException subtype is about its own HTTPS request, never the CDN/Xray hop. */
+fun mapRelayProbeFailureForPath(
+    category: RelayFailureCategory,
+    failureKind: RelayProbeFailureKind?,
+    pathKind: PathKind,
+    transportKind: TransportKind?,
+): DiagnosticFailureReason =
+    if ((pathKind == PathKind.CHAIN_CDN || pathKind == PathKind.CHAIN_DIRECT) && transportKind != null &&
+        category == RelayFailureCategory.UPSTREAM_EXIT_UNREACHABLE
+    ) {
+        when (failureKind) {
+            RelayProbeFailureKind.DNS_RESOLUTION_FAILED -> DiagnosticFailureReason.RELAY_PROBE_DNS_FAILURE
+            RelayProbeFailureKind.TLS_HANDSHAKE_FAILED -> DiagnosticFailureReason.RELAY_PROBE_TLS_FAILURE
+            RelayProbeFailureKind.REQUEST_TIMED_OUT -> DiagnosticFailureReason.RELAY_PROBE_TIMEOUT
+            null -> mapRelayFailureForPath(category, pathKind, transportKind)
+        }
+    } else mapRelayFailureForPath(category, pathKind, transportKind)
 
 /** Xray's native, in-tunnel remote confirmation failed after local core start. */
 fun mapTransportFailureForPath(
