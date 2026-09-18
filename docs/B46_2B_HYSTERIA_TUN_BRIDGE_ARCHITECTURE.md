@@ -33,6 +33,33 @@ see the new dedicated Section 10.5, and updated Sections 1, 3, 7, 21, 22,
 preserved by default. No Kotlin state-machine change was needed for this
 pass (the dependency swap invalidates no state-machine invariant).
 
+**THIRD CORRECTION PASS (same day, following a direct license audit of
+PR #89) — the single most consequential correction in this document:**
+every prior pass incorrectly stated `sing-tun` (both the `apernet` and
+`sagernet` forks) is MIT-licensed. **Both are GPL-3.0-or-later**, verified
+directly from each fork's own `LICENSE` file — the earlier error came from
+reading Hysteria2's own top-level `LICENSE.md` (genuinely MIT) and wrongly
+attributing that license to the separate `sing-tun` Go module. This pass:
+(1) corrects every MIT claim about `sing-tun` in this document (Sections
+7, 21); (2) adds a dedicated licensing-audit section (10.6) establishing
+that Nova's repository has no `LICENSE` file and that no owner decision on
+GPL-compatible distribution exists; (3) replaces the prior pass's
+overstated "Android executable cross-build" claim with a REAL, verified
+in-process JNI/AAR artifact — a `gomobile bind`-produced `.aar` whose
+native library was confirmed (via `go tool nm`) to contain 1,344 linked
+`sing-tun` symbols (Section 10.7); (4) audits, with objective binary
+evidence, whether Hysteria2's own child-process executable also links
+GPL-3.0-or-later `sing-tun` code (Section 10.8 — yes, 125 symbols,
+confirmed via `go tool nm` on a freshly built binary); (5) performs a deep
+audit of a credible, all-MIT alternative, `heiher/hev-socks5-tunnel`
+(Section 10.9), including a real successful native Android `.so` build;
+and (6) re-decides the verdict from **ARCHITECTURE READY FOR B46-2P** to
+**TECHNICALLY READY — LICENSING DECISION REQUIRED** (Section "Decision
+gate"), since a technical success on a GPL-3.0-or-later dependency is not
+the same claim as "cleared to ship," and this pass is not positioned to
+make that licensing call. No repository license was added or changed by
+this pass — that is an owner decision.
+
 **Status of this document: ARCHITECTURE ONLY, with a real host-side synthetic
 proof. No physical Android device was available in this environment. No
 production code, `TransportKind`, or wiring into `TransportRegistry`/
@@ -115,11 +142,28 @@ vanishes — confirmed on both dependencies audited. All now written into
 this document and the proof program's own comments so B46-2P does not
 rediscover them the hard way.
 
-**Verdict: ARCHITECTURE READY FOR B46-2P** (see Section "Decision gate" —
-re-decided from scratch in each of this document's correction passes
-following direct reviews of PR #89, never preserved by default), scoped
-exactly as narrow as the evidence supports — see "Known unknowns" for what
-is still open and explicitly deferred.
+**A fourth correction pass found the single most consequential error yet:
+both `sing-tun` forks this document evaluated are GPL-3.0-or-later, not
+MIT as earlier passes incorrectly stated** (a direct read of each
+`LICENSE` file, not carried over from an unverified assumption) — and this
+pass proved, with a real `gomobile bind`-produced Android AAR containing
+1,344 linked `sing-tun` symbols, that the selected architecture genuinely
+links this GPL code in-process into Nova's own `VpnService`. Nova's
+repository carries no `LICENSE` file establishing a compatible
+distribution policy, and no such policy decision has been made — an
+engineering pass cannot make that decision.
+
+**Verdict: TECHNICALLY READY — LICENSING DECISION REQUIRED** (see Section
+"Decision gate" — re-decided from scratch in each of this document's
+correction passes following direct reviews of PR #89, never preserved by
+default). The `sing-tun`-based bridge is technically sound (deterministic
+fd ownership, real TCP+UDP round trip, race-clean, a real in-process
+JNI/AAR artifact built and verified) but gated on an explicit owner
+licensing decision before any release-track physical integration. A
+credible, deeply-audited, all-MIT alternative (`heiher/hev-socks5-tunnel`)
+exists and could independently reach a clean "ready" verdict without that
+decision — its own live round-trip proof is the recommended next step. See
+"Known unknowns" for what is still open and explicitly deferred.
 
 ## 2. Repository baseline / re-audit scope
 
@@ -243,10 +287,17 @@ VpnService TUN fd -> sing-tun Options.FileDescriptor -> sing-tun "system" stack
   Go code, built the same way the pinned `hysteria` binary already is
   (Section 3), so no NEW packaging research is required.
 - **Maintenance/supply-chain burden**: Nova depends on ONE additional Go
-  module (`apernet/sing-tun`, MIT-licensed, already a transitive dependency
-  Hysteria2 itself pulls and already audited for buildability by B46-2A) —
-  strictly smaller than option B's fork burden, and no new third-party
-  runtime is introduced (unlike option C).
+  module (`apernet/sing-tun`, already a transitive dependency Hysteria2
+  itself pulls and already audited for buildability by B46-2A) — strictly
+  smaller than option B's fork burden, and no new third-party runtime is
+  introduced (unlike option C). **License correction (fourth correction
+  pass, licensing audit): `apernet/sing-tun`'s own `LICENSE` file, read
+  directly, is GNU General Public License v3 "or (at your option) any
+  later version" — NOT MIT.** An earlier pass of this document incorrectly
+  stated MIT here, conflating Hysteria2's OWN top-level `LICENSE.md` (which
+  genuinely is MIT) with `sing-tun`'s separate, independent `LICENSE` file.
+  See the dedicated "sing-tun / bridge-dependency licensing audit" section
+  for the full correction and its consequences.
 - **Performance overhead**: one additional userspace hop (TUN -> sing-tun ->
   local SOCKS5 -> Hysteria2) versus option B's direct handoff — real but
   bounded, not measured in this pass (no physical device, see "Known
@@ -397,9 +448,14 @@ code):
   — the same program (or a close variant) can be re-run in CI on any Linux
   host with `CAP_NET_ADMIN`, unlike Option B which would need either a
   patched-and-rebuilt Hysteria2 binary or an Android device to exercise.
-- **Supply-chain risk**: one additional, already-vetted (by B46-2A's own
-  build/provenance work), MIT-licensed dependency; no new third-party
-  runtime (unlike Option C).
+- **Supply-chain risk**: one additional, already-vetted-for-buildability (by
+  B46-2A's own work) dependency; no new third-party runtime (unlike Option
+  C). **This bullet no longer says "MIT-licensed" — corrected: the
+  dependency is GPL-3.0-or-later (see the dedicated licensing-audit section
+  below). Supply-chain risk here is therefore not just build/version risk
+  but a real licensing-architecture question, addressed on its own terms
+  in that section rather than folded into this bullet's original,
+  incorrect framing.**
 - **Future upgrade cost**: bounded to tracking `sing-tun`'s own release
   cadence (narrower and slower-moving than the whole Hysteria2 app tree),
   not to maintaining a patch against Hysteria2 itself.
@@ -892,23 +948,271 @@ fully documented; and the larger dependency graph does not translate into a
 larger Android build artifact (confirmed, not assumed) because of Go's own
 build-tag exclusion for the linux-only/`with_gvisor`-gated code paths.
 
-**Android arm64 build feasibility for the selected dependency, confirmed
-directly (compile-only, no physical device claim)**: `GOOS=android
-GOARCH=arm64 CGO_ENABLED=0 go build` on this exact proof program (importing
-`github.com/sagernet/sing-tun` at the pinned commit) succeeds cleanly, no
-NDK, no `-checklinkname` workaround, no `wlynxg/anet`-style dependency at
-all (confirmed absent from this dependency's own `go.sum` — that dependency
-was specific to Hysteria2's OWN module, not to `sing-tun` itself). The
-resulting binary is a real ELF `ARM aarch64` `pie executable` targeting
-`/system/bin/linker64`, `go1.25.0`-stamped. This is stronger, easier
-Android build-level feasibility evidence than B46-2A had to establish for
-Hysteria2's own binary (which needed NDK/`CGO_ENABLED=1`/a linkname
-workaround) — a genuinely encouraging, if narrow, data point for the
-bridge's own eventual `gomobile bind` packaging (not attempted in this
-pass; the exported-surface/JNI-binding design remains B46-2P work, per
-Section 13's own scope).
+**Android build feasibility — corrected scope (fourth correction pass).**
+An earlier pass of this document ran `GOOS=android GOARCH=arm64
+CGO_ENABLED=0 go build` on the proof program and presented the resulting
+executable as evidence "for the bridge's own eventual `gomobile bind`
+packaging." **That conflated two different things: it proves the Go code
+can cross-compile to `android/arm64` as a standalone EXECUTABLE — it does
+NOT prove the actual selected architecture's real boundary
+(`Kotlin/VpnService -> JNI/gomobile -> in-process Go bridge`).** No
+`gomobile bind`, Android AAR, or JNI shared library was actually built in
+that pass. This is corrected in the dedicated "in-process JNI/AAR binding"
+section below, which reports what WAS actually built and proven for the
+real boundary — a materially stronger and narrower-scoped result than the
+executable cross-build alone ever established.
 
-## 11. DNS model (design only)
+## 10.6. sing-tun / bridge-dependency licensing audit (fourth correction pass — load-bearing)
+
+**A direct review of PR #89 checked the actual `LICENSE` files of both
+`sing-tun` forks this document discusses, rather than trusting the earlier
+passes' unverified "MIT" claims. Both are wrong as previously stated.**
+
+**Verified directly, this pass, by reading the files themselves:**
+
+- `github.com/apernet/sing-tun` (Hysteria2's own pin, commit
+  `299f04629986`) — `LICENSE` file: **GNU General Public License, version
+  3, "or (at your option) any later version"** (GPL-3.0-or-later),
+  copyright "nekohasekai". NOT MIT.
+- `github.com/sagernet/sing-tun` (the Nova bridge's own pin, commit
+  `fbc0c3dff312e91f512756ad843af74dd209577c`) — identical `LICENSE` file
+  text, same GPL-3.0-or-later, same copyright holder. NOT MIT. (Unsurprising
+  once found: the `apernet` repository is a fork of `SagerNet/sing-tun`,
+  and evidently kept the same `LICENSE` file verbatim across the fork.)
+
+**Root cause of the earlier error, stated plainly**: earlier passes of this
+document read Hysteria2's own top-level `LICENSE.md` (genuinely MIT,
+"Copyright 2023 Toby") and incorrectly attributed that license to the
+SEPARATE `sing-tun` Go module Hysteria2 depends on, without opening
+`sing-tun`'s own `LICENSE` file. This was a real documentation error, not a
+minor imprecision — it materially misstated the licensing architecture this
+whole design rests on, and is corrected here in full rather than patched
+inline.
+
+### VPNrus repository license state (verified directly)
+
+The Nova VPN (VPNrus) repository has **no root `LICENSE` file** (checked
+directly: `ls`/`find` at the repository root return nothing matching
+`LICENSE*`). This means:
+
+- **Do NOT assume** the application is intentionally structured for
+  GPL-compatible distribution.
+- **Do NOT conclude** that in-process linking of GPL-3.0-or-later code into
+  Nova's `VpnService` process is legally acceptable — that is a real,
+  substantive question this engineering audit is not positioned to answer.
+- **Do NOT conclude the opposite** either — that it is categorically
+  impossible. Whether and how GPL-3.0 copyleft obligations apply to an
+  Android app that dynamically loads a JNI `.so` built from GPL-3.0
+  sources, versus one that merely bundles it as a separate executable, is a
+  real question with real nuance (dynamic linking, "mere aggregation," the
+  GPL's own "derivative work" boundary) that competent legal counsel, not
+  an engineering pass, must resolve for Nova's specific distribution model.
+- This is recorded as an **explicit product-licensing gap requiring an
+  owner decision**, not resolved, not worked around, and not defaulted in
+  either direction by this pass.
+
+### Why the in-process boundary makes this MORE material, not less
+
+Section 13 pinned the Nova bridge to run **in-process, via JNI**, inside
+the same `VpnService` process/APK component Nova ships. This is a
+materially different distribution shape from shipping Hysteria2 as an
+independent child-process executable communicating over a socket — the
+in-process bridge's compiled code (a `.so` built from GPL-3.0-or-later
+Go source, confirmed in the next section to actually link `sing-tun`
+symbols) is loaded directly into, and executes within, the same process
+Nova's own application code runs in. This is exactly the shape of
+integration GPL-3.0's copyleft terms are most commonly read to reach most
+strongly (as opposed to separate executables communicating via IPC, which
+is the shape Hysteria2's own child-process relationship already has, and
+where GPL's reach is more commonly argued to be weaker, though still not
+uncontested). **This document does not resolve that legal question** — it
+states the fact (in-process linking of GPL-3.0-or-later code is the
+current selected shape) so the owner's licensing decision is made with the
+right architectural fact in hand, not a wrong one.
+
+## 10.7. In-process JNI/AAR binding — actually built and verified (not merely argued)
+
+**Corrects the earlier pass's overstated Android-build claim (Section
+10.5's own correction note above).** This pass built and verified the
+REAL boundary: `Kotlin/VpnService -> JNI (gomobile-produced .aar) ->
+in-process Go bridge (linking `sagernet/sing-tun`)`.
+
+**Toolchain required, stated accurately**: `gomobile bind` requires a real
+Android SDK (platform + build-tools, for `aapt`/Java stub generation) AND
+an Android NDK (for the native `.so` cross-compile) — NOT merely a Go
+toolchain. Neither was present in this environment at the start of this
+pass (confirmed: `gomobile bind` failed immediately with `could not locate
+Android SDK`). Both were installed for this pass specifically to produce
+real evidence rather than assume the result: Android commandline-tools
+(`commandlinetools-linux-11076708`), platform `android-34`, build-tools
+`34.0.0`, and NDK `26.1.10909125` — all via Google's own `sdkmanager`,
+standard, publicly documented components, not an unofficial mirror.
+
+**A minimal gomobile-safe wrapper package was written** (`bridge.go`, not
+committed to the repository — this was a throwaway feasibility check, per
+the task's own "do not implement the full Android bridge yet" scope),
+exposing ONLY primitive-typed functions across the boundary
+(`StartBridge(fd int, mtu int, inet4Address string) (handle int, err
+error)`, `StopBridge(handle int) error`) — no `sing-tun` type (`Options`,
+`Handler`, `Stack`, etc.) crosses the exported surface directly, per the
+review's explicit requirement, since gomobile cannot export Go interfaces
+with unexported methods or arbitrary structs across the Java boundary.
+Internally, `StartBridge` DOES construct real `sing-tun` objects
+(`tun.Options`, `tun.New`, `tun.NewStack("system", ...)`) — proving
+gomobile can bind a package that genuinely depends on `sing-tun`, not
+merely an empty stub that would prove nothing about the real dependency.
+
+**Result, run twice for different scope, both real successes**:
+
+1. Empty-stub wrapper (no `sing-tun` import): `gomobile bind -androidapi 26
+   -target=android/arm64 -o bridge.aar ./bridge` succeeded, producing a
+   real `.aar` (`AndroidManifest.xml`, `classes.jar`, `R.txt`,
+   `jni/arm64-v8a/libgojni.so`).
+2. The SAME wrapper, with `StartBridge` actually calling
+   `sagernet/sing-tun`'s real `Options`/`New`/`NewStack` APIs internally:
+   the SAME `gomobile bind` command succeeded again, producing a LARGER
+   `.aar` (`libgojni.so` grew from ~2.7MB to ~8.8MB, consistent with
+   `sing-tun`'s own weight). **Verified objectively, not assumed**: `go tool
+   nm` on the extracted `jni/arm64-v8a/libgojni.so` finds **1,344 symbols**
+   from `sagernet/sing-tun` actually linked into this real, JNI-loadable,
+   `ARM aarch64` shared object targeting API 26 — the exact library Nova's
+   `VpnService` process would `System.loadLibrary()` in this architecture.
+
+**This is a real, verified, in-process JNI/AAR artifact — not a claim
+inferred from the earlier executable cross-build.** It directly answers
+the review's requirement ("prove actual in-process Android binding
+feasibility, not merely an Android executable build") with actual
+evidence rather than a narrower proxy. It does NOT prove: production
+packaging correctness (ProGuard/R8 interaction, `useLegacyPackaging`
+behavior for this specific `.so`, physical-device loading), a real
+`StartBridge`/`StopBridge` implementation with correct fd-ownership/error
+handling wired to the real `dup()`/`detachFd()` model (this wrapper is a
+feasibility stub, not the real bridge), or anything about the licensing
+question the previous section raises — a technically successful build
+does not resolve whether shipping it is a licensing decision Nova is
+ready to make.
+
+## 10.8. Hysteria2 child-binary dependency/license audit
+
+**A separate, real question from the Nova bridge's own dependency**:
+does the actual Hysteria2 client EXECUTABLE Nova intends to package (as a
+separate child process, Section 13) itself contain the GPL-3.0-or-later
+`apernet/sing-tun` code, given that `app/cmd/client.go` imports
+`internal/tun`, which imports `apernet/sing-tun` (Section 4)?
+
+**Verified with objective binary evidence, not assumed from `go.mod`
+alone**, per the review's explicit instruction: the actual pinned
+Hysteria2 `app/v2.12.3` client binary (commit
+`e1366b173ccf5706e1e4630fe8aa654a4b574085`) was built fresh in this pass
+(host build, for evidence purposes — not the Android cross-build), and
+`go tool nm` was run against the real resulting executable:
+
+```
+$ go tool nm hysteria | grep -c "apernet/sing-tun"
+125
+```
+
+**125 real symbols from `apernet/sing-tun`** (`NativeTun.Close`,
+`.BatchRead`, `.BatchWrite`, `.Read`, `.Write`, etc.) are objectively
+present, statically linked, in the actual compiled `hysteria` client
+binary. This is not merely "listed in `go.mod`" — these are functions the
+Go linker determined are REACHABLE from `main()` and therefore compiled
+into the final executable.
+
+**Why this is reachable regardless of runtime configuration, verified by
+reading the call graph, not assumed**: `app/cmd/client.go`'s `runClient`
+dispatches to `clientTUN(...)` via a plain runtime `if config.TUN != nil`
+branch (line 917/1152 of that file) — there is NO build tag gating this
+import or this function. Go's linker performs dead-code elimination based
+on whether a function is reachable from `main` through the STATIC call
+graph, not on whether a particular config value is ever set at runtime —
+`clientTUN` is reachable (it is called from a function `main` itself
+transitively reaches via cobra command wiring) regardless of whether any
+real deployment ever configures `tun:` in its YAML. **This means Nova's
+planned Hysteria2 child-process binary, exactly as it would ship (running
+only the SOCKS5 listener, never enabling the `tun:` config block), still
+contains linked GPL-3.0-or-later object code from `apernet/sing-tun`.**
+
+**Whether a Hysteria2 build limited to Nova's actual needs (SOCKS5/QUIC
+only) can exclude `sing-tun` — investigated, not assumed**: no existing
+build tag, compile-time flag, or `//go:build` constraint in the current
+`app/v2.12.3` source excludes `internal/tun`'s import (confirmed: `grep -rl
+"go:build" cmd/*.go internal/tun/*.go` finds only IPv6-check platform
+files, nothing gating the tun import itself). **The only way to produce a
+Hysteria2 binary without `sing-tun` linked in would be a SOURCE
+modification to Hysteria2 itself** (removing or build-tag-gating the
+`clientTUN`/`internal/tun` import) — which this task explicitly scopes out
+("Do not modify Hysteria yet. This is an audit only."). This is recorded
+as a finding for a future slice to act on if Nova wants a `sing-tun`-free
+Hysteria2 binary, not attempted here.
+
+**Consequence, stated within engineering scope, not as a legal
+conclusion**: the Hysteria2 executable Nova intends to bundle as a child
+process has its own, separate source-distribution obligations arising from
+the GPL-3.0-or-later code linked into it — this is true independent of
+anything about Nova's own bridge design, and independent of whether
+bundling a separate GPL-licensed executable as a child process (rather
+than linking it in-process) carries different copyleft implications for
+Nova's own application than the in-process bridge case does. **This
+document does NOT conclude that these obligations extend to, or exclude,
+the rest of the Nova Android app merely because the executable runs as a
+separate child process** — that determination requires the same competent
+legal review as the in-process case, and is out of scope for this
+engineering audit.
+
+**`FORMAL LICENSE/LEGAL REVIEW REQUIRED BEFORE RELEASE`** — recorded here
+explicitly, covering BOTH the in-process Nova bridge (Section 10.6) and
+the separate Hysteria2 child-process executable (this section), as two
+related but distinct questions the same review should address.
+
+## 10.9. Option L2 audit — `heiher/hev-socks5-tunnel` (MIT, purpose-built TUN→SOCKS5)
+
+Given the licensing finding above, this pass performed the deep audit of
+`heiher/hev-socks5-tunnel` the earlier pass's Option C comparison only
+sketched structurally. Cloned fresh, submodules initialized
+(`git submodule update --init --recursive`), all facts below verified from
+source/build, not from README claims alone.
+
+| Fact | Value |
+|---|---|
+| Exact current commit | `21a784a6702e5f1b1b87c63c38a314234d956e55`, dated 2026-09-17 — titled "Build: Bundle Java JNI binding into android AAR (#331)", i.e. upstream added Android AAR/JNI packaging within the last day of this audit. |
+| License | MIT (`LICENSE`, read directly — "Copyright (c) 2022 hev"). All four git submodules this project depends on (`hev-task-system`, `yaml`, `lwip` fork, `hev-socks5-core`) were cloned and checked independently: `hev-task-system`/`yaml`/`hev-socks5-core` are MIT (same "Copyright (c) 2022 hev" text); `lwip` (heiher's fork) is BSD-style ("Copyright (c) 2001, 2002 Swedish Institute of Computer Science"). **No GPL code anywhere in this dependency's tree**, verified, not assumed. |
+| External Android TUN-fd support | **Real, first-class, verified at the source level** — `src/hev-jni.c` registers `hev.htproxy.TProxyService.TProxyStartService(String config_path, int fd)` as a JNI native (confirmed: `android/hev/htproxy/TProxyService.java`, shipped inside the project itself); the SAME underlying `hev_socks5_tunnel_main(config_path, tun_fd)` C entry point is used by both the JNI path and (with `tun_fd=-1`, meaning "open my own") the CLI binary. |
+| **Fd ownership semantics — read directly, exactly matching this design's own requirement** | `src/hev-socks5-tunnel.c`'s `tunnel_init(extern_tun_fd)`: `if (extern_tun_fd >= 0) { ...; tun_fd = extern_tun_fd; return 0; }` — sets only `O_NONBLOCK` via `ioctl(fd, FIONBIO, ...)` and otherwise touches nothing else; `tun_fd_local` (the flag controlling whether `tunnel_fini()` ever calls `close()` on the fd) is left `0` in this branch. `tunnel_fini()`'s own guard, read directly: `if (!tun_fd_local) return;` — **an externally-supplied fd is never closed by this library**, by construction, with no Nova-side ownership-split engineering required (unlike `sing-tun`, where Section 8's `dup()`/`detachFd()` design was necessary specifically because `sing-tun`'s own `Close()` DOES close whatever fd it is given). This is a materially SIMPLER, more conservative ownership contract than either `sing-tun` fork's. |
+| TCP support | Yes — `hev-socks5-client-tcp.c`/`hev-socks5-session-tcp.c`, real SOCKS5 CONNECT client logic against the configured upstream. |
+| UDP support | Yes, and explicitly configurable — `conf/main.yml`'s `socks5.udp: 'udp'|'tcp'` selects SOCKS5 UDP-ASSOCIATE-over-UDP or the (RFC-nonstandard but some servers require it) UDP-over-TCP relay mode; `hev-socks5-client-udp.c`/`hev-socks5-session-udp.c` implement it. Not exercised end-to-end in this pass (see "known unknowns" below) but the source-level implementation is real, not aspirational. |
+| IPv4/IPv6 | Both, per `conf/main.yml`'s `tunnel.ipv4`/`tunnel.ipv6` fields and `hev_tunnel_set_ipv4`/`hev_tunnel_set_ipv6` — a real dual-stack path, unlike this document's own Option A design (Section 12), which deliberately scopes to IPv4-only for its first physical spike. |
+| Lifecycle | `hev_socks5_tunnel_init`/`hev_socks5_tunnel_run`/`hev_socks5_tunnel_stop`/`hev_socks5_tunnel_fini` — a plain, synchronous init/run/stop/fini shape, no hidden background threads outside its own cooperative task system (`hev-task-system`, a real coroutine-style scheduler, also audited above). |
+| Android JNI/library build path | **Actually built in this pass, for real**: `ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk APP_ABI=arm64-v8a APP_PLATFORM=android-26` (the SAME NDK installed for the gomobile check above) succeeded cleanly, producing a real `libhev-socks5-tunnel.so` (`ELF 64-bit LSB shared object, ARM aarch64`, confirmed via `file`, with a real exported `JNI_OnLoad` symbol confirmed via `nm -D`). |
+| arm64 buildability | Confirmed directly (above) — real NDK build, real `.so`, no patch needed. |
+| Thread/concurrency model | Cooperative task-based (`hev-task-system`, the same author's own coroutine library, MIT, audited above) — not raw OS-thread-per-connection; not independently race-tested in this pass (no `-race`-equivalent tool exists for C the way `go build -race` does for Go; a real audit would need a C sanitizer build, e.g. ThreadSanitizer, not attempted here — a known unknown, see below). |
+| Also built and confirmed on this host, for context | The plain Linux daemon build (`make`, no NDK) also succeeded cleanly, producing a real `hev-socks5-tunnel` executable — useful for a future host-side round-trip proof (see "known unknowns"), though the CLI binary's own `main()` hardcodes `tun_fd=-1` (always opens its own device by name) — reaching the external-fd path on a host requires calling the library's C API directly (`hev_socks5_tunnel_main(config, fd)`), not the CLI binary as shipped. |
+
+**Known unknown, stated honestly**: a full host-side synthetic proof
+equivalent to Section 10's `sing-tun` proof (real TCP round trip, real UDP
+round trip, deterministic metadata check, through a real duplicated
+external fd, against a real local SOCKS5 target) was **NOT completed in
+this pass** — it would require either a small custom C harness calling
+`hev_socks5_tunnel_main` directly (the CLI binary doesn't expose the
+external-fd argument) or driving the JNI entry point from a JVM, and was
+judged, at this point in an already-extensive audit, better scoped to a
+following pass than rushed. The SOURCE-LEVEL evidence above (external-fd
+semantics, non-owning close behavior, real native build success, clean MIT
+tree) is real and directly verified, but it is evidence of a different,
+narrower kind than Section 10's fully-executed, race-checked round trip —
+this document does not claim otherwise.
+
+## 10.10. Option L3 — `xjasonlyu/tun2socks` (secondary permissive fallback, re-confirmed only)
+
+Per the task's own instruction ("do not implement a full proof unless L2
+fails or evidence makes L3 clearly preferable"), L2's audit above did not
+fail and no evidence surfaced making L3 clearly preferable — so L3 is
+re-confirmed only at the level Section 6 already established (MIT, Go,
+`gVisor`-based, real external-fd support via `core/device/fdbased.open(fd
+int, ...)`, real TCP/UDP/IPv6 support, real Android usage precedent via
+several GUI proxy clients) and not re-audited further or proven in this
+pass. It remains the secondary MIT fallback if L2's own UDP/concurrency
+unknowns (above) turn out to be blocking in a future pass.
 
 - Android's `VpnService.Builder.addDnsServer(...)` determines what DNS
   servers appear to apps inside the tunnel — unchanged by this design;
@@ -1230,7 +1534,7 @@ dependency, not the superseded one.**
 
 | Component | Detail |
 |---|---|
-| `github.com/sagernet/sing-tun` (Nova bridge's own pinned dependency — SELECTED, replacing the superseded `apernet/sing-tun` pin) | Commit `fbc0c3dff312e91f512756ad843af74dd209577c` (resolved pseudo-version `v0.9.4-0.20260917142847-fbc0c3dff312`), pinned exactly in `go.mod`/`go.sum` — never a floating `dev` branch. MIT license (`LICENSE` file, read directly from a fresh clone). Build toolchain: standard Go module resolution via the Go module proxy, content-addressed and immutable per version — no anonymous/unpinned binary download. This is an INDEPENDENT dependency choice from Hysteria2's own `apernet/sing-tun` pin (Section 3) — justified by Section 13's in-process-bridge/separate-child-process boundary, which means the two never need to share a build. |
+| `github.com/sagernet/sing-tun` (Nova bridge's race-clean dependency choice — see the dedicated licensing-audit section for why this is NO LONGER unconditionally "selected") | Commit `fbc0c3dff312e91f512756ad843af74dd209577c` (resolved pseudo-version `v0.9.4-0.20260917142847-fbc0c3dff312`), pinned exactly in `go.mod`/`go.sum` — never a floating `dev` branch. **License, corrected in this pass: GNU General Public License v3 "or (at your option) any later version" (`LICENSE` file, read directly from a fresh clone) — NOT MIT**, a stale claim in an earlier pass of this document. Build toolchain: standard Go module resolution via the Go module proxy, content-addressed and immutable per version — no anonymous/unpinned binary download. This is an INDEPENDENT dependency choice from Hysteria2's own `apernet/sing-tun` pin (Section 3) — the process boundary means the two never need to share a build, but it does NOT mean the license question is avoided: an in-process JNI/AAR bridge genuinely links this GPL-3.0-or-later code into the same binary artifact loaded by Nova's `VpnService` process. |
 | Larger transitive dependency surface than the superseded pin, stated honestly | `sagernet/gvisor`, `sagernet/nftables`, `mdlayher/netlink`, `florianl/go-nfqueue/v2`, `sagernet/fswatch` are now part of the module graph (none needed by the superseded `apernet` pin). Confirmed NOT to inflate the Android build artifact: the gVisor-backed stack is gated behind a `with_gvisor` build tag (not compiled by default, not used here), and the nftables/nfqueue redirect code is gated behind `//go:build linux`, which does not match `GOOS=android` — verified empirically by a successful `GOOS=android GOARCH=arm64 CGO_ENABLED=0` build. This is still a real, larger dependency GRAPH (more modules to track for CVEs/license changes) even where it doesn't inflate the compiled artifact — an honest, not-fully-eliminated cost of the R2 choice. |
 | Hysteria2's OWN `sing-tun` pin (unchanged, untouched, a separate fact) | `github.com/apernet/sing-tun@v0.2.6-0.20250920121535-299f04629986` — still exactly what Hysteria2's own `app/go.mod` pins (Section 3); this pass does not patch, fork, or otherwise touch Hysteria2 or its dependencies, per the task's explicit scope freeze. |
 | Update policy | Track `sagernet/sing-tun`'s own commit history directly (independent of both Hysteria2's release cadence AND the apernet fork's), re-verify `Options.FileDescriptor`/`EXP_ExternalConfiguration`/the `NewConnectionEx`/`NewPacketConnectionEx` contract against any future version bump before adopting it — this dependency's API has already been shown to move (Handler interface, buffer headroom semantics) between the version audited here and whatever version existed before it, so a future bump is not assumed compatible by default. |
@@ -1265,24 +1569,41 @@ linkname workaround.
 
 ## 23. Known unknowns (explicit)
 
-- **Full SOCKS5 UDP ASSOCIATE framing (the hop between the bridge and
-  Hysteria2's own SOCKS5 listener) was not implemented or tested** in this
-  slice's proof — the proof's UDP round trip goes through a controlled
-  local echo target standing in for that listener, not through a real
-  Hysteria2 process. This is real, bounded, well-understood engineering
-  (RFC 1928 Section 7) that B46-2P's concrete bridge implementation must
+- **The product-licensing decision itself is the single largest known
+  unknown** (Section 10.6) — whether Nova can/should ship GPL-3.0-or-later
+  code (either `sing-tun` fork) in-process is an owner decision, not
+  resolved by this pass and not something further engineering evidence
+  alone can resolve.
+- **`hev-socks5-tunnel`'s live TCP/UDP round-trip proof was not
+  completed** (Section 10.9) — real source-level and build-level evidence
+  exists, but the same rigor Section 10 applied to `sing-tun` (real
+  duplicated fd, real round trip, deterministic metadata check) has not
+  yet been applied to this MIT-licensed alternative.
+- **Full SOCKS5 UDP ASSOCIATE framing (the hop between the `sing-tun`
+  bridge and Hysteria2's own SOCKS5 listener) was not implemented or
+  tested** in this slice's proof — the proof's UDP round trip goes through
+  a controlled local echo target standing in for that listener, not
+  through a real Hysteria2 process. This is real, bounded, well-understood
+  engineering (RFC 1928 Section 7) that a future bridge implementation must
   still do; it is not a research gap, but it is also not proven working
-  against a real Hysteria2 SOCKS5 server yet.
+  against a real Hysteria2 SOCKS5 server yet. (`hev-socks5-tunnel` needs no
+  equivalent work — it already speaks SOCKS5 CONNECT/UDP-ASSOCIATE
+  natively, per Section 10.9.)
 - **`ParcelFileDescriptor.dup()`+`detachFd()`'s exact behavior on a real
   Android device is unverified** — Section 8's ownership model is designed
   against Android's own documented API contract and validated on Linux via
   the equivalent `unix.Dup()` call, but no Android runtime was available in
   this environment to exercise the real API.
-- **JNI/native packaging mechanics for the in-process bridge are
-  unresolved** — Section 13 pins the PROCESS BOUNDARY (in-process JNI,
-  matching Xray's own precedent) but the exact `gomobile bind`
-  invocation/`.aar` structure is not yet built or tested, only argued from
-  precedent.
+- **The real in-process JNI/AAR artifact (Section 10.7) is a feasibility
+  stub, not the real bridge** — `StartBridge`/`StopBridge`'s actual
+  fd-ownership/error-handling wiring to the real `dup()`/`detachFd()` model
+  and to a real Handler implementation remains to be built; production
+  packaging correctness (ProGuard/R8, `useLegacyPackaging` for this
+  specific `.so`, physical-device loading) is untested.
+- **`hev-socks5-tunnel`'s C code has not been sanitizer/race-tested** — no
+  ThreadSanitizer-equivalent build was attempted in this pass (Section
+  10.9); its cooperative-task concurrency model was read, not adversarially
+  tested.
 - **Nothing about Android's `VpnService`/SELinux/app-process-exclusion
   behavior was tested** — this slice's proof is entirely a plain-Linux-host
   program; B33's own findings (an app process is excluded from its own VPN
@@ -1330,12 +1651,27 @@ linkname workaround.
 
 ## 25. Explicit next-slice recommendation
 
-**B46-2P: real Android physical feasibility spike**, scoped exactly to step
-1 of Section 24 first (TUN + bridge alone, no Hysteria2 yet) before adding
-Hysteria2's own process/FD-Control complexity — the same "do not skip step
-1" discipline B46-2A already recommended, now backed by a working host-side
-reference implementation of the bridge's core demux logic to port rather
-than design from scratch on-device.
+**Corrected in this pass — B46-2P should NOT start on the `sing-tun` path
+as a release architecture until the owner licensing decision (Section
+10.6) is made.** Two credible next steps, not mutually exclusive:
+
+1. **Recommended first**: a bounded follow-up to THIS slice (B46-2B, not
+   B46-2P) completing `heiher/hev-socks5-tunnel`'s (Section 10.9) live
+   synthetic proof — the same TCP/UDP round-trip rigor Section 10 already
+   applied to `sing-tun` — via a small custom C harness calling
+   `hev_socks5_tunnel_main(config, fd)` directly. If that proof succeeds
+   with the same rigor, it can independently justify verdict A
+   (`ARCHITECTURE READY FOR B46-2P`) on a wholly MIT-licensed path with NO
+   Nova licensing-policy decision required at all.
+2. **Only if the owner explicitly resolves the licensing question in favor
+   of the GPL-3.0-or-later `sing-tun` path**: B46-2P proceeds as originally
+   scoped (step 1 of Section 24 - TUN + bridge alone, no Hysteria2 yet),
+   backed by the real, working host-side proof and the real in-process
+   JNI/AAR artifact this pass already built (Sections 10.5/10.7).
+
+Either way, Hysteria2's own child-process GPL question (Section 10.8) is a
+separate, parallel item the same licensing review should cover before
+release, regardless of which bridge path is chosen.
 
 ## Decision gate
 
@@ -1381,69 +1717,88 @@ before:
   Android-maturity grounds and kept as the documented fallback if `sing-tun`
   itself proves inadequate on a real device.
 
-**Fourth correction (a separate pass, after the above five were already
-fixed): the pinned `apernet/sing-tun` dependency had a real, reproducible
-internal data race** (Section 10/10.5), found only because the race-enabled
-proof from THIS pass's own fixes was actually run. Resolved by re-pinning
-the Nova bridge's OWN `sing-tun` dependency (never Hysteria2's) to current
+**Fourth correction (after the above five were already fixed): the pinned
+`apernet/sing-tun` dependency had a real, reproducible internal data
+race** (Section 10/10.5), found only because the race-enabled proof from
+THIS pass's own fixes was actually run. Resolved by re-pinning the Nova
+bridge's OWN `sing-tun` dependency (never Hysteria2's) to current
 `github.com/sagernet/sing-tun@fbc0c3dff312e91f512756ad843af74dd209577c`,
-which fixes the race structurally upstream (per-session locking, verified
-by reading source) — not by a Nova-owned patch. The proof was fully ported
-to the new API (Handler interface, buffer headroom semantics — Section
-10.5), re-proven TCP+UDP round trip, and is now race-clean under
-`go build -race`, run twice. Android arm64 build-level feasibility was
-additionally confirmed for this exact dependency (`GOOS=android
-GOARCH=arm64 CGO_ENABLED=0`, no NDK needed).
+which fixes the race structurally upstream — not by a Nova-owned patch.
+Re-proven TCP+UDP round trip, race-clean under `go build -race`, run
+twice.
 
-**None of the fixes above changed the underlying technical facts that
-originally justified Option A** — an externally-owned TUN fd's TCP/UDP
-traffic can still be demuxed and forwarded via a `sing-tun`-class library
-(now on a race-clean, more Android-conscious dependency than first proven),
-Hysteria2's SOCKS5 listener is still real and unmodified, and no new
-blocker was discovered that prevents building the physical spike. What
-changed is that the design is now actually SOUND where it previously only
-looked sound — which is what these correction passes exist to verify.
+**Fifth correction (a separate, direct license audit of PR #89): the
+"MIT" license claimed for BOTH `sing-tun` forks throughout this document
+was wrong.** Both `apernet/sing-tun` (Hysteria2's own pin) and
+`sagernet/sing-tun` (the Nova bridge's own pin, selected in the fourth
+correction) are **GPL-3.0-or-later** (Section 10.6, verified directly from
+each `LICENSE` file). This is load-bearing, not cosmetic: the selected
+architecture links this GPL-3.0-or-later code in-process into Nova's own
+`VpnService` (Section 10.7 now proves this really happens — 1,344
+`sing-tun` symbols confirmed linked into a real, working `gomobile
+bind`-produced `.aar`'s native library), and Nova's own repository carries
+no `LICENSE` file establishing a compatible distribution policy. This
+changes the verdict below — a technical success is not the same claim as
+"safe to ship," and this pass does not conflate the two.
 
-**A. ARCHITECTURE READY FOR B46-2P.**
+**A separate MIT-licensed, purpose-built TUN→SOCKS5 alternative
+(`heiher/hev-socks5-tunnel`, Section 10.9) was found and deeply audited in
+this pass** — real external-fd support with even simpler,
+already-correct, non-owning close semantics than `sing-tun` requires; a
+real native `.so` built successfully via the same NDK for `arm64-v8a`/API
+26; a clean, verified all-MIT/BSD dependency tree. Its own live TCP/UDP
+round-trip proof was not completed in this already-extensive pass (a
+genuine, stated known unknown, not a disqualifying failure) — so it cannot
+yet be declared the SELECTED architecture with the same certainty
+`sing-tun`'s fully-executed, race-checked proof carries, but it is a real,
+credible, and per this pass's own evidence probably SIMPLER path (it
+already speaks SOCKS5 natively — Nova would not need to write the
+TCP/UDP-forwarding bridge logic Option A's `sing-tun` design otherwise
+requires) that sidesteps the licensing question entirely.
 
-- Architecture is selected: Option A, `NOVA_SING_TUN_ADAPTER` (Section 7),
-  re-affirmed after a real Option C audit (Section 6).
-- One `sing-tun` dependency strategy is selected and exactly pinned: R2,
-  `github.com/sagernet/sing-tun@fbc0c3dff312e91f512756ad843af74dd209577c`
-  (Section 10.5) — an independent, justified choice from Hysteria2's own
-  pin, made safe by Section 13's process boundary.
-- The external-fd path is still proven, on the selected dependency: `New()`
-  skips its own device-open path when given a duplicated fd, exactly as
-  re-verified in Section 10.5.
-- TCP round trip passes; UDP round trip passes — both re-proven against the
-  selected dependency (Section 10.5), deterministically observed via
-  channel synchronization, never a heuristic.
-- **The race-enabled proof has ZERO races** — confirmed twice in a row
-  against the selected dependency (Section 10.5), a hard requirement this
-  correction pass explicitly could not waive.
-- Android arm64 build feasibility is credible: a real `GOOS=android
-  GOARCH=arm64 CGO_ENABLED=0` build of the exact program importing the
-  selected dependency succeeds, no NDK, no linkname workaround (Section
-  10.5) — stronger evidence than B46-2A needed to establish for Hysteria2's
-  own binary.
-- TUN fd ownership remains deterministic: split via `dup()`+`detachFd()`,
-  no double-close possible by construction (Section 8), unaffected by the
-  dependency swap (the ownership model is a property of this design, not of
-  which `sing-tun` fork implements `Close()`).
-- The process boundary is PINNED, not left open: in-process JNI for the
-  bridge, matching Nova's own existing Xray precedent; Hysteria2 stays a
-  separate child process (Section 13).
-- Bridge and Hysteria2-runtime ownership are correctly separated in the
-  debug state machine, with a direct regression test proving a bridge
-  failure never falsely clears a still-owned runtime pid (Section 14) — no
-  Kotlin state-machine invariant was invalidated by the dependency swap, so
-  no further state-machine change was made in this pass.
-- No unresolved blocker prevents building the physical Android spike: the
-  remaining unknowns (Section 23) are ordinary engineering/testing work for
-  B46-2P (SOCKS5 UDP-ASSOCIATE framing against a real Hysteria2 process,
-  the real Android `dup()`/`detachFd()`/JNI mechanics, MTU/PMTU, and
-  performance measurement) — none are open research questions about
-  whether the architecture can work at all.
+**Separately, Hysteria2's own child-process binary (Section 10.8) was
+verified, with objective `go tool nm` evidence, to contain 125 linked
+symbols from GPL-3.0-or-later `apernet/sing-tun`, regardless of whether
+Nova's deployment ever enables Hysteria2's own `tun:` config** — a second,
+independent GPL question this pass surfaces but does not resolve, since it
+concerns Hysteria2's own executable, not the Nova-authored bridge.
+
+**B. TECHNICALLY READY — LICENSING DECISION REQUIRED.**
+
+Not A, because a real, unresolved product-licensing gap exists and this
+pass is correctly not the one to close it:
+
+- The in-process `sing-tun`-based bridge (Option A / `NOVA_SING_TUN_ADAPTER`)
+  is technically fully proven: TUN fd ownership is deterministic
+  (`dup()`+`detachFd()`, Section 8, unaffected by any of the above), the
+  external-fd path works, TCP round trip passes, UDP round trip passes, the
+  race-enabled proof has ZERO races (Section 10.5), and a REAL in-process
+  JNI/AAR artifact was built with `sing-tun` genuinely linked into it
+  (Section 10.7 — not merely an executable cross-build, which was itself a
+  claim this pass had to correct).
+- **But its selected dependency (either `sing-tun` fork) is
+  GPL-3.0-or-later, Nova's own repository license is unestablished, and no
+  owner decision endorsing GPL-compatible in-process distribution has been
+  made** (Section 10.6). Proceeding to real physical Android integration
+  as a RELEASE architecture on this dependency, before that decision is
+  made, would risk building real product surface on a licensing
+  foundation nobody has actually approved.
+- Hysteria2's own child-process binary carries a parallel, separate GPL
+  question (Section 10.8) needing the same kind of review, independent of
+  whatever is decided about the Nova bridge.
+- A credible permissively-licensed alternative exists (`hev-socks5-tunnel`,
+  Section 10.9) that would let a future slice reach verdict A without
+  requiring any Nova licensing-policy decision at all — but its own
+  live round-trip proof is not yet complete, so this pass does not
+  prematurely declare it selected either.
+
+**Do not proceed to B46-2P as a release-track physical integration on the
+GPL-3.0-or-later `sing-tun` path until the repository owner has made an
+explicit, informed licensing decision.** A future slice completing L2's
+round-trip proof (Section 10.9's known unknown) could independently reach
+verdict A on a wholly MIT-licensed path without waiting on that decision at
+all — that is the recommended next step (see "Explicit next-slice
+recommendation" below, updated accordingly).
 
 ## Sources cited (external)
 
@@ -1466,11 +1821,27 @@ looked sound — which is what these correction passes exist to verify.
   `stack_system.go`/`stack_system_nat.go`/`udp_nat.go`/`flow.go`/`go.mod`
   read directly.
 - [xjasonlyu/tun2socks repository](https://github.com/xjasonlyu/tun2socks) —
-  cloned fresh in this correction pass (Option C candidate 1, Section 6);
-  `LICENSE`/`go.mod`/`core/device/fdbased/open_unix.go` read directly.
-- [heiher/hev-socks5-tunnel repository](https://github.com/heiher/hev-socks5-tunnel) —
-  cloned fresh in this correction pass (Option C candidate 2, Section 6);
-  `LICENSE`/`README.md` read directly.
+  cloned fresh in an earlier correction pass (Option C/L3 candidate,
+  Section 6/10.10); `LICENSE`/`go.mod`/`core/device/fdbased/open_unix.go`
+  read directly.
+- [heiher/hev-socks5-tunnel repository](https://github.com/heiher/hev-socks5-tunnel),
+  commit `21a784a6702e5f1b1b87c63c38a314234d956e55` — cloned fresh with
+  submodules in this pass (Option L2, Section 10.9); `LICENSE`,
+  `src/hev-socks5-tunnel.c`, `src/hev-jni.c`, `src/hev-main.c`,
+  `android/hev/htproxy/TProxyService.java`, `conf/main.yml`, `Android.mk`,
+  `Application.mk` read directly; its four submodules
+  (`heiher/hev-task-system`, `heiher/yaml`, `heiher/lwip`,
+  `heiher/hev-socks5-core`) each cloned and their own `LICENSE` files
+  checked independently.
+- `github.com/apernet/sing-tun`'s and `github.com/sagernet/sing-tun`'s own
+  `LICENSE` files — read directly in this pass (both from the module
+  caches/clones already used in earlier passes), the source of the
+  license correction (Section 10.6).
+- `golang.org/x/mobile` (`gomobile`) — used in this pass, per its own
+  standard public toolchain, to build the real in-process JNI/AAR artifact
+  (Section 10.7); Android SDK components (`platform-tools`,
+  `platforms;android-34`, `build-tools;34.0.0`) and NDK `26.1.10909125`
+  installed via Google's own `sdkmanager` specifically for this check.
 - Internal: `docs/B46_2A_HYSTERIA2_ANDROID_FEASIBILITY.md` (baseline
   findings this document extends, not re-derives from scratch),
   `docs/B45A_SHADOWSOCKS_RUST_SPIKE.md` /
@@ -1479,22 +1850,27 @@ looked sound — which is what these correction passes exist to verify.
   boundaries, B33's app-process-exclusion finding),
   `android/app/src/main/java/net/pocvpn/client/vpn/xray/XrayCoreRuntime.kt`
   and `android/app/src/main/java/net/pocvpn/client/vpn/shadowsocks/ShadowsocksProcessLauncher.kt`
-  (read directly in this correction pass to confirm Nova's own real
+  (read directly in an earlier correction pass to confirm Nova's own real
   in-process-JNI vs. child-process precedent, Section 13).
 
 ## Files changed in this slice
 
 - `docs/B46_2B_HYSTERIA_TUN_BRIDGE_ARCHITECTURE.md` (this document; created,
-  then corrected in two same-day follow-up passes per direct PR review —
-  the second specifically re-pinning the bridge's `sing-tun` dependency).
+  then corrected in three same-day follow-up passes per direct PR review —
+  the second re-pinning the bridge's `sing-tun` dependency for a race fix,
+  the third correcting the sing-tun license claim and adding the licensing/
+  JNI-AAR/L2/Hysteria2-binary audit sections).
 - `research/b46-2b-hysteria-tun-bridge/singtun-proof/{main.go,go.mod,go.sum,.gitignore}`
   (new, isolated host-side synthetic proof — not part of the Android app,
   not built by Gradle, not reachable from any production path; rewritten
   twice: once for the fd-ownership split/full deterministic UDP round
   trip/race-free synchronization, and again to port from the superseded
-  `apernet/sing-tun` to the selected, race-clean `sagernet/sing-tun`
-  commit, including the Handler-interface and buffer-headroom API
-  migration this port required).
+  `apernet/sing-tun` to the race-clean `sagernet/sing-tun` commit, including
+  the Handler-interface and buffer-headroom API migration this port
+  required). Unchanged in this third pass — the licensing/JNI-AAR/L2 work
+  was done in throwaway scratch locations outside the repository (per the
+  task's own "do not implement the full Android bridge yet" scope), not
+  committed.
 - `android/app/src/debug/java/net/pocvpn/client/debug/b46hysteria/B46HysteriaSpikeState.kt`
   (adds `TUN_BRIDGE_READY` phase, `tunBridgeReady`/`bridgeFailed`
   transitions (renamed from `bridgeExitedUnexpectedly` and corrected to
