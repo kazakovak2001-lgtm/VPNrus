@@ -1,6 +1,6 @@
 # B45B-4P — Shadowsocks 2022 Selection Wiring: Physical Validation Attempt
 
-## Status: NOT PASSED — data-plane proof failed, one new bug found
+## Status: NOT PASSED — data-plane proof still failing; the disconnect/ownership bug found in the first attempt is now fixed (§5b)
 
 This is a truthful record of a real physical validation attempt of the B45B-4
 selection wiring, run end to end through the production pipeline (Smart
@@ -120,6 +120,57 @@ An `am force-stop` was required to actually clean up the orphaned process
 and interface. This is a real bug for the Shadowsocks adapter's failure path,
 separate from the data-plane connectivity issue above, and is recorded here
 for a future fix - not something this task attempted to diagnose or repair.
+
+## 5b. Fix slice 1 — the disconnect/ownership cleanup bug (§5) is fixed
+
+Root cause, traced through the real production classes (`ShadowsocksTransport`,
+`ShadowsocksVpnService`) - two compounding bugs, both in the disconnect path,
+never in `ShadowsocksRuntime` itself (already correct and already covered by
+`ShadowsocksRuntimeTest`):
+
+- **Bug A**: `ShadowsocksTransport.disconnect()` had an early-return shortcut -
+  whenever `state` already reported `TransportState.Error`, it set
+  `Disconnected` directly and returned **without ever sending
+  `ShadowsocksVpnService.ACTION_STOP`**, wrongly assuming Error always means
+  the service/process/TUN were already torn down. They are not guaranteed to
+  be.
+- **Bug B**: even on the normal path, `ShadowsocksVpnService.teardown()` set
+  its companion `status` flow straight to `null` on a genuine stop -
+  `ShadowsocksTransport`'s own status collector explicitly ignores a `null`
+  status, so a real, successful teardown never reported back to the
+  transport's own `state`, which would then get stuck on `Disconnecting`
+  forever. `teardown()` also ran synchronously on the calling thread
+  (`onStartCommand`, always the main thread for a Service), blocking up to
+  ~4s on `ShadowsocksRuntime.stop()`'s own bounded wait - a latent ANR risk.
+
+Fix: `disconnect()` now always sends `ACTION_STOP` unless `state` is already
+genuinely `Disconnected` (the one case that IS safe to skip), and
+deterministically waits (bounded, forced-Disconnected on timeout) for a real
+terminal state rather than firing-and-forgetting. `teardown()` now publishes
+a real `ShadowsocksRuntimePhase.STOPPED` status (mapped to
+`TransportState.Disconnected`) instead of `null`, and is dispatched off the
+main thread. No changes to `ShadowsocksRuntime`, `TransportOrchestrator`, or
+AWG/Xray lifecycle behavior.
+
+**Physically re-verified end to end on the same device**, using the same
+real Frankfurt activation and the same real matching Shadowsocks credential
+from §3 (nothing re-provisioned):
+
+- Connect 1: `sslocal` PID `23564`, TUN `10.202.46.1/24`, both bridge sockets
+  present, UI Protected.
+- Disconnect 1: UI Disconnected; `sslocal` process **gone**, `tun0` **gone**,
+  both bridge sockets **gone** - no `am force-stop` needed this time.
+- Connect 2: forced `Manual(SHADOWSOCKS_2022)` again, **new** `sslocal` PID
+  `24795` (confirmed different from PID `23564`), same real TUN config, UI
+  Protected again.
+- Disconnect 2: clean teardown again - process gone, TUN gone, sockets gone,
+  UI Disconnected.
+- No crash, no ANR, at any point (checked directly against logcat for
+  `FATAL EXCEPTION`/`ANR in`/`Force finishing activity` - none found).
+
+The lifecycle/ownership bug from §5 is fixed and physically confirmed twice.
+**This does not touch or claim anything about §4** (the TCP data-plane
+proof) - that failure is unchanged and still open.
 
 ## 6. What remains explicitly UNVERIFIED (unchanged from B45B-4)
 
