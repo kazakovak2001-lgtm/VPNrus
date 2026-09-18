@@ -14,6 +14,22 @@ val gatewayDevProperties = Properties().apply {
 }
 fun gatewayDevProp(key: String): String = gatewayDevProperties.getProperty(key, "")
 
+// B45A data-plane validation (round 6) - a SEPARATE, debug-only, gitignored
+// local properties file carrying the disposable Frankfurt test server's
+// endpoint/credential (see docs/B45A_SHADOWSOCKS_RUST_SPIKE.md Section 30).
+// Never committed, never printed - same "developer-local override, gitignored"
+// discipline as gatewayDevProperties above, but its own file so this
+// spike-only, disposable material is never mixed with real gateway dev
+// config. buildConfigField calls for it live ONLY inside the `debug {}`
+// buildType block below (never defaultConfig, never release) - this is a
+// structural guarantee, not merely an empty-value one: the field does not
+// exist in release's generated BuildConfig class at all.
+val b45aDataPlaneProperties = Properties().apply {
+    val f = file("b45a-dataplane.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun b45aDataPlaneProp(key: String): String = b45aDataPlaneProperties.getProperty(key, "")
+
 // B17/B20 - the real production Signed Offline Bootstrap manifest
 // distribution endpoints (see docs/B12_MANIFEST_KEY_CEREMONY.md's
 // "Production ceremony (B17)" section and docs/ROADMAP.md's Signed Offline
@@ -87,6 +103,18 @@ android {
             // with, unless a developer's local gateway-dev.properties
             // overrides it.
             buildConfigField("String", "MANIFEST_URLS", "\"${resolveManifestUrls()}\"")
+
+            // B45A data-plane validation (round 6) - debug-buildType-only,
+            // read from the gitignored b45a-dataplane.properties above.
+            // Empty string defaults (never null) so B45ARuntime's own
+            // fallback-to-mechanics-only-fake-loopback logic (unchanged
+            // from rounds 1-5) works identically when this file is absent -
+            // every OTHER developer's checkout, and CI, builds exactly as
+            // before.
+            buildConfigField("String", "B45A_TEST_SERVER_HOST", "\"${b45aDataPlaneProp("serverHost")}\"")
+            buildConfigField("String", "B45A_TEST_SERVER_PORT", "\"${b45aDataPlaneProp("serverPort")}\"")
+            buildConfigField("String", "B45A_TEST_SERVER_METHOD", "\"${b45aDataPlaneProp("method")}\"")
+            buildConfigField("String", "B45A_TEST_SERVER_KEY", "\"${b45aDataPlaneProp("key")}\"")
         }
         release {
             isMinifyEnabled = false
@@ -123,6 +151,29 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+}
+
+// B45A packaging-route experiment (temporary, Phase 3/4 - not yet approved
+// for permanent adoption). Variant API, debug-only: sets
+// ApplicationVariant.packaging.jniLibs.useLegacyPackaging for the debug
+// variant specifically, leaving release's own packaging.jniLibs untouched.
+// B45A - approved debug-only packaging fix (see
+// docs/B45A_SHADOWSOCKS_RUST_SPIKE.md Section 26). AGP 8.7.3's public
+// Variant API, applied ONLY to the debug variant: sets
+// ApplicationVariant.packaging.jniLibs.useLegacyPackaging so the Android
+// package manager extracts src/debug/jniLibs/arm64-v8a/libsslocal_spike.so
+// to a real filesystem path (applicationInfo.nativeLibraryDir) instead of
+// dlopen'ing it directly from the APK zip - required for the pinned
+// shadowsocks-rust spike binary to be exec()'d as a subprocess. Proven not
+// to affect release's own native-library packaging (byte-identical release
+// APK SHA-256; packageRelease task stays UP-TO-DATE). The base
+// com.android.build.api.dsl.JniLibsPackaging.useLegacyPackaging DSL
+// property (android.packaging.jniLibs {} in this file) is deliberately NOT
+// used here - it is whole-module/global, with no per-buildType equivalent.
+androidComponents {
+    onVariants(selector().withName("debug")) { variant ->
+        variant.packaging.jniLibs.useLegacyPackaging.set(true)
     }
 }
 
