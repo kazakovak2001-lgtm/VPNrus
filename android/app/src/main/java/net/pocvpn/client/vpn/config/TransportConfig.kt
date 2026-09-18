@@ -109,4 +109,20 @@ sealed class TransportConfig {
         val isRelayed: Boolean = false,
         val relayExitProbeHost: String? = null,
     ) : TransportConfig()
+
+    /**
+     * B45B-3 - config for the isolated ShadowsocksTransport/ShadowsocksVpnService
+     * adapter shell. TransportKind.SHADOWSOCKS_2022 stays NOT_IMPLEMENTED in
+     * TransportRegistry, so nothing in production ever constructs this yet -
+     * only tests. Deliberately carries no key material: the AEAD-2022 secret
+     * is resolved from Shadowsocks2022CredentialRepository at connect() time,
+     * scoped to [endpointId], never threaded through this config object or
+     * any Intent extra (see ShadowsocksTransport's own docs).
+     */
+    data class Shadowsocks(
+        val endpointId: EndpointId,
+        val host: String,
+        val port: Int,
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+    ) : TransportConfig()
 }

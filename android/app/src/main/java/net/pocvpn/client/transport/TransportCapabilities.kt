@@ -171,6 +171,36 @@ data class TransportCapabilities(
             maturity = TransportMaturity.NOT_IMPLEMENTED,
         )
 
+        /**
+         * B45B-3 - ShadowsocksTransport/ShadowsocksVpnService as an isolated
+         * adapter shell, the same "real code exists, zero/limited physical
+         * evidence, not registered AVAILABLE" shape [xrayRealityAdapterShell]
+         * documents (TransportRegistry keeps SHADOWSOCKS_2022 at
+         * NOT_IMPLEMENTED/[notImplemented] - this factory describes only
+         * what the adapter code itself does, never Smart Connect
+         * eligibility). usesUdp/usesTcp/supportsFullTunnel stay true -
+         * B45A's own physical proof of the underlying mechanism carries over
+         * unchanged (see [shadowsocks2022]'s own docs for that evidence).
+         * maturity is EXPERIMENTAL, not NOT_IMPLEMENTED: unlike
+         * [shadowsocks2022] (protocol proven, zero adapter code), real
+         * adapter code now exists here - the same gap
+         * [xrayRealityAdapterShell] already describes for Xray.
+         */
+        fun shadowsocks2022AdapterShell(): TransportCapabilities = TransportCapabilities(
+            usesUdp = true,
+            usesTcp = true,
+            supportsPort443 = false,
+            supportsObfuscation = false,
+            suitableForRestrictiveNetworks = false,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.EXPERIMENTAL,
+        )
+
         /** A transport with no implementation at all: every capability is truthfully false/unknown. */
         fun notImplemented(): TransportCapabilities = TransportCapabilities(
             usesUdp = false,

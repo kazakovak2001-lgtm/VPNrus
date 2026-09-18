@@ -54,5 +54,19 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- B45B-3 - isolated Shadowsocks 2022 adapter shell. Not started by
+             VpnController/TransportOrchestrator; SHADOWSOCKS_2022 stays
+             NOT_IMPLEMENTED in TransportRegistry (see ShadowsocksTransport's
+             own docs) - reachable only from a test constructing
+             ShadowsocksTransport directly. -->
+        <service
+            android:name=".vpn.shadowsocks.ShadowsocksVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
