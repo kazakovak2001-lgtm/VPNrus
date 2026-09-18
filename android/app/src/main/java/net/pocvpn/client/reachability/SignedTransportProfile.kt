@@ -23,6 +23,20 @@ sealed interface SignedTransportProfile {
     ) : SignedTransportProfile {
         override val transportKind: TransportKind = TransportKind.XRAY_XHTTP
     }
+
+    /**
+     * B45B-1 - PUBLIC/SIGNED Shadowsocks 2022 facts only (see
+     * [Shadowsocks2022Profile]'s own doc for the public/secret split). TYPES
+     * ONLY as of B45B-1 - constructing this value does not activate any
+     * runtime consumption; no code path reads it to drive a real connection
+     * yet.
+     */
+    data class Shadowsocks2022(
+        override val endpointId: EndpointId,
+        val profile: Shadowsocks2022Profile,
+    ) : SignedTransportProfile {
+        override val transportKind: TransportKind = TransportKind.SHADOWSOCKS_2022
+    }
 }
 
 sealed interface SignedTransportProfileReadResult {
@@ -32,20 +46,44 @@ sealed interface SignedTransportProfileReadResult {
     data object Invalid : SignedTransportProfileReadResult
 }
 
-/** Reads only the typed, safe facts for this exact endpoint/binding pair. */
+/**
+ * Reads only the typed, safe facts for this exact endpoint/binding pair.
+ * Dispatches by [EndpointTransportBinding.kind] first: a kind with no typed
+ * profile reader of its own (everything except [TransportKind.XRAY_XHTTP]
+ * and, as of B45B-1, [TransportKind.SHADOWSOCKS_2022]) always reads as
+ * [SignedTransportProfile.Legacy] - the existing, already-established
+ * fail-closed/not-yet-wired fallback, unchanged by adding a new kind.
+ */
 fun EndpointTransportBinding.signedTransportProfile(endpointId: EndpointId): SignedTransportProfileReadResult {
-    return when (val cdn = cdnProviderProfile()) {
-        CdnProviderProfileReadResult.Missing -> SignedTransportProfileReadResult.Parsed(
-            SignedTransportProfile.Legacy(endpointId, kind),
-        )
-        CdnProviderProfileReadResult.UnsupportedVersion -> SignedTransportProfileReadResult.Unsupported
-        CdnProviderProfileReadResult.Invalid -> SignedTransportProfileReadResult.Invalid
-        is CdnProviderProfileReadResult.Parsed -> {
-            if (kind != TransportKind.XRAY_XHTTP || ingressKind() != IngressKind.CDN_FRONTED) {
-                SignedTransportProfileReadResult.Invalid
-            } else {
-                SignedTransportProfileReadResult.Parsed(SignedTransportProfile.CdnXhttp(endpointId, cdn.profile))
+    if (kind == TransportKind.XRAY_XHTTP) {
+        return when (val cdn = cdnProviderProfile()) {
+            CdnProviderProfileReadResult.Missing -> SignedTransportProfileReadResult.Parsed(
+                SignedTransportProfile.Legacy(endpointId, kind),
+            )
+            CdnProviderProfileReadResult.UnsupportedVersion -> SignedTransportProfileReadResult.Unsupported
+            CdnProviderProfileReadResult.Invalid -> SignedTransportProfileReadResult.Invalid
+            is CdnProviderProfileReadResult.Parsed -> {
+                if (ingressKind() != IngressKind.CDN_FRONTED) {
+                    SignedTransportProfileReadResult.Invalid
+                } else {
+                    SignedTransportProfileReadResult.Parsed(SignedTransportProfile.CdnXhttp(endpointId, cdn.profile))
+                }
             }
         }
     }
+
+    if (kind == TransportKind.SHADOWSOCKS_2022) {
+        return when (val ss = shadowsocks2022Profile()) {
+            Shadowsocks2022ProfileReadResult.Missing -> SignedTransportProfileReadResult.Parsed(
+                SignedTransportProfile.Legacy(endpointId, kind),
+            )
+            Shadowsocks2022ProfileReadResult.UnsupportedVersion -> SignedTransportProfileReadResult.Unsupported
+            Shadowsocks2022ProfileReadResult.Invalid -> SignedTransportProfileReadResult.Invalid
+            is Shadowsocks2022ProfileReadResult.Parsed -> SignedTransportProfileReadResult.Parsed(
+                SignedTransportProfile.Shadowsocks2022(endpointId, ss.profile),
+            )
+        }
+    }
+
+    return SignedTransportProfileReadResult.Parsed(SignedTransportProfile.Legacy(endpointId, kind))
 }

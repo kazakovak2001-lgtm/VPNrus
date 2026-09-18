@@ -65,6 +65,16 @@ class TransportRegistry private constructor(
                     status = TransportStatus.NOT_IMPLEMENTED,
                     capabilities = TransportCapabilities.notImplemented(),
                 ),
+                // B45B-1 - types + metadata only (see docs/B45B_SHADOWSOCKS_PRODUCTION_ADAPTER_DESIGN.md).
+                // NOT_IMPLEMENTED/notImplemented(), no factory - the same fail-closed shape every other
+                // not-yet-wired kind above already uses. No VpnTransport implementation exists for this
+                // kind yet; never selectable/executable via this registry until a real adapter shell
+                // (B45B-3+) registers it as AVAILABLE with a real factory and real capabilities.
+                TransportDescriptor(
+                    kind = TransportKind.SHADOWSOCKS_2022,
+                    status = TransportStatus.NOT_IMPLEMENTED,
+                    capabilities = TransportCapabilities.notImplemented(),
+                ),
             ),
         )
     }

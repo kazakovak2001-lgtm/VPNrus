@@ -79,8 +79,17 @@ class SmartConnectDecisionEngineTest {
 
 
     @Test
-    fun `preferred order explicitly contains every transport kind including XHTTP`() {
-        assertEquals(TransportKind.entries.toSet(), SmartConnectDecisionEngine.PREFERRED_ORDER.toSet())
+    fun `preferred order explicitly contains every transport kind including XHTTP, except kinds not yet wired into Smart Connect selection`() {
+        // B45B-1 - SHADOWSOCKS_2022 exists as a type (TransportKind, TransportCapabilities,
+        // SignedTransportProfile) but is deliberately NOT wired into Smart Connect selection yet
+        // (TransportRegistry registers it NOT_IMPLEMENTED with no factory - see B45B-1's own scope
+        // boundary in docs/B45B_SHADOWSOCKS_PRODUCTION_ADAPTER_DESIGN.md). PREFERRED_ORDER is the
+        // real selection-priority authority and must not silently include a kind with no adapter.
+        val notYetWiredIntoSelection = setOf(TransportKind.SHADOWSOCKS_2022)
+        assertEquals(
+            TransportKind.entries.toSet() - notYetWiredIntoSelection,
+            SmartConnectDecisionEngine.PREFERRED_ORDER.toSet(),
+        )
         assertEquals(
             listOf(
                 TransportKind.AMNEZIA_WG,
