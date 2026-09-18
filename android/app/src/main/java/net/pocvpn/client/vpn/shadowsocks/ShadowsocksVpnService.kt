@@ -25,6 +25,7 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
+import net.pocvpn.client.vpn.config.VpnDnsPolicy
 import net.pocvpn.client.vpn.policy.RoutingMode
 
 private const val TAG = "ShadowsocksVpnService"
@@ -207,6 +208,18 @@ class ShadowsocksVpnService : VpnService() {
             .setMtu(ShadowsocksTunConfig.MTU)
             .addAddress(ShadowsocksTunConfig.ADDRESS, ShadowsocksTunConfig.PREFIX_LENGTH)
             .setSession(SESSION_NAME)
+        // B45B-4P fix - root cause of zero inbound TCP at the server: this
+        // TUN never carried a DNS server, unlike every other transport
+        // (NovaXrayVpnService, AwgConfigMapper both call addDnsServer from
+        // the same VpnDnsPolicy authority). Per VpnService.Builder.addDnsServer's
+        // own contract, an interface with a route but no DNS server of a
+        // given family leaves that family's DNS resolution broken for every
+        // app routed through it - so routed apps never got a resolved
+        // destination to open a TCP connection to in the first place,
+        // meaning sslocal never saw a packet to relay. Same canonical
+        // resolver list every other transport already uses (never a second,
+        // transport-specific DNS decision).
+        VpnDnsPolicy.servers.forEach { builder.addDnsServer(it) }
         // Full-tunnel IPv4 route via the same RoutingDecisionEngine authority
         // the Xray adapters already use (Phase 5 - never a parallel routing
         // decision system). No IPv6 route/address anywhere (fail closed).
