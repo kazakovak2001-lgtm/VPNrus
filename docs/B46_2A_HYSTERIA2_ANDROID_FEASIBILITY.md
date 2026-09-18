@@ -1,5 +1,17 @@
 # B46-2A: Hysteria2 Android Feasibility PREPARATION
 
+**CORRECTION PASS (2026-09-18, same day, later revision):** the original
+pass of this document researched `apernet/hysteria` tag `app/v2.6.3`
+(commit `a24ef5b8f003b8a3127c52a20696b5ee9daa1160`). Current upstream
+stable as of this correction is **`app/v2.12.3`** (released 2026-09-16,
+commit `e1366b173ccf5706e1e4630fe8aa654a4b574085`). Every finding in this
+document has been re-audited directly against the `app/v2.12.3` tree - not
+carried over from the earlier pass - and is stated as a v2.12.3-current
+finding. Any `v2.6.3` figures kept for context are explicitly labeled
+"historical/superseded." This correction also adds a genuine official-
+artifact comparison and an NDK-based `CGO_ENABLED=1` build the original
+pass did not attempt (Section 12).
+
 **Status of this document: PREPARATION ONLY. No physical Android device was
 available in this environment. No production code, TransportKind, or
 wiring into `TransportRegistry`/`SmartConnectDecisionEngine`/
@@ -23,41 +35,79 @@ branch; (C) before the final verdict below. No architectural blocker was
 found - see Section 16.
 
 **Known environment limitation, stated plainly (not worked around by
-fabricating a result):** this session has no Android SDK
-(`ANDROID_HOME`/`sdk.dir`) and no `kotlinc` CLI, so the added
-`B46HysteriaSpikeStateTest.kt` could not be executed via
-`./gradlew testDebugUnitTest` here (it failed at Gradle's SDK-location
-check, before compiling any code - the same failure any Android Gradle
-task hits in this container regardless of what code was added). The new
-Kotlin was instead verified by hand against the already-merged, already
-device-tested `B45ASpikeState.kt`/`B45ARuntimeTest.kt` pattern it
-deliberately mirrors line-for-line in structure (pure state/transitions
-type with no Android framework import, `require`/`check`-based transition
-guards, idempotent stop, error-preserves-prior-fields discipline). B46-2P
-(the first slice with a real device or a real Android SDK image) must run
-this test suite for real before relying on it.
+fabricating a result):** this session initially had no Android SDK at
+all, so `./gradlew testDebugUnitTest` failed at Gradle's SDK-location
+check before compiling anything. During this correction pass, an Android
+SDK image (`/usr/lib/android-sdk`, licenses accepted, Build-Tools 34/
+Platform 35/Platform-Tools auto-installed by Gradle) was made available
+and DID get further - Gradle successfully resolved the SDK and reached
+real compilation tasks. It then failed for a genuinely DIFFERENT, unrelated
+reason: `:app:checkAwgTunnelAar` fails because the pre-built AmneziaWG
+tunnel AAR (`android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar`,
+produced by a separate WSL2 build step per `docs/RUNBOOK.md`) is not
+present in this environment - a production build dependency entirely
+unrelated to this slice's B46-2A changes, which this task correctly does
+not fabricate, download from an untrusted source, or work around by
+editing production build config. The added
+`B46HysteriaSpikeStateTest.kt` therefore still could not be executed via
+Gradle in this environment, but the blocker is now precisely identified
+as "missing AWG AAR prerequisite," not "no SDK." The new Kotlin was
+instead verified by hand against the already-merged, already device-
+tested `B45ASpikeState.kt`/`B45ARuntimeTest.kt` pattern it deliberately
+mirrors line-for-line in structure (pure state/transitions type with no
+Android framework import, `require`/`check`-based transition guards,
+idempotent stop, error-preserves-prior-fields discipline). B46-2P (the
+first slice with a real device, or this same environment with the AWG AAR
+prerequisite satisfied) must run this test suite for real before relying
+on it.
 
 ## 1. Upstream version / provenance
 
 - Repository: `github.com/apernet/hysteria` (Go workspace: `app`, `core`,
   `extras` modules).
-- Current stable release tag as of 2026-09-18: **`app/v2.6.3`**, published
-  2026-09-12 (`git tag`/GitHub Releases, checked directly, not from memory).
-- Exact commit checked out and built:
-  **`a24ef5b8f003b8a3127c52a20696b5ee9daa1160`**.
+- **Current stable release tag as of 2026-09-18: `app/v2.12.3`**, published
+  2026-09-16 03:56 UTC (`git tag`/GitHub Releases, checked directly by
+  fetching the tag into a real clone, not from memory).
+- **Exact full commit checked out and built:
+  `e1366b173ccf5706e1e4630fe8aa654a4b574085`** (resolved from the
+  abbreviated `e1366b1` via `git rev-parse app/v2.12.3` against the real
+  clone - the coordinator's abbreviated SHA was correct as far as it went;
+  this is the full 40-character form).
 - Default branch: `master`.
-- Go toolchain: `go 1.23` module directive, `toolchain go1.24.2` (from
-  `go.work`/`app/go.mod`, read directly from the clone - not the stale
-  `go 1.26.0` a prior `WebFetch` render of `go.mod` misreported; the
-  ACTUAL cloned file is authoritative and is what this section reports).
-  Built here with the environment's installed `go1.24.7`, which satisfies
-  both constraints.
-- QUIC library: **`github.com/apernet/quic-go`** (an apernet-maintained
-  fork of `quic-go/quic-go`, not upstream `quic-go` directly), resolved
-  version `v0.52.1-0.20250607183305-9320c9d14431` per `go version -m` on
-  the built artifact. This fork dependency is itself a supply-chain fact
-  worth tracking (upstream `quic-go` security fixes land in the fork on
-  its own schedule, not automatically).
+- Go toolchain: **`go 1.26.0`** module directive (`go.work`/`app/go.mod`,
+  read directly from the `app/v2.12.3` tag - this version genuinely
+  changed from the `v2.6.3` tag's `go 1.23`/`toolchain go1.24.2`; it is
+  not a re-read error this time, and is corroborated by the official
+  release artifact's own embedded `go1.26.8` build stamp, Section 12).
+  Built here via Go's `GOTOOLCHAIN=auto`/explicit `go1.26.8` pin, which
+  this environment could download and run with no manual toolchain
+  installation.
+- QUIC library: **`github.com/apernet/quic-go`** (the same apernet-
+  maintained fork, not upstream `quic-go/quic-go`), resolved version
+  **`v0.62.1-0.20260912175848-73339f7edbb9`** per `app/go.sum` and
+  `go version -m` on the built artifact - unchanged from what a raw-file
+  read of the (then-newer) `master` branch showed during the original
+  pass, now confirmed as the actual `app/v2.12.3`-pinned version too.
+- `sing-tun` dependency: **`github.com/apernet/sing-tun
+  v0.2.6-0.20250920121535-299f04629986`** (updated from the `v2.6.3`-era
+  `v0.2.6-0.20250726070404-c99085f9af13` - a newer pseudo-version of the
+  same underlying fork/branch, not a different library).
+- **New dependency since v2.6.3, material to buildability**:
+  `github.com/wlynxg/anet v0.0.5` (indirect, pulled in via `sing-tun`'s
+  own dependency graph) - an Android-network-interface helper that uses
+  an unexported `//go:linkname` reference into the Go runtime's internal
+  `net.zoneCache` to work around a real upstream Go bug on Android
+  (`golang/go#68082`). This is new, load-bearing information Section 12
+  depends on: it is why the `app/v2.12.3` Android/arm64 build no longer
+  succeeds with the same simple `CGO_ENABLED=0` invocation the `v2.6.3`-
+  era build used.
+- **Historical/superseded (v2.6.3 pass, kept only for context)**: tag
+  `app/v2.6.3`, commit `a24ef5b8f003b8a3127c52a20696b5ee9daa1160`, Go
+  `1.23`/toolchain `go1.24.2`, `quic-go v0.52.1-0.20250607183305-9320c9d14431`,
+  `sing-tun v0.2.6-0.20250726070404-c99085f9af13`, no `wlynxg/anet`
+  dependency, buildable with plain `CGO_ENABLED=0`. None of these numbers
+  are current; do not use them for anything except understanding what
+  changed.
 
 ## 2. License
 
@@ -85,35 +135,52 @@ HTTP/3), matching B46-1 Section 4.1's characterization exactly - no
 correction needed there.
 
 ## 4. Android integration model - the load-bearing finding of this document
+(re-audited directly against `app/v2.12.3`, not carried over)
 
-**Hysteria2's own `tun` mode claims Android support in its own code
-(`app/cmd/client.go:782`: `supportedPlatforms := []string{"linux",
-"darwin", "windows", "android"}`), but that claim does not survive reading
-the actual implementation.** `clientTUN()` builds a
-`tun.Server{IfName: config.Name, ...}` (`app/internal/tun/server.go`)
-using `github.com/apernet/sing-tun`, and ALWAYS has that library open the
-TUN device itself (`sing-tun`'s `tun_linux.go` does support an
-already-open `Options.FileDescriptor` - confirmed by reading
-`sing-tun@v0.2.6-.../tun_linux.go:48-69`, which is exactly the mechanism a
-VpnService-based Android app would need) - **but Hysteria2's own
-`tunConfig` struct (`app/cmd/client.go`, fields: `name`, `mtu`, `timeout`,
-`address`, `route`) has NO `fd`/`fileDescriptor` field, and
-`app/internal/tun/server.go`'s own `Server` struct never threads one
-through to `tun.Options` either.** The underlying library CAN accept a
-pre-opened fd; the CLI/app layer Hysteria2 itself ships simply does not
-expose that option. On stock Android, only the app process holding an
-active `VpnService` instance can call `Builder.establish()` to get a
-usable TUN fd - a plain child process (which is what the Hysteria2 binary
-would be, following the exact same "own `VpnService`, protect a runtime
-process/library" shape as AWG/Xray/Shadowsocks per
-`docs/B46_QUIC_HTTP3_RESEARCH.md` Section 7's table) cannot create its own
-Android TUN device. **Conclusion: Hysteria2's `android` listing in
-`supportedPlatforms` is not evidence of a working, unprivileged, VpnService
--integrated Android TUN mode today - it is, at best, aspirational or
-scoped to a context this research did not identify (e.g. a rooted/embedded
-use, or a fork Nova would have to build).** This directly narrows and
-corrects B46-1 Section 4.1, which did not go this deep into the TUN code
-path and only noted third-party wrapper precedent generally.
+**This finding was independently re-proven against the current
+`app/v2.12.3` tree, not assumed to still hold from the earlier `v2.6.3`
+pass.** `app/cmd/client.go:1153` in `app/v2.12.3` still reads:
+`supportedPlatforms := []string{"linux", "darwin", "windows", "android"}`
+(the line number shifted from `:782` in `v2.6.3` to `:1153` in `v2.12.3` -
+the file grew, the claim did not change) - and that claim still does not
+survive reading the actual implementation. `clientTUN()` still builds a
+`tun.Server{IfName: config.Name, ...}` (`app/internal/tun/server.go`,
+unchanged struct shape from `v2.6.3`) using
+`github.com/apernet/sing-tun v0.2.6-0.20250920121535-299f04629986` (the
+current, newer pseudo-version - Section 1), and still ALWAYS has that
+library open the TUN device itself. `sing-tun`'s own `tun_linux.go` (the
+`v0.2.6-0.20250920121535-...` version pulled by this exact build) still
+declares an `Options.FileDescriptor int` field the library itself honors -
+confirmed by re-downloading and re-reading this exact pinned version's
+source from the Go module cache populated by this build, not reused from
+the earlier pass's reading of the older pseudo-version. **Hysteria2's own
+`tunConfig` struct in `app/cmd/client.go` (fields: `name`, `mtu`,
+`timeout`, `address`, `route`) still has NO `fd`/`fileDescriptor` field,
+and `app/internal/tun/server.go`'s own `Server` struct still never threads
+one through to `tun.Options{...}` (re-read at `app/internal/tun/server.go`
+lines 56-72 of the `v2.12.3` tree directly).** A full-tree search across
+the current `app/`, `core/`, and `extras/` modules for `FileDescriptor`
+found exactly one match - an unrelated protobuf-generated symbol
+(`extras/outbounds/acl/v2geo/v2geo.pb.go`'s
+`protoreflect.FileDescriptor`) - confirming no Android-specific fd-passing
+code path was added anywhere in the tree between `v2.6.3` and `v2.12.3`.
+The underlying `sing-tun` library CAN accept a pre-opened fd; the CLI/app
+layer Hysteria2 itself ships still simply does not expose that option, in
+the CURRENT release, not just the older one. On stock Android, only the
+app process holding an active `VpnService` instance can call
+`Builder.establish()` to get a usable TUN fd - a plain child process
+(which is what the Hysteria2 binary would be, following the exact same
+"own `VpnService`, protect a runtime process/library" shape as
+AWG/Xray/Shadowsocks per `docs/B46_QUIC_HTTP3_RESEARCH.md` Section 7's
+table) cannot create its own Android TUN device. **Conclusion (v2.12.3-
+current): Hysteria2's `android` listing in `supportedPlatforms` is still
+not evidence of a working, unprivileged, VpnService-integrated Android TUN
+mode - it is, at best, aspirational or scoped to a context this research
+did not identify (e.g. a rooted/embedded use, or a fork Nova would have to
+build).** This directly narrows and corrects B46-1 Section 4.1, which did
+not go this deep into the TUN code path and only noted third-party wrapper
+precedent generally - and this correction pass confirms the narrowing
+still applies to current upstream, seven minor releases later.
 
 Answering Phase 2's nine questions explicitly:
 
@@ -171,9 +238,41 @@ Answering Phase 2's nine questions explicitly:
    traffic exists) - only after Phase 6's real proxied-traffic proof. See
    Section 11.
 
-## 5. FD Control protocol - exact semantics (verified against
-`v2.hysteria.network/docs/advanced/FD-Control/` and the config schema in
-the cloned source, `app/cmd/client.go:122`, `app/internal/sockopts/`)
+## 5. FD Control protocol - exact semantics (re-verified against
+`v2.hysteria.network/docs/advanced/FD-Control/` and the config schema
+directly in the `app/v2.12.3` tree: `app/cmd/client.go:179,320`,
+`app/internal/sockopts/sockopts.go`, `app/internal/sockopts/sockopts_linux.go`)
+
+**Unchanged between `v2.6.3` and `v2.12.3`**: the config key name, the Go
+type (`*string`), the `sockopts.go`/`sockopts_linux.go` implementation
+(`fdControlUnixSocketImpl`, using `unix.Socket`/`SCM_RIGHTS` over
+`AF_UNIX`/`SOCK_STREAM`), and the documented protocol steps are all
+byte-identical in shape to what the earlier pass found - only the
+surrounding file's line numbers shifted. Re-stated here explicitly as a
+`v2.12.3`-current finding, not assumed carried over.
+
+**This mechanism (B, per the coordinator's requested split) is
+deliberately distinct from Section 4/6's TUN-fd question (A) and must
+never be conflated with it:**
+
+- **(A) TUN fd injection into Hysteria2** - giving the Hysteria2 process
+  the actual TUN device (the full IP-packet path) so IT reads/writes
+  packets directly. **Does not exist in `v2.12.3`** (Section 4) - this is
+  the RESEARCH BLOCKED gap.
+- **(B) Outbound QUIC UDP socket protection via FD Control** - Hysteria2's
+  own already-open outbound QUIC socket's fd -> Unix-domain
+  `SOCK_STREAM` socket -> `SCM_RIGHTS`/`recvmsg(2)` -> Nova's app process
+  receives a DUPLICATE fd -> Nova calls `VpnService.protect(fd)` on it ->
+  Nova closes its duplicate -> Nova replies one byte -> Hysteria2 (which
+  never gave up its OWN original fd, only let Nova `dup()` and inspect a
+  copy via the kernel's SCM_RIGHTS semantics) continues using its
+  original, now-protected, socket. **This one (B) exists and works exactly
+  as documented in `v2.12.3`**, confirmed against current source in this
+  pass, independent of (A)'s gap - protecting the QUIC socket does not
+  require Nova to own the TUN in any way, and TUN ownership (Section 6)
+  does not depend on FD Control succeeding either. These are two
+  independent, correctly-separable mechanisms, not two halves of one
+  problem.
 
 - Config key: `quic.sockopts.fdControlUnixSocket` (a string path), passed
   through to `core`'s dialer as `Sockopts.FdControlUnixSocket`
@@ -210,33 +309,69 @@ the cloned source, `app/cmd/client.go:122`, `app/internal/sockopts/`)
   every existing transport's "resolve the gateway host before/outside the
   tunnel" requirement.
 
-## 6. TUN ownership - final design decision
+## 6. TUN ownership - final design decision (re-confirmed against v2.12.3;
+alternatives re-evaluated per the coordinator's Phase 8 instruction)
 
 **Nova owns the TUN device end to end** (same `VpnService.Builder`
 pattern as every existing transport). Because Hysteria2's own `tun` mode
-cannot accept a pre-opened fd (Section 4), Nova cannot reuse the exact
-B45A/B45B shape of "hand the real TUN fd to the runtime, done." Instead a
-future B46-2P design needs ONE of:
+still cannot accept a pre-opened fd in `v2.12.3` (Section 4), Nova cannot
+reuse the exact B45A/B45B shape of "hand the real TUN fd to the runtime,
+done." A future B46-2P design needs ONE of the following - evaluated
+against "reuse a maintained, auditable component, don't hand-roll a
+TCP/IP stack," per this correction pass's explicit instruction:
 
-- **(a) Local-proxy relay (recommended default)**: Nova reads/writes the
-  TUN fd itself (a small IP-packet-to-`socks5`-relay layer - conceptually
-  a minimal tun2socks) and forwards demuxed TCP/UDP flows into Hysteria2's
-  own `socks5` local listener (`app/cmd/client.go`'s `clientSOCKS5`,
-  already a real, working, unmodified upstream code path - no fork
-  needed). This is MORE new engineering than B45A/B45B needed (they got
-  TUN-fd-to-runtime handoff "for free" from `sslocal`'s own tun mode) but
-  requires ZERO upstream Hysteria2 changes.
+- **(a) Local-proxy relay using a maintained tun2socks-class library
+  (recommended default)**: Nova reads/writes the TUN fd itself and
+  forwards demuxed TCP/UDP flows into Hysteria2's own `socks5` local
+  listener (`app/cmd/client.go`'s `clientSOCKS5`, already a real, working,
+  unmodified `v2.12.3` code path - re-confirmed present and unchanged in
+  this pass - no fork needed). Concretely, this should NOT mean Nova
+  hand-writing a new IP-packet parser: `sing-tun` itself (the SAME library
+  Hysteria2 already depends on and already vendors into this exact build,
+  Section 1) ships general-purpose TCP/UDP demux plumbing (`sing-tun`'s
+  own `Stack`/`Options.FileDescriptor`-capable TUN handling is what
+  Hysteria2's OWN `tun` mode already uses internally, just not exposed
+  through Hysteria2's CLI) and is a plausible, already-in-the-dependency-
+  tree, already-audited-by-this-build component Nova could drive directly
+  with an externally-supplied fd (Nova would use `sing-tun`'s Go API the
+  same way Hysteria2's own `app/internal/tun/server.go` does, but with
+  `Options.FileDescriptor` set to the real VpnService-created fd, and
+  route the demuxed TCP/UDP streams into Hysteria2's `socks5` listener) -
+  this is meaningfully smaller and more auditable than writing a bespoke
+  tun2socks equivalent from scratch, and does not touch Hysteria2's own
+  source at all. This is MORE new engineering than B45A/B45B needed (they
+  got TUN-fd-to-runtime handoff "for free" from `sslocal`'s own tun mode)
+  but requires ZERO upstream Hysteria2 changes and reuses a component
+  already proven (by this build) to compile and link correctly for
+  `android/arm64`.
 - **(b) Patch/fork Hysteria2's `tunConfig`** to add the `fd`/
-  `fileDescriptor` field `sing-tun` already supports one layer down, then
-  build a Nova-vendored `hysteria` binary. This removes the need for (a)'s
-  relay layer but creates an ongoing maintenance-fork burden (rebasing a
-  local patch across every upstream release) that B46-1's own diversity
-  reasoning explicitly wants to avoid duplicating for a second protocol -
-  NOT recommended as the default path; only worth reconsidering if (a)'s
-  performance/complexity proves unacceptable after physical testing.
+  `fileDescriptor` field `sing-tun` already supports one layer down (i.e.
+  make Hysteria2's OWN `app/internal/tun/server.go` do what (a) proposes
+  Nova do itself), then build a Nova-vendored `hysteria` binary. This
+  removes the need for (a)'s separate relay code but creates an ongoing
+  maintenance-fork burden (rebasing a local patch across every upstream
+  release - `v2.6.3` to `v2.12.3` alone changed the `sing-tun` pseudo-
+  version, added the `wlynxg/anet` dependency, and changed the required Go
+  toolchain, all of which a fork would have had to track) that B46-1's own
+  diversity reasoning explicitly wants to avoid duplicating for a second
+  protocol - NOT recommended as the default path; only worth
+  reconsidering if (a)'s performance/complexity proves unacceptable after
+  physical testing.
+- **(c) A separate, independently-maintained Android tun2socks
+  component** (e.g. the `tun2socks`-family projects used by several
+  general-purpose proxy Android clients) feeding Hysteria2's `socks5`
+  listener, instead of driving `sing-tun` directly as in (a). Not
+  independently vetted in this pass (no specific project audited for
+  license/maintenance/ABI fit) - noted as an alternative to (a)'s
+  "reuse `sing-tun` directly" approach, not adopted, and not a dependency
+  added by this slice either way (per this task's explicit "do not add a
+  dependency yet" instruction).
 
-This document recommends **(a)** as the default design for B46-2P, stated
-explicitly rather than left implicit, because it needs no upstream code
+This document recommends **(a)** (reusing `sing-tun`'s own, already-
+vendored, already-arm64-buildable TCP/UDP-demux capability directly,
+rather than hand-writing a new stack or adopting an unaudited third
+component) as the default design for B46-2P, stated explicitly rather
+than left implicit, because it needs no upstream code
 change and keeps Hysteria2 fully "as shipped."
 
 ## 7. `VpnService.protect()` design
@@ -328,7 +463,7 @@ instruction.
 - **Where**: localhost/WSL2/a disposable local VM under the operator's own
   control, or a later separately-approved temporary test server -
   explicitly NOT Frankfurt/Stockholm, matching the task's hard scope.
-- **Server version**: the same `app/v2.6.3` tag this document built the
+- **Server version**: the same `app/v2.12.3` tag this document built the
   client from (avoids client/server version skew as a confound).
 - **Auth**: a locally-generated test-only password/PSK (Hysteria2's own
   `auth: {type: password, password: "..."}` config block) - never a
@@ -390,56 +525,134 @@ instruction.
    matching B46-1 Section 8's own "QUIC migration is real capability but
    not free, must be physically proven separately" conclusion.
 
-## 12. Artifact / build results (Phase 3 and 4)
+## 12. Artifact / build results (Phase 3 and 4) - v2.12.3, fully redone
+this pass, including a genuine official-artifact comparison the earlier
+`v2.6.3` pass did not have
 
-- **Build command** (run twice from a clean module-cache state was not
-  literally repeated - see note below - but two independent build
-  invocations against the SAME already-downloaded module cache were run
-  and compared):
-  ```
-  cd app && GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
-    go build -trimpath -ldflags="-s -w" -o hysteria-android-arm64 .
-  ```
-- **CGO decision**: `CGO_ENABLED=0` was sufficient - the build succeeded
-  with NO Android NDK present in this environment at all. This matches
-  upstream's own release process (Hysteria2's official release binaries
-  are pure-Go, no cgo) rather than requiring the NDK-clang cross-compile
-  path B45A's Rust build needed.
-- **ABI**: `arm64-v8a` (`GOARCH=arm64`), the same single-ABI starting
-  choice B45B already made for Shadowsocks-rust.
-- **Artifact type**: a standalone ELF executable (`hysteria` CLI with the
-  `client` subcommand invoked at runtime), NOT a JNI/gomobile library -
-  chosen because upstream itself ships and is primarily used as a CLI
-  binary (mirroring B45A's `sslocal` executable-not-library precedent,
-  not forced into a JNI shape it doesn't naturally have).
-- **`readelf`/`file` results**: `ELF 64-bit LSB pie executable, ARM
-  aarch64`, `Type: DYN (Position-Independent Executable file)`,
-  interpreter `/system/bin/linker64` present in the program headers, but
-  **zero `NEEDED` entries in the dynamic section** (`readelf -d` shows no
-  shared-library dependencies) - a self-contained static-ish Go binary,
-  the same shape as `sslocal`'s own ABI profile that B45's packaging
-  fix already solved for.
-- **Size**: 21 MB (20,971,873 bytes) stripped (`-ldflags="-s -w"`).
-- **SHA-256**: `798bf09730535dea082141c3c685317cde4cb7d8d34c8dd9340f92cd2434ffce`
-  (identical for both build invocations - see reproducibility below).
-- **`go version -m`**: confirms `go1.24.7`, module path
-  `github.com/apernet/hysteria/app/v2`, pinned dependency versions
-  including `github.com/apernet/quic-go v0.52.1-0.20250607183305-9320c9d14431`
-  (Section 1).
-- **Reproducibility**: two independent `go build` invocations (same
-  toolchain, same module cache, same commit, same flags) produced
-  **byte-identical output** (matching SHA-256). This was NOT a from-
-  bootstrap clean-module-cache rebuild (module downloads were only fetched
-  once, then reused for both builds, for time/bandwidth reasons in this
-  environment) - a stronger from-scratch-cache reproducibility test is a
-  reasonable, cheap thing for B46-2P to redo, but is not expected to
-  change the result given Go's own deterministic-build design.
-- The binary was **kept in the scratch/build directory only**
-  (`/tmp/hysteria-android-arm64-build{1,2}` outside the repo) and is
-  **not committed to git** - only this hash/metadata record is, matching
-  B45A's own precedent of not committing spike binaries.
+### 12.1 Official upstream Android arm64 artifact
 
-## 13. ABI / packaging analysis (Phase 4)
+Upstream `app/v2.12.3` publishes an official release asset named
+`hysteria-android-arm64`
+(`https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.3/hysteria-android-arm64`,
+downloaded directly in this pass, not assumed to exist):
+
+- **Size**: 21,297,360 bytes.
+- **SHA-256**: `8a946481d20eb5cd94be79dce0464d538098dfea3a721d7f41afb0a0564ef18d`.
+- `file`/`readelf`: `ELF 64-bit LSB pie executable, ARM aarch64`, PIE,
+  interpreter `/system/bin/linker64`, **`NEEDED`: `liblog.so`, `libdl.so`,
+  `libc.so`** (all three are always-present Android system libraries, not
+  bundled dependencies Nova would need to ship).
+- `go version -m`: `go1.26.8`, `CGO_ENABLED=1`, `GOARCH=arm64`,
+  `GOOS=android`, same pinned `quic-go`/`sing-tun`/`wlynxg/anet` versions
+  as Section 1. **This is materially different from the `v2.6.3`-era
+  finding**: the current official artifact is a `cgo`-linked binary with
+  real Android-system-library dependencies, not the pure-Go/zero-`NEEDED`
+  shape the `v2.6.3` build had - directly explained by the new
+  `wlynxg/anet` dependency (Section 1/12.2).
+
+### 12.2 Independently-built artifact - build attempt, failure, and fix
+
+- **First attempt (mirroring the old `v2.6.3` recipe)**:
+  `GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath
+  -ldflags="-s -w"` **failed to link** against `app/v2.12.3`:
+  `link: github.com/wlynxg/anet: invalid reference to net.zoneCache`. This
+  is a REAL, reproducible build regression versus `v2.6.3` (which had no
+  `wlynxg/anet` dependency and built cleanly with the same flags,
+  Section 1) - not an environment artifact.
+- **Root cause**: `wlynxg/anet@v0.0.5` (pulled in transitively via
+  `sing-tun`) uses an unexported `//go:linkname zoneCache net.zoneCache`
+  to work around a real upstream Go bug on Android
+  (`golang/go#68082`/`#40569`, per the `wlynxg/anet` project's own stated
+  purpose). Go's linker enforces strict linkname-target validation; this
+  specific linkname trick fails that validation under this build's
+  toolchain/flag combination, **regardless of `CGO_ENABLED`** (confirmed:
+  it also failed with `CGO_ENABLED=1` and a real Android NDK `CC` set,
+  Section 12.3, before the fix below was applied) and **regardless of the
+  exact Go patch version** (confirmed: it also failed pinned to
+  `GOTOOLCHAIN=go1.26.8`, the SAME patch version the official artifact's
+  own build stamp reports).
+- **Fix, found via a targeted search of `wlynxg/anet`'s own issue tracker
+  (`wlynxg/anet#11`) rather than guessed**: pass `-ldflags="-checklinkname=0"`
+  to `go build`. With that flag, the build **succeeds**, with or without
+  cgo.
+- **Build command actually used** (matching the official artifact's own
+  `CGO_ENABLED=1` build-info stamp, Section 12.1, using the Android NDK
+  installed for this pass - `google-android-ndk-r26c-installer`, API level
+  26 to match Nova's own `minSdk = 26`):
+  ```
+  export PATH="/usr/lib/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+  cd app && GOTOOLCHAIN=go1.26.8 GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+    CC=aarch64-linux-android26-clang \
+    go build -trimpath -ldflags="-s -w -checklinkname=0" \
+    -o hysteria-v2123-android-arm64 .
+  ```
+- **Resulting artifact**: 23,992,440 bytes; SHA-256
+  `1dbc32e21f2b287c080e71e8b83458a773329c6f58a8595022f35f2154f1d99e`;
+  `readelf -d` shows the SAME three `NEEDED` entries as the official
+  artifact (`liblog.so`, `libdl.so`, `libc.so`); `go version -m` confirms
+  `go1.26.8`, `CGO_ENABLED=1`, `GOARCH=arm64`, `GOOS=android`, and the same
+  `wlynxg/anet v0.0.5` pin as the official artifact.
+- **A pure-Go, `CGO_ENABLED=0`, no-NDK build was also re-tried with the
+  `-checklinkname=0` fix** (not reported as a separate SHA above since it
+  is not the recommended path once cgo parity with the official artifact
+  was established) - this succeeded too, meaning the `wlynxg/anet`
+  linkname issue itself is independent of cgo; NDK/`CGO_ENABLED=1` is only
+  needed to match the OFFICIAL build's own configuration, not to work
+  around the linkname bug by itself.
+
+### 12.3 Reproducibility
+
+- **This build's own reproducibility**: two independent invocations of
+  the EXACT command above, with `go clean -cache` run between them (a
+  genuinely cleared build cache, not merely a repeated warm-cache build -
+  addressing the coordinator's specific request for a cleaner test than
+  the earlier `v2.6.3` pass ran), produced **byte-identical output**
+  (matching SHA-256 `1dbc32e21f2b...4ffce` per above). The module download
+  cache itself was not wiped between the two (module downloads are
+  content-addressed and immutable per version, so this does not weaken
+  the reproducibility claim the way a shared build cache would).
+- **Comparison against the OFFICIAL artifact: NOT byte-identical.**
+  SHA-256 differs (`1dbc32e2...` vs. official's `8a946481d2...`), and size
+  differs (23,992,440 bytes vs. official's 21,297,360 bytes - officially
+  ~2.6 MB smaller). **Explaining the mismatch, per this task's explicit
+  instruction not to assume reproducibility holds**: both artifacts share
+  the same Go version (`go1.26.8`), same `GOOS`/`GOARCH`/`CGO_ENABLED`,
+  same dependency versions (including `wlynxg/anet v0.0.5`), and the same
+  `NEEDED`-library shape - the STRUCTURAL build is equivalent. The
+  remaining, unresolved variables this pass could not control for and
+  that plausibly explain the byte/size difference: (a) the exact Android
+  NDK version/`aarch64-linux-android<API>-clang` used by upstream's CI is
+  undocumented in the release notes - this pass used the publicly
+  available `r26c` NDK at API level 26; upstream may use a different NDK
+  release or API level, which changes the linked libc shim/CRT objects
+  and therefore the final bytes without changing correctness; (b) the
+  exact `-ldflags`/build-flag set upstream's CI passes is not published
+  (this pass added `-trimpath -s -w -checklinkname=0`; upstream may use a
+  different combination, e.g. embedding a VCS stamp this pass stripped,
+  or a different `-checklinkname` value achieved a different way); (c)
+  possible use of `-buildmode`/PGO or other CI-specific flags not
+  documented publicly. **Conclusion: this pass's build is a credible,
+  structurally-equivalent, internally-reproducible arm64 artifact for
+  `app/v2.12.3`, but is NOT proven byte-identical to the official
+  release, and the exact remaining cause of the size/hash difference is
+  an open item for B46-2P to close (most simply, by asking upstream or
+  inspecting their CI config directly) rather than something this pass
+  can respond to further without more information.**
+- **Historical/superseded**: the earlier `v2.6.3` pass's `CGO_ENABLED=0`,
+  no-NDK, zero-`NEEDED`-libs build (SHA-256
+  `798bf09730535dea082141c3c685317cde4cb7d8d34c8dd9340f92cd2434ffce`,
+  21 MB) is now understood to correspond to an OLDER upstream build shape
+  that no longer applies to `v2.12.3` and was never compared against an
+  official artifact in that pass - kept here only as a "what changed"
+  data point (Section 1), not as current guidance.
+- The independently-built binary and the downloaded official artifact
+  were both **kept in the scratch/build directory only**
+  (`/tmp/hysteria-v2123-android-arm64-build{1,2}`, `/tmp/dl_hysteria-android-arm64`,
+  outside the repo) and are **not committed to git** - only this
+  hash/metadata record is, matching B45A's own precedent.
+
+## 13. ABI / packaging analysis (Phase 4) - updated for the v2.12.3
+CGO_ENABLED=1 artifact shape
 
 Per `PROJECT_ARCHITECTURE.md` (lines ~2399-2408) and B45A's own physically-
 proven lesson (Section 24.2 of `B45A_SHADOWSOCKS_RUST_SPIKE.md`:
@@ -455,10 +668,21 @@ Android package manager extracts it to `applicationInfo.nativeLibraryDir`
 at install time with the OS-trusted `apk_data_file` SELinux label, never
 an app-written `filesDir` copy. This is a NEW binary reusing an EXISTING,
 already-proven packaging mechanism - no new packaging research is claimed
-to be needed, only re-application of B45A's fix to a second binary. The
-binary's own shape (no `NEEDED` shared libs, static-ish PIE, standard
-System V ELF) is at least as simple as `sslocal`'s, so no NEW ABI risk is
-identified beyond what B45A already solved.
+to be needed, only re-application of B45A's fix to a second binary.
+
+**Updated for `v2.12.3`'s actual (cgo-linked) shape**: unlike the earlier
+`v2.6.3`-era pass's zero-`NEEDED` static-ish binary, the CURRENT correct
+artifact (Section 12.2) links against `liblog.so`/`libdl.so`/`libc.so` -
+but these are Android's OWN always-present system libraries (part of the
+Bionic libc/system image on every Android device, never something an app
+bundles), so this does NOT change the packaging mechanism: the same
+`jniLibs`/`useLegacyPackaging` fix applies identically regardless of
+whether the binary is static or dynamically linked against system
+libraries, because the fix addresses WHERE/how the OS extracts and labels
+the file (execute permission + SELinux label at install time), not
+whether the binary itself has shared-library dependencies. No NEW ABI
+risk is identified beyond what B45A already solved, though this is a
+genuine, not-yet-physically-verified assumption (unresolved: Section 15).
 
 ## 14. Lifecycle model (Phase 5/2 combined)
 
@@ -512,58 +736,88 @@ engineering this candidate needs that Shadowsocks's own B45A/B45B spike
 did not (Section 6's TUN-ownership gap), before adding Hysteria2's own
 complexity on top.
 
-## 17. Idle/screen-lock issue analysis (Phase 9)
+## 17. Idle/screen-lock issue analysis (Phase 9) - re-assessed against
+v2.12.1/v2.12.2/v2.12.3, not left at the earlier pass's conclusion
 
 - **Issue tracked**: `apernet/hysteria#1510`, "Android: Hysteria2
   constantly drops connection when idle or screen locked," opened
   2026-01-30, referencing an earlier related report (`#1365`).
-- **Current status as of 2026-09-18 (re-checked directly, not assumed
-  fixed from B46-1's text)**: **still OPEN**. No maintainer
-  acknowledgment/reproduction, no assigned fix, and no documented
-  workaround were found in the issue as read. It is NOT closed and NOT
-  marked fixed in any release note reviewed in this pass.
-- **Affected layer**: the report is specifically about third-party
-  Android WRAPPER clients (Husi, NekoBox, Excalve) rather than a
-  Hysteria2-core-only repro with no VpnService/wrapper involved - the
-  issue does not cleanly separate "Hysteria2 core protocol/QUIC-library
-  bug" from "wrapper's own foreground-service/Doze handling bug," and this
-  research pass did not find upstream language that isolates it to one
-  side. **Treat as UNATTRIBUTED, not core-confirmed and not
-  wrapper-confirmed**, until B46-2P's own physical test either reproduces
-  it under Nova's OWN foreground-service/Doze handling (which already has
-  real, tested discipline for every other transport) or shows it does not
-  reproduce there.
-- **Newer releases**: no release note reviewed in this pass (up to
-  `app/v2.6.3`) claims a fix for this behavior.
-- **Accepted workaround**: none found.
-- **Doze/wakelock handling implication for Nova**: given the issue remains
-  open and unattributed, Nova cannot assume Hysteria2's own QUIC
-  keep-alive/idle-timeout tuning (`maxIdleTimeout`/`keepAlivePeriod` in
-  server/client config) alone solves this - Nova's existing
-  foreground-service/wakelock discipline (already applied uniformly across
-  transports per `docs/B46_QUIC_HTTP3_RESEARCH.md`'s own table) must still
-  be exercised specifically against Hysteria2's session, and **this is
-  hereby marked a MANDATORY physical test case for the future B46 device
-  validation** (Section 11's plan must include an explicit
-  screen-lock/idle scenario, not just the connect/TCP/UDP/reconnect cases
-  already listed) - not optional, not assumed pre-solved.
+- **Current status as of 2026-09-18 (re-checked directly again in this
+  correction pass, not assumed unchanged from the earlier finding)**:
+  **still OPEN**. Re-fetching the issue in this pass found no comments
+  referencing `v2.12.1`/`v2.12.2`/`v2.12.3` or "stateless reset," no
+  confirmation from the reporter or anyone else that a fix helped, and no
+  report that it is now resolved - it remains an unresolved, open bug
+  report with no visible maintainer disposition change since the earlier
+  pass.
+- **New, material fact this pass found that the earlier pass did not
+  have**: `app/v2.12.1`'s changelog documents "Fixed slow reconnection
+  after the client has been idle or asleep, most noticeable on mobile
+  devices. The server now sends QUIC stateless resets, so a client
+  holding a stale connection reconnects immediately instead of waiting
+  out its idle timeout." **This must NOT be read as "issue #1510 is
+  fixed"** - the release note does not reference `#1510` or `#1365` by
+  number, and the mechanisms described are distinguishable: `#1510`
+  describes the connection being DROPPED (and often failing to
+  reconnect at all, "most of the time it does not reconnect... requires
+  manual reconnection") when the screen locks; `v2.12.1`'s fix addresses
+  RECONNECTION SPEED once a client already holds a stale connection (a
+  server-side stateless-reset signal that shortens the wait before a
+  client notices its old connection is dead and starts a new one) - a
+  real, plausibly-helpful, but NARROWER fix than "the connection never
+  drops on screen-lock in the first place." **Conclusion: v2.12.1-2.12.3
+  PARTIALLY and UNCONFIRMED-ly address the reported symptom (faster
+  recovery, IF a client does reconnect), and do NOT demonstrably address
+  the root cause (why the connection drops/fails to reconnect on
+  screen-lock at all)** - this is a judgment based on reading the
+  release-note mechanism against the issue's own reported symptom, not a
+  maintainer statement either way, and should be stated exactly this
+  cautiously, not rounded up to "fixed" or down to "unrelated."
+- **Affected layer**: still unattributed between Hysteria2 core/QUIC-
+  library behavior and third-party wrapper (Husi, NekoBox, Excalve)
+  foreground-service/Doze handling - re-confirmed unchanged in this pass;
+  no upstream language found that isolates it to one side.
+- **Accepted workaround**: none found, in this pass either.
+- **Doze/wakelock handling implication for Nova, updated**: given the
+  issue remains open and only partially/unconfirmed-ly addressed by
+  `v2.12.1`'s stateless-reset change, Nova cannot assume Hysteria2's own
+  QUIC keep-alive/idle-timeout tuning OR the new stateless-reset behavior
+  alone solves this - Nova's existing foreground-service/wakelock
+  discipline (already applied uniformly across transports per
+  `docs/B46_QUIC_HTTP3_RESEARCH.md`'s own table) must still be exercised
+  specifically against Hysteria2's session, and **this remains a
+  MANDATORY physical test case for the future B46 device validation**
+  (Section 11's plan must include an explicit screen-lock/idle scenario,
+  not just the connect/TCP/UDP/reconnect cases already listed) - not
+  optional, not assumed pre-solved by `v2.12.1`'s changelog text alone.
 
 ## Sources cited (external)
 
 - [apernet/hysteria repository](https://github.com/apernet/hysteria)
 - [apernet/hysteria releases](https://github.com/apernet/hysteria/releases) -
-  tag `app/v2.6.3`
+  tag `app/v2.12.3` (current, this pass); `app/v2.12.1` (idle/reconnect
+  fix changelog, Section 17); `app/v2.6.3` (historical, superseded)
+- [apernet/hysteria releases - hysteria-android-arm64 asset for app/v2.12.3](https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.3/hysteria-android-arm64) -
+  downloaded and hashed directly in this pass (Section 12.1)
 - [FD Control Protocol - Hysteria 2 docs](https://v2.hysteria.network/docs/advanced/FD-Control/)
 - [Hysteria 2 Full Client Config docs](https://v2.hysteria.network/docs/advanced/Full-Client-Config/)
-- [apernet/hysteria#1510 - Android idle/screen-lock disconnect issue](https://github.com/apernet/hysteria/issues/1510)
+- [Hysteria 2 Changelog](https://v2.hysteria.network/docs/Changelog/)
+- [apernet/hysteria#1510 - Android idle/screen-lock disconnect issue](https://github.com/apernet/hysteria/issues/1510) -
+  re-checked in this pass, still open
 - [apernet/hysteria#1365 - prior related disconnection report](https://github.com/apernet/hysteria/issues/1365)
-- Source read directly from the cloned repository at commit
-  `a24ef5b8f003b8a3127c52a20696b5ee9daa1160`:
-  `LICENSE.md`, `go.work`, `app/go.mod`, `app/cmd/client.go`,
+- [wlynxg/anet#11 - invalid reference to net.zoneCache (the `-checklinkname=0` fix)](https://github.com/wlynxg/anet/issues/11)
+- [golang/go#68082 - the upstream Go/Android bug `wlynxg/anet` works around](https://github.com/golang/go/issues/68082)
+- Source read directly from the cloned repository, `app/v2.12.3` tag,
+  commit `e1366b173ccf5706e1e4630fe8aa654a4b574085` (this pass):
+  `LICENSE.md`, `go.work`, `app/go.mod`, `app/go.sum`, `app/cmd/client.go`,
   `app/internal/tun/server.go`, `app/internal/sockopts/sockopts.go`,
   `app/internal/sockopts/sockopts_linux.go`, and the vendored
-  `github.com/apernet/sing-tun@v0.2.6-.../tun.go`/`tun_linux.go` in the
-  local Go module cache (`/root/go/pkg/mod`) populated by this build.
+  `github.com/apernet/sing-tun@v0.2.6-0.20250920121535-.../tun.go`/
+  `tun_linux.go` and `github.com/wlynxg/anet@v0.0.5/interface_android.go`
+  in the local Go module cache (`/root/go/pkg/mod`) populated by this
+  build. Historical: the earlier pass's `app/v2.6.3` commit
+  `a24ef5b8f003b8a3127c52a20696b5ee9daa1160` reading, kept only for the
+  Section 1 "what changed" comparison.
 
 ## Internal prior evidence cited
 
@@ -577,16 +831,32 @@ complexity on top.
 - `PROJECT_ARCHITECTURE.md` (lines ~2399-2408) - jniLibs packaging
   invariant for both debug and release variants.
 
-## Final classification
+## Final classification - based on current app/v2.12.3, not superseded
+v2.6.3 research
 
-**B. RESEARCH BLOCKED** - not on license, not on the core protocol, and
-not on buildability (the arm64 artifact builds cleanly and reproducibly
-with zero NDK and zero cgo), but specifically because **Hysteria2's own
-shipped `tun` client mode cannot accept a VpnService-created TUN fd
-(Section 4)**, which means the smallest credible Android spike needs a
-genuinely new piece of engineering B45A/B45B's shadowsocks-rust spike did
-not (a TUN-to-SOCKS5 relay layer, Section 6/15) before any physical device
-test can even attempt `TUN_ESTABLISHED -> RUNTIME_STARTED`. This is a
-named, precise, solvable problem (not a rejection of the protocol/license/
-maintenance posture, all of which look credible) - B46-2P's first task is
-exactly this relay-layer design (Section 16), not physical testing yet.
+**B. RESEARCH BLOCKED** - re-confirmed, not merely carried over, against
+current upstream `app/v2.12.3` (commit `e1366b173ccf5706e1e4630fe8aa654a4b574085`).
+Not on license (still MIT), not on the core protocol, and not on
+buildability in the sense that matters (a structurally-equivalent arm64
+artifact WAS produced, matching the official artifact's toolchain,
+CGO/NDK configuration, and dependency-linkage shape - though not yet
+byte-identical to it, Section 12.3, and only after discovering and working
+around a real `v2.12.3`-introduced build regression, the `wlynxg/anet`
+linkname issue, Section 12.2). The blocking reason is unchanged in kind
+but newly re-verified in substance: **Hysteria2's own shipped `tun` client
+mode still cannot accept a VpnService-created TUN fd in `app/v2.12.3`**
+(Section 4 - re-read directly from the current tree, not assumed), which
+means the smallest credible Android spike still needs a genuinely new
+piece of engineering B45A/B45B's shadowsocks-rust spike did not (a
+TUN-to-`sing-tun`-driven-relay layer feeding Hysteria2's SOCKS5 listener,
+Section 6/15) before any physical device test can even attempt
+`TUN_ESTABLISHED -> RUNTIME_STARTED`. This is a named, precise, solvable
+problem (not a rejection of the protocol/license/maintenance posture, all
+of which look credible seven minor releases later too) - B46-2P's first
+task is exactly this relay-layer design (Section 16), not physical testing
+yet. Two new, genuinely useful facts this correction pass adds beyond
+re-confirming the verdict: (1) an official Android arm64 artifact now
+exists upstream and was independently compared against (Section 12.1,
+12.3), and (2) `v2.12.1`'s server-side stateless-reset change is real but
+only PARTIALLY relevant to issue `#1510` and must not be read as resolving
+it (Section 17).
