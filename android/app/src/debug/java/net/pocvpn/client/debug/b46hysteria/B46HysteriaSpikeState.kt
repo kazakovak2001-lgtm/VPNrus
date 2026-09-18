@@ -62,7 +62,17 @@ sealed interface B46HysteriaSpikeError {
     data class StopTimedOut(val waitedMillis: Long) : B46HysteriaSpikeError
 }
 
-/** Immutable snapshot of everything a future debug UI would show. */
+/**
+ * Immutable snapshot of everything a future debug UI would show.
+ *
+ * [runtimePid] means "the pid this status currently claims ownership of" -
+ * it is ALWAYS cleared (set to `null`) the moment the runtime process is
+ * known to no longer be live (normal `stopped()`, or an unexpected exit
+ * via [B46HysteriaSpikeTransitions.runtimeExitedUnexpectedly]), so a
+ * caller can never read a stale pid and mistake it for a still-owned,
+ * still-live process. [exitCode] is separate, purely diagnostic evidence
+ * of how the LAST run ended and is allowed to persist independently.
+ */
 data class B46HysteriaSpikeStatus(
     val phase: B46HysteriaSpikePhase,
     val runtimePid: Int? = null,
@@ -73,6 +83,9 @@ data class B46HysteriaSpikeStatus(
 ) {
     companion object {
         val IDLE = B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.IDLE)
+
+        /** The terminal state a normal, completed stop reaches - see [B46HysteriaSpikeTransitions.stopped]. */
+        val STOPPED = B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.STOPPED)
     }
 }
 
@@ -92,10 +105,20 @@ data class B46HysteriaSpikeStatus(
  */
 object B46HysteriaSpikeTransitions {
 
-    /** Only IDLE, STOPPED, or ERROR may transition to STARTING - never a double-start. */
+    /**
+     * Only IDLE or STOPPED may transition to STARTING - never a double-start,
+     * and, deliberately, **never directly from ERROR**. `failed()`/
+     * [runtimeExitedUnexpectedly] can be entered while a runtime/process/
+     * resource is still live or not yet confirmed torn down (ERROR only
+     * records that something went wrong, not that cleanup finished) - so
+     * ERROR is NOT treated as "safe to restart from" here. The required
+     * recovery path is explicit: `ERROR -> STOPPING -> STOPPED -> STARTING`
+     * (i.e. the SAME stop/cleanup path a normal session takes, `canStop`
+     * already allows it from ERROR too), never a shortcut straight back to
+     * STARTING.
+     */
     fun canStart(current: B46HysteriaSpikeStatus): Boolean = current.phase == B46HysteriaSpikePhase.IDLE ||
-        current.phase == B46HysteriaSpikePhase.STOPPED ||
-        current.phase == B46HysteriaSpikePhase.ERROR
+        current.phase == B46HysteriaSpikePhase.STOPPED
 
     fun starting(): B46HysteriaSpikeStatus = B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.STARTING)
 
@@ -126,14 +149,29 @@ object B46HysteriaSpikeTransitions {
 
     fun stopping(current: B46HysteriaSpikeStatus): B46HysteriaSpikeStatus = current.copy(phase = B46HysteriaSpikePhase.STOPPING)
 
-    fun stopped(): B46HysteriaSpikeStatus = B46HysteriaSpikeStatus.IDLE
+    /**
+     * A completed stop reaches `STOPPED`, never silently collapsed back to
+     * `IDLE` - they are distinct phases in [B46HysteriaSpikePhase] on
+     * purpose (IDLE = never started; STOPPED = a session ran and was
+     * cleanly torn down), and collapsing them would make `STOPPED`
+     * unreachable via the normal stop path.
+     */
+    fun stopped(): B46HysteriaSpikeStatus = B46HysteriaSpikeStatus.STOPPED
 
     fun failed(current: B46HysteriaSpikeStatus, error: B46HysteriaSpikeError): B46HysteriaSpikeStatus =
         current.copy(phase = B46HysteriaSpikePhase.ERROR, lastError = error)
 
-    /** A runtime process that exits on its own (never requested) always clears ownership - never left dangling. */
+    /**
+     * A runtime process that exits on its own (never requested) always
+     * clears [B46HysteriaSpikeStatus.runtimePid] - the process is KNOWN
+     * terminated, so the resulting `ERROR` status must never claim
+     * ownership of a pid that no longer refers to a live process.
+     * [exitCode] is kept as separate diagnostic evidence of how that run
+     * ended; it is not an ownership claim.
+     */
     fun runtimeExitedUnexpectedly(current: B46HysteriaSpikeStatus, exitCode: Int): B46HysteriaSpikeStatus = current.copy(
         phase = B46HysteriaSpikePhase.ERROR,
+        runtimePid = null,
         exitCode = exitCode,
         lastError = B46HysteriaSpikeError.RuntimeExitedUnexpectedly(exitCode),
     )

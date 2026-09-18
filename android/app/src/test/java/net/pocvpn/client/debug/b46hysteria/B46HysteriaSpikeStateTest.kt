@@ -19,10 +19,40 @@ class B46HysteriaSpikeStateTest {
     }
 
     @Test
-    fun `canStart is true from IDLE STOPPED and ERROR`() {
+    fun `canStart is true from IDLE and STOPPED only`() {
         assertTrue(B46HysteriaSpikeTransitions.canStart(B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.IDLE)))
         assertTrue(B46HysteriaSpikeTransitions.canStart(B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.STOPPED)))
-        assertTrue(B46HysteriaSpikeTransitions.canStart(B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.ERROR)))
+    }
+
+    @Test
+    fun `canStart is false from ERROR - restart must go through explicit cleanup first`() {
+        // ERROR only records that something went wrong, never that cleanup finished - a runtime/
+        // process/resource may still be live. Restarting directly from ERROR would risk starting
+        // a second session on top of one that was never confirmed torn down.
+        assertFalse(B46HysteriaSpikeTransitions.canStart(B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.ERROR)))
+    }
+
+    @Test
+    fun `required recovery path from ERROR is STOPPING then STOPPED then STARTING`() {
+        var status = B46HysteriaSpikeTransitions.starting()
+        status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 42)
+        status = B46HysteriaSpikeTransitions.failed(status, B46HysteriaSpikeError.RuntimeSpawnFailed("boom"))
+        assertEquals(B46HysteriaSpikePhase.ERROR, status.phase)
+        assertFalse(B46HysteriaSpikeTransitions.canStart(status))
+
+        // ERROR must still be stoppable (cleanup is how you get OUT of ERROR).
+        assertTrue(B46HysteriaSpikeTransitions.canStop(status))
+        status = B46HysteriaSpikeTransitions.stopping(status)
+        assertEquals(B46HysteriaSpikePhase.STOPPING, status.phase)
+        assertFalse(B46HysteriaSpikeTransitions.canStart(status))
+
+        status = B46HysteriaSpikeTransitions.stopped()
+        assertEquals(B46HysteriaSpikePhase.STOPPED, status.phase)
+        assertTrue(B46HysteriaSpikeTransitions.canStart(status))
+
+        status = B46HysteriaSpikeTransitions.starting()
+        assertEquals(B46HysteriaSpikePhase.STARTING, status.phase)
     }
 
     @Test
@@ -62,7 +92,11 @@ class B46HysteriaSpikeStateTest {
         assertEquals(B46HysteriaSpikePhase.STOPPING, status.phase)
 
         status = B46HysteriaSpikeTransitions.stopped()
-        assertEquals(B46HysteriaSpikeStatus.IDLE, status)
+        // A completed stop reaches STOPPED, not IDLE - they are distinct phases (IDLE = never
+        // started; STOPPED = ran and was cleanly torn down), and collapsing them would make
+        // STOPPED unreachable via the normal stop path.
+        assertEquals(B46HysteriaSpikeStatus.STOPPED, status)
+        assertEquals(B46HysteriaSpikePhase.STOPPED, status.phase)
     }
 
     @Test
@@ -79,8 +113,9 @@ class B46HysteriaSpikeStateTest {
     }
 
     @Test
-    fun `stop is idempotent - canStop is false once STOPPED`() {
+    fun `stop is idempotent - canStop is false once STOPPED or IDLE`() {
         assertFalse(B46HysteriaSpikeTransitions.canStop(B46HysteriaSpikeStatus.IDLE))
+        assertFalse(B46HysteriaSpikeTransitions.canStop(B46HysteriaSpikeStatus.STOPPED))
     }
 
     @Test
@@ -94,6 +129,21 @@ class B46HysteriaSpikeStateTest {
         assertEquals(B46HysteriaSpikePhase.ERROR, status.phase)
         assertEquals(137, status.exitCode)
         assertTrue(status.lastError is B46HysteriaSpikeError.RuntimeExitedUnexpectedly)
+    }
+
+    @Test
+    fun `runtimeExitedUnexpectedly clears runtimePid - a terminated process is never claimed as owned`() {
+        var status = B46HysteriaSpikeTransitions.starting()
+        status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 999)
+        assertEquals(999, status.runtimePid)
+
+        status = B46HysteriaSpikeTransitions.runtimeExitedUnexpectedly(status, exitCode = 1)
+
+        // The pid is cleared - the process is KNOWN dead, so ERROR must never claim ownership of it.
+        assertEquals(null, status.runtimePid)
+        // exitCode remains as separate, purely diagnostic evidence of how the run ended.
+        assertEquals(1, status.exitCode)
     }
 
     @Test

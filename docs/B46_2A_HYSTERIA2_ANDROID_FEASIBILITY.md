@@ -12,6 +12,21 @@ finding. Any `v2.6.3` figures kept for context are explicitly labeled
 artifact comparison and an NDK-based `CGO_ENABLED=1` build the original
 pass did not attempt (Section 12).
 
+**SECOND CORRECTION PASS (2026-09-18, same day, final revision before
+merge-readiness review):** the Hysteria2 `v2.12.3` research conclusion
+above (RESEARCH BLOCKED, TUN-fd gap, FD Control findings) is unchanged and
+was independently re-checked, not revised. This pass fixes three bugs
+found in the debug-only pure Kotlin state machine itself
+(`B46HysteriaSpikeState.kt`/`B46HysteriaSpikeStateTest.kt`, Section 8):
+`STOPPED` was unreachable via the normal stop path (`stopped()` returned
+`IDLE`), `canStart()` unsafely allowed restarting directly from `ERROR`,
+and `runtimeExitedUnexpectedly()` did not clear `runtimePid` for a
+process known to be dead. **Note for anyone reading this PR**: this PR's
+diff is NOT documentation-only - it contains this research document AND
+the debug-only Kotlin state-machine source + test file described in
+Section 8, all under `android/app/src/debug/` and
+`android/app/src/test/` and unreachable from any production code path.
+
 **Status of this document: PREPARATION ONLY. No physical Android device was
 available in this environment. No production code, TransportKind, or
 wiring into `TransportRegistry`/`SmartConnectDecisionEngine`/
@@ -35,31 +50,36 @@ branch; (C) before the final verdict below. No architectural blocker was
 found - see Section 16.
 
 **Known environment limitation, stated plainly (not worked around by
-fabricating a result):** this session initially had no Android SDK at
-all, so `./gradlew testDebugUnitTest` failed at Gradle's SDK-location
-check before compiling anything. During this correction pass, an Android
-SDK image (`/usr/lib/android-sdk`, licenses accepted, Build-Tools 34/
-Platform 35/Platform-Tools auto-installed by Gradle) was made available
-and DID get further - Gradle successfully resolved the SDK and reached
-real compilation tasks. It then failed for a genuinely DIFFERENT, unrelated
-reason: `:app:checkAwgTunnelAar` fails because the pre-built AmneziaWG
-tunnel AAR (`android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar`,
-produced by a separate WSL2 build step per `docs/RUNBOOK.md`) is not
-present in this environment - a production build dependency entirely
-unrelated to this slice's B46-2A changes, which this task correctly does
-not fabricate, download from an untrusted source, or work around by
-editing production build config. The added
-`B46HysteriaSpikeStateTest.kt` therefore still could not be executed via
-Gradle in this environment, but the blocker is now precisely identified
-as "missing AWG AAR prerequisite," not "no SDK." The new Kotlin was
-instead verified by hand against the already-merged, already device-
-tested `B45ASpikeState.kt`/`B45ARuntimeTest.kt` pattern it deliberately
-mirrors line-for-line in structure (pure state/transitions type with no
-Android framework import, `require`/`check`-based transition guards,
-idempotent stop, error-preserves-prior-fields discipline). B46-2P (the
-first slice with a real device, or this same environment with the AWG AAR
-prerequisite satisfied) must run this test suite for real before relying
-on it.
+fabricating a result):** `./gradlew testDebugUnitTest` still cannot run
+end to end in this environment. An Android SDK image was made available
+during the correction pass (`/usr/lib/android-sdk`, licenses accepted,
+Build-Tools 34/Platform 35/Platform-Tools auto-installed by Gradle) and
+Gradle got as far as real compilation tasks, but then failed at
+`:app:checkAwgTunnelAar` - a pre-built AmneziaWG tunnel AAR
+(`android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar`, produced by
+a separate WSL2 build step per `docs/RUNBOOK.md`) is not present in this
+environment. That is a production build prerequisite entirely unrelated
+to this slice's B46-2A changes, and this task correctly does not
+fabricate it, download it from an untrusted source, or work around it by
+editing production build config - so the real Gradle/Android unit-test
+task was never actually run, in either pass.
+
+**What WAS actually run in the Kotlin-bugfix correction pass, and is a
+genuine (not fabricated) result**: `B46HysteriaSpikeState.kt` and
+`B46HysteriaSpikeStateTest.kt` were compiled directly with the Kotlin
+compiler (`K2JVMCompiler`, assembled from jars already present in the
+Gradle distribution/cache in this environment - no Android Gradle Plugin,
+no Android SDK involved) against JUnit 4.13.2 + Hamcrest 1.3, and the
+resulting test class was executed with `org.junit.runner.JUnitCore`
+directly on the JVM. **Result: all 12 tests passed** (`JUnit version
+4.13.2 ... OK (12 tests)`). This is a real execution of the real test
+code against the real compiled state-machine code - it is NOT the same as
+a full Gradle/Android `testDebugUnitTest` run (which additionally
+validates Android Gradle Plugin wiring, source-set configuration, and
+dependency resolution that this manual harness bypasses entirely), and
+B46-2P (or this same environment once the AWG AAR prerequisite is
+satisfied) must still run the real Gradle task before relying on this as
+the whole story.
 
 ## 1. Upstream version / provenance
 
@@ -415,11 +435,31 @@ not-yet-written I/O classes:
     (`TUN_ESTABLISHED` before `RUNTIME_STARTED` before
     `FD_CONTROL_READY` before `DATA_PLANE_READY`, via `check()` guards),
     idempotent stop, and "unexpected exit always clears to `ERROR`."
+  - **Correction-pass bugfixes (found in review, fixed in the same PR,
+    not carried as known bugs)**: (1) `stopped()` now returns
+    `phase = STOPPED`, not `IDLE` - a completed cleanup is a distinct,
+    reachable phase from "never started," matching the enum's own
+    `STOPPED` value actually being used; (2) `canStart()` now allows only
+    `IDLE`/`STOPPED`, never `ERROR` directly - `ERROR` only records that
+    something went wrong, not that a live runtime/process/resource was
+    torn down, so the enforced recovery path is
+    `ERROR -> STOPPING -> STOPPED -> STARTING`, never a shortcut; (3)
+    `runtimeExitedUnexpectedly()` now clears `runtimePid` to `null` (the
+    process is KNOWN terminated, so `ERROR` must never claim ownership of
+    a dead pid) while keeping `exitCode` as separate diagnostic evidence.
 - `android/app/src/test/java/net/pocvpn/client/debug/b46hysteria/B46HysteriaSpikeStateTest.kt`
-  - 9 unit tests covering the happy path, illegal-skip rejection
-    (`dataPlaneReady` cannot be reached by skipping `fdControlReady`),
-    idempotent stop, counter accumulation without cross-field mutation,
-    and unexpected-exit handling.
+  - 12 unit tests (grew from the original 9 to cover the three fixes
+    above) covering the happy path (now asserting `STOPPED`, not `IDLE`),
+    illegal-skip rejection (`dataPlaneReady` cannot be reached by
+    skipping `fdControlReady`), idempotent stop from both `IDLE` and
+    `STOPPED`, counter accumulation without cross-field mutation,
+    unexpected-exit handling (including the `runtimePid`-clearing
+    behavior), `canStart(ERROR) == false`, and the full
+    `ERROR -> STOPPING -> STOPPED -> STARTING` recovery path. **All 12
+    pass** - see the environment-limitation note above for exactly how
+    they were executed in this session (a manual `kotlinc`+`JUnitCore`
+    harness, not the full Gradle task, which remains blocked by an
+    unrelated missing AWG AAR prerequisite).
 
 **Not written in this slice, deliberately**: `B46HysteriaSpikeActivity`,
 `B46HysteriaVpnService`, `B46HysteriaRuntime`, the FD Control bridge
