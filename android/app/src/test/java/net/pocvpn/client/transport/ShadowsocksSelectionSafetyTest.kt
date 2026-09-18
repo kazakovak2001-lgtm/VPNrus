@@ -6,11 +6,12 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * B45B-3 (Phase 16, items 18-20 / Phase 15) - guards that the production
- * ShadowsocksTransport/ShadowsocksVpnService adapter shell this slice adds
- * remains genuinely unreachable from real selection: TransportRegistry's
- * defaults() must keep SHADOWSOCKS_2022 at NOT_IMPLEMENTED with no live
- * factory, exactly as before this slice.
+ * B45B-3 (Phase 16, items 18-20 / Phase 15) - guards that TransportRegistry's
+ * static defaults() helper (a legacy Phase-2A fixture, distinct from the real
+ * per-endpoint construction path - MainViewModel.buildTransportRegistry(endpointId) -
+ * that B45B-4 wires SHADOWSOCKS_2022 selection into) keeps SHADOWSOCKS_2022 at
+ * NOT_IMPLEMENTED with no live factory. B45B-4's own tests
+ * (MainViewModelShadowsocksSelectionTest) cover the real selection path.
  */
 class ShadowsocksSelectionSafetyTest {
 

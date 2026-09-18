@@ -245,6 +245,17 @@ class VpnController(
     // before connect(); failure in an observer cannot alter execution.
     private val onTransportAttemptStarting: ((EndpointId, TransportKind) -> Unit)? = null,
     private val onReconnectIncident: ((ReconnectIncidentEvent) -> Unit)? = null,
+    // B45B-4 - additive, defaults to null (same "no wiring, no behavior" seam
+    // every other optional collaborator in this class already uses). The SAME
+    // real ShadowsocksTransport instance the Smart Connect registry
+    // (MainViewModel.buildTransportRegistry) also registers - never a second,
+    // independently-constructed one (see that class's own "one instance"
+    // discipline). Its own credential/ABI/binary eligibility is unaffected by
+    // this wiring - only WHETHER this controller can build a TransportConfig
+    // for SHADOWSOCKS_2022 at all (see supportedKinds/buildTransportConfig's
+    // own docs); registry-level AVAILABLE/NOT_IMPLEMENTED is the real gate on
+    // whether Smart Connect ever resolves this kind in the first place.
+    private val shadowsocksTransport: VpnTransport? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -274,6 +285,10 @@ class VpnController(
         if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null || relayXrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
         if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null || relayXrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
         if (cdnRuntimeCapabilities.isPinnedXhttpExecutable()) add(TransportKind.XRAY_XHTTP)
+        // B45B-4 - same shape as the others: this controller can only ever
+        // build a TransportConfig.Shadowsocks (see buildTransportConfig's own
+        // `when`) when a real ShadowsocksTransport was actually wired.
+        if (shadowsocksTransport != null) add(TransportKind.SHADOWSOCKS_2022)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -510,7 +525,18 @@ class VpnController(
                 // (VpnController.doConnectAttempt) is completely unaffected,
                 // this only ever fires for an XRAY_REALITY/TLS_TCP transport.
                 if (transportState is TransportState.Error &&
-                    (newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP || newTransport.kind == TransportKind.XRAY_XHTTP)
+                    (
+                        newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP ||
+                            newTransport.kind == TransportKind.XRAY_XHTTP ||
+                            // B45B-4 - same reasoning: ShadowsocksTransport's own
+                            // observeState() only reports Error after
+                            // ShadowsocksVpnService's own real fail-closed checks
+                            // (credential/binary/tun) - see that service's own
+                            // docs - so this is a genuine terminal failure, never
+                            // fabricated, and must be recorded under the SAME
+                            // typed category for Auto-gateway advancement to work.
+                            newTransport.kind == TransportKind.SHADOWSOCKS_2022
+                        )
                 ) {
                     diagnostics.recordError(VpnError.HandshakeTimeout)
                 }
@@ -963,8 +989,9 @@ class VpnController(
                             false
                         }
                     } else {
-                        // B8I6/B33 - XRAY_REALITY/TLS_TCP (the only other
-                        // kinds reaching here): never fabricate a stronger
+                        // B8I6/B33/B45B-4 - XRAY_REALITY/TLS_TCP/XRAY_XHTTP/
+                        // SHADOWSOCKS_2022 (the only other kinds reaching
+                        // here): never fabricate a stronger
                         // success signal than the transport itself provides -
                         // no forced Connected here, ever. As of B33,
                         // VlessRealityTransport/VlessTlsTransport's own
@@ -1189,6 +1216,28 @@ class VpnController(
                 }
             }
 
+            TransportKind.SHADOWSOCKS_2022 -> {
+                // B45B-4 - deliberately carries no key material (mirrors
+                // TransportConfig.Shadowsocks's own docs): the AEAD-2022
+                // secret is resolved from Shadowsocks2022CredentialRepository
+                // inside ShadowsocksVpnService at connect() time, scoped to
+                // endpointId, never threaded through this config object.
+                // Unreachable unless shadowsocksTransport != null (that's the
+                // only way SHADOWSOCKS_2022 ever enters supportedKinds).
+                // host/port come from THIS attempt's own GatewayConfigSnapshot
+                // (config.endpointHost/endpointPort) - the SAME manifest-
+                // derived-per-candidate-binding source AWG's own peer address
+                // already uses (see AutoGatewaySelector.snapshotFor's own
+                // docs: every candidate, of any transport, carries a snapshot
+                // built from ITS OWN manifest binding) - never a second,
+                // independently-resolved address for this transport.
+                TransportConfig.Shadowsocks(
+                    endpointId = pendingConnectEndpointId,
+                    host = config.endpointHost,
+                    port = config.endpointPort,
+                    routingMode = routingMode,
+                )
+            }
             else -> throw UnsupportedOperationException("no TransportConfig builder for $kind yet")
         }
 

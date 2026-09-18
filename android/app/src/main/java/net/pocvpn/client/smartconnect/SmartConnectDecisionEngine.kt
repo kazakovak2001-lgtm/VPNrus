@@ -28,6 +28,11 @@ object SmartConnectDecisionEngine {
         // Foundation only: remains NOT_IMPLEMENTED until real XHTTP execution is wired.
         TransportKind.XRAY_XHTTP,
         TransportKind.TLS_TCP,
+        // B45B-4 - appended, never inserted earlier: SHADOWSOCKS_2022 must
+        // only ever be chosen when every other transport above it is
+        // unavailable (or the user pins it via Manual), same as this list's
+        // existing ordering discipline never reorders an earlier entry.
+        TransportKind.SHADOWSOCKS_2022,
     )
 
     fun decide(

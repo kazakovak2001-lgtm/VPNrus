@@ -79,17 +79,14 @@ class SmartConnectDecisionEngineTest {
 
 
     @Test
-    fun `preferred order explicitly contains every transport kind including XHTTP, except kinds not yet wired into Smart Connect selection`() {
-        // B45B-1 - SHADOWSOCKS_2022 exists as a type (TransportKind, TransportCapabilities,
-        // SignedTransportProfile) but is deliberately NOT wired into Smart Connect selection yet
-        // (TransportRegistry registers it NOT_IMPLEMENTED with no factory - see B45B-1's own scope
-        // boundary in docs/B45B_SHADOWSOCKS_PRODUCTION_ADAPTER_DESIGN.md). PREFERRED_ORDER is the
-        // real selection-priority authority and must not silently include a kind with no adapter.
-        val notYetWiredIntoSelection = setOf(TransportKind.SHADOWSOCKS_2022)
-        assertEquals(
-            TransportKind.entries.toSet() - notYetWiredIntoSelection,
-            SmartConnectDecisionEngine.PREFERRED_ORDER.toSet(),
-        )
+    fun `preferred order explicitly contains every transport kind, SHADOWSOCKS_2022 appended last`() {
+        // B45B-4 - SHADOWSOCKS_2022 selection wiring: appended to the END of
+        // PREFERRED_ORDER, never inserted earlier or reordering an existing
+        // entry (task requirement - "do not reorder AMNEZIA_WG/XRAY_REALITY
+        // blindly"). Registry-level AVAILABLE/NOT_IMPLEMENTED (see
+        // TransportRegistry/MainViewModel.buildTransportRegistry) remains the
+        // real gate on whether it is ever actually selectable.
+        assertEquals(TransportKind.entries.toSet(), SmartConnectDecisionEngine.PREFERRED_ORDER.toSet())
         assertEquals(
             listOf(
                 TransportKind.AMNEZIA_WG,
@@ -97,9 +94,65 @@ class SmartConnectDecisionEngineTest {
                 TransportKind.XRAY_REALITY,
                 TransportKind.XRAY_XHTTP,
                 TransportKind.TLS_TCP,
+                TransportKind.SHADOWSOCKS_2022,
             ),
             SmartConnectDecisionEngine.PREFERRED_ORDER,
         )
+    }
+
+    @Test
+    fun `SHADOWSOCKS_2022 is only chosen under AUTO when nothing else is AVAILABLE`() {
+        val shadowsocks = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val registryWithBoth = TransportRegistry.build(
+            listOf(
+                net.pocvpn.client.transport.TransportDescriptor(
+                    kind = TransportKind.AMNEZIA_WG,
+                    status = net.pocvpn.client.transport.TransportStatus.AVAILABLE,
+                    capabilities = net.pocvpn.client.transport.TransportCapabilities.amneziaWg(),
+                    factory = { FakeVpnTransport() },
+                ),
+                net.pocvpn.client.transport.TransportDescriptor(
+                    kind = TransportKind.SHADOWSOCKS_2022,
+                    status = net.pocvpn.client.transport.TransportStatus.AVAILABLE,
+                    capabilities = net.pocvpn.client.transport.TransportCapabilities.shadowsocks2022AdapterShell(),
+                    factory = { shadowsocks },
+                ),
+            ),
+        )
+        val decision = SmartConnectDecisionEngine.decide(usableProfile(), registryWithBoth)
+        assertEquals(TransportSelectionDecision.SelectTransport(TransportKind.AMNEZIA_WG), decision)
+
+        val registryWithOnlyShadowsocks = TransportRegistry.build(
+            listOf(
+                net.pocvpn.client.transport.TransportDescriptor(
+                    kind = TransportKind.SHADOWSOCKS_2022,
+                    status = net.pocvpn.client.transport.TransportStatus.AVAILABLE,
+                    capabilities = net.pocvpn.client.transport.TransportCapabilities.shadowsocks2022AdapterShell(),
+                    factory = { shadowsocks },
+                ),
+            ),
+        )
+        val onlyDecision = SmartConnectDecisionEngine.decide(usableProfile(), registryWithOnlyShadowsocks)
+        assertEquals(TransportSelectionDecision.SelectTransport(TransportKind.SHADOWSOCKS_2022), onlyDecision)
+    }
+
+    @Test
+    fun `manual selection of SHADOWSOCKS_2022 succeeds when it is AVAILABLE`() {
+        val shadowsocks = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val registry = TransportRegistry.build(
+            listOf(
+                net.pocvpn.client.transport.TransportDescriptor(
+                    kind = TransportKind.SHADOWSOCKS_2022,
+                    status = net.pocvpn.client.transport.TransportStatus.AVAILABLE,
+                    capabilities = net.pocvpn.client.transport.TransportCapabilities.shadowsocks2022AdapterShell(),
+                    factory = { shadowsocks },
+                ),
+            ),
+        )
+        val decision = SmartConnectDecisionEngine.decide(
+            usableProfile(), registry, UserTransportPreference.Manual(TransportKind.SHADOWSOCKS_2022),
+        )
+        assertEquals(TransportSelectionDecision.SelectTransport(TransportKind.SHADOWSOCKS_2022), decision)
     }
 
     @Test

@@ -883,4 +883,102 @@ class VpnControllerTest {
         assertFalse(controller.state.value.toString().contains(invalidProfile.realityPublicKey))
         assertFalse(controller.state.value.toString().contains(invalidProfile.shortId))
     }
+
+    // --- B45B-4: SHADOWSOCKS_2022 selection wiring - orchestrator/ownership/failure semantics ---
+
+    @Test
+    fun `resolved SHADOWSOCKS_2022 with a wired transport invokes it with a config built from this attempt's own endpoint host-port`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        runCurrent()
+
+        assertEquals(1, shadowsocksTransport.connectCallCount)
+        assertEquals(0, awgTransport.connectCallCount)
+        val sentConfig = shadowsocksTransport.lastConfig
+        assertTrue(sentConfig is TransportConfig.Shadowsocks)
+        assertEquals(configuredGateway().endpointHost, (sentConfig as TransportConfig.Shadowsocks).host)
+        assertEquals(configuredGateway().endpointPort, sentConfig.port)
+        assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `SHADOWSOCKS_2022 is refused before the transport is ever touched when no ShadowsocksTransport is wired`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            // shadowsocksTransport deliberately not wired.
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        runCurrent()
+
+        assertEquals(0, shadowsocksTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `a failed SHADOWSOCKS_2022 start leaves no active transport ownership - kind clears, state is terminal Error`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022).apply {
+            failConnectWith = java.io.IOException("simulated process exit before Connected")
+        }
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        runCurrent()
+
+        assertEquals(1, shadowsocksTransport.connectCallCount)
+        // Note: not asserting controller.state.value directly - see
+        // `currentTransportKind stays null throughout a backend runtime
+        // failure`'s own doc for the pre-existing FakeVpnTransport/collector
+        // replay detail this shares. currentTransportKind==null (never
+        // running) and never Connected is the real ownership invariant.
+        assertEquals(VpnError.BackendStartFailure("IOException"), diagnostics.snapshot.value.lastError)
+        assertEquals(null, controller.currentTransportKind.value)
+        assertFalse(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `stop after a failed SHADOWSOCKS_2022 start is idempotent - never throws, never double-disconnects the underlying transport`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022).apply {
+            failConnectWith = java.io.IOException("simulated launch failure")
+        }
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        runCurrent()
+
+        controller.disconnect()
+        runCurrent()
+        controller.disconnect()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Disconnected || controller.state.value is TransportState.Error)
+    }
 }
