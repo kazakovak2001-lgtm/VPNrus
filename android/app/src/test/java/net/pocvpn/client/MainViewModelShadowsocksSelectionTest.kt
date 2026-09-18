@@ -30,16 +30,23 @@ import java.util.Base64
 private val VALID_KEY_BASE64 = Base64.getEncoder().encodeToString(ByteArray(32) { it.toByte() })
 
 /**
- * B45B-4 (Phase 7, items 1/2/3/4/5/9) - proves SHADOWSOCKS_2022's registry
- * eligibility genuinely requires all three narrow facts (ABI+binary
- * eligibility, wired credential source, a validated credential) and stays
- * NOT_IMPLEMENTED/fail-closed whenever any one is missing - never a fake
- * AVAILABLE state.
+ * B45B-4 (review fix) - proves SHADOWSOCKS_2022's registry eligibility
+ * genuinely requires all three narrow facts (ABI+binary eligibility, a
+ * wired per-endpoint credential source, a validated credential for THAT
+ * endpoint) and stays NOT_IMPLEMENTED/fail-closed whenever any one is
+ * missing - never a fake AVAILABLE state, and never a country/provider
+ * literal deciding availability. [shadowsocksCredentialRepositories] is a
+ * plain `Map<EndpointId, Shadowsocks2022CredentialRepository>` (the same
+ * shape [MainViewModel]'s Factory populates from `ProductionGatewayCatalog.all`,
+ * never a single Germany-fixed field) - these tests exercise it with
+ * arbitrary, non-catalog endpoint ids to prove nothing here depends on a
+ * specific country/provider name.
  */
 class MainViewModelShadowsocksSelectionTest {
 
     private val testDispatcher = StandardTestDispatcher()
-    private val germanyEndpointId = ProductionGatewayCatalog.GERMANY.endpointId
+    private val endpointA = EndpointId("endpoint-a")
+    private val endpointB = EndpointId("endpoint-b")
 
     @Before
     fun setUp() {
@@ -51,7 +58,7 @@ class MainViewModelShadowsocksSelectionTest {
         Dispatchers.resetMain()
     }
 
-    private fun validCredential(endpointId: EndpointId = germanyEndpointId) =
+    private fun validCredential(endpointId: EndpointId) =
         (
             Shadowsocks2022CredentialValidator.validate(endpointId, "2022-blake3-aes-256-gcm", VALID_KEY_BASE64)
                 as net.pocvpn.client.identity.Shadowsocks2022CredentialValidationResult.Valid
@@ -59,8 +66,8 @@ class MainViewModelShadowsocksSelectionTest {
 
     private fun newViewModel(
         shadowsocksTransport: FakeVpnTransport? = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022),
-        shadowsocksCredentialRepository: net.pocvpn.client.identity.Shadowsocks2022CredentialRepository? =
-            FakeShadowsocks2022CredentialRepository(validCredential()),
+        shadowsocksCredentialRepositories: Map<EndpointId, net.pocvpn.client.identity.Shadowsocks2022CredentialRepository> =
+            mapOf(endpointA to FakeShadowsocks2022CredentialRepository(validCredential(endpointA))),
         shadowsocksBinaryEligibility: ShadowsocksBinaryEligibility = ShadowsocksBinaryEligibility.Eligible,
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
@@ -69,7 +76,7 @@ class MainViewModelShadowsocksSelectionTest {
         reconnectManager = FakeReconnectManager(),
         diagnosticsStore = DiagnosticsStore(),
         shadowsocksTransport = shadowsocksTransport,
-        shadowsocksCredentialRepository = shadowsocksCredentialRepository,
+        shadowsocksCredentialRepositories = shadowsocksCredentialRepositories,
         shadowsocksBinaryEligibility = shadowsocksBinaryEligibility,
     )
 
@@ -79,7 +86,7 @@ class MainViewModelShadowsocksSelectionTest {
         val viewModel = newViewModel(shadowsocksTransport = transport)
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertEquals(TransportStatus.AVAILABLE, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
         // The registered factory produces the EXACT SAME instance this
         // ViewModel was given - never a second/independently-constructed one.
@@ -93,7 +100,7 @@ class MainViewModelShadowsocksSelectionTest {
         )
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
         assertNull(registry.createTransport(TransportKind.SHADOWSOCKS_2022))
     }
@@ -105,7 +112,7 @@ class MainViewModelShadowsocksSelectionTest {
         )
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
         assertNull(registry.createTransport(TransportKind.SHADOWSOCKS_2022))
     }
@@ -113,31 +120,31 @@ class MainViewModelShadowsocksSelectionTest {
     @Test
     fun `missing credential - SHADOWSOCKS_2022 stays NOT_IMPLEMENTED even with an eligible ABI-binary`() = runTest {
         val viewModel = newViewModel(
-            shadowsocksCredentialRepository = FakeShadowsocks2022CredentialRepository(credential = null),
+            shadowsocksCredentialRepositories = mapOf(endpointA to FakeShadowsocks2022CredentialRepository(credential = null)),
         )
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
     }
 
     @Test
     fun `corrupted credential - SHADOWSOCKS_2022 stays NOT_IMPLEMENTED, never trusted just because a file exists`() = runTest {
         val viewModel = newViewModel(
-            shadowsocksCredentialRepository = FakeShadowsocks2022CredentialRepository(corrupted = true),
+            shadowsocksCredentialRepositories = mapOf(endpointA to FakeShadowsocks2022CredentialRepository(corrupted = true)),
         )
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
     }
 
     @Test
-    fun `no credential repository wired at all - stays NOT_IMPLEMENTED, no fabricated availability`() = runTest {
-        val viewModel = newViewModel(shadowsocksCredentialRepository = null)
+    fun `no credential repository wired for any endpoint - stays NOT_IMPLEMENTED, no fabricated availability`() = runTest {
+        val viewModel = newViewModel(shadowsocksCredentialRepositories = emptyMap())
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
     }
 
@@ -146,29 +153,73 @@ class MainViewModelShadowsocksSelectionTest {
         val viewModel = newViewModel(shadowsocksTransport = null)
         testDispatcher.scheduler.runCurrent()
 
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
+        val registry = viewModel.buildTransportRegistry(endpointA)
         assertNull(registry.descriptorFor(TransportKind.SHADOWSOCKS_2022))
     }
 
+    // --- Endpoint-scoping/isolation (review fix - no country/provider literal decides this) ---
+
     @Test
-    fun `a credential for a different endpoint never makes Germany's SHADOWSOCKS_2022 appear available`() = runTest {
-        val otherEndpoint = EndpointId("some-other-endpoint")
+    fun `endpoint A has a real credential - A becomes eligible`() = runTest {
         val viewModel = newViewModel(
-            shadowsocksCredentialRepository = FakeShadowsocks2022CredentialRepository(validCredential(otherEndpoint)),
+            shadowsocksCredentialRepositories = mapOf(endpointA to FakeShadowsocks2022CredentialRepository(validCredential(endpointA))),
         )
         testDispatcher.scheduler.runCurrent()
 
-        // The repository itself is endpoint-scoped at construction (B45B-2) -
-        // this ViewModel's own repository instance is bound to Germany, so a
-        // credential minted for a different endpoint id never leaks through
-        // isShadowsocksAvailableFor for Germany.
-        val registry = viewModel.buildTransportRegistry(germanyEndpointId)
-        assertEquals(TransportStatus.AVAILABLE, registry.descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
-        // (Repository scoping itself - "endpoint A never receives endpoint
-        // B's credential file" - is proven at the B45B-2 layer by
-        // Shadowsocks2022CredentialRepositoryTest; this assertion documents
-        // that a mismatched endpointId embedded in the STORED credential
-        // payload is a separate, already-covered case, not a registry-layer
-        // concern this test needs to re-prove.)
+        assertEquals(TransportStatus.AVAILABLE, viewModel.buildTransportRegistry(endpointA).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+    }
+
+    @Test
+    fun `endpoint B has no wired repository at all - B stays ineligible`() = runTest {
+        val viewModel = newViewModel(
+            shadowsocksCredentialRepositories = mapOf(endpointA to FakeShadowsocks2022CredentialRepository(validCredential(endpointA))),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, viewModel.buildTransportRegistry(endpointB).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+    }
+
+    @Test
+    fun `A's credential never makes B eligible, even when B has a repository wired but no valid credential`() = runTest {
+        val viewModel = newViewModel(
+            shadowsocksCredentialRepositories = mapOf(
+                endpointA to FakeShadowsocks2022CredentialRepository(validCredential(endpointA)),
+                endpointB to FakeShadowsocks2022CredentialRepository(credential = null),
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(TransportStatus.AVAILABLE, viewModel.buildTransportRegistry(endpointA).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, viewModel.buildTransportRegistry(endpointB).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+    }
+
+    @Test
+    fun `multiple endpoints independently resolve their own credentials - both become eligible`() = runTest {
+        val viewModel = newViewModel(
+            shadowsocksCredentialRepositories = mapOf(
+                endpointA to FakeShadowsocks2022CredentialRepository(validCredential(endpointA)),
+                endpointB to FakeShadowsocks2022CredentialRepository(validCredential(endpointB)),
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(TransportStatus.AVAILABLE, viewModel.buildTransportRegistry(endpointA).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+        assertEquals(TransportStatus.AVAILABLE, viewModel.buildTransportRegistry(endpointB).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+    }
+
+    @Test
+    fun `Factory wiring is catalog-driven, not country-literal - proves both real catalog gateways are independently representable`() = runTest {
+        val germany = ProductionGatewayCatalog.GERMANY.endpointId
+        val stockholm = ProductionGatewayCatalog.STOCKHOLM.endpointId
+        val viewModel = newViewModel(
+            shadowsocksCredentialRepositories = mapOf(
+                germany to FakeShadowsocks2022CredentialRepository(validCredential(germany)),
+                stockholm to FakeShadowsocks2022CredentialRepository(credential = null),
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(TransportStatus.AVAILABLE, viewModel.buildTransportRegistry(germany).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, viewModel.buildTransportRegistry(stockholm).descriptorFor(TransportKind.SHADOWSOCKS_2022)?.status)
     }
 }
