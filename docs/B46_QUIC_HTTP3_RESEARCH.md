@@ -207,10 +207,15 @@ CONNECT-UDP alone are not, by themselves, full VPN data-plane mechanisms.
   proprietary-adjacent Android app would need the identical legal review
   before this candidate could move past research.
 - **Language**: Rust.
-- **Android/ABI**: no official Android SDK observed; would need its own JNI
-  wrapper, comparable in shape to the Shadowsocks-rust `local-tun` work but
-  starting from zero (no existing B45A-equivalent spike proves Android
-  feasibility for TUIC specifically).
+- **Android/ABI**: no first-party Android SDK/AAR identified in this
+  research pass; third-party Android integration precedent exists (TUIC
+  client support appears in general-purpose multi-protocol Android proxy
+  clients in the same ecosystem as Hysteria2's own third-party wrappers -
+  Section 4.1), but Nova has no TUIC-specific Android/`VpnService`/physical
+  feasibility evidence of its own. A future Nova adapter would still need
+  its own JNI wrapper, comparable in shape to the Shadowsocks-rust
+  `local-tun` work, with no existing B45A-equivalent spike proving Android
+  feasibility for TUIC specifically.
 
 ### 4.3 General QUIC libraries (quiche, quinn, s2n-quic)
 
@@ -1045,8 +1050,8 @@ actually established - not before, and not by this document.
   need to design its own framing/auth (explicitly out of scope: "no new
   cryptography," and a bespoke protocol has no external security review),
   or build a standards-based MASQUE/CONNECT-IP client (Section 4.5) which is
-  more defensible but still has zero Android precedent anywhere surveyed in
-  this pass.
+  more defensible but still has no existing Android implementation
+  precedent identified anywhere in this research pass.
 
 **Recommendation carried into Section 21/22's overall conclusion**: B46
 should treat option A (Xray XHTTP/H3) as effectively researched-out for the
@@ -1065,7 +1070,7 @@ physical evidence rather than by this document's analysis alone.
 | Independent failure domain from Xray | Yes | Yes | Yes | **No** (Section 5) |
 | License | MIT | **GPLv3** (needs legal review) | Depends on library (quiche BSD-2, quinn MIT/Apache-2.0, s2n-quic Apache-2.0, quic-go MIT) | MPL-2.0 (already accepted) |
 | Upstream governance stability | Active, single canonical org (apernet) | Recently restarted, multiple forks, less canonical | N/A (Nova would own the protocol code) | Already pinned/tracked in this repo |
-| Known Android runtime precedent | Third-party wrappers exist (Husi/NekoBox/Excalve), no official AAR | None observed | None (would be from-scratch) | Already running in production (`NovaXrayVpnService`) |
+| Known Android runtime precedent | Third-party wrappers exist (Husi/NekoBox/Excalve), no official AAR | No first-party SDK/AAR identified in this research pass; third-party Android integration precedent exists (general-purpose multi-protocol Android proxy clients), but no Nova-specific evidence | None (would be from-scratch) | Already running in production (`NovaXrayVpnService`) |
 | Known Android-specific issues | Documented idle/lock disconnect bug (open, unresolved) | Not surveyed in depth (less community deployment data found) | Unknown (unbuilt) | Already solved for existing Xray transports; H3 specifically blocked by Nova's own `HTTP3_DIAL_NOT_BOUNDED` gate |
 | Full TCP+UDP tunnel design intent | Yes | Yes | Yes (RFC 9484 CONNECT-IP specifically) | Only via closing the H3-dial-bounding gap, and still shares Xray's runtime |
 | Obfuscation vs QUIC fingerprinting | Active upstream investment (Salamander, Gecko) | Not found as a standard feature in this pass | Rides real HTTP/3 semantics (fingerprint audit deferred to B47) | Inherits Xray's own H3 fingerprint, not independently evaluated |
@@ -1079,7 +1084,8 @@ Nova-specific physical proof. TUIC's GPLv3 licensing and governance churn
 make it the weakest candidate for near-term adoption without a dedicated
 legal review. A from-scratch MASQUE/CONNECT-IP client is the most
 standards-aligned long-term option but the largest engineering lift with no
-existing Android precedent at all. Xray XHTTP-h3 is not a genuine diversity
+existing Android implementation precedent identified in this research pass.
+Xray XHTTP-h3 is not a genuine diversity
 candidate regardless of its lower integration cost.
 
 ## 22. Summary / MERGE READY statement
