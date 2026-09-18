@@ -123,6 +123,54 @@ data class TransportCapabilities(
             maturity = TransportMaturity.EXPERIMENTAL,
         )
 
+        /**
+         * B45B-1 - typed capability facts for the AEAD-2022 shadowsocks-rust
+         * protocol/mechanism B45A physically proved on real Android hardware
+         * (see docs/B45A_SHADOWSOCKS_RUST_SPIKE.md - FEASIBILITY PROVEN -
+         * and docs/B45B_SHADOWSOCKS_PRODUCTION_ADAPTER_DESIGN.md Section 2).
+         * As of B45B-1 there is NO `VpnTransport` implementation for this
+         * kind yet (no adapter shell class references this factory the way
+         * [xrayRealityAdapterShell] etc. are referenced by their own
+         * transport classes) - this value exists only so the type is
+         * representable; `TransportRegistry` does not register
+         * `SHADOWSOCKS_2022` as available.
+         *
+         * `usesTcp`/`usesUdp`/`supportsFullTunnel` are `true` because B45A
+         * physically proved real end-to-end TCP AND UDP data-plane traffic
+         * through a real `VpnService` TUN (Section 35 of the spike doc: 3/3
+         * exact UDP round-trip matches, repeated TCP proofs). Every other
+         * field stays at its safe, truthful default (`false`) because it
+         * was never exercised: `supportsRoaming` is `false` because B45A's
+         * own Q7 (Wi-Fi/cellular handover) remains explicitly BLOCKED/
+         * deferred/UNVERIFIED - this field must never be flipped to `true`
+         * without a physical handover proof, regardless of how plausible
+         * `RESTART_SESSION` sounds on paper. `suitableForRestrictiveNetworks`
+         * is `false` because no censorship-resistance/Russia/hard-whitelist
+         * testing was ever performed or claimed. `supportsObfuscation` is
+         * `false`: plain AEAD-2022 has no TLS-mimicry/CDN-fronting layer
+         * (unlike `XRAY_XHTTP`). `maturity` is `NOT_IMPLEMENTED`, not
+         * `EXPERIMENTAL`: unlike the Xray adapter-shell factories above
+         * (real adapter code, zero device evidence), this transport has
+         * real device evidence (B45A) but zero production adapter code -
+         * the opposite gap, and `TransportMaturity` has no value for
+         * "protocol proven, no code" - `NOT_IMPLEMENTED` is the only
+         * truthful choice until B45B-3's adapter shell exists.
+         */
+        fun shadowsocks2022(): TransportCapabilities = TransportCapabilities(
+            usesUdp = true,
+            usesTcp = true,
+            supportsPort443 = false,
+            supportsObfuscation = false,
+            suitableForRestrictiveNetworks = false,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.NOT_IMPLEMENTED,
+        )
+
         /** A transport with no implementation at all: every capability is truthfully false/unknown. */
         fun notImplemented(): TransportCapabilities = TransportCapabilities(
             usesUdp = false,
