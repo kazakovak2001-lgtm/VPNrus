@@ -9,6 +9,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.support.DiagnosticOutcome
+import net.pocvpn.client.diagnostics.support.DiagnosticEventType
 import net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore
 import net.pocvpn.client.diagnostics.support.PathKind
 import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
@@ -17,6 +18,7 @@ import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkType
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.FakeClientKeyRepository
+import net.pocvpn.client.vpn.FakeClientTunnelIdentityStore
 import net.pocvpn.client.vpn.FakeConnectionOutcomeStore
 import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
@@ -24,6 +26,9 @@ import net.pocvpn.client.vpn.FakeSelectedGatewayStore
 import net.pocvpn.client.vpn.FakeVpnTransport
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
+import net.pocvpn.client.vpn.config.GatewaySelectionMode
+import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
+import net.pocvpn.client.vpn.config.ProductionGatewayId
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -39,6 +44,115 @@ import org.junit.Test
  * configuration.
  */
 class MainViewModelSupportDiagnosticsTest {
+
+    @Test
+    fun `direct permission prompt and denial never claim a transport attempt`() = runTest {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(store, "1.0", 1L)
+        val transport = FakeVpnTransport(permission = android.content.Intent())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            selectedGatewayStore = FakeSelectedGatewayStore(ProductionGatewayId.STOCKHOLM),
+            clientTunnelIdentityStore = FakeClientTunnelIdentityStore(mapOf(ProductionGatewayId.STOCKHOLM to "10.77.0.6")),
+            initialNetworkProfile = usableWifi,
+            connectionOutcomeStore = FakeConnectionOutcomeStore(),
+            supportDiagnosticsRecorder = recorder,
+            supportDiagnosticsStore = store,
+        )
+        testDispatcher.scheduler.runCurrent()
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        assertTrue(store.recent().isEmpty())
+        assertTrue(recorder.currentSessionId() != null)
+        viewModel.onVpnPermissionResult(false)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, transport.connectCallCount)
+        val session = store.recent().single()
+        assertEquals("stockholm", session.events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }.tags["plannedEndpointId"])
+        assertFalse(session.events.any { it.tags.containsKey("attemptedEndpointId") })
+        assertFalse(session.events.any { it.type == DiagnosticEventType.TRANSPORT_START })
+    }
+
+    @Test
+    fun `direct connect failure retains the actual endpoint and candidate ordinal`() = runTest {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(store, "1.0", 1L)
+        val transport = FakeVpnTransport().apply { failConnectWith = IllegalStateException("dial failed") }
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            selectedGatewayStore = FakeSelectedGatewayStore(ProductionGatewayId.STOCKHOLM),
+            clientTunnelIdentityStore = FakeClientTunnelIdentityStore(mapOf(ProductionGatewayId.STOCKHOLM to "10.77.0.6")),
+            initialNetworkProfile = usableWifi,
+            connectionOutcomeStore = FakeConnectionOutcomeStore(),
+            supportDiagnosticsRecorder = recorder,
+            supportDiagnosticsStore = store,
+        )
+        testDispatcher.scheduler.runCurrent()
+        viewModel.connect()
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, transport.connectCallCount)
+        // Persist the open diagnostic timeline after the real failing dial;
+        // transport callback identity is the subject of this regression.
+        if (store.recent().isEmpty()) recorder.finishFailedFromTransport(null, null)
+        val session = store.recent().single()
+        val start = session.events.single { it.type == DiagnosticEventType.TRANSPORT_START }
+        val failure = session.events.single { it.type == DiagnosticEventType.PATH_FAILED }
+        assertEquals("stockholm", start.tags["attemptedEndpointId"])
+        assertEquals("stockholm", failure.tags["attemptedEndpointId"])
+        assertEquals("1", start.tags["attemptOrdinal"])
+        assertEquals("1", failure.tags["attemptOrdinal"])
+    }
+
+    @Test
+    fun `manual Stockholm selection exports the resolved endpoint rather than the previous UI gateway`() = runTest {
+        val store = InMemoryDiagnosticSessionStore()
+        val transport = FakeVpnTransport()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            selectedGatewayStore = FakeSelectedGatewayStore(ProductionGatewayId.GERMANY),
+            clientTunnelIdentityStore = FakeClientTunnelIdentityStore(mapOf(
+                ProductionGatewayId.GERMANY to "10.77.0.5",
+                ProductionGatewayId.STOCKHOLM to "10.77.0.6",
+            )),
+            initialNetworkProfile = usableWifi,
+            connectionOutcomeStore = FakeConnectionOutcomeStore(),
+            supportDiagnosticsRecorder = SupportDiagnosticsRecorder(store, "1.0", 1L),
+            supportDiagnosticsStore = store,
+        )
+        testDispatcher.scheduler.runCurrent()
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        val session = store.recent().single()
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, session.gatewaySelectionMode)
+        val candidate = session.events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals("stockholm", candidate.tags["plannedEndpointId"])
+        assertFalse(candidate.tags.containsKey("attemptedEndpointId"))
+        assertEquals("stockholm", session.events.single { it.type == DiagnosticEventType.TRANSPORT_START }.tags["attemptedEndpointId"])
+        assertEquals(ProductionGatewayCatalog.STOCKHOLM.endpointId.value,
+            session.events.single { it.type == DiagnosticEventType.PATH_SUCCEEDED }.tags["attemptedEndpointId"])
+        assertEquals(ProductionGatewayCatalog.STOCKHOLM.endpointId.value,
+            session.events.single { it.type == DiagnosticEventType.VPN_PROTECTED }.tags["attemptedEndpointId"])
+        assertEquals("1", session.events.single { it.type == DiagnosticEventType.VPN_PROTECTED }.tags["attemptOrdinal"])
+        assertFalse(viewModel.exportSupportBundleJson().contains("attemptedEndpointId\":\"frankfurt"))
+    }
 
     private val testDispatcher = StandardTestDispatcher()
 
@@ -98,6 +212,51 @@ class MainViewModelSupportDiagnosticsTest {
         assertEquals(PathKind.DIRECT, session.selectedPathKind)
         assertEquals(TransportKind.AMNEZIA_WG, session.selectedTransportKind)
         assertEquals("Last connection succeeded", viewModel.lastConnectionResultSummary())
+    }
+
+    @Test
+    fun `successful reconnect diagnostic closes once with pinned direct identity and ordinal`() = runTest {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(store, appVersionName = "1.0", appVersionCode = 1L)
+        val transport = FakeVpnTransport()
+        val reconnect = FakeReconnectManager()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway),
+            reconnectManager = reconnect,
+            diagnosticsStore = DiagnosticsStore(),
+            selectedGatewayStore = FakeSelectedGatewayStore(),
+            initialNetworkProfile = usableWifi,
+            connectionOutcomeStore = FakeConnectionOutcomeStore(),
+            supportDiagnosticsRecorder = recorder,
+            supportDiagnosticsStore = store,
+        )
+        testDispatcher.scheduler.runCurrent()
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(1, store.recent().size)
+
+        reconnect.triggerNetworkLost()
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(recorder.isReconnectIncidentOpen())
+        reconnect.triggerNetworkAvailable()
+        testDispatcher.scheduler.advanceTimeBy(1_500L)
+        testDispatcher.scheduler.runCurrent()
+
+        val sessions = store.recent()
+        assertEquals(2, sessions.size)
+        val incident = sessions.first()
+        assertEquals(DiagnosticOutcome.PROTECTED, incident.outcome)
+        assertEquals(PathKind.DIRECT, incident.selectedPathKind)
+        assertEquals(TransportKind.AMNEZIA_WG, incident.selectedTransportKind)
+        val attempt = incident.events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals("1", attempt.tags["attemptOrdinal"])
+        assertTrue(attempt.tags["plannedEndpointId"]?.isNotBlank() == true)
+        val success = incident.events.single { it.type == DiagnosticEventType.PATH_SUCCEEDED }
+        assertEquals(attempt.tags["plannedEndpointId"], success.tags["attemptedEndpointId"])
+        assertEquals(1, incident.events.count { it.type == DiagnosticEventType.VPN_PROTECTED })
+        assertFalse(recorder.isReconnectIncidentOpen())
     }
 
     @Test

@@ -114,6 +114,10 @@ fun AppRoot(
 
     var credential by remember { mutableStateOf("") }
     var showDiagnostics by remember { mutableStateOf(false) }
+    // SG-002 evidence-closure - debug-only: last result of the "Save
+    // diagnostics locally" button (DebugDiagnosticsExport), shown in the
+    // SAME dialog. Never persisted, never read by production logic.
+    var diagnosticsSaveStatus by remember { mutableStateOf<String?>(null) }
     var showGatewayPicker by remember { mutableStateOf(false) }
     var showPrivateGatewayDialog by remember { mutableStateOf(false) }
     var privateGatewayValidationError by remember { mutableStateOf<net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason?>(null) }
@@ -445,9 +449,11 @@ fun AppRoot(
                 }
             },
             onRegenerateIdentity = { viewModel.regenerateIdentity() },
-            onForceXrayTest = {
+            transportForce = (viewModel.transportPreference as? net.pocvpn.client.transport.UserTransportPreference.Manual)?.kind,
+            onSetTransportForce = { kind ->
                 viewModel.debugSetTransportPreference(
-                    net.pocvpn.client.transport.UserTransportPreference.Manual(net.pocvpn.client.transport.TransportKind.XRAY_REALITY),
+                    kind?.let { net.pocvpn.client.transport.UserTransportPreference.Manual(it) }
+                        ?: net.pocvpn.client.transport.UserTransportPreference.Auto,
                 )
             },
             onSimulateAwgFailure = {
@@ -467,6 +473,24 @@ fun AppRoot(
                 showDiagnostics = false
             },
             onRefreshManifest = { viewModel.debugRefreshManifest() },
+            // SG-002 evidence-closure - reuses the SAME
+            // viewModel.exportSupportBundleJson() the real Export
+            // diagnostics button (SettingsScreen) calls - never a second/
+            // divergent serialization. LocalDiagnosticsExporter itself is
+            // build-type-scoped (a real writer in src/debug, a no-op
+            // stub returning null in src/release - see that class's own
+            // docs) - main never needs its own BuildConfig.DEBUG check
+            // here, since a release build's own copy already always
+            // returns null.
+            onSaveDiagnosticsLocally = {
+                diagnosticsSaveStatus = runCatching {
+                    val json = viewModel.exportSupportBundleJson()
+                    val file = net.pocvpn.client.diagnostics.support.LocalDiagnosticsExporter
+                        .exportLatest(context.filesDir, json)
+                    if (file != null) "${file.absolutePath} (${json.length}B)" else "unavailable (release build)"
+                }.getOrElse { "failed: ${it.message}" }
+            },
+            saveLocallyStatus = diagnosticsSaveStatus,
             onDismiss = { showDiagnostics = false },
         )
     }

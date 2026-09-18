@@ -22,6 +22,8 @@ interface VpnTransport {
     val name: String
     val kind: TransportKind
     val capabilities: TransportCapabilities
+    val underlyingNetworkRecovery: UnderlyingNetworkRecovery
+        get() = UnderlyingNetworkRecovery.IN_PLACE
 
     /** Null if no OS-level permission is needed or it's already granted; otherwise the Intent to launch. */
     fun preparePermissionIntent(): Intent?
@@ -32,4 +34,9 @@ interface VpnTransport {
 
     suspend fun probe(context: ProbeContext): ProbeResult = ProbeResult.Unsupported
     suspend fun stats(): TransportStats = TransportStats.Unsupported
+}
+
+enum class UnderlyingNetworkRecovery {
+    IN_PLACE,
+    RESTART_SESSION,
 }

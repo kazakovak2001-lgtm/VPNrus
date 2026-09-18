@@ -34,6 +34,8 @@ class VlessXhttpTransport(
     override val kind: TransportKind = TransportKind.XRAY_XHTTP
     override val capabilities: TransportCapabilities =
         TransportCapabilities.xrayXhttpAdapterShell()
+    override val underlyingNetworkRecovery: UnderlyingNetworkRecovery =
+        UnderlyingNetworkRecovery.RESTART_SESSION
 
     private val state =
         MutableStateFlow<TransportState>(TransportState.Disconnected)

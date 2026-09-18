@@ -10,15 +10,21 @@ package net.pocvpn.client.diagnostics.support
  * never accept a raw free-text string in the first place (every
  * [net.pocvpn.client.diagnostics.support.DiagnosticEvent.tags] value the
  * production recorder ever writes is an enum name, a bounded integer/boolean
- * rendered as text, or [net.pocvpn.client.reachability.NetworkFingerprinter]'s
- * own opaque output - never anything read off a network response, a stored
- * profile, or a manifest). [isSafeValue] is the SECOND, independent check
- * this file's own [buildSupportBundle] additionally runs over every single
- * tag value and every session field before serialization, so a future
+ * rendered as text, a pinned non-secret EndpointId, or
+ * [net.pocvpn.client.reachability.NetworkFingerprinter]'s own opaque output
+ * - never a host or credential from a network response or profile.
+ * [isSafeValue] is the SECOND, independent check [buildSupportBundle] runs
+ * over every event tag value before serialization, so a future
  * call site that accidentally passes something secret-shaped is still
  * caught rather than silently exported.
  */
 object DiagnosticSanitizer {
+
+    // Operator endpoint IDs are short slugs. Reject host/URL/path-shaped or
+    // otherwise unexpected IDs even if the generic secret-shape scan misses
+    // them. This affects support export only, never candidate eligibility.
+    private val ENDPOINT_ID_REGEX = Regex("[a-z][a-z0-9_-]{0,127}")
+    private val ENDPOINT_ID_TAGS = setOf("plannedEndpointId", "attemptedEndpointId", "plannedIngressEndpointId", "attemptedIngressEndpointId", "plannedExitEndpointId", "attemptedExitEndpointId")
 
     // A UUID (activation credentials/tunnel identities/device public-key-derived
     // ids in this codebase are all UUID-shaped or Base64 - see
@@ -70,5 +76,7 @@ object DiagnosticSanitizer {
     fun sanitize(value: String): String = if (isSafeValue(value)) value else "[redacted]"
 
     /** Sanitizes every value of [tags] (keys are already a closed, typed vocabulary - see [net.pocvpn.client.diagnostics.support.DiagnosticEvent]'s own docs - so only values are checked). */
-    fun sanitizeTags(tags: Map<String, String>): Map<String, String> = tags.mapValues { (_, v) -> sanitize(v) }
+    fun sanitizeTags(tags: Map<String, String>): Map<String, String> = tags.mapValues { (key, value) ->
+        if (key in ENDPOINT_ID_TAGS && !ENDPOINT_ID_REGEX.matches(value)) "[redacted]" else sanitize(value)
+    }
 }

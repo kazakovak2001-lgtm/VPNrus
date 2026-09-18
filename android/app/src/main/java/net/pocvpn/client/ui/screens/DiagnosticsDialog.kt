@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import net.pocvpn.client.R
+import net.pocvpn.client.transport.TransportKind
 
 /**
  * B8D/B8E - debug-only technical detail, unchanged in meaning from the
@@ -35,24 +36,29 @@ import net.pocvpn.client.R
  * Modifier.verticalScroll on a Column inside it has nothing to scroll
  * within - the dialog just grows (and clips against the screen edge on a
  * real device) instead of scrolling. Here the Surface is explicitly capped
- * to 85% of screen height, the title and the action buttons keep their
- * natural (unweighted) height, and ONLY the middle content Column is
- * `weight(1f)` + `verticalScroll` - so it, and only it, absorbs whatever
- * height remains and becomes finger-scrollable while the header and
- * actions stay pinned and always reachable.
+ * to 85% of screen height and only the title stays pinned/unweighted -
+ * the `lines` detail list AND every action button below it share ONE
+ * `weight(1f)` + `verticalScroll` region (SG-002 evidence-closure fix:
+ * originally only `lines` scrolled while the button block stayed fixed-
+ * height, which silently squeezed the last buttons to ~0dp once this
+ * dialog grew enough debug-only actions that the button block alone could
+ * exceed maxDialogHeight while connected - see that fix's own inline docs
+ * below) - so every action, Close included, is always reachable by
+ * scrolling regardless of how many `lines`/buttons exist.
  */
 @Composable
 fun DiagnosticsDialog(
     lines: List<String>,
     onCopyPublicKey: () -> Unit,
     onRegenerateIdentity: () -> Unit,
-    // B18-2 - debug-only: pins UserTransportPreference.Manual(XRAY_REALITY)
+    // Stabilization gate - debug-only: pins a requested transport
     // for the NEXT connect() (same "saved, applied on next connect"
     // discipline as every other setting here) so the real VpnController/
     // Smart Connect path can be exercised with Xray for adaptive-route
-    // consistency testing - see MainViewModel.debugSetTransportPreference's
+    // physical testing - see MainViewModel.debugSetTransportPreference's
     // own docs. Never itself reconnects.
-    onForceXrayTest: () -> Unit,
+    transportForce: TransportKind?,
+    onSetTransportForce: (TransportKind?) -> Unit,
     // B19 physical-validation follow-up - debug-only: writes a REAL
     // FAILURE/SUCCESS ConnectionOutcome + PathHistory entry for Frankfurt
     // AWG into the SAME stores the real Auto ranking pipeline reads - see
@@ -76,6 +82,15 @@ fun DiagnosticsDialog(
     // own docs. Exists for deterministic physical validation without
     // force-stopping the app between fault-injection steps.
     onRefreshManifest: () -> Unit,
+    // SG-002 evidence-closure - debug-only: writes the EXACT SAME JSON
+    // [onExportDiagnosticsClick] (SettingsScreen's real "Export diagnostics"
+    // button) already produces to app-private storage instead of the
+    // share sheet - see MainViewModel.exportSupportBundleJson/
+    // net.pocvpn.client.diagnostics.support.LocalDiagnosticsExporter's own
+    // docs (a build-type-scoped symbol: a real writer only in the debug
+    // source set, a no-op stub in release). Never shares/uploads anything.
+    onSaveDiagnosticsLocally: () -> Unit,
+    saveLocallyStatus: String?,
     onDismiss: () -> Unit,
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
@@ -95,10 +110,24 @@ fun DiagnosticsDialog(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // The only scrollable region - bounded by the Surface's
-                // heightIn(max=...) above, which is what makes weight(1f)
-                // (and therefore verticalScroll) actually have something
-                // finite to scroll within instead of growing unbounded.
+                // SG-002 evidence-closure fix - the ONLY scrollable region,
+                // bounded by the Surface's heightIn(max=...) above (same
+                // "weight(1f) needs a finite parent to scroll within"
+                // reasoning as before). Originally wrapped only the
+                // technical-detail `lines` list, keeping every action
+                // button pinned below it at ALWAYS-full, unweighted height -
+                // that assumption broke the day this dialog grew enough
+                // debug-only buttons (12, after adding "Save diagnostics
+                // locally") that the button block ALONE could exceed
+                // maxDialogHeight while connected (more `lines` content
+                // than disconnected): Compose then squeezes the LAST
+                // buttons (observed: the new button and Close) to a
+                // degenerate ~0dp size - present in the tree, genuinely
+                // untappable. Now the buttons scroll together with the
+                // lines in ONE region, so every action (Close included)
+                // stays reachable regardless of line/button count - no
+                // regression for the empty-lines case, since an empty list
+                // just means the scrollable region starts at the buttons.
                 Column(
                     modifier = Modifier
                         .weight(weight = 1f, fill = false)
@@ -112,33 +141,63 @@ fun DiagnosticsDialog(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                     }
-                }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                TextButton(onClick = onCopyPublicKey, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_copy_public_key))
-                }
-                TextButton(onClick = onRegenerateIdentity, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_regenerate_identity))
-                }
-                TextButton(onClick = onForceXrayTest, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_force_xray_test))
-                }
-                TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_simulate_awg_failure))
-                }
-                TextButton(onClick = onSimulateAwgSuccess, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_simulate_awg_success))
-                }
-                TextButton(onClick = onReactivateGermany, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_reactivate_germany))
-                }
-                TextButton(onClick = onRefreshManifest, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_refresh_manifest))
-                }
-                TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.diagnostics_close))
+                    TextButton(onClick = onCopyPublicKey, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_copy_public_key))
+                    }
+                    TextButton(onClick = onRegenerateIdentity, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_regenerate_identity))
+                    }
+                    Text(
+                        text = stringResource(
+                            R.string.diagnostics_transport_force_status,
+                            transportForce?.name ?: "AUTO",
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    TextButton(onClick = { onSetTransportForce(null) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_auto))
+                    }
+                    TextButton(onClick = { onSetTransportForce(TransportKind.AMNEZIA_WG) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_awg))
+                    }
+                    TextButton(onClick = { onSetTransportForce(TransportKind.XRAY_REALITY) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_reality))
+                    }
+                    TextButton(onClick = { onSetTransportForce(TransportKind.TLS_TCP) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_tls))
+                    }
+                    TextButton(onClick = { onSetTransportForce(TransportKind.XRAY_XHTTP) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_xhttp))
+                    }
+                    TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_simulate_awg_failure))
+                    }
+                    TextButton(onClick = onSimulateAwgSuccess, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_simulate_awg_success))
+                    }
+                    TextButton(onClick = onReactivateGermany, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_reactivate_germany))
+                    }
+                    TextButton(onClick = onRefreshManifest, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_refresh_manifest))
+                    }
+                    TextButton(onClick = onSaveDiagnosticsLocally, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_save_locally))
+                    }
+                    saveLocallyStatus?.let {
+                        Text(
+                            text = stringResource(R.string.diagnostics_save_locally_status, it),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                    TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_close))
+                    }
                 }
             }
         }

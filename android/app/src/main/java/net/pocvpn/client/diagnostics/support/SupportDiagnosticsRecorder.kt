@@ -3,6 +3,7 @@ package net.pocvpn.client.diagnostics.support
 import net.pocvpn.client.controlplane.ControlPlaneFailureReason
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.network.NetworkType
+import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
@@ -15,15 +16,20 @@ import net.pocvpn.client.vpn.config.GatewaySelectionMode
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.policy.RoutingMode
 
+/** Pinned route identity; relay ingress/exit are planned until their respective execution boundaries are observed. */
+sealed interface AttemptEndpointIdentity {
+    data class Direct(val endpointId: EndpointId) : AttemptEndpointIdentity
+    data class Relayed(val ingressEndpointId: EndpointId, val exitEndpointId: EndpointId) : AttemptEndpointIdentity
+}
+
 /**
  * B29 (task D) - THE ONE place a real [DiagnosticSession] is assembled,
  * automatically, from the SAME data the real connect flow already computes
  * (task's own "reuse real existing state/events... do not create a second
  * connection state machine merely for diagnostics"). Every `record*`
- * function here is narrow and typed - none accepts a raw string, so nothing
- * secret-shaped can enter [DiagnosticEvent.tags] through this API at all
- * (the structural half of the sanitization boundary - see
- * [DiagnosticSanitizer]'s own docs for the second, defense-in-depth half).
+ * function here is narrow and typed - none accepts a raw free-text message.
+ * EndpointId is operator metadata, but its shape is checked again by
+ * [DiagnosticSanitizer] before support export.
  *
  * [net.pocvpn.client.MainViewModel] owns exactly one instance of this
  * (constructed once, alongside its other collaborators) and calls it from
@@ -71,6 +77,13 @@ class SupportDiagnosticsRecorder(
         var selectedPathKind: PathKind = PathKind.NONE
         var selectedTransportKind: TransportKind? = null
         var typedProbeFailureReason: DiagnosticFailureReason? = null
+        var attemptOrdinal: Int = 0
+        var attemptIdentity: AttemptEndpointIdentity? = null
+        var directTransportAttempted: Boolean = false
+        var relayIngressAttempted: Boolean = false
+        var relayExitAttempted: Boolean = false
+        var currentAttemptFailed: Boolean = false
+        var isReconnectIncident: Boolean = false
         val events = mutableListOf<DiagnosticEvent>()
     }
 
@@ -78,6 +91,13 @@ class SupportDiagnosticsRecorder(
 
     /** Currently-open session id, or null - lets a caller correlate a live UI state with the session being built, without reading store internals. */
     fun currentSessionId(): String? = open?.sessionId
+
+    /** The Auto execution owner, not the health collector, closes an Auto connect sequence. Reconnect incidents keep their existing health-owned lifecycle. */
+    fun isAutoConnectSessionOpen(): Boolean = open?.let {
+        it.context.gatewaySelectionMode == GatewaySelectionMode.AUTO && !it.isReconnectIncident
+    } == true
+
+    fun isReconnectIncidentOpen(): Boolean = open?.isReconnectIncident == true
 
     /**
      * Starts a NEW session, ending (as [DiagnosticOutcome.IN_PROGRESS] never
@@ -106,11 +126,47 @@ class SupportDiagnosticsRecorder(
         record(DiagnosticEventType.CANDIDATE_RANKED, mapOf(TAG_COUNT to candidateCount.toString()))
 
     /** Also pins [pathKind]/[transportKind] as the session's own selected-path fields (task A) - the LAST attempt started wins, matching which attempt a session's terminal outcome actually describes. */
-    fun recordCandidateAttemptStarted(pathKind: PathKind, transportKind: TransportKind) {
+    fun recordCandidateAttemptStarted(pathKind: PathKind, transportKind: TransportKind, identity: AttemptEndpointIdentity? = null) {
         open?.selectedPathKind = pathKind
         open?.selectedTransportKind = transportKind
         open?.typedProbeFailureReason = null
-        record(DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED, mapOf(TAG_PATH_KIND to pathKind.name, TAG_TRANSPORT_KIND to transportKind.name))
+        open?.attemptOrdinal = (open?.attemptOrdinal ?: 0) + 1
+        open?.attemptIdentity = identity
+        open?.directTransportAttempted = false
+        open?.relayIngressAttempted = false
+        open?.relayExitAttempted = false
+        open?.currentAttemptFailed = false
+        record(DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED, mapOf(TAG_PATH_KIND to pathKind.name, TAG_TRANSPORT_KIND to transportKind.name) + attemptTags())
+    }
+
+    /** Called at VpnController's actual transport.connect boundary, never from resolution or a permission prompt. */
+    fun recordTransportAttemptStarted(endpointId: EndpointId, transportKind: TransportKind) {
+        val session = open ?: return
+        when (val identity = session.attemptIdentity) {
+            is AttemptEndpointIdentity.Direct -> {
+                if (identity.endpointId != endpointId) return
+                session.directTransportAttempted = true
+            }
+            is AttemptEndpointIdentity.Relayed -> {
+                if (identity.ingressEndpointId != endpointId) return
+                session.relayIngressAttempted = true
+            }
+            null -> return
+        }
+        record(DiagnosticEventType.TRANSPORT_START, mapOf(TAG_TRANSPORT_KIND to transportKind.name) + attemptTags())
+    }
+
+    /** Marks the endpoint already owned by an in-place reconnect (AWG); no new TRANSPORT_START is fabricated. */
+    fun recordActiveEndpointRecovery(endpointId: EndpointId) {
+        val session = open ?: return
+        when (val identity = session.attemptIdentity) {
+            is AttemptEndpointIdentity.Direct -> if (identity.endpointId == endpointId) session.directTransportAttempted = true
+            is AttemptEndpointIdentity.Relayed -> if (identity.ingressEndpointId == endpointId) {
+                session.relayIngressAttempted = true
+                session.relayExitAttempted = true
+            }
+            null -> Unit
+        }
     }
 
     fun recordEndpointReachabilityResult(state: ReachabilityState) =
@@ -159,8 +215,16 @@ class SupportDiagnosticsRecorder(
      * ONE session, ONE timeline, until something genuinely terminal happens
      * (see [finishFailed]/[finishProtected]/[finishDisconnected]).
      */
-    fun recordPathFailed(reason: DiagnosticFailureReason) =
-        record(DiagnosticEventType.PATH_FAILED, mapOf(TAG_FAILURE_REASON to reason.name))
+    fun recordPathFailed(reason: DiagnosticFailureReason) {
+        record(DiagnosticEventType.PATH_FAILED, mapOf(TAG_FAILURE_REASON to reason.name) + attemptTags())
+        open?.currentAttemptFailed = true
+    }
+
+    /** The execution observer knows this attempt failed, but has no new typed cause to classify. */
+    fun recordAttemptFailed() {
+        record(DiagnosticEventType.PATH_FAILED, attemptTags())
+        open?.currentAttemptFailed = true
+    }
 
     /** B36: same B29 event, using the currently pinned attempt's path/transport. */
     fun recordRelayPathFailed(category: RelayFailureCategory, failureKind: RelayProbeFailureKind? = null) {
@@ -182,11 +246,12 @@ class SupportDiagnosticsRecorder(
     }
 
     /** TERMINAL - the whole connect() request ends in failure, for [reason] - see [recordPathFailed]'s own docs for the non-terminal, per-candidate counterpart. */
-    fun finishFailed(reason: DiagnosticFailureReason) = finish(
-        DiagnosticOutcome.FAILED,
-        if (reason == DiagnosticFailureReason.NO_CANDIDATE || reason == DiagnosticFailureReason.INTERNAL_ERROR || reason == DiagnosticFailureReason.GATEWAY_UNREACHABLE)
-            open?.typedProbeFailureReason ?: reason else reason,
-    )
+    fun finishFailed(reason: DiagnosticFailureReason) {
+        val finalReason = if (reason == DiagnosticFailureReason.NO_CANDIDATE || reason == DiagnosticFailureReason.INTERNAL_ERROR || reason == DiagnosticFailureReason.GATEWAY_UNREACHABLE)
+            open?.typedProbeFailureReason ?: reason else reason
+        if (open?.attemptOrdinal != 0 && open?.currentAttemptFailed == false) recordPathFailed(finalReason)
+        finish(DiagnosticOutcome.FAILED, finalReason)
+    }
 
     /** B36: preserve generic failure mapping unless a typed CDN/XHTTP fact exists. */
     fun finishFailedFromTransport(error: VpnError?, failureKind: TransportFailureKind?) {
@@ -201,8 +266,9 @@ class SupportDiagnosticsRecorder(
 
     /** TERMINAL - records [DiagnosticEventType.VPN_PROTECTED] (also, redundantly per requirement B's own vocabulary, [DiagnosticEventType.PATH_SUCCEEDED]) and finishes the session as [DiagnosticOutcome.PROTECTED]. */
     fun finishProtected() {
-        record(DiagnosticEventType.PATH_SUCCEEDED)
-        record(DiagnosticEventType.VPN_PROTECTED)
+        val tags = attemptTags(pathProtected = true)
+        record(DiagnosticEventType.PATH_SUCCEEDED, tags)
+        record(DiagnosticEventType.VPN_PROTECTED, tags)
         finish(DiagnosticOutcome.PROTECTED, null)
     }
 
@@ -283,13 +349,37 @@ class SupportDiagnosticsRecorder(
     // own docs. The session still terminates through the existing
     // [finishProtected]/[finishFailed]/[finishDisconnected] - no new outcome
     // vocabulary needed.
-    fun recordReconnectIncidentStarted() = record(DiagnosticEventType.RECONNECT_INCIDENT_STARTED)
+    fun recordReconnectIncidentStarted() {
+        open?.isReconnectIncident = true
+        record(DiagnosticEventType.RECONNECT_INCIDENT_STARTED)
+    }
 
     private fun record(type: DiagnosticEventType, tags: Map<String, String> = emptyMap()) {
         val session = open ?: return
         // Task D's own per-session bound (see DiagnosticSession.MAX_EVENTS_PER_SESSION) - a runaway retry loop can never grow one session's timeline unboundedly.
         if (session.events.size >= DiagnosticSession.MAX_EVENTS_PER_SESSION) return
         session.events.add(DiagnosticEvent(type, nowProvider(), tags))
+    }
+
+    private fun attemptTags(pathProtected: Boolean = false): Map<String, String> {
+        val session = open ?: return emptyMap()
+        if (session.attemptOrdinal == 0) return emptyMap()
+        return buildMap {
+            put(TAG_ATTEMPT_ORDINAL, session.attemptOrdinal.toString())
+            when (val identity = session.attemptIdentity) {
+                is AttemptEndpointIdentity.Direct -> {
+                    put(TAG_PLANNED_ENDPOINT_ID, identity.endpointId.value)
+                    if (session.directTransportAttempted) put(TAG_ATTEMPTED_ENDPOINT_ID, identity.endpointId.value)
+                }
+                is AttemptEndpointIdentity.Relayed -> {
+                    put(TAG_PLANNED_INGRESS_ENDPOINT_ID, identity.ingressEndpointId.value)
+                    put(TAG_PLANNED_EXIT_ENDPOINT_ID, identity.exitEndpointId.value)
+                    if (session.relayIngressAttempted) put(TAG_ATTEMPTED_INGRESS_ENDPOINT_ID, identity.ingressEndpointId.value)
+                    if (pathProtected || session.relayExitAttempted) put(TAG_ATTEMPTED_EXIT_ENDPOINT_ID, identity.exitEndpointId.value)
+                }
+                null -> Unit // Legacy callers/sessions have unknown endpoint identity.
+            }
+        }
     }
 
     private fun finish(outcome: DiagnosticOutcome, failureReason: DiagnosticFailureReason?) {
@@ -333,5 +423,12 @@ class SupportDiagnosticsRecorder(
         const val TAG_FAILURE_REASON = "failureReason"
         const val TAG_GATEWAY = "gateway"
         const val TAG_ORIGIN_INDEX = "originIndex"
+        const val TAG_ATTEMPT_ORDINAL = "attemptOrdinal"
+        const val TAG_PLANNED_ENDPOINT_ID = "plannedEndpointId"
+        const val TAG_ATTEMPTED_ENDPOINT_ID = "attemptedEndpointId"
+        const val TAG_PLANNED_INGRESS_ENDPOINT_ID = "plannedIngressEndpointId"
+        const val TAG_ATTEMPTED_INGRESS_ENDPOINT_ID = "attemptedIngressEndpointId"
+        const val TAG_PLANNED_EXIT_ENDPOINT_ID = "plannedExitEndpointId"
+        const val TAG_ATTEMPTED_EXIT_ENDPOINT_ID = "attemptedExitEndpointId"
     }
 }

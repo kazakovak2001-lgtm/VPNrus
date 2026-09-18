@@ -31,6 +31,8 @@ class FakeVpnTransport(
 ) : VpnTransport {
     override val name: String = "fake"
     override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
+    override val underlyingNetworkRecovery: UnderlyingNetworkRecovery =
+        if (kind == TransportKind.AMNEZIA_WG) UnderlyingNetworkRecovery.IN_PLACE else UnderlyingNetworkRecovery.RESTART_SESSION
 
     private val stateFlow = MutableStateFlow<TransportState>(TransportState.Disconnected)
     var connectCallCount = 0
@@ -101,22 +103,25 @@ class FakeGatewayConfigurationRepository(private var config: GatewayConfiguratio
 class FakeReconnectManager : ReconnectManager {
     private var onLost: (() -> Unit)? = null
     private var onAvailable: (() -> Unit)? = null
+    private var onChanged: (() -> Unit)? = null
     var networkAvailable = true
     var startCallCount = 0
         private set
     var stopCallCount = 0
         private set
 
-    override fun start(onNetworkLost: () -> Unit, onNetworkAvailable: () -> Unit) {
+    override fun start(onNetworkLost: () -> Unit, onNetworkAvailable: () -> Unit, onUnderlyingNetworkChanged: () -> Unit) {
         startCallCount++
         onLost = onNetworkLost
         onAvailable = onNetworkAvailable
+        onChanged = onUnderlyingNetworkChanged
     }
 
     override fun stop() {
         stopCallCount++
         onLost = null
         onAvailable = null
+        onChanged = null
     }
 
     override fun isNetworkAvailable(): Boolean = networkAvailable
@@ -129,6 +134,11 @@ class FakeReconnectManager : ReconnectManager {
     fun triggerNetworkAvailable() {
         networkAvailable = true
         onAvailable?.invoke()
+    }
+
+    fun triggerUnderlyingNetworkChanged() {
+        networkAvailable = true
+        onChanged?.invoke()
     }
 }
 

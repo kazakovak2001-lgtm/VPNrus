@@ -51,6 +51,7 @@ class VlessTlsTransport(
     override val name: String = "xray-vless-tls"
     override val kind: TransportKind = TransportKind.TLS_TCP
     override val capabilities: TransportCapabilities = TransportCapabilities.xrayTlsAdapterShell()
+    override val underlyingNetworkRecovery: UnderlyingNetworkRecovery = UnderlyingNetworkRecovery.RESTART_SESSION
 
     private val state = MutableStateFlow<TransportState>(TransportState.Disconnected)
 

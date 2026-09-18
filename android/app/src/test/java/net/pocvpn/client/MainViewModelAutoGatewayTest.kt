@@ -26,6 +26,7 @@ import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.FakeClientKeyRepository
 import net.pocvpn.client.vpn.FakeClientTunnelIdentityStore
+import net.pocvpn.client.vpn.FakeConnectionOutcomeStore
 import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeSelectedGatewayStore
@@ -34,6 +35,11 @@ import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayAutoModeStore
+import net.pocvpn.client.vpn.config.FileGatewayAutoModeStore
+import net.pocvpn.client.vpn.config.FileGatewaySelectionModeStore
+import net.pocvpn.client.vpn.config.FileSelectedGatewayStore
+import net.pocvpn.client.vpn.config.GatewaySelectionMode
+import net.pocvpn.client.vpn.config.GatewaySelectionModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayId
@@ -83,6 +89,19 @@ private class FakeGatewayAutoModeStore(initial: Boolean = false) : GatewayAutoMo
     override fun write(auto: Boolean) {
         writeCallCount++
         current = auto
+    }
+}
+
+private class FakeGatewaySelectionModeStore(initial: GatewaySelectionMode = GatewaySelectionMode.MANUAL_MANAGED) : GatewaySelectionModeStore {
+    var current: GatewaySelectionMode = initial
+        private set
+    var writeCallCount = 0
+        private set
+
+    override fun read(): GatewaySelectionMode = current
+    override fun write(mode: GatewaySelectionMode) {
+        writeCallCount++
+        current = mode
     }
 }
 
@@ -249,6 +268,8 @@ class MainViewModelAutoGatewayTest {
         identityStore: net.pocvpn.client.vpn.config.ClientTunnelIdentityStore = bothProvisioned,
         selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = FakeSelectedGatewayStore(),
         manifestRepository: EndpointManifestRepository? = manifestRepositoryNaming("frankfurt", "stockholm"),
+        selectionModeStore: GatewaySelectionModeStore = FakeGatewaySelectionModeStore(),
+        connectionOutcomeStore: net.pocvpn.client.smartconnect.ConnectionOutcomeStore? = null,
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -258,8 +279,10 @@ class MainViewModelAutoGatewayTest {
         selectedGatewayStore = selectedGatewayStore,
         clientTunnelIdentityStore = identityStore,
         gatewayAutoModeStore = autoModeStore,
+        gatewaySelectionModeStore = selectionModeStore,
         initialNetworkProfile = USABLE_WIFI,
         manifestRepository = manifestRepository,
+        connectionOutcomeStore = connectionOutcomeStore,
     )
 
     // --- candidate construction ---
@@ -331,13 +354,199 @@ class MainViewModelAutoGatewayTest {
     @Test
     fun `manually selecting a gateway exits automatic mode - manual selection stays deterministic`() {
         val autoStore = FakeGatewayAutoModeStore(initial = true)
-        val viewModel = newViewModel(autoModeStore = autoStore)
+        val modeStore = FakeGatewaySelectionModeStore(GatewaySelectionMode.AUTO)
+        val selectedStore = FakeSelectedGatewayStore()
+        val viewModel = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
         assertTrue(viewModel.gatewayAutoMode.value)
 
         viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
 
         assertEquals(false, viewModel.gatewayAutoMode.value)
         assertEquals(ProductionGatewayId.STOCKHOLM, viewModel.selectedGateway.value)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, viewModel.gatewaySelectionMode.value)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, modeStore.read())
+        assertEquals(ProductionGatewayId.STOCKHOLM, selectedStore.read())
+
+        val restarted = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
+        assertEquals(ProductionGatewayId.STOCKHOLM, restarted.selectedGateway.value)
+        assertFalse(restarted.gatewayAutoMode.value)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, restarted.gatewaySelectionMode.value)
+    }
+
+    @Test
+    fun `selecting either managed gateway from Auto persists one manual state without connecting`() {
+        for (gateway in ProductionGatewayId.entries) {
+            val transport = FakeVpnTransport()
+            val autoStore = FakeGatewayAutoModeStore(initial = true)
+            val modeStore = FakeGatewaySelectionModeStore(GatewaySelectionMode.AUTO)
+            val selectedStore = FakeSelectedGatewayStore()
+            val viewModel = newViewModel(transport, autoStore, selectedGatewayStore = selectedStore, selectionModeStore = modeStore)
+
+            viewModel.selectGateway(gateway)
+
+            assertEquals(gateway, viewModel.selectedGateway.value)
+            assertEquals(gateway, selectedStore.read())
+            assertFalse(viewModel.gatewayAutoMode.value)
+            assertFalse(autoStore.read())
+            assertEquals(GatewaySelectionMode.MANUAL_MANAGED, viewModel.gatewaySelectionMode.value)
+            assertEquals(GatewaySelectionMode.MANUAL_MANAGED, modeStore.read())
+            assertEquals(0, transport.connectCallCount)
+            assertEquals(0, transport.disconnectCallCount)
+        }
+    }
+
+    @Test
+    fun `next connect after selecting Stockholm uses manual endpoint without invoking Auto selector`() = runTest {
+        val transport = FakeVpnTransport()
+        val outcomes = FakeConnectionOutcomeStore()
+        val viewModel = newViewModel(
+            transport = transport,
+            autoModeStore = FakeGatewayAutoModeStore(initial = true),
+            selectionModeStore = FakeGatewaySelectionModeStore(GatewaySelectionMode.AUTO),
+            // Auto must fail closed without a trusted manifest; manual does not consult it.
+            manifestRepository = null,
+            connectionOutcomeStore = outcomes,
+        )
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, transport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+        assertNull(viewModel.autoGatewayDiagnostics.value)
+        assertEquals(ProductionGatewayCatalog.STOCKHOLM.endpointId.value, outcomes.recent().last().gatewayId)
+    }
+
+    @Test
+    fun `unprovisioned selection from Auto changes no mode or gateway store`() {
+        val autoStore = FakeGatewayAutoModeStore(initial = true)
+        val modeStore = FakeGatewaySelectionModeStore(GatewaySelectionMode.AUTO)
+        val selectedStore = FakeSelectedGatewayStore()
+        val viewModel = newViewModel(
+            autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore,
+            identityStore = FakeClientTunnelIdentityStore(mapOf(ProductionGatewayId.GERMANY to "10.77.0.5")),
+        )
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        assertEquals(ProductionGatewayId.GERMANY, viewModel.selectedGateway.value)
+        assertEquals(GatewaySelectionMode.AUTO, viewModel.gatewaySelectionMode.value)
+        assertTrue(viewModel.gatewayAutoMode.value)
+        assertEquals(0, selectedStore.writeCallCount)
+        assertEquals(0, autoStore.writeCallCount)
+        assertEquals(0, modeStore.writeCallCount)
+    }
+
+    @Test
+    fun `explicit managed selection leaves Private and reconstructs as manual`() {
+        val autoStore = FakeGatewayAutoModeStore(initial = false)
+        val modeStore = FakeGatewaySelectionModeStore(GatewaySelectionMode.PRIVATE)
+        val selectedStore = FakeSelectedGatewayStore()
+        val viewModel = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
+        assertEquals(GatewaySelectionMode.PRIVATE, viewModel.gatewaySelectionMode.value)
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, viewModel.gatewaySelectionMode.value)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, modeStore.read())
+        assertFalse(viewModel.gatewayAutoMode.value)
+        val restarted = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, restarted.gatewaySelectionMode.value)
+        assertEquals(ProductionGatewayId.STOCKHOLM, restarted.selectedGateway.value)
+    }
+
+    @Test
+    fun `legacy and explicit mode setters keep their compatibility state synchronized`() {
+        val autoStore = FakeGatewayAutoModeStore()
+        val modeStore = FakeGatewaySelectionModeStore()
+        val viewModel = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore)
+
+        viewModel.setGatewayAutoMode(true)
+        assertEquals(GatewaySelectionMode.AUTO, viewModel.gatewaySelectionMode.value)
+        assertTrue(viewModel.gatewayAutoMode.value)
+        viewModel.setGatewayAutoMode(false)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, viewModel.gatewaySelectionMode.value)
+        assertFalse(viewModel.gatewayAutoMode.value)
+        viewModel.selectGatewaySelectionMode(GatewaySelectionMode.PRIVATE)
+        assertFalse(viewModel.gatewayAutoMode.value)
+        viewModel.setGatewayAutoMode(false)
+        assertEquals(GatewaySelectionMode.PRIVATE, viewModel.gatewaySelectionMode.value)
+        viewModel.selectGatewaySelectionMode(GatewaySelectionMode.AUTO)
+        assertTrue(viewModel.gatewayAutoMode.value)
+        assertEquals(GatewaySelectionMode.AUTO, modeStore.read())
+    }
+
+    @Test
+    fun `managed selection survives reconstruction with the real three file stores`() {
+        val directory = tmp.newFolder()
+        val selectedStore = FileSelectedGatewayStore(directory)
+        val autoStore = FileGatewayAutoModeStore(directory)
+        val modeStore = FileGatewaySelectionModeStore(directory)
+        autoStore.write(true)
+        modeStore.write(GatewaySelectionMode.AUTO)
+        val viewModel = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        assertEquals(ProductionGatewayId.STOCKHOLM, selectedStore.read())
+        assertFalse(autoStore.read())
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, modeStore.read())
+        val restarted = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
+        assertEquals(ProductionGatewayId.STOCKHOLM, restarted.selectedGateway.value)
+        assertFalse(restarted.gatewayAutoMode.value)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, restarted.gatewaySelectionMode.value)
+    }
+
+    @Test
+    fun `accepted selection reconciles a stale explicit mode file with legacy manual state`() {
+        val directory = tmp.newFolder()
+        val selectedStore = FileSelectedGatewayStore(directory)
+        val autoStore = FileGatewayAutoModeStore(directory)
+        val modeStore = FileGatewaySelectionModeStore(directory)
+        autoStore.write(false)
+        modeStore.write(GatewaySelectionMode.AUTO)
+        val viewModel = newViewModel(autoModeStore = autoStore, selectionModeStore = modeStore, selectedGatewayStore = selectedStore)
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, viewModel.gatewaySelectionMode.value)
+
+        viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+        assertEquals(GatewaySelectionMode.MANUAL_MANAGED, modeStore.read())
+        assertEquals(ProductionGatewayId.STOCKHOLM, selectedStore.read())
+    }
+
+    @Test
+    fun `active connection states reject managed selection without partial writes or reconnect`() = runTest {
+        for (blockedState in listOf(
+            TransportState.Connected, TransportState.Connecting,
+            TransportState.Reconnecting(1), TransportState.Disconnecting,
+        )) {
+            val transport = FakeVpnTransport()
+            val selectedStore = FakeSelectedGatewayStore()
+            val autoStore = FakeGatewayAutoModeStore(initial = true)
+            val modeStore = FakeGatewaySelectionModeStore(GatewaySelectionMode.AUTO)
+            val viewModel = newViewModel(
+                transport = transport, autoModeStore = autoStore,
+                selectionModeStore = modeStore, selectedGatewayStore = selectedStore,
+            )
+            viewModel.connect()
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(1, transport.connectCallCount)
+            transport.forceState(blockedState)
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(blockedState, viewModel.transportState.value)
+
+            viewModel.selectGateway(ProductionGatewayId.STOCKHOLM)
+
+            assertEquals(ProductionGatewayId.GERMANY, viewModel.selectedGateway.value)
+            assertEquals(GatewaySelectionMode.AUTO, viewModel.gatewaySelectionMode.value)
+            assertTrue(viewModel.gatewayAutoMode.value)
+            assertEquals(0, selectedStore.writeCallCount)
+            assertEquals(0, autoStore.writeCallCount)
+            assertEquals(0, modeStore.writeCallCount)
+            assertEquals(1, transport.connectCallCount)
+            assertEquals(0, transport.disconnectCallCount)
+        }
     }
 
     // --- manual mode never cross-fails ---

@@ -166,15 +166,16 @@ enum class DiagnosticFailureReason {
 enum class DiagnosticOutcome { IN_PROGRESS, PROTECTED, FAILED, DISCONNECTED }
 
 /**
- * B29 (task B) - one bounded timeline entry. [tags] is a CLOSED, already-
- * sanitized key/value set - every value here MUST already be one of an
+ * B29 (task B) - one bounded timeline entry. [tags] uses a CLOSED key
+ * vocabulary; every value here MUST be one of an
  * enum name, a small integer/boolean rendered as text, or an opaque id
- * (e.g. [net.pocvpn.client.reachability.NetworkFingerprinter]'s own output)
+ * (e.g. [net.pocvpn.client.reachability.NetworkFingerprinter]'s own output,
+ * or a stable non-secret [net.pocvpn.client.reachability.EndpointId])
  * - see [DiagnosticSanitizer] for the defense-in-depth check applied again
  * at export time. NEVER a free-text message, host, credential, or key -
  * [SupportDiagnosticsRecorder]'s own typed `record*` functions are the ONLY
  * production call sites that construct this, and none of them accept a raw
- * string parameter.
+ * string parameter. Endpoint ids are sanitized again on export.
  */
 data class DiagnosticEvent(
     val type: DiagnosticEventType,
@@ -187,7 +188,7 @@ data class DiagnosticEvent(
  * evidence. Deliberately carries NO endpoint host/IP (task's own "do not
  * expose actual endpoint host/IP unless explicitly proven necessary" - not
  * proven necessary here) - only stable logical ids ([PathKind]/[TransportKind]
- * enum names) and the coarse, already-privacy-reviewed
+ * enum names and per-attempt endpoint ids in event tags) and the coarse, already-privacy-reviewed
  * [networkFingerprintId] ([net.pocvpn.client.reachability.NetworkFingerprinter]'s
  * own output, or null when no fingerprint key was ever wired).
  *
