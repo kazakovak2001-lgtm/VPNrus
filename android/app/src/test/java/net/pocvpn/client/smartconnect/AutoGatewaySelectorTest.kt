@@ -1296,4 +1296,63 @@ class AutoGatewaySelectorTest {
         assertTrue(attempts.isEmpty())
         assertTrue(AutoGatewaySelector.isRestrictedNetworkExhaustion(attempts, RestrictionClass.POSSIBLE_HARD_WHITELIST))
     }
+
+    // --- B45B-4: SHADOWSOCKS_2022 manifest-driven candidate construction ---
+
+    @Test
+    fun `SHADOWSOCKS_2022 candidate is included only when shadowsocksAvailableFor reports true for that endpoint`() {
+        val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.SHADOWSOCKS_2022, "203.0.113.55", 8388),
+            ),
+        )
+        val registry = multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.SHADOWSOCKS_2022)
+
+        val withoutShadowsocks = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(germany), gatewayFactsFor = { catalogById[it] },
+            provisioned = { true }, clientTunnelIp = { "10.77.0.5" }, registryFor = { registry },
+            xrayAvailableFor = { false }, xrayTlsAvailableFor = { false },
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+            transportHealthFor = { healthy() }, historyFor = { _, _ -> null },
+            shadowsocksAvailableFor = { false },
+        )
+        assertEquals(setOf(TransportKind.AMNEZIA_WG), withoutShadowsocks.map { it.transport }.toSet())
+
+        val withShadowsocks = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(germany), gatewayFactsFor = { catalogById[it] },
+            provisioned = { true }, clientTunnelIp = { "10.77.0.5" }, registryFor = { registry },
+            xrayAvailableFor = { false }, xrayTlsAvailableFor = { false },
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+            transportHealthFor = { healthy() }, historyFor = { _, _ -> null },
+            shadowsocksAvailableFor = { true },
+        )
+        assertEquals(setOf(TransportKind.AMNEZIA_WG, TransportKind.SHADOWSOCKS_2022), withShadowsocks.map { it.transport }.toSet())
+    }
+
+    @Test
+    fun `omitting shadowsocksAvailableFor entirely defaults to excluded - every pre-B45B-4 call site stays byte-for-byte unaffected`() {
+        val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+            transports = listOf(
+                EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+                EndpointTransportBinding(TransportKind.SHADOWSOCKS_2022, "203.0.113.55", 8388),
+            ),
+        )
+        val candidates = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(germany), gatewayFactsFor = { catalogById[it] },
+            provisioned = { true }, clientTunnelIp = { "10.77.0.5" },
+            registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.SHADOWSOCKS_2022) },
+            xrayAvailableFor = { false }, xrayTlsAvailableFor = { false },
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+            transportHealthFor = { healthy() }, historyFor = { _, _ -> null },
+        )
+        assertEquals(setOf(TransportKind.AMNEZIA_WG), candidates.map { it.transport }.toSet())
+    }
+
+    @Test
+    fun `AMNEZIA_WG and XRAY_REALITY eligibility are completely unaffected by SHADOWSOCKS_2022 wiring`() {
+        val candidates = buildDefault()
+        assertEquals(setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM), candidates.map { it.gatewayId }.toSet())
+        assertEquals(setOf(TransportKind.AMNEZIA_WG), candidates.map { it.transport }.toSet())
+    }
 }

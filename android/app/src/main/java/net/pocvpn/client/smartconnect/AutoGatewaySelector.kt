@@ -133,6 +133,15 @@ object AutoGatewaySelector {
         // Defaults to Long.MAX_VALUE - same "byte-for-byte unaffected unless
         // a caller opts in" contract PathScorer.score itself documents.
         nowEpochMillis: Long = Long.MAX_VALUE,
+        // B45B-4 - same shape/reasoning as xrayAvailableFor/xrayTlsAvailableFor
+        // above: the manifest merely says the endpoint SUPPORTS
+        // SHADOWSOCKS_2022 at a given host:port, never that this device has
+        // a usable (valid, ABI/binary-eligible) credential for it yet.
+        // Appended at the end (not inserted alongside xrayAvailableFor) so
+        // every pre-B45B-4 positional call site is byte-for-byte unaffected.
+        // Defaults to `{ false }` - fail closed for any caller that never
+        // wires Shadowsocks.
+        shadowsocksAvailableFor: (EndpointId) -> Boolean = { false },
     ): List<GatewayAttemptCandidate> {
         val eligible = manifestEndpoints.mapNotNull { manifestEndpoint ->
             val gateway = gatewayFactsFor(manifestEndpoint.id) ?: return@mapNotNull null
@@ -171,6 +180,9 @@ object AutoGatewaySelector {
                     TransportKind.AMNEZIA_WG -> true // already gated by provisioned()/clientTunnelIp() above
                     TransportKind.XRAY_REALITY -> xrayAvailableFor(manifestEndpoint.id)
                     TransportKind.TLS_TCP -> xrayTlsAvailableFor(manifestEndpoint.id)
+                    // B45B-4 - same per-endpoint device-eligibility gate shape as
+                    // XRAY_REALITY/TLS_TCP above.
+                    TransportKind.SHADOWSOCKS_2022 -> shadowsocksAvailableFor(manifestEndpoint.id)
                     else -> false
                 }
             }
@@ -576,11 +588,15 @@ object AutoGatewaySelector {
         nowEpochMillis: Long = Long.MAX_VALUE,
         restrictionClass: RestrictionClass = RestrictionClass.UNKNOWN,
         cdnRuntimeCapabilities: CdnClientRuntimeCapabilities = CdnClientRuntimeCapabilities.unsupported(),
+        // B45B-4 - see buildCandidates's own docs for this parameter. Appended
+        // at the end for the same "every pre-existing positional call site
+        // unaffected" reason.
+        shadowsocksAvailableFor: (EndpointId) -> Boolean = { false },
     ): List<AutoConnectAttempt> {
         val direct = buildCandidates(
             manifestEndpoints, gatewayFactsFor, provisioned, clientTunnelIp, registryFor,
             xrayAvailableFor, xrayTlsAvailableFor, reachabilityFor, transportHealthFor, historyFor,
-            preference, nowEpochMillis,
+            preference, nowEpochMillis, shadowsocksAvailableFor,
         )
         val relayed = buildRelayedCandidates(
             manifestEndpoints, registryFor, reachabilityFor, transportHealthFor, historyFor,

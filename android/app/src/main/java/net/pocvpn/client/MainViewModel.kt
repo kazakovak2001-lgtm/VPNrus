@@ -409,6 +409,34 @@ class MainViewModel(
     private val xrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
     private val xrayTlsTransport: VpnTransport? = null,
     private val xrayXhttpTransport: VpnTransport? = null,
+    // B45B-4 - additive, defaults to null (same "no wiring, no behavior"
+    // seam every other optional transport instance above already uses). The
+    // SAME real ShadowsocksTransport instance registered here (Smart Connect
+    // selection, buildTransportRegistry below) must also be the one handed
+    // to VpnController as its resolvable SHADOWSOCKS_2022 executor - never a
+    // second, independently-constructed instance (see xrayTransport's own
+    // "B8I7" doc note for the exact same discipline).
+    private val shadowsocksTransport: VpnTransport? = null,
+    // B45B-4 - the endpoint-scoped, encrypted credential repository (B45B-2)
+    // this device has for SHADOWSOCKS_2022, bound to Germany's own endpoint
+    // id (mirrors xrayProfileRepository's own Germany-fixed wiring above -
+    // narrowest possible slice; a future multi-gateway wiring can generalize
+    // this to a resolver the same way xrayProfileRepositoryResolver does,
+    // without changing this field's own meaning). null means no credential
+    // source is wired at all - isShadowsocksAvailableFor stays false for
+    // every endpoint, never a fabricated availability.
+    private val shadowsocksCredentialRepository: net.pocvpn.client.identity.Shadowsocks2022CredentialRepository? = null,
+    // B45B-4 - the ONE typed, fail-closed ABI/binary eligibility fact this
+    // ViewModel is told about (see ShadowsocksBinaryEligibility's own docs) -
+    // conservative default (UnsupportedAbi with an empty device-ABI list)
+    // keeps every legacy/test caller fail-closed, same discipline
+    // cdnRuntimeCapabilities above already follows. Production Factory
+    // computes the REAL value once (Build.SUPPORTED_ABIS + the real
+    // nativeLibraryDir) - never re-derived per endpoint/per call, since a
+    // device's own ABI/packaged-binary facts never change within a process
+    // lifetime.
+    private val shadowsocksBinaryEligibility: net.pocvpn.client.vpn.shadowsocks.ShadowsocksBinaryEligibility =
+        net.pocvpn.client.vpn.shadowsocks.ShadowsocksBinaryEligibility.UnsupportedAbi(emptyList()),
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
     // B13 consolidated review fix - additive, defaults to null (same "no
     // wiring, no behavior" seam as every other optional dependency above).
@@ -905,6 +933,10 @@ class MainViewModel(
         relayXrayProfileRepositoryResolver = relayXrayProfileRepositoryResolver,
         relayXrayTlsProfileRepositoryResolver = relayXrayTlsProfileRepositoryResolver,
         cdnRuntimeCapabilities = cdnRuntimeCapabilities,
+        // B45B-4 - the SAME real ShadowsocksTransport instance registered in
+        // buildTransportRegistry - never a second, independently-constructed
+        // one (see that field's own docs).
+        shadowsocksTransport = shadowsocksTransport,
         // B13 - the SAME pathHistoryStore/fingerprintKeyProvider instances
         // reachabilityDiagnostics() below already reads (never a second,
         // independently-constructed pair) - this is the live-connect-path
@@ -952,6 +984,32 @@ class MainViewModel(
 
     private fun isXrayTlsAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
         endpointId in xrayTlsAvailableEndpoints.value
+
+    // B45B-4 - same per-endpoint Set<EndpointId> shape/reasoning as
+    // [xrayAvailableEndpoints]/[xrayTlsAvailableEndpoints] above - a
+    // credential existing for one endpoint must never make a different
+    // endpoint appear available.
+    private val shadowsocksAvailableEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
+
+    /**
+     * B45B-4 - the ONE place SHADOWSOCKS_2022 device-eligibility is actually
+     * decided, reused identically by both buildTransportRegistry(endpointId)
+     * (Smart Connect selection within an already-known gateway) and
+     * AutoGatewaySelector.buildCombinedAttempts's own shadowsocksAvailableFor
+     * parameter (manifest-driven Auto gateway candidate construction) - never
+     * two independently-derived checks that could disagree about the SAME
+     * endpoint. Requires ALL THREE narrow, typed, fail-closed facts (Phase
+     * 2/3 of B45B-4's own task spec): a real credential source was wired for
+     * this endpoint AND that credential actually validated (populated
+     * asynchronously into [shadowsocksAvailableEndpoints] below, the same
+     * "checked once at startup/on provisioning, never polled" discipline
+     * [xrayAvailableEndpoints] already uses) AND this device's own ABI/binary
+     * eligibility ([shadowsocksBinaryEligibility]) is genuinely [ShadowsocksBinaryEligibility.Eligible] -
+     * never claiming support for an ABI/binary this checkout does not
+     * actually package.
+     */
+    private fun isShadowsocksAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
+        shadowsocksBinaryEligibility.isEligible && endpointId in shadowsocksAvailableEndpoints.value
 
     /**
      * B8O3 - the kind of the transport actually running/last attempted
@@ -1104,6 +1162,23 @@ class MainViewModel(
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
                 capabilities = if (available) xhttp.capabilities else TransportCapabilities.notImplemented(),
                 factory = if (available) ({ xhttp }) else null,
+            )
+        }
+        // B45B-4 - same shape as XRAY_REALITY/TLS_TCP above: AVAILABLE only
+        // when isShadowsocksAvailableFor(endpointId) is true - see that
+        // function's own docs for the three facts it requires (wired
+        // credential source, validated credential, ABI/binary eligibility).
+        // A NOT_IMPLEMENTED (no shadowsocksTransport wired at all) or
+        // ineligible device/endpoint never gets a factory - fails closed
+        // exactly like every other not-yet-eligible kind in this function.
+        val shadowsocks = shadowsocksTransport
+        if (shadowsocks != null) {
+            val available = isShadowsocksAvailableFor(endpointId)
+            descriptors += TransportDescriptor(
+                kind = shadowsocks.kind,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) shadowsocks.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ shadowsocks }) else null,
             )
         }
         return TransportRegistry.build(descriptors)
@@ -1777,6 +1852,24 @@ class MainViewModel(
             viewModelScope.launch {
                 val ready = XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready
                 if (ready) xrayTlsAvailableEndpoints.update { it + endpointId }
+            }
+        }
+        // B45B-4 - same startup-check shape as the Xray/TLS blocks above:
+        // checked ONCE at init (never polled), reusing the SAME real
+        // Shadowsocks2022CredentialRepository.getCredential() authoritative
+        // check ShadowsocksVpnService itself runs at connect() time - never a
+        // looser/duplicated "credential exists" heuristic that could
+        // disagree with what connect() actually accepts. A corrupted or
+        // absent credential never adds the endpoint - fails closed, exactly
+        // like Xray's own resolveTls() gate.
+        shadowsocksCredentialRepository?.let { repository ->
+            viewModelScope.launch {
+                val present = try {
+                    repository.getCredential() is net.pocvpn.client.identity.Shadowsocks2022CredentialGetResult.Present
+                } catch (t: Throwable) {
+                    false
+                }
+                if (present) shadowsocksAvailableEndpoints.update { it + germanyEndpointId }
             }
         }
         // B8I - mirrors reconnectManager's own start()-in-init/stop()-in-
@@ -2705,6 +2798,7 @@ class MainViewModel(
             registryFor = { endpointId -> buildTransportRegistry(endpointId) },
             xrayAvailableFor = ::isXrayAvailableFor,
             xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
+            shadowsocksAvailableFor = ::isShadowsocksAvailableFor,
             reachabilityFor = { endpointId, kind ->
                 val gateway = gatewaysById.getValue(endpointId)
                 val endpoint = net.pocvpn.client.smartconnect.ProductionGatewayEndpoints.descriptorFor(
@@ -2927,6 +3021,7 @@ class MainViewModel(
             registryFor = { endpointId -> buildTransportRegistry(endpointId) },
             xrayAvailableFor = ::isXrayAvailableFor,
             xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
+            shadowsocksAvailableFor = ::isShadowsocksAvailableFor,
             cdnRuntimeCapabilities = cdnRuntimeCapabilities,
             reachabilityFor = { endpointId, kind ->
                 // B24 - relay endpoint ids (an INGRESS/EXIT the manifest
@@ -3979,6 +4074,24 @@ class MainViewModel(
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
                 xrayXhttpTransport = net.pocvpn.client.vpn.VlessXhttpTransport(context),
+                // B45B-4 - the SAME real ShadowsocksTransport instance
+                // registered for BOTH Smart Connect selection
+                // (buildTransportRegistry) and execution (VpnController) -
+                // same "one instance" discipline as xrayTransport above.
+                // Endpoint-scoped credential repository bound to Germany's
+                // own endpoint id (narrowest possible slice - see that
+                // field's own doc for why). ABI/binary eligibility is
+                // computed ONCE here from the real device/APK facts, never
+                // re-derived per endpoint or per connect attempt.
+                shadowsocksTransport = net.pocvpn.client.vpn.shadowsocks.ShadowsocksTransport(context),
+                shadowsocksCredentialRepository = net.pocvpn.client.identity.Shadowsocks2022CredentialRepositoryFactory.create(
+                    context,
+                    net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.endpointId,
+                ),
+                shadowsocksBinaryEligibility = net.pocvpn.client.vpn.shadowsocks.ShadowsocksAdapterEligibilityChecker.check(
+                    deviceAbis = android.os.Build.SUPPORTED_ABIS.toList(),
+                    nativeLibraryDir = context.applicationInfo.nativeLibraryDir,
+                ),
                 xrayTlsTransport = VlessTlsTransport(context) { id ->
                     if (id.value == net.pocvpn.client.smartconnect.ProductionGateway.ID) xrayTlsProfileRepository else XrayTlsProfileRepositoryFactory.create(context, id)
                 },
