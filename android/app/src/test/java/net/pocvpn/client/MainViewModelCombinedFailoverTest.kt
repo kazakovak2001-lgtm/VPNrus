@@ -3,6 +3,7 @@
 package net.pocvpn.client
 
 import android.content.Intent
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -11,6 +12,11 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.test.runTest
 import net.pocvpn.client.diagnostics.DiagnosticsStore
+import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.diagnostics.support.DiagnosticOutcome
+import net.pocvpn.client.diagnostics.support.DiagnosticEventType
+import net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore
+import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
 import net.pocvpn.client.reachability.Ed25519ManifestVerifier
 import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
@@ -31,6 +37,7 @@ import net.pocvpn.client.relay.RelayIngressResolution
 import net.pocvpn.client.relay.RelayIngressResolver
 import net.pocvpn.client.relay.RelayedExecutionPlan
 import net.pocvpn.client.smartconnect.AutoGatewaySelector
+import net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.FakeClientKeyRepository
@@ -40,6 +47,7 @@ import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeSelectedGatewayStore
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnTransport
+import net.pocvpn.client.vpn.VpnSessionHealth
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayAutoModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
@@ -130,6 +138,10 @@ private class OrderLoggingFailNThenSucceedTransport(
     private val orderLog: MutableList<String>,
     private val hostLabels: Map<String, String>,
     private val succeedOnCall: Int,
+    private val diagnostics: DiagnosticsStore? = null,
+    private val firstFailureGate: CompletableDeferred<Unit>? = null,
+    private val onSecondConnect: (() -> Unit)? = null,
+    private val permissionOnSecond: Boolean = false,
 ) : VpnTransport {
     override val name: String = "order-logging-fail-n-then-succeed"
     override val kind: TransportKind = TransportKind.AMNEZIA_WG
@@ -139,7 +151,8 @@ private class OrderLoggingFailNThenSucceedTransport(
         private set
     val configs = mutableListOf<TransportConfig.Awg>()
 
-    override fun preparePermissionIntent(): Intent? = null
+    override fun preparePermissionIntent(): Intent? =
+        if (permissionOnSecond && connectCallCount == 1) Intent() else null
 
     override suspend fun connect(config: TransportConfig) {
         connectCallCount++
@@ -148,8 +161,14 @@ private class OrderLoggingFailNThenSucceedTransport(
         val label = hostLabels[awg.config.peer.endpointHost] ?: "direct:${awg.config.peer.endpointHost}"
         orderLog += label
         if (connectCallCount < succeedOnCall) {
+            if (connectCallCount == 1 && firstFailureGate != null) {
+                diagnostics?.recordError(VpnError.BackendStartFailure("gated failure"))
+                stateFlow.value = TransportState.Error("gated failure")
+                firstFailureGate.await()
+            }
             throw RuntimeException("simulated backend start failure")
         }
+        if (connectCallCount == 2) onSecondConnect?.invoke()
         stateFlow.value = TransportState.Connected
     }
 
@@ -224,7 +243,7 @@ class MainViewModelCombinedFailoverTest {
      * MainViewModelRelayAttemptTest's own note on why AMNEZIA_WG, not
      * XRAY_REALITY/TLS_TCP, keeps this an orchestration-only test).
      */
-    private fun manifestRepositoryWithAllThree(): EndpointManifestRepository {
+    private fun manifestRepositoryWithAllThree(includeIngress: Boolean = true): EndpointManifestRepository {
         val manifest = EndpointManifest(
             manifestVersion = 1,
             issuedAtEpochMillis = 1_000L,
@@ -253,7 +272,7 @@ class MainViewModelCombinedFailoverTest {
                     transports = listOf(EndpointTransportBinding(TransportKind.AMNEZIA_WG, "203.0.113.50", 51820)),
                     relayTo = germany.endpointId,
                 ),
-            ),
+            ).filter { includeIngress || EndpointRole.INGRESS !in it.roles },
         )
         val signer = Ed25519Signer()
         signer.init(true, manifestSigningKey)
@@ -316,13 +335,17 @@ class MainViewModelCombinedFailoverTest {
         relayIngressResolver: RelayIngressResolver,
         manifestRepository: EndpointManifestRepository,
         pathHistoryStore: PathHistoryStore? = null,
+        selectedGatewayStore: net.pocvpn.client.vpn.config.SelectedGatewayStore = FakeSelectedGatewayStore(),
+        supportStore: InMemoryDiagnosticSessionStore? = null,
+        supportRecorder: SupportDiagnosticsRecorder? = null,
+        diagnosticsStore: DiagnosticsStore = DiagnosticsStore(),
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
         gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
         reconnectManager = FakeReconnectManager(),
-        diagnosticsStore = DiagnosticsStore(),
-        selectedGatewayStore = FakeSelectedGatewayStore(),
+        diagnosticsStore = diagnosticsStore,
+        selectedGatewayStore = selectedGatewayStore,
         clientTunnelIdentityStore = FakeClientTunnelIdentityStore(
             mapOf(ProductionGatewayId.GERMANY to "10.77.0.5", ProductionGatewayId.STOCKHOLM to "10.77.0.2"),
         ),
@@ -332,10 +355,219 @@ class MainViewModelCombinedFailoverTest {
         pathHistoryStore = pathHistoryStore,
         fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
         relayIngressResolver = relayIngressResolver,
+        supportDiagnosticsRecorder = supportRecorder ?: supportStore?.let { SupportDiagnosticsRecorder(it, "1.0", 1L) },
+        supportDiagnosticsStore = supportStore,
     )
+
+    @Test
+    fun `R2 Auto diagnostics follow actual combined attempts despite a different selected gateway`() = runTest {
+        val orderLog = mutableListOf<String>()
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val history = SeededPathHistoryStore(mapOf(
+            germany.endpointId.value to richSuccessHistory,
+            stockholm.endpointId.value to richFailureHistory,
+        ))
+        val transport = OrderLoggingFailNThenSucceedTransport(orderLog, hostLabels, succeedOnCall = 2)
+        val resolver = OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) }
+        val viewModel = newViewModel(
+            transport, resolver, manifestRepositoryWithAllThree(), history,
+            selectedGatewayStore = FakeSelectedGatewayStore(ProductionGatewayId.STOCKHOLM),
+            supportStore = supportStore,
+        )
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(listOf("direct:GERMANY", "relay:${ingressId.value}", "direct:STOCKHOLM"), orderLog)
+        val session = supportStore.recent().single()
+        val starts = session.events.filter { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals(listOf("frankfurt", null, "stockholm"), starts.map { it.tags["plannedEndpointId"] })
+        assertTrue(starts.none { it.tags.containsKey("attemptedEndpointId") })
+        assertEquals(listOf("1", "2", "3"), starts.map { it.tags["attemptOrdinal"] })
+        assertEquals(ingressId.value, starts[1].tags["plannedIngressEndpointId"])
+        assertEquals(germany.endpointId.value, starts[1].tags["plannedExitEndpointId"])
+        assertTrue(!starts[1].tags.containsKey("attemptedIngressEndpointId"))
+        assertTrue(session.events.filter { it.type == DiagnosticEventType.PATH_FAILED }.any {
+            it.tags["attemptOrdinal"] == "1" && it.tags["attemptedEndpointId"] == germany.endpointId.value
+        })
+        assertTrue(session.events.filter { it.type == DiagnosticEventType.PATH_FAILED }.any {
+            it.tags["attemptOrdinal"] == "2" && it.tags["plannedIngressEndpointId"] == ingressId.value &&
+                !it.tags.containsKey("attemptedIngressEndpointId") && !it.tags.containsKey("attemptedExitEndpointId")
+        })
+        assertEquals(stockholm.endpointId.value,
+            session.events.single { it.type == DiagnosticEventType.PATH_SUCCEEDED }.tags["attemptedEndpointId"])
+    }
 
     private fun alwaysFailingRelayResolution(plan: RelayedExecutionPlan): RelayIngressResolution =
         RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE)
+
+    @Test
+    fun `R2 Auto candidate B remains planned during permission prompt then uses ordinal two at dial`() = runTest {
+        val orderLog = mutableListOf<String>()
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(supportStore, "1.0", 1L)
+        val transport = OrderLoggingFailNThenSucceedTransport(
+            orderLog, hostLabels, succeedOnCall = 2, permissionOnSecond = true,
+        )
+        val history = SeededPathHistoryStore(mapOf(
+            germany.endpointId.value to richSuccessHistory,
+            stockholm.endpointId.value to richFailureHistory,
+        ))
+        val viewModel = newViewModel(
+            transport, OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) },
+            manifestRepositoryWithAllThree(includeIngress = false), history,
+            supportStore = supportStore, supportRecorder = recorder,
+        )
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(listOf("direct:GERMANY"), orderLog)
+        assertTrue(supportStore.recent().isEmpty())
+        val sessionId = recorder.currentSessionId()
+        assertTrue(sessionId != null)
+
+        viewModel.onVpnPermissionResult(true)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(2, transport.connectCallCount)
+        assertEquals(listOf("direct:GERMANY", "direct:STOCKHOLM"), orderLog)
+        val session = supportStore.recent().single()
+        assertEquals(sessionId, session.sessionId)
+        val starts = session.events.filter { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals(listOf("1", "2"), starts.map { it.tags["attemptOrdinal"] })
+        assertEquals(listOf("frankfurt", "stockholm"), starts.map { it.tags["plannedEndpointId"] })
+        assertTrue(starts.none { it.tags.containsKey("attemptedEndpointId") })
+        val dials = session.events.filter { it.type == DiagnosticEventType.TRANSPORT_START }
+        assertEquals(listOf("frankfurt", "stockholm"), dials.map { it.tags["attemptedEndpointId"] })
+        assertEquals(listOf("1", "2"), dials.map { it.tags["attemptOrdinal"] })
+        assertEquals("frankfurt", session.events.single { it.type == DiagnosticEventType.PATH_FAILED }.tags["attemptedEndpointId"])
+        for (type in listOf(DiagnosticEventType.PATH_SUCCEEDED, DiagnosticEventType.VPN_PROTECTED)) {
+            assertEquals("stockholm", session.events.single { it.type == type }.tags["attemptedEndpointId"])
+        }
+    }
+
+    @Test
+    fun `R2 Auto support session survives Failed before and after failover bookkeeping`() = runTest {
+        val orderLog = mutableListOf<String>()
+        val diagnostics = DiagnosticsStore()
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val recorder = SupportDiagnosticsRecorder(supportStore, "1.0", 1L)
+        val firstFailureGate = CompletableDeferred<Unit>()
+        lateinit var viewModel: MainViewModel
+        var lateObservationSessionId: String? = null
+        var lateObservationPersisted = false
+        var lateObservationFailureEligible = false
+        val transport = OrderLoggingFailNThenSucceedTransport(
+            orderLog, hostLabels, succeedOnCall = 2,
+            diagnostics = diagnostics, firstFailureGate = firstFailureGate,
+            onSecondConnect = {
+                // A's watcher has recorded failure and selected B. Replaying
+                // the late Failed health observation at B's real transport
+                // boundary must leave this same support session open.
+                viewModel.recordFailedHealthForSupport()
+                lateObservationSessionId = recorder.currentSessionId()
+                lateObservationPersisted = supportStore.recent().isNotEmpty()
+                lateObservationFailureEligible = AutoGatewayFailoverPolicy.isEligibleForNextCandidate(
+                    viewModel.transportState.value, diagnostics.snapshot.value.lastError,
+                )
+            },
+        )
+        val history = SeededPathHistoryStore(mapOf(
+            germany.endpointId.value to richSuccessHistory,
+            stockholm.endpointId.value to richFailureHistory,
+        ))
+        viewModel = newViewModel(
+            transport, OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) },
+            manifestRepositoryWithAllThree(includeIngress = false), history,
+            supportStore = supportStore, supportRecorder = recorder, diagnosticsStore = diagnostics,
+        )
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(1, transport.connectCallCount)
+        assertTrue(viewModel.sessionHealth.value is VpnSessionHealth.Failed)
+        assertTrue(AutoGatewayFailoverPolicy.isEligibleForNextCandidate(viewModel.transportState.value, diagnostics.snapshot.value.lastError))
+        val sessionId = recorder.currentSessionId()
+        assertTrue(sessionId != null)
+        assertTrue(supportStore.recent().isEmpty())
+        // A's retry-eligible failure is visible while controller.connect is
+        // suspended, before the failover watcher can do its bookkeeping.
+        viewModel.recordFailedHealthForSupport()
+        assertEquals(sessionId, recorder.currentSessionId())
+        assertTrue(supportStore.recent().isEmpty())
+
+        firstFailureGate.complete(Unit)
+        testDispatcher.scheduler.runCurrent()
+        assertEquals(2, transport.connectCallCount)
+        assertEquals(sessionId, lateObservationSessionId)
+        assertTrue(!lateObservationPersisted)
+        assertTrue(lateObservationFailureEligible)
+        assertEquals(listOf("direct:GERMANY", "direct:STOCKHOLM"), orderLog)
+        val session = supportStore.recent().single()
+        assertEquals(DiagnosticOutcome.PROTECTED, session.outcome)
+        assertEquals(sessionId, session.sessionId)
+        val starts = session.events.filter { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals(listOf("1", "2"), starts.map { it.tags["attemptOrdinal"] })
+        assertEquals(listOf("frankfurt", "stockholm"), starts.map { it.tags["plannedEndpointId"] })
+        assertTrue(starts.none { it.tags.containsKey("attemptedEndpointId") })
+        val failed = session.events.filter { it.type == DiagnosticEventType.PATH_FAILED }
+        assertEquals(1, failed.size)
+        assertEquals("1", failed.single().tags["attemptOrdinal"])
+        assertEquals("frankfurt", failed.single().tags["attemptedEndpointId"])
+        for (type in listOf(DiagnosticEventType.PATH_SUCCEEDED, DiagnosticEventType.VPN_PROTECTED)) {
+            val success = session.events.single { it.type == type }
+            assertEquals("2", success.tags["attemptOrdinal"])
+            assertEquals("stockholm", success.tags["attemptedEndpointId"])
+        }
+    }
+
+    @Test
+    fun `R2 Auto exhaustion closes once with no duplicate failed attempt event`() = runTest {
+        val orderLog = mutableListOf<String>()
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val history = SeededPathHistoryStore(mapOf(
+            germany.endpointId.value to richSuccessHistory,
+            stockholm.endpointId.value to richFailureHistory,
+        ))
+        val viewModel = newViewModel(
+            OrderLoggingAlwaysFailTransport(orderLog, hostLabels),
+            OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) },
+            manifestRepositoryWithAllThree(includeIngress = false), history,
+            supportStore = supportStore,
+        )
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(listOf("direct:GERMANY", "direct:STOCKHOLM"), orderLog)
+        val session = supportStore.recent().single()
+        assertEquals(DiagnosticOutcome.FAILED, session.outcome)
+        assertEquals(listOf("1", "2"), session.events.filter { it.type == DiagnosticEventType.PATH_FAILED }.map { it.tags["attemptOrdinal"] })
+    }
+
+    @Test
+    fun `R2 user disconnect closes an open Auto diagnostic session once`() = runTest {
+        val orderLog = mutableListOf<String>()
+        val diagnostics = DiagnosticsStore()
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val gate = CompletableDeferred<Unit>()
+        val transport = OrderLoggingFailNThenSucceedTransport(
+            orderLog, hostLabels, succeedOnCall = 2, diagnostics = diagnostics, firstFailureGate = gate,
+        )
+        val viewModel = newViewModel(
+            transport, OrderLoggingResolver(orderLog) { alwaysFailingRelayResolution(it) },
+            manifestRepositoryWithAllThree(includeIngress = false),
+            supportStore = supportStore, diagnosticsStore = diagnostics,
+        )
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(supportStore.recent().isEmpty())
+        viewModel.disconnect()
+        gate.complete(Unit)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(listOf("direct:GERMANY"), orderLog)
+        assertEquals(DiagnosticOutcome.DISCONNECTED, supportStore.recent().single().outcome)
+    }
 
     // --- A: Direct A fails -> Relayed B is attempted next (Relayed ranks ABOVE Direct STOCKHOLM here too - see D) ---
 

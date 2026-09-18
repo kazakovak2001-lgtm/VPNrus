@@ -140,4 +140,90 @@ class ReconnectAvailabilityLifecycleTest {
         assertTrue(gen2 < gen3)
         assertEquals(gen3, gen3) // sanity: begin() itself returns the now-current generation
     }
+
+    @Test
+    fun `A secondary cellular appearance while WiFi remains authoritative emits no change`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        assertTrue(lifecycle.onAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAvailable(generation, "cellular"))
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertTrue(lifecycle.networkAvailable)
+    }
+
+    @Test
+    fun `B authoritative WiFi to cellular change while both remain available emits once`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        lifecycle.onAvailable(generation, "wifi")
+        lifecycle.onAvailable(generation, "cellular")
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertTrue(lifecycle.onAuthoritativeAvailable(generation, "cellular"))
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "cellular"))
+    }
+
+    @Test
+    fun `C authoritative cellular to WiFi change emits once`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        lifecycle.onAvailable(generation, "cellular")
+        lifecycle.onAvailable(generation, "wifi")
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "cellular"))
+        assertTrue(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+    }
+
+    @Test
+    fun `D losing secondary cellular while WiFi is authoritative emits no change`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        lifecycle.onAvailable(generation, "wifi")
+        lifecycle.onAvailable(generation, "cellular")
+        lifecycle.onAuthoritativeAvailable(generation, "wifi")
+        assertFalse(lifecycle.onLost(generation, "cellular"))
+        assertTrue(lifecycle.networkAvailable)
+        assertFalse(lifecycle.onAuthoritativeLost(generation, "cellular"))
+    }
+
+    @Test
+    fun `E late loss of old cellular after WiFi became authoritative emits no change`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        lifecycle.onAvailable(generation, "cellular")
+        lifecycle.onAvailable(generation, "wifi")
+        lifecycle.onAuthoritativeAvailable(generation, "cellular")
+        assertTrue(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAuthoritativeLost(generation, "cellular"))
+        assertFalse(lifecycle.onLost(generation, "cellular"))
+        assertTrue(lifecycle.networkAvailable)
+    }
+
+    @Test
+    fun `F loss of WiFi followed by authoritative cellular replacement emits once`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        lifecycle.onAvailable(generation, "wifi")
+        lifecycle.onAvailable(generation, "cellular")
+        lifecycle.onAuthoritativeAvailable(generation, "wifi")
+        assertFalse(lifecycle.onLost(generation, "wifi"))
+        assertTrue(lifecycle.onAuthoritativeLost(generation, "wifi"))
+        assertTrue(lifecycle.onAuthoritativeAvailable(generation, "cellular"))
+        assertTrue(lifecycle.networkAvailable)
+    }
+
+    @Test
+    fun `G duplicate callback events never fabricate transitions`() {
+        val lifecycle = ReconnectAvailabilityLifecycle()
+        val generation = lifecycle.beginGeneration()
+        assertTrue(lifecycle.onAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onAuthoritativeAvailable(generation, "wifi"))
+        assertFalse(lifecycle.onLost(generation, "unknown"))
+        assertFalse(lifecycle.onAuthoritativeLost(generation, "unknown"))
+        assertTrue(lifecycle.onAuthoritativeLost(generation, "wifi"))
+        assertFalse(lifecycle.onAuthoritativeLost(generation, "wifi"))
+        assertTrue(lifecycle.networkAvailable)
+    }
 }

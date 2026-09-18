@@ -77,6 +77,7 @@ class VlessRealityTransport(
     override val name: String = "xray-vless-reality"
     override val kind: TransportKind = TransportKind.XRAY_REALITY
     override val capabilities: TransportCapabilities = TransportCapabilities.xrayRealityAdapterShell()
+    override val underlyingNetworkRecovery: UnderlyingNetworkRecovery = UnderlyingNetworkRecovery.RESTART_SESSION
 
     private val state = MutableStateFlow<TransportState>(TransportState.Disconnected)
 

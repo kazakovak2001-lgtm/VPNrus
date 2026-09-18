@@ -10,6 +10,9 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
+import net.pocvpn.client.diagnostics.support.DiagnosticEventType
+import net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore
+import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
 import net.pocvpn.client.reachability.Ed25519ManifestVerifier
 import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
@@ -235,6 +238,7 @@ class MainViewModelRelayAttemptTest {
         relayEndToEndProbe: RelayEndToEndProbe = NotConfiguredRelayEndToEndProbe,
         pathHistoryStore: PathHistoryStore? = null,
         fingerprintKeyProvider: NetworkFingerprintKeyProvider? = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
+        supportStore: InMemoryDiagnosticSessionStore? = null,
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -250,7 +254,44 @@ class MainViewModelRelayAttemptTest {
         fingerprintKeyProvider = fingerprintKeyProvider,
         relayIngressResolver = relayIngressResolver,
         relayEndToEndProbe = relayEndToEndProbe,
+        supportDiagnosticsRecorder = supportStore?.let { SupportDiagnosticsRecorder(it, "1.0", 1L) },
+        supportDiagnosticsStore = supportStore,
     )
+
+    @Test
+    fun `R2 NotProvisioned relay exports only planned route identities`() = runTest {
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val resolver = StubRelayIngressResolver { RelayIngressResolution.NotProvisioned(RelayFailureCategory.INGRESS_UNREACHABLE) }
+        val viewModel = newViewModel(relayIngressResolver = resolver, supportStore = supportStore)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        val session = supportStore.recent().single()
+        val start = session.events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals(ingressId.value, start.tags["plannedIngressEndpointId"])
+        assertEquals(ProductionGatewayCatalog.GERMANY.endpointId.value, start.tags["plannedExitEndpointId"])
+        assertTrue(session.events.none { it.tags.containsKey("attemptedIngressEndpointId") || it.tags.containsKey("attemptedExitEndpointId") })
+    }
+
+    @Test
+    fun `R2 resolved failing ingress is attempted at controller transport call but exit is not`() = runTest {
+        val supportStore = InMemoryDiagnosticSessionStore()
+        val fakeTransport = AlwaysFailingIngressTransport()
+        val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
+        val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, supportStore = supportStore)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, fakeTransport.connectCallCount)
+        val session = supportStore.recent().single()
+        val start = session.events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertFalse(start.tags.containsKey("attemptedIngressEndpointId"))
+        val transportStart = session.events.single { it.type == DiagnosticEventType.TRANSPORT_START }
+        assertEquals(ingressId.value, transportStart.tags["attemptedIngressEndpointId"])
+        assertEquals(1, session.events.count { it.type == DiagnosticEventType.PATH_FAILED })
+        assertTrue(session.events.filter { it.type == DiagnosticEventType.PATH_FAILED }.any { it.tags["attemptedIngressEndpointId"] == ingressId.value })
+        assertTrue(session.events.none { it.tags.containsKey("attemptedExitEndpointId") })
+    }
 
     // --- Task requirement A/B (integration level) ---
 
@@ -398,10 +439,11 @@ class MainViewModelRelayAttemptTest {
     @Test
     fun `a genuine end-to-end probe success promotes the relayed session to RelayProtected and records a real Success`() = runTest {
         val store = RecordingPathHistoryStore()
+        val supportStore = InMemoryDiagnosticSessionStore()
         val fakeTransport = HandshakeSucceedingIngressTransport()
         val resolver = StubRelayIngressResolver { plan -> RelayIngressResolution.Resolved(fakeTransport, TransportKind.AMNEZIA_WG, fakeIngressClientProfile(plan)) }
         val probe = StubRelayEndToEndProbe { _, _ -> RelayProbeResult.Success }
-        val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, relayEndToEndProbe = probe, pathHistoryStore = store)
+        val viewModel = newViewModel(transport = fakeTransport, relayIngressResolver = resolver, relayEndToEndProbe = probe, pathHistoryStore = store, supportStore = supportStore)
 
         viewModel.connect()
         testDispatcher.scheduler.runCurrent()
@@ -410,6 +452,9 @@ class MainViewModelRelayAttemptTest {
         assertEquals(VpnSessionHealth.RelayProtected, viewModel.sessionHealth.value)
         val relayRecords = store.records.filter { it.pathId.contains("->") }
         assertTrue("a genuine end-to-end probe success must record a real Success under the composite historyPathId", relayRecords.any { it.success })
+        val success = supportStore.recent().single().events.single { it.type == DiagnosticEventType.PATH_SUCCEEDED }
+        assertEquals(ingressId.value, success.tags["attemptedIngressEndpointId"])
+        assertEquals(ProductionGatewayCatalog.GERMANY.endpointId.value, success.tags["attemptedExitEndpointId"])
     }
 
     @Test

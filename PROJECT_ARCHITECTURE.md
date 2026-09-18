@@ -25,10 +25,10 @@ NetworkProfiler
   promotes the SAME `ReachabilityEngine`/`PathCandidateBuilder`/`PathScorer`
   pipeline (reused verbatim, never a parallel scorer) into a ranked
   `GatewayAttemptCandidate` list. Only engaged when
-  `MainViewModel.gatewayAutoMode` is true (persisted, default `false`/Manual -
-  every pre-B16 install/test is unaffected). Manual gateway selection
-  (`SelectedGatewayStore`/`selectGateway()`) is byte-for-byte unchanged and
-  always wins when active - selecting a gateway manually also turns Auto off.
+  `MainViewModel.gatewaySelectionMode` is `AUTO`; the persisted legacy
+  `gatewayAutoMode` boolean remains compatibility state. An accepted explicit
+  managed selection persists `MANUAL_MANAGED`, turns the compatibility boolean
+  off, and applies to the next connection only.
 - **B17 - runtime authority for Auto DISCOVERY AND execution-time endpoint
   address moved to the signed manifest, superseding B16's own shortcut**:
   `AutoGatewaySelector.buildCandidates` takes `manifestEndpoints: List<EndpointDescriptor>`
@@ -2334,9 +2334,10 @@ the one explicit authority `MainViewModel.connect()` dispatches on -
 `ProductionGatewayCatalog` or the signed manifest (`PrivateGatewayConfig` has
 no conversion function to either type - structurally incapable of entering
 them). The legacy `GatewayAutoModeStore` boolean is kept in lockstep both
-directions (`selectGatewaySelectionMode`/`setGatewayAutoMode`) so every
-pre-B22 caller/test observing that boolean is unaffected; `PRIVATE` can only
-ever come from the new store (the boolean has no way to express it).
+  directions (`selectGatewaySelectionMode`/`setGatewayAutoMode`), and an accepted
+  `selectGateway()` call also enters `MANUAL_MANAGED` (including from `PRIVATE`).
+  `PRIVATE` can only be selected explicitly through the new store (the boolean
+  has no way to express it).
 
 **Client private key never touches ordinary config (architecture constraint
 1)**: `PrivateGatewayConfig` has no private-key field at all - the keypair

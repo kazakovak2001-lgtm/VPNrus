@@ -64,6 +64,151 @@ private val VALID_XRAY_TLS_PROFILE = XrayTlsProfile(
 class VpnControllerXrayReconnectTest {
 
     @Test
+    fun `Xray underlying network identity change restarts pinned session and recovers`() = runTest {
+        val transport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val reconnectManager = FakeReconnectManager()
+        val events = mutableListOf<ReconnectIncidentEvent>()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, DiagnosticsStore(), backgroundScope,
+            xrayTlsProfileRepository = FakeXrayTlsProfileRepository(VALID_XRAY_TLS_PROFILE),
+            onReconnectIncident = events::add,
+        )
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.TLS_TCP))
+        runCurrent()
+
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(2, transport.connectCallCount)
+        assertEquals(1, transport.disconnectCallCount)
+        assertEquals(1, events.filterIsInstance<ReconnectIncidentEvent.Started>().size)
+        assertEquals(1, events.filterIsInstance<ReconnectIncidentEvent.Succeeded>().size)
+        assertEquals(0, events.filterIsInstance<ReconnectIncidentEvent.Failed>().size)
+    }
+
+    @Test
+    fun `competing network changes leave only newest reconnect generation authoritative`() = runTest {
+        val transport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val reconnectManager = FakeReconnectManager()
+        val events = mutableListOf<ReconnectIncidentEvent>()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, DiagnosticsStore(), backgroundScope,
+            xrayProfileRepository = FakeXrayProfileRepository(VALID_XRAY_PROFILE),
+            onReconnectIncident = events::add,
+        )
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.XRAY_REALITY))
+        runCurrent()
+
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals("superseded job must never create a duplicate VPN session", 2, transport.connectCallCount)
+        assertEquals(1, events.filterIsInstance<ReconnectIncidentEvent.Started>().size)
+        assertEquals(1, events.filterIsInstance<ReconnectIncidentEvent.Succeeded>().size)
+    }
+
+    @Test
+    fun `user disconnect during network-change recovery fences late completion`() = runTest {
+        val transport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val reconnectManager = FakeReconnectManager()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, DiagnosticsStore(), backgroundScope,
+            xrayTlsProfileRepository = FakeXrayTlsProfileRepository(VALID_XRAY_TLS_PROFILE),
+        )
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.TLS_TCP))
+        runCurrent()
+        transport.connectGate = kotlinx.coroutines.CompletableDeferred()
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        runCurrent()
+
+        val disconnect = launch { controller.disconnect() }
+        runCurrent()
+        transport.connectGate?.complete(Unit)
+        runCurrent()
+        disconnect.join()
+
+        assertTrue(controller.state.value is TransportState.Disconnected)
+    }
+
+    @Test
+    fun `explicit connect supersedes an in-flight automatic recovery`() = runTest {
+        val transport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val reconnectManager = FakeReconnectManager()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, DiagnosticsStore(), backgroundScope,
+            xrayTlsProfileRepository = FakeXrayTlsProfileRepository(VALID_XRAY_TLS_PROFILE),
+        )
+        val resolved = TransportOrchestrator.Resolution.Resolved(transport, TransportKind.TLS_TCP)
+        controller.connect(resolved)
+        runCurrent()
+        transport.connectGate = kotlinx.coroutines.CompletableDeferred()
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        runCurrent()
+
+        val explicit = launch { controller.connect(resolved) }
+        runCurrent()
+        transport.connectGate?.complete(Unit)
+        explicit.join()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(3, transport.connectCallCount)
+    }
+
+    @Test
+    fun `AWG ignores identity-change restart signal and keeps its active tunnel`() = runTest {
+        val transport = FakeVpnTransport()
+        val reconnectManager = FakeReconnectManager()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, DiagnosticsStore(), backgroundScope,
+        )
+        controller.connect()
+        runCurrent()
+
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(1, transport.connectCallCount)
+        assertEquals(0, transport.disconnectCallCount)
+    }
+
+    @Test
+    fun `genuine current transport failure still publishes one terminal incident`() = runTest {
+        val transport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val events = mutableListOf<ReconnectIncidentEvent>()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), DiagnosticsStore(), backgroundScope,
+            xrayTlsProfileRepository = FakeXrayTlsProfileRepository(VALID_XRAY_TLS_PROFILE),
+            onReconnectIncident = events::add,
+        )
+        controller.connect(TransportOrchestrator.Resolution.Resolved(transport, TransportKind.TLS_TCP))
+        runCurrent()
+
+        transport.forceState(TransportState.Error("current failure"))
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(1, events.filterIsInstance<ReconnectIncidentEvent.Started>().size)
+        assertEquals(1, events.filterIsInstance<ReconnectIncidentEvent.Failed>().size)
+    }
+
+    @Test
     fun `TLS_TCP process alive plus underlying network lost eventually leaves Protected`() = runTest {
         val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
         val reconnectManager = FakeReconnectManager()
@@ -120,7 +265,7 @@ class VpnControllerXrayReconnectTest {
             "a short transient loss must not permanently fail TLS_TCP, was ${controller.state.value}",
             controller.state.value is TransportState.Connected,
         )
-        assertEquals(1, tlsTransport.connectCallCount) // recovery never re-calls connect() - same tunnel
+        assertEquals(2, tlsTransport.connectCallCount) // Xray replaces the stale process/socket session on the new network
     }
 
     @Test

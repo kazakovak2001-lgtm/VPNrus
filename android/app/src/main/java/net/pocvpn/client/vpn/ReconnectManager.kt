@@ -5,10 +5,17 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 
 /** Client-side network-loss detection. Actual AWG reconnect across a real gateway remains UNVERIFIED until B8+. */
 interface ReconnectManager {
-    fun start(onNetworkLost: () -> Unit, onNetworkAvailable: () -> Unit)
+    fun start(
+        onNetworkLost: () -> Unit,
+        onNetworkAvailable: () -> Unit,
+        onUnderlyingNetworkChanged: () -> Unit = {},
+    )
     fun stop()
     fun isNetworkAvailable(): Boolean
 }
@@ -73,6 +80,8 @@ internal class NetworkAvailabilitySet {
 internal class ReconnectAvailabilityLifecycle {
     private var currentGeneration = 0L
     private var availability = NetworkAvailabilitySet()
+    private var authoritativeNetwork: Any? = null
+    private var authoritativeNetworkPresent = false
 
     @Volatile var networkAvailable = false
         private set
@@ -81,6 +90,8 @@ internal class ReconnectAvailabilityLifecycle {
     fun beginGeneration(): Long {
         currentGeneration++
         availability = NetworkAvailabilitySet()
+        authoritativeNetwork = null
+        authoritativeNetworkPresent = false
         networkAvailable = false
         return currentGeneration
     }
@@ -89,6 +100,8 @@ internal class ReconnectAvailabilityLifecycle {
     fun endGeneration() {
         currentGeneration++
         networkAvailable = false
+        authoritativeNetwork = null
+        authoritativeNetworkPresent = false
     }
 
     /** Returns true exactly when [generation] is current AND this call transitions empty -> non-empty for it - a stale [generation] is silently ignored. */
@@ -103,8 +116,32 @@ internal class ReconnectAvailabilityLifecycle {
     fun onLost(generation: Long, id: Any): Boolean {
         if (generation != currentGeneration) return false
         val lostAll = availability.markLost(id)
-        if (lostAll) networkAvailable = false
+        if (lostAll) {
+            networkAvailable = false
+            authoritativeNetwork = null
+            authoritativeNetworkPresent = false
+        }
         return lostAll
+    }
+
+    /**
+     * Consumes only the callback stream that Android documents as the best
+     * matching non-VPN network. The first value establishes a baseline; a
+     * later different value is the sole authoritative handover signal.
+     */
+    fun onAuthoritativeAvailable(generation: Long, id: Any): Boolean {
+        if (generation != currentGeneration) return false
+        val previous = authoritativeNetwork
+        authoritativeNetwork = id
+        authoritativeNetworkPresent = true
+        return previous != null && previous != id
+    }
+
+    /** A loss never guesses a replacement; retain its identity so the next best match can be compared. */
+    fun onAuthoritativeLost(generation: Long, id: Any): Boolean {
+        if (generation != currentGeneration || authoritativeNetwork != id || !authoritativeNetworkPresent) return false
+        authoritativeNetworkPresent = false
+        return true
     }
 }
 
@@ -130,30 +167,28 @@ internal class ReconnectAvailabilityLifecycle {
  * XRAY_REALITY - see [VpnController.handleNetworkLost]'s updated docs)
  * exhibited stale-Protected.
  *
- * Fix: request [NetworkCapabilities.NET_CAPABILITY_NOT_VPN] explicitly, via
- * [ConnectivityManager.registerNetworkCallback] (not
- * `registerDefaultNetworkCallback`) - the documented Android pattern for a
- * VPN-owning app to observe its REAL underlying connectivity rather than its
- * own resulting default network. Because a matching request can report
- * MULTIPLE concurrently-available networks (e.g. WiFi AND cellular both up),
- * [NetworkAvailabilitySet] tracks the whole set so [onNetworkLost] fires
- * ONLY when it becomes genuinely empty - a WiFi<->cellular handover where a
- * usable network is available throughout never spuriously reports "network
- * lost" (Phase C's own "normal handover should not cause unnecessary
- * permanent failure" requirement), while a real total loss still reports
- * correctly. No change to [ReconnectManager]'s contract, [VpnController],
- * or anything downstream of `onNetworkLost`/`onNetworkAvailable` - this is
- * strictly a same-interface fix to what evidence feeds the EXISTING
- * `handleNetworkLost()`/`reconnectLoop()` health authority, never a second
- * one.
+ * Availability and identity are deliberately separate. A filtered
+ * [ConnectivityManager.registerNetworkCallback] reports all matching
+ * INTERNET + NOT_VPN networks and owns only the aggregate empty/non-empty
+ * signal. On API 31+, [ConnectivityManager.registerBestMatchingNetworkCallback]
+ * with the same request is the sole identity authority. Its first value is a
+ * baseline; a later different best match is a handover. API 26-30 has no
+ * passive filtered best-match callback, so identity changes fail closed
+ * there instead of being guessed from all-network callback order.
  */
 class AndroidReconnectManager(context: Context) : ReconnectManager {
     private val connectivityManager =
         context.applicationContext.getSystemService(ConnectivityManager::class.java)
-    private var callback: ConnectivityManager.NetworkCallback? = null
+    private val callbackHandler = Handler(Looper.getMainLooper())
+    private var availabilityCallback: ConnectivityManager.NetworkCallback? = null
+    private var authoritativeCallback: ConnectivityManager.NetworkCallback? = null
     private val lifecycle = ReconnectAvailabilityLifecycle()
 
-    override fun start(onNetworkLost: () -> Unit, onNetworkAvailable: () -> Unit) {
+    override fun start(
+        onNetworkLost: () -> Unit,
+        onNetworkAvailable: () -> Unit,
+        onUnderlyingNetworkChanged: () -> Unit,
+    ) {
         stop()
         // B30B review fix (PR #46) - this generation id is captured HERE, in
         // this specific start() call's own local val, then closed over by
@@ -166,7 +201,7 @@ class AndroidReconnectManager(context: Context) : ReconnectManager {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
-        val cb = object : ConnectivityManager.NetworkCallback() {
+        val availabilityCb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (lifecycle.onAvailable(generation, network)) onNetworkAvailable()
             }
@@ -175,19 +210,36 @@ class AndroidReconnectManager(context: Context) : ReconnectManager {
                 if (lifecycle.onLost(generation, network)) onNetworkLost()
             }
         }
-        callback = cb
-        connectivityManager.registerNetworkCallback(request, cb)
+        availabilityCallback = availabilityCb
+        connectivityManager.registerNetworkCallback(request, availabilityCb, callbackHandler)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val authoritativeCb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (lifecycle.onAuthoritativeAvailable(generation, network)) {
+                        onUnderlyingNetworkChanged()
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    lifecycle.onAuthoritativeLost(generation, network)
+                }
+            }
+            authoritativeCallback = authoritativeCb
+            connectivityManager.registerBestMatchingNetworkCallback(request, authoritativeCb, callbackHandler)
+        }
     }
 
     override fun stop() {
-        callback?.let {
+        listOfNotNull(availabilityCallback, authoritativeCallback).forEach {
             try {
                 connectivityManager.unregisterNetworkCallback(it)
             } catch (_: IllegalArgumentException) {
                 // already unregistered - not an error for our purposes
             }
         }
-        callback = null
+        availabilityCallback = null
+        authoritativeCallback = null
         lifecycle.endGeneration()
     }
 

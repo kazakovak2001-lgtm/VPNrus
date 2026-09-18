@@ -9,6 +9,9 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.diagnostics.support.DiagnosticEventType
+import net.pocvpn.client.diagnostics.support.InMemoryDiagnosticSessionStore
+import net.pocvpn.client.diagnostics.support.SupportDiagnosticsRecorder
 import net.pocvpn.client.vpn.FakeClientKeyRepository
 import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
@@ -82,6 +85,7 @@ class MainViewModelPrivateGatewayTest {
         privateGatewayStore.write(validPrivateConfig)
         val managedConfigRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing)
         val transport = FakeVpnTransport()
+        val supportStore = InMemoryDiagnosticSessionStore()
         val gatewaySelectionModeStore = FileGatewaySelectionModeStore(freshDir())
         gatewaySelectionModeStore.write(GatewaySelectionMode.PRIVATE)
 
@@ -94,6 +98,8 @@ class MainViewModelPrivateGatewayTest {
             gatewaySelectionModeStore = gatewaySelectionModeStore,
             privateGatewayStore = privateGatewayStore,
             privateGatewayKeyRepository = FakeClientKeyRepository(privateKey = "PRIVATE_KEY=="),
+            supportDiagnosticsRecorder = SupportDiagnosticsRecorder(supportStore, "1.0", 1L),
+            supportDiagnosticsStore = supportStore,
         )
 
         assertEquals(GatewaySelectionMode.PRIVATE, viewModel.gatewaySelectionMode.value)
@@ -106,6 +112,15 @@ class MainViewModelPrivateGatewayTest {
         val awgConfig = (transport.lastConfig as TransportConfig.Awg).config
         assertEquals("PRIVATE_KEY==", awgConfig.privateKeyBase64)
         assertEquals("203.0.113.5", awgConfig.peer.endpointHost)
+        val events = supportStore.recent().single().events
+        val candidate = events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals(PrivateGatewayConfig.ID, candidate.tags["plannedEndpointId"])
+        assertTrue(!candidate.tags.containsKey("attemptedEndpointId"))
+        for (type in listOf(DiagnosticEventType.TRANSPORT_START, DiagnosticEventType.PATH_SUCCEEDED, DiagnosticEventType.VPN_PROTECTED)) {
+            val event = events.single { it.type == type }
+            assertEquals(PrivateGatewayConfig.ID, event.tags["attemptedEndpointId"])
+            assertEquals("1", event.tags["attemptOrdinal"])
+        }
     }
 
     @Test

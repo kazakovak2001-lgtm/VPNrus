@@ -2,6 +2,8 @@ package net.pocvpn.client.diagnostics.support
 
 import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.network.NetworkType
+import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.smartconnect.ProductionIngressEndpoints
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.relay.IngressActivationOutcome
 import net.pocvpn.client.relay.RelayFailureCategory
@@ -11,6 +13,7 @@ import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.TransportFailureKind
 import net.pocvpn.client.vpn.config.GatewaySelectionMode
+import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.policy.RoutingMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -25,6 +28,162 @@ import org.junit.Test
  * (never re-deriving anything itself).
  */
 class SupportDiagnosticsRecorderTest {
+
+    @Test
+    fun `resolved direct endpoint remains planned until its own transport starts`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.PRIVATE, TransportKind.AMNEZIA_WG,
+            AttemptEndpointIdentity.Direct(EndpointId("private")))
+        recorder.recordTransportAttemptStarted(EndpointId("wrong-endpoint"), TransportKind.AMNEZIA_WG)
+        recorder.finishFailed(mapVpnErrorToFailureReason(VpnError.PermissionDenied))
+
+        val session = store.recent().single()
+        assertEquals("private", session.events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }.tags["plannedEndpointId"])
+        assertFalse(session.events.any { it.tags.containsKey("attemptedEndpointId") })
+        assertEquals("1", session.events.single { it.type == DiagnosticEventType.PATH_FAILED }.tags["attemptOrdinal"])
+    }
+
+    @Test
+    fun `every current production endpoint id survives support export`() {
+        val ids = (ProductionGatewayCatalog.all.map { it.endpointId } + ProductionIngressEndpoints.all.map { it.id }).distinct()
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        ids.forEach { id ->
+            recorder.startSession(context())
+            recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG, AttemptEndpointIdentity.Direct(id))
+            recorder.recordTransportAttemptStarted(id, TransportKind.AMNEZIA_WG)
+            recorder.finishProtected()
+        }
+        val bundle = buildSupportBundle(store.recent(), "1.0", 1L, 5_000L)
+        val exported = bundle.sessions.flatMap { session ->
+            session.events.filter { it.type == DiagnosticEventType.TRANSPORT_START }.mapNotNull { it.tags["attemptedEndpointId"] }
+        }
+        assertEquals(ids.map { it.value }.toSet(), exported.toSet())
+        ids.forEach { assertTrue(bundle.toJson().contains(it.value)) }
+    }
+
+    @Test
+    fun `direct failover keeps each resolved endpoint on its own attempt failure and success events`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG, AttemptEndpointIdentity.Direct(EndpointId("endpoint-a")))
+        recorder.recordTransportAttemptStarted(EndpointId("endpoint-a"), TransportKind.AMNEZIA_WG)
+        recorder.recordPathFailed(DiagnosticFailureReason.GATEWAY_UNREACHABLE)
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG, AttemptEndpointIdentity.Direct(EndpointId("endpoint-b")))
+        recorder.recordTransportAttemptStarted(EndpointId("endpoint-b"), TransportKind.AMNEZIA_WG)
+        recorder.finishProtected()
+
+        val events = store.recent().single().events
+        val starts = events.filter { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }
+        assertEquals(listOf("endpoint-a", "endpoint-b"), starts.map { it.tags["plannedEndpointId"] })
+        assertTrue(starts.none { it.tags.containsKey("attemptedEndpointId") })
+        assertEquals(listOf("1", "2"), starts.map { it.tags["attemptOrdinal"] })
+        val failed = events.single { it.type == DiagnosticEventType.PATH_FAILED }
+        val succeeded = events.single { it.type == DiagnosticEventType.PATH_SUCCEEDED }
+        assertEquals("endpoint-a", failed.tags["attemptedEndpointId"])
+        assertEquals("1", failed.tags["attemptOrdinal"])
+        assertEquals("endpoint-b", succeeded.tags["attemptedEndpointId"])
+        assertEquals("2", succeeded.tags["attemptOrdinal"])
+        assertEquals("endpoint-b", events.single { it.type == DiagnosticEventType.VPN_PROTECTED }.tags["attemptedEndpointId"])
+    }
+
+    @Test
+    fun `unresolved relay names planned ingress and exit without claiming either was attempted`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_CDN, TransportKind.XRAY_XHTTP,
+            AttemptEndpointIdentity.Relayed(EndpointId("ingress-a"), EndpointId("exit-b")))
+        recorder.recordRelayPathFailed(RelayFailureCategory.INGRESS_HANDSHAKE_FAILED)
+        recorder.finishFailed(DiagnosticFailureReason.INGRESS_UNREACHABLE)
+
+        val events = store.recent().single().events
+        for (event in events.filter { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED || it.type == DiagnosticEventType.PATH_FAILED }) {
+            assertEquals("ingress-a", event.tags["plannedIngressEndpointId"])
+            assertEquals("exit-b", event.tags["plannedExitEndpointId"])
+            assertFalse(event.tags.containsKey("attemptedIngressEndpointId"))
+            assertFalse(event.tags.containsKey("attemptedExitEndpointId"))
+        }
+    }
+
+    @Test
+    fun `relay ingress transport start makes ingress attempted while exit remains planned on failure`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_DIRECT, TransportKind.TLS_TCP,
+            AttemptEndpointIdentity.Relayed(EndpointId("ingress-a"), EndpointId("exit-b")))
+        recorder.recordTransportAttemptStarted(EndpointId("ingress-a"), TransportKind.TLS_TCP)
+        recorder.recordRelayPathFailed(RelayFailureCategory.INGRESS_HANDSHAKE_FAILED)
+        recorder.finishFailed(DiagnosticFailureReason.INGRESS_UNREACHABLE)
+
+        val events = store.recent().single().events
+        assertFalse(events.single { it.type == DiagnosticEventType.CANDIDATE_ATTEMPT_STARTED }.tags.containsKey("attemptedIngressEndpointId"))
+        for (event in events.filter { it.type == DiagnosticEventType.TRANSPORT_START || it.type == DiagnosticEventType.PATH_FAILED }) {
+            assertEquals("ingress-a", event.tags["attemptedIngressEndpointId"])
+            assertEquals("exit-b", event.tags["plannedExitEndpointId"])
+            assertFalse(event.tags.containsKey("attemptedExitEndpointId"))
+        }
+    }
+
+    @Test
+    fun `protected relay associates both distinct endpoints with the winning attempt`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.CHAIN_DIRECT, TransportKind.TLS_TCP,
+            AttemptEndpointIdentity.Relayed(EndpointId("ingress-a"), EndpointId("exit-b")))
+        recorder.recordTransportAttemptStarted(EndpointId("ingress-a"), TransportKind.TLS_TCP)
+        recorder.finishProtected()
+
+        val success = store.recent().single().events.single { it.type == DiagnosticEventType.PATH_SUCCEEDED }
+        assertEquals("ingress-a", success.tags["attemptedIngressEndpointId"])
+        assertEquals("exit-b", success.tags["attemptedExitEndpointId"])
+        assertEquals("exit-b", success.tags["plannedExitEndpointId"])
+    }
+
+    @Test
+    fun `terminal transport failure carries the current direct identity without changing reason`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG,
+            AttemptEndpointIdentity.Direct(EndpointId("frankfurt")))
+        recorder.recordTransportAttemptStarted(EndpointId("frankfurt"), TransportKind.AMNEZIA_WG)
+        recorder.finishFailedFromTransport(VpnError.HandshakeTimeout, null)
+        val session = store.recent().single()
+        assertEquals("frankfurt", session.events.single { it.type == DiagnosticEventType.PATH_FAILED }.tags["attemptedEndpointId"])
+        assertEquals(mapVpnErrorToFailureReason(VpnError.HandshakeTimeout), session.failureReason)
+    }
+
+    @Test
+    fun `legacy event tags stay absent and sensitive shaped endpoint ids are redacted on export`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG)
+        recorder.finishProtected()
+        val legacy = store.recent().single()
+        assertFalse(legacy.events.any { it.tags.containsKey("attemptedEndpointId") })
+        assertEquals(1, buildSupportBundle(listOf(legacy), "1.0", 1L, 5_000L).schemaVersion)
+
+        recorder.startSession(context())
+        val credentialShaped = "123e4567-e89b-12d3-a456-426614174000"
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG,
+            AttemptEndpointIdentity.Direct(EndpointId(credentialShaped)))
+        recorder.finishProtected()
+        recorder.startSession(context())
+        recorder.recordCandidateAttemptStarted(PathKind.DIRECT, TransportKind.AMNEZIA_WG,
+            AttemptEndpointIdentity.Direct(EndpointId("private.example.org")))
+        recorder.finishProtected()
+        val json = buildSupportBundle(store.recent(), "1.0", 1L, 5_000L).toJson()
+        assertFalse(json.contains(credentialShaped))
+        assertFalse(json.contains("private.example.org"))
+        assertTrue(json.contains("[redacted]"))
+    }
 
     @Test
     fun `typed out of band probe failures survive generic terminal error and export without raw detail`() {

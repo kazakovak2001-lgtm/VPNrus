@@ -8,6 +8,7 @@ import net.pocvpn.client.smartconnect.AutoGatewaySelector
 import net.pocvpn.client.transport.TransportKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -146,6 +147,23 @@ class RelayExecutionTest {
 // --- B33 relay follow-up: HttpRelayEndToEndProbe.probeProfile - the narrower half [XrayCoreController]'s Relayed confirmation reuses ---
 
 class HttpRelayEndToEndProbeTest {
+
+    @Test
+    fun `HTTP error statuses remain generic relay proof failures without CDN or origin inference`() = runTest {
+        for (status in listOf(405, 429, 500, 502, 503)) {
+            val probe = HttpRelayEndToEndProbe(openConnection = { url -> object : java.net.HttpURLConnection(url) {
+                override fun connect() = Unit
+                override fun disconnect() = Unit
+                override fun usingProxy() = false
+                override fun getResponseCode(): Int = status
+            } })
+
+            val result = probe.probeProfile(fakeIngressClientProfile(plan())) as RelayProbeResult.Failure
+
+            assertEquals(RelayFailureCategory.END_TO_END_DATA_PLANE_FAILED, result.category)
+            assertNull(result.failureKind)
+        }
+    }
 
     @Test
     fun `real probe HTTP boundary carries closed DNS TLS and timeout facts without changing relay category`() = runTest {

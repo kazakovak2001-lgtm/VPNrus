@@ -1144,6 +1144,106 @@ class MainViewModelTest {
         assertEquals(0, awgTransport.connectCallCount)
         assertEquals(1, xrayTransport.connectCallCount)
         assertTrue(viewModel.transportState.value is TransportState.Connected)
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
+    }
+
+    @Test
+    fun `debug TLS force selects valid TLS once and then restores Auto`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val tlsRepository = net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(SAMPLE_XRAY_TLS_PROFILE_SUCCESS.toXrayTlsProfile())
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTlsTransport = tlsTransport,
+            xrayTlsProfileRepository = tlsRepository,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.TLS_TCP))
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, awgTransport.connectCallCount)
+        assertEquals(1, tlsTransport.connectCallCount)
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
+    }
+
+    @Test
+    fun `debug AWG force uses the real AWG path once and then restores Auto`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.AMNEZIA_WG))
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, awgTransport.connectCallCount)
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
+    }
+
+    @Test
+    fun `debug force of unavailable transport fails closed and is still consumed`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val unavailableReality = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTransport = unavailableReality,
+            xrayProfileRepository = FakeXrayProfileRepository(profile = null),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.XRAY_REALITY))
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, awgTransport.connectCallCount)
+        assertEquals(0, unavailableReality.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
+    }
+
+    @Test
+    fun `clearing a pending debug force restores normal Auto selection`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.XRAY_REALITY))
+        viewModel.debugSetTransportPreference(UserTransportPreference.Auto)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(1, awgTransport.connectCallCount)
+        assertEquals(0, xrayTransport.connectCallCount)
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
     }
 
     @Test

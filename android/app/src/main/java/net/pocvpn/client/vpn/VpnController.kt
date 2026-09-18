@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn
 
 import android.content.Intent
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -9,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -61,6 +63,22 @@ sealed class ControllerEvent {
     data class RequestVpnPermission(val intent: Intent) : ControllerEvent()
 }
 
+sealed interface ReconnectIncidentEvent {
+    val generation: Long
+
+    data class Started(
+        override val generation: Long,
+        val endpointId: EndpointId,
+        val transportKind: TransportKind,
+        val attemptContext: VpnAttemptContext,
+        val restartsTransport: Boolean,
+    ) : ReconnectIncidentEvent
+
+    data class Succeeded(override val generation: Long) : ReconnectIncidentEvent
+    data class Failed(override val generation: Long) : ReconnectIncidentEvent
+    data class Disconnected(override val generation: Long) : ReconnectIncidentEvent
+}
+
 /**
  * Connection orchestrator sitting between the UI (ViewModel) and VpnTransport.
  * Owns: VPN permission flow, gateway-config precondition checks, connect/
@@ -68,7 +86,7 @@ sealed class ControllerEvent {
  * client-side reconnect state machine. Holds no UI references and survives
  * independently of any Activity.
  *
- * B8G1 - "Break-before-make" and why reconnectLoop() never re-calls connect():
+ * B8G1/R4 - reconnect behavior follows the transport's declared network-change contract.
  * decompiling the pinned AmneziaWG AAR's org.amnezia.awg.backend.GoBackend
  * .setState(tunnel, UP, config) shows that whenever a tunnel is ALREADY up,
  * bringing up ANY config (even an unchanged one) first tears the existing
@@ -80,8 +98,7 @@ sealed class ControllerEvent {
  * to that pinned, unmodified dependency - not something this class can
  * avoid by "not calling disconnect" alone.
  *
- * The fix: reconnectLoop() below NEVER calls transport.connect() to retry
- * an unchanged config. Once a tunnel is established, the AmneziaWG/
+ * For AmneziaWG, reconnectLoop() never calls transport.connect(). Once a tunnel is established, the AmneziaWG/
  * WireGuard protocol itself keeps attempting handshakes on its own - no
  * app-level "nudge" is needed or even available (the pinned AAR's native
  * JNI bridge, org.amnezia.awg.GoBackend, exposes only awgTurnOn / awgTurnOff
@@ -90,16 +107,16 @@ sealed class ControllerEvent {
  * standard, documented
  * WireGuard behavior ("you don't need to worry about asking it to
  * reconnect... everything else is handled for you automatically"),
- * reinforced here by AwgPeer's own default persistentKeepaliveSeconds=25,
- * which keeps the underlying engine periodically retrying even with no
- * real outbound traffic queued. So reconnectLoop() only WAITS (polling the
+ * reinforced here by AwgPeer's own default persistentKeepaliveSeconds=25.
+ * Its reconnect path only waits (polling the
  * exact same awaitFreshHandshake() the initial connect already uses) for
  * that automatic recovery, leaving the established interface/routes
  * completely untouched throughout - no setState call, no teardown window,
  * for as long as the session is merely recovering rather than being
- * explicitly reconfigured. A real rebuild (a new setState(UP, ...) call)
- * only ever happens for a genuine INITIAL connect() or an explicit
- * reactivation - never as an automatic retry.
+ * explicitly reconfigured. Xray transports declare RESTART_SESSION because
+ * their process/outbound sockets do not migrate reliably between Android
+ * Network identities. Their recovery stops the old session completely and
+ * starts one replacement from the already-pinned TransportConfig.
  *
  * This closes the automatic-failure leak window Level A (this class) can
  * control. It does NOT make this a strict, OS-enforced kill switch: if the
@@ -223,6 +240,11 @@ class VpnController(
     // (same "read fresh, never cached" discipline gatewayConfigurationRepository.get()
     // already uses elsewhere in this class).
     private val networkProfileProvider: (() -> NetworkProfile)? = null,
+    // R2: optional, diagnostic-only observation of the exact pinned endpoint's
+    // transport call. Invoked after permission/config validation, immediately
+    // before connect(); failure in an observer cannot alter execution.
+    private val onTransportAttemptStarting: ((EndpointId, TransportKind) -> Unit)? = null,
+    private val onReconnectIncident: ((ReconnectIncidentEvent) -> Unit)? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -359,6 +381,8 @@ class VpnController(
 
     @Volatile private var userInitiatedDisconnect = true
     private var reconnectJob: Job? = null
+    private val reconnectOwnershipLock = Any()
+    private var reconnectGeneration = 0L
 
     // B8I4 - the kind of the resolution the CURRENT/most recent connect()
     // attempt validated (see connect() below) - defaults to this
@@ -389,6 +413,7 @@ class VpnController(
     // connect()/disconnect()/doConnectAttempt, all under connectMutex - same
     // discipline as [pendingConnectKind]/[pendingConnectEndpointId].
     private var pendingConnectConfig: net.pocvpn.client.vpn.config.GatewayConfigSnapshot? = null
+    private var activeTransportConfig: TransportConfig? = null
 
     // B22 - the private-gateway keypair repository for the CURRENT/most
     // recent connect() attempt, when resolved carried one (see
@@ -435,6 +460,7 @@ class VpnController(
         reconnectManager.start(
             onNetworkLost = { handleNetworkLost() },
             onNetworkAvailable = { /* reconnect loop polls isNetworkAvailable() on its own cadence */ },
+            onUnderlyingNetworkChanged = { handleUnderlyingNetworkChanged() },
         )
     }
 
@@ -488,6 +514,15 @@ class VpnController(
                 ) {
                     diagnostics.recordError(VpnError.HandshakeTimeout)
                 }
+                val failureIncidentGeneration = if (
+                    transportState is TransportState.Error &&
+                    _state.value is TransportState.Connected &&
+                    reconnectJob?.isActive != true
+                ) {
+                    publishReconnectIncidentStarted(restartsTransport = false)
+                } else {
+                    null
+                }
                 // While a reconnect cycle owns the visible state (Reconnecting/backoff),
                 // don't let a transient Disconnected from an internal retry attempt
                 // flicker the UI back to plain Disconnected.
@@ -495,6 +530,9 @@ class VpnController(
                     setState(transportState)
                 }
                 diagnostics.updateTransportState(_state.value)
+                failureIncidentGeneration?.let {
+                    runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Failed(it)) }
+                }
             }
         }
     }
@@ -562,7 +600,10 @@ class VpnController(
     suspend fun connect(
         resolved: TransportOrchestrator.Resolution.Resolved = TransportOrchestrator.Resolution.Resolved(transport, transport.kind),
     ) {
-        if (!connectMutex.tryLock()) {
+        val supersededRecovery = cancelReconnectForExplicitConnect()
+        if (supersededRecovery) {
+            connectMutex.lock()
+        } else if (!connectMutex.tryLock()) {
             diagnostics.recordError(VpnError.AlreadyInProgress)
             return
         }
@@ -652,6 +693,7 @@ class VpnController(
             // saved policy - never an automatic mid-session rebuild.
             _appliedRoutingPolicy.value = null
             _appliedRoutingMode.value = null
+            activeTransportConfig = null
             // B8O3 - nothing is running/attempted any more.
             _currentTransportKind.value = null
             // B16 - a completed/abandoned attempt's pinned candidate config
@@ -764,6 +806,7 @@ class VpnController(
         activeTransport.disconnect()
         _appliedRoutingPolicy.value = null
         _appliedRoutingMode.value = null
+        activeTransportConfig = null
         pendingConnectConfig = null
         pendingConnectPrivateKeyRepository = null
         pendingAttemptContext = VpnAttemptContext.Direct
@@ -871,7 +914,9 @@ class VpnController(
                 val attemptStartEpochMillis = System.currentTimeMillis()
                 return try {
                     hasTouchedTransport = true
+                    runCatching { onTransportAttemptStarting?.invoke(pendingConnectEndpointId, kind) }
                     activeTransport.connect(transportConfig)
+                    activeTransportConfig = transportConfig
                     // B8H - the VpnService interface now reflects
                     // routingPolicy (whether or not a handshake follows) -
                     // only a thrown connect() (caught below) means no
@@ -951,6 +996,7 @@ class VpnController(
                         true
                     }
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Backend failed to start"))
                     // B25 (task D fix) - a relayed attempt's outcome is
@@ -1283,17 +1329,51 @@ class VpnController(
         if (userInitiatedDisconnect) return
         if (_state.value !is TransportState.Connected) return
         diagnostics.updateNetworkType("unavailable")
-        reconnectJob = scope.launch { reconnectLoop() }
+        startReconnect(restartImmediately = false)
     }
 
     /**
-     * B8G1 - kill-switch fix: this loop NEVER calls transport.connect() (=
-     * backend.setState(UP, config)) to "retry" - see the class doc's own
-     * "Break-before-make" section for exactly why that would be
-     * counterproductive. It only WAITS for the SAME already-established
-     * tunnel to recover a fresh handshake on its own, polling via the exact
-     * same awaitFreshHandshake() helper doConnectAttempt() uses for the
-     * initial connect - reused verbatim, not reimplemented.
+     * R4: the existing reconnect authority also owns changes between two
+     * simultaneously available NOT_VPN Android Network identities. Xray
+     * transports require a fresh process/socket session on that boundary;
+     * AWG keeps its existing in-place native migration behavior.
+     */
+    private fun handleUnderlyingNetworkChanged() {
+        if (userInitiatedDisconnect) return
+        if (_state.value !is TransportState.Connected) return
+        if (activeTransport.underlyingNetworkRecovery != UnderlyingNetworkRecovery.RESTART_SESSION) return
+        startReconnect(restartImmediately = true)
+    }
+
+    private fun startReconnect(restartImmediately: Boolean) {
+        synchronized(reconnectOwnershipLock) {
+            reconnectJob?.cancel()
+            val generation = ++reconnectGeneration
+            reconnectJob = scope.launch { reconnectLoop(generation, restartImmediately) }
+        }
+    }
+
+    private fun publishReconnectIncidentStarted(restartsTransport: Boolean): Long {
+        val generation = synchronized(reconnectOwnershipLock) { ++reconnectGeneration }
+        runCatching {
+            onReconnectIncident?.invoke(
+                ReconnectIncidentEvent.Started(
+                    generation,
+                    pendingConnectEndpointId,
+                    pendingConnectKind,
+                    pendingAttemptContext,
+                    restartsTransport,
+                ),
+            )
+        }
+        return generation
+    }
+
+    /**
+     * AWG waits for its established tunnel's fresh handshake. A transport
+     * declaring RESTART_SESSION is stopped to a terminal Disconnected state
+     * and restarted from activeTransportConfig. Every state publication is
+     * fenced by [generation], and no saved routing/endpoint input is reread.
      *
      * reconnectionThresholdEpochMillis is captured ONCE, at the moment this
      * reconnect session begins - not recomputed per attempt - because the
@@ -1303,17 +1383,29 @@ class VpnController(
      * per-attempt "now" threshold could miss a handshake that already
      * landed moments before this loop happened to check.
      */
-    private suspend fun reconnectLoop() {
+    private suspend fun reconnectLoop(generation: Long, restartImmediately: Boolean) {
         var attempt = 0
         val reconnectionThresholdEpochMillis = System.currentTimeMillis()
+        runCatching {
+            onReconnectIncident?.invoke(
+                ReconnectIncidentEvent.Started(
+                    generation,
+                    pendingConnectEndpointId,
+                    pendingConnectKind,
+                    pendingAttemptContext,
+                    activeTransport.underlyingNetworkRecovery == UnderlyingNetworkRecovery.RESTART_SESSION,
+                ),
+            )
+        }
         while (coroutineContext.isActive && !userInitiatedDisconnect) {
             attempt++
+            if (!isCurrentReconnect(generation)) return
             diagnostics.updateReconnectAttempts(attempt)
-            setState(TransportState.Reconnecting(attempt))
+            if (!setReconnectState(generation, TransportState.Reconnecting(attempt))) return
 
             if (attempt > ReconnectBackoff.MAX_ATTEMPTS) {
+                if (!setReconnectState(generation, TransportState.Error("Reconnect attempts exhausted"))) return
                 diagnostics.recordError(VpnError.ReconnectExhausted)
-                setState(TransportState.Error("Reconnect attempts exhausted"))
                 // B8I - ONE outcome for the whole exhausted recovery cycle,
                 // not one per backoff attempt - keeps the bounded history
                 // meaningful instead of filling up with per-attempt noise.
@@ -1326,21 +1418,34 @@ class VpnController(
                     recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.RECONNECT_EXHAUSTED, reconnectionThresholdEpochMillis)
                     recordPathHistory(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                 }
+                runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Failed(generation)) }
                 return
             }
 
-            delay(ReconnectBackoff.delayForAttempt(attempt))
+            if (!(restartImmediately && attempt == 1)) {
+                delay(ReconnectBackoff.delayForAttempt(attempt))
+            }
             if (!coroutineContext.isActive || userInitiatedDisconnect) return
+            if (!isCurrentReconnect(generation)) return
 
             if (!reconnectManager.isNetworkAvailable()) {
                 continue // keep backing off until a network reappears
             }
 
-            val recovered = connectMutex.withLock { awaitFreshHandshake(reconnectionThresholdEpochMillis) }
+            val recovered = if (activeTransport.underlyingNetworkRecovery == UnderlyingNetworkRecovery.RESTART_SESSION) {
+                restartActiveTransportForNetworkChange(generation)
+            } else {
+                connectMutex.withLock {
+                    if (!isCurrentReconnect(generation)) return@withLock false
+                    awaitFreshHandshake(reconnectionThresholdEpochMillis)
+                }
+            }
+            if (!isCurrentReconnect(generation)) return
             if (recovered) {
                 recordCurrentStats()
-                setState(TransportState.Connected)
+                if (!setReconnectState(generation, TransportState.Connected)) return
                 diagnostics.updateReconnectAttempts(0)
+                runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Succeeded(generation)) }
                 // B8I1 - OUTCOME OWNERSHIP: deliberately does NOT call
                 // recordConnectionOutcome() here. The chosen model is: one
                 // record per doConnectAttempt() (the initial SUCCESS/FAILURE)
@@ -1358,10 +1463,79 @@ class VpnController(
         }
     }
 
+    private suspend fun restartActiveTransportForNetworkChange(generation: Long): Boolean = connectMutex.withLock {
+        if (!isCurrentReconnect(generation) || userInitiatedDisconnect) return@withLock false
+        hasTouchedTransport = true
+        activeTransport.disconnect()
+        val stoppedState = activeTransport.observeState().first {
+            it is TransportState.Disconnected || it is TransportState.Error
+        }
+        if (!isCurrentReconnect(generation) || userInitiatedDisconnect) return@withLock false
+        if (stoppedState is TransportState.Error) {
+            setReconnectState(generation, stoppedState)
+            return@withLock false
+        }
+        val config = activeTransportConfig ?: return@withLock false
+        runCatching { onTransportAttemptStarting?.invoke(pendingConnectEndpointId, pendingConnectKind) }
+        try {
+            activeTransport.connect(config)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (!isCurrentReconnect(generation)) return@withLock false
+            diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
+            setReconnectState(generation, TransportState.Error("Backend failed to restart"))
+            return@withLock false
+        }
+        val terminalState = activeTransport.observeState().first {
+            it is TransportState.Connected || it is TransportState.Error
+        }
+        if (!isCurrentReconnect(generation) || userInitiatedDisconnect) return@withLock false
+        when (terminalState) {
+            is TransportState.Connected -> true
+            is TransportState.Error -> {
+                setReconnectState(generation, terminalState)
+                false
+            }
+            else -> false
+        }
+    }
+
+    private fun isCurrentReconnect(generation: Long): Boolean =
+        synchronized(reconnectOwnershipLock) { generation == reconnectGeneration }
+
+    private fun setReconnectState(generation: Long, state: TransportState): Boolean =
+        synchronized(reconnectOwnershipLock) {
+            if (generation != reconnectGeneration) return@synchronized false
+            setState(state)
+            true
+        }
+
+    private fun cancelReconnectForExplicitConnect(): Boolean {
+        val cancelledGeneration = synchronized(reconnectOwnershipLock) {
+            if (reconnectJob?.isActive != true) return@synchronized null
+            val oldGeneration = reconnectGeneration
+            reconnectGeneration++
+            reconnectJob?.cancel()
+            reconnectJob = null
+            oldGeneration
+        }
+        if (cancelledGeneration != null) {
+            runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Disconnected(cancelledGeneration)) }
+        }
+        return cancelledGeneration != null
+    }
+
     /** Caller must already hold connectMutex. */
     private fun cancelReconnectLocked() {
-        reconnectJob?.cancel()
-        reconnectJob = null
+        val cancelledGeneration = synchronized(reconnectOwnershipLock) {
+            val oldGeneration = reconnectGeneration
+            reconnectGeneration++
+            reconnectJob?.cancel()
+            reconnectJob = null
+            oldGeneration
+        }
+        runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Disconnected(cancelledGeneration)) }
     }
 
     /**

@@ -550,6 +550,11 @@ class MainViewModel(
     // an identity-linkage bug, not a convenience).
     private val privateGatewayKeyRepository: ClientKeyRepository? = null,
 ) : ViewModel() {
+    // A debug UI force is intentionally a one-shot input. Keep the marker
+    // separate from userTransportPreference so constructor-injected Manual
+    // preferences retain their established lifetime in tests and future
+    // product wiring, while Diagnostics can promise "next connect" exactly.
+    private var debugTransportForcePending: Boolean = false
 
     /**
      * B13 review fix - whether THIS DEVICE has a client tunnel identity
@@ -670,18 +675,20 @@ class MainViewModel(
     fun selectGateway(id: net.pocvpn.client.vpn.config.ProductionGatewayId) {
         if (!isGatewayProvisioned(id)) return
         if (transportState.value.blocksGatewaySelection()) return
-        selectedGatewayStore.write(id)
-        _selectedGateway.value = id
-        // B16 - choosing a specific gateway manually is exactly what
-        // GatewayPickerDialog's own row tap already meant pre-B16; making it
-        // ALSO exit automatic mode keeps that meaning intact rather than
-        // silently leaving Auto engaged with a manual pick the user can't
-        // see took no effect (per task requirement 2: manual selection must
-        // remain deterministic).
+        // Persist mode before the new gateway. If a process dies between
+        // these separate atomic file writes, reconstruction can at worst use
+        // the previous managed selection; it must not show the new selection
+        // while still dispatching Auto or Private. Publish flows only after
+        // all writes have succeeded. The files are not a joint transaction.
+        val manualMode = net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED
+        gatewaySelectionModeStore.write(manualMode)
         if (_gatewayAutoMode.value) {
             gatewayAutoModeStore.write(false)
-            _gatewayAutoMode.value = false
         }
+        selectedGatewayStore.write(id)
+        _gatewaySelectionMode.value = manualMode
+        _gatewayAutoMode.value = false
+        _selectedGateway.value = id
         _activeGatewayId.value = id
     }
 
@@ -693,7 +700,7 @@ class MainViewModel(
     val gatewayAutoMode: StateFlow<Boolean> = _gatewayAutoMode.asStateFlow()
 
     /**
-     * B16 - THE one place automatic-gateway mode is toggled. Same
+     * B16 - the legacy boolean setter for automatic-gateway mode. Same
      * active-session guard [selectGateway] already enforces (task
      * requirement 8/"select now, apply on the next real connect()" - never
      * changes what an already-connected tunnel is doing).
@@ -739,7 +746,8 @@ class MainViewModel(
     val gatewaySelectionMode: StateFlow<net.pocvpn.client.vpn.config.GatewaySelectionMode> = _gatewaySelectionMode.asStateFlow()
 
     /**
-     * B22 - THE one place [GatewaySelectionMode] is changed. Same
+     * B22 - the explicit mode-picker entry point; [selectGateway] also
+     * enters MANUAL_MANAGED after an accepted managed selection. Same
      * active-session guard [selectGateway]/[setGatewayAutoMode] already
      * enforce. Keeps the legacy [gatewayAutoMode] boolean in lockstep
      * (true only for [GatewaySelectionMode.AUTO]) purely so any
@@ -910,6 +918,10 @@ class MainViewModel(
         // networkProfileProvider above already uses - restrictionClass()
         // recomputes fresh from live evidence on every call, never cached.
         restrictionClassProvider = { restrictionClass() },
+        onTransportAttemptStarting = { endpointId, kind ->
+            supportDiagnosticsRecorder?.recordTransportAttemptStarted(endpointId, kind)
+        },
+        onReconnectIncident = { event -> recordReconnectIncidentEvent(event) },
     )
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
@@ -1616,6 +1628,7 @@ class MainViewModel(
      */
     fun debugSetTransportPreference(preference: UserTransportPreference) {
         userTransportPreference = preference
+        debugTransportForcePending = preference is UserTransportPreference.Manual
     }
 
     /**
@@ -1794,14 +1807,14 @@ class MainViewModel(
         // observes the SAME real [sessionHealth] StateFlow the UI already
         // reads (never a second state machine). Every EXPLICIT typed
         // finish*() call elsewhere in this class (connectAuto/connectManual/
-        // connectPrivate/attemptCombined) is more precise and runs first in
-        // practice, but [SupportDiagnosticsRecorder]'s own finish is a no-op
-        // once a session is already closed - so this collector is a safe,
-        // idempotent BACKSTOP that guarantees a session started for ANY real
-        // attempt is eventually closed (never left open forever) even for a
-        // failure path this class does not separately instrument, and is
-        // the ONE place [DiagnosticOutcome.PROTECTED]/[DiagnosticOutcome
-        // .DISCONNECTED] are ever recorded at all.
+        // connectPrivate/attemptCombined) is more precise. For an Auto
+        // connect sequence, the combined-attempt coordinator and its watcher
+        // own terminal-vs-retry; this health collector must not close the
+        // session on a transient Failed/Idle emission from an intermediate
+        // candidate. User disconnect is closed explicitly by disconnect().
+        // For manual/private and reconnect incidents, this remains the
+        // terminal-failure/disconnect backstop; Protected still closes the
+        // actual successful session for all modes.
         if (supportDiagnosticsRecorder != null) {
             viewModelScope.launch {
                 var previousHealth: net.pocvpn.client.vpn.VpnSessionHealth = net.pocvpn.client.vpn.VpnSessionHealth.Idle
@@ -1809,52 +1822,99 @@ class MainViewModel(
                     when (health) {
                         is net.pocvpn.client.vpn.VpnSessionHealth.DirectProtected,
                         is net.pocvpn.client.vpn.VpnSessionHealth.RelayProtected,
-                        -> supportDiagnosticsRecorder.finishProtected()
+                        -> if (!supportDiagnosticsRecorder.isReconnectIncidentOpen()) supportDiagnosticsRecorder.finishProtected()
                         is net.pocvpn.client.vpn.VpnSessionHealth.RelayHandshake ->
                             supportDiagnosticsRecorder.recordDataPlaneReadinessResult(health.stage)
-                        // B30C - the fix: B29's own session for the initial
-                        // attempt already closed as PROTECTED the moment this
-                        // health first reached DirectProtected/RelayProtected
-                        // above, so a LATER real reconnect incident (this
-                        // branch - reached ONLY via VpnController.handleNetworkLost's
-                        // own Connected-only guard, never during an initial
-                        // connect attempt, which never passes through
-                        // Reconnecting) would otherwise have no open session
-                        // to record into at all - finishFailed()/
-                        // finishProtected() below would silently no-op (see
-                        // SupportDiagnosticsRecorder.finish's own "open ?:
-                        // return" guard). currentSessionId() == null is the
-                        // single-authority dedup: it is true exactly once per
-                        // incident (false for every repeated Reconnecting
-                        // emission while this session is still open, whether
-                        // from the StateFlow's own equals-conflation of the
-                        // singleton VpnSessionHealth.Reconnecting value or
-                        // from a distinct attempt count that still maps to
-                        // the same health) - so a Reconnecting -> attempt 1
-                        // -> attempt 2 -> ... run opens exactly ONE session,
-                        // never one per backoff attempt.
+                        // R4 reconnect diagnostics are owned by the controller's
+                        // generation-tagged ReconnectIncidentEvent callbacks.
+                        // Broad health emissions cannot close them prematurely.
                         is net.pocvpn.client.vpn.VpnSessionHealth.Reconnecting -> {
-                            if (supportDiagnosticsRecorder.currentSessionId() == null) {
-                                val restriction = restrictionClass()
-                                supportDiagnosticsRecorder.startSession(buildDiagnosticStartContext(restriction, restriction))
-                                supportDiagnosticsRecorder.recordReconnectIncidentStarted()
-                            }
+                            Unit
                         }
-                        is net.pocvpn.client.vpn.VpnSessionHealth.Failed -> {
-                            val transportFailure = (controller.state.value as? net.pocvpn.client.vpn.TransportState.Error)?.failureKind
-                            supportDiagnosticsRecorder.finishFailedFromTransport(
-                                diagnosticsStore.snapshot.value.lastError,
-                                transportFailure,
-                            )
-                        }
+                        is net.pocvpn.client.vpn.VpnSessionHealth.Failed -> recordFailedHealthForSupport()
                         is net.pocvpn.client.vpn.VpnSessionHealth.Idle ->
-                            if (previousHealth !is net.pocvpn.client.vpn.VpnSessionHealth.Idle) supportDiagnosticsRecorder.finishDisconnected()
+                            if (previousHealth !is net.pocvpn.client.vpn.VpnSessionHealth.Idle && !supportDiagnosticsRecorder.isAutoConnectSessionOpen())
+                                supportDiagnosticsRecorder.finishDisconnected()
                         else -> Unit
                     }
                     previousHealth = health
                 }
             }
         }
+    }
+
+    /** Auto's execution owner closes its own diagnostic session; health may observe a transient failure before or after that owner's bookkeeping. */
+    internal fun recordFailedHealthForSupport() {
+        val recorder = supportDiagnosticsRecorder ?: return
+        if (recorder.isAutoConnectSessionOpen()) return
+        if (recorder.isReconnectIncidentOpen()) return
+        val transportFailure = (controller.state.value as? net.pocvpn.client.vpn.TransportState.Error)?.failureKind
+        recorder.finishFailedFromTransport(diagnosticsStore.snapshot.value.lastError, transportFailure)
+    }
+
+    private var activeReconnectDiagnosticGeneration: Long? = null
+
+    private fun recordReconnectIncidentEvent(event: net.pocvpn.client.vpn.ReconnectIncidentEvent) {
+        val recorder = supportDiagnosticsRecorder ?: return
+        when (event) {
+            is net.pocvpn.client.vpn.ReconnectIncidentEvent.Started -> {
+                activeReconnectDiagnosticGeneration = event.generation
+                val restriction = restrictionClass()
+                recorder.startSession(buildDiagnosticStartContext(restriction, restriction))
+                recorder.recordReconnectIncidentStarted()
+                when (val context = event.attemptContext) {
+                    is net.pocvpn.client.relay.VpnAttemptContext.Direct ->
+                        recorder.recordCandidateAttemptStarted(
+                            net.pocvpn.client.diagnostics.support.PathKind.DIRECT,
+                            event.transportKind,
+                            net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(event.endpointId),
+                        )
+                    is net.pocvpn.client.relay.VpnAttemptContext.Relayed -> {
+                        val plan = context.plan
+                        val path = if (plan.ingressKind == net.pocvpn.client.reachability.IngressKind.CDN_FRONTED) {
+                            net.pocvpn.client.diagnostics.support.PathKind.CHAIN_CDN
+                        } else {
+                            net.pocvpn.client.diagnostics.support.PathKind.CHAIN_DIRECT
+                        }
+                        recorder.recordCandidateAttemptStarted(
+                            path,
+                            event.transportKind,
+                            net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Relayed(
+                                plan.ingressEndpointId,
+                                plan.exitEndpointId,
+                            ),
+                        )
+                    }
+                }
+                if (!event.restartsTransport) recorder.recordActiveEndpointRecovery(event.endpointId)
+            }
+            is net.pocvpn.client.vpn.ReconnectIncidentEvent.Succeeded -> {
+                if (activeReconnectDiagnosticGeneration == event.generation) {
+                    recorder.finishProtected()
+                    activeReconnectDiagnosticGeneration = null
+                }
+            }
+            is net.pocvpn.client.vpn.ReconnectIncidentEvent.Failed -> {
+                if (activeReconnectDiagnosticGeneration == event.generation) {
+                    val failure = (controller.state.value as? net.pocvpn.client.vpn.TransportState.Error)?.failureKind
+                    recorder.finishFailedFromTransport(diagnosticsStore.snapshot.value.lastError, failure)
+                    activeReconnectDiagnosticGeneration = null
+                }
+            }
+            is net.pocvpn.client.vpn.ReconnectIncidentEvent.Disconnected -> {
+                if (activeReconnectDiagnosticGeneration == event.generation) {
+                    recorder.finishDisconnected()
+                    activeReconnectDiagnosticGeneration = null
+                }
+            }
+        }
+    }
+
+    /** Called only after the existing Auto watcher has decided a terminal state is not eligible for another candidate. */
+    private fun finishAutoDiagnosticForTerminalState(state: net.pocvpn.client.vpn.TransportState, error: VpnError?) {
+        if (state !is net.pocvpn.client.vpn.TransportState.Error && state !is net.pocvpn.client.vpn.TransportState.HandshakeFailed) return
+        val transportFailure = (state as? net.pocvpn.client.vpn.TransportState.Error)?.failureKind
+        supportDiagnosticsRecorder?.finishFailedFromTransport(error, transportFailure)
     }
 
     // B8B3C requirement 6 (fail closed): NotFound and Corrupted are handled
@@ -2440,6 +2500,7 @@ class MainViewModel(
      */
     fun connect() {
         viewModelScope.launch {
+            val consumeDebugTransportForce = debugTransportForcePending
             // B8I8A - a NEW connect() request always supersedes/invalidates
             // any still-pending permission/failover context (and stops
             // watching for it) from an EARLIER, unresolved request - a later
@@ -2450,10 +2511,17 @@ class MainViewModel(
             // instead of the plain boolean - AUTO/MANUAL_MANAGED still call
             // the exact SAME pre-B22 functions, byte-for-byte, for every
             // existing test/behavior; PRIVATE is the one new branch.
-            when (gatewaySelectionMode.value) {
-                net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO -> connectAuto()
-                net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED -> connectManual()
-                net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE -> connectPrivate()
+            try {
+                when (gatewaySelectionMode.value) {
+                    net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO -> connectAuto()
+                    net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED -> connectManual()
+                    net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE -> connectPrivate()
+                }
+            } finally {
+                if (consumeDebugTransportForce) {
+                    userTransportPreference = UserTransportPreference.Auto
+                    debugTransportForcePending = false
+                }
             }
         }
     }
@@ -2501,7 +2569,6 @@ class MainViewModel(
                 return
             }
             is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Valid -> {
-                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(net.pocvpn.client.diagnostics.support.PathKind.PRIVATE, transport.kind)
                 _activeGatewayId.value = selectedGateway.value
                 val resolved = TransportOrchestrator.Resolution.Resolved(
                     transport = transport,
@@ -2509,6 +2576,10 @@ class MainViewModel(
                     endpointId = net.pocvpn.client.reachability.EndpointId(net.pocvpn.client.vpn.config.PrivateGatewayConfig.ID),
                     gatewayConfigSnapshot = validation.config.toGatewayConfigSnapshot(),
                     privateKeyRepository = keyRepository,
+                )
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
+                    net.pocvpn.client.diagnostics.support.PathKind.PRIVATE, resolved.kind,
+                    net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(resolved.endpointId),
                 )
                 controller.connect(resolved)
             }
@@ -2525,7 +2596,6 @@ class MainViewModel(
         when (val decision = smartConnectDecision()) {
             is SmartConnectDecision.Selected -> {
                 val kind = decision.score.candidate.transport.kind
-                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(net.pocvpn.client.diagnostics.support.PathKind.DIRECT, kind)
                 // B13 - the real SmartConnectCandidateSelector-chosen
                 // GatewayCandidate.id (today always ProductionGateway.ID,
                 // but derived, never hardcoded here) - the first place
@@ -2544,6 +2614,10 @@ class MainViewModel(
                 val orchestrator = TransportOrchestrator(registry)
                 when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId)) {
                     is TransportOrchestrator.Resolution.Resolved -> {
+                        supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
+                            net.pocvpn.client.diagnostics.support.PathKind.DIRECT, resolution.kind,
+                            net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(resolution.endpointId),
+                        )
                         // B8I8A - checked BEFORE connect() (same
                         // side-effect-free query VpnController.connect()
                         // itself performs immediately after, on the SAME
@@ -3008,16 +3082,9 @@ class MainViewModel(
         val advancedKeys = attemptedKeys + next.attemptKey
         when (next) {
             is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.DirectAttempt -> {
-                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(net.pocvpn.client.diagnostics.support.PathKind.DIRECT, next.candidate.transport)
                 attemptAutoCandidate(next.candidate, PendingAutoGatewayContext(attempts, advancedKeys))
             }
             is net.pocvpn.client.smartconnect.AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt -> {
-                val pathKind = if (next.candidate.ingressKind == net.pocvpn.client.reachability.IngressKind.CDN_FRONTED) {
-                    net.pocvpn.client.diagnostics.support.PathKind.CHAIN_CDN
-                } else {
-                    net.pocvpn.client.diagnostics.support.PathKind.CHAIN_DIRECT
-                }
-                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(pathKind, next.candidate.ingressTransport)
                 attemptRelayedAttempt(next.candidate, attempts, advancedKeys)
             }
         }
@@ -3080,6 +3147,15 @@ class MainViewModel(
         isActivationRetry: Boolean = false,
     ) {
         val plan = net.pocvpn.client.relay.RelayedExecutionPlan.from(candidate)
+        val pathKind = if (plan.ingressKind == net.pocvpn.client.reachability.IngressKind.CDN_FRONTED) {
+            net.pocvpn.client.diagnostics.support.PathKind.CHAIN_CDN
+        } else {
+            net.pocvpn.client.diagnostics.support.PathKind.CHAIN_DIRECT
+        }
+        supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
+            pathKind, plan.ingressTransport,
+            net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Relayed(plan.ingressEndpointId, plan.exitEndpointId),
+        )
         when (val resolution = relayIngressResolver.resolve(plan)) {
             is net.pocvpn.client.relay.RelayIngressResolution.NotProvisioned -> {
                 val outcome = net.pocvpn.client.relay.RelayAttemptOutcome.Failure(
@@ -3124,7 +3200,6 @@ class MainViewModel(
                 )
                 val orchestrator = TransportOrchestrator(registry)
                 val decision = TransportSelectionDecision.SelectTransport(resolution.kind)
-                supportDiagnosticsRecorder?.recordTransportStart(resolution.kind)
                 when (
                     val orchResolution = orchestrator.resolve(
                         decision,
@@ -3233,6 +3308,10 @@ class MainViewModel(
         val decision = TransportSelectionDecision.SelectTransport(candidate.transport)
         when (val resolution = orchestrator.resolve(decision, candidate.endpointId, candidate.configSnapshot)) {
             is TransportOrchestrator.Resolution.Resolved -> {
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
+                    net.pocvpn.client.diagnostics.support.PathKind.DIRECT, resolution.kind,
+                    net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(resolution.endpointId),
+                )
                 val permissionPending = resolution.transport.preparePermissionIntent() != null
                 val attempt = PendingFailoverAttempt(
                     initialKind = candidate.transport,
@@ -3302,7 +3381,12 @@ class MainViewModel(
 
         when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY), endpointId)) {
             is TransportOrchestrator.Resolution.Resolved -> {
+                supportDiagnosticsRecorder?.recordAttemptFailed()
                 controller.disconnect()
+                supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
+                    net.pocvpn.client.diagnostics.support.PathKind.DIRECT, xrayResolution.kind,
+                    net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(xrayResolution.endpointId),
+                )
                 controller.connect(xrayResolution)
             }
             // Defensive only: xrayAvailable already guarantees the registry
@@ -3522,7 +3606,10 @@ class MainViewModel(
                     }
                     val error = diagnosticsStore.snapshot.value.lastError
                     val eligible = net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy.isEligibleForNextCandidate(state, error)
-                    if (!eligible) return@collect
+                    if (!eligible) {
+                        finishAutoDiagnosticForTerminalState(state, error)
+                        return@collect
+                    }
                     supportDiagnosticsRecorder?.recordRelayPathFailed(net.pocvpn.client.relay.RelayFailureCategory.INGRESS_HANDSHAKE_FAILED)
                     recordRelayOutcome(
                         relayPlan,
@@ -3549,7 +3636,11 @@ class MainViewModel(
                     // AWG->Xray check below.
                     val error = diagnosticsStore.snapshot.value.lastError
                     val eligible = net.pocvpn.client.smartconnect.AutoGatewayFailoverPolicy.isEligibleForNextCandidate(state, error)
-                    if (!eligible) return@collect
+                    if (!eligible) {
+                        finishAutoDiagnosticForTerminalState(state, error)
+                        return@collect
+                    }
+                    supportDiagnosticsRecorder?.recordAttemptFailed()
                     pendingFailoverAttempt = null
                     _autoGatewayDiagnostics.value = _autoGatewayDiagnostics.value?.copy(
                         lastFailureReason = error?.let { it::class.simpleName } ?: state::class.simpleName,
@@ -3591,6 +3682,7 @@ class MainViewModel(
         // stale context, and never keep watching, for a request the user no
         // longer wants acted on.
         clearFailoverWatch()
+        if (supportDiagnosticsRecorder?.isAutoConnectSessionOpen() == true) supportDiagnosticsRecorder.finishDisconnected()
         // B16 - VpnController.disconnect() itself clears its own pinned
         // pendingConnectConfig (see that field's own docs) - a completed/
         // abandoned Auto sequence never leaves a stale candidate config
@@ -3616,6 +3708,10 @@ class MainViewModel(
                 pendingFailoverAttempt?.let { armFailoverWatch(it) }
             } else {
                 clearFailoverWatch()
+                if (supportDiagnosticsRecorder?.isAutoConnectSessionOpen() == true) {
+                    val transportFailure = (controller.state.value as? net.pocvpn.client.vpn.TransportState.Error)?.failureKind
+                    supportDiagnosticsRecorder.finishFailedFromTransport(diagnosticsStore.snapshot.value.lastError, transportFailure)
+                }
                 // B16 - VpnController.onVpnPermissionResult(false) itself
                 // clears its own pinned pendingConnectConfig on denial (see
                 // that function's own docs) - gatewayStatus() never keeps
