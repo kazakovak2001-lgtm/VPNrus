@@ -6,7 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * B46-2A - PREPARATION ONLY. Unit tests for the pure
+ * B46-2A/B46-2B - PREPARATION ONLY. Unit tests for the pure
  * [B46HysteriaSpikeTransitions] state machine - no real process, TUN, or
  * Unix-domain socket involved. See B46HysteriaSpikeState.kt's own header
  * for why this exists without a real runtime/service class yet.
@@ -36,6 +36,7 @@ class B46HysteriaSpikeStateTest {
     fun `required recovery path from ERROR is STOPPING then STOPPED then STARTING`() {
         var status = B46HysteriaSpikeTransitions.starting()
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
         status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 42)
         status = B46HysteriaSpikeTransitions.failed(status, B46HysteriaSpikeError.RuntimeSpawnFailed("boom"))
         assertEquals(B46HysteriaSpikePhase.ERROR, status.phase)
@@ -60,6 +61,7 @@ class B46HysteriaSpikeStateTest {
         for (phase in listOf(
             B46HysteriaSpikePhase.STARTING,
             B46HysteriaSpikePhase.TUN_ESTABLISHED,
+            B46HysteriaSpikePhase.TUN_BRIDGE_READY,
             B46HysteriaSpikePhase.RUNTIME_STARTED,
             B46HysteriaSpikePhase.FD_CONTROL_READY,
             B46HysteriaSpikePhase.DATA_PLANE_READY,
@@ -76,6 +78,9 @@ class B46HysteriaSpikeStateTest {
 
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
         assertEquals(B46HysteriaSpikePhase.TUN_ESTABLISHED, status.phase)
+
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
+        assertEquals(B46HysteriaSpikePhase.TUN_BRIDGE_READY, status.phase)
 
         status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 1234)
         assertEquals(B46HysteriaSpikePhase.RUNTIME_STARTED, status.phase)
@@ -103,6 +108,7 @@ class B46HysteriaSpikeStateTest {
     fun `dataPlaneReady cannot be reached by skipping fdControlReady`() {
         var status = B46HysteriaSpikeTransitions.starting()
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
         status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 1)
         try {
             B46HysteriaSpikeTransitions.dataPlaneReady(status)
@@ -110,6 +116,33 @@ class B46HysteriaSpikeStateTest {
         } catch (expected: IllegalStateException) {
             // expected: RUNTIME_STARTED alone (process running) is never sufficient for DATA_PLANE_READY.
         }
+    }
+
+    @Test
+    fun `runtimeStarted cannot be reached by skipping tunBridgeReady`() {
+        var status = B46HysteriaSpikeTransitions.starting()
+        status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        try {
+            B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 1)
+            org.junit.Assert.fail("expected IllegalStateException skipping TUN_BRIDGE_READY")
+        } catch (expected: IllegalStateException) {
+            // expected: TUN_ESTABLISHED alone (fd exists) is never sufficient to start the Hysteria2
+            // process - the sing-tun-driven relay (B46-2B, Option A) must be live first, since the
+            // process has nothing to talk to before the bridge is running.
+        }
+    }
+
+    @Test
+    fun `bridgeExitedUnexpectedly clears to ERROR with typed BridgeExited cause and clears runtimePid`() {
+        var status = B46HysteriaSpikeTransitions.starting()
+        status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
+
+        status = B46HysteriaSpikeTransitions.bridgeExitedUnexpectedly(status, reason = "relay panic")
+
+        assertEquals(B46HysteriaSpikePhase.ERROR, status.phase)
+        assertEquals(null, status.runtimePid)
+        assertTrue(status.lastError is B46HysteriaSpikeError.BridgeExited)
     }
 
     @Test
@@ -122,6 +155,7 @@ class B46HysteriaSpikeStateTest {
     fun `runtimeExitedUnexpectedly always clears to ERROR with exit code recorded`() {
         var status = B46HysteriaSpikeTransitions.starting()
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
         status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 77)
 
         status = B46HysteriaSpikeTransitions.runtimeExitedUnexpectedly(status, exitCode = 137)
@@ -135,6 +169,7 @@ class B46HysteriaSpikeStateTest {
     fun `runtimeExitedUnexpectedly clears runtimePid - a terminated process is never claimed as owned`() {
         var status = B46HysteriaSpikeTransitions.starting()
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
         status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 999)
         assertEquals(999, status.runtimePid)
 
@@ -150,6 +185,7 @@ class B46HysteriaSpikeStateTest {
     fun `fdControl request counters accumulate without resetting other fields`() {
         var status = B46HysteriaSpikeTransitions.starting()
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
         status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 5)
         status = B46HysteriaSpikeTransitions.fdControlReady(status)
 
