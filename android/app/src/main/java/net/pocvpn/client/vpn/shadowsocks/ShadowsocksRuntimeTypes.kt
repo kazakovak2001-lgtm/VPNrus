@@ -19,6 +19,8 @@ internal sealed interface ShadowsocksRuntimeError {
     data class CredentialAbsent(val endpointId: String) : ShadowsocksRuntimeError
     data class CredentialCorrupted(val reason: String) : ShadowsocksRuntimeError
     data class BinaryMissing(val reason: String) : ShadowsocksRuntimeError
+    /** B45B-3P - a previous abnormal process death (SIGABRT/SIGKILL) left ephemeral runtime files this start attempt could not clear before writing a new plaintext config - see ShadowsocksRuntime's own sweepStaleEphemeralState docs. */
+    data class StaleStateCleanupFailed(val reason: String) : ShadowsocksRuntimeError
     data class RuntimeConfigWriteFailed(val reason: String) : ShadowsocksRuntimeError
     data class ProtectListenerFailed(val reason: String) : ShadowsocksRuntimeError
     data class SpawnFailed(val reason: String) : ShadowsocksRuntimeError

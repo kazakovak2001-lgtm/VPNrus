@@ -167,7 +167,10 @@ class ShadowsocksVpnService : VpnService() {
 
             val started = newRuntime.start(
                 binaryPath = binaryPath.absolutePath,
-                tunFd = established.fd,
+                // Borrowed, never a second owner - see ShadowsocksRuntime.start's
+                // own docs. `established` (this service's own TUN ParcelFileDescriptor)
+                // remains the sole close authority throughout.
+                tunFd = established.fileDescriptor,
                 workingDir = File(filesDir, WORKING_DIR_NAME),
                 tunInterfaceAddressCidr = ShadowsocksTunConfig.CIDR,
                 target = ShadowsocksRuntimeTarget(host, port, credential.method, credential.key.base64),
