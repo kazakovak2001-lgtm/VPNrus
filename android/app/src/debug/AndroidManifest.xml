@@ -24,5 +24,27 @@
             android:name="net.pocvpn.client.debug.XrayDiagnosticsActivity"
             android:exported="true"
             android:label="Xray Diagnostics (debug)" />
+
+        <!-- B45A - SPIKE ONLY, NOT A PRODUCTION TRANSPORT. Debug-only manual
+             entry point for the independent shadowsocks-rust Android
+             integration feasibility spike (see
+             docs/B45A_SHADOWSOCKS_RUST_SPIKE.md). Lives in this `debug`
+             source set fragment exactly like XrayDiagnosticsActivity above -
+             genuinely absent from a release APK's merged manifest, never
+             merely a BuildConfig.DEBUG runtime check. Never wired into
+             TransportRegistry/TransportOrchestrator/SmartConnect - this
+             service is reachable ONLY from this manual debug Activity. -->
+        <activity
+            android:name="net.pocvpn.client.debug.b45a.B45ASpikeActivity"
+            android:exported="true"
+            android:label="B45A Shadowsocks Spike (debug, not production)" />
+        <service
+            android:name="net.pocvpn.client.debug.b45a.B45ASpikeVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

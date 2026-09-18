@@ -52,3 +52,24 @@ android/app/build/
 # testing (B7C) - contains a real server public key + endpoint once a VPS
 # exists. Never committed.
 android/app/gateway-dev.properties
+
+# B45A - independent shadowsocks-rust spike binary (debug-only, see
+# docs/B45A_SHADOWSOCKS_RUST_SPIKE.md Section 26). A locally-built ELF
+# binary, not source, and not meant to ever be committed per the B45A git
+# rules - kept gitignored so a routine `git add` cannot accidentally stage
+# this large binary artifact. Packaged as a debug-only jniLibs entry (the
+# ONE binary source - see B45ANativeBinaryResolver), extracted by the
+# Android package manager itself to `applicationInfo.nativeLibraryDir` at
+# install time via a debug-only AGP Variant-API packaging fix
+# (`packaging.jniLibs.useLegacyPackaging`, set only for the `debug` variant
+# in android/app/build.gradle.kts - proven not to affect release packaging).
+# The earlier debug-asset + filesDir-extraction design (see git history)
+# was physically rejected on-device (real app-process exec denied,
+# `error=13, Permission denied`) and is no longer used.
+android/app/src/debug/jniLibs/arm64-v8a/libsslocal_spike.so
+
+# B45A data-plane validation (round 6, see
+# docs/B45A_SHADOWSOCKS_RUST_SPIKE.md) - disposable Frankfurt test server
+# endpoint/credential (server, port, method, base64 key). Debug-buildType-
+# only via android/app/build.gradle.kts, never committed, never printed.
+android/app/b45a-dataplane.properties
