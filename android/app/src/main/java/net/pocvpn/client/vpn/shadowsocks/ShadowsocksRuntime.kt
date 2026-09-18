@@ -1,6 +1,8 @@
 package net.pocvpn.client.vpn.shadowsocks
 
+import android.util.Log
 import java.io.File
+import java.io.FileDescriptor
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -9,6 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+private const val TAG = "ShadowsocksRuntime"
 private const val PROTECT_SOCKET_FILENAME = "protect_path"
 private const val TUN_FD_SOCKET_FILENAME = "tun_fd_path"
 private const val RUNTIME_CONFIG_FILENAME = "runtime_config.json"
@@ -56,9 +59,27 @@ internal class ShadowsocksRuntime(
     private var runtimeConfigFile: File? = null
 
     /**
+     * B45B-3P - `tun_fd_path` is bound/listened-on by sslocal itself, never
+     * by this class (Android is only the CLIENT in that protocol - see
+     * [ShadowsocksTunFdBridge]'s own docs) - so it is only ever safe to
+     * unlink AFTER sslocal's process has been confirmed terminated (physical
+     * testing found sslocal does not unlink its own bound socket on a plain
+     * SIGTERM, so a normal Stop left this file behind until this fix - see
+     * [stopSpawnedProcessIfAny]/[cleanupEphemeralFiles], always called in
+     * that order). Never deleted while the process might still be alive.
+     */
+    private var tunSocketFile: File? = null
+
+    /**
      * [binaryPath] must already exist ([ShadowsocksNativeBinaryResolver]).
-     * [tunFd] is the raw fd of an already-established VpnService.Builder
-     * result - this class never establishes the TUN itself (that stays
+     * [tunFd] is BORROWED from an already-established VpnService.Builder
+     * result's own `ParcelFileDescriptor` - this class (and everything it
+     * calls) never closes, adopts, or otherwise takes ownership of it; the
+     * caller's `ParcelFileDescriptor` remains the sole close authority
+     * before, during, and after this call (see [ShadowsocksTunFdBridge]'s
+     * own docs for why a plain [FileDescriptor], not an `Int` or a second
+     * `ParcelFileDescriptor`, is the correct type for this boundary). This
+     * class never establishes the TUN itself (that stays
      * [ShadowsocksVpnService]'s job). [target] carries the decrypted
      * credential for exactly this call - the caller never retains it beyond
      * calling this. Returns false immediately if already
@@ -66,7 +87,7 @@ internal class ShadowsocksRuntime(
      */
     fun start(
         binaryPath: String,
-        tunFd: Int,
+        tunFd: FileDescriptor,
         workingDir: File,
         tunInterfaceAddressCidr: String,
         target: ShadowsocksRuntimeTarget,
@@ -88,6 +109,22 @@ internal class ShadowsocksRuntime(
         workingDir.mkdirs()
         val protectSocketPath = File(workingDir, PROTECT_SOCKET_FILENAME)
         val tunSocketPath = File(workingDir, TUN_FD_SOCKET_FILENAME)
+        val runtimeConfigPath = File(workingDir, RUNTIME_CONFIG_FILENAME)
+
+        // A process-level crash (SIGABRT/SIGKILL) bypasses every Kotlin
+        // `finally` block, so a previous abnormal death can leave the
+        // plaintext runtime config or a stale UDS behind (physically
+        // observed - see this slice's own report). Swept BEFORE writing any
+        // new plaintext config, scoped to ONLY this transport's own known
+        // ephemeral filenames in [workingDir] - never the encrypted
+        // credential repository (a different directory entirely,
+        // `noBackupFilesDir`, never touched here) or any other app file.
+        // Fails closed (never overwrites stale state and continues) if a
+        // stale file cannot actually be removed.
+        if (!sweepStaleEphemeralState(protectSocketPath, tunSocketPath, runtimeConfigPath)) {
+            fail(ShadowsocksRuntimeError.StaleStateCleanupFailed("could not remove stale ephemeral runtime files"))
+            return false
+        }
 
         val configFile = try {
             ShadowsocksRuntimeConfigWriter.write(
@@ -134,6 +171,7 @@ internal class ShadowsocksRuntime(
             return false
         }
         process = spawned
+        tunSocketFile = tunSocketPath
         spawned.onExit { exitCode -> onProcessExitedUnexpectedly(exitCode) }
 
         scope.launch(ioDispatcher) {
@@ -167,19 +205,9 @@ internal class ShadowsocksRuntime(
         if (current.phase == ShadowsocksRuntimePhase.STOPPED) return
         _status.value = ShadowsocksRuntimeStatus(ShadowsocksRuntimePhase.STOPPING)
 
-        val proc = process
-        if (proc != null && proc.isAlive()) {
-            proc.requestStop()
-            if (proc.waitForExit(gracefulStopTimeoutMillis) == null) {
-                proc.forceStop()
-                proc.waitForExit(DEFAULT_FORCE_STOP_WAIT_MILLIS)
-            }
-        }
-
+        stopSpawnedProcessIfAny()
         protectBridge.stop()
-        process = null
-        runtimeConfigFile?.let { ShadowsocksRuntimeConfigWriter.delete(it) }
-        runtimeConfigFile = null
+        cleanupEphemeralFiles()
         _status.value = ShadowsocksRuntimeStatus.IDLE
     }
 
@@ -193,13 +221,71 @@ internal class ShadowsocksRuntime(
     }
 
     private fun teardownAfterFailure() {
+        // Same ordering as stop() - the process (if the failure happened
+        // after spawn, e.g. TunFdHandoffTimedOut) must be confirmed
+        // terminated before tun_fd_path can be safely unlinked (see
+        // [tunSocketFile]'s own docs). Previously this path left a spawned
+        // sslocal process running unattended on a handoff timeout - fixed
+        // alongside the same physically-found UDS cleanup gap.
+        stopSpawnedProcessIfAny()
         protectBridge.stop()
+        cleanupEphemeralFiles()
+    }
+
+    /** Blocks (bounded) until the spawned process is confirmed dead, or is a no-op if none was ever spawned or it already exited. Always call before [cleanupEphemeralFiles] - see [tunSocketFile]'s own docs. */
+    private fun stopSpawnedProcessIfAny() {
+        val proc = process
+        if (proc != null && proc.isAlive()) {
+            proc.requestStop()
+            if (proc.waitForExit(gracefulStopTimeoutMillis) == null) {
+                proc.forceStop()
+                proc.waitForExit(DEFAULT_FORCE_STOP_WAIT_MILLIS)
+            }
+        }
         process = null
+    }
+
+    /**
+     * Only the transport's own known ephemeral files - never the encrypted
+     * credential repository (a different directory entirely). Idempotent -
+     * a missing file is not an error. Best-effort: a failed delete here
+     * never blocks the STOPPING->IDLE transition (stop() must always
+     * complete), but is logged (path only, never secret material - these
+     * files never carry the raw key in their name) so a real leak is
+     * observable rather than silent.
+     */
+    private fun cleanupEphemeralFiles() {
         runtimeConfigFile?.let { ShadowsocksRuntimeConfigWriter.delete(it) }
         runtimeConfigFile = null
+        tunSocketFile?.let { file ->
+            val deleted = runCatching { file.delete() }.getOrDefault(false)
+            if (!deleted && file.exists()) {
+                Log.w(TAG, "failed to remove tun-fd UDS at ${file.name}")
+            }
+        }
+        tunSocketFile = null
     }
 
     private fun fail(error: ShadowsocksRuntimeError) {
         _status.value = ShadowsocksRuntimeStatus(ShadowsocksRuntimePhase.FAILED, error)
     }
 }
+
+/**
+ * Removes exactly the files listed - this transport's own known ephemeral
+ * runtime material (protect UDS, TUN-fd UDS, plaintext runtime config) - and
+ * nothing else. Idempotent (a file that does not exist counts as already
+ * clean); returns false the moment any listed file still exists after a
+ * delete attempt, which the caller treats as fail-closed (never proceeds to
+ * write a new plaintext config over state it could not actually clear).
+ * File-scope, not a method, specifically so it never has access to anything
+ * beyond the paths it is explicitly given - it cannot reach the encrypted
+ * credential repository (a different directory entirely) or any other app
+ * file even by mistake.
+ */
+internal fun sweepStaleEphemeralState(vararg ephemeralFiles: File): Boolean =
+    ephemeralFiles.all { file ->
+        if (!file.exists()) return@all true
+        file.delete()
+        !file.exists()
+    }

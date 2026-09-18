@@ -68,6 +68,17 @@ android/app/gateway-dev.properties
 # `error=13, Permission denied`) and is no longer used.
 android/app/src/debug/jniLibs/arm64-v8a/libsslocal_spike.so
 
+# B45B-3P - the production-named (never production-packaged - see
+# docs/B45B3P_SHADOWSOCKS_PHYSICAL_VALIDATION.md) sslocal binary used ONLY to
+# physically validate the production adapter shell through the debug-only
+# validation harness. Same reproducible local build as the B45A spike binary
+# above (same upstream commit, same cargo-ndk command - see the doc's own
+# provenance section), packaged debug-only alongside it, under a distinct
+# filename so the two are never confused. Not meant to ever be committed, for
+# the same "large binary artifact, reproducible from a pinned source" reason
+# as libsslocal_spike.so above.
+android/app/src/debug/jniLibs/arm64-v8a/libsslocal.so
+
 # B45A data-plane validation (round 6, see
 # docs/B45A_SHADOWSOCKS_RUST_SPIKE.md) - disposable Frankfurt test server
 # endpoint/credential (server, port, method, base64 key). Debug-buildType-

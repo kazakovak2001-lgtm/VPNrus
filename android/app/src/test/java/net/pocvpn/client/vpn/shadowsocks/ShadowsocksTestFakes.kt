@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.shadowsocks
 
 import java.io.File
+import java.io.FileDescriptor
 
 internal class FakeShadowsocksSpawnedProcess : ShadowsocksSpawnedProcess {
     var stopRequested = false
@@ -55,8 +56,13 @@ internal class FakeShadowsocksTunFdBridge(
     var handOffCalls = 0
         private set
 
-    override fun handOff(tunFd: Int, socketPath: File, timeoutMillis: Long): ShadowsocksTunFdBridgeState {
+    /** Set whenever handOff is invoked - lets tests assert the EXACT same [FileDescriptor] instance the caller passed in was forwarded, never a copy/replacement. */
+    var lastTunFd: FileDescriptor? = null
+        private set
+
+    override fun handOff(tunFd: FileDescriptor, socketPath: File, timeoutMillis: Long): ShadowsocksTunFdBridgeState {
         handOffCalls++
+        lastTunFd = tunFd
         return result
     }
 }

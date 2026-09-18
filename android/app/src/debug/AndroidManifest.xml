@@ -46,5 +46,19 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- B45B-3P - isolated PHYSICAL VALIDATION harness for the PRODUCTION
+             Shadowsocks 2022 adapter shell (ShadowsocksTransport/
+             ShadowsocksVpnService/ShadowsocksRuntime, all in src/main).
+             Never wired into TransportRegistry/TransportOrchestrator/
+             SmartConnect/AutoGatewaySelector/PathCandidateBuilder - reachable
+             ONLY from this manual debug Activity, same discipline as
+             B45ASpikeActivity/XrayDiagnosticsActivity above. exported=true
+             for the same `adb shell am start` reason B13 already documented
+             on XrayDiagnosticsActivity. -->
+        <activity
+            android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
+            android:exported="true"
+            android:label="Shadowsocks Adapter Validation (debug, not production)" />
     </application>
 </manifest>
