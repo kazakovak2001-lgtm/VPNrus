@@ -24,16 +24,23 @@ package net.pocvpn.client.debug.b46hysteria
  * **B46-2B addition: `TUN_BRIDGE_READY`.** B46-2A's TUN-ownership finding
  * (Nova must own the TUN; Hysteria2 cannot receive an external fd directly)
  * means there are now genuinely TWO independently-verifiable milestones
- * between "the TUN device exists" and "the Hysteria2 process is running":
- * (1) the TUN fd exists ([TUN_ESTABLISHED]), and (2) a separate bridge
- * component (the sing-tun-driven relay, Option A) is actually demuxing
- * TCP/UDP flows off that fd and forwarding them toward the not-yet-started
- * Hysteria2 process's local listener ([TUN_BRIDGE_READY]). Collapsing these
- * would let a caller believe the relay is live merely because the TUN
- * exists, which B46-2B's own synthetic proof shows are NOT the same
- * event (the relay must be constructed and started against the fd before
- * it demuxes anything) - so this is a real, independently observable
- * boundary, not an arbitrary subdivision.
+ * between "the TUN device exists" and "the Hysteria2 process is started":
+ * (1) the TUN fd exists ([TUN_ESTABLISHED]), and (2) the sing-tun-driven
+ * bridge (Option A) has ACCEPTED the (duplicated - see the architecture
+ * doc's Section 8 fd-ownership model) TUN fd, its stack has started
+ * successfully, and its handler infrastructure is able to receive/demux a
+ * flow ([TUN_BRIDGE_READY]). Collapsing these would let a caller believe
+ * the bridge is live merely because the TUN exists, which B46-2B's own
+ * synthetic proof shows are NOT the same event (bridge construction/start
+ * can itself fail even after the fd exists) - so this is a real,
+ * independently observable boundary, not an arbitrary subdivision.
+ *
+ * **`TUN_BRIDGE_READY` precisely does NOT mean** the Hysteria2 process is
+ * running, that SOCKS5 forwarding works, that QUIC works, or that any data
+ * plane exists - those remain gated behind [RUNTIME_STARTED],
+ * [FD_CONTROL_READY], and [DATA_PLANE_READY] respectively, exactly as
+ * before. It is a statement about the bridge's own readiness to demux
+ * flows off the fd, nothing about what happens to a flow once demuxed.
  *
  * This is not, and must never become, a second production transport/
  * reconnect/diagnostics authority - see architecture principle 11 in
@@ -67,8 +74,17 @@ sealed interface B46HysteriaSpikeError {
     /** The sing-tun-driven relay (Option A, B46-2B) failed to construct/start against the TUN fd. */
     data class BridgeStartFailed(val reason: String) : B46HysteriaSpikeError
 
-    /** The bridge process/component exited on its own - distinct from a Hysteria2 runtime exit. */
-    data class BridgeExited(val reason: String) : B46HysteriaSpikeError
+    /**
+     * The bridge (an in-process sing-tun-driven stack/worker, per the
+     * architecture doc's chosen process boundary - never a separate child
+     * process for this component) failed on its own. Named `BridgeFailed`,
+     * not `BridgeExited`: an in-process worker failing is not a process
+     * "exit" the way a child process exiting is, and this must never be
+     * confused with [RuntimeExitedUnexpectedly] (the Hysteria2 CHILD
+     * PROCESS exiting) - they are separate failure domains with separate
+     * ownership consequences, see [bridgeFailed]'s own doc.
+     */
+    data class BridgeFailed(val reason: String) : B46HysteriaSpikeError
 
     /** The bridge received bytes off the TUN fd it could not parse as a valid IPv4/TCP/UDP flow. */
     data class BridgeFlowParseFailed(val reason: String) : B46HysteriaSpikeError
@@ -176,16 +192,29 @@ object B46HysteriaSpikeTransitions {
             .copy(phase = B46HysteriaSpikePhase.RUNTIME_STARTED, runtimePid = pid)
 
     /**
-     * The bridge component exits/crashes on its own (never requested) -
-     * mirrors [runtimeExitedUnexpectedly]'s "known terminated, never claim
-     * ownership" discipline, applied to the bridge rather than the
-     * Hysteria2 runtime process (they are separate failure domains, see
-     * the architecture doc's failure taxonomy).
+     * The bridge fails on its own (never requested) - a SEPARATE failure
+     * domain from the Hysteria2 runtime process, deliberately NOT mirroring
+     * [runtimeExitedUnexpectedly]'s `runtimePid = null` clear.
+     *
+     * **B46-2B review fix (load-bearing ownership correction)**: a bridge
+     * failure does NOT prove the Hysteria2 child process terminated - the
+     * bridge and the Hysteria2 runtime are two independently-owned
+     * components (the bridge runs in-process with the VpnService; Hysteria2
+     * is a separate child process, per the architecture doc's Section 13
+     * process-boundary decision). If the bridge fails while Hysteria2 is
+     * still running, `runtimePid` must remain recorded exactly as it was -
+     * clearing it here would falsely claim the Hysteria2 process is no
+     * longer owned/tracked when nothing has actually confirmed that. Only
+     * [runtimeExitedUnexpectedly] may clear `runtimePid`, and only because
+     * IT is the transition backed by evidence the runtime process itself
+     * exited. Cleanup (the ordinary `STOPPING -> STOPPED` path) is what
+     * actually terminates a still-running Hysteria2 process after a bridge
+     * failure - `runtimePid` is cleared there when the runtime component's
+     * own I/O layer confirms termination, not by this transition.
      */
-    fun bridgeExitedUnexpectedly(current: B46HysteriaSpikeStatus, reason: String): B46HysteriaSpikeStatus = current.copy(
+    fun bridgeFailed(current: B46HysteriaSpikeStatus, reason: String): B46HysteriaSpikeStatus = current.copy(
         phase = B46HysteriaSpikePhase.ERROR,
-        runtimePid = null,
-        lastError = B46HysteriaSpikeError.BridgeExited(reason),
+        lastError = B46HysteriaSpikeError.BridgeFailed(reason),
     )
 
     fun fdControlReady(current: B46HysteriaSpikeStatus): B46HysteriaSpikeStatus =

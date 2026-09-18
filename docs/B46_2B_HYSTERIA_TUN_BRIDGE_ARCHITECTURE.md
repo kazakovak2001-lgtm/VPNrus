@@ -1,5 +1,23 @@
 # B46-2B: Hysteria2 Android TUN bridge — architecture spike and synthetic proof
 
+**CORRECTION PASS (same day, following a direct review of PR #89 against the
+pinned `sing-tun` source):** the original pass's TUN-fd ownership model was
+insufficiently precise (it did not account for `sing-tun`'s `NativeTun.Close()`
+closing whatever raw fd number it is given, which risked a double-close if
+the original `ParcelFileDescriptor`'s fd were handed to it directly), the
+synthetic proof's UDP path was demux-only and its pass/fail result did not
+actually depend on the handler having observed anything (a `Write()` +
+`sleep` was wrongly treated as success), the proof carried unsynchronized
+shared-state reads/writes across goroutines, the bridge/Hysteria2-process
+boundary was left ambiguous while still claiming the "no cross-process fd
+transfer" advantage, and `bridgeExitedUnexpectedly` incorrectly cleared
+`runtimePid` for a Hysteria2 process the bridge's own failure never actually
+proved had terminated. All five are fixed in this pass — see Sections 6, 8,
+9, 10, 13, 14, 17, and 21 below, each now re-derived from a real *host-side
+re-run* and, for Option C, a real *audit of two candidates' current source*,
+not carried over from the first pass's prose. The verdict was re-decided from
+scratch after the fixes (Section "Decision gate"), not preserved by default.
+
 **Status of this document: ARCHITECTURE ONLY, with a real host-side synthetic
 proof. No physical Android device was available in this environment. No
 production code, `TransportKind`, or wiring into `TransportRegistry`/
@@ -37,24 +55,34 @@ descriptor — the gap is in Hysteria2's own `app` layer, not in the
 `sing-tun` library it already vendors, which genuinely supports an external
 fd via `Options.FileDescriptor`. This slice designed and picked the smallest
 architecture to bridge that gap — **Option A, `NOVA_SING_TUN_ADAPTER`**
-(Nova drives `sing-tun` itself against the VpnService-created fd, and
+(Nova drives `sing-tun` itself, IN-PROCESS with the `VpnService` — Section
+13's now-pinned boundary — against a DEDICATED DUPLICATE of the
+VpnService-created fd — Section 8's corrected ownership model — and
 forwards demuxed TCP/UDP flows into Hysteria2's own, unmodified, SOCKS5
 listener) — and then built and ran a real, non-mocked, host-side proof
 program that exercises the exact API surface a future B46-2P Android bridge
-would use: it opens a genuine Linux TUN device, hands only the fd number to
-an unmodified copy of the exact `sing-tun` version Hysteria2 itself pins,
-and shows a real TCP connection round-tripping through it and a real UDP
-datagram being correctly demultiplexed with correct 5-tuple metadata. The
-proof also surfaced one real, non-obvious API-contract fact undocumented
-anywhere upstream (`sing-tun`'s System-stack `acceptLoop` force-closes an
-accepted TCP connection the instant the handler returns — a handler must
-relay synchronously, not fire-and-forget), which is now written into both
-this document and the proof program's own comments so B46-2P does not
-rediscover it the hard way.
+would use: it opens a genuine Linux TUN device, duplicates the fd (never
+sharing the original with `sing-tun`), hands only the duplicate to an
+unmodified copy of the exact `sing-tun` version Hysteria2 itself pins, and
+shows a real TCP connection round-tripping through it and a real, FULL UDP
+round trip (payload out and back, not merely a demuxed flow) through it,
+both deterministically observed via channel synchronization. The proof
+surfaced two real, non-obvious API-contract facts undocumented anywhere
+upstream (`sing-tun`'s System-stack `acceptLoop` force-closes an accepted
+TCP connection the instant the handler returns — a handler must relay
+synchronously, not fire-and-forget; and `WritePacket`'s `destination`
+argument must be the original virtual destination, not the source, or a
+UDP reply silently vanishes) plus one genuine, currently-open internal data
+race inside the pinned `sing-tun` dependency itself (found via
+`go build -race`, reported honestly, not worked around) — all now written
+into this document and the proof program's own comments so B46-2P does not
+rediscover them the hard way.
 
-**Verdict: ARCHITECTURE READY FOR B46-2P** (see Section "Decision gate"),
-scoped exactly as narrow as the evidence supports — see "Known unknowns" for
-what is still open and explicitly deferred.
+**Verdict: ARCHITECTURE READY FOR B46-2P** (see Section "Decision gate" —
+re-decided from scratch in a same-day correction pass following a direct
+review of PR #89, not preserved by default), scoped exactly as narrow as
+the evidence supports — see "Known unknowns" for what is still open and
+explicitly deferred.
 
 ## 2. Repository baseline / re-audit scope
 
@@ -227,21 +255,57 @@ Nova TUN fd -> minimally patched Hysteria2 tunConfig/tun.Server -> Hysteria2's
 
 ### Option C — `THIRD_PARTY_TUN2SOCKS`
 
-- Not adopted, and per this task's explicit scope, not independently vetted
-  against a specific named project in this pass (no candidate's license,
-  Android ABI maturity, or security history was audited here — doing so
-  without adding the dependency would itself require picking a candidate to
-  investigate, which this task did not ask for once Option A's own
-  synthetic proof succeeded).
-- **Rejected as the default** on structural grounds that do not require a
-  per-project audit to state: it would introduce a SECOND general-purpose
-  userspace network stack into the app (alongside `sing-tun`, which
-  Hysteria2 itself already vendors and Option A already reuses) — a second
-  large runtime/failure domain and a second thing to keep patched, for
-  capability Option A's synthetic proof already shows `sing-tun` alone
-  provides. Reconsider only if Option A's physical Android performance
-  proves unacceptable AND Option B's fork burden is judged worse — not
-  reached in this pass.
+**Correction pass: this section previously dismissed Option C on purely
+structural grounds without auditing a specific candidate — that did not
+satisfy the task's explicit requirement to evaluate at least one real,
+current alternative. Two credible, actively-maintained candidates were
+cloned fresh and audited directly in this pass** (shallow clones,
+`LICENSE`/`go.mod`/source read directly — not inferred from README claims
+alone):
+
+**Candidate 1 — `github.com/xjasonlyu/tun2socks`** (cloned fresh, HEAD commit
+2026-09-13):
+
+| Fact | Value |
+|---|---|
+| License | MIT (`LICENSE`, read directly) |
+| Language/runtime | Go; `core/` is a `gVisor`-netstack-based userspace TCP/IP stack (`go.mod` pins `gvisor.dev/gvisor v0.0.0-20260906120324-45bde0d1defa` directly) |
+| Maintenance | Active — most recent commit is 5 days before this audit |
+| TUN-fd compatibility | **Confirmed real and direct**: `core/device/fdbased/open_unix.go`'s `open(fd int, mtu uint32, offset int) (device.Device, error)` wraps an externally-supplied fd exactly the way this slice's own proof wraps one for `sing-tun` (`os.NewFile(uintptr(fd), ...)` then builds an endpoint on it) — no re-derivation needed, read directly from source. |
+| TCP/UDP/IPv6 | All three supported — it is a general-purpose tun2socks built specifically to be protocol-complete (used as the core of several GUI proxy clients). |
+| Android usage precedent | Real — this project (or its lineage) underlies multiple existing Android GUI proxy clients. |
+| Integration/runtime burden vs. `sing-tun` | **This is the material finding that changes the comparison from purely structural to factual**: adopting it would add a SECOND, independently-versioned, gVisor-based full TCP/IP stack alongside `sing-tun` (which itself optionally offers a gVisor-backed `"mixed"`/`"gvisor"` stack mode — `stack.go`'s own `WithGVisor` branch) — not a smaller footprint than Option A, and not obviously more Android-proven than `sing-tun` (which every Hysteria2 Android build already carries and links). |
+
+**Candidate 2 — `github.com/heiher/hev-socks5-tunnel`** (cloned fresh, HEAD
+commit 2026-09-17, one day before this audit — the most active of any
+candidate examined in this document):
+
+| Fact | Value |
+|---|---|
+| License | MIT (`LICENSE`, read directly — NOT LGPL, correcting an assumption this slice initially had reason to expect for a C networking project) |
+| Language/runtime | C, ~5,000 LOC (`find src -name '*.c' \| xargs wc -l`) — its own small, purpose-built lwIP-style TCP/IP stack, not gVisor-based |
+| Maintenance | Extremely active (commit the day before this audit) |
+| TUN-fd compatibility | Designed for exactly this use case — consumes an externally-created TUN fd and redirects TCP/UDP through a SOCKS5 upstream, per its own README/config shape |
+| TCP/UDP/IPv6 | All three, explicitly, including "Fullcone NAT, UDP-in-UDP and UDP-in-TCP" framing options for the SOCKS5 UDP relay — more UDP-framing flexibility than this slice's own Option A design currently specifies (Section 9) |
+| Android usage precedent | **Strong, and notable**: its own README credits real production Android VPN apps as users, including **Orbot** (the Guardian Project's widely-deployed Tor VPN client) — a materially stronger existing-Android-production track record than `sing-tun`'s own (which is proven only via Hysteria2's own non-Android-integrated `tun` mode and general sing-box usage, per B46-2A). |
+| Integration/runtime burden vs. `sing-tun` | Real trade-off, stated plainly: it is genuinely SMALLER and more Android-proven than adding `tun2socks`/gVisor, but it is C code requiring its own JNI boundary and its own small independent TCP/IP stack implementation — still a second stack Nova would maintain/patch/update on its own schedule, distinct from `sing-tun`, and not something Hysteria2 itself already vendors (unlike `sing-tun`). |
+
+**Conclusion, Option C not adopted, for a stated factual reason rather than
+a structural dismissal**: both real candidates would add a genuinely
+separate, independently-maintained network-stack dependency alongside
+`sing-tun` — one (`tun2socks`) duplicating the SAME class of capability
+(gVisor-based userspace TCP/IP) `sing-tun` optionally already offers, the
+other (`hev-socks5-tunnel`) a smaller, C-native, more Android-battle-tested
+alternative that is a genuinely close call on Android-maturity grounds but
+still does not reuse anything already in Hysteria2's own dependency tree
+the way Option A does. Option A remains preferred because it needs ZERO new
+runtime dependency beyond what Hysteria2 already ships and links for
+Android (Section 3) — not because Option C's candidates are deficient.
+**`hev-socks5-tunnel` is recorded here as the strongest fallback candidate**
+if a future physical spike finds `sing-tun`'s own Android TCP/UDP behavior
+unacceptable, given its real Orbot production precedent — stronger than
+Option B's fork-maintenance fallback for a scenario where the problem is
+`sing-tun` itself rather than the extra SOCKS5 hop.
 
 ## 7. Phase 4 — chosen architecture
 
@@ -265,10 +329,12 @@ code):
   slice's own proof shows is stable and unchanged in the exact version
   Hysteria2 currently pins.
 - **Android correctness**: the fd-handoff shape (external owner
-  creates+configures the TUN; `sing-tun` never opens its own device) is
-  proven directly on Linux in this slice (Section 10) — the Android-specific
-  unknowns that remain (SELinux, VpnService-specific fd semantics, cross-
-  process boundaries) are named explicitly in "Known unknowns," not glossed
+  creates+configures the TUN; `sing-tun` never opens its own device, only
+  ever a dedicated duplicate per Section 8) is proven directly on Linux in
+  this slice (Section 10). The process boundary itself is pinned (Section
+  13), not an open unknown; the remaining Android-specific unknowns
+  (SELinux, the real `ParcelFileDescriptor.dup()`/`detachFd()` behavior on
+  a device) are named explicitly in "Known unknowns," not glossed
   over.
 - **TCP+UDP support**: both demonstrated working in the synthetic proof.
 - **Lifecycle ownership**: clean single-process ownership — Nova's own
@@ -288,27 +354,91 @@ code):
 
 ## 8. Phase 5 — FD ownership model (exact)
 
-### Android VPN TUN fd (from `VpnService.Builder.establish()`)
+**Correction pass (load-bearing fix).** The original pass of this section
+claimed the raw fd integer could be passed directly into
+`tun.Options.FileDescriptor` with "no dup needed," reasoning that in-process
+delivery alone made ownership safe. That reasoning was incomplete: it did
+not account for `sing-tun`'s own close behavior. Read directly from the
+pinned `tun_linux.go`, `NativeTun.Close()` is:
+
+```go
+func (t *NativeTun) Close() error {
+    ...
+    return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
+}
+```
+
+`t.tunFile` is `os.NewFile(uintptr(options.FileDescriptor), "tun")` — i.e.
+`sing-tun` closes the EXACT fd NUMBER it was given, unconditionally, when
+its own `Tun`/`Stack` is torn down. If that fd number were the SAME one
+`VpnService`'s `ParcelFileDescriptor` also believes it owns, both
+`sing-tun`'s `Close()` and a later `ParcelFileDescriptor.close()` would
+independently believe they alone are responsible for closing it — a
+double-close is then possible by construction, not merely by a
+implementation bug. This is exactly the ambiguity the review flagged, and it
+is real, not theoretical: this pass's own synthetic proof (Section 10)
+reproduces the exact failure mode and its fix on a real Linux TUN fd.
+
+**Corrected model: split ownership via `dup()`, never share one fd number
+across two independent owners.**
+
+```
+VpnService.Builder.establish()
+  -> original ParcelFileDescriptor            (stays owned by VpnService, whole session)
+  -> ParcelFileDescriptor.dup()                (Android's own supported public API — see below)
+     -> duplicate ParcelFileDescriptor.detachFd()   (ownership-transfer point)
+        -> raw bridge fd (int)                 -> tun.Options.FileDescriptor
+                                                -> sing-tun exclusively owns/closes THIS fd
+```
+
+**Android API shape chosen, and why**: `ParcelFileDescriptor.dup()` is a
+supported, non-reflection public Android API — it performs a real `dup(2)`
+under the hood, producing a genuinely independent fd number that refers to
+the SAME underlying open-file description (so both fds remain valid and
+usable, and closing one never invalidates the other). `detachFd()` is then
+called on that DUPLICATE (never on the original) — Android's own documented
+semantics for `detachFd()` are exactly the ownership-transfer contract this
+design needs: the `ParcelFileDescriptor` object's own `close()`/finalizer
+becomes a no-op after `detachFd()`, and the caller (here: the bridge/JNI
+boundary) becomes solely responsible for eventually closing the returned raw
+fd exactly once. This avoids the "invent unsafe reflection just to extract
+an integer" trap entirely — no reflection is used anywhere in this design;
+`getFd()` alone would have been insufficient because it does NOT transfer
+ownership (the Java object would still believe it owns and might close the
+fd later), which is precisely the ambiguity being eliminated.
+
+This slice's own host-side proof program (Section 10) implements the exact
+Linux equivalent of this model — `unix.Dup(originalFd)` in place of
+`ParcelFileDescriptor.dup()`+`detachFd()` — since there is no Android
+runtime available in this environment, and confirms it works end to end.
+
+### Android VPN TUN fd (from `VpnService.Builder.establish()`) — corrected ownership table
 
 | # | Question | Answer |
 |---|---|---|
-| 1 | Creator | Nova's `VpnService` subclass (the future `B46HysteriaVpnService`), via `Builder.establish()` — same as every existing transport. |
-| 2 | Owner | The SAME `VpnService` subclass, for the whole session — never transferred to a child process, never handed to Hysteria2. |
-| 3 | Duplicated? | **No dup needed for the bridge itself.** Unlike B45A/B45B's Shadowsocks design (which sends the real TUN fd across a process boundary via `SCM_RIGHTS` to `sslocal`), Option A's bridge runs the `sing-tun`-driven relay IN-PROCESS with the `VpnService` (see Section 14's process-shape discussion) — the raw fd integer from the already-owned `ParcelFileDescriptor` is passed directly into `tun.Options.FileDescriptor`, no `dup()`, no cross-process transfer. |
-| 4 | Who closes the original | The `VpnService` subclass, on stop — via `ParcelFileDescriptor.close()`, after the bridge (`sing-tun` Stack) has been told to stop reading/writing it (Section 12's ordering). |
-| 5 | Who closes a duplicate | N/A — no duplicate exists on this path. |
-| 6 | Failure-path cleanup | If bridge construction (`tun.New`/`tun.NewStack`) fails after `establish()` succeeded, the `VpnService` must still close the `ParcelFileDescriptor` itself (bridge failure never leaves the fd orphaned) and transition to `ERROR`/`TUN_ESTABLISH_FAILED` or the new `BRIDGE_START_FAILED` typed cause (Section 15). |
-| 7 | Crash cleanup | If the `VpnService` process dies, Android itself reclaims the fd (it is a normal process-owned file descriptor) — no separate cleanup mechanism is needed or safe to invent; this matches every other transport's existing assumption. |
+| 1 | Original creator | Nova's `VpnService` subclass (the future `B46HysteriaVpnService`), via `Builder.establish()` — same as every existing transport. |
+| 2 | Original owner | The SAME `VpnService` subclass, for the whole session. |
+| 3 | Duplicate creator | The `VpnService` subclass, via `original.dup()` immediately before starting the bridge. |
+| 4 | Duplicate owner (after transfer) | The bridge component exclusively, from the moment `detachFd()` returns the raw fd until the bridge's own `Tun.Close()` runs. The `VpnService`/Kotlin side never touches this fd number again after the transfer point. |
+| 5 | Ownership-transfer point | `duplicate.detachFd()` — the single, explicit, non-reflective API call after which exactly one component (the bridge) owns the duplicate. |
+| 6 | Who closes the original | The `VpnService` subclass, via `ParcelFileDescriptor.close()`, and ONLY AFTER the bridge (`sing-tun` `Stack`/`Tun`) has been confirmed stopped (Section 16's ordering) — never before, and never assumed-safe to close early just because a duplicate exists. |
+| 7 | Who closes the duplicate | `sing-tun`'s own `NativeTun.Close()`, called from the bridge's own stop path — never the Kotlin/`VpnService` side, which no longer holds a live reference to that fd number after `detachFd()`. |
+| 8 | Bridge-start failure | If `tun.New`/`tun.NewStack` fails against the duplicate, the bridge itself must close the duplicate it was given (it is the sole owner from the transfer point on); the `VpnService` still separately closes the ORIGINAL — each side closes only the fd it owns, never the other's. |
+| 9 | Bridge crash | If the in-process bridge worker fails after successfully starting (Section 14's `bridgeFailed`), the duplicate's fate depends on whether `sing-tun`'s own objects are still reachable — the design requirement is that cleanup (Section 16) always reaches `Tun.Close()` for the duplicate exactly once, whether via the failure path or the ordinary stop path, and the `VpnService` still separately owns and closes the original regardless of the bridge's outcome. |
+| 10 | `VpnService` destruction | Android reclaims BOTH fd numbers (they are ordinary process-owned descriptors) — no separate cleanup mechanism is needed or safe to invent, matching every other transport's existing assumption; this is a backstop, not a substitute for the explicit close ordering above under normal/error stop. |
+| 11 | App-process death | Same as `VpnService` destruction — the OS reclaims both fds; no state is expected to survive process death (the debug state machine is in-memory only). |
 
-**This is a genuinely simpler ownership story than B45A/B45B's Shadowsocks
-design**, precisely because Option A avoids ever transferring the TUN fd
-across a process boundary — there is no second process to hand it to, no
-`SCM_RIGHTS` round trip for the TUN fd itself, and therefore no double-close
-or ownership-race class of bug to guard against for this fd. (B45B3P's own
-found bug was in exactly that kind of cross-process handoff, on the
-Shadowsocks side — Option A's design structurally avoids reintroducing it
-for the TUN fd, though the QUIC-socket handoff below still needs the same
-discipline B45A/B45B already established.)
+**No object ever believes it owns the same close responsibility as
+another, by construction**: after the transfer point, the original and the
+duplicate are two independent kernel-level fd numbers, each closed by
+exactly one owner. This is a genuinely simpler ownership story than B45A/
+B45B's Shadowsocks design in one respect — the duplicate never crosses a
+process boundary via `SCM_RIGHTS` (see Section 13's confirmed in-process
+boundary decision) — while being MORE careful than the original pass of
+this document about not conflating "same process" with "safe to share one
+fd number." B45B3P's own found cross-process cleanup bug remains the
+motivating precedent for verifying this ordering physically on a real
+device in B46-2P, never assumed correct from reading source alone.
 
 ### Hysteria outbound QUIC UDP socket fd (FD Control, separate and unchanged)
 
@@ -384,6 +514,23 @@ clone used by this slice) — the SOCKS5-UDP-framing work is real,
 well-scoped engineering for a future B46-2P bridge implementation, NOT a
 research gap this document leaves open by omission.
 
+**Correction pass: the `WritePacket` destination argument, verified by
+running a real round trip, not just reading source.** This slice's
+corrected synthetic proof (Section 10) implements the RESPONSE direction
+for real, which required reading `stack_system.go`'s
+`systemUDPPacketWriter4.WritePacket` line by line: the `destination
+M.Socksaddr` argument passed to `conn.WritePacket(buffer, destination)`
+becomes the reply packet's FABRICATED SOURCE IP (`ipHdr.SetSourceIP(destination.Addr)`)
+— i.e. it must be set to the ORIGINAL virtual destination
+(`metadata.Destination`, e.g. the Hysteria2 server's own address as the
+app believes it), never `metadata.Source` and never the real local target's
+address, or the real client socket receives a reply that appears to come
+from the wrong peer and silently drops it (UDP has no equivalent of a
+TCP RST to signal the mismatch — it just looks like packet loss). This is a
+second genuine, non-obvious API-contract fact this slice's proof surfaced
+by actually exercising the write-back path, not merely reading the
+`WritePacket` interface signature.
+
 **Timeout/session cleanup**: `sing-tun`'s `udpnat.Service` already applies a
 configurable idle timeout (`StackOptions.UDPTimeout`, set to 30s in this
 slice's proof) per flow — a Nova bridge implementation should size this
@@ -391,7 +538,14 @@ consistently with Hysteria2's own QUIC idle-timeout configuration rather
 than inventing an independent value, though the exact number is left for
 B46-2P's own tuning (not a research blocker).
 
-## 10. Synthetic test results — the critical assumption, proven
+## 10. Synthetic test results — the critical assumption, proven, corrected pass
+
+**This section fully supersedes the original pass's proof, not merely
+extends it** — the original proof's UDP path was demux-only, its pass/fail
+result did not depend on the handler actually having been invoked, it
+shared the original TUN fd directly with `sing-tun` (the double-close risk
+Section 8 corrects), and it had unsynchronized shared-state access. All four
+are fixed in the version described below and committed to this branch.
 
 **What was proven, and how, in full**: a Go program
 (`research/b46-2b-hysteria-tun-bridge/singtun-proof/main.go` in this
@@ -401,55 +555,114 @@ branch) that:
    — playing the "external owner creates and configures the TUN" role
    `VpnService.Builder.establish()` plays on Android, using the SAME kernel
    primitive (a real Linux TUN device, not a mock).
-2. Configures the interface's address (`198.18.55.1/30`) and a route for an
+2. **Duplicates that fd (`unix.Dup`) before handing anything to `sing-tun`**
+   — the Linux equivalent of Section 8's `ParcelFileDescriptor.dup()`+
+   `detachFd()` model. The ORIGINAL fd is retained by `main()` (the
+   "VpnService" role) and closed LAST; only the DUPLICATE is ever given to
+   `sing-tun`.
+3. Configures the interface's address (`198.18.55.1/30`) and a route for an
    arbitrary, otherwise-unrelated test destination (`203.0.113.9/32`) via
    the real `ip` tool — analogous to what `VpnService.Builder`'s own
    `addAddress`/`addRoute` calls do.
-3. Hands ONLY the resulting fd integer (never re-opening the device) to
-   `tun.Options{FileDescriptor: fd}`, using the exact pinned `sing-tun`
-   pseudo-version Hysteria2 itself vendors (Section 3) — `tun.New(options)`
-   confirmed to accept it and skip its own device-open path (matching the
-   Section 4 code-reading finding).
-4. Drives `sing-tun`'s unmodified `"system"` stack
-   (`tun.NewStack("system", ...)`) against that fd, with a Handler
-   standing in for the future Nova bridge.
-5. From the SAME host, makes a real `net.Dial("tcp", "203.0.113.9:9000")`
+4. Hands ONLY the duplicate fd integer (never the original, never re-opening
+   the device) to `tun.Options{FileDescriptor: bridgeFd}`, using the exact
+   pinned `sing-tun` pseudo-version Hysteria2 itself vendors (Section 3) —
+   `tun.New(options)` confirmed to accept it and skip its own device-open
+   path (matching the Section 4 code-reading finding).
+5. Drives `sing-tun`'s unmodified `"system"` stack
+   (`tun.NewStack("system", ...)`) against that duplicate fd, with a Handler
+   standing in for the future Nova bridge. The Handler reports every
+   `NewConnection`/`NewPacketConnection` invocation over a buffered CHANNEL
+   (`tcpSeen`/`udpSeen`) — never a shared counter/slice read without
+   synchronization — so the main goroutine can deterministically wait for,
+   and assert on, a real observed flow instead of sleeping and hoping.
+6. From the SAME host, makes a real `net.Dial("tcp", "203.0.113.9:9000")`
    and a real `net.Dial("udp", "203.0.113.9:9001")` — real kernel-routed
    traffic, not fabricated packets — which the kernel routes onto the real
-   TUN device because of the route programmed in step 2.
+   TUN device because of the route programmed in step 3.
+7. For TCP, the Handler relays synchronously to a local echo target and the
+   test asserts the exact byte payload returns AND that a channel receive
+   observed the expected destination — a send/receive success alone is not
+   treated as sufficient (mirroring the stronger bar now applied uniformly
+   to both protocols).
+8. For UDP, the Handler now performs the FULL round trip: it reads the real
+   inbound datagram off the tun-side flow (`conn.ReadPacket`), forwards the
+   exact payload to a local UDP echo target, reads the echo response, and
+   writes it back through `conn.WritePacket(outBuf, metadata.Destination)`
+   — the corrected destination-argument semantics from Section 9. The test
+   asserts, IN ORDER: (a) a channel receive observed `NewPacketConnection`
+   within a bounded timeout (never proceeding on a bare `Write()`), (b) the
+   observed destination string is EXACTLY `"203.0.113.9:9001"`, (c) the
+   observed source is non-empty, and (d) the real client socket receives
+   the exact original payload back, byte for byte, through the tun.
 
-**Result, this slice's own run, verbatim**:
+**Result, this slice's corrected run, verbatim** (re-run twice,
+deterministic both times — no flake observed):
 
 ```
-OK: sing-tun accepted externally-created fd via Options.FileDescriptor, did not open its own device
-[bridge] TCP flow demuxed: 198.18.55.1:54182 -> 203.0.113.9:9000
-TCP round trip through externally-owned TUN -> sing-tun -> local target: match=true
-[bridge] UDP flow demuxed: 198.18.55.1:46712 -> 203.0.113.9:9001
+OK: split ownership — original fd=5 (VpnService role, closed last), bridge fd=6 (sing-tun role, closed by NativeTun.Close())
+OK: sing-tun accepted the duplicate fd via Options.FileDescriptor, did not open its own device
+TCP OK: round trip match=true, handler observed source=198.18.55.1:47142 destination=203.0.113.9:9000
+UDP OK: handler observed source=198.18.55.1:52476 destination=203.0.113.9:9001, round trip match=true
 
-=== RESULT === tcpFlowsDemuxed=1 udpFlowsDemuxed=1 tcpRoundTrip=true udpFlowDemuxed=true
+=== RESULT === tcpObserved=true(&{source:198.18.55.1:47142 destination:203.0.113.9:9000}) tcpRoundTrip=true udpObserved=true(&{source:198.18.55.1:52476 destination:203.0.113.9:9001}) udpRoundTrip=true
 ```
 
-The TCP flow was forwarded by the bridge Handler to a local TCP echo server
-standing in for Hysteria2's SOCKS5 listener, and the exact 16-byte payload
-sent by the real client came back byte-for-byte through the full path
-(`kernel -> real TUN fd -> sing-tun -> Handler -> local target -> Handler ->
-sing-tun -> real TUN fd -> kernel -> client`). The UDP flow was correctly
-demultiplexed with the correct source/destination 5-tuple (full round-trip
-UDP echo forwarding is explicitly left unimplemented in this proof program —
-see "Known unknowns" — since the goal was to prove the demux/metadata
-assumption, not to build the whole relay).
+Exit code `0` on both runs — the program's own exit code is now driven
+strictly by the observed conditions above (`os.Exit(1)` if the TCP round
+trip fails, if the UDP handler observation times out, if the observed UDP
+metadata mismatches, or if the UDP round trip fails), never by a
+send-only heuristic.
 
-**What this does and does not prove, stated precisely**: this proves
-`sing-tun`'s external-fd path and TCP/UDP demux work correctly against a
-REAL Linux kernel TUN device and REAL traffic, using the identical library
-version Hysteria2 ships — the single largest open technical-feasibility
-question B46-2A left (Section 15 there: "the local relay layer's exact
-shape... is not designed"). It does NOT prove anything about Android's
-`VpnService` specifically (SELinux labeling, the app-process/VPN-exclusion
-interaction B33's own findings already show matters for OTHER transports'
-diagnostic probes, JNI/native packaging correctness, or battery/idle
-behavior) — those remain physical-device unknowns for B46-2P, named
-explicitly below, not silently assumed proven by this host-side result.
+**`go vet ./...`**: clean, no findings.
+
+**Race-enabled run (`go build -race`), a genuine, honest finding about the
+pinned dependency, not about this proof's own code**: running the
+race-instrumented binary surfaced **3 real data-race warnings, all inside
+`sing-tun`'s own `stack_system_nat.go` `TCPNat.LookupBack`/`Lookup`**, not in
+this proof program's code. Read directly:
+
+```go
+func (n *TCPNat) LookupBack(port uint16) *TCPSession {
+    n.portAccess.RLock()
+    session := n.portMap[port]
+    n.portAccess.RUnlock()
+    if session != nil {
+        session.LastActive = time.Now() // <- written OUTSIDE the lock
+    }
+    return session
+}
+```
+
+`session.LastActive` is written here AFTER `n.portAccess.RUnlock()` — a real,
+pre-existing, unsynchronized concurrent write, racing against
+`checkTimeout`'s own read of the same field under `portAccess.Lock()`
+elsewhere in the same file, and against concurrent `LookupBack` calls from
+different goroutines (this proof's real TCP flow triggered concurrent calls
+from `acceptLoop`'s goroutine and `processIPv4TCP`'s reverse-NAT check on
+the tun-read goroutine). **This is a genuine defect in the pinned `sing-tun`
+version Hysteria2 itself vendors** (Section 3's exact pseudo-version), not
+an artifact of this proof's own design — the proof's own TCP/UDP result was
+still correct in the race-instrumented run (the race is on a
+best-effort "last active" timestamp used only for idle-timeout eviction,
+not on any value that reached the wire), but it is recorded honestly here
+as a real finding for Section 21's supply-chain assessment, not glossed
+over because the functional result still passed.
+
+**What this does and does not prove, stated precisely**: this proves (a)
+`sing-tun`'s external-fd path works correctly against a REAL Linux kernel
+TUN device using a REAL, independently-owned duplicate fd (never the
+original), (b) TCP and now FULL-ROUND-TRIP UDP work correctly through it,
+deterministically observed via channel synchronization, and (c) the
+dependency itself has at least one real, currently-unfixed internal data
+race worth tracking. It does NOT prove anything about Android's
+`VpnService` specifically (SELinux labeling, `ParcelFileDescriptor.dup()`/
+`detachFd()`'s exact behavior on a real device, the app-process/VPN-
+exclusion interaction B33's own findings already show matters for OTHER
+transports' diagnostic probes, JNI/native packaging correctness, or
+battery/idle behavior) — those remain physical-device unknowns for B46-2P,
+named explicitly below, not silently assumed proven by this host-side
+result.
 
 ## 11. DNS model (design only)
 
@@ -505,29 +718,62 @@ explicitly below, not silently assumed proven by this host-side result.
   network path with a smaller MTU was involved) — an explicit unknown for
   physical testing (Section "Known unknowns").
 
-## 13. Runtime/process architecture (conceptual, not built)
+## 13. Runtime/process architecture — process boundary PINNED (corrected pass)
 
-Per Section 8's ownership analysis, the bridge does NOT need to be a
-separate process from the `VpnService` — no cross-process TUN-fd transfer is
-required (unlike B45A/B45B's Shadowsocks design), so the smallest auditable
-shape is:
+**Correction pass: the original pass left the bridge's process boundary
+open ("in-process JNI or a small dedicated bridge binary launched as a
+child process") while simultaneously claiming Option A's ownership
+advantage rested on "no cross-process TUN-fd transfer." Those two claims
+cannot both remain true unresolved — an ambiguous boundary is not a
+decided architecture. This is now pinned.**
 
-- **A Go library, compiled into a single native binary alongside (or as
-  part of) the same build that already produces the pinned `hysteria`
-  binary** (matching this slice's own proof program's toolchain — same Go
-  version, same Android NDK cross-compile discipline B46-2A already
-  established, Section 12 there), invoked via **gomobile-style JNI bindings
-  or a small dedicated bridge binary launched as a child process** — the
-  exact choice (in-process JNI vs. a second child process) is left open
-  pending B46-2P's own concrete implementation, since Section 8's ownership
-  model works either way (only the TUN fd integer needs to cross the
-  JNI/process boundary, a single `int`, not a `SCM_RIGHTS` handoff, if a
-  child process is chosen it would need one anyway to receive it from the
-  Kotlin side — a strictly simpler handoff than B45A's own TUN-fd
-  `SCM_RIGHTS` design).
-- The Hysteria2 process itself remains a separate child process (as it
-  already is designed to be, B46-2A Section 8), talked to by the bridge
-  over a local SOCKS5 TCP connection.
+**Decision: the Nova sing-tun bridge runs IN-PROCESS with the
+`VpnService`. Hysteria2 remains a separate child process.**
+
+```
+Android app / VpnService process:
+  - ParcelFileDescriptor (original, VpnService-owned)
+  - TUN duplicate (bridge-owned, via dup()+detachFd(), Section 8)
+  - sing-tun-driven bridge (in-process JNI)
+  - FD Control server (Unix-domain socket listener)
+  - VpnService.protect()
+
+Separate child process:
+  - Hysteria2 executable
+  - SOCKS5 listener
+  - Hysteria QUIC runtime
+```
+
+**Justification, from REAL precedent already in this codebase, not a fresh
+guess**: Nova already has both boundary shapes proven in production for
+different transports, and the choice between them is not arbitrary —
+`XrayCoreRuntime.kt`'s own doc states its real implementation "loads a
+native `.so` via JNI" (the pinned AndroidLibXrayLite AAR, `libgojni.so`,
+loaded IN-PROCESS with the app/`VpnService`), while
+`ShadowsocksProcessLauncher.kt` launches `sslocal` via a real
+`ProcessBuilder` as a SEPARATE CHILD PROCESS. Xray's Go core is a
+`gomobile`-bind-style library exactly like what this bridge would be — the
+SAME precedented pattern applies directly: a Go library (this bridge,
+built with the SAME toolchain/NDK discipline B46-2A already established for
+the `hysteria` binary itself, Section 12 there) compiled via `gomobile bind`
+into an `.aar`, loaded via JNI into the `VpnService`'s own process, exactly
+as Xray's core already is. This is not a new pattern for Nova to invent or
+validate — it is reuse of an already-shipped mechanism.
+
+**This decision is what makes Section 8's ownership model correct**: only
+because the bridge is in-process does "the duplicate fd never crosses a
+process boundary" hold — had a child-process bridge been chosen instead,
+the "no cross-process TUN-fd transfer" advantage would evaporate and an
+explicit `SCM_RIGHTS`-style handoff (like B45A's own `RealB45ATunFdBridge`)
+would be required for the TUN duplicate, exactly as the review flagged.
+Choosing in-process removes that requirement rather than leaving it
+implicit.
+
+Hysteria2 itself remains a SEPARATE child process (as B46-2A Section 8
+already established, and as `ShadowsocksProcessLauncher`'s own precedent
+confirms Nova already knows how to run and manage), talked to by the
+in-process bridge over a local SOCKS5 TCP connection — this boundary is
+unaffected by the bridge's own boundary decision above.
 
 A plausible future debug-only runtime sequence (conceptual only, not built
 in this slice):
@@ -566,23 +812,46 @@ TUN/stack setup had succeeded).
   has nothing to talk to (no local SOCKS5 bridge yet) before the bridge is
   live, so starting it earlier would be a real ordering bug, not merely an
   inconsistency.
-- `B46HysteriaSpikeTransitions.bridgeExitedUnexpectedly(current, reason)`
-  added, mirroring `runtimeExitedUnexpectedly`'s discipline (clears
-  `runtimePid`, records a typed `BridgeExited` cause) but for the bridge's
-  own failure domain, kept distinct from a Hysteria2 process exit.
+- `B46HysteriaSpikeTransitions.bridgeFailed(current, reason)` added
+  — **corrected in this review pass, renamed from the original
+  `bridgeExitedUnexpectedly`/`BridgeExited`**. The original version
+  unconditionally cleared `runtimePid`, which was wrong: a bridge failure
+  (Section 13's chosen in-process worker/stack) is a SEPARATE failure
+  domain from the Hysteria2 CHILD PROCESS, and never itself proves that
+  child process terminated. `bridgeFailed` now preserves `runtimePid`
+  exactly as it was — only `runtimeExitedUnexpectedly` (backed by real
+  evidence the runtime process itself exited) may clear it. The renamed
+  error type `BridgeFailed` (from `BridgeExited`) reflects that this is an
+  in-process worker/stack failure, not a process "exit" the way a child
+  process exiting is a process exit.
 - New typed errors added to `B46HysteriaSpikeError`: `BridgeStartFailed`,
-  `BridgeExited`, `BridgeFlowParseFailed`, `AuthFailed`, `TlsFailed`,
+  `BridgeFailed`, `BridgeFlowParseFailed`, `AuthFailed`, `TlsFailed`,
   `QuicUnreachable`, `TcpProbeFailed`, `UdpProbeFailed`, `DnsProbeFailed`
   (replacing the single generic `DataPlaneProbeFailed` with the specific
   causes Phase 15 of this task required distinguishing).
-- Two new unit tests added: `runtimeStarted cannot be reached by skipping
-  tunBridgeReady` (illegal-skip rejection, mirroring the existing
-  FD_CONTROL_READY skip test) and `bridgeExitedUnexpectedly clears to ERROR
-  with typed BridgeExited cause and clears runtimePid`.
+- Four unit tests added/kept covering this boundary precisely:
+  `runtimeStarted cannot be reached by skipping tunBridgeReady`
+  (illegal-skip rejection), `bridgeFailed clears to ERROR with typed
+  BridgeFailed cause but does NOT clear runtimePid before Hysteria2 has
+  started`, `bridgeFailed does NOT falsely clear a still-owned Hysteria
+  runtimePid` (starts the runtime first, THEN fails the bridge, and asserts
+  the pid survives — this is the review's exact required regression test),
+  and `runtimeExitedUnexpectedly is the ONLY transition that clears
+  runtimePid - proven by contrast with bridgeFailed` (runs both transitions
+  from the identical starting state and asserts they diverge).
 - All other existing call sites (`full happy path`, the ERROR-recovery test,
   the two `runtimeExitedUnexpectedly` tests, the FD Control counter test)
   updated to call `tunBridgeReady(status)` between `tunEstablished` and
   `runtimeStarted`, preserving their original intent.
+- `TUN_BRIDGE_READY`'s own doc comment tightened (Section 6 above,
+  restated in-code) to explicitly state what it does NOT mean: not that
+  Hysteria2 is running, not that SOCKS5 forwarding works, not that QUIC
+  works, not that any data plane exists.
+
+16 tests total, all passing (compiled and run via the same manual
+`kotlinc`+`JUnitCore` harness B46-2A used, since the full Gradle
+`testDebugUnitTest` task remains blocked by the unrelated missing AWG AAR
+prerequisite in this environment).
 
 No production state model was touched.
 
@@ -597,7 +866,7 @@ phase, per the existing state machine's own design — B45A's precedent):
 |---|---|
 | TUN establish failed | `TunEstablishFailed` |
 | Bridge failed to start | `BridgeStartFailed` |
-| Bridge exited unexpectedly | `BridgeExited` (via `bridgeExitedUnexpectedly`) |
+| Bridge (in-process worker/stack) failed | `BridgeFailed` (via `bridgeFailed` — never clears `runtimePid`, see Section 14) |
 | Bridge could not parse a flow off the TUN fd | `BridgeFlowParseFailed` |
 | Hysteria2 binary missing | `BinaryMissing` |
 | Hysteria2 failed to start | `RuntimeSpawnFailed` |
@@ -629,18 +898,22 @@ exercised on a device):
    TUN fd itself (confirmed by reading `stack_system.go`'s `Close()` — it
    only closes `s.tcpListener`/`s.tcpListener6`, never `s.tun`).
 5. Close the `Tun` object (`NativeTun.Close()` — confirmed this closes
-   `t.tunFile`, i.e. the same fd number `VpnService` originally created).
-6. Close/release the `ParcelFileDescriptor` on the `VpnService` side if it
-   is a genuinely separate Java-level object from what step 5 closed (exact
-   mechanics depend on whether the bridge is in-process JNI or a separate
-   child process — an open detail for B46-2P's concrete implementation,
-   Section 13).
+   `t.tunFile`, i.e. the DUPLICATE fd number the bridge was given, per
+   Section 8's corrected ownership model — never the original).
+6. Close the original `ParcelFileDescriptor` on the `VpnService` side —
+   now unambiguous per Section 13's pinned in-process boundary: this is a
+   genuinely separate fd number (the original, never handed to the bridge)
+   closed by the `VpnService` itself, always AFTER step 5, never before and
+   never assumed to be the same close call as step 5.
 7. Remove the FD Control Unix-domain-control socket (mirroring B45B3P's own
    found-and-fixed cleanup bug — this must be physically re-verified on a
    real device, never assumed correct from reading source).
-8. Clear PID/fd ownership fields in the state machine (`runtimePid = null`
-   on both stop paths — already enforced by `stopped()`/
-   `runtimeExitedUnexpectedly()`/`bridgeExitedUnexpectedly()`).
+8. Clear the state machine's `runtimePid` ONLY on the normal-stop path
+   (once the Hysteria2 process is confirmed terminated by this same
+   cleanup sequence, step 3) or via `runtimeExitedUnexpectedly()` — NEVER
+   via `bridgeFailed()`, which (per Section 14's correction) must preserve
+   whatever `runtimePid` value it found, since a bridge failure alone never
+   proves the runtime process terminated.
 9. Transition to `STOPPED`.
 
 **Why steps 4-5's ordering matters, confirmed by reading source rather than
@@ -656,11 +929,11 @@ just yanked" errors reaching the Handler mid-relay.
 
 | Scenario | Required behavior |
 |---|---|
-| Hysteria2 process crashes | Bridge's own dial-to-SOCKS5 calls start failing; state machine moves to `ERROR` via `runtimeExitedUnexpectedly` (already unit-tested); TUN/bridge are torn down via the cleanup model above — never left as a stale `RUNNING`/`DATA_PLANE_READY`. |
-| Bridge process/component crashes | State machine moves to `ERROR` via the new `bridgeExitedUnexpectedly` (already unit-tested); the Hysteria2 child process, now unreachable from the TUN, must still be terminated (never left as an orphan) — the SAME cleanup ordering above applies, entered from the bridge-crash trigger instead of a normal stop request. |
-| `VpnService` is destroyed | Android reclaims the TUN fd; any bridge/Hysteria2 child process must be explicitly terminated by the service's own `onDestroy`/`onRevoke` handling (unchanged discipline from every other transport) — never rely on the OS to clean up a child process it does not itself own. |
+| Hysteria2 process crashes | Bridge's own dial-to-SOCKS5 calls start failing; state machine moves to `ERROR` via `runtimeExitedUnexpectedly` (already unit-tested, clears `runtimePid` — evidence-backed); TUN/bridge are torn down via the cleanup model above — never left as a stale `RUNNING`/`DATA_PLANE_READY`. |
+| Bridge (in-process worker/stack) fails | State machine moves to `ERROR` via `bridgeFailed` (already unit-tested) — **`runtimePid` is preserved, not cleared**, because a bridge failure never proves the Hysteria2 child process terminated (Section 14's correction). Cleanup must still explicitly terminate the still-possibly-running Hysteria2 child process (never left as an orphan just because the bridge died) — the SAME cleanup ordering above applies, entered from the bridge-failure trigger instead of a normal stop request; `runtimePid` is only cleared once that termination is confirmed, via the same evidence-backed path `runtimeExitedUnexpectedly` uses. |
+| `VpnService` is destroyed | Android reclaims BOTH the original and duplicate TUN fds; any bridge/Hysteria2 child process must be explicitly terminated by the service's own `onDestroy`/`onRevoke` handling (unchanged discipline from every other transport) — never rely on the OS to clean up a child process it does not itself own. |
 | FD Control socket dies | Mirrors B46-2A's own unresolved-but-flagged case: the NEXT QUIC-socket protect() attempt fails, surfaced as `FdControlHandoffFailed`/`FdControlHandoffTimedOut` — never a silent "still protected" assumption. |
-| TUN fd becomes invalid | Bridge's read/write on it fails; must be treated the same as a bridge crash (`BridgeExited`/`BridgeFlowParseFailed` as appropriate) — never retried silently against a dead fd. |
+| TUN fd becomes invalid | Bridge's read/write on it fails; must be treated the same as a bridge failure (`BridgeFailed`/`BridgeFlowParseFailed` as appropriate, `runtimePid` preserved per the row above) — never retried silently against a dead fd. |
 | App process is killed | Same as `VpnService` destroyed — no persisted "Protected"/"DATA_PLANE_READY" state survives process death (the debug state machine is in-memory only, matching every other transport's own restart-clears-state behavior). |
 
 No case leaves a stale `Protected`/`DATA_PLANE_READY` claim or an orphaned
@@ -713,43 +986,60 @@ architecture resolves or is expected to resolve.
 | Reproducibility/provenance | This slice's synthetic proof program is a NEW, small (`~250` line), fully-reviewed Go program in `research/b46-2b-hysteria-tun-bridge/`, not committed as a dependency of the app itself — it is prototype/research code, explicitly excluded from any production build. No new binary artifact from this slice is committed to git (matching B45A/B46-2A precedent) — the proof was built and run locally in this session only. |
 | No custom cryptography | None introduced — the entire design routes all cryptographic work through Hysteria2's own existing QUIC/TLS stack, unchanged. |
 | No unpinned dependency | `sing-tun`'s pseudo-version is pinned exactly (a full commit-derived pseudo-version string, not a branch or `latest`), matching this repo's existing discipline for every other pinned binary/dependency. |
+| **Known defect in the pinned dependency (new finding, this correction pass)** | `sing-tun`'s own `stack_system_nat.go` `TCPNat.LookupBack` has a real, reproducible internal data race (Section 10 — found via `go build -race`, not read speculatively): `session.LastActive = time.Now()` is written outside the `portAccess` lock it was just read under. This is upstream's own defect, not something this design introduces or can silently work around. It does not block adopting `sing-tun` (the raced field is a best-effort idle-timeout timestamp, not anything that reaches the wire, and Hysteria2 itself already ships this exact code on Android via its own `tun` mode's internal use of the same library) but it is recorded here as a genuine, currently-open upstream quality concern to track — a candidate for a small upstream bug report/PR rather than a Nova-side workaround, since patching it locally would reintroduce exactly the fork-maintenance cost Option B was passed over for. |
 
 ## 22. Synthetic test results (Phase 11) — summary
 
-See Section 10 for the full account. Summary: real TCP round trip through an
-externally-owned TUN fd, proven; real UDP flow demultiplexing with correct
-5-tuple metadata through the same externally-owned TUN fd, proven; one
-real, previously-undocumented API-contract requirement (`NewConnection` must
-relay synchronously) discovered and now documented for B46-2P. This is a
-genuine, reproducible (re-run twice during this session, deterministic
-result both times) proof, not a claim inferred from reading library source
-alone.
+See Section 10 for the full account, corrected in this pass. Summary: real
+TCP round trip through an externally-owned, PROPERLY-DUPLICATED TUN fd
+(never the original), proven; a FULL real UDP round trip (not merely demux)
+through the same duplicated fd, proven, with both the source/destination
+metadata and the returned payload verified deterministically via channel
+synchronization (never a sleep-and-hope pattern); two real,
+previously-undocumented API-contract requirements discovered and now
+documented for B46-2P (`NewConnection` must relay synchronously;
+`WritePacket`'s `destination` argument must be the original virtual
+destination, not the source); one real, reproducible internal data race in
+the pinned `sing-tun` dependency itself, found via `go build -race` and
+recorded honestly rather than glossed over. Re-run twice (plain build) plus
+once under the race detector, deterministic functional result all three
+times — not a claim inferred from reading library source alone.
 
 ## 23. Known unknowns (explicit)
 
-- **Full SOCKS5 UDP ASSOCIATE framing was not implemented or tested** in
-  this slice's proof — only the demux/metadata layer was proven (Section
-  10). This is real, bounded, well-understood engineering (RFC 1928 Section
-  7) that B46-2P's concrete bridge implementation must still do; it is not
-  a research gap, but it is also not proven working end to end yet.
-- **JNI/native packaging for the bridge itself is unresolved** — whether the
-  bridge ships as a `gomobile`-produced `.aar`, a second native `.so`
-  alongside the existing pinned `hysteria` binary, or a separate small
-  binary launched as a child process is an open implementation choice for
-  B46-2P (Section 13), not decided here because Section 8's ownership model
-  is compatible with either choice.
+- **Full SOCKS5 UDP ASSOCIATE framing (the hop between the bridge and
+  Hysteria2's own SOCKS5 listener) was not implemented or tested** in this
+  slice's proof — the proof's UDP round trip goes through a controlled
+  local echo target standing in for that listener, not through a real
+  Hysteria2 process. This is real, bounded, well-understood engineering
+  (RFC 1928 Section 7) that B46-2P's concrete bridge implementation must
+  still do; it is not a research gap, but it is also not proven working
+  against a real Hysteria2 SOCKS5 server yet.
+- **`ParcelFileDescriptor.dup()`+`detachFd()`'s exact behavior on a real
+  Android device is unverified** — Section 8's ownership model is designed
+  against Android's own documented API contract and validated on Linux via
+  the equivalent `unix.Dup()` call, but no Android runtime was available in
+  this environment to exercise the real API.
+- **JNI/native packaging mechanics for the in-process bridge are
+  unresolved** — Section 13 pins the PROCESS BOUNDARY (in-process JNI,
+  matching Xray's own precedent) but the exact `gomobile bind`
+  invocation/`.aar` structure is not yet built or tested, only argued from
+  precedent.
 - **Nothing about Android's `VpnService`/SELinux/app-process-exclusion
   behavior was tested** — this slice's proof is entirely a plain-Linux-host
   program; B33's own findings (an app process is excluded from its own VPN
   by `addDisallowedApplication`) are a directly relevant precedent for
   anything the bridge does INSIDE Nova's own excluded process, and must be
-  re-checked against whatever concrete process shape B46-2P picks.
+  re-checked against the now-pinned in-process boundary.
 - **MTU/PMTU interaction with QUIC was not exercised** (Section 12) — no
   real network path with a constrained MTU was involved in the host-side
   proof.
 - **Performance overhead of the extra SOCKS5 hop is unmeasured** — no
   throughput/latency/CPU numbers exist for Option A versus a hypothetical
   Option B, on any platform.
+- **The `sing-tun` internal data race (Section 21) has not been reported
+  upstream** in this pass — recorded here, not yet acted on beyond
+  documentation.
 - **The idle/screen-lock issue (Section 20) remains open upstream** and
   untouched by this design.
 - **IPv6 is out of scope entirely for this slice** (Section 12) — not
@@ -784,22 +1074,78 @@ than design from scratch on-device.
 
 ## Decision gate
 
+**Re-decided from scratch in this correction pass, not preserved by
+default** (per the explicit instruction not to keep the prior verdict merely
+because it was the prior verdict). Weighing the state AFTER the fixes, not
+before:
+
+- **TUN fd ownership**: previously stated but NOT actually deterministic
+  (Section 8's original "no dup needed" reasoning had a real double-close
+  risk once `sing-tun`'s own `Close()` behavior was read correctly). NOW
+  genuinely deterministic: split ownership via `dup()`+`detachFd()`, two
+  independent fd numbers, one owner each, no object believing it owns the
+  same close responsibility as another. This was the single load-bearing
+  gap the review identified, and it is now closed by a real design, not
+  patched over.
+- **Process boundary**: previously left ambiguous while relying on the
+  boundary implicitly. NOW pinned to a specific, precedented shape
+  (in-process JNI, matching Xray's own already-shipped pattern) — no
+  remaining internal contradiction between "no cross-process fd transfer"
+  and "the boundary is undecided."
+- **UDP proof**: previously demux-only with a send-and-sleep pass condition
+  that did not depend on the handler having been invoked at all. NOW a full
+  round trip (payload forwarded to a real target and returned byte-for-byte
+  through `sing-tun`'s own `WritePacket` path), gated on a genuine channel
+  observation of the handler with exact-match metadata assertions — the
+  proof's pass/fail result is now driven by real observed conditions,
+  never a heuristic.
+- **Determinism**: previously relied on an unsynchronized shared-counter/
+  slice read after a fixed sleep. NOW channel-synchronized throughout, and
+  additionally exercised under the race detector (which correctly found
+  ZERO races in this proof's OWN code, and separately surfaced one honestly
+  disclosed pre-existing race inside the pinned dependency itself).
+- **Bridge/runtime ownership separation**: previously conflated (a bridge
+  failure incorrectly cleared a Hysteria2 runtime pid it had no evidence
+  about). NOW correctly separated in the state machine and unit-tested
+  directly (`bridgeFailed does NOT falsely clear a still-owned Hysteria
+  runtimePid`).
+- **Option C**: previously dismissed structurally without auditing a real
+  candidate. NOW backed by a real audit of two current, credible candidates
+  (`xjasonlyu/tun2socks`, `heiher/hev-socks5-tunnel`), with one
+  (`hev-socks5-tunnel`) recorded honestly as a genuinely close call on
+  Android-maturity grounds and kept as the documented fallback if `sing-tun`
+  itself proves inadequate on a real device.
+
+**None of the fixes above changed the underlying technical facts that
+originally justified Option A** — `sing-tun`'s external-fd path still
+works (re-proven, more rigorously, in this pass), Hysteria2's SOCKS5
+listener is still real and unmodified, and no new blocker was discovered
+that prevents building the physical spike. What changed is that the design
+is now actually SOUND where it previously only looked sound — which is what
+this correction pass exists to verify.
+
 **A. ARCHITECTURE READY FOR B46-2P.**
 
-- Architecture is selected: Option A, `NOVA_SING_TUN_ADAPTER` (Section 7).
-- TUN fd ownership is solved: no cross-process transfer needed at all for
-  the TUN fd (Section 8) — a strictly simpler ownership story than B45A/B45B's
-  own already-proven design.
-- TCP and UDP forwarding model is credible: both flow models are specified
-  (Section 9) against real, existing Hysteria2/`sing-tun` capabilities, not
-  invented primitives.
-- The critical assumption is proven, not merely argued: this slice's own
-  synthetic proof (Section 10) demonstrates real TCP round-trip and real UDP
-  demux through an externally-owned fd using the exact dependency version
-  Hysteria2 ships.
+- Architecture is selected: Option A, `NOVA_SING_TUN_ADAPTER` (Section 7),
+  re-affirmed after a real Option C audit (Section 6).
+- TUN fd ownership is solved DETERMINISTICALLY, not merely asserted: split
+  via `dup()`+`detachFd()`, no double-close possible by construction
+  (Section 8), verified on Linux via the direct `unix.Dup()` equivalent.
+- The process boundary is PINNED, not left open: in-process JNI for the
+  bridge, matching Nova's own existing Xray precedent; Hysteria2 stays a
+  separate child process (Section 13).
+- TCP and UDP forwarding models are credible AND now both proven with a
+  real round trip, deterministically observed (Sections 9-10) — UDP is no
+  longer demux-only.
+- Bridge and Hysteria2-runtime ownership are correctly separated in the
+  debug state machine, with a direct regression test proving a bridge
+  failure never falsely clears a still-owned runtime pid (Section 14).
 - No unresolved blocker prevents building the physical Android spike: the
   remaining unknowns (Section 23) are ordinary engineering/testing work for
-  B46-2P, not open research questions.
+  B46-2P (SOCKS5 UDP-ASSOCIATE framing against a real Hysteria2 process,
+  the real Android `dup()`/`detachFd()`/JNI mechanics, MTU/PMTU, and
+  performance measurement) — none are open research questions about
+  whether the architecture can work at all.
 
 ## Sources cited (external)
 
@@ -809,26 +1155,43 @@ than design from scratch on-device.
 - [apernet/sing-tun repository](https://github.com/apernet/sing-tun),
   pseudo-version `v0.2.6-0.20250920121535-299f04629986` — resolved and
   downloaded fresh via the Go module proxy in this slice;
-  `tun.go`/`tun_linux.go`/`stack.go`/`stack_system.go` read directly from
-  the populated module cache.
+  `tun.go`/`tun_linux.go`/`stack.go`/`stack_system.go`/`stack_system_nat.go`
+  read directly from the populated module cache (the last one specifically
+  in this correction pass, to trace the data race Section 10/21 report).
+- [xjasonlyu/tun2socks repository](https://github.com/xjasonlyu/tun2socks) —
+  cloned fresh in this correction pass (Option C candidate 1, Section 6);
+  `LICENSE`/`go.mod`/`core/device/fdbased/open_unix.go` read directly.
+- [heiher/hev-socks5-tunnel repository](https://github.com/heiher/hev-socks5-tunnel) —
+  cloned fresh in this correction pass (Option C candidate 2, Section 6);
+  `LICENSE`/`README.md` read directly.
 - Internal: `docs/B46_2A_HYSTERIA2_ANDROID_FEASIBILITY.md` (baseline
   findings this document extends, not re-derives from scratch),
   `docs/B45A_SHADOWSOCKS_RUST_SPIKE.md` /
   `docs/B45B3P_SHADOWSOCKS_PHYSICAL_VALIDATION.md` (fd-handoff/cleanup
   precedent), `PROJECT_ARCHITECTURE.md` (reachability/transport-selection
-  boundaries, B33's app-process-exclusion finding).
+  boundaries, B33's app-process-exclusion finding),
+  `android/app/src/main/java/net/pocvpn/client/vpn/xray/XrayCoreRuntime.kt`
+  and `android/app/src/main/java/net/pocvpn/client/vpn/shadowsocks/ShadowsocksProcessLauncher.kt`
+  (read directly in this correction pass to confirm Nova's own real
+  in-process-JNI vs. child-process precedent, Section 13).
 
 ## Files changed in this slice
 
-- `docs/B46_2B_HYSTERIA_TUN_BRIDGE_ARCHITECTURE.md` (this document, new).
-- `research/b46-2b-hysteria-tun-bridge/singtun-proof/{main.go,go.mod,go.sum}`
+- `docs/B46_2B_HYSTERIA_TUN_BRIDGE_ARCHITECTURE.md` (this document; created,
+  then corrected in a same-day follow-up pass per direct PR review).
+- `research/b46-2b-hysteria-tun-bridge/singtun-proof/{main.go,go.mod,go.sum,.gitignore}`
   (new, isolated host-side synthetic proof — not part of the Android app,
-  not built by Gradle, not reachable from any production path).
+  not built by Gradle, not reachable from any production path; rewritten in
+  the correction pass for the fd-ownership split, the full deterministic
+  UDP round trip, and race-free synchronization).
 - `android/app/src/debug/java/net/pocvpn/client/debug/b46hysteria/B46HysteriaSpikeState.kt`
-  (adds `TUN_BRIDGE_READY` phase, `tunBridgeReady`/`bridgeExitedUnexpectedly`
-  transitions, and the expanded typed error taxonomy — still debug-only,
-  still unreachable from any manifest entry point, per B46-2A's own
-  isolation guarantee).
+  (adds `TUN_BRIDGE_READY` phase, `tunBridgeReady`/`bridgeFailed`
+  transitions (renamed from `bridgeExitedUnexpectedly` and corrected to
+  preserve `runtimePid`), and the expanded typed error taxonomy — still
+  debug-only, still unreachable from any manifest entry point, per
+  B46-2A's own isolation guarantee).
 - `android/app/src/test/java/net/pocvpn/client/debug/b46hysteria/B46HysteriaSpikeStateTest.kt`
-  (updates existing tests for the new required phase, adds two new tests).
+  (updates existing tests for the new required phase; adds four new tests
+  covering the `TUN_BRIDGE_READY` gate and the corrected bridge/runtime
+  ownership separation).
 - `docs/ROADMAP.md` (B46 row status wording only — see below).

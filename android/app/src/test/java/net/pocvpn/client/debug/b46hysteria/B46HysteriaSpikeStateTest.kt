@@ -133,16 +133,47 @@ class B46HysteriaSpikeStateTest {
     }
 
     @Test
-    fun `bridgeExitedUnexpectedly clears to ERROR with typed BridgeExited cause and clears runtimePid`() {
+    fun `bridgeFailed clears to ERROR with typed BridgeFailed cause but does NOT clear runtimePid before Hysteria2 has started`() {
         var status = B46HysteriaSpikeTransitions.starting()
         status = B46HysteriaSpikeTransitions.tunEstablished(status)
         status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
 
-        status = B46HysteriaSpikeTransitions.bridgeExitedUnexpectedly(status, reason = "relay panic")
+        status = B46HysteriaSpikeTransitions.bridgeFailed(status, reason = "stack panic")
 
         assertEquals(B46HysteriaSpikePhase.ERROR, status.phase)
-        assertEquals(null, status.runtimePid)
-        assertTrue(status.lastError is B46HysteriaSpikeError.BridgeExited)
+        assertEquals(null, status.runtimePid) // never started in this path - nothing to preserve
+        assertTrue(status.lastError is B46HysteriaSpikeError.BridgeFailed)
+    }
+
+    @Test
+    fun `bridgeFailed does NOT falsely clear a still-owned Hysteria runtimePid - a bridge failure never proves the runtime process exited`() {
+        var status = B46HysteriaSpikeTransitions.starting()
+        status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
+        status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 4242)
+        assertEquals(4242, status.runtimePid)
+
+        status = B46HysteriaSpikeTransitions.bridgeFailed(status, reason = "stack panic while Hysteria2 was running")
+
+        assertEquals(B46HysteriaSpikePhase.ERROR, status.phase)
+        // The bridge and the Hysteria2 runtime are separate ownership domains (B46-2B review fix) -
+        // a bridge failure must never claim the still-running runtime process is no longer owned/tracked.
+        assertEquals(4242, status.runtimePid)
+        assertTrue(status.lastError is B46HysteriaSpikeError.BridgeFailed)
+    }
+
+    @Test
+    fun `runtimeExitedUnexpectedly is the ONLY transition that clears runtimePid - proven by contrast with bridgeFailed`() {
+        var status = B46HysteriaSpikeTransitions.starting()
+        status = B46HysteriaSpikeTransitions.tunEstablished(status)
+        status = B46HysteriaSpikeTransitions.tunBridgeReady(status)
+        status = B46HysteriaSpikeTransitions.runtimeStarted(status, pid = 555)
+
+        val afterBridgeFailure = B46HysteriaSpikeTransitions.bridgeFailed(status, reason = "worker crash")
+        assertEquals(555, afterBridgeFailure.runtimePid) // preserved
+
+        val afterRuntimeExit = B46HysteriaSpikeTransitions.runtimeExitedUnexpectedly(status, exitCode = 9)
+        assertEquals(null, afterRuntimeExit.runtimePid) // cleared - evidence the process itself exited
     }
 
     @Test
