@@ -2942,4 +2942,3 @@ in scope for this spike's exit criteria).
 
 Per this round's own instruction: **no B45B implementation follows this
 finding automatically.** This document stops here for review.
-
