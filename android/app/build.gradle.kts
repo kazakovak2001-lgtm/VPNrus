@@ -175,6 +175,19 @@ androidComponents {
     onVariants(selector().withName("debug")) { variant ->
         variant.packaging.jniLibs.useLegacyPackaging.set(true)
     }
+
+    // B45B Option A - APPROVED production packaging (see docs/ROADMAP.md's
+    // B45 row for the full physical-evidence trail). Narrowest possible
+    // variant-level change: release-only, same Variant API shape as the
+    // pre-existing debug-only block above, so debug's own behavior is
+    // completely unaffected. This DOES change how release packages every
+    // native library (Xray/AWG included, not just libsslocal.so) - a known,
+    // measured, and accepted cost (release APK/installed footprint both
+    // shrank in practice for this app's actual native-lib set - see
+    // ROADMAP), not an oversight.
+    onVariants(selector().withName("release")) { variant ->
+        variant.packaging.jniLibs.useLegacyPackaging.set(true)
+    }
 }
 
 // Pinned AmneziaWG :tunnel AAR, built reproducibly via third_party/build-tunnel-wsl.sh
