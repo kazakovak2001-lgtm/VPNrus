@@ -84,3 +84,12 @@ android/app/src/debug/jniLibs/arm64-v8a/libsslocal.so
 # endpoint/credential (server, port, method, base64 key). Debug-buildType-
 # only via android/app/build.gradle.kts, never committed, never printed.
 android/app/b45a-dataplane.properties
+
+# B45B Option A - APPROVED production packaging (see docs/ROADMAP.md's B45
+# row). Same pinned sslocal binary as libsslocal.so above, placed under
+# src/main/jniLibs so a real release build ships it. Never committed - same
+# "large binary artifact, reproducible from a pinned source" reason as
+# every other pinned binary above; a real release build/CI run must place
+# it here locally before assembling release (see that ROADMAP row for the
+# pinned upstream source/commit/hash).
+android/app/src/main/jniLibs/arm64-v8a/libsslocal.so

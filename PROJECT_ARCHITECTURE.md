@@ -2393,6 +2393,24 @@ DNS/IPv6 invariants held, managed identity/state completely unaffected - see
 - Normal product UI (picker/LocationCard/Home) shows geography only - no provider/ASN
   names. Provider metadata is diagnostics/debug-only.
 
+## Release native library packaging (B45B, 2026-09-18)
+
+`android/app/build.gradle.kts`'s `androidComponents.onVariants` sets
+`packaging.jniLibs.useLegacyPackaging = true` for BOTH the `debug` and `release`
+variants (two separate blocks, same Variant API shape) - release native libraries
+(Xray's `libgojni.so`, AWG's `libwg*.so`, and any future pinned executable such as
+`libsslocal.so`) are extracted to `nativeLibraryDir` at install time, never
+mmap'd directly from the APK. This is module-wide by construction - AGP exposes no
+per-file granularity for this setting, confirmed by direct investigation, not
+assumed. Physically proven end to end on real hardware for both AMNEZIA_WG and
+XRAY_REALITY (real connect/data-plane/disconnect, no crash) - see `docs/ROADMAP.md`'s
+B45 row for the full evidence trail. A pinned production binary placed under
+`android/app/src/main/jniLibs/<abi>/` must be gitignored, never committed (see
+`.gitignore`'s own B45B entries) and its provenance hash recorded against BOTH the
+pre-build pinned value and the post-`stripReleaseDebugSymbols` shipped value (AGP
+strips this specific binary's ELF section headers during release packaging) - see
+ROADMAP for the current pinned `sslocal` example.
+
 ## Infrastructure safety
 
 Never allocate/purchase paid cloud resources (including Elastic IPs) or make
