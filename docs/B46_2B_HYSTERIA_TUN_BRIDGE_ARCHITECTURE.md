@@ -60,6 +60,32 @@ the same claim as "cleared to ship," and this pass is not positioned to
 make that licensing call. No repository license was added or changed by
 this pass — that is an owner decision.
 
+**FOURTH CORRECTION PASS (same day) — completing the prior pass's own
+recommended next step, and finding a reason NOT to select it:** a real
+host-side data-plane proof for `heiher/hev-socks5-tunnel` (Section 10.9's
+MIT-licensed candidate) was attempted, using a real third-party SOCKS5
+server (`danted`) and real TCP/UDP echo targets, with a C harness calling
+HEV's own public `hev_socks5_tunnel_main`/`hev_socks5_tunnel_quit` API.
+Two independent, reproducible crashes were found and confirmed via `gdb`
+backtraces into HEV's own library code: an invalid external TUN fd
+crashes the process (`double free or corruption`, inside HEV's own
+task-system cleanup), and a SOCKS5-client outbound-socket failure crashes
+it a second way (`munmap_chunk(): invalid pointer`, inside HEV's own
+coroutine-stack cleanup) — the latter triggered in this sandbox by a
+kernel with no IPv6 support at all interacting with HEV's own hardcoded
+`AF_INET6` socket usage, but landing in the same class of unhandled-
+early-failure defect as the first, Android-realistic one. Per the task's
+own instruction not to force HEV selection merely for being MIT-licensed,
+**`hev-socks5-tunnel` is NOT selected** — see the new dedicated Section
+10.10. `sing-tun` remains the sole candidate with a complete, crash-free,
+race-checked proof; the verdict remains **TECHNICALLY READY — LICENSING
+DECISION REQUIRED**, now for a more decisive reason (no crash-free
+MIT alternative currently exists) rather than merely "not yet proven."
+HEV's real Android AAR/JNI build success (Section 10.10) and its clean
+MIT license tree (Section 10.9) remain accurate, unaffected facts — only
+its runtime crash-safety on early-failure paths is now known to be
+deficient. No repository license was added or changed by this pass.
+
 **Status of this document: ARCHITECTURE ONLY, with a real host-side synthetic
 proof. No physical Android device was available in this environment. No
 production code, `TransportKind`, or wiring into `TransportRegistry`/
@@ -153,17 +179,34 @@ repository carries no `LICENSE` file establishing a compatible
 distribution policy, and no such policy decision has been made — an
 engineering pass cannot make that decision.
 
+**A fifth correction pass then attempted to complete that recommended next
+step — `hev-socks5-tunnel`'s own live round-trip proof — and found two
+independent, reproducible crash defects in HEV's own error-handling paths
+instead** (Section 10.10): an invalid external TUN fd crashes the calling
+process (`double free or corruption`, confirmed via `gdb`, inside HEV's own
+task-system cleanup), and a SOCKS5-client outbound-socket failure crashes
+it a second, distinct way (`munmap_chunk(): invalid pointer`, also
+confirmed via `gdb`, also inside HEV's own coroutine-stack cleanup). Both
+reproduced in a plain, non-instrumented build, ruling out sanitizer false
+positives. Per this task's own explicit instruction ("do not force HEV
+selection merely because it is MIT"), **`heiher/hev-socks5-tunnel` is NOT
+selected** — an in-process bridge that crashes the host process on a
+plausible, Android-realistic failure input (an invalid fd) is a genuine
+safety concern, not merely an incomplete proof. `sing-tun` remains the
+only candidate with a complete, crash-free, race-checked round-trip proof.
+
 **Verdict: TECHNICALLY READY — LICENSING DECISION REQUIRED** (see Section
 "Decision gate" — re-decided from scratch in each of this document's
 correction passes following direct reviews of PR #89, never preserved by
 default). The `sing-tun`-based bridge is technically sound (deterministic
 fd ownership, real TCP+UDP round trip, race-clean, a real in-process
 JNI/AAR artifact built and verified) but gated on an explicit owner
-licensing decision before any release-track physical integration. A
-credible, deeply-audited, all-MIT alternative (`heiher/hev-socks5-tunnel`)
-exists and could independently reach a clean "ready" verdict without that
-decision — its own live round-trip proof is the recommended next step. See
-"Known unknowns" for what is still open and explicitly deferred.
+licensing decision before any release-track physical integration.
+`hev-socks5-tunnel` remains a credible MIT-licensed alternative on every
+axis EXCEPT the two crash defects just found — a future pass could revisit
+it once those are understood/fixed upstream, but this pass does not
+recommend it as ready. See "Known unknowns" for what is still open and
+explicitly deferred.
 
 ## 2. Repository baseline / re-audit scope
 
@@ -390,11 +433,13 @@ still does not reuse anything already in Hysteria2's own dependency tree
 the way Option A does. Option A remains preferred because it needs ZERO new
 runtime dependency beyond what Hysteria2 already ships and links for
 Android (Section 3) — not because Option C's candidates are deficient.
-**`hev-socks5-tunnel` is recorded here as the strongest fallback candidate**
-if a future physical spike finds `sing-tun`'s own Android TCP/UDP behavior
-unacceptable, given its real Orbot production precedent — stronger than
-Option B's fork-maintenance fallback for a scenario where the problem is
-`sing-tun` itself rather than the extra SOCKS5 hop.
+**`hev-socks5-tunnel` was recorded here as the strongest fallback
+candidate** given its real Orbot production precedent — **a later pass
+(Section 10.10) completed its live proof and found two reproducible crash
+defects in its own error-handling code, so it is NOT currently selected**;
+this structural comparison (smaller, C-native, more Android-battle-tested
+than `tun2socks`) remains accurate as a structural assessment, just not as
+a current recommendation.
 
 ## 7. Phase 4 — chosen architecture
 
@@ -1188,21 +1233,165 @@ source/build, not from README claims alone.
 | Thread/concurrency model | Cooperative task-based (`hev-task-system`, the same author's own coroutine library, MIT, audited above) — not raw OS-thread-per-connection; not independently race-tested in this pass (no `-race`-equivalent tool exists for C the way `go build -race` does for Go; a real audit would need a C sanitizer build, e.g. ThreadSanitizer, not attempted here — a known unknown, see below). |
 | Also built and confirmed on this host, for context | The plain Linux daemon build (`make`, no NDK) also succeeded cleanly, producing a real `hev-socks5-tunnel` executable — useful for a future host-side round-trip proof (see "known unknowns"), though the CLI binary's own `main()` hardcodes `tun_fd=-1` (always opens its own device by name) — reaching the external-fd path on a host requires calling the library's C API directly (`hev_socks5_tunnel_main(config, fd)`), not the CLI binary as shipped. |
 
-**Known unknown, stated honestly**: a full host-side synthetic proof
-equivalent to Section 10's `sing-tun` proof (real TCP round trip, real UDP
-round trip, deterministic metadata check, through a real duplicated
-external fd, against a real local SOCKS5 target) was **NOT completed in
-this pass** — it would require either a small custom C harness calling
-`hev_socks5_tunnel_main` directly (the CLI binary doesn't expose the
-external-fd argument) or driving the JNI entry point from a JVM, and was
-judged, at this point in an already-extensive audit, better scoped to a
-following pass than rushed. The SOURCE-LEVEL evidence above (external-fd
+**Superseded by Section 10.10 below**: a following pass DID complete a real
+host-side proof attempt with a custom C harness calling
+`hev_socks5_tunnel_main` directly — and found two confirmed, reproducible
+crash defects in HEV's own error-handling paths, which is why HEV is NOT
+selected. The source-level evidence in the table above (external-fd
 semantics, non-owning close behavior, real native build success, clean MIT
-tree) is real and directly verified, but it is evidence of a different,
-narrower kind than Section 10's fully-executed, race-checked round trip —
-this document does not claim otherwise.
+tree) remains accurate and stands; it does not extend to "safe to run,"
+which the next section addresses directly with real, negative evidence.
 
-## 10.10. Option L3 — `xjasonlyu/tun2socks` (secondary permissive fallback, re-confirmed only)
+## 10.10. HEV final bridge proof (fifth correction pass) — two confirmed crash defects found; HEV NOT selected
+
+**A real host-side data-plane proof, structurally equivalent to Section
+10's `sing-tun` proof, was attempted**: a genuine external TUN fd (opened
+and configured exactly as in Section 10, then `dup()`'d per this design's
+ownership model), a REAL third-party SOCKS5 server (`danted` 1.4.3, a
+mature, independently-developed SOCKS4/5 daemon — not a hand-rolled stand-in
+— installed via the distribution's own package manager) standing in for
+Hysteria2's own SOCKS5 listener, and real TCP/UDP echo targets reachable
+only through it. **Before wiring up HEV, the SOCKS5 leg itself was verified
+independently and directly** (a raw Python SOCKS5 client): a real SOCKS5
+CONNECT round trip and a real SOCKS5 UDP-ASSOCIATE round trip both worked
+byte-exact against the echo targets — proving the test harness's SOCKS5
+server leg is genuine and correctly configured before any HEV code is
+involved.
+
+**A C test harness was written** (`hev_proof.c`, throwaway scratch, not
+committed) implementing the required cycle shape: `start -> TCP+UDP proof
+-> stop -> start again -> TCP+UDP proof -> stop`, plus dedicated failure-
+path cycles (invalid fd, SOCKS5 listener absent), calling
+`hev_socks5_tunnel_main(config_path, dup_fd)` in a `pthread` and
+`hev_socks5_tunnel_quit()` to stop it — the exact public API shape the
+task asked to prove (`start(fd, ...)`/`stop()`).
+
+**Two independent, reproducible crashes were found, confirmed via `gdb`
+backtraces into HEV's own library code (never into this harness's own
+code):**
+
+1. **Invalid external TUN fd crashes the calling process.** Per Section
+   10.9's own fd-ownership table, `tunnel_init(extern_tun_fd)` is documented
+   (by this pass's own prior reading) to fail cleanly (`return -1`) when
+   `ioctl(fd, FIONBIO, ...)` fails on a bad fd. **Verified this is NOT what
+   actually happens**: calling `hev_socks5_tunnel_main(config, 9999)` (an
+   unopened, invalid fd) produces `double free or corruption (out)` and a
+   `SIGABRT`, confirmed via `gdb bt`:
+   ```
+   #6  malloc_printerr (str="double free or corruption (out)")
+   #7  _int_free_merge_chunk
+   #9  __libc_free
+   #10 hev_task_system_fini ()  <-- from libhev-task-system.so
+   #11 hev_socks5_tunnel_main_inner ()  <-- from libhev-socks5-tunnel.so
+   ```
+   Root cause, at the level this pass could confirm without a full upstream
+   bug-hunt: `hev_task_system_fini()` is called on a task system that was
+   `hev_task_system_init()`'d but never `hev_task_system_run()`'d (because
+   `hev_socks5_tunnel_init()` failed before reaching `hev_task_system_run`)
+   — a state HEV's own cleanup path does not handle safely. **This directly
+   fails the task's own explicit requirement for the invalid-fd failure
+   path: "No crash of the host proof process."**
+2. **A real SOCKS5-client outbound-socket failure also crashes the
+   process**, via a genuinely different code path: this host sandbox's
+   kernel has NO IPv6 support at all (confirmed: no `/proc/net/if_inet6`,
+   `socket(AF_INET6, ...)` itself fails with `EAFNOSUPPORT` at the kernel
+   level, no `modprobe` even available to load an ipv6 module). HEV's own
+   `hev_socks5_socket()` (`core/src/hev-socks5-misc.c`) unconditionally
+   creates an `AF_INET6` socket (with `IPV6_V6ONLY=0`, a standard
+   dual-stack pattern) for EVERY outbound SOCKS5 connection, including pure
+   IPv4 targets — there is no config option to force IPv4-only sockets.
+   When that `socket()` call fails, `hev_socks5_client_connect` logs
+   `"socks5 client socket"` and returns -1 — but the resulting cleanup
+   crashes with `munmap_chunk(): invalid pointer`, confirmed via `gdb bt`
+   pointing into `hev_task_executer()` (HEV's own coroutine-stack cleanup)
+   in `libhev-task-system.so`, freeing what appears to be task stack
+   memory incorrectly. This reproduced identically in BOTH a plain build
+   and an ASan/UBSan-instrumented build (ASan itself additionally warned
+   `"ignoring requested __asan_handle_no_return"` — a known, documented
+   ASan limitation for hand-written coroutine stack-switching code that
+   never calls ASan's fiber-switch annotation API, meaning ASan cannot be
+   trusted for a clean verdict on this codebase without upstream adding
+   those annotations; but the PLAIN, non-instrumented build crashing
+   identically proves this is a REAL bug, not an ASan false positive).
+
+**Assessment, stated precisely**: defect (2)'s trigger (a kernel with zero
+IPv6 support) is very unlikely to occur on real Android hardware — Android
+devices are effectively guaranteed to support `AF_INET6` socket creation
+regardless of actual network IPv6 reachability. But the SAME crash class
+this trigger exposes (an unhandled early-failure path inside HEV's task-
+system/coroutine cleanup) is exactly what defect (1) ALSO exposes, via a
+completely different, Android-realistic trigger (an invalid fd — plausible
+from an ownership bug, a race, or a caller error) with no dependency on the
+IPv6 quirk at all. Two independent triggers landing in the same class of
+unhandled-early-failure crash is a meaningfully stronger signal than either
+alone: **this reads as a real, load-bearing gap in HEV's error-handling
+robustness around early startup failure, not an artifact of this one
+sandbox.** An in-process JNI bridge that crashes the whole host process
+(Nova's own `VpnService`, since Section 10.7 already proved this pattern
+of dependency links in-process) on a plausible, Android-realistic failure
+input is a genuine, serious concern — more serious than "the round-trip
+proof wasn't completed," because it is now KNOWN to fail unsafely rather
+than merely unverified.
+
+**Per the task's own decision framework** ("If HEV fails TCP/UDP/lifecycle
+requirements: keep sing-tun as technically-proven candidate... Do not force
+HEV selection merely because it is MIT"): **HEV is NOT selected.** The
+full `start -> proof -> stop -> restart -> proof -> stop` cycle and the
+live TCP/UDP round-trip proof could not be safely completed, because the
+harness's own required failure-path test (invalid fd) already crashes the
+host process before any of the success-path cycles can be trusted to run
+without risking the same class of corruption. This is recorded as a
+concrete, evidence-based "fails," not a time-boxed "not yet proven."
+
+**What remains true and unaffected by this finding**: `heiher/hev-socks5-tunnel`'s
+license (MIT, clean tree), its documented fd-ownership semantics (as
+literally read from source in Section 10.9), and its real Android AAR/JNI
+build success (this section's own build below) are all still accurate,
+independently-verified facts — this finding is specifically about runtime
+crash-safety on early-failure paths, not about licensing or static build
+feasibility. A future re-audit, after upstream fixes are confirmed (or
+after re-testing on a normal IPv6-capable host to isolate whether defect
+(1) alone — the more Android-realistic one — is fixed), could revisit this
+verdict; this pass does not foreclose that.
+
+**Android AAR/JNI artifact — built successfully, using upstream's own
+official CI recipe, not an ad hoc guess**: `.github/workflows/build.yaml`'s
+own `android` job (read directly) does exactly:
+`ndk-build APP_MODULES=hev-socks5-tunnel` (the module containing
+`hev-jni.c`, distinct from the `hev-socks5-tunnel-bin` CLI module) then
+packages `libhev-socks5-tunnel.so` + a `javac`-compiled `classes.jar` (from
+the project's own shipped `TProxyService.java`) + a manifest + proguard
+rules into a zip. This exact recipe was reproduced in this pass (NDK
+`26.1.10909125`, `APP_PLATFORM=android-26` — adapted from upstream's own
+`android-29` to match Nova's actual `minSdk=26`, confirmed to build
+cleanly at the lower API level too):
+
+- `libhev-socks5-tunnel.so`: `ELF 64-bit LSB shared object, ARM aarch64`,
+  stripped, exports `JNI_OnLoad` (`nm -D`), **SHA-256:
+  `986f0e5e372a107efe5cea04b931b742de0e42deaea16839822df62b95cf83c6`**.
+  `readelf -d` shows exactly three `NEEDED` entries: `libc.so`, `libm.so`,
+  `libdl.so` — all Android system libraries, always present, no bundled
+  dependency required. Fully self-contained.
+- `hev-socks5-tunnel.aar` assembled per the exact upstream recipe:
+  `classes.jar` (987 bytes, compiled from the unmodified
+  `android/hev/htproxy/TProxyService.java`), `proguard.txt`,
+  `AndroidManifest.xml` (`minSdkVersion=26`), `jni/arm64-v8a/libhev-socks5-tunnel.so`
+  — **SHA-256 of the assembled AAR:
+  `17ca3cbb4c2e58d34d95943153a5f34b8e4cdb4778cf430799103f6a10da7aaf`**
+  (this pass's own build; will not match upstream's official release
+  artifact byte-for-byte, since upstream targets `minSdkVersion=29` and a
+  newer NDK r27d — the SAME kind of non-byte-identical-but-structurally-
+  equivalent result B46-2A already documented for the Hysteria2 binary
+  itself).
+- Neither artifact is committed to this repository (matching every prior
+  pass's own binary-provenance discipline) — hashes/metadata recorded here,
+  binaries discarded after inspection.
+
+This confirms the JNI/native-library BUILD path for HEV is real and
+credible — the crash findings above are about RUNTIME behavior on specific
+inputs, not about whether the artifact can be produced.
+
+## 10.11. Option L3 — `xjasonlyu/tun2socks` (secondary permissive fallback, re-confirmed only)
 
 Per the task's own instruction ("do not implement a full proof unless L2
 fails or evidence makes L3 clearly preferable"), L2's audit above did not
@@ -1574,11 +1763,17 @@ linkname workaround.
   code (either `sing-tun` fork) in-process is an owner decision, not
   resolved by this pass and not something further engineering evidence
   alone can resolve.
-- **`hev-socks5-tunnel`'s live TCP/UDP round-trip proof was not
-  completed** (Section 10.9) — real source-level and build-level evidence
-  exists, but the same rigor Section 10 applied to `sing-tun` (real
-  duplicated fd, real round trip, deterministic metadata check) has not
-  yet been applied to this MIT-licensed alternative.
+- **`hev-socks5-tunnel`'s two confirmed crash defects (Section 10.10) have
+  not been root-caused to the exact upstream source line, nor reported
+  upstream** — this pass confirmed WHERE they crash (via `gdb` backtraces
+  into HEV's own `hev_task_system_fini`/`hev_task_executer`) but not
+  WHY at the level of a fixable upstream patch; a future pass or an
+  upstream issue report would need that depth.
+- **Whether defect (1) (invalid external fd) is reproducible outside this
+  session's specific sandbox is unverified** — it did not depend on the
+  IPv6 quirk that triggered defect (2), so it is plausibly a general HEV
+  defect, but this was not independently re-confirmed on a second,
+  differently-configured host or a physical Android device.
 - **Full SOCKS5 UDP ASSOCIATE framing (the hop between the `sing-tun`
   bridge and Hysteria2's own SOCKS5 listener) was not implemented or
   tested** in this slice's proof — the proof's UDP round trip goes through
@@ -1600,10 +1795,16 @@ linkname workaround.
   and to a real Handler implementation remains to be built; production
   packaging correctness (ProGuard/R8, `useLegacyPackaging` for this
   specific `.so`, physical-device loading) is untested.
-- **`hev-socks5-tunnel`'s C code has not been sanitizer/race-tested** — no
-  ThreadSanitizer-equivalent build was attempted in this pass (Section
-  10.9); its cooperative-task concurrency model was read, not adversarially
-  tested.
+- **`hev-socks5-tunnel`'s C code WAS built with ASan/UBSan (Section
+  10.10), but the result is not fully trustworthy** — HEV's own coroutine
+  stack-switching code (`hev-task-execute`) has no ASan fiber-switch
+  annotations, so ASan itself warned it was "ignoring requested
+  `__asan_handle_no_return`" and produced at least one likely-false-positive
+  "bad-free" report distinct from the two REAL crashes (which reproduced
+  identically in a plain, non-instrumented build). No ThreadSanitizer or
+  Valgrind run was attempted — Valgrind was judged, given the two crashes
+  already found by simpler means, not the best use of further time in this
+  pass; a future pass revisiting HEV would benefit from it.
 - **Nothing about Android's `VpnService`/SELinux/app-process-exclusion
   behavior was tested** — this slice's proof is entirely a plain-Linux-host
   program; B33's own findings (an app process is excluded from its own VPN
@@ -1651,18 +1852,20 @@ linkname workaround.
 
 ## 25. Explicit next-slice recommendation
 
-**Corrected in this pass — B46-2P should NOT start on the `sing-tun` path
-as a release architecture until the owner licensing decision (Section
-10.6) is made.** Two credible next steps, not mutually exclusive:
+**Corrected again in this pass — the previously-recommended `hev-socks5-tunnel`
+round-trip proof was completed, and found disqualifying (Section 10.10).**
+Two credible next steps remain, not mutually exclusive:
 
-1. **Recommended first**: a bounded follow-up to THIS slice (B46-2B, not
-   B46-2P) completing `heiher/hev-socks5-tunnel`'s (Section 10.9) live
-   synthetic proof — the same TCP/UDP round-trip rigor Section 10 already
-   applied to `sing-tun` — via a small custom C harness calling
-   `hev_socks5_tunnel_main(config, fd)` directly. If that proof succeeds
-   with the same rigor, it can independently justify verdict A
-   (`ARCHITECTURE READY FOR B46-2P`) on a wholly MIT-licensed path with NO
-   Nova licensing-policy decision required at all.
+1. **A bounded follow-up investigating HEV's two confirmed crash defects**
+   (Section 10.10): reproduce defect (1) (invalid external fd) on a normal
+   IPv6-capable host or a physical Android device, to isolate it from
+   defect (2)'s IPv6-specific trigger; check whether either is already
+   fixed on HEV's current `main` branch by the time of that follow-up;
+   and/or file the findings upstream. If defect (1) — the genuinely
+   Android-realistic one — is confirmed fixed or was itself an artifact of
+   this session's own harness (not yet ruled out with full confidence,
+   though the `gdb` evidence points into HEV's own library code), HEV could
+   be reconsidered as the MIT path with no Nova licensing decision needed.
 2. **Only if the owner explicitly resolves the licensing question in favor
    of the GPL-3.0-or-later `sing-tun` path**: B46-2P proceeds as originally
    scoped (step 1 of Section 24 - TUN + bridge alone, no Hysteria2 yet),
@@ -1742,19 +1945,21 @@ changes the verdict below — a technical success is not the same claim as
 "safe to ship," and this pass does not conflate the two.
 
 **A separate MIT-licensed, purpose-built TUN→SOCKS5 alternative
-(`heiher/hev-socks5-tunnel`, Section 10.9) was found and deeply audited in
-this pass** — real external-fd support with even simpler,
-already-correct, non-owning close semantics than `sing-tun` requires; a
-real native `.so` built successfully via the same NDK for `arm64-v8a`/API
-26; a clean, verified all-MIT/BSD dependency tree. Its own live TCP/UDP
-round-trip proof was not completed in this already-extensive pass (a
-genuine, stated known unknown, not a disqualifying failure) — so it cannot
-yet be declared the SELECTED architecture with the same certainty
-`sing-tun`'s fully-executed, race-checked proof carries, but it is a real,
-credible, and per this pass's own evidence probably SIMPLER path (it
-already speaks SOCKS5 natively — Nova would not need to write the
-TCP/UDP-forwarding bridge logic Option A's `sing-tun` design otherwise
-requires) that sidesteps the licensing question entirely.
+(`heiher/hev-socks5-tunnel`, Section 10.9) was found and deeply audited —
+and then a following pass completed the live proof this section originally
+deferred, finding it disqualifying.** Real external-fd support with even
+simpler, already-correct, non-owning close semantics than `sing-tun`
+requires; a real native `.so` built successfully via the same NDK for
+`arm64-v8a`/API 26; a clean, verified all-MIT/BSD dependency tree — all
+still true. But the live TCP/UDP round-trip proof (Section 10.10) found
+**two independent, reproducible crashes in HEV's own error-handling code**
+(an invalid external fd, and a SOCKS5-client outbound-socket failure, both
+confirmed via `gdb` backtraces into HEV's own library, not this session's
+harness): a plausible, Android-realistic invalid-fd input crashes the
+entire host process. Per this task's own explicit instruction not to force
+HEV selection merely for being MIT, **`hev-socks5-tunnel` is NOT selected**
+— it sidesteps the licensing question but does not yet meet the bar of "no
+critical memory/lifecycle blocker."
 
 **Separately, Hysteria2's own child-process binary (Section 10.8) was
 verified, with objective `go tool nm` evidence, to contain 125 linked
@@ -1786,19 +1991,21 @@ pass is correctly not the one to close it:
 - Hysteria2's own child-process binary carries a parallel, separate GPL
   question (Section 10.8) needing the same kind of review, independent of
   whatever is decided about the Nova bridge.
-- A credible permissively-licensed alternative exists (`hev-socks5-tunnel`,
-  Section 10.9) that would let a future slice reach verdict A without
-  requiring any Nova licensing-policy decision at all — but its own
-  live round-trip proof is not yet complete, so this pass does not
-  prematurely declare it selected either.
+- A credible permissively-licensed alternative (`hev-socks5-tunnel`,
+  Sections 10.9/10.10) was deeply investigated specifically to let a
+  future slice reach verdict A without any Nova licensing-policy decision
+  — but its live proof found two real, reproducible crash defects in its
+  own error-handling paths (Section 10.10), so it is NOT selected this
+  pass, not merely deferred.
 
 **Do not proceed to B46-2P as a release-track physical integration on the
 GPL-3.0-or-later `sing-tun` path until the repository owner has made an
-explicit, informed licensing decision.** A future slice completing L2's
-round-trip proof (Section 10.9's known unknown) could independently reach
-verdict A on a wholly MIT-licensed path without waiting on that decision at
-all — that is the recommended next step (see "Explicit next-slice
-recommendation" below, updated accordingly).
+explicit, informed licensing decision.** No crash-free, fully-proven
+MIT-licensed alternative currently exists — `hev-socks5-tunnel` remains
+the closest candidate but needs its two confirmed crash defects understood
+and fixed (upstream, or independently re-verified as unreachable in a
+normal environment) before it can be reconsidered. Until then, `sing-tun`
+is the only technically-complete candidate, and it is licensing-gated.
 
 ## Sources cited (external)
 
@@ -1842,6 +2049,18 @@ recommendation" below, updated accordingly).
   (Section 10.7); Android SDK components (`platform-tools`,
   `platforms;android-34`, `build-tools;34.0.0`) and NDK `26.1.10909125`
   installed via Google's own `sdkmanager` specifically for this check.
+- `heiher/hev-socks5-tunnel`'s own `.github/workflows/build.yaml` — read
+  directly in the fourth correction pass to reproduce its official Android
+  AAR build recipe exactly (Section 10.10).
+- `dante-server` (`danted`) 1.4.3 — the real, independently-developed
+  third-party SOCKS4/5 daemon installed (via the host distribution's own
+  package manager) and used as the controlled SOCKS5 server in the HEV
+  proof attempt (Section 10.10); its own SOCKS5 CONNECT/UDP-ASSOCIATE
+  behavior was independently verified with a raw Python client before any
+  HEV code was involved.
+- `gdb`/`strace` — used directly in this pass to obtain real backtraces and
+  syscall traces confirming both HEV crash defects originate inside HEV's
+  own library code, not in this session's test harness (Section 10.10).
 - Internal: `docs/B46_2A_HYSTERIA2_ANDROID_FEASIBILITY.md` (baseline
   findings this document extends, not re-derives from scratch),
   `docs/B45A_SHADOWSOCKS_RUST_SPIKE.md` /
@@ -1856,10 +2075,12 @@ recommendation" below, updated accordingly).
 ## Files changed in this slice
 
 - `docs/B46_2B_HYSTERIA_TUN_BRIDGE_ARCHITECTURE.md` (this document; created,
-  then corrected in three same-day follow-up passes per direct PR review —
+  then corrected in four same-day follow-up passes per direct PR review —
   the second re-pinning the bridge's `sing-tun` dependency for a race fix,
   the third correcting the sing-tun license claim and adding the licensing/
-  JNI-AAR/L2/Hysteria2-binary audit sections).
+  JNI-AAR/L2/Hysteria2-binary audit sections, the fourth completing and
+  reporting HEV's own live proof attempt and its two confirmed crash
+  defects, Section 10.10).
 - `research/b46-2b-hysteria-tun-bridge/singtun-proof/{main.go,go.mod,go.sum,.gitignore}`
   (new, isolated host-side synthetic proof — not part of the Android app,
   not built by Gradle, not reachable from any production path; rewritten
@@ -1867,10 +2088,10 @@ recommendation" below, updated accordingly).
   trip/race-free synchronization, and again to port from the superseded
   `apernet/sing-tun` to the race-clean `sagernet/sing-tun` commit, including
   the Handler-interface and buffer-headroom API migration this port
-  required). Unchanged in this third pass — the licensing/JNI-AAR/L2 work
-  was done in throwaway scratch locations outside the repository (per the
-  task's own "do not implement the full Android bridge yet" scope), not
-  committed.
+  required). Unchanged in this fourth pass — the licensing/JNI-AAR/L2/HEV
+  proof work was done in throwaway scratch locations outside the repository
+  (per the task's own "do not implement the full Android bridge yet"
+  scope), not committed.
 - `android/app/src/debug/java/net/pocvpn/client/debug/b46hysteria/B46HysteriaSpikeState.kt`
   (adds `TUN_BRIDGE_READY` phase, `tunBridgeReady`/`bridgeFailed`
   transitions (renamed from `bridgeExitedUnexpectedly` and corrected to
