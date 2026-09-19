@@ -2521,3 +2521,58 @@ needed (no pre-B27 relay history exists on any real device). Still
 FOUNDATION - no real ingress of either kind is deployed, Russia
 hard-whitelist bypass remains UNVERIFIED, and this slice does not claim
 CDN whitelist bypass works.)
+
+---
+Last updated: 2026-09-19 (B56-1 - added the activation authority as a new,
+independent boundary alongside the existing manifest/network authority: a
+new `net.pocvpn.client.activation` package holds `ActivationEnvelope`/
+`SignedActivationEnvelope` (activation entitlement metadata, signed by a
+future delegated activation-issuer key - never a host/IP/port/SNI/gateway/
+transport fact), `ActivationEnvelopeCanonicalizer` (deterministic canonical
+encoding, mirroring `ManifestCanonicalizer`'s discipline, prefixed with a
+fixed domain-separation tag `NOVA_ACTIVATION_ENVELOPE_V1` so its canonical
+bytes can never be confused with `EndpointManifest`'s), `ActivationEnvelopeCodec`/
+`ActivationEnvelopeTextCodec` (wire/text container, mirroring
+`SignedManifestCodec`), `ActivationIssuerTrustAnchors`/
+`FixedActivationIssuerTrustAnchors` (a trust-anchor type deliberately
+DISJOINT from `ManifestTrustAnchors`/`FixedManifestTrustAnchors` - activation-
+issuer keys and manifest signing keys are separate sets by construction, not
+convention), and `Ed25519ActivationEnvelopeVerifier` (same BouncyCastle
+Ed25519 primitives as `Ed25519ManifestVerifier`, own typed
+`ActivationEnvelopeFailureKind` set). Pure Kotlin/JVM, no Android framework
+dependency, no network/UI code added. This slice does NOT implement
+`SignedBootstrapBundle` or the `NovaActivationPackage` container (schemaVersion
+stays a container-level concern for a later slice) - see ROADMAP's B56 row
+and `RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md` for the full design and
+remaining slice breakdown.)
+
+---
+Last updated: 2026-09-19 (B56-1 correction, PR #92 review - the activation
+authority described above was corrected on three points without changing
+the boundary itself: (1) every ByteArray/list-bearing field on
+`ActivationEnvelope`/`ActivationBundleRef`/`SignedActivationEnvelope`/
+`FixedActivationIssuerTrustAnchors` is now defensively copied on the way in
+and exposed only through a copying accessor on the way out, since a Kotlin
+`val ByteArray` only fixes the reference, not the bytes - this closed a
+hole where mutating a caller's own source array/list, or an array obtained
+from an accessor, after construction/verification could change an
+already-built or already-verified object's effective signed data; (2) the
+Ed25519 verifier's clock policy was simplified to reuse
+`Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS` as its single
+tolerance for both the `issuedAt`-implausibly-future check
+(`CLOCK_UNCERTAIN`) and the `notBefore` lower bound, with `expiresAt`
+checked as `now >= expiresAt` (boundary-exclusive, no tolerance) to match
+`Ed25519ManifestVerifier`'s own expiry convention exactly - the previous
+arbitrary ~10-year "absurd clock" heuristic was removed as a second,
+undocumented clock-trust model; (3) `ActivationEnvelopeCanonicalizer`'s
+string decoding is now strict UTF-8 (REPORT, not REPLACE, on malformed
+input), and `issuerKeyId`/`bootstrapEndpointHints` now validate UTF-8 BYTE
+length (not Kotlin character count) so every constructible
+`ActivationEnvelope` is guaranteed to round-trip through encode/decode -
+`ActivationEnvelopeTextCodec` also gained a pre-Base64-decode text-length
+bound derived from `ActivationEnvelopeCodec.MAX_ENCODED_BYTES` and strict
+canonical-alphabet checking. No architectural boundary moved; see
+ROADMAP's B56 row for the corrected implementation status. Gradle
+integration (`./gradlew :app:compileDebugKotlin` / `:app:testDebugUnitTest`)
+was subsequently verified for real outside the review sandbox - 111/111
+relevant tests pass; see that row for detail.)
