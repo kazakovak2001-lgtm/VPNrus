@@ -2638,7 +2638,35 @@ FIRST activation/manifest-signing tool to avoid the older
 future signing-key tooling in this repo should follow this file's pattern,
 not that older one. `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md` is the
 durable ceremony/rotation/revocation runbook for this authority, mirroring
-`B12_MANIFEST_KEY_CEREMONY.md`'s role for the manifest key. NO production
-activation-issuer key exists yet and NO production public key is in
-Android's `ActivationIssuerTrustAnchors` - see that doc for the remaining
-B56-4B steps. No networking, no UI, no server/gateway changes.)
+`B12_MANIFEST_KEY_CEREMONY.md`'s role for the manifest key. No networking,
+no UI, no server/gateway changes.)
+
+---
+Last updated: 2026-09-20 (B56-4B1 - production activation-issuer key
+ceremony completed. A first candidate keypair
+(`prod-activation-issuer-2026-09-20`) was generated via
+`activation_envelope_issuer.py generate-key` on an operator-controlled
+WSL/Linux machine but WITHOUT positive evidence of network isolation for
+the generation process itself (ordinary networking, no namespace/interface
+isolation used) - it was abandoned before merge (never trusted, never used
+to issue anything; not a compromise claim). A second, FINAL keypair
+(`issuerKeyId=prod-activation-issuer-2026-09-20-r2`) was then generated
+inside an explicitly network-isolated Linux network namespace
+(`unshare --net`, verified loopback-only/no-route immediately before
+generation, in the same namespace/process); the private key exists only
+outside this repository in both cases. The FINAL production PUBLIC key is
+committed via `net.pocvpn.client.activation.ProductionActivationIssuerTrustAnchors`,
+which populates the EXISTING `FixedActivationIssuerTrustAnchors` - no
+second trust-anchor type or verifier was added, and the abandoned
+candidate's key id is absent from the committed map. Real production-key
+cross-verification (against the final key) passed against the EXISTING
+`ActivationEnvelopeCodec`/`Ed25519ActivationEnvelopeVerifier`
+(`ProductionActivationIssuerTrustAnchorsTest`). This object is a trust-root
+SOURCE only - nothing in this slice references it from bootstrap
+networking, UI, `MainViewModel`, `ActivationScreen`, or reachability code;
+that runtime composition is B56-5's responsibility. No redeemable
+production `ActivationEnvelope` has been issued and the production
+activation store was never touched - see
+`docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md` for the full ceremony record
+(including the abandoned candidate), offline-backup status, and rotation
+policy.)
