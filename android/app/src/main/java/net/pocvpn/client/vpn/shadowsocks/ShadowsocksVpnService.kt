@@ -7,6 +7,7 @@ import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import java.io.File
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,6 +25,7 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
+import net.pocvpn.client.vpn.config.VpnDnsPolicy
 import net.pocvpn.client.vpn.policy.RoutingMode
 
 private const val TAG = "ShadowsocksVpnService"
@@ -50,15 +52,33 @@ class ShadowsocksVpnService : VpnService() {
     private var tunInterface: ParcelFileDescriptor? = null
     private var statusCollectionJob: Job? = null
 
+    // B45B-4P fix - the session id [teardown] publishes its terminal STOPPED
+    // status under. Set only when a session genuinely proceeds past the
+    // "already running" guard in [startIfNotAlreadyRunning] - a duplicate
+    // start request that gets ignored must never overwrite the id the
+    // ALREADY-running session's own teardown needs to report against.
+    private var activeSessionId: Long = 0L
+
     /** Test seam - same contract as NovaXrayVpnService.profileRepositoryFactory. */
     internal var credentialRepositoryFactory: (Context, EndpointId) -> Shadowsocks2022CredentialRepository = { context, endpointId ->
         Shadowsocks2022CredentialRepositoryFactory.create(context, endpointId)
     }
 
+    /** Test seam - same reasoning as [credentialRepositoryFactory] above: lets a test run [teardown]'s dispatch synchronously (e.g. Dispatchers.Unconfined) instead of waiting on a real background dispatcher. Production default unchanged. */
+    internal var teardownDispatcher: CoroutineDispatcher = Dispatchers.Default
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                teardown()
+                // B45B-4P fix - [teardown] blocks (bounded, up to ~4s inside
+                // ShadowsocksRuntime.stop's own graceful/force-stop wait) -
+                // onStartCommand always runs on the main thread, so that wait
+                // must never happen there. Dispatched onto [serviceScope]
+                // (Dispatchers.Default), exactly like startIfNotAlreadyRunning's
+                // own heavier work already is. Safe even if this races with a
+                // later onDestroy()-driven teardown() call - every step inside
+                // teardown() is already null-safe/idempotent by construction.
+                serviceScope.launch(teardownDispatcher) { teardown() }
                 return START_NOT_STICKY
             }
             ACTION_START -> {
@@ -101,6 +121,7 @@ class ShadowsocksVpnService : VpnService() {
             Log.w(TAG, "already running - ignoring duplicate start")
             return
         }
+        activeSessionId = sessionId
 
         serviceScope.launch {
             // Credential absent/corrupted -> fail closed (Phase 7/16) -
@@ -187,6 +208,18 @@ class ShadowsocksVpnService : VpnService() {
             .setMtu(ShadowsocksTunConfig.MTU)
             .addAddress(ShadowsocksTunConfig.ADDRESS, ShadowsocksTunConfig.PREFIX_LENGTH)
             .setSession(SESSION_NAME)
+        // B45B-4P fix - root cause of zero inbound TCP at the server: this
+        // TUN never carried a DNS server, unlike every other transport
+        // (NovaXrayVpnService, AwgConfigMapper both call addDnsServer from
+        // the same VpnDnsPolicy authority). Per VpnService.Builder.addDnsServer's
+        // own contract, an interface with a route but no DNS server of a
+        // given family leaves that family's DNS resolution broken for every
+        // app routed through it - so routed apps never got a resolved
+        // destination to open a TCP connection to in the first place,
+        // meaning sslocal never saw a packet to relay. Same canonical
+        // resolver list every other transport already uses (never a second,
+        // transport-specific DNS decision).
+        VpnDnsPolicy.servers.forEach { builder.addDnsServer(it) }
         // Full-tunnel IPv4 route via the same RoutingDecisionEngine authority
         // the Xray adapters already use (Phase 5 - never a parallel routing
         // decision system). No IPv6 route/address anywhere (fail closed).
@@ -203,6 +236,20 @@ class ShadowsocksVpnService : VpnService() {
         return builder.establish()
     }
 
+    /**
+     * B45B-4P fix - a real ownership/cleanup bug found on a physical device:
+     * this previously set [_status] straight to `null` on a genuine stop.
+     * [ShadowsocksTransport]'s own status collector explicitly ignores a
+     * `null` status (see that class's own docs) - so a real, successful
+     * teardown never reached it at all, leaving [ShadowsocksTransport.state]
+     * stuck at [net.pocvpn.client.vpn.TransportState.Disconnecting] forever,
+     * with the real `sslocal` process/TUN/bridges already torn down here but
+     * nothing ever reporting that fact back. Publishing a genuine
+     * [ShadowsocksRuntimePhase.STOPPED] status (mapped to
+     * [net.pocvpn.client.vpn.TransportState.Disconnected] by
+     * [shadowsocksTransportStateFor]) closes that gap - the ONE typed
+     * terminal-stop signal, never a second one.
+     */
     private fun teardown() {
         statusCollectionJob?.cancel()
         statusCollectionJob = null
@@ -210,7 +257,7 @@ class ShadowsocksVpnService : VpnService() {
         runtime = null
         runCatching { tunInterface?.close() }
         tunInterface = null
-        _status.value = null
+        publish(activeSessionId, ShadowsocksRuntimePhase.STOPPED)
         stopSelf()
     }
 
