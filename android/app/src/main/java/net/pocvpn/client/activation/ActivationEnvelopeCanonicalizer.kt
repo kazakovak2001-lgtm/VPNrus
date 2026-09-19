@@ -4,6 +4,9 @@ import net.pocvpn.client.reachability.EndpointId
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 
 /**
  * Deterministic, dependency-free binary encoding of an [ActivationEnvelope] -
@@ -30,6 +33,16 @@ import java.io.DataOutputStream
  * meaningful order), [bootstrapEndpointHints] here is a ranking hint whose
  * ORDER is itself part of the signed data - it is encoded and decoded
  * exactly as given, never sorted.
+ *
+ * ## Strict UTF-8 (PR #92 correction)
+ *
+ * String fields are decoded with a [CharacterCodingException]-on-error
+ * decoder (malformed input and unmappable characters both REPORT, never
+ * REPLACE) - the JVM's default `String(bytes, Charsets.UTF_8)` silently
+ * substitutes U+FFFD for malformed input instead of rejecting it, which
+ * would have let malformed UTF-8 sail through this "strict, bounded parser
+ * for attacker-controlled input" undetected. See
+ * `ActivationEnvelopeCanonicalizerTest`'s malformed-UTF-8 cases.
  */
 object ActivationEnvelopeCanonicalizer {
     /** Domain/type marker - see class docs. Never reused for another signed object type. */
@@ -37,6 +50,17 @@ object ActivationEnvelopeCanonicalizer {
 
     /** This canonical field-schema's own version - see [ActivationEnvelopeCodec] for the outer wire-container version, which is a separate concept (see this file's [ActivationEnvelope] companion docs on the schema-version boundary). */
     const val FORMAT_VERSION = 1
+
+    /**
+     * Upper bound on canonical bytes this canonicalizer will ever produce or
+     * accept - single source of truth shared by [canonicalBytes] (which
+     * asserts it never emits more than this - PR #92's encoder/decoder
+     * symmetry correction) and [ActivationEnvelopeCodec] (which enforces the
+     * same bound on decode). Comfortably above the largest buildable
+     * [ActivationEnvelope] given every field's own construction-time bound
+     * (see ActivationEnvelopeCanonicalizerTest's max-size fixture).
+     */
+    const val MAX_CANONICAL_BYTES = 16_384
 
     fun canonicalBytes(envelope: ActivationEnvelope): ByteArray {
         val out = ByteArrayOutputStream()
@@ -54,8 +78,9 @@ object ActivationEnvelopeCanonicalizer {
                 d.writeInt(bundleRef.manifestVersion)
                 writeBytes(d, bundleRef.contentHash)
             }
-            d.writeInt(envelope.bootstrapEndpointHints.size)
-            envelope.bootstrapEndpointHints.forEach { writeString(d, it.value) }
+            val hints = envelope.bootstrapEndpointHints
+            d.writeInt(hints.size)
+            hints.forEach { writeString(d, it.value) }
             val capabilityHint = envelope.bootstrapCapabilityHint
             d.writeBoolean(capabilityHint != null)
             if (capabilityHint != null) {
@@ -64,7 +89,14 @@ object ActivationEnvelopeCanonicalizer {
             writeBytes(d, envelope.nonce)
             writeString(d, envelope.issuerKeyId.value)
         }
-        return out.toByteArray()
+        val bytes = out.toByteArray()
+        // PR #92 blocker 5: the encoder must never emit what its own decoder
+        // would reject. Given every field's own construction-time bound this
+        // should be unreachable - a hard `check` (not `require`) here turns a
+        // future bound-widening mistake into an immediate, loud failure
+        // instead of a silently unparsable envelope.
+        check(bytes.size <= MAX_CANONICAL_BYTES) { "canonical envelope encoding exceeds MAX_CANONICAL_BYTES ($MAX_CANONICAL_BYTES): ${bytes.size}" }
+        return bytes
     }
 
     /**
@@ -75,6 +107,7 @@ object ActivationEnvelopeCanonicalizer {
      * format and turns these into architecture-level failures.
      */
     fun decode(bytes: ByteArray): ActivationEnvelopeDecodeResult {
+        if (bytes.size > MAX_CANONICAL_BYTES) return malformed()
         return try {
             val stream = bytes.inputStream()
             DataInputStream(stream).use { d ->
@@ -105,10 +138,9 @@ object ActivationEnvelopeCanonicalizer {
                     if (contentHash.size != ActivationBundleRef.CONTENT_HASH_LENGTH) {
                         return ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.InvalidBundleRefHashLength)
                     }
-                    val ref = runCatching { ActivationBundleRef(manifestVersion, contentHash) }.getOrElse {
+                    runCatching { ActivationBundleRef(manifestVersion, contentHash) }.getOrElse {
                         return ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.InvalidBundleRefManifestVersion)
                     }
-                    ref
                 } else null
 
                 val hintCount = d.readInt()
@@ -117,7 +149,7 @@ object ActivationEnvelopeCanonicalizer {
                 }
                 val hints = ArrayList<EndpointId>(hintCount)
                 repeat(hintCount) {
-                    val raw = readString(d, MAX_ENDPOINT_ID_BYTES) ?: return malformed()
+                    val raw = readString(d, ActivationEnvelope.MAX_ENDPOINT_HINT_UTF8_BYTES) ?: return malformed()
                     val id = runCatching { EndpointId(raw) }.getOrElse {
                         return ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.InvalidEndpointHint)
                     }
@@ -138,7 +170,7 @@ object ActivationEnvelopeCanonicalizer {
                     return ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.InvalidNonceLength)
                 }
 
-                val issuerKeyIdRaw = readString(d, ActivationIssuerKeyId.MAX_LENGTH) ?: return malformed()
+                val issuerKeyIdRaw = readString(d, ActivationIssuerKeyId.MAX_LENGTH_BYTES) ?: return malformed()
                 val issuerKeyId = runCatching { ActivationIssuerKeyId(issuerKeyIdRaw) }.getOrElse {
                     return ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.InvalidIssuerKeyId)
                 }
@@ -165,13 +197,13 @@ object ActivationEnvelopeCanonicalizer {
                 ActivationEnvelopeDecodeResult.Success(envelope)
             }
         } catch (e: java.io.EOFException) {
-            ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
+            malformed()
         } catch (e: java.io.IOException) {
-            ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
+            malformed()
         } catch (e: IllegalArgumentException) {
-            ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
+            malformed()
         } catch (e: OutOfMemoryError) {
-            ActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
+            malformed()
         }
     }
 
@@ -184,15 +216,27 @@ object ActivationEnvelopeCanonicalizer {
         d.write(bytes)
     }
 
-    /** Returns null (never throws) on any length/EOF problem, so the caller can map it to a typed decode failure. */
+    /**
+     * Returns null (never throws) on any length/EOF/malformed-UTF-8 problem,
+     * so the caller can map it to a typed decode failure. Uses a STRICT UTF-8
+     * decoder (REPORT, not REPLACE, on malformed input and unmappable
+     * characters) - see class docs.
+     */
     private fun readString(d: DataInputStream, maxBytes: Int): String? {
         val len = try { d.readInt() } catch (e: java.io.EOFException) { return null }
         if (len < 0 || len > maxBytes) return null
         val bytes = ByteArray(len)
-        return try {
+        try {
             d.readFully(bytes)
-            String(bytes, Charsets.UTF_8)
         } catch (e: java.io.EOFException) {
+            return null
+        }
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        return try {
+            decoder.decode(ByteBuffer.wrap(bytes)).toString()
+        } catch (e: CharacterCodingException) {
             null
         }
     }
@@ -230,7 +274,6 @@ object ActivationEnvelopeCanonicalizer {
 
     private const val MAX_STRING_BYTES = 4096
     private const val MAX_DOMAIN_TAG_BYTES = 64
-    private const val MAX_ENDPOINT_ID_BYTES = 128
 }
 
 /** Result of [ActivationEnvelopeCanonicalizer.decode] - never throws for malformed input. */

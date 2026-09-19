@@ -27,7 +27,16 @@ interface ActivationIssuerTrustAnchors {
  * convention. Production key material is never committed here; this slice
  * only ever constructs instances from test-only key material under test
  * sources.
+ *
+ * [keys] is defensively copied - both the map structure itself and each
+ * public-key `ByteArray` value - at construction time, and [publicKeyFor]
+ * hands back a fresh copy on every call (PR #92 correction). Without this,
+ * a caller who mutated the `Map`/`ByteArray` they originally passed in, or
+ * who mutated an array this class had handed back, could change which key
+ * bytes an already-constructed trust-anchor set actually verifies against.
  */
-class FixedActivationIssuerTrustAnchors(private val keys: Map<ActivationIssuerKeyId, ByteArray>) : ActivationIssuerTrustAnchors {
-    override fun publicKeyFor(keyId: ActivationIssuerKeyId): ByteArray? = keys[keyId]
+class FixedActivationIssuerTrustAnchors(keys: Map<ActivationIssuerKeyId, ByteArray>) : ActivationIssuerTrustAnchors {
+    private val keys: Map<ActivationIssuerKeyId, ByteArray> = keys.mapValues { (_, publicKey) -> publicKey.copyOf() }
+
+    override fun publicKeyFor(keyId: ActivationIssuerKeyId): ByteArray? = keys[keyId]?.copyOf()
 }

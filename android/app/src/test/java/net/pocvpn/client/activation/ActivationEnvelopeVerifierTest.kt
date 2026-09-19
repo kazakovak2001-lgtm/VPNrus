@@ -1,5 +1,6 @@
 package net.pocvpn.client.activation
 
+import net.pocvpn.client.reachability.Ed25519ManifestVerifier
 import net.pocvpn.client.reachability.EndpointId
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
@@ -106,7 +107,7 @@ class ActivationEnvelopeVerifierTest {
     @Test
     fun `just before tolerated boundary of notBefore is valid`() {
         val (priv, pub) = keypair()
-        val skew = Ed25519ActivationEnvelopeVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS
+        val skew = Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS
         val signed = sign(envelope(notBefore = 1_000_000L, expiresAt = 2_000_000L), priv)
         val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
         val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = 1_000_000L - skew)
@@ -116,20 +117,35 @@ class ActivationEnvelopeVerifierTest {
     @Test
     fun `outside forward-skew tolerance before notBefore is rejected`() {
         val (priv, pub) = keypair()
-        val skew = Ed25519ActivationEnvelopeVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS
-        val signed = sign(envelope(notBefore = 1_000_000L, expiresAt = 2_000_000L), priv)
+        val skew = Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS
+        // issuedAt pinned well in the past so this test isolates the notBefore
+        // check - otherwise, with the default issuedAt == notBefore, "now" a
+        // hair below notBefore would ALSO trip the separate issuedAt-in-the-
+        // future (CLOCK_UNCERTAIN) check and mask what this test is proving.
+        val signed = sign(envelope(issuedAt = 0L, notBefore = 1_000_000L, expiresAt = 2_000_000L), priv)
         val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
         val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = 1_000_000L - skew - 1)
         assertEquals(ActivationEnvelopeFailureKind.PACKAGE_NOT_YET_VALID, (result as ActivationEnvelopeVerificationResult.Invalid).kind)
     }
 
     @Test
-    fun `exactly at expiresAt is valid`() {
+    fun `one millisecond before expiresAt is valid`() {
         val (priv, pub) = keypair()
         val signed = sign(envelope(notBefore = 1_000_000L, expiresAt = 2_000_000L), priv)
         val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
-        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = 2_000_000L)
+        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = 1_999_999L)
         assertTrue(result is ActivationEnvelopeVerificationResult.Valid)
+    }
+
+    @Test
+    fun `exactly at expiresAt is rejected - boundary is exclusive, matching manifest convention`() {
+        val (priv, pub) = keypair()
+        val signed = sign(envelope(notBefore = 1_000_000L, expiresAt = 2_000_000L), priv)
+        val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
+        // now >= expiresAt -> PACKAGE_EXPIRED, exactly mirroring
+        // Ed25519ManifestVerifier's `expiresAtEpochMillis <= nowEpochMillis` check.
+        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = 2_000_000L)
+        assertEquals(ActivationEnvelopeFailureKind.PACKAGE_EXPIRED, (result as ActivationEnvelopeVerificationResult.Invalid).kind)
     }
 
     @Test
@@ -142,12 +158,35 @@ class ActivationEnvelopeVerifierTest {
     }
 
     @Test
-    fun `absurd device clock is reported as CLOCK_UNCERTAIN`() {
+    fun `issuedAt exactly at now plus tolerance is valid`() {
         val (priv, pub) = keypair()
-        val signed = sign(envelope(issuedAt = 1_000_000L, notBefore = 1_000_000L, expiresAt = 2_000_000L), priv)
+        val now = 1_000_000L
+        val skew = Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS
+        val signed = sign(envelope(issuedAt = now + skew, notBefore = now, expiresAt = now + 10_000_000L), priv)
         val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
-        val absurdNow = 1_000_000L + Ed25519ActivationEnvelopeVerifier.DEFAULT_ABSURD_CLOCK_SKEW_TOLERANCE_MS + 1
-        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = absurdNow)
+        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = now)
+        assertTrue(result is ActivationEnvelopeVerificationResult.Valid)
+    }
+
+    @Test
+    fun `issuedAt one millisecond beyond tolerance is CLOCK_UNCERTAIN`() {
+        val (priv, pub) = keypair()
+        val now = 1_000_000L
+        val skew = Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS
+        val signed = sign(envelope(issuedAt = now + skew + 1, notBefore = now, expiresAt = now + 10_000_000L), priv)
+        val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
+        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = now)
+        assertEquals(ActivationEnvelopeFailureKind.CLOCK_UNCERTAIN, (result as ActivationEnvelopeVerificationResult.Invalid).kind)
+    }
+
+    @Test
+    fun `issuedAt years in the future is CLOCK_UNCERTAIN`() {
+        val (priv, pub) = keypair()
+        val now = 1_000_000L
+        val yearsInFuture = now + 10L * 365 * 24 * 60 * 60 * 1000
+        val signed = sign(envelope(issuedAt = yearsInFuture, notBefore = now, expiresAt = now + 10_000_000L), priv)
+        val anchors = FixedActivationIssuerTrustAnchors(mapOf(ActivationIssuerKeyId("issuer-key-1") to pub))
+        val result = Ed25519ActivationEnvelopeVerifier().verify(signed, anchors, nowEpochMillis = now)
         assertEquals(ActivationEnvelopeFailureKind.CLOCK_UNCERTAIN, (result as ActivationEnvelopeVerificationResult.Invalid).kind)
     }
 

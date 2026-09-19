@@ -1,5 +1,6 @@
 package net.pocvpn.client.activation
 
+import net.pocvpn.client.reachability.Ed25519ManifestVerifier
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 
@@ -52,23 +53,43 @@ interface ActivationEnvelopeVerifier {
 
 /**
  * Real Ed25519 verification, reusing the exact same BouncyCastle
- * primitives as [net.pocvpn.client.reachability.Ed25519ManifestVerifier]
- * (no second crypto stack introduced).
+ * primitives as [Ed25519ManifestVerifier] (no second crypto stack
+ * introduced).
  *
- * [clockSkewToleranceMillis] applies ONLY to the [ActivationEnvelope.notBeforeEpochMillis]
- * lower bound (a device clock that lags the issuer's may otherwise see a
- * freshly-issued envelope as "not yet valid"). Expiry
- * ([ActivationEnvelope.expiresAtEpochMillis]) is checked strictly, with no
- * tolerance added - loosening it because "the device clock might be wrong"
- * would blunt the one property `expiresAt` exists to guarantee.
- * [absurdClockSkewToleranceMillis] guards the opposite extreme: a device
- * clock so far from the envelope's own timestamps that treating the result
- * as an ordinary not-yet-valid/expired verdict would be misleading -
- * that case is reported as `CLOCK_UNCERTAIN` instead.
+ * ## Clock policy (PR #92 correction)
+ *
+ * A single [clockSkewToleranceMillis] - defaulted to and normally equal to
+ * [Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS], not a second,
+ * independently-invented tolerance - governs every clock-skew-tolerant
+ * check here, exactly mirroring the existing manifest trust policy:
+ *
+ * 1. **`issuedAt` implausibly in the future** - `issuedAt > now + tolerance`
+ *    -> `CLOCK_UNCERTAIN`. This is the SAME check
+ *    [Ed25519ManifestVerifier.verify] makes for `EndpointManifest.issuedAtEpochMillis`,
+ *    just reported under this verifier's own `CLOCK_UNCERTAIN` kind instead
+ *    of manifest's `CLOCK_SKEW` (the B56-1 task requires `CLOCK_UNCERTAIN`
+ *    to exist as its own kind here). A local clock running years ahead
+ *    cannot be reliably distinguished from an envelope genuinely issued
+ *    long ago by comparing `now` and `issuedAt` alone - this check exists to
+ *    catch the ordinary "device clock is off by minutes" case, not to make
+ *    any claim about detecting a maliciously/wildly wrong clock.
+ * 2. **`notBefore` lower bound** - `now < notBefore - tolerance` ->
+ *    `PACKAGE_NOT_YET_VALID`. Tolerance allows a device clock lagging the
+ *    issuer's to still accept a freshly-issued envelope.
+ * 3. **`expiresAt` upper bound** - `now >= expiresAt` -> `PACKAGE_EXPIRED`.
+ *    Boundary-EXCLUSIVE and with NO added tolerance, matching
+ *    [Ed25519ManifestVerifier]'s own `expiresAtEpochMillis <= nowEpochMillis`
+ *    check exactly (same convention, restated as `now >= expiresAt`) -
+ *    loosening this because "the device clock might be wrong" would blunt
+ *    the one property `expiresAt` exists to guarantee.
+ *
+ * There is no separate "absurd clock" heuristic - a previous version of
+ * this file had one (an arbitrary ~10-year `issuedAt` delta), which invented
+ * a second, undocumented clock-trust model instead of reusing the existing
+ * one; it has been removed.
  */
 class Ed25519ActivationEnvelopeVerifier(
-    private val clockSkewToleranceMillis: Long = DEFAULT_CLOCK_SKEW_TOLERANCE_MS,
-    private val absurdClockSkewToleranceMillis: Long = DEFAULT_ABSURD_CLOCK_SKEW_TOLERANCE_MS,
+    private val clockSkewToleranceMillis: Long = Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS,
 ) : ActivationEnvelopeVerifier {
 
     override fun verify(encoded: ByteArray, trustAnchors: ActivationIssuerTrustAnchors, nowEpochMillis: Long): ActivationEnvelopeVerificationResult {
@@ -97,13 +118,13 @@ class Ed25519ActivationEnvelopeVerifier(
             return ActivationEnvelopeVerificationResult.Invalid(ActivationEnvelopeFailureKind.PACKAGE_SIGNATURE_INVALID, "signature verification failed")
         }
 
-        if (kotlin.math.abs(nowEpochMillis - envelope.issuedAtEpochMillis) > absurdClockSkewToleranceMillis) {
-            return ActivationEnvelopeVerificationResult.Invalid(ActivationEnvelopeFailureKind.CLOCK_UNCERTAIN, "device clock implausibly far from envelope issuedAt")
+        if (envelope.issuedAtEpochMillis > nowEpochMillis + clockSkewToleranceMillis) {
+            return ActivationEnvelopeVerificationResult.Invalid(ActivationEnvelopeFailureKind.CLOCK_UNCERTAIN, "issuedAt is implausibly in the future")
         }
         if (nowEpochMillis < envelope.notBeforeEpochMillis - clockSkewToleranceMillis) {
             return ActivationEnvelopeVerificationResult.Invalid(ActivationEnvelopeFailureKind.PACKAGE_NOT_YET_VALID, "envelope is not yet valid")
         }
-        if (nowEpochMillis > envelope.expiresAtEpochMillis) {
+        if (nowEpochMillis >= envelope.expiresAtEpochMillis) {
             return ActivationEnvelopeVerificationResult.Invalid(ActivationEnvelopeFailureKind.PACKAGE_EXPIRED, "envelope has expired")
         }
 
@@ -117,11 +138,5 @@ class Ed25519ActivationEnvelopeVerifier(
         verifier.init(false, Ed25519PublicKeyParameters(publicKeyBytes, 0))
         verifier.update(message, 0, message.size)
         return verifier.verifySignature(signature)
-    }
-
-    companion object {
-        const val DEFAULT_CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000L
-        /** A device clock more than ~10 years from the envelope's own issuedAt is treated as unreliable rather than a legitimate not-yet-valid/expired verdict. */
-        const val DEFAULT_ABSURD_CLOCK_SKEW_TOLERANCE_MS = 10L * 365 * 24 * 60 * 60 * 1000
     }
 }

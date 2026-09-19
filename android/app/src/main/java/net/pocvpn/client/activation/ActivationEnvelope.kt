@@ -37,6 +37,22 @@ import net.pocvpn.client.reachability.EndpointId
  * later slice reads it and decides whether to even hand the inner envelope
  * bytes to this parser. No architecture field has been silently moved:
  * `schemaVersion` still belongs to the container, not to this envelope.
+ *
+ * ## Post-verification immutability (PR #92 correction)
+ *
+ * Every ByteArray-bearing field below (nonce, bootstrapCapabilityHint,
+ * ActivationBundleRef.contentHash, SignedActivationEnvelope.signature) and
+ * [ActivationEnvelope.bootstrapEndpointHints] are defensively copied ON THE
+ * WAY IN (so mutating a caller's own source array/list after construction
+ * can never change an already-built/already-verified object) and exposed
+ * only through a computed property that copies ON THE WAY OUT (so mutating
+ * an array obtained from an accessor can never change internal state
+ * either). A Kotlin `val ByteArray` is NOT immutable - only a reference is
+ * fixed, the underlying bytes remain fully mutable - so this had to be done
+ * with plain (non-`data`) classes holding private backing fields, since a
+ * `data class`'s primary-constructor properties cannot transform their
+ * input before storing it. See ActivationEnvelopeImmutabilityTest for the
+ * regression coverage this closes.
  */
 data class ActivationId(val value: String) {
     init {
@@ -56,7 +72,9 @@ data class ActivationId(val value: String) {
  * without padding). Sensitive: never logged, never in `toString()`/
  * exception messages - [toString] is overridden to redact; equals/hashCode
  * stay value-based (needed for round-trip/mutation tests) but callers must
- * not print them either.
+ * not print them either. Backed by an immutable Kotlin `String`, so unlike
+ * the ByteArray-bearing fields elsewhere in this file, no defensive copy is
+ * needed here.
  */
 class ActivationCredential(val value: String) {
     init {
@@ -71,20 +89,29 @@ class ActivationCredential(val value: String) {
 
     companion object {
         private val FORMAT = Regex("^[A-Za-z0-9_-]+$")
-        /** Generous headroom over today's 43-char token_urlsafe(32) output for future rotation. */
+        /** Generous headroom over today's 43-char token_urlsafe(32) output for future rotation. ASCII-only charset, so this is also the exact UTF-8 byte-length bound the wire parser enforces - no char/byte asymmetry possible. */
         const val MAX_LENGTH = 256
     }
 }
 
-/** Identifies which activation-issuer public key must verify an [ActivationEnvelope]. Never a manifest signing-key id - see [ActivationIssuerKeyId]. */
+/**
+ * Identifies which activation-issuer public key must verify an
+ * [ActivationEnvelope]. Never a manifest signing-key id - see
+ * [ActivationIssuerKeyId]. [MAX_LENGTH_BYTES] bounds the UTF-8 BYTE length
+ * (not the Kotlin/UTF-16 character count) so this can never accept a value
+ * whose encoded form is longer than what [ActivationEnvelopeCanonicalizer]'s
+ * wire parser allows - see PR #92's byte-length-symmetry correction.
+ */
 data class ActivationIssuerKeyId(val value: String) {
     init {
         require(value.isNotBlank()) { "issuerKeyId must not be blank" }
-        require(value.length <= MAX_LENGTH) { "issuerKeyId exceeds max length ($MAX_LENGTH): ${value.length}" }
+        require(value.toByteArray(Charsets.UTF_8).size <= MAX_LENGTH_BYTES) {
+            "issuerKeyId exceeds max UTF-8 byte length ($MAX_LENGTH_BYTES)"
+        }
     }
 
     companion object {
-        const val MAX_LENGTH = 64
+        const val MAX_LENGTH_BYTES = 64
     }
 }
 
@@ -94,21 +121,30 @@ data class ActivationIssuerKeyId(val value: String) {
  * a manifest version number and a content hash that a client can use to
  * confirm "this is the bundle the envelope was issued alongside", nothing
  * more.
+ *
+ * [contentHash] is defensively copied from the constructor argument and
+ * exposed only through a copying accessor - see this file's class docs on
+ * post-verification immutability.
  */
-class ActivationBundleRef(val manifestVersion: Int, val contentHash: ByteArray) {
+class ActivationBundleRef(val manifestVersion: Int, contentHash: ByteArray) {
+    private val contentHashBytes: ByteArray = contentHash.copyOf()
+
+    /** Always a fresh copy - mutating the returned array never affects this instance. */
+    val contentHash: ByteArray get() = contentHashBytes.copyOf()
+
     init {
         require(manifestVersion >= 1) { "manifestVersion must be >= 1: $manifestVersion" }
-        require(contentHash.size == CONTENT_HASH_LENGTH) { "contentHash must be exactly $CONTENT_HASH_LENGTH bytes (SHA-256): ${contentHash.size}" }
+        require(contentHashBytes.size == CONTENT_HASH_LENGTH) { "contentHash must be exactly $CONTENT_HASH_LENGTH bytes (SHA-256): ${contentHashBytes.size}" }
     }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is ActivationBundleRef) return false
-        return manifestVersion == other.manifestVersion && contentHash.contentEquals(other.contentHash)
+        return manifestVersion == other.manifestVersion && contentHashBytes.contentEquals(other.contentHashBytes)
     }
 
-    override fun hashCode(): Int = 31 * manifestVersion + contentHash.contentHashCode()
-    override fun toString(): String = "ActivationBundleRef(manifestVersion=$manifestVersion, contentHash=<${contentHash.size} bytes>)"
+    override fun hashCode(): Int = 31 * manifestVersion + contentHashBytes.contentHashCode()
+    override fun toString(): String = "ActivationBundleRef(manifestVersion=$manifestVersion, contentHash=<${contentHashBytes.size} bytes>)"
 
     companion object {
         /** Fixed hash format: SHA-256. */
@@ -119,7 +155,7 @@ class ActivationBundleRef(val manifestVersion: Int, val contentHash: ByteArray) 
 /**
  * The activation authority's signed payload. Every field listed here is
  * covered by [signature] via [ActivationEnvelopeCanonicalizer] - see
- * ActivationEnvelopeMutationTest for proof that mutating any one of them
+ * ActivationEnvelopeVerifierTest for proof that mutating any one of them
  * invalidates the signature.
  *
  * [bootstrapEndpointHints] and [bootstrapCapabilityHint] are NON-authoritative:
@@ -127,33 +163,84 @@ class ActivationBundleRef(val manifestVersion: Int, val contentHash: ByteArray) 
  * trusts via a separately-verified manifest, and this layer does not
  * interpret [bootstrapCapabilityHint] at all (bytes are preserved exactly,
  * size-bounded, and treated as sensitive).
+ *
+ * Deliberately NOT a `data class`: [nonce], [bootstrapCapabilityHint], and
+ * [bootstrapEndpointHints] are defensively copied from whatever the caller
+ * passed in and exposed only through copying accessors (see this file's
+ * class docs on post-verification immutability) - a `data class` cannot do
+ * this because its primary-constructor properties cannot transform their
+ * input before storing it. [copy] is hand-written below to keep the same
+ * call-site ergonomics tests rely on.
  */
-data class ActivationEnvelope(
+class ActivationEnvelope(
     val activationId: ActivationId,
     val credential: ActivationCredential,
     val issuedAtEpochMillis: Long,
     val notBeforeEpochMillis: Long,
     val expiresAtEpochMillis: Long,
     val bootstrapBundleRef: ActivationBundleRef?,
-    val bootstrapEndpointHints: List<EndpointId>,
-    val bootstrapCapabilityHint: ByteArray?,
-    val nonce: ByteArray,
+    bootstrapEndpointHints: List<EndpointId>,
+    bootstrapCapabilityHint: ByteArray?,
+    nonce: ByteArray,
     val issuerKeyId: ActivationIssuerKeyId,
 ) {
+    private val hintsList: List<EndpointId> = bootstrapEndpointHints.toList()
+    private val capabilityHintBytes: ByteArray? = bootstrapCapabilityHint?.copyOf()
+    private val nonceBytes: ByteArray = nonce.copyOf()
+
+    /** Order-preserving, immutable snapshot taken at construction time - mutating a caller-owned source list afterward never affects this instance. */
+    val bootstrapEndpointHints: List<EndpointId> get() = hintsList
+
+    /** Always a fresh copy, or null - mutating the returned array never affects this instance. */
+    val bootstrapCapabilityHint: ByteArray? get() = capabilityHintBytes?.copyOf()
+
+    /** Always a fresh copy - mutating the returned array never affects this instance. */
+    val nonce: ByteArray get() = nonceBytes.copyOf()
+
     init {
         require(notBeforeEpochMillis < expiresAtEpochMillis) {
             "notBeforeEpochMillis ($notBeforeEpochMillis) must be before expiresAtEpochMillis ($expiresAtEpochMillis)"
         }
-        require(nonce.size == NONCE_LENGTH) { "nonce must be exactly $NONCE_LENGTH bytes: ${nonce.size}" }
-        require(bootstrapEndpointHints.size <= MAX_ENDPOINT_HINTS) {
-            "too many bootstrapEndpointHints (${bootstrapEndpointHints.size} > $MAX_ENDPOINT_HINTS)"
+        require(nonceBytes.size == NONCE_LENGTH) { "nonce must be exactly $NONCE_LENGTH bytes: ${nonceBytes.size}" }
+        require(hintsList.size <= MAX_ENDPOINT_HINTS) {
+            "too many bootstrapEndpointHints (${hintsList.size} > $MAX_ENDPOINT_HINTS)"
         }
-        val distinctHints = bootstrapEndpointHints.toSet()
-        require(distinctHints.size == bootstrapEndpointHints.size) { "bootstrapEndpointHints contains a duplicate EndpointId" }
-        bootstrapCapabilityHint?.let {
+        val distinctHints = hintsList.toSet()
+        require(distinctHints.size == hintsList.size) { "bootstrapEndpointHints contains a duplicate EndpointId" }
+        // B56-local boundary (PR #92 correction): EndpointId itself allows up
+        // to 128 UTF-16 characters, which for multi-byte text can exceed what
+        // ActivationEnvelopeCanonicalizer's wire parser accepts per hint
+        // (MAX_ENDPOINT_HINT_UTF8_BYTES UTF-8 bytes). Enforced HERE, not by
+        // narrowing EndpointId's own global semantics (used elsewhere for
+        // manifest endpoints too), so every constructible ActivationEnvelope
+        // is guaranteed to round-trip through encode/decode.
+        hintsList.forEach { hint ->
+            val byteLength = hint.value.toByteArray(Charsets.UTF_8).size
+            require(byteLength <= MAX_ENDPOINT_HINT_UTF8_BYTES) {
+                "bootstrapEndpointHint '${hint.value}' exceeds max UTF-8 byte length ($MAX_ENDPOINT_HINT_UTF8_BYTES): $byteLength"
+            }
+        }
+        capabilityHintBytes?.let {
             require(it.size <= MAX_CAPABILITY_HINT_BYTES) { "bootstrapCapabilityHint exceeds max length ($MAX_CAPABILITY_HINT_BYTES): ${it.size}" }
         }
     }
+
+    /** Mirrors `data class` copy() ergonomics without the immutability hole a real `data class` would reopen here - reads through the copying accessors above, so the new instance never aliases this one's backing arrays/list. */
+    fun copy(
+        activationId: ActivationId = this.activationId,
+        credential: ActivationCredential = this.credential,
+        issuedAtEpochMillis: Long = this.issuedAtEpochMillis,
+        notBeforeEpochMillis: Long = this.notBeforeEpochMillis,
+        expiresAtEpochMillis: Long = this.expiresAtEpochMillis,
+        bootstrapBundleRef: ActivationBundleRef? = this.bootstrapBundleRef,
+        bootstrapEndpointHints: List<EndpointId> = this.bootstrapEndpointHints,
+        bootstrapCapabilityHint: ByteArray? = this.bootstrapCapabilityHint,
+        nonce: ByteArray = this.nonce,
+        issuerKeyId: ActivationIssuerKeyId = this.issuerKeyId,
+    ): ActivationEnvelope = ActivationEnvelope(
+        activationId, credential, issuedAtEpochMillis, notBeforeEpochMillis, expiresAtEpochMillis,
+        bootstrapBundleRef, bootstrapEndpointHints, bootstrapCapabilityHint, nonce, issuerKeyId,
+    )
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -164,9 +251,9 @@ data class ActivationEnvelope(
             notBeforeEpochMillis == other.notBeforeEpochMillis &&
             expiresAtEpochMillis == other.expiresAtEpochMillis &&
             bootstrapBundleRef == other.bootstrapBundleRef &&
-            bootstrapEndpointHints == other.bootstrapEndpointHints &&
-            (bootstrapCapabilityHint?.contentEquals(other.bootstrapCapabilityHint ?: ByteArray(0)) ?: (other.bootstrapCapabilityHint == null)) &&
-            nonce.contentEquals(other.nonce) &&
+            hintsList == other.hintsList &&
+            (capabilityHintBytes?.contentEquals(other.capabilityHintBytes ?: ByteArray(0)) ?: (other.capabilityHintBytes == null)) &&
+            nonceBytes.contentEquals(other.nonceBytes) &&
             issuerKeyId == other.issuerKeyId
     }
 
@@ -177,9 +264,9 @@ data class ActivationEnvelope(
         result = 31 * result + notBeforeEpochMillis.hashCode()
         result = 31 * result + expiresAtEpochMillis.hashCode()
         result = 31 * result + (bootstrapBundleRef?.hashCode() ?: 0)
-        result = 31 * result + bootstrapEndpointHints.hashCode()
-        result = 31 * result + (bootstrapCapabilityHint?.contentHashCode() ?: 0)
-        result = 31 * result + nonce.contentHashCode()
+        result = 31 * result + hintsList.hashCode()
+        result = 31 * result + (capabilityHintBytes?.contentHashCode() ?: 0)
+        result = 31 * result + nonceBytes.contentHashCode()
         result = 31 * result + issuerKeyId.hashCode()
         return result
     }
@@ -188,31 +275,44 @@ data class ActivationEnvelope(
     override fun toString(): String =
         "ActivationEnvelope(activationId=$activationId, credential=REDACTED, issuedAtEpochMillis=$issuedAtEpochMillis, " +
             "notBeforeEpochMillis=$notBeforeEpochMillis, expiresAtEpochMillis=$expiresAtEpochMillis, " +
-            "bootstrapBundleRef=$bootstrapBundleRef, bootstrapEndpointHints=$bootstrapEndpointHints, " +
-            "bootstrapCapabilityHint=${if (bootstrapCapabilityHint != null) "<${bootstrapCapabilityHint.size} bytes REDACTED>" else "null"}, " +
-            "nonce=<${nonce.size} bytes>, issuerKeyId=$issuerKeyId)"
+            "bootstrapBundleRef=$bootstrapBundleRef, bootstrapEndpointHints=$hintsList, " +
+            "bootstrapCapabilityHint=${if (capabilityHintBytes != null) "<${capabilityHintBytes.size} bytes REDACTED>" else "null"}, " +
+            "nonce=<${nonceBytes.size} bytes>, issuerKeyId=$issuerKeyId)"
 
     companion object {
         /** Architecture-approved size - see docs/RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md section 6. Local dedupe/import metadata only, NOT a replay-prevention security boundary. */
         const val NONCE_LENGTH = 16
         const val MAX_ENDPOINT_HINTS = 32
         const val MAX_CAPABILITY_HINT_BYTES = 4096
+
+        /** Matches [ActivationEnvelopeCanonicalizer]'s own per-hint wire cap exactly - see this class's init{} and PR #92's byte-length-symmetry correction. */
+        const val MAX_ENDPOINT_HINT_UTF8_BYTES = 128
     }
 }
 
-/** An [ActivationEnvelope] plus the raw Ed25519 signature bytes over its canonical encoding - see [ActivationEnvelopeCanonicalizer]. */
-data class SignedActivationEnvelope(val envelope: ActivationEnvelope, val signature: ByteArray) {
+/**
+ * An [ActivationEnvelope] plus the raw Ed25519 signature bytes over its
+ * canonical encoding - see [ActivationEnvelopeCanonicalizer]. [signature] is
+ * defensively copied in and exposed only through a copying accessor - see
+ * [ActivationEnvelope]'s class docs on post-verification immutability.
+ */
+class SignedActivationEnvelope(val envelope: ActivationEnvelope, signature: ByteArray) {
+    private val signatureBytes: ByteArray = signature.copyOf()
+
+    /** Always a fresh copy - mutating the returned array never affects this instance. */
+    val signature: ByteArray get() = signatureBytes.copyOf()
+
     init {
-        require(signature.size == SIGNATURE_LENGTH) { "signature must be exactly $SIGNATURE_LENGTH bytes: ${signature.size}" }
+        require(signatureBytes.size == SIGNATURE_LENGTH) { "signature must be exactly $SIGNATURE_LENGTH bytes: ${signatureBytes.size}" }
     }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is SignedActivationEnvelope) return false
-        return envelope == other.envelope && signature.contentEquals(other.signature)
+        return envelope == other.envelope && signatureBytes.contentEquals(other.signatureBytes)
     }
 
-    override fun hashCode(): Int = 31 * envelope.hashCode() + signature.contentHashCode()
+    override fun hashCode(): Int = 31 * envelope.hashCode() + signatureBytes.contentHashCode()
 
     companion object {
         const val SIGNATURE_LENGTH = 64

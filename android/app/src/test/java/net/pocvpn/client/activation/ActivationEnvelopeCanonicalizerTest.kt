@@ -176,7 +176,7 @@ class ActivationEnvelopeCanonicalizerTest {
     }
 
     @Test
-    fun `decode rejects invalid UTF-8 in a string field`() {
+    fun `decode rejects invalid UTF-8 in the domain tag`() {
         // Build a payload with a domain-tag string field containing an invalid UTF-8 byte.
         val out = java.io.ByteArrayOutputStream()
         java.io.DataOutputStream(out).use { d ->
@@ -184,9 +184,146 @@ class ActivationEnvelopeCanonicalizerTest {
             d.write(byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0x00))
         }
         val result = ActivationEnvelopeCanonicalizer.decode(out.toByteArray())
-        // Malformed UTF-8 decodes to the replacement character rather than throwing in the JVM,
-        // so this is expected to fail on domain-tag mismatch rather than crash either way.
+        // PR #92 correction: the decoder now uses a STRICT UTF-8 decoder
+        // (REPORT on malformed input), so this fails immediately as
+        // malformed UTF-8 rather than silently substituting the replacement
+        // character and only failing later on domain-tag mismatch.
         assertTrue(result is ActivationEnvelopeDecodeResult.Failure)
+    }
+
+    @Test
+    fun `decode rejects invalid UTF-8 in the credential field`() {
+        val out = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(out).use { d ->
+            writeStringField(d, ActivationEnvelopeCanonicalizer.DOMAIN_TAG)
+            d.writeInt(ActivationEnvelopeCanonicalizer.FORMAT_VERSION)
+            writeStringField(d, "a".repeat(32))
+            // credential field: declared length 3, invalid UTF-8 bytes.
+            d.writeInt(3)
+            d.write(byteArrayOf(0xC0.toByte(), 0xAF.toByte(), 0x00))
+        }
+        val result = ActivationEnvelopeCanonicalizer.decode(out.toByteArray())
+        assertTrue(result is ActivationEnvelopeDecodeResult.Failure)
+        assertEquals(ActivationEnvelopeFailureKind.PACKAGE_MALFORMED, (result as ActivationEnvelopeDecodeResult.Failure).failure.toFailureKind())
+    }
+
+    @Test
+    fun `decode rejects invalid UTF-8 in an endpoint hint field`() {
+        val out = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(out).use { d ->
+            writeStringField(d, ActivationEnvelopeCanonicalizer.DOMAIN_TAG)
+            d.writeInt(ActivationEnvelopeCanonicalizer.FORMAT_VERSION)
+            writeStringField(d, "a".repeat(32))
+            writeStringField(d, "abcDEF123_-abcDEF123_-abcDEF123456789")
+            d.writeLong(1_000_000L)
+            d.writeLong(1_000_000L)
+            d.writeLong(2_000_000L)
+            d.writeBoolean(false) // no bundle ref
+            d.writeInt(1) // one endpoint hint
+            // malformed UTF-8 hint bytes (overlong encoding, invalid).
+            d.writeInt(2)
+            d.write(byteArrayOf(0xC0.toByte(), 0xAF.toByte()))
+        }
+        val result = ActivationEnvelopeCanonicalizer.decode(out.toByteArray())
+        assertTrue(result is ActivationEnvelopeDecodeResult.Failure)
+        assertEquals(ActivationEnvelopeFailureKind.PACKAGE_MALFORMED, (result as ActivationEnvelopeDecodeResult.Failure).failure.toFailureKind())
+    }
+
+    @Test
+    fun `decode rejects invalid UTF-8 in the issuerKeyId field`() {
+        val out = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(out).use { d ->
+            writeStringField(d, ActivationEnvelopeCanonicalizer.DOMAIN_TAG)
+            d.writeInt(ActivationEnvelopeCanonicalizer.FORMAT_VERSION)
+            writeStringField(d, "a".repeat(32))
+            writeStringField(d, "abcDEF123_-abcDEF123_-abcDEF123456789")
+            d.writeLong(1_000_000L)
+            d.writeLong(1_000_000L)
+            d.writeLong(2_000_000L)
+            d.writeBoolean(false) // no bundle ref
+            d.writeInt(0) // no hints
+            d.writeBoolean(false) // no capability hint
+            d.writeInt(ActivationEnvelope.NONCE_LENGTH)
+            d.write(nonce())
+            // malformed UTF-8 issuerKeyId bytes.
+            d.writeInt(2)
+            d.write(byteArrayOf(0xED.toByte(), 0xA0.toByte()))
+        }
+        val result = ActivationEnvelopeCanonicalizer.decode(out.toByteArray())
+        assertTrue(result is ActivationEnvelopeDecodeResult.Failure)
+        assertEquals(ActivationEnvelopeFailureKind.PACKAGE_MALFORMED, (result as ActivationEnvelopeDecodeResult.Failure).failure.toFailureKind())
+    }
+
+    private fun writeStringField(d: java.io.DataOutputStream, s: String) {
+        val bytes = s.toByteArray(Charsets.UTF_8)
+        d.writeInt(bytes.size)
+        d.write(bytes)
+    }
+
+    @Test
+    fun `multi-byte UTF-8 endpoint hint round trips when within the byte budget`() {
+        // 40 Cyrillic characters, 2 bytes each = 80 UTF-8 bytes, well within the 128-byte cap.
+        val hint = EndpointId("ш".repeat(40))
+        val envelope = minimalEnvelope().copy(bootstrapEndpointHints = listOf(hint))
+        roundTrip(envelope)
+    }
+
+    @Test
+    fun `endpoint hint exactly at the UTF-8 byte limit round trips`() {
+        val hint = EndpointId("a".repeat(ActivationEnvelope.MAX_ENDPOINT_HINT_UTF8_BYTES))
+        val envelope = minimalEnvelope().copy(bootstrapEndpointHints = listOf(hint))
+        roundTrip(envelope)
+    }
+
+    @Test
+    fun `endpoint hint one UTF-8 byte over the limit is rejected at construction`() {
+        // Each Cyrillic character is 2 UTF-8 bytes; 65 of them = 130 bytes > 128-byte cap,
+        // while still satisfying EndpointId's own separate 128-CHARACTER limit (65 chars).
+        val hint = EndpointId("ш".repeat(65))
+        try {
+            minimalEnvelope().copy(bootstrapEndpointHints = listOf(hint))
+            throw AssertionError("expected IllegalArgumentException")
+        } catch (e: IllegalArgumentException) {
+            // expected: B56-local UTF-8 byte-length boundary, see ActivationEnvelope.init{}
+        }
+    }
+
+    @Test
+    fun `issuerKeyId exactly at the UTF-8 byte limit round trips`() {
+        val envelope = minimalEnvelope().copy(issuerKeyId = ActivationIssuerKeyId("k".repeat(ActivationIssuerKeyId.MAX_LENGTH_BYTES)))
+        roundTrip(envelope)
+    }
+
+    @Test
+    fun `issuerKeyId one UTF-8 byte over the limit is rejected at construction`() {
+        try {
+            ActivationIssuerKeyId("k".repeat(ActivationIssuerKeyId.MAX_LENGTH_BYTES + 1))
+            throw AssertionError("expected IllegalArgumentException")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+    }
+
+    @Test
+    fun `multi-byte UTF-8 issuerKeyId round trips when within the byte budget`() {
+        // 30 Cyrillic characters, 2 bytes each = 60 UTF-8 bytes, within the 64-byte cap.
+        val envelope = minimalEnvelope().copy(issuerKeyId = ActivationIssuerKeyId("щ".repeat(30)))
+        roundTrip(envelope)
+    }
+
+    @Test
+    fun `maximum-size envelope encodes within limits and round trips`() {
+        val maxHints = (0 until ActivationEnvelope.MAX_ENDPOINT_HINTS).map { EndpointId("h".repeat(ActivationEnvelope.MAX_ENDPOINT_HINT_UTF8_BYTES - 4) + "-%03d".format(it)) }
+        check(maxHints.all { it.value.toByteArray(Charsets.UTF_8).size == ActivationEnvelope.MAX_ENDPOINT_HINT_UTF8_BYTES }) { "fixture hint length must be exactly at the byte cap" }
+        val envelope = fullEnvelope().copy(
+            credential = ActivationCredential("c".repeat(ActivationCredential.MAX_LENGTH)),
+            issuerKeyId = ActivationIssuerKeyId("k".repeat(ActivationIssuerKeyId.MAX_LENGTH_BYTES)),
+            bootstrapEndpointHints = maxHints,
+            bootstrapCapabilityHint = ByteArray(ActivationEnvelope.MAX_CAPABILITY_HINT_BYTES) { it.toByte() },
+        )
+        val bytes = ActivationEnvelopeCanonicalizer.canonicalBytes(envelope)
+        assertTrue("max-size canonical envelope must stay within MAX_CANONICAL_BYTES", bytes.size <= ActivationEnvelopeCanonicalizer.MAX_CANONICAL_BYTES)
+        roundTrip(envelope)
     }
 
     @Test

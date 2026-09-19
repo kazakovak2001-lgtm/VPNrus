@@ -26,9 +26,15 @@ import java.io.DataOutputStream
 object ActivationEnvelopeCodec {
     private const val FORMAT_VERSION = 1
 
-    /** Conservative upper bound on the entire encoded package this parser will ever attempt to read - rejects a huge declared length before allocating. */
-    private const val MAX_ENCODED_BYTES = 32_768
-    private const val MAX_CANONICAL_BYTES = 16_384
+    /**
+     * Conservative upper bound on the entire encoded package this parser
+     * will ever attempt to read - rejects a huge declared length before
+     * allocating. Public (not `private`) so [ActivationEnvelopeTextCodec]
+     * can derive its own pre-Base64-decode text-length bound from the SAME
+     * constant (PR #92's text-transport size-bound correction) instead of
+     * duplicating a magic number that could drift out of sync.
+     */
+    const val MAX_ENCODED_BYTES = 32_768
 
     fun encode(signed: SignedActivationEnvelope): ByteArray {
         val canonicalBytes = ActivationEnvelopeCanonicalizer.canonicalBytes(signed.envelope)
@@ -40,7 +46,10 @@ object ActivationEnvelopeCodec {
             d.writeInt(signed.signature.size)
             d.write(signed.signature)
         }
-        return out.toByteArray()
+        val bytes = out.toByteArray()
+        // PR #92 blocker 5: never emit what our own decode() would reject.
+        check(bytes.size <= MAX_ENCODED_BYTES) { "encoded activation package exceeds MAX_ENCODED_BYTES ($MAX_ENCODED_BYTES): ${bytes.size}" }
+        return bytes
     }
 
     /**
@@ -61,7 +70,7 @@ object ActivationEnvelopeCodec {
                     return SignedActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.UnsupportedFormatVersion(version))
                 }
                 val canonicalLen = input.readInt()
-                if (canonicalLen < 0 || canonicalLen > MAX_CANONICAL_BYTES) {
+                if (canonicalLen < 0 || canonicalLen > ActivationEnvelopeCanonicalizer.MAX_CANONICAL_BYTES) {
                     return SignedActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
                 }
                 val canonicalBytes = ByteArray(canonicalLen)
