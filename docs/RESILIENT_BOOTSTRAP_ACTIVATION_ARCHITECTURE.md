@@ -6,6 +6,21 @@ It is a design proposal, produced against the real repository state as of
 Decision Gate and Recommended Implementation Slices sections for what would
 actually need to be built, and in what order, if this proposal is approved.
 
+**Revision note (correction pass):** the first version of this document
+(reviewed on PR #91) left one load-bearing gap: it defined credential
+delivery and offline verification, but never actually gave a bootstrapping
+device a way to reach `/v1/activate` if every endpoint the app already knew
+about was blocked - the imported package could only reorder already-known,
+already-trusted candidates, never add a genuinely new reachable one, and no
+restricted-transport fallback existed for the case where none of them work.
+That left the original "needs the API to activate, needs to be routed to
+reach the API" cycle partially intact. This revision closes that gap by
+splitting the single package into two independently authenticated objects
+(section 5-7) and by adding a two-level bootstrap reachability model
+(section 11). Every section below reflects the corrected design; nothing
+from the first version survives silently unreviewed - where a prior
+decision was reused, it is re-justified here, not just repeated.
+
 This document was produced applying the `vpn-architecture` review discipline
 in-session (per `CLAUDE.md` rule 7 - no `Agent`/`Task` subagent dispatch is
 available in this session's tool surface for that persona), by reading
@@ -19,8 +34,8 @@ repeated per section.
 
 ## 1. Current-state audit
 
-Verified directly against the repository (file paths and behavior described
-below were read, not assumed):
+Unchanged from the first version (re-verified, not re-derived, for this
+correction pass):
 
 **Activation (B8C1/B8C1A/B8C1B/B8C1C, `gateway/api/activations.py` +
 `gateway/tools/activation_tokens.py`):**
@@ -29,661 +44,876 @@ below were read, not assumed):
 - `issue_activation()` (operator CLI only) generates a random
   `secrets.token_urlsafe(32)` credential and a random 32-hex `activation_id`,
   with `max_devices` and optional `expires_at`. The plaintext credential is
-  printed to stdout **exactly once**, at issue time - this file's own
-  docstring makes that discipline explicit.
-- `decide_and_bind()` is the one function `POST /v1/activate` calls. It runs
-  under a single `flock(LOCK_EX)` spanning read -> decide -> write, so two
-  concurrent first-use requests for different public keys against the same
-  `max_devices` activation cannot both win (pending entries count toward the
-  limit the instant they exist). `provision_with_activation()` additionally
-  wraps decide/provision/finalize-or-rollback in a **per-activation** lock
-  (keyed by credential digest) so the AWG provisioning side effect itself is
-  serialized per activation, not just the bookkeeping. This is already a
-  correct, race-free, atomic redemption transaction - see the "Redemption
-  transaction" section below for why this slice reuses it unchanged.
+  printed to stdout **exactly once**, at issue time.
+- `decide_and_bind()` is the one function `POST /v1/activate` calls, under a
+  single `flock(LOCK_EX)` spanning read -> decide -> write - already
+  race-free for concurrent first-use requests. `provision_with_activation()`
+  additionally wraps decide/provision/finalize-or-rollback in a
+  **per-activation** lock so the AWG provisioning side effect itself is
+  serialized per activation. This is already a correct, race-free, atomic
+  redemption transaction - reused unchanged (section 12).
 - Device identity for binding is the device's own AmneziaWG public key
-  (`ClientKeyRepository`/`AwgClientKeyRepository`,
-  `android/app/src/main/java/net/pocvpn/client/identity/ClientKeyRepository.kt`):
-  a real Ed25519X25519 keypair generated once, private key AES-GCM-encrypted
-  at rest, public key handed to `/v1/activate`. This is already the
-  "device generates keypair -> activation includes public key -> server
-  atomically binds" model the task asks about - it exists today, it is not a
-  gap.
-- `ActivationResilienceCoordinator` (B30,
-  `android/.../controlplane/ActivationResilienceCoordinator.kt`) wraps the
-  client's own `/v1/activate` call with short-circuit local-freshness reuse
-  and retries across `ControlPlaneOrigin` candidates from
-  `ControlPlaneOriginSetBuilder.forGateway()` - which **only ever returns
-  `ProductionGatewayCatalog`-compiled hosts, never an arbitrary caller-
-  supplied URL** (its own docs state this is a structural, not conventional,
-  guarantee for exactly the reason this design must respect: "never accept
-  arbitrary user-supplied activation URLs in Auto mode"). This is the
-  existing control-plane multi-origin pattern - separate from, and today
-  narrower than, the manifest's multi-origin pattern (see below).
+  (`ClientKeyRepository`/`AwgClientKeyRepository`) - a real keypair generated
+  once, private key AES-GCM-encrypted at rest, public key handed to
+  `/v1/activate`. Already the "device generates keypair -> activation
+  includes public key -> server atomically binds" model; not a gap.
+- `ActivationResilienceCoordinator` (B30) wraps `/v1/activate` with
+  short-circuit local-freshness reuse and retries across `ControlPlaneOrigin`
+  candidates from `ControlPlaneOriginSetBuilder.forGateway()` - which
+  **only ever returns `ProductionGatewayCatalog`-compiled hosts, never an
+  arbitrary caller-supplied URL** (a structural, not conventional,
+  guarantee). This is the existing control-plane multi-origin pattern,
+  narrower today than the manifest's own.
 - Nginx already exposes `/v1/activate` (`POST`) and `/v1/manifest` (`GET`)
-  as the only two routes reachable **without** an existing device-specific
-  authenticated session - `gateway/edge/nginx-pocvpn.conf` and
-  `nginx-pocvpn-stockholm.conf` both show this. **No `limit_req`/`limit_conn`
-  directive exists anywhere in `gateway/edge/*.conf` today** - there is
-  currently no rate limiting on `/v1/activate` or `/v1/manifest` at the edge.
-  This is a real, pre-existing gap this design must not paper over (see
-  "Abuse/rate limiting" and "Owner decisions required").
+  as the only two routes reachable without an existing device-specific
+  session (`nginx-pocvpn.conf`, `nginx-pocvpn-stockholm.conf`). **No
+  `limit_req`/`limit_conn` directive exists anywhere in `gateway/edge/*.conf`
+  today** for either route - confirmed absent, not assumed. See section 11
+  for why this is a real but *separate* gap from the reachability gap this
+  revision fixes.
 
 **Enrollment tokens (older, distinct mechanism -
-`gateway/tools/enrollment_tokens.py` + `gateway/api/tokens.py`):**
-- A token is bound to a specific public key **at issuance time** by the
-  operator CLI; the HTTP API is read-only over that store by construction
-  (no write-capable code path exists under `gateway/api/` for it at all).
-  This is fundamentally different from activation credentials, which bind to
-  *whichever* device first presents them, up to `max_devices`. This document
-  never conflates the two, per the task's explicit instruction, and does not
-  touch `enrollment_tokens.py`/`tokens.py`.
+`gateway/tools/enrollment_tokens.py` + `gateway/api/tokens.py`):** bound to a
+specific public key at issuance time, read-only HTTP API. Fundamentally
+different from activation credentials (first-use binds, up to
+`max_devices`). Never conflated with activation credentials or with the new
+objects introduced below; not touched.
 
 **Manifest / bootstrap trust (B11/B12/B17/B20/B42-B44,
 `android/.../reachability/*.kt`):**
-- `EndpointManifest` (`EndpointManifest.kt`) is a signed, versioned, typed
-  set of `EndpointDescriptor`s, each carrying id/roles/region/provider/ASN
-  and a list of `EndpointTransportBinding` (kind/host/port/free-form string
-  metadata). `ManifestCanonicalizer` is a deterministic, dependency-free,
-  fixed-field-order binary encoding - the exact bytes an offline tool
-  (`gateway/tools/manifest_signing.py`) signs and `Ed25519ManifestVerifier`
-  verifies. No credential-bearing material is ever in this structure.
-- `Ed25519ManifestVerifier` checks: unknown signing key -> reject, clock
-  skew (issuedAt implausibly in the future, 5-minute tolerance) -> reject,
-  expired -> reject, bad signature -> reject. Every rejection is a distinct
-  typed `ManifestVerificationFailureKind`.
+- `EndpointManifest`/`ManifestCanonicalizer`/`Ed25519ManifestVerifier` - a
+  signed, versioned, typed endpoint set, deterministic canonical encoding,
+  four typed rejection categories (unknown key, clock skew, expired, bad
+  signature). No credential-bearing material ever enters this structure.
 - `EndpointManifestRepository.trustedState()` is **the one place** a
-  manifest becomes trusted for a session, with fixed precedence: (1) LKG if
-  it verifies, else (2) the embedded bootstrap if it *also* verifies against
-  the same trust anchors, else (3) `NoneTrusted` - an explicit fail-closed
-  state, never a silent "use whatever shipped in the APK anyway."
-  `EmbeddedBootstrapManifest` is a real, offline-signed manifest naming both
-  real production gateways with only public routing facts. `ManifestRollbackGuard`
-  (consumed by `offer()`) prevents an older-or-equal-version candidate from
-  ever replacing what is currently trusted.
+  manifest becomes trusted for a session: (1) LKG if it verifies, else (2)
+  the embedded bootstrap if it *also* verifies, else (3) `NoneTrusted` -
+  explicit fail-closed. `offer()` is the **one place** a new candidate can
+  ever be adopted into LKG - it re-verifies from scratch and enforces
+  `ManifestRollbackGuard` against whatever is *currently trusted*,
+  regardless of the candidate's origin. **This is the exact function this
+  revision's imported-manifest path (section 10/16) reuses without
+  modification** - `offer()` was already origin-agnostic by construction,
+  it just has never been called with a candidate that arrived via anything
+  other than an HTTPS fetch.
 - **Key rotation precedent already exists**: `EmbeddedBootstrapManifest`
-  embeds *two* simultaneously-trusted key IDs
-  (`prod-manifest-key-2026-09-01` and `prod-manifest-key-2026-09-14`) via
-  `FixedManifestTrustAnchors`. This is the exact mechanism this design reuses
-  for activation-issuer key rotation - no new rotation mechanism is needed.
+  embeds *two* simultaneously-trusted key IDs via `FixedManifestTrustAnchors`
+  - reused for activation-issuer key rotation, no new mechanism needed.
 - **Multi-origin delivery already exists for the manifest** (B20):
-  `MultiOriginManifestDistributionClient` fetches from every configured
-  `BuildConfig.MANIFEST_URLS` origin (both real production gateways today,
-  Frankfurt and Stockholm) on every refresh, feeds each origin's bytes
-  through the *same* `EndpointManifestRepository.offer()` trust boundary,
-  and an origin is explicitly "transport availability only, never a trust
-  authority" (verbatim invariant from `PROJECT_ARCHITECTURE.md`). This is
-  already exactly Pattern C from the task's research context - it does not
-  need to be invented for manifests, only reused for the activation package.
-- B44 (`docs/ROADMAP.md`) added signed endpoint operational state
-  (`ACTIVE`/`DISABLED`/`RETIRED`) for emergency rotation using existing
-  manifest metadata - status **PARTIAL**, route-level disable and production
-  control-plane emission remain out of scope there.
-- B43 "Bootstrap Resilience" (**PARTIAL**) and B52 "Offline / Outage Mode
-  research" (**RESEARCH**, not started) are the two existing roadmap rows
-  closest to this document's subject; neither is an activation-package or
-  self-service-issuance design. B51 (non-datacenter endpoint research) and
-  B54 (restricted-network field validation) are adjacent but distinct.
+  `MultiOriginManifestDistributionClient` fetches every configured HTTPS
+  origin on every refresh, feeds each through the *same* `offer()` boundary;
+  an origin is "transport availability only, never a trust authority."
+- B44 added signed endpoint operational state (`ACTIVE`/`DISABLED`/
+  `RETIRED`) - **PARTIAL**. B43 "Bootstrap Resilience" - **PARTIAL**. B52
+  "Offline / Outage Mode research" - **RESEARCH**, not started.
 
-**What does not exist today** (confirmed by search, not assumed absent):
-no activation-package/voucher format, no QR/deep-link import path, no
-self-service (non-operator) issuance channel, no dedicated "bootstrap edge"
-service or nginx location distinct from the existing `/v1/activate`/
-`/v1/manifest` routes, no rate limiting at the edge for either route, no
-delegated activation-issuer key distinct from the manifest signing key, no
-peer-pairing/relay code.
+**What does not exist today** (unchanged): no activation-package/voucher
+format, no QR/deep-link import path, no self-service issuance channel, no
+dedicated bootstrap-transport listener, no rate limiting at the edge, no
+delegated activation-issuer key, no peer-pairing/relay code, and -
+confirmed newly in this pass - **no code path anywhere calls
+`EndpointManifestRepository.offer()` with a candidate that did not arrive
+over the existing HTTPS `MultiOriginManifestDistributionClient`**. That last
+fact is exactly the gap this revision's imported-manifest design closes
+(section 10/16), and it closes cleanly because `offer()`'s own contract
+never assumed HTTPS as the only legitimate way a candidate could arrive.
 
 ---
 
 ## 2. Problem statement
 
-A new Nova install has no per-device credential and no trusted live manifest
-beyond the embedded bootstrap. If the reachable network already blocks the
-real Nova API host(s) before the device has ever successfully talked to
-them, the device has no way to obtain a working activation credential or a
-fresher manifest than what shipped in the APK - a circular dependency
-between "needs the API to activate" and "needs to already be activated (or
-otherwise routed) to reach the API." The goal is to give the client enough
-*locally verifiable, portable* information ahead of time that the very
-first live connection attempt is not the device's *only* chance to guess at
-where the Nova control plane lives, without turning that portable
-information into a universal secret or an unrestricted VPN.
+Unchanged, restated precisely because the correction below exists to
+actually solve it, not merely to describe it: a new Nova install has no
+per-device credential and no trusted live manifest beyond the embedded
+bootstrap. If the reachable network already blocks every endpoint the
+device currently knows about - both the embedded bootstrap's endpoints and
+anything a package could merely *point at* among them - no signed pointer
+alone helps, because pointing at an already-blocked candidate changes
+nothing. **The root architectural gap this revision fixes**: the first
+version of this design could deliver a credential and could re-rank already-
+known endpoints, but could not deliver *new, verifiably-authentic* endpoint
+facts, and had no fallback transport level for when direct HTTPS to every
+known control-plane origin fails outright. Both are fixed below.
 
 ## 3. Constraints
+
+Unchanged, plus one addition:
 
 - Reuse the existing Ed25519/manifest trust primitives; no new cryptography.
 - Never conflate activation credentials with enrollment tokens.
 - Never replace `decide_and_bind`/`provision_with_activation`'s already
   race-free redemption transaction.
 - Never let a package supply an arbitrary host/URL that bypasses
-  `ControlPlaneOriginSetBuilder`'s "no caller-supplied origin" invariant.
+  `ControlPlaneOriginSetBuilder`'s "no caller-supplied origin" invariant, and
+  never let it supply a network fact that bypasses `EndpointManifestRepository`'s
+  signature/rollback boundary either (new, section 6/16 - this is the
+  correction's central invariant).
 - No infrastructure stood up, no production nginx/gateway changes, no
-  billing, no peer relay, in this slice.
+  billing, no peer relay, in this slice - a restricted pre-activation
+  transport (section 11, Level 2) is designed here, never built.
 - No claim of guaranteed whitelist bypass, Russia connectivity, or
   untraceability anywhere in the resulting design or its UX copy.
 
 ## 4. External design patterns reviewed
 
-Summarized only as architectural reference; Nova implements its own
-mechanism (see Constraints):
+Unchanged from the first version, with Proton-style alternative routing now
+actually implemented at the architecture level (section 11, Level 2) rather
+than only named:
 
-- **Proton-style alternative routing** -> informs `BootstrapReachabilityResolver`
-  (section 11): a small resolver layer that tries alternate *paths*, never a
-  general traffic proxy.
+- **Proton-style alternative routing** -> Level 2 restricted bootstrap
+  transport (section 11): a small resolver layer that tries alternate
+  *paths* to the control plane, never a general traffic proxy.
 - **Psiphon-style embedded bootstrap knowledge** -> already implemented for
-  the manifest (`EmbeddedBootstrapManifest`); this design extends the same
-  idea to the activation package rather than re-inventing it.
+  the manifest; this design's imported-manifest path (section 10) extends
+  the same idea with a genuinely new *delivery* channel, not a new trust
+  mechanism.
 - **Lantern-style multi-origin configuration, trust-by-signature** ->
-  already implemented for the manifest (`MultiOriginManifestDistributionClient`);
-  reused verbatim for package *delivery* (section 10).
-- **Outline/Amnezia-style self-contained access package** -> the activation
-  package itself (section 7): QR/deep-link/file/clipboard, verifiable before
-  any network access.
+  already implemented for the manifest; reused for both package and
+  imported-manifest delivery (section 10).
+- **Outline/Amnezia-style self-contained access package** -> the
+  `NovaActivationPackage` container (section 5/7): QR/deep-link/file/
+  clipboard, verifiable before any network access.
 
 ## 5. Target architecture
 
+**Correction 1 applied.** The package is no longer one signed object. It is
+a container carrying **two independently authenticated logical objects**,
+each verified by its own key and its own existing code path - never merged
+into one signature, so a compromise of one never lets an attacker forge the
+other:
+
 ```
-Activation Package (signed, portable)
+NovaActivationPackage (container - QR / deep link / file / clipboard)
         |
-ActivationPackageVerifier      (new, offline, mirrors Ed25519ManifestVerifier)
-        |
-BootstrapCandidateRepository   (new, thin - reads EndpointManifestRepository)
-        |
-EndpointManifestRepository     (existing, UNCHANGED trust precedence)
-        |
-BootstrapReachabilityResolver  (new, thin orchestration only)
-        |
-ReachabilityEngine / NetworkProfiler / RestrictionClassifier   (existing, reused as-is)
-        |
-BootstrapLaneClient            (new - talks to the SAME /v1/activate, /v1/manifest routes)
-        |
-provision_with_activation()    (existing, gateway/api/activations.py, UNCHANGED)
-        |
-existing profile repositories (AWG/Xray/etc, UNCHANGED)
+        +---------------------------+---------------------------+
+        |                                                       |
+ActivationEnvelope                                    SignedBootstrapBundle
+(signed by the activation-issuer key,                 (signed by the EXISTING
+ a NEW delegated key - section 6/8)                    manifest signing key -
+        |                                               NO new key)
+        v                                                       v
+ActivationPackageVerifier                             EndpointManifestRepository.offer()
+(new, offline, mirrors                                (EXISTING, unmodified - section 16)
+ Ed25519ManifestVerifier)                                       |
+        |                                              new ManifestSource.IMPORTED_SIGNED_BOOTSTRAP
+        |                                              on acceptance; same LKG store either way
+        |                                                       |
+        +---------------------------+---------------------------+
+                                     |
+                        BootstrapCandidateRepository
+                        (new, thin - reads whatever
+                         EndpointManifestRepository now trusts,
+                         AFTER the bundle above was offered)
+                                     |
+                        BootstrapReachabilityResolver
+                        (new, thin orchestration only)
+                          /                        \
+           LEVEL 1: direct control-plane      LEVEL 2: restricted
+           reuses ReachabilityEngine/          bootstrap transport
+           NetworkProfiler/                    (architecture-level only,
+           RestrictionClassifier                NOT built this slice -
+                          \                        section 11)
+                           \                      /
+                        BootstrapLaneClient
+                        (talks to the SAME /v1/activate,
+                         /v1/manifest routes either way)
+                                     |
+                        provision_with_activation()
+                        (EXISTING, gateway/api/activations.py, UNCHANGED)
+                                     |
+                        existing profile repositories (AWG/Xray/etc, UNCHANGED)
 ```
 
-The activation package is deliberately **not** a second trust root. It is a
-signed pointer/envelope: it carries (a) a reference to an activation
-credential already issued through the existing `activation_tokens.py issue`
-path, and (b) optional, non-authoritative hints about which manifest-known
-endpoints to try first. It never carries new host/IP facts that aren't
-already inside a manifest the client can independently verify, and it never
-grants entitlement by itself - see section 6 and section 15 (Revocation).
+Neither signed object is a second trust *root*. The `ActivationEnvelope`
+grants no authority over network facts - it cannot invent, alter, or imply
+a host/port/endpoint (Correction 1's core rule). The `SignedBootstrapBundle`
+grants no activation entitlement - it is exactly a manifest candidate,
+subject to exactly the same rules any other manifest candidate already is.
+Only their *combination*, arriving through `provision_with_activation()`
+and `EndpointManifestRepository` respectively, produces a working device.
 
 ## 6. Trust model
 
-One hierarchy, two purposes, already partially precedented by the manifest's
-own two-simultaneously-trusted-keys design:
+**Correction 1 applied precisely**: two purposes, two keys, one ceremony
+process, and - critically - the second "new" key claimed in the first
+version of this document is now **not actually new for network facts**.
+Network-fact authority stays with the manifest signing key that already
+exists; only activation-entitlement-envelope authority gets a new delegated
+key.
 
 ```
 Offline root ceremony (docs/B12_MANIFEST_KEY_CEREMONY.md process, reused)
         |
-        +-- manifest signing key(s)        (existing: prod-manifest-key-*)
+        +-- manifest signing key(s)        (EXISTING: prod-manifest-key-* -
+        |                                    SignedBootstrapBundle uses THIS,
+        |                                    not a new key)
         |
-        +-- activation-issuer key(s)       (NEW, delegated, distinct from manifest keys)
+        +-- activation-issuer key(s)       (NEW, delegated, distinct from
+                                             manifest keys - ActivationEnvelope
+                                             uses THIS, and ONLY this)
 ```
 
-- The activation-issuer key is a **separate** key from the manifest signing
-  key, generated the same offline way, embedded the same way
-  (`FixedManifestTrustAnchors`-shaped keyset, but its own set - never merged
-  with the manifest trust anchors) so a compromise of one key's *usage
-  surface* does not automatically compromise the other's.
-- The manifest root/signing key stays reserved for infrequent, high-value,
-  operator-only manifest signing (as today). The activation-issuer key is
-  the one used for higher-volume, eventually self-service package issuance -
-  this is precisely "do not use the root/high-value manifest key for
-  high-volume online voucher issuance," satisfied by delegation, not by
-  inventing a second independent PKI.
-- **Trust comes from the Ed25519 signature over canonical bytes, exactly as
-  today.** A compromised delivery origin (dashboard, mirror, email) can
-  serve anything it wants; the client rejects anything that doesn't verify.
-- A valid package signature proves the package was genuinely issued by
-  Nova's activation-issuer key. It does **not** prove current entitlement -
-  the activation store (`gateway/api/activations.py`) remains the sole,
-  final, online authority for revoked/consumed/device-count/expiry (see
-  section 15).
+- **`ActivationEnvelope`** is signed by the activation-issuer key. It may
+  contain `activationId`, the existing plaintext activation credential,
+  envelope validity window, package metadata, and a reference (version and/or
+  content hash) to the accompanying `SignedBootstrapBundle` - never a host,
+  IP, port, SNI, or any other network fact. This is enforced structurally in
+  the schema (section 7), not by convention: the envelope's canonical
+  encoding has no field capable of carrying one.
+- **`SignedBootstrapBundle`** is signed by the *existing* manifest key(s) -
+  the same `FixedManifestTrustAnchors`/`Ed25519ManifestVerifier` machinery
+  already in production, unmodified. It is not a new artifact type at the
+  cryptography layer - it is an ordinary `SignedManifest` (or a subset-shaped
+  manifest, see section 9), verified and adopted the exact same way any
+  manifest candidate already is. This is what makes network-endpoint
+  authority stay unique (Correction 3's requirement): there is exactly one
+  key family that can ever make a client trust a new host, and it was never
+  touched by this design.
+- The activation-issuer key is used for envelope issuance only - never for
+  signing anything that reaches `EndpointManifestRepository`. Compromise of
+  this key cannot mint network facts (see the corrected threat model,
+  section 21, for the precise blast radius, distinguished per Correction 10
+  from compromise of the *issuance service* that holds it).
+- Trust for both objects still ultimately comes from an Ed25519 signature
+  over canonical bytes - no new cryptography, exactly as before. A
+  compromised delivery channel (dashboard, mirror, email, QR host) can serve
+  anything; the client rejects whatever doesn't verify, for each object
+  independently.
+- A valid `ActivationEnvelope` proves provenance, never current entitlement
+  - unchanged, section 15. A valid `SignedBootstrapBundle` proves the
+  endpoints inside it are genuinely Nova-issued, never that they are
+  *newer or more trustworthy* than what the device already has -
+  `ManifestRollbackGuard` decides that, unchanged (section 16).
 
 ## 7. Activation package format
 
-Minimum fields, derived from the audit above - deliberately **not** the
-example schema in the task prompt, because several of its fields either
-already exist server-side (device counting, expiry) or would create a
-second, competing source of truth if duplicated client-side:
+**Correction 1 applied**: the container now holds two objects. Neither
+duplicates a schema-level field that already exists server-side or in the
+manifest.
 
 ```
-NovaBootstrapPackage {
-    schemaVersion        : int            // format version, independent of manifestVersion
-    activationId         : 32 lowercase hex   // same non-secret id activations.py already prints via status/list
-    credential           : string         // the SAME plaintext bearer credential issue_activation() already produces once
-    issuedAt             : epoch millis
-    notBefore            : epoch millis   // package-envelope validity window; independent of the activation's own server-side expires_at
-    expiresAt            : epoch millis   // package-envelope validity window; SHORTER than or equal to the activation's own expires_at is the operational default, not a hard schema rule
-    bootstrapManifestVersion : int        // informational only - "the manifest version this package's issuer expected the client to already trust or fetch"
-    bootstrapEndpointHints   : list of EndpointId strings (0..N) // NON-authoritative ranking hint, see section 9
-    nonce                 : 16 random bytes  // LOCAL replay/import dedupe only, not a security boundary (see section 14)
-    issuerKeyId            : string
-    signature              : Ed25519, 64 bytes, over the canonical encoding of every field above
+NovaActivationPackage {
+    schemaVersion         : int
+    envelope               : ActivationEnvelope        // section 6, signed by activation-issuer key
+    bootstrapBundle         : SignedBootstrapBundle | null   // section 9, signed by the EXISTING manifest key; MAY be omitted (see below)
+}
+
+ActivationEnvelope {
+    activationId          : 32 lowercase hex   // same non-secret id activations.py already prints via status/list
+    credential             : string             // the SAME plaintext bearer credential issue_activation() already produces once
+    issuedAt               : epoch millis
+    notBefore              : epoch millis       // envelope validity window; independent of the activation's own server-side expires_at
+    expiresAt              : epoch millis       // envelope validity window; SHORTER than or equal to the activation's own expires_at is the operational default, not a hard schema rule
+    bootstrapBundleRef      : { manifestVersion: int, contentHash: bytes } | null   // informational cross-reference to `bootstrapBundle` above, NEVER a host/port fact
+    bootstrapEndpointHints  : list of EndpointId strings (0..N)   // NON-authoritative ranking hint over whatever manifest is ALREADY trusted, see section 9
+    bootstrapCapabilityHint : opaque bytes | null   // OPTIONAL - see section 11's chosen bootstrap-auth model; carries no network fact either
+    nonce                   : 16 random bytes   // LOCAL replay/import dedupe only, not a security boundary (see section 14)
+    issuerKeyId              : string
+    signature                : Ed25519, 64 bytes, over the canonical encoding of every ActivationEnvelope field above
+}
+
+SignedBootstrapBundle {
+    // Exactly a SignedManifest (EndpointManifest + Ed25519 signature) as it
+    // already exists today, OR a size-bounded subset of one (a small,
+    // still-independently-verifiable manifest naming only bootstrap-capable
+    // endpoints) - see section 9 for which shape is recommended and why.
+    // Signed by an EXISTING manifest signing key. Adds NOTHING to
+    // EndpointManifest's own schema.
 }
 ```
 
-Explicit answers to the task's checklist:
+`bootstrapBundle` is nullable because it solves a *specific* failure mode
+(every endpoint the device already knows is blocked) - a package issued for
+a device that will almost certainly still reach a known origin does not need
+one, and omitting it keeps the QR/package small (Correction 9 - this is an
+out-of-band *recovery* mechanism, not a mandatory part of every activation).
 
-- **Must be inside**: `activationId`, `credential`, the envelope's own
-  `notBefore`/`expiresAt`, `issuerKeyId`, `signature`. Without the plaintext
-  credential the package cannot bootstrap anything - see "Model" discussion
-  in section 16 for why this is not a new secret category.
-- **Must NOT be inside**: `max_devices`, a redemption counter, per-device
-  keys, AWG/Xray/REALITY credentials, raw host/IP/port facts not already in
-  a verifiable manifest, any PII.
+Explicit answers to the task's checklist, corrected where Correction 1
+changes them:
+
+- **Must be inside**: (envelope) `activationId`, `credential`, `notBefore`/
+  `expiresAt`, `issuerKeyId`, `signature`; (bundle, when present) exactly
+  what `EndpointManifest` already requires - nothing more.
+- **Must NOT be inside**: (envelope) any host/IP/port/SNI/transport fact,
+  `max_devices`, a redemption counter, per-device keys, AWG/Xray/REALITY
+  credentials, PII. (bundle) anything `EndpointManifest` already forbids
+  today (credential-bearing material) - unchanged.
 - **Public**: `activationId`, `issuerKeyId`, `schemaVersion`,
-  `bootstrapManifestVersion`, `bootstrapEndpointHints`, timestamps,
-  `signature` itself.
+  `bootstrapBundleRef`, `bootstrapEndpointHints`, timestamps, both
+  signatures, and everything already public inside a `SignedManifest`.
 - **Secret** (bearer, not encrypted - see below): `credential`.
-- **Signed**: every field, over the same fixed-order canonical-bytes
-  convention `ManifestCanonicalizer` already uses (reused, not reinvented).
-- **Encrypted**: no. Rationale: the client has no pre-shared key or
-  passphrase to decrypt with that wouldn't itself need the same secure
-  channel the package already travels over; encrypting the credential a
-  second time adds UX friction (a passphrase) without shrinking the actual
-  exposure window, which is already bounded by the envelope's own
-  `notBefore`/`expiresAt` and the activation's server-side `max_devices`/
-  `expires_at`/revocation. This mirrors why the existing plaintext
-  credential itself is not encrypted at rest in the operator's terminal
-  output today - the *scope* of the secret is deliberately bounded through
-  server-side mechanisms, not through cryptographic wrapping of the bearer
-  value.
+  `bootstrapCapabilityHint`, if present, is short-lived and narrowly scoped
+  (section 11) - not a long-lived secret, and its absence never blocks
+  Level 1 bootstrap.
+- **Signed**: every `ActivationEnvelope` field under the activation-issuer
+  key; every `EndpointManifest` field under the manifest key - two
+  independent signatures, reusing the same canonical-bytes convention
+  (`ManifestCanonicalizer`) for both, never merged into one signature over
+  the concatenation of both (which would recreate a single trust root by
+  accident).
+- **Encrypted**: no, for the same reasoning as the first version (adds UX
+  friction without shrinking the actual exposure window, which is bounded by
+  envelope expiry and server-side entitlement controls) - unchanged by this
+  correction, since it was never about network-fact authority.
 - **Stable identifier**: `activationId`.
 - **One-time value**: the `credential`, made one-time *in effect* by
-  `decide_and_bind()`'s existing per-key-then-max_devices binding (already
-  race-free, see section 1) - for the common `max_devices=1` case this is
-  genuinely single-use; for `max_devices>1` it is a shared secret with an
-  already-enforced cap, exactly as today, unchanged by this design.
-- **Replay prevention**: two independent layers, never confused with each
-  other - (a) server-side: unchanged, already race-free
-  `decide_and_bind`/`per_activation_lock`. (b) client-side: the `nonce` is
-  used only for **local** "have I already successfully imported this exact
-  package on this device" bookkeeping (a UX/idempotency convenience, e.g. to
-  avoid re-showing "Checking activation package" for a package already
-  consumed on this device) - it is explicitly **not** a security control and
-  must never be relied on to prevent a *different* device from redeeming a
-  copied package; that property is, and remains, the server's job.
-- **Package theft**: identical blast radius to today's credential theft -
-  bounded by the activation's own `max_devices`/`expires_at`/revocation.
-  The package's own shorter envelope `expiresAt` reduces the *exposure
-  window* (a screenshot/forward found weeks later is simply rejected
-  locally as `PACKAGE_EXPIRED` before ever reaching the network) but does
-  not change the underlying entitlement model.
-- **Simultaneous redemption from two devices**: unchanged from today -
-  `decide_and_bind`'s existing flock-guarded pending-count-toward-max_devices
-  check already makes this race-free (see section 1's citation); the
-  package format adds nothing here and removes nothing.
-- **max_devices interaction**: none beyond what already exists - the
-  package is a delivery wrapper around one `activationId`; every device
-  that imports a copy of the same package presents the same underlying
-  credential to the same, unchanged, server-side entitlement check.
-- **After expiry**: two independent, non-conflatable outcomes - a
-  *package-envelope*-expired package is rejected locally
-  (`PACKAGE_EXPIRED`) without any network call; a package that still
-  verifies locally but whose underlying activation has separately expired
-  server-side still reaches `decide_and_bind`'s own `EXPIRED` outcome,
-  surfaced as `ACTIVATION_EXPIRED` (not `PACKAGE_EXPIRED` - these must
-  render as distinct UX states, see section 20).
-- **Issuer-key rotation**: identical mechanism to the manifest's already-
-  proven two-key `FixedManifestTrustAnchors` pattern - embed the current and
-  the immediately-previous activation-issuer key simultaneously; a package
-  signed by either verifies. A signed keyset-update object (the task's own
-  "signed keyset updates" idea) is explicitly deferred to future work
-  (section 30) rather than built now - out of scope per the "no new
-  production control-plane surface this slice" instruction.
-- **Device clock wrong**: reuse `Ed25519ManifestVerifier`'s existing
-  clock-skew-tolerance constant and reasoning verbatim (a small forward
-  tolerance, no backward tolerance) for `notBefore`/`expiresAt`; distinguish
-  a package that is `EXPIRED` under a plausible clock from one that is only
-  rejected because the *device* clock is implausible, and surface the latter
-  as the distinct `CLOCK_UNCERTAIN` failure (section 20) rather than
-  silently loosening the check.
+  `decide_and_bind()`'s existing binding - unchanged.
+- **Replay prevention**: unchanged (section 14) for the envelope/credential.
+  For the bundle: `EndpointManifestRepository.offer()`'s existing rollback
+  guard is itself the replay defense for network facts - a captured old
+  bundle is simply not-newer and rejected, exactly like a captured old
+  HTTPS-fetched manifest would be.
+- **Package theft**: unchanged for the envelope/credential (bounded by
+  `max_devices`/`expires_at`/revocation). A stolen bundle grants nothing new
+  - it can, at most, tell a thief's device about endpoints that were already
+  going to be signed and public regardless of who imports them.
+- **Two devices redeeming simultaneously**: unchanged (section 12) -
+  `decide_and_bind`'s race-free binding is untouched by adding a bundle.
+- **max_devices interaction**: unchanged - the bundle carries no entitlement.
+- **After expiry**: unchanged three-way distinction (envelope-expired vs.
+  activation-expired), plus a **new**, independent fourth case: a bundle
+  whose *own* manifest `expiresAtEpochMillis` has passed is rejected by the
+  *existing* `Ed25519ManifestVerifier` the same way any expired manifest is
+  - surfaced as `BOOTSTRAP_BUNDLE_EXPIRED` (section 20), never conflated with
+  `PACKAGE_EXPIRED` (envelope) or `ACTIVATION_EXPIRED` (server-side).
+- **Issuer-key rotation**: unchanged for the activation-issuer key (two-key
+  `FixedManifestTrustAnchors` pattern). The bundle needs no separate rotation
+  story at all - it rotates exactly when the manifest signing key already
+  does, because it *is* signed by that key.
+- **Device clock wrong**: unchanged (`CLOCK_UNCERTAIN`, section 7 original /
+  20) for both objects independently - the bundle already gets this for free
+  from `Ed25519ManifestVerifier`'s existing clock-skew handling.
 
 ## 8. Key hierarchy
 
-Covered in section 6. Concretely: one offline ceremony process (the
-existing `docs/B12_MANIFEST_KEY_CEREMONY.md` procedure, reused, not
-reinvented) produces both the manifest signing key and a **new**,
-independently rotatable activation-issuer key. Embedded public-key sets for
-each purpose are separate `FixedManifestTrustAnchors`-shaped objects, never
-merged. Compromise of the activation-issuer key's signing capability lets an
-attacker mint *packages* that verify - but per section 6/15, a verifying
-package alone confers no entitlement; the server-side activation store is
-still the final gate. This bounds blast radius of an issuer-key compromise
-to "can produce spam/decoy packages," not "can provision arbitrary devices."
+Corrected per Correction 1/6: one offline ceremony produces the manifest
+signing key (unchanged, reused for `SignedBootstrapBundle`) and a **new**
+activation-issuer key (used only for `ActivationEnvelope`). These are never
+merged, never cross-trusted (an envelope signed by the manifest key, or a
+bundle signed by the activation-issuer key, must both be rejected as
+`UNKNOWN_SIGNING_KEY` by their respective verifiers - each verifier's trust-
+anchor set only ever contains keys for its own purpose). Blast radius of
+each key's compromise is analyzed precisely in the corrected threat model
+(section 21), not summarized here as it was in the first version.
 
 ## 9. Bootstrap candidate model
 
-No new candidate type. `bootstrapEndpointHints` in the package is a list of
-`EndpointId` values that **must already appear** in whatever manifest the
-client currently trusts (via `EndpointManifestRepository.trustedState()`,
-unchanged). The `BootstrapCandidateRepository` (new, thin) does exactly one
-thing: given the currently-trusted manifest and an optional hint list,
-produce an ordered subset of that manifest's own `EndpointDescriptor`s/
-`EndpointTransportBinding`s - hints reorder, they never introduce. This is
-what makes "never accept arbitrary user-supplied activation URLs" hold
-structurally for bootstrap too, not just for the existing `ActivationResilienceCoordinator`
-path: a hint that names an `EndpointId` absent from the trusted manifest is
-silently ignored (never an error, never a fallback host).
+`bootstrapEndpointHints` (unsigned, inside the envelope) is unchanged from
+the first version and its rule is unchanged (Correction 8, made explicit):
+**hints may only reorder candidates already present in whatever manifest is
+currently trusted** - they can never introduce a new one. This remains true
+even after this correction, and is now stated precisely alongside the
+mechanism that *can* introduce new candidates:
 
-A future slice (see section 32) may add a narrow capability flag to
-`EndpointTransportBinding.metadata` (already a free-form string map, so this
-needs no wire-format change) marking which bindings a *bootstrap* client
-(no device profile yet) is allowed to dial - server-enforced (section 11),
-not merely a client-side hint.
+**New candidate facts can enter only through a validly-signed
+`SignedBootstrapBundle`, consumed by `EndpointManifestRepository.offer()`
+(section 16) - never through any unsigned field.** This is Correction 8's
+distinction made structural: an attacker who can inject or modify an
+unsigned hint list gains nothing (it only reorders what a signature already
+vouches for); an attacker who wants to add a new endpoint must forge a
+manifest-key signature, which this design never weakens.
+
+`SignedBootstrapBundle`'s recommended shape: reuse `EndpointManifest`
+byte-for-byte (Correction 1's "choose the cleanest format after inspecting
+existing manifest types" - a full, ordinary `SignedManifest` already
+satisfies every requirement here with zero new wire format). A future slice
+may additionally define a narrower, size-bounded bundle shape (a manifest
+naming only the endpoints/bindings an operator wants to hand out via
+out-of-band recovery packages) if QR payload size becomes a real constraint
+- but this is an operational packaging choice, not a new trust type, since
+it would still be exactly an `EndpointManifest` under exactly the same
+signature.
+
+A future slice may add a narrow capability flag to
+`EndpointTransportBinding.metadata` (already a free-form string map, no wire
+change needed) marking which bindings a bootstrapping client (no device
+profile yet) may dial under Level 2 (section 11) - server-enforced, never
+merely a client-side hint, unchanged from the first version's proposal.
 
 ## 10. Multi-origin retrieval design
 
-For the **package itself**: reuse Pattern C exactly as already proven for
-manifests. The package's integrity is its signature; therefore *any* of
-dashboard, email, QR, downloadable file, or a static mirror is pure
-delivery, never a trust authority. No new mechanism is needed here - the
-manifest's own `MultiOriginManifestDistributionClient` already demonstrates
-the pattern this design would apply to package distribution, and the
-principle transfers without new code (there is nothing to "fetch" over
-multiple origins for a package the user already imported by QR/file/paste -
-multi-origin *retrieval* in the package case reduces to "multi-channel
-*distribution*", handled in section 27, not a network resolver).
+Corrected per Correction 9: this section now names three *distinct*
+mechanisms explicitly, rather than treating package delivery as if it were
+equivalent to live multi-origin manifest retrieval.
 
-For the **manifest** consulted during bootstrap: unchanged - the existing
-`EndpointManifestRepository`/`MultiOriginManifestDistributionClient`
-precedence (LIVE via configured origins -> LKG -> EMBEDDED) is reused
-as-is; a bootstrapping device with no profile yet can still refresh/consult
-the manifest through this exact existing path, since manifest fetch has
-never depended on per-device provisioning.
+1. **Live multi-origin manifest retrieval** (unchanged, existing,
+   `MultiOriginManifestDistributionClient`): network-time redundancy across
+   already-configured HTTPS origins. Solves "one origin is down/blocked,
+   others aren't." Does not help if *every* configured origin is blocked.
+2. **Out-of-band imported signed manifest** (new, this revision,
+   `SignedBootstrapBundle`): solves a *different* failure - the device's
+   entire currently-trusted candidate set (LIVE origins that are all
+   blocked, LKG, and embedded bootstrap) is stale or fully blocked, and an
+   operator hands the user a *signed* replacement/addition out-of-band (QR,
+   file, support channel). This is delivery-channel diversity for the
+   *manifest itself*, not network-path diversity for reaching one - it
+   recovers a device that has no working network path to any manifest
+   origin at all, by letting a human carry the signed bytes around that
+   barrier instead. It reuses `offer()`'s trust boundary; it does not
+   replace live retrieval, and it does not run periodically - it is
+   consumed once, at import.
+3. **Package delivery** (envelope + bundle container, unchanged
+   reasoning from the first version): QR/email/file/dashboard/messenger are
+   all pure delivery for the *container*; integrity comes from the two
+   signatures inside it, never from which channel carried it.
 
 ## 11. Restricted bootstrap lane
 
-**Finding, not proposal**: the production control plane already is a
-narrowly-scoped, unauthenticated-reachable surface for exactly two routes -
-`POST /v1/activate` and `GET /v1/manifest` (confirmed in both
-`nginx-pocvpn.conf` and `nginx-pocvpn-stockholm.conf`). There is no VPN data
-plane reachable before activation succeeds; "restricted bootstrap lane" is
-therefore mostly **already true by construction** for the control-plane
-half of the problem - a bootstrapping device was never going to get
-"arbitrary Internet access" through these two HTTP routes regardless of this
-design.
+**Correction 4/5/6 applied - this section now defines two genuinely distinct
+levels, not one.**
 
-What is genuinely missing (confirmed absent, not assumed): **rate limiting**.
-No `limit_req`/`limit_conn` exists anywhere in `gateway/edge/*.conf` today,
-for any route, including `/v1/activate`. Publishing this design (and
-especially self-service issuance, section 25) increases the incentive to
-abuse `/v1/activate`, so closing this gap is a genuine prerequisite - see
-section 22 and "Owner decisions required."
+### Level 1 - direct control-plane bootstrap (preferred, cheapest)
 
-Enforcement must be server-side (nginx `limit_req_zone`/`limit_req` keyed by
-client IP for `/v1/activate` and `/v1/manifest`, plus the existing
-per-activation flock already bounding concurrent redemption attempts for one
-`activationId`) - never client-side-only. A dedicated "Bootstrap Edge"
-service/segment is **not** proposed for v1: the two existing routes are
-already narrow enough that standing up a separate nginx listener or network
-segment would add operational surface without closing a real gap that rate
-limiting doesn't already close more cheaply. Revisit this decision if a
-production incident shows the two-route scope is not narrow enough in
-practice.
+`BootstrapCandidateRepository` builds an ordered candidate list from
+whatever `EndpointManifestRepository` now trusts - which, after this
+revision, may include endpoints that only became trusted because a
+`SignedBootstrapBundle` was just offered and accepted (section 10.2). Every
+candidate is dialed as an ordinary HTTPS request to `/v1/activate` or
+`/v1/manifest`, using the *existing* `ReachabilityEngine`/`NetworkProfiler`/
+`RestrictionClassifier` (never a parallel scorer, per the task's own
+constraint). If any candidate succeeds, bootstrap is done at Level 1 - no
+new transport, no new authentication, nothing beyond what
+`ActivationResilienceCoordinator`'s pattern already demonstrates, just
+widened to whatever the manifest (possibly just-freshened by an imported
+bundle) now names.
+
+**Finding, reused from the first version**: `/v1/activate` and
+`/v1/manifest` are already the only two unauthenticated-reachable routes,
+and there is already no VPN data plane reachable pre-activation - Level 1
+was never at risk of becoming "arbitrary Internet access." What Level 1
+alone cannot do is help a device on a network that blocks literally every
+manifest-known origin/IP by destination, regardless of protocol - that is
+Level 2's job.
+
+### Level 2 - restricted pre-activation bootstrap transport (fallback,
+architecture defined here, NOT built this slice)
+
+**Correction 5 - bootstrap auth model selected: Hybrid (Model D), with the
+two authorities kept deliberately separate:**
+
+- The **transport-access question** ("may this client use the narrow
+  Level 2 lane at all, and how much of it") is answered by a short-lived,
+  narrow-scope **bootstrap capability** - conceptually a small, server-
+  minted, time-boxed token (reusing existing HMAC/Ed25519 primitives, no new
+  cryptography) that a Level-2 listener can check locally without touching
+  the activation store. It is bound to the `ActivationEnvelope`'s signature/
+  `activationId` (so a capability cannot be requested without presenting a
+  validly-signed envelope first) but is **not** the activation credential
+  itself and **grants no entitlement** - it only opens a narrow pipe.
+  `bootstrapCapabilityHint` (section 7) is where a *pre-issued* capability,
+  if the issuer chose to hand one out at package-creation time, would travel
+  - optional, because a capability can equally be requested live (envelope
+  presented to a narrow, rate-limited capability-issuance endpoint) at
+  bootstrap time instead of being pre-baked into the package.
+- The **entitlement question** ("does this device actually get provisioned")
+  stays exactly what it already is - `/v1/activate`'s existing
+  `decide_and_bind`/`provision_with_activation`, reached *through* the
+  Level-2 lane once it's open, unchanged (section 12).
+- This separation is the point of Correction 5: a stolen capability alone
+  (short TTL, narrow scope, no entitlement) cannot provision a device
+  without also having the real credential; a stolen credential alone
+  (today's existing risk, unchanged) cannot open the Level-2 lane without
+  also presenting a validly-signed envelope. Two independent, narrower
+  blast radii instead of one wider one.
+
+**Correction 6 - server-side enforcement boundary, defined but not built:**
+
+Level 2 requires a real network listener distinct from "an HTTP route
+behind the normal control-plane" - a capability alone is meaningless without
+something that checks it before permitting *any* bytes through. Conceptually:
+a narrow, dedicated listener (a separate bind/socket, not merely another
+nginx `location` on the existing control-plane vhost) that:
+- accepts a connection, checks the bootstrap capability before relaying
+  anything,
+- allowlists destinations to exactly `/v1/activate` and `/v1/manifest` on
+  the same gateway (never a general egress path, never another gateway's
+  data plane),
+- enforces its own short TTL, per-capability bandwidth/request caps, and
+  connection caps, independent of and in addition to whatever rate limiting
+  Level 1's existing routes eventually get (section 22),
+- runs as its own least-privilege service/account so a bug in it cannot
+  reach `activations.py`'s store directly - only through the same
+  `/v1/activate` HTTP call Level 1 already makes.
+
+This is an architecture-level specification, not a build: no listener, no
+nginx change, no capability-issuance endpoint is created by this PR. It
+exists so that if Level 1 is approved and later found insufficient in the
+field (B54), Level 2 has a concrete, already-reviewed target to build
+against instead of an open question.
 
 ## 12. Redemption transaction
 
-Unchanged. `provision_with_activation()` (section 1) already provides:
-atomic per-activation serialization across the whole
-decide/provision/finalize-or-rollback sequence, race-free device-limit
-enforcement under concurrent same/different-key requests, and monotonic,
-ownership-checked rollback on a failed provisioning attempt. This design
-adds nothing to `/v1/activate`'s semantics - a package-derived redemption
-request is byte-for-byte the same `(public_key, activation_credential)` pair
-the existing endpoint already accepts. **No change to `/v1/activate` is
+Unchanged. `provision_with_activation()` already provides atomic
+per-activation serialization, race-free device-limit enforcement, and
+monotonic ownership-checked rollback. Neither the envelope/bundle split nor
+the two-level bootstrap model changes `/v1/activate`'s semantics at all - a
+redemption request reaching it, whether via Level 1 or Level 2, is
+byte-for-byte the same `(public_key, activation_credential)` pair the
+existing endpoint already accepts. **No change to `/v1/activate` is
 required by this slice.**
 
 ## 13. Device binding
 
-Unchanged (section 1): the device's own AWG keypair
-(`ClientKeyRepository`) is the binding identity, exactly as today. A
-reinstall/lost-app-data/new-device scenario is already the existing
-`BOUND_EXISTING` vs `DEVICE_LIMIT` outcome space in `activations.py` -
-nothing new to design here.
+Unchanged (section 1): the device's own AWG keypair remains the binding
+identity. Nothing about the envelope/bundle split changes this.
 
 ## 14. Replay prevention
 
-See section 7's answer in full. Server-side: unchanged, already correct.
-Client-side `nonce`: explicitly non-security, local dedupe only - stated
-here again because it is the single easiest place for a future implementer
-to over-claim a security property this field does not have.
+Unchanged for the envelope/credential (section 7's answer). For the bundle:
+see section 7's new bullet - `ManifestRollbackGuard` is the replay defense
+for network facts, already existing, reused without modification. For a
+Level 2 bootstrap capability (section 11): bounded by its own short TTL and
+narrow scope - a replayed capability is only ever useful for the narrow
+window and narrow destinations it was already scoped to, never a standing
+credential.
 
 ## 15. Revocation
 
-Local package verification proves *provenance* (issued by Nova's
-activation-issuer key), never *current entitlement*. A device that only
-ever gets as far as offline package verification, and never reaches a live
-`/v1/activate` call, must never be shown "activated" - the client's own
-package-import success state must be phrased as "package verified, ready to
-attempt activation," not "activated" (see section 20/24). Revocation remains
-exactly what it already is: `revoke_activation()` flips the activation's
-server-side `status` to `REVOKED`, observed by any subsequent
-`decide_and_bind`/`finalize_reservation` call under the same lock discipline
-already analyzed for the B8C1A/B8C1B races. A package cannot un-revoke
-itself by being re-imported.
+Unchanged (section 1 original): local verification of either signed object
+proves provenance, never current entitlement. `revoke_activation()` remains
+the sole, final, online authority for the underlying activation. A
+Level 2 bootstrap capability's own short TTL is its own de facto revocation
+mechanism (it simply stops working); no separate capability-revocation list
+is proposed for v1 given the short TTL already bounds exposure.
 
 ## 16. Manifest/LKG/embedded integration
 
-Deliberately unchanged (section 1/9/10): `EndpointManifestRepository`'s
-existing LIVE->LKG->EMBEDDED precedence and rollback guard are reused
-verbatim. The package never carries manifest bytes and never asserts a
-manifest version *takes precedence over* what the device already trusts -
-`bootstrapManifestVersion` is informational (lets the client's diagnostics
-report "issuer expected version N, device currently trusts version M"),
-never an input to `ManifestRollbackGuard`. This satisfies the task's
-explicit warning against letting an older package roll back an
-already-trusted newer manifest, structurally: the field is never consulted
-by the rollback guard at all.
+**Correction 2/3 applied - this is the section that most changed.**
+
+`EndpointManifestRepository`'s existing precedence and rollback guard are
+reused **unmodified**, with one new, additive fact source layered in at
+exactly the point the existing design already generalizes to:
+
+```
+Precedence, corrected:
+  1. LIVE  - via MultiOriginManifestDistributionClient, EXISTING, unchanged
+  2. LKG   - EXISTING, unchanged
+  3. EMBEDDED_BOOTSTRAP - EXISTING, unchanged
+  4. IMPORTED_SIGNED_BOOTSTRAP - NEW delivery-only source: a SignedBootstrapBundle
+     the user imported out-of-band, offered to the SAME EndpointManifestRepository.offer()
+     every other candidate already goes through.
+```
+
+Concretely, `IMPORTED_SIGNED_BOOTSTRAP` is not a new precedence *tier* with
+special privilege - it is simply calling the existing `offer(candidate)`
+with a candidate whose bytes arrived via QR/file instead of HTTPS. `offer()`
+already re-verifies signature/expiry/clock-skew from scratch and already
+rejects anything not strictly newer than what is currently trusted
+(`ManifestRollbackGuard`), regardless of who calls it or how the bytes
+arrived - this is precisely why no change to that function is required.
+The only new code is the call site (a client-side "import bundle" action)
+and a new `ManifestSource.IMPORTED_SIGNED_BOOTSTRAP` value purely for
+diagnostics (so a support engineer can see *why* a candidate got adopted),
+never a new acceptance rule.
+
+Explicit resolution of every case Correction 3 asked for:
+
+- **Imported version newer than embedded** -> accepted by the existing
+  rollback guard exactly like a newer HTTPS-fetched manifest would be;
+  becomes the new LKG.
+- **Imported version older than LKG** -> rejected by the existing rollback
+  guard (`ROLLBACK_OR_NOT_NEWER`), exactly like a stale HTTPS fetch; LKG
+  untouched. An imported bundle can **never** roll back an already-trusted
+  newer manifest - this was already structurally true of `offer()` before
+  this revision existed, and remains true now.
+- **Imported manifest expired** -> rejected by `Ed25519ManifestVerifier`
+  (`EXPIRED`), exactly like an expired HTTPS fetch.
+- **Imported manifest signed by a previous-but-still-trusted key** ->
+  accepted, exactly like the manifest's existing two-key rotation window
+  already handles for HTTPS fetches (`prod-manifest-key-2026-09-01` and
+  `-09-14` both currently verify).
+- **Imported manifest signed by an unknown key** -> rejected
+  (`UNKNOWN_SIGNING_KEY`), exactly like an HTTPS fetch signed by a key the
+  device has never embedded.
+- **Device offline for months** -> unchanged existing behavior: LKG (if
+  still unexpired) or embedded bootstrap remains the fallback exactly as
+  today; an imported bundle, if the user has one, is simply one more
+  candidate offered through the same boundary - it does not need to be
+  "newer than everything" to be useful, only newer than whatever the device
+  currently trusts, which may itself be very stale after months offline.
+- **Emergency rollback policy** -> unchanged: none exists today beyond
+  "a strictly newer valid manifest wins," and this revision does not add
+  one. An operator recovering a fleet of devices stuck behind a block would
+  issue a new, strictly-newer, validly-signed bundle - never a mechanism to
+  force-accept an older one.
+
+This satisfies Correction 2's explicit requirement ("must not bypass
+`EndpointManifestRepository`... must NOT create a second trust path... the
+source is only a delivery mechanism") by construction: there is exactly one
+function, `offer()`, that can ever cause a new endpoint fact to become
+trusted, and this revision adds no second one.
 
 ## 17. Transport selection integration
 
-Not touched. Once `provision_with_activation()` succeeds, normal profile
-provisioning (AWG/Xray/REALITY/TLS-TCP/etc, as already gated by
-`TransportRegistry`/`AutoGatewaySelector`/Smart Connect) takes over
-unchanged. The bootstrap package's authority ends the moment a device
-profile exists - see section 24.
+Unchanged. Once `provision_with_activation()` succeeds, normal profile
+provisioning takes over unchanged. Neither Level 1/Level 2 bootstrap nor the
+imported-bundle path is consulted again once a device profile exists.
 
 ## 18. Server architecture
 
-No new service for v1 (section 11). Concretely, this slice's *eventual*
-server-side implementation work (not built now) is:
+Corrected to reflect the two-level model (section 11), still nothing built
+this slice:
 1. `limit_req_zone`/`limit_req` for `/v1/activate` and `/v1/manifest` in
-   both existing nginx configs (closes the confirmed gap in section 1/11).
-2. A new, separate CLI (mirroring `activation_tokens.py`'s own structure,
-   never modifying it) for the future self-service issuer to mint activation
-   credentials via the *existing* `issue_activation()` function, then wrap
-   the result into a signed `NovaBootstrapPackage` using the new,
-   independently-rotatable activation-issuer key. This CLI is an *issuance*
-   tool only - it never touches `/v1/activate`'s runtime path.
+   both existing nginx configs (Level 1 hardening - section 11/22, unchanged
+   from the first version, still a real and separate gap).
+2. A new, separate CLI (mirroring `activation_tokens.py`'s structure, never
+   modifying it) that calls the *existing* `issue_activation()` and wraps
+   the result into a signed `ActivationEnvelope` using the new activation-
+   issuer key - and, separately, a way for an operator to attach an existing,
+   already-signed `EndpointManifest` (produced by the *existing*
+   `manifest_signing.py`, unmodified) as the package's `SignedBootstrapBundle`
+   when out-of-band manifest recovery is the goal.
+3. (Level 2 only, deferred - section 11) a narrow, dedicated
+   listener/service issuing and checking bootstrap capabilities, allowlisted
+   to `/v1/activate`/`/v1/manifest` on its own gateway, least-privilege,
+   rate/bandwidth/TTL-bounded. Specified, not built.
 
 ## 19. Client architecture
 
-New components, all thin, all reusing existing authorities:
-- `ActivationPackageParser` - decode/schema-validate only, no crypto.
-- `ActivationPackageVerifier` - mirrors `Ed25519ManifestVerifier`'s shape
-  (own trust-anchor set, own typed failure enum) almost exactly; genuinely
-  new code, but not a new *pattern*.
-- `BootstrapCandidateRepository` - thin read-through over
-  `EndpointManifestRepository.trusted()` plus hint reordering (section 9).
-- `BootstrapReachabilityResolver` - thin orchestration calling the existing
-  `ReachabilityEngine`/`NetworkProfiler`/`RestrictionClassifier` over the
-  candidates above; produces an ordered attempt list, never a new scorer.
-- `BootstrapLaneClient` - calls the same `/v1/activate` HTTP shape the
-  existing `ProvisioningClient`/`ActivationResilienceCoordinator` already
-  use, parameterized by the package's credential instead of an
-  operator-typed one; **not** a new HTTP client stack.
+Corrected component list - `ActivationPackageVerifier` is now two verifiers
+behind one container parser, and a new resolver step chooses between Level 1
+and Level 2:
 
-**Explicitly not duplicated**: `ReachabilityEngine`, `PathScorer`,
-`PathCandidateBuilder`, `AutoGatewaySelector`, `SmartConnectDecisionEngine`,
-`EndpointManifestRepository`, `Ed25519ManifestVerifier`'s crypto primitive,
-`ManifestCanonicalizer`'s encoding convention, `ClientKeyRepository`,
-`provision_with_activation()`.
+- `ActivationPackageParser` - decodes the container into its two logical
+  objects; no crypto.
+- `ActivationEnvelopeVerifier` - mirrors `Ed25519ManifestVerifier`'s shape,
+  own trust-anchor set (activation-issuer keys only), own typed failures.
+- **`SignedBootstrapBundle` verification performs NO new verification code**
+  - it is handed to the *existing* `EndpointManifestRepository.offer()`
+  unmodified (section 16); there is deliberately no
+  `BootstrapBundleVerifier` type, because inventing one would be exactly the
+  second trust path Correction 2 forbids.
+- `BootstrapCandidateRepository` - thin read-through over
+  `EndpointManifestRepository.trusted()` (called *after* any bundle offer)
+  plus hint reordering (section 9) - unchanged in shape from the first
+  version, now simply reading a possibly-just-refreshed trust state.
+- `BootstrapReachabilityResolver` - thin orchestration; tries Level 1 first
+  (existing `ReachabilityEngine`/`NetworkProfiler`/`RestrictionClassifier`
+  over the candidates above), falls back to Level 2 only if every Level 1
+  candidate is exhausted and a Level 2 lane is actually configured/available
+  (it may not be, in v1 - see section 32's slice ordering).
+- `BootstrapLaneClient` - calls the same `/v1/activate` HTTP shape either
+  way; parameterized by which lane (Level 1 direct, or Level 2 through the
+  capability-gated listener) it is currently using, never a new HTTP client
+  stack.
+
+**Explicitly not duplicated** (unchanged list, still holds): `ReachabilityEngine`,
+`PathScorer`, `PathCandidateBuilder`, `AutoGatewaySelector`,
+`SmartConnectDecisionEngine`, `EndpointManifestRepository`,
+`Ed25519ManifestVerifier`'s crypto primitive, `ManifestCanonicalizer`'s
+encoding convention, `ClientKeyRepository`, `provision_with_activation()`.
 
 ## 20. Failure model
 
-Typed, per the task's own list, mapped to this design's actual checks (no
-invented category beyond what a component above actually produces):
-`PACKAGE_MALFORMED`, `PACKAGE_SIGNATURE_INVALID`, `PACKAGE_EXPIRED`,
-`PACKAGE_NOT_YET_VALID`, `PACKAGE_VERSION_UNSUPPORTED`,
-`ISSUER_KEY_UNKNOWN`, `CLOCK_UNCERTAIN` (section 7),
-`BOOTSTRAP_MANIFEST_UNAVAILABLE` (delegates to
-`TrustedManifestState.NoneTrusted`, unchanged), `NO_TRUSTED_BOOTSTRAP_CANDIDATE`,
-`ALL_BOOTSTRAP_PATHS_UNREACHABLE`, `BOOTSTRAP_AUTH_REJECTED` (maps to
-`decide_and_bind`'s existing `INVALID`), `ACTIVATION_REVOKED` (existing
-`REVOKED_OUTCOME`), `ACTIVATION_EXPIRED` (existing `EXPIRED` - kept
-textually distinct from `PACKAGE_EXPIRED`, section 7), `DEVICE_LIMIT_REACHED`
-(existing `DEVICE_LIMIT`), `PROFILE_PROVISIONING_FAILED` (existing
-provisioning-error path), `BOOTSTRAP_RATE_LIMITED` (new, once section 11's
-rate limiting exists).
+Corrected/extended failure set - every addition maps to a check a component
+above actually performs, none invented beyond that:
+
+`PACKAGE_MALFORMED`, `ENVELOPE_SIGNATURE_INVALID`, `PACKAGE_EXPIRED`
+(envelope), `PACKAGE_NOT_YET_VALID`, `PACKAGE_VERSION_UNSUPPORTED`,
+`ISSUER_KEY_UNKNOWN` (envelope), `BOOTSTRAP_BUNDLE_SIGNATURE_INVALID`,
+`BOOTSTRAP_BUNDLE_EXPIRED`, `BOOTSTRAP_BUNDLE_UNKNOWN_KEY`,
+`BOOTSTRAP_BUNDLE_ROLLBACK_REJECTED` (all four map 1:1 to the *existing*
+`ManifestVerificationFailureKind`/`ManifestUpdateRejectionKind` enums via
+`offer()` - no new verification logic, just a client-facing label for an
+existing rejection reached from a new call site), `CLOCK_UNCERTAIN`,
+`BOOTSTRAP_MANIFEST_UNAVAILABLE` (`TrustedManifestState.NoneTrusted`,
+unchanged), `NO_TRUSTED_BOOTSTRAP_CANDIDATE`,
+`ALL_LEVEL1_PATHS_UNREACHABLE` (renamed from `ALL_BOOTSTRAP_PATHS_UNREACHABLE`
+to be precise about which level exhausted), `LEVEL2_UNAVAILABLE` (new - no
+capability, or no configured Level 2 lane, or the lane itself rejected the
+capability), `BOOTSTRAP_AUTH_REJECTED` (`decide_and_bind`'s `INVALID`),
+`ACTIVATION_REVOKED`, `ACTIVATION_EXPIRED`, `DEVICE_LIMIT_REACHED`,
+`PROFILE_PROVISIONING_FAILED`, `BOOTSTRAP_RATE_LIMITED` (Level 1, once
+section 22 ships).
 
 ## 21. Threat model
 
-- **Network adversary**: unchanged from the existing manifest/activation
-  threat surface - DNS/IP/DPI blocking of one origin is mitigated by the
-  already-proven multi-origin manifest fetch and, for the package, by
-  channel-independent delivery (section 27); this design cannot create
-  connectivity where a hard whitelist admits none (section 27's own
-  limitation section restates this explicitly).
-- **Package thief**: bounded exactly as an activation-credential thief is
-  bounded today (section 7) - no worse.
+**Correction 10 applied - blast radii now distinguished by exactly which
+authority is compromised, not collapsed into "activation-issuer key
+compromise" as a single category:**
+
+- **Signing-key-only compromise (activation-issuer key)**: an attacker who
+  extracts only the private key can forge `ActivationEnvelope`s that verify
+  locally, but every one of them still terminates at `decide_and_bind`,
+  which only ever binds/provisions for an `activationId` that genuinely
+  exists, is `ACTIVE`, unexpired, and under its device cap in the *real*
+  server-side store. Blast radius: can produce plausible-looking but
+  non-functional decoy/spam packages; **cannot** provision any real device,
+  because forging a signature does not create a matching store entry.
+- **Signing-key-only compromise (manifest key)**: unchanged from today
+  (pre-existing risk, not introduced by this design) - can forge a
+  `SignedBootstrapBundle` (or any manifest) that verifies, but
+  `ManifestRollbackGuard` still bounds it to "can supply endpoints, cannot
+  roll back a newer trusted manifest." This is the highest-value key in the
+  whole system precisely because it is the *only* one with network-fact
+  authority - which is exactly why this design deliberately never gives the
+  activation-issuer key that power (section 6).
+- **Package-delivery compromise** (a mirror, dashboard, or QR-hosting
+  service is compromised): can serve a stale-but-still-validly-signed
+  object, or refuse to serve anything, or serve garbage - cannot forge
+  either signature, cannot roll back a newer manifest, cannot grant
+  entitlement. Unchanged from the first version's "malicious mirror"
+  analysis, now stated for both objects, not just the package.
+- **Issuer-*service* compromise** (the running process/host that holds the
+  activation-issuer private key AND is authorized to call the existing
+  `issue_activation()` on the live store): **materially worse than
+  signing-key-only compromise**, and understated as "spam/decoy" in the
+  first version of this document - corrected here. Such a compromise can
+  mint **real**, server-valid activations (via the legitimate
+  `issue_activation()` call, which the service is *supposed* to be able to
+  make) and wrap them in validly-signed envelopes - i.e. it can provision
+  real devices, up to whatever `max_devices`/rate limits are in force. This
+  is why the future self-service issuance service (section 32, B56-8) needs
+  its own hardening review before it goes live, separate from and *in
+  addition to* this architecture document - the issuer-service's ability to
+  call `issue_activation()` is the actual high-value target, not the
+  signing key alone.
+- **Activation-store/API compromise** (`pocvpn-api` itself, or its
+  `activations.py` store, compromised): unchanged from today - this
+  design introduces no new authority here; blast radius is exactly what
+  compromise of `pocvpn-api` already means, whether or not packages exist.
+- **Compromised bootstrap capability** (Level 2 only, section 11): bounded
+  by its own short TTL, narrow destination allowlist, and the fact that it
+  grants transport, not entitlement - a stolen capability alone cannot
+  provision a device without also having the real credential.
 - **Reverse engineer**: assume APK-embedded activation-issuer public keys,
   manifest public keys, and embedded bootstrap manifest are all recoverable
-  - none of them are secrets; only the per-package `credential` is, and it
+  - none are secrets. Only the per-envelope `credential` is secret, and it
   is never embedded in the APK.
-- **Malicious mirror**: cannot forge a package or manifest (signature), and
-  cannot roll back a newer trusted manifest (`ManifestRollbackGuard`,
-  unchanged) or a newer-issued package (package `notBefore`/`expiresAt` are
-  envelope facts checked against device clock, not against "newest seen" -
-  a malicious mirror serving an old-but-still-validly-signed package can at
-  worst hand out a package whose underlying `activationId` may already be
-  consumed/revoked, which `decide_and_bind` already rejects).
-- **Compromised bootstrap endpoint** (i.e. a compromised production
-  gateway's control-plane process): blast radius is exactly what compromise
-  of `pocvpn-api` already means today - it is not raised or lowered by this
-  design, because no new server-side trust authority is introduced. It
-  cannot mint arbitrary permanent device profiles beyond what a compromised
-  `pocvpn-api` could already do to `activations.py`'s own store.
-- **Compromised activation voucher/credential**: bounded by
-  `max_devices`/`expires_at`/revocation, unchanged.
-- **Clock manipulation**: section 7's `CLOCK_UNCERTAIN` handling.
-- **Replay**: section 14.
-- **Denial of service**: section 11/22.
+- **Clock manipulation / Replay / Denial of service**: sections 7/14/22,
+  unchanged in substance, now covering both objects and both bootstrap
+  levels explicitly.
 
 ## 22. Abuse/rate limiting
 
-The one concrete, currently-missing control this design surfaces (section
-11): per-IP `limit_req` on `/v1/activate` and `/v1/manifest`. Additional
-layers worth designing *before* self-service issuance ships (section 25),
-not before this architecture slice: per-`activation_id` attempt caps (cheap
-to add - `decide_and_bind` already reads/writes under a per-activation lock,
-a natural place to also track a bounded recent-attempt counter without
-introducing a second store) and avoiding simplistic IP-only lockouts for
-shared/NAT'd carrier IPs, per the task's own caution.
+**Correction 11 applied**: rate limiting is reframed as one of four
+*independent* layers this architecture identifies, not treated as if it
+were the primary fix for the reachability gap (it never was):
+
+1. **Level 1 edge rate limiting** (`limit_req` on `/v1/activate`/
+   `/v1/manifest`) - protects the *existing* activation surface from abuse,
+   independent of whether packages ever ship. Confirmed still missing
+   (section 1).
+2. **Package/envelope signing** - solves credential *delivery* integrity,
+   not abuse capacity.
+3. **Imported signed manifest** (section 10/16) - solves stale/blocked
+   endpoint *knowledge*, not abuse capacity.
+4. **Level 2's own capability TTL/scope/bandwidth/request caps** (section
+   11) - solves restricted-transport abuse specifically, independent of
+   Level 1's edge limiting, because Level 2 is a different listener with a
+   different abuse surface (connection/bandwidth exhaustion, not just
+   request-rate abuse).
+
+None of these four substitute for another; all four are genuinely
+independent hardening layers, and shipping any subset without the others
+leaves exactly the gap that subset doesn't cover - stated explicitly so a
+future implementer doesn't treat "we added rate limiting" as if it also
+means "Level 2 abuse is handled."
 
 ## 23. Privacy
 
-Bootstrap-time server visibility, enumerated exhaustively for this design:
-source IP (already true for any HTTP request), `activation_id`/credential
-digest (already logged server-side today, unchanged), the device's AWG
-public key (already sent to `/v1/activate` today), app version (if already
-sent - unchanged), the manifest version currently trusted, and which
-transport binding was attempted. Nothing new: no device serial, IMEI,
-advertising ID, phone number, contacts, or new fingerprinting is introduced
-by this design.
+Unchanged from the first version, extended only by the fact that a Level 2
+lane (if built) would also see: which capability was presented and which
+narrow destination was requested - nothing beyond what Level 1 already sees
+today (source IP, activation_id/credential digest, device public key, app
+version, manifest version, transport binding attempted). No device serial,
+IMEI, advertising ID, phone number, contacts, or new fingerprinting.
 
 ## 24. Observability
 
-New, safe event names for the new client components only (server-side
-event naming is unchanged, existing): `BOOTSTRAP_PACKAGE_IMPORTED`,
-`BOOTSTRAP_PACKAGE_VERIFIED`, `BOOTSTRAP_PACKAGE_REJECTED` (with the typed
-kind from section 20, never a raw string), `BOOTSTRAP_MANIFEST_SOURCE_SELECTED`,
-`BOOTSTRAP_PATH_ATTEMPT`, `BOOTSTRAP_PATH_REACHABLE`,
+Corrected event list - splits the original `BOOTSTRAP_PACKAGE_*` events by
+which object they describe, and adds Level 1/Level 2/bundle-specific events:
+`ENVELOPE_IMPORTED`, `ENVELOPE_VERIFIED`, `ENVELOPE_REJECTED` (typed kind),
+`BOOTSTRAP_BUNDLE_IMPORTED`, `BOOTSTRAP_BUNDLE_OFFERED`,
+`BOOTSTRAP_BUNDLE_ACCEPTED`, `BOOTSTRAP_BUNDLE_REJECTED` (typed kind, one of
+the four `offer()`-derived reasons), `BOOTSTRAP_MANIFEST_SOURCE_SELECTED`
+(now including `IMPORTED_SIGNED_BOOTSTRAP` as a possible value),
+`BOOTSTRAP_LEVEL1_PATH_ATTEMPT`, `BOOTSTRAP_LEVEL1_PATH_REACHABLE`,
+`BOOTSTRAP_LEVEL2_REQUESTED`, `BOOTSTRAP_LEVEL2_ESTABLISHED`,
 `BOOTSTRAP_LANE_ESTABLISHED`, `ACTIVATION_REDEMPTION_STARTED`,
 `ACTIVATION_REDEMPTION_ACCEPTED`, `ACTIVATION_REDEMPTION_REJECTED`,
 `DEVICE_BOUND`, `NORMAL_PROFILE_PROVISIONED`, `BOOTSTRAP_CONSUMED`. None of
 these ever carry the plaintext credential, a private key, raw package
-bytes, or a bearer token - matching the existing `SupportDiagnosticsRecorder`
-discipline of tagging events with closed enums/indices, never raw secrets
-or hostnames.
+bytes, a bootstrap capability's raw bytes, or a bearer token.
 
 ## 25. UX
 
+Unchanged in shape from the first version - the corrected architecture is
+invisible to the user by design:
+
 ```
 Install Nova -> Open app -> Scan QR / paste activation package
-  -> "Checking activation package"      (local verification, section 7/20)
-  -> "Finding a connection route"       (BootstrapReachabilityResolver, section 19)
+  -> "Checking activation package"      (envelope + bundle local verification, section 7/20)
+  -> "Finding a connection route"       (BootstrapReachabilityResolver - Level 1, then Level 2 if configured, section 19)
   -> "Activating this device"           (BootstrapLaneClient -> /v1/activate, unchanged endpoint)
   -> "VPN is ready"
 ```
 
-No manifest/transport/gateway/signing-key language surfaces in this flow.
+No manifest/transport/gateway/signing-key/"Level 1 vs Level 2" language
+surfaces in this flow.
 
 ## 26. Migration/backward compatibility
 
-Phase 1 (this design, if implemented): operator-issued raw activation
-credentials (today's flow) keep working completely unchanged - the package
-format is an additional, optional, *wrapper* around the exact same
-`issue_activation()`-produced credential, not a replacement transport for
-it. Phase 2: self-service issuance (section 25 interface only, not billing)
-becomes the default distribution path for new customers. Phase 3: raw
-credential distribution (copy/paste a bare token) is deprecated for new
-issuance but never removed from what `/v1/activate` accepts, so already-
-issued/undelivered credentials keep working. No existing user or activation
-record is broken at any phase - `activations.py`'s schema is untouched.
+Unchanged in substance from the first version. Phase 1: operator-issued raw
+credentials keep working unchanged; the envelope is an additive wrapper, the
+bundle is an additive, optional recovery object - neither replaces anything.
+Phase 2: self-service issuance (section 32, B56-8) becomes the default
+distribution path. Phase 3: raw credential distribution is deprecated for
+new issuance but never removed from what `/v1/activate` accepts. No existing
+user or activation record is broken at any phase; `activations.py`'s and
+`EndpointManifest`'s schemas are both untouched by this design.
 
 ## 27. Hard-whitelist limitations
 
-Stated plainly, matching the task's explicit prohibition on overclaiming:
+Restated, now honestly accounting for what Level 2 does and does not change:
 if a network permits only a fixed external destination whitelist and *none*
-of Nova's manifest-known endpoints, package-delivery channels, or issuer
-domains are on that whitelist, this architecture cannot create
-connectivity that does not exist. Multi-origin delivery and embedded
-bootstrap knowledge reduce dependence on any *one* reachable path; they
-cannot manufacture a path where the network genuinely permits none. This
-document makes no guaranteed-whitelist-bypass, guaranteed-Russia-connectivity,
-untraceability, or universal-censorship-bypass claim, anywhere. Future,
-separately-researched mechanisms for the genuinely-hard-whitelist case
-(pre-provisioned working endpoint, trusted personal relay/pairing, offline
-transfer of a currently-reachable gateway's data) are named in the task
-prompt and are explicitly out of scope for this slice (see peer pairing,
-section 29, and B51).
+of Nova's manifest-known endpoints, a Level 2 lane's own destination (were
+one ever deployed), package-delivery channels, or issuer domains are on that
+whitelist, this architecture still cannot create connectivity that does not
+exist. Level 2 widens *which* destinations might work (a small, dedicated,
+differently-hosted listener is one more thing that could be on, or added to,
+a whitelist by the network operator - it is not a technique for getting onto
+a whitelist the operator did not choose to include it on) - it does not
+change the fundamental limitation. This document makes no guaranteed-
+whitelist-bypass, guaranteed-Russia-connectivity, untraceability, or
+universal-censorship-bypass claim, anywhere, including about Level 2.
+Future, separately-researched mechanisms for the genuinely-hard-whitelist
+case (pre-provisioned working endpoint, trusted personal relay/pairing,
+offline transfer of a currently-reachable gateway's data) remain named but
+out of scope (peer pairing, B51, B54).
 
 ## 28. Test plan
 
-Unit: package parsing (well-formed/malformed), signature verification
-(valid/unknown-key/tampered), expiry/not-before (including clock-skew
-tolerance boundary), hint-list filtering against a manifest that does/does
-not contain the hinted `EndpointId`s, and - reusing existing test fixtures
-where possible - the already-proven `decide_and_bind`/`finalize_reservation`/
-`unbind_reservation` race tests remain the authority for redemption
-correctness; this design adds no new redemption test surface because it
-adds no new redemption code path.
+Extended from the first version with bundle/Level-2-specific cases, nothing
+removed:
 
-Integration: primary manifest origin reachable/blocked (reuses existing
-`MultiOriginManifestDistributionClientTest` fixtures), LKG-only, embedded-
-only, all manifest origins blocked, a `BootstrapLaneClient` request against
-a revoked/consumed/expired activation (reuses existing `activations.py`
-fixtures, no new server-side test surface needed), simultaneous redemption
-(already covered by existing B8C1A/B8C1C tests, re-verified not re-invented).
+Unit: envelope parsing/signature/expiry (unchanged from the first version's
+package tests, now scoped to `ActivationEnvelope` only), hint-list filtering
+(unchanged), and - new - `SignedBootstrapBundle` offering through `offer()`
+reusing the *existing* `EndpointManifestRepositoryTest` fixtures directly
+(newer-than-embedded accepted, older-than-LKG rejected, expired rejected,
+unknown-key rejected, previous-but-still-trusted-key accepted) - proving
+this design adds no new acceptance logic to verify, only a new call site.
 
-Chaos: DNS failure/timeout/TLS failure/reset during bootstrap lane
-resolution (reuses existing `ReachabilityEngine`/`RestrictionClassifier`
-chaos-test patterns, not a new harness), corrupt persisted LKG (existing
-`EndpointManifestRepositoryTest` coverage, reused).
+Integration: Level 1 exhausted -> falls back to attempting bundle import (if
+the user has one) -> re-resolves candidates -> succeeds; all manifest
+origins AND all embedded/LKG candidates blocked with no bundle available ->
+correctly reports `NO_TRUSTED_BOOTSTRAP_CANDIDATE`/`ALL_LEVEL1_PATHS_UNREACHABLE`
+rather than silently hanging; simultaneous redemption (unchanged, reuses
+existing B8C1A/B8C1C tests).
 
-Security: replay of a captured package against a second device (must be
-rejected at the server, proving client-side `nonce` really is non-load-
-bearing - see section 14), signature substitution/downgrade (must be
-rejected by `ActivationPackageVerifier`), attempted unlimited bootstrap
-egress (must be structurally impossible today per section 11's finding -
-test asserts no data-plane route exists pre-activation), device-count race
-under concurrent redemption from two copies of the same package (reduces to
-the already-proven `decide_and_bind` race test, re-run, not reinvented).
+Chaos: unchanged from the first version, extended to include a bundle
+import racing a concurrent LIVE manifest refresh (both should converge on
+the same "highest valid version wins" outcome via the existing rollback
+guard - no new race to prove, since both paths call the same `offer()`
+under whatever concurrency control it already has).
+
+Security: replay/theft (unchanged), bundle substitution/downgrade (must be
+rejected by the *existing* rollback guard, not a new one - test asserts no
+new code path exists to bypass it), attempted unlimited Level 2 egress (must
+be rejected by the architecture-level destination allowlist - deferred to
+whenever Level 2 is actually built, section 32), device-count race
+(unchanged, reduces to existing `decide_and_bind` tests).
 
 No test in this plan produces or implies a real Russia/hard-whitelist claim.
 
@@ -694,77 +924,100 @@ rollout of production infrastructure occurs in this document.
 
 ## 30. Open questions
 
-- Should the activation-issuer key rotation eventually be delivered as its
-  own small signed keyset-update object (mirroring a future manifest
-  keyset-update mechanism), or is APK-release-only rotation acceptable
-  indefinitely? Deferred - not blocking Slice 1/2.
-- Should `bootstrapEndpointHints` be present at all in v1, given
-  `EndpointManifestRepository`'s existing precedence already produces a
-  reasonable default ordering? It is optional and non-authoritative, so it
-  can ship empty in v1 without any behavior change, and be populated later
-  once real operational data justifies it.
-- Peer pairing (section 29 of the task prompt / section 31 below) remains
-  future research only; no architectural commitment is made here beyond
-  "the design above does not preclude it" (a peer-transferred package is
-  just another delivery channel, per section 10's principle).
+- Should `SignedBootstrapBundle` ship as a full `EndpointManifest` or a
+  narrower, size-bounded subset shape in v1? (section 9) - a packaging
+  choice, not a trust-model choice; either is verified identically.
+- Should Level 2 ship in the same initial rollout as Level 1, or only after
+  field evidence (B54) shows Level 1 alone is insufficient? (Now an explicit
+  owner decision, section "Owner decisions required" below - this was
+  previously the undecided architectural gap; it is now a genuine, resolved-
+  at-the-architecture-level, deferred-at-the-build-level choice.)
+- Should a Level 2 bootstrap capability ever be issuable *without* an
+  already-presented envelope (e.g. a fully anonymous, extremely narrow
+  "probe" capability just to check reachability)? Not proposed here -
+  default is capability issuance always requires a validly-signed envelope
+  first.
+- Peer pairing remains future research only; unchanged from the first
+  version.
 
 ## 31. Explicitly rejected alternatives
 
+Unchanged list from the first version, plus two new rejections from this
+correction pass:
+
 - **A separate, independent trust root for activation packages** - rejected;
-  violates the task's own "one root architecture, multiple delivery paths"
-  principle and the repository's own precedent (one ceremony, delegated
-  keys).
-- **A brand-new "bootstrap edge" service/network segment for v1** -
-  rejected for now (section 11); the existing two-route surface is already
-  narrow, and the real gap is rate limiting, not topology.
-- **Encrypting the package's credential field** - rejected (section 7); adds
-  UX friction without shrinking the actual exposure window, which is already
-  bounded by envelope expiry and server-side entitlement controls.
+  violates "one root architecture, multiple delivery paths."
+- **A brand-new "bootstrap edge" service/network segment for Level 1** -
+  still rejected; Level 1's existing two-route surface is already narrow.
+- **Encrypting the envelope's credential field** - rejected; adds friction
+  without shrinking the actual exposure window.
 - **A package-level redemption/device counter duplicating `max_devices`** -
-  rejected; would create a second, unsynchronized source of truth racing
-  against the server's own already-correct counter.
+  rejected; second unsynchronized source of truth.
 - **Model 3 (unauthenticated public bootstrap tunnel with broad restricted
-  egress)** - rejected; the existing two narrow HTTP routes already satisfy
-  "restricted bootstrap lane" without introducing a new tunnel/egress
-  surface to defend at all.
-- **Reusing enrollment tokens as the bootstrap credential** - rejected per
-  the task's explicit instruction not to conflate the two mechanisms; they
-  have different binding semantics (pre-bound-to-a-key vs. first-use-binds).
+  egress)** - rejected for Level 1; Level 2 (Model D hybrid) is deliberately
+  narrower than this.
+- **Reusing enrollment tokens as the bootstrap credential** - rejected.
+- **New: signing the envelope and the bundle together as one object under
+  one signature** - rejected; this is exactly the "one physical encoding"
+  the correction explicitly warned against - it would silently recreate a
+  single trust root, defeating the entire point of separating activation
+  entitlement authority from network-fact authority (section 6).
+- **New: letting the activation-issuer key sign network endpoint facts
+  directly, to avoid having two signature types in one package** - rejected;
+  this is precisely Correction 1's forbidden shortcut. Implementation
+  convenience is not a reason to let a high-volume, eventually self-service
+  key acquire network-fact authority.
 
 ## 32. Recommended implementation slices
 
-Numbered as a **new** roadmap item - B42-B55 are all already-assigned,
-unrelated or adjacent work (section 1); this proposal is provisionally
-**B56 - Self-Contained Bootstrap Activation Packages**, to be confirmed by
-the repository owner before `docs/ROADMAP.md` is updated with anything
-beyond the "ARCHITECTURE / RESEARCH" placeholder row this branch adds.
+Corrected per Correction 13 - reordered so the load-bearing reachability
+work (envelope/bundle split, imported-manifest path) lands before anything
+that only reorders already-trusted candidates, and Level 2 is explicitly
+its own, later, separately-gated slice:
 
-1. **B56-1** - `ActivationPackageParser`/`ActivationPackageVerifier` +
-   canonical encoding + typed failure enum + unit tests. No network code, no
-   server changes. Independently reviewable and fail-closed on its own.
-2. **B56-2** - Delegated activation-issuer key ceremony (reusing the
-   existing B12 ceremony process) + a new operator-only issuance CLI that
-   calls the *existing* `issue_activation()` and wraps its result into a
-   signed package. No `/v1/activate` changes.
+1. **B56-1** - `ActivationEnvelope` parser/verifier + canonical encoding +
+   typed failure enum + unit tests. No network code, no server changes, no
+   bundle handling yet.
+2. **B56-2** - Client-side "import a `SignedBootstrapBundle`" action that
+   calls the *existing* `EndpointManifestRepository.offer()` unmodified,
+   plus the new `ManifestSource.IMPORTED_SIGNED_BOOTSTRAP` diagnostic value
+   and its unit tests (reusing existing `EndpointManifestRepositoryTest`
+   fixtures per section 28). This is the slice that actually closes the
+   circular-dependency gap and is deliberately sequenced before rate
+   limiting or issuance tooling, since it is the load-bearing fix.
 3. **B56-3** - `limit_req`/`limit_conn` for `/v1/activate` and
-   `/v1/manifest` in both existing nginx configs - closes the confirmed gap
-   in section 1/11, independently useful even if the rest of this proposal
-   is never built.
-4. **B56-4** - `BootstrapCandidateRepository`/`BootstrapReachabilityResolver`/
-   `BootstrapLaneClient` client components, wired to the existing
+   `/v1/manifest` in both existing nginx configs - closes the confirmed,
+   independent gap (section 1/11/22), does not depend on B56-1/2.
+4. **B56-4** - Delegated activation-issuer key ceremony + operator-only
+   issuance CLI producing `ActivationEnvelope`s via the *existing*
+   `issue_activation()`, plus an operator workflow for attaching an
+   existing signed `EndpointManifest` as a package's optional bundle.
+5. **B56-5** - `BootstrapCandidateRepository`/`BootstrapReachabilityResolver`
+   (Level 1 only)/`BootstrapLaneClient`, wired to the existing
    `ReachabilityEngine`/`EndpointManifestRepository`, behind a debug-only
-   entry point first (mirroring how `XrayDiagnosticsActivity` stays
-   debug-only) before any release-facing QR/deep-link UI.
-5. **B56-5** - QR/deep-link import UI + recovery UX (section 25/20), release-
-   facing only after B56-1 through B56-4 are merged and reviewed.
-6. **B56-6** - Self-service issuance interface definition (entitlement
-   system -> issuer -> user), explicitly without billing/ecommerce, per the
-   task's own scope limit.
-7. **B56-7** - Chaos/security validation pass (section 28) against a real
-   staging activation store, before any production rollout decision.
+   entry point first.
+6. **B56-6** - Level 2 restricted bootstrap transport: capability
+   issuance/validation, the dedicated listener, its destination allowlist
+   and abuse limits (section 11) - explicitly gated on an owner decision
+   (below) about whether it ships in the same rollout as Level 1 or only
+   after field evidence justifies it. Independently reviewable and
+   independently deferrable without blocking B56-1 through B56-5.
+7. **B56-7** - QR/deep-link/import UX + recovery UX (section 25/20),
+   release-facing only after B56-1/2/5 are merged and reviewed (B56-6 not
+   required for a release if Level 2 is deferred).
+8. **B56-8** - Self-service issuance interface definition, explicitly
+   without billing/ecommerce, **with its own security review of the
+   issuer-service compromise scenario** (section 21's corrected finding -
+   this is now an explicit prerequisite of this slice, not an afterthought).
+9. **B56-9** - Chaos/security/replay/outage validation pass (section 28)
+   against a real staging activation store, before any production rollout
+   decision.
 
-Each slice fails closed on its own and does not require the next slice to
-exist to be safe to merge.
+Each slice fails closed on its own and does not require a later slice to
+exist to be safe to merge. B56-6 (Level 2) is the one slice this correction
+pass explicitly allows to be deferred independently of the rest - Level 1
+(B56-1/2/3/4/5/7) is a complete, self-consistent bootstrap architecture on
+its own; Level 2 is additive hardening for the harder reachability case.
 
 ---
 
@@ -772,39 +1025,64 @@ exist to be safe to merge.
 
 **Verdict: B - ARCHITECTURE READY WITH EXPLICIT OWNER DECISIONS.**
 
-The trust model is coherent (one delegated hierarchy, section 6), the
-package format is defined (section 7), replay/device-binding design is
-defined by reusing already-correct existing mechanisms (sections 12-14),
-multi-origin retrieval is defined by reusing the already-proven manifest
-pattern (section 10), and the existing signed manifest/LKG architecture is
-reused cleanly with no changes required to it. No unresolved cryptographic
-or trust-model blocker was found. The following are genuine **owner
-decisions**, not open technical unknowns, and are why this is B rather than A:
+Re-decided from scratch, not carried over from the first version. Every
+load-bearing architectural question Correction 1-11 raised now has a
+defined answer:
 
-1. **Rate limiting is a real, currently-missing production gap** (section
-   1/11/22) that this proposal's B56-3 would close. Should B56-3 be
-   prioritized and shipped independently of the rest of this proposal,
-   given it improves the *existing* `/v1/activate`/`/v1/manifest` surface
-   regardless of whether packages ever ship?
-2. **Package envelope default `expiresAt` window** (section 7) - this
-   document recommends "short, e.g. 24-72h" as an operational default, not
-   a schema requirement. The owner should set the actual product-facing
-   default.
-3. **Whether self-service issuance (B56-6) is wanted at all before a
-   billing/entitlement system exists**, or whether packages should remain
-   operator-issued-only (via the new CLI, B56-2) indefinitely, with
-   self-service deferred until commerce infrastructure exists.
-4. **Whether `bootstrapEndpointHints` ships empty in v1** (section 30) or is
-   populated from day one - purely a scope choice, not a security one.
-5. **B56's assigned milestone number** - this document proposes B56;
-   `docs/ROADMAP.md` is only updated in this branch with a minimal
-   placeholder row (status `ARCHITECTURE / RESEARCH`) rather than a fully
-   fleshed-out row, pending the owner's confirmation of the number/scope.
+- Credential delivery: solved (`ActivationEnvelope`, section 6/7).
+- Fresh endpoint recovery when known endpoints are blocked: solved
+  (`SignedBootstrapBundle` through the existing, unmodified
+  `EndpointManifestRepository.offer()`, section 10/16) - **this is the fix
+  for the gap that made the first version insufficient.**
+- Direct bootstrap reachability: defined (Level 1, section 11, reuses
+  existing reachability infrastructure).
+- Restricted fallback transport: defined at the architecture level (Level 2,
+  section 11) with a selected auth model (Hybrid/Model D) and an explicit
+  server-side enforcement boundary - not built, but no longer an open
+  question either.
+- Manifest authority uniqueness: preserved structurally (section 6/9) - the
+  activation-issuer key can never sign a network fact; `offer()` remains the
+  one and only acceptance point for endpoint facts, unmodified.
+- Rollback/precedence behavior: fully specified for every case Correction 3
+  asked about (section 16), all resolved by the existing rollback guard.
+- Threat model: corrected with distinguished blast radii per authority
+  (section 21), including the previously-understated issuer-service
+  compromise case.
+
+No unresolved cryptographic or trust-model blocker remains. This stays a
+**B**, not an A, because the following are genuinely product/operational
+choices, not technical unknowns - unchanged in kind from the first version,
+with three new items reflecting Level 2's now-defined-but-not-built status:
+
+1. **Rate limiting** (section 1/11/22) - still real and missing; B56-3 is
+   independent of everything else and can ship regardless of the rest of
+   this proposal's timeline.
+2. **Envelope default `expiresAt` window** - "short, e.g. 24-72h"
+   recommended, not mandated.
+3. **Self-service issuance timing** (B56-8) - and now explicitly gated on
+   its own issuer-service security review per the corrected threat model
+   (section 21).
+4. **Whether Level 2 (B56-6) ships in the same rollout as Level 1, or only
+   after field evidence (B54) shows Level 1 is insufficient** - new, and
+   deliberately classified here as a product/operational timing choice, not
+   a load-bearing architecture gap, because Level 1 alone is already a
+   complete, self-consistent bootstrap architecture (section 32).
+5. **Bootstrap capability TTL and abuse limits** (Level 2, section 11/22) -
+   concrete numeric defaults, not an open trust-model question.
+6. **Imported-bundle maximum acceptable age / any additional recovery rules
+   beyond what `ManifestRollbackGuard` already enforces** - new; this
+   document's position is that no additional rule is needed (the existing
+   guard already fully specifies acceptance), but the owner may want an
+   operational policy on top (e.g. "don't hand out a bundle recovery package
+   for a manifest generation older than N").
+7. **B56's assigned milestone number** - reconfirmed still free on
+   `origin/main` as of this correction pass; provisional.
 
 ## Final report
 
-See the branch's final message to the user for the full 40-point report
-(starting SHA, files changed, confirmations that B46-2P/B37/PR #35/PR #86/
-B45B-5/production infrastructure/production transport selection were all
-untouched, and that no universal long-lived bootstrap secret or whitelist-
-bypass claim was introduced).
+See the branch's final message to the user for the full point-by-point
+report, including the corrected starting-baseline SHA (this branch's actual
+parent commit, not the stale local ref the first version's report cited),
+confirmations that B46-2P/B37/PR #35/PR #86/B45B-5/production infrastructure/
+production transport selection were all untouched, and that no universal
+long-lived bootstrap secret or whitelist-bypass claim was introduced.
