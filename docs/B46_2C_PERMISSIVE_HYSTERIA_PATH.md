@@ -25,6 +25,24 @@ Android VpnService TUN -> MIT tun2socks bridge (in-process JNI/AAR)
   -> Hysteria2 QUIC -> Nova Hysteria gateway
 ```
 
+**Framing clarification (same slice, no rework):** the standard monolithic
+`hysteria` CLI binary (`app/cmd`, built and run as a real server in Part J)
+is historical/reference tooling only in this document, useful for standing
+up a real test server and for the licensing comparison in Part K/L - it is
+**not** the target release architecture. The target Hysteria runtime is the
+minimal Nova-specific client (Part H), built directly on
+`github.com/apernet/hysteria/core/v2/client`, Hysteria's own SOCKS5 TCP/UDP
+logic (`app/internal/socks5`, over the real client, no `sing-tun`), TLS/auth/
+QUIC/Salamander-obfuscation, and FD-Control/protect support, and which does
+**not** import `app/internal/tun` or `apernet/sing-tun`. This is supported
+directly by source: `core/go.mod` contains no `sing-tun` requirement at all
+(confirmed: zero matches); `app/internal/socks5/server.go` implements SOCKS5
+`CmdConnect` (TCP) and `CmdUDP`/UDP-ASSOCIATE directly over
+`core/v2/client.Client`, with no `sing-tun` import; `app/internal/tun` -
+specifically `app/internal/tun/server.go:10`, `tun
+"github.com/apernet/sing-tun"` - is the one and only component that imports
+it, and the minimal client never imports that package.
+
 ## Part A - xjasonlyu/tun2socks source audit
 
 - Repo: `github.com/xjasonlyu/tun2socks`, audited at commit
@@ -119,6 +137,96 @@ UDP OK: round trip match, via tun2socks -> SOCKS5(danted) UDP ASSOCIATE -> echo 
 Both are byte-exact round trips (fixed payload written, read back, compared
 byte-for-byte), through the real gVisor TCP/IP stack and a real SOCKS5
 UDP-ASSOCIATE relay - not a metadata-only or send-only check.
+
+## Part C.1 - routing-loop boundary (real Hysteria SOCKS5, not danted)
+
+Added per a same-slice clarification, without redoing the work above: the
+proof in Part C used `danted` as a controlled stand-in for "a SOCKS5
+listener." This section replaces that stand-in with the **real minimal
+Hysteria2 client from Part H** and specifically proves the boundary that
+matters for a real Android deployment: TUN traffic must reach Hysteria's own
+local SOCKS5 listener, while Hysteria's own outbound QUIC socket must never
+be captured by the tunnel's own routing (the reason
+FD-Control/`VpnService.protect(fd)` exists at all - without it, a
+full-tunnel VPN's own default route would swallow the VPN client's own
+uplink packets, creating a routing loop that prevents the tunnel from ever
+establishing).
+
+Test harness: `research/b46-2c-permissive-hysteria-path/routing-loop-boundary/loopcheck.go`
+(new). It opens a real TUN in the client network namespace, starts the real
+`tun2socks` engine against it (Proxy pointed at the real minimal Hysteria
+client's SOCKS5 port, not `danted`), and - critically - points the **client
+netns's own default route at the TUN** (`ip route add default dev <tun>`),
+simulating a full-tunnel Android VPN that captures all outbound traffic by
+default. A second real Hysteria2 server was placed at an address
+(`10.200.9.1:34443`, a secondary address added directly on the root
+namespace's own veth endpoint) that is deliberately **not** on the client's
+directly-connected subnet, so it is genuinely subject to the client's
+default-route change - unlike an earlier, discarded attempt that placed the
+server on the client's own connected-veth subnet, where a longer-prefix
+connected route always wins over any default-route change regardless of
+protection, silently proving nothing. (A separate attempt to reach the
+server through a second, non-adjacent network namespace was also
+discarded: this sandbox's kernel does not actually forward packets between
+two independently-created namespaces via a transit root namespace - traffic
+arrives at the transit `veth` but the `FORWARD` chain records zero hits, an
+environment limitation, not a code finding. The final topology needed only
+one real hop, avoiding that limitation entirely.)
+
+The minimal Hysteria2 client's FD-protect hook (Part H) was extended
+(additively - `--protect-stub`'s existing behavior is untouched) with a real
+`--fwmark N` option: when set, it calls `SO_MARK` on the raw fd of every
+outbound QUIC UDP socket via the same `ConnFactory` hook already proven in
+Part H/J. A matching `ip rule add fwmark N lookup 100` plus a table `100`
+route holding the real (pre-full-tunnel) egress route is the Linux
+policy-routing analog of what Android's real `VpnService.protect(fd)`
+achieves by excluding the marked socket from the default (tunnel) route.
+This is not literally `VpnService.protect()` (which works via netd's
+network-association bypass on Android) but is a real, verifiable exclusion
+mechanism proving the same boundary.
+
+Real A/B result, both runs performed under the identical full-tunnel
+default-route condition:
+
+**Protect ON** (`--fwmark` set, matching `ip rule`):
+
+```
+FD_PROTECT_MARK: set SO_MARK=0x2333 on fd=5
+connected: udpEnabled=true tx=0
+```
+(server log: `client connected {"addr": "10.200.0.2:...", ...}`)
+
+and, at the same time, app traffic sent into the TUN reached the same
+Hysteria SOCKS5 listener with no interference:
+
+```
+APP-TCP OK: reached echo target THROUGH TUN -> tun2socks -> Hysteria SOCKS5 -> real QUIC -> server -> echo target
+APP-UDP OK: reached echo target THROUGH TUN -> tun2socks -> Hysteria SOCKS5 -> real QUIC -> server -> echo target
+```
+
+**Protect OFF** (identical topology, no `--fwmark`):
+
+```
+hysteria client construction/handshake failed: connect error: timeout: no recent network activity
+```
+
+tun2socks's own log for this run shows exactly why - the unprotected QUIC
+socket's own packets were captured by the TUN's default route and handed to
+tun2socks, which (correctly, but uselessly, since no tunnel exists yet)
+tried to relay them onward via SOCKS5:
+
+```
+[UDP] dial 10.200.9.1:34443: connect to 127.0.0.1:...: dial tcp 127.0.0.1:...: connect: connection refused
+```
+
+This is real, reproduced evidence - not an assumption - that (a) TUN app
+traffic genuinely reaches the local Hysteria SOCKS5 listener with the
+protect mechanism active and with no interference between the two traffic
+classes, and (b) the QUIC socket **does** get captured by the tunnel's own
+routing and **does** fail to establish when the protect/exclude mechanism is
+missing, i.e. the hazard FD-Control/`protect(fd)` exists to prevent is real
+and reproducible on this host-side topology, and the existing protect hook
+(Part H) genuinely prevents it here.
 
 ## Part D - DNS transport
 
@@ -380,10 +488,14 @@ assumption.
   was not started).
 - No claim is made about behavior on any real, restricted, or
   geographically specific network.
-- Salamander obfuscation and the FD-protect hook were proven *wired and
-  reachable*, not exercised end-to-end with a non-empty obfuscation password
-  or a real Android `VpnService.protect()` call (the stub only proves the
-  call-site and fd validity).
+- Salamander obfuscation was proven *wired and reachable*, not exercised
+  end-to-end with a non-empty obfuscation password. The FD-protect hook
+  itself now has a real end-to-end proof of the boundary it exists for (Part
+  C.1: a genuine QUIC-handshake failure without it, a genuine success with
+  it, under a real full-tunnel routing condition) - via a host-side
+  `SO_MARK`/policy-routing analog, not a literal `VpnService.protect()` JNI
+  call (that still requires B46-2P, physical Android testing, out of scope
+  here).
 - IPv6 was not exercised (sandbox kernel has no IPv6 support at all - an
   environment limitation, not a code-path finding, carried over from
   B46-2B).
@@ -398,7 +510,8 @@ assumption.
 - `docs/B46_2C_PERMISSIVE_HYSTERIA_PATH.md` (this file, new).
 - `docs/ROADMAP.md` (B46 row updated).
 - `research/b46-2c-permissive-hysteria-path/tun2socks-proof/{main.go,go.mod,go.sum}` (new, committed proof, builds against a real pinned tun2socks pseudo-version, no local-clone replace).
-- `research/b46-2c-permissive-hysteria-path/hysteria-minimal-client/{novaminimal_main.go,README.md}` (new, prototype + grafting instructions).
+- `research/b46-2c-permissive-hysteria-path/hysteria-minimal-client/{novaminimal_main.go,README.md}` (prototype + grafting instructions; `novaminimal_main.go` additively extended with a real `--fwmark` SO_MARK protect option alongside the existing `--protect-stub`, no removed behavior).
+- `research/b46-2c-permissive-hysteria-path/routing-loop-boundary/{loopcheck.go,go.mod,go.sum,README.md}` (new, routing-loop-boundary proof harness, builds against the same real pinned tun2socks pseudo-version).
 
 No production source under `android/app/src/main` was touched. No
 `TransportRegistry`, `SmartConnectDecisionEngine`, `AutoGatewaySelector`,

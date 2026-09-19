@@ -78,6 +78,7 @@ func main() {
 	obfsPassword := flag.String("obfs-salamander", "", "salamander obfuscation password (optional)")
 	socksListen := flag.String("socks-listen", "127.0.0.1:0", "local SOCKS5 listen address")
 	protectStub := flag.Bool("protect-stub", false, "exercise the FD-protect hook with a no-op implementation (proves the call path)")
+	fwmark := flag.Int("fwmark", 0, "if nonzero, set SO_MARK to this value on every outbound QUIC socket via the FD-protect hook (Linux policy-routing analog of VpnService.protect(fd): used to prove the routing-loop boundary, see the routing-loop-boundary proof)")
 	flag.Parse()
 
 	if *serverAddr == "" {
@@ -95,6 +96,26 @@ func main() {
 				return err
 			}
 			log.Printf("FD_PROTECT_STUB: called on fd=%d", fd)
+			return nil
+		}
+	}
+
+	if *fwmark != 0 {
+		mark := *fwmark
+		protectFD = func(fd int) error {
+			// SO_MARK is the Linux host-side analog of what Android's real
+			// VpnService.protect(fd) achieves: it excludes this specific
+			// socket's packets from the VPN's own routing (here, a policy
+			// `ip rule` sends fwmark-tagged packets to a table with the real
+			// egress route instead of the TUN-capturing default route). This
+			// is not literally VpnService.protect() (which works via netd's
+			// network-association bypass on Android), but it is a real,
+			// verifiable exclusion mechanism proving the same boundary: the
+			// QUIC socket must never be captured by the TUN's own route.
+			if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, mark); err != nil {
+				return err
+			}
+			log.Printf("FD_PROTECT_MARK: set SO_MARK=%#x on fd=%d", mark, fd)
 			return nil
 		}
 	}
