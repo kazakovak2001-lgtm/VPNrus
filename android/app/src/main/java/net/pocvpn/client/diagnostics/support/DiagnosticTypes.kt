@@ -29,7 +29,7 @@ enum class PathKind { DIRECT, CHAIN_DIRECT, CHAIN_CDN, PRIVATE, NONE }
  * [mapManifestSourceToManifestSourceKind] for the pure mapping from the real
  * [net.pocvpn.client.reachability.ManifestSource]? into this vocabulary.
  */
-enum class ManifestSourceKind { LAST_KNOWN_GOOD, EMBEDDED_BOOTSTRAP, NONE }
+enum class ManifestSourceKind { LAST_KNOWN_GOOD, EMBEDDED_BOOTSTRAP, IMPORTED_SIGNED_BOOTSTRAP, NONE }
 
 /**
  * B29 (task B) - the bounded, typed timeline vocabulary a support bundle

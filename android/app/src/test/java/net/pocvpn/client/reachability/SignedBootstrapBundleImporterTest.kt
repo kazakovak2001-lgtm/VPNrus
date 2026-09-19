@@ -99,6 +99,55 @@ class SignedBootstrapBundleImporterTest {
         assertTrue((repo.trustedState() as TrustedManifestState.Trusted).source == ManifestSource.LAST_KNOWN_GOOD)
     }
 
+    // --- PR #93 review fix - Accepted.source is structurally, not just documentarily, fixed ---
+
+    @Test
+    fun `Accepted's source is a computed property with no backing constructor parameter - it cannot be overridden by a caller`() {
+        // Reflection proof, not just a docs claim: the primary constructor
+        // takes exactly one parameter (the manifest); "source" only exists
+        // as a getter, so `Accepted(manifest, ManifestSource.LAST_KNOWN_GOOD)`
+        // does not even compile - there is no such constructor to call.
+        val primaryConstructor = BootstrapBundleImportResult.Accepted::class.java.declaredConstructors.single()
+        assertEquals(1, primaryConstructor.parameterTypes.size)
+        assertEquals(EndpointManifest::class.java, primaryConstructor.parameterTypes[0])
+    }
+
+    @Test
+    fun `import result source and the repository's own trustedSource are intentionally different after acceptance`() {
+        val repo = repository(newStore())
+        val result = importer(repo).import(sign(manifest(version = 2))) as BootstrapBundleImportResult.Accepted
+
+        assertEquals(ManifestSource.IMPORTED_SIGNED_BOOTSTRAP, result.source)
+        assertEquals(ManifestSource.LAST_KNOWN_GOOD, repo.trustedSource())
+    }
+
+    // --- CLOCK_SKEW / CLOCK_UNCERTAIN (PR #93 review fix - no prior regression test) ---
+
+    @Test
+    fun `an imported manifest issued implausibly far in the future is rejected as CLOCK_UNCERTAIN, LKG unchanged`() {
+        val repo = repository(newStore()) // trusted N = 1 (embedded bootstrap)
+        assertTrue(importer(repo).import(sign(manifest(version = 2))) is BootstrapBundleImportResult.Accepted)
+
+        val now = 2_000L
+        val implausiblyFutureIssuedAt = now + Ed25519ManifestVerifier.DEFAULT_CLOCK_SKEW_TOLERANCE_MS + 1
+        val clockSkewedCandidate = sign(
+            manifest(
+                version = 3, // newer than currently trusted - proves rejection is the clock check, not rollback
+                issuedAt = implausiblyFutureIssuedAt,
+                expiresAt = implausiblyFutureIssuedAt + 9_000_000L,
+            ),
+        )
+
+        val result = importer(repo).import(clockSkewedCandidate)
+
+        assertTrue(result is BootstrapBundleImportResult.Rejected)
+        assertEquals(BootstrapBundleImportRejectionKind.BOOTSTRAP_BUNDLE_CLOCK_UNCERTAIN, (result as BootstrapBundleImportResult.Rejected).kind)
+
+        // Existing LKG (real verifier, real repository, no mocking) is completely unchanged.
+        assertEquals(2, repo.trusted()!!.manifestVersion)
+        assertEquals(ManifestSource.LAST_KNOWN_GOOD, repo.trustedSource())
+    }
+
     @Test
     fun `import when nothing is currently trusted (NoneTrusted) is accepted - nothing to roll back from`() {
         val otherPriv = Ed25519PrivateKeyParameters(random)

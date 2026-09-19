@@ -493,9 +493,13 @@ class SupportDiagnosticsRecorderTest {
     }
 
     @Test
-    fun `mapManifestSourceToManifestSourceKind only ever re-labels the two real ManifestSource values, never a host-derived label`() {
+    fun `mapManifestSourceToManifestSourceKind re-labels every real ManifestSource value truthfully, never a host-derived label`() {
         assertEquals(ManifestSourceKind.LAST_KNOWN_GOOD, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.LAST_KNOWN_GOOD))
         assertEquals(ManifestSourceKind.EMBEDDED_BOOTSTRAP, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.EMBEDDED_BOOTSTRAP))
+        // B56-2/PR #93 review fix - IMPORTED_SIGNED_BOOTSTRAP must map to its
+        // own truthful ManifestSourceKind, never collapsed into NONE (NONE
+        // means "no known source", which this is not).
+        assertEquals(ManifestSourceKind.IMPORTED_SIGNED_BOOTSTRAP, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.IMPORTED_SIGNED_BOOTSTRAP))
         assertEquals(ManifestSourceKind.NONE, mapManifestSourceToManifestSourceKind(null))
     }
 

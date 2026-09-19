@@ -36,20 +36,22 @@ fun ManifestUpdateRejectionKind.toBootstrapBundleImportRejectionKind(): Bootstra
 sealed class BootstrapBundleImportResult {
     /**
      * [manifest] is the SAME [EndpointManifest] instance [EndpointManifestRepository.offer]
-     * accepted and stored as ordinary last-known-good. [source] is ALWAYS
-     * [ManifestSource.IMPORTED_SIGNED_BOOTSTRAP] here - it is this import
-     * action's own delivery-provenance diagnostic, reported ONCE at the
-     * moment of acceptance, and is NOT what [EndpointManifestRepository.trustedState]
+     * accepted and stored as ordinary last-known-good. [source] is
+     * STRUCTURALLY, not just documentarily, always
+     * [ManifestSource.IMPORTED_SIGNED_BOOTSTRAP] here - a computed property
+     * with no backing constructor parameter, so no caller can construct an
+     * [Accepted] claiming any other provenance (PR #93 review fix). It is
+     * this import action's own delivery-provenance diagnostic, reported ONCE
+     * at the moment of acceptance, and is NOT what [EndpointManifestRepository.trustedState]
      * reports afterward (that is, and remains, ordinary
      * [ManifestSource.LAST_KNOWN_GOOD] - see this class's and
      * [ManifestSource.IMPORTED_SIGNED_BOOTSTRAP]'s own docs for why
      * conflating the two would wrongly imply a second, higher-precedence
      * trust tier that does not exist).
      */
-    data class Accepted(
-        val manifest: EndpointManifest,
-        val source: ManifestSource = ManifestSource.IMPORTED_SIGNED_BOOTSTRAP,
-    ) : BootstrapBundleImportResult()
+    data class Accepted(val manifest: EndpointManifest) : BootstrapBundleImportResult() {
+        val source: ManifestSource get() = ManifestSource.IMPORTED_SIGNED_BOOTSTRAP
+    }
 
     data class Rejected(val kind: BootstrapBundleImportRejectionKind, val reason: String) : BootstrapBundleImportResult()
 
