@@ -139,7 +139,20 @@ _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 # android SignedManifestCodec.kt) - reused verbatim by
 # inspect_signed_manifest_bundle, never a second independently-chosen limit.
 _SIGNED_MANIFEST_MAX_CANONICAL_BYTES = 1_000_000
-_SIGNED_MANIFEST_MAX_SIGNATURE_BYTES = 256
+_SIGNED_MANIFEST_MAX_SIGNATURE_BYTES = 256  # SignedManifestCodec's own generic container ceiling
+
+# PR #95 review fix (round 2) - the REAL client trust boundary
+# (Ed25519ManifestVerifier) requires an EXACT 64-byte Ed25519 signature;
+# this stricter operational bound is enforced by inspect_signed_manifest_bundle
+# below (still metadata inspection only - no cryptographic verification).
+_SIGNED_MANIFEST_SIGNATURE_LENGTH = 64
+
+# Maximum plausible total SignedManifestCodec container size, derived
+# directly from the SAME existing constants above - used to reject an
+# obviously over-bound bootstrap-bundle file via a cheap os.path.getsize()
+# BEFORE reading it into memory at all (a local DoS/hygiene bound only,
+# never a new manifest wire format).
+_SIGNED_MANIFEST_MAX_TOTAL_BYTES = 4 + 4 + _SIGNED_MANIFEST_MAX_CANONICAL_BYTES + 4 + _SIGNED_MANIFEST_SIGNATURE_LENGTH
 
 _ISSUER_METADATA_REQUIRED_FIELDS = frozenset({"issuerKeyId", "publicKeyBase64", "publicKeyFingerprintSha256Hex"})
 
@@ -508,58 +521,155 @@ def _write_temp_secret_file(directory: str, data: bytes) -> str:
     return tmp_path
 
 
-def _publish_no_clobber(tmp_path: str, final_path: str) -> None:
-    """PR #95 review fix (item 4) - a REAL atomic no-clobber publication
-    primitive, replacing the previous TOCTOU-vulnerable
-    `if os.path.exists(...): ... ; os.replace(...)` pattern (a concurrent
-    writer could create `final_path` in the window between that check and
-    the replace, and `os.replace` would then silently overwrite it).
+@dataclasses.dataclass(frozen=True)
+class PublicationResult:
+    """PR #95 review fix (round 2) - a closed, explicit representation of
+    the TWO publication phases, so a caller can never confuse "the file is
+    durably published" with "every housekeeping/durability nicety around
+    it also succeeded":
+
+      PRE-PUBLICATION: temp file creation/write/fsync, before the final
+      no-clobber link. Failures here may freely raise/propagate - nothing
+      has been committed yet.
+
+      COMMITTED PUBLICATION: the atomic no-clobber `os.link(tmp, final)`
+      call itself succeeds. The instant that call returns, `final_path`
+      exists and is complete - `published` is true from that point on, and
+      NOTHING afterward (removing the now-redundant temp hardlink name,
+      fsyncing the containing directory) may ever be reported back as if
+      publication itself failed.
+
+    `published` is true iff the final no-clobber link succeeded.
+    `directory_sync_confirmed` is true iff the POST-publication directory
+    fsync (a separate, additional crash-durability guarantee for the
+    directory ENTRY, not the file's own contents - those are already
+    fsynced pre-publication) also succeeded; false means that step could
+    not be confirmed, surfaced as a printed warning, never a rollback
+    trigger.
+    `temp_cleanup_confirmed` is true iff the now-redundant temporary
+    hardlink name was successfully removed after publication (cosmetic
+    only - once `published` is true, the data lives at `final_path`
+    regardless of whether the temp name itself still lingers).
+    """
+
+    published: bool
+    directory_sync_confirmed: bool
+    temp_cleanup_confirmed: bool
+
+
+def _print_durability_warning(message: str) -> None:
+    """Fixed, non-secret prefix - every durability warning goes through
+    here so it is trivially greppable and consistently worded."""
+    print(f"activation_envelope_issuer: WARNING - durability: {message}", file=sys.stderr)
+
+
+def _publish_no_clobber(tmp_path: str, final_path: str) -> PublicationResult:
+    """PR #95 review fix (item 4, corrected in round 2) - a REAL atomic
+    no-clobber publication primitive, replacing the previous TOCTOU-
+    vulnerable `if os.path.exists(...): ... ; os.replace(...)` pattern (a
+    concurrent writer could create `final_path` in the window between that
+    check and the replace, and `os.replace` would then silently overwrite
+    it).
 
     `os.link` creates a NEW directory entry (`final_path`) pointing at
     `tmp_path`'s existing inode - the OS itself guarantees this fails
     atomically with `FileExistsError` if `final_path` already exists,
-    rather than requiring this code to check-then-act. `tmp_path` is
-    always unlinked afterward - once `final_path` exists as a hard link to
-    the SAME inode, removing the temp name does not remove the data, which
-    now lives under `final_path`.
+    rather than requiring this code to check-then-act.
 
-    FAILS CLOSED: if `os.link` raises any OTHER `OSError` (e.g. the
-    platform/filesystem does not support hardlinks, or `tmp_path` and
-    `final_path` are on different filesystems), this raises `IssuerError`
-    rather than silently falling back to an overwrite-capable operation
-    like `os.replace`.
+    FAILS CLOSED PRE-PUBLICATION: if `os.link` itself raises (including any
+    OTHER `OSError` - e.g. the platform/filesystem does not support
+    hardlinks, or `tmp_path`/`final_path` are on different filesystems),
+    this raises `IssuerError` - `final_path` was never created, so this is
+    still squarely a pre-publication failure and may propagate freely.
+
+    ONCE `os.link` SUCCEEDS, publication is COMMITTED - `final_path` exists
+    and is complete. Removing the now-redundant `tmp_path` hardlink name is
+    pure housekeeping; a failure to do so is reported in the returned
+    `PublicationResult`, NEVER raised - `final_path` is entirely unaffected
+    either way (a hard link and its original name refer to the SAME inode,
+    so a leftover temp name is harmless clutter, not a partial write).
     """
     try:
         os.link(tmp_path, final_path)
     except FileExistsError:
-        raise IssuerError(f"refusing to overwrite existing file: {final_path!r}") from None
-    except OSError as exc:
-        raise IssuerError(
-            f"atomic no-clobber publication is not supported for {final_path!r} "
-            f"({exc.__class__.__name__}) - refusing to fall back to an overwrite-capable write"
-        ) from None
-    finally:
+        # PRE-publication failure - final_path was never created. tmp_path
+        # is still ours alone at this point; clean it up before raising so
+        # a rejected publication never leaves stray temp files behind.
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        raise IssuerError(f"refusing to overwrite existing file: {final_path!r}") from None
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise IssuerError(
+            f"atomic no-clobber publication is not supported for {final_path!r} "
+            f"({exc.__class__.__name__}) - refusing to fall back to an overwrite-capable write"
+        ) from None
+
+    # --- COMMITTED: final_path now exists. Nothing below may raise. ---
+    temp_cleanup_confirmed = True
+    try:
+        os.unlink(tmp_path)
+    except OSError as exc:
+        temp_cleanup_confirmed = False
+        _print_durability_warning(
+            f"failed to remove the now-redundant temporary file {tmp_path!r} after successfully publishing "
+            f"{final_path!r} ({exc.__class__.__name__}) - {final_path!r} is complete and valid; the leftover "
+            "temp file is harmless clutter and may be removed manually"
+        )
+    return PublicationResult(published=True, directory_sync_confirmed=False, temp_cleanup_confirmed=temp_cleanup_confirmed)
 
 
-def _atomic_write_secret_file(path: str, data: bytes) -> None:
+def _confirm_directory_durability(directory: str, published_path: str) -> bool:
+    """POST-publication crash-durability confirmation for the DIRECTORY
+    ENTRY at `published_path` - a separate, additional guarantee from the
+    file's own contents (already fsynced before publication). NEVER
+    raises: on failure this prints a non-secret `_print_durability_warning`
+    and returns False. `published_path` already exists and is complete
+    either way - this step's failure is an operator condition worth
+    investigating before distributing/relying on the artifact, never a
+    reason to consider publication itself to have failed."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return True
+    except OSError as exc:
+        _print_durability_warning(
+            f"directory fsync failed for {directory!r} after {published_path!r} was already successfully "
+            f"published ({exc.__class__.__name__}) - the file's own contents were fsynced before publication "
+            "and it is complete and readable now, but crash-durability of the DIRECTORY ENTRY pointing to it "
+            "could not be confirmed; investigate before distributing/relying on this artifact"
+        )
+        return False
+
+
+def _atomic_write_secret_file(path: str, data: bytes) -> PublicationResult:
     """Writes `data` to `path` with REAL atomic no-clobber semantics (see
     `_publish_no_clobber`) - temp sibling file -> write -> fsync -> atomic
-    publish-only-if-absent -> fsync the containing directory. Used for the
-    private key, the public metadata, and the signed envelope artifact -
-    the SAME primitive for all three sensitive outputs (PR #95 review fix,
-    item 4)."""
+    publish-only-if-absent -> best-effort post-publication directory-fsync
+    durability confirmation. Used for the private key, the public
+    metadata, and the signed envelope artifact - the SAME primitive for
+    all three sensitive outputs (PR #95 review fix, item 4).
+
+    Raises `IssuerError` ONLY for a PRE-publication failure (temp write, or
+    the final link itself). Once `_publish_no_clobber` returns, `path`
+    exists and this function NEVER raises - the trailing directory-fsync
+    step is a post-publication durability confirmation only; see
+    `PublicationResult`/`_confirm_directory_durability`'s own docs for why
+    its failure is a returned warning flag, never an exception.
+    """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     tmp_path = _write_temp_secret_file(directory, data)
-    _publish_no_clobber(tmp_path, path)
-    dir_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    result = _publish_no_clobber(tmp_path, path)  # raises IssuerError only if PRE-publication
+    directory_sync_confirmed = _confirm_directory_durability(directory, path)
+    return dataclasses.replace(result, directory_sync_confirmed=directory_sync_confirmed)
 
 
 # --- generate-key ---
@@ -595,36 +705,61 @@ def cmd_generate_key(args) -> int:
     # If this fails, NO private key file has ever been written - the
     # "command failure before private-key commit -> no private key file
     # remains" invariant holds trivially by ordering alone.
-    _atomic_write_secret_file(args.public_metadata_out, metadata_bytes)
+    metadata_publication = _atomic_write_secret_file(args.public_metadata_out, metadata_bytes)
 
-    # PRIVATE key is published SECOND - the final, sensitive commit. If
-    # this fails, best-effort clean up the metadata we just published so
-    # this command's failure never leaves a half-published (metadata
-    # without a key) artifact pair on disk.
+    # PRIVATE key is published SECOND. The SENSITIVE COMMIT POINT is the
+    # successful no-clobber final-path link inside _atomic_write_secret_file
+    # - NOT this function returning cleanly (round 2 review fix). If the
+    # private key's link NEVER succeeds (a pre-publication failure - see
+    # PublicationResult's own docs), no private key file exists at all, and
+    # we deliberately do NOT delete the metadata we already published: an
+    # unconditional `os.remove(args.public_metadata_out)` would delete
+    # WHATEVER currently occupies that pathname - which could, in a real
+    # race, be a completely different file a concurrent actor placed there
+    # after our own publish - a genuine TOCTOU cleanup race. The metadata
+    # is PUBLIC data that cannot sign anything by itself; `issue` already
+    # requires its public key to match a private key's OWN derived public
+    # key, so an orphaned metadata file with no matching private key is
+    # simply unusable, never a security risk - a harmless public orphan is
+    # strictly preferable to a pathname-based deletion race. See
+    # docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md's "metadata orphan policy".
     priv_bytes = private_key.private_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PrivateFormat.Raw,
         encryption_algorithm=serialization.NoEncryption(),
     )
     try:
-        _atomic_write_secret_file(args.private_key_out, priv_bytes)
+        key_publication = _atomic_write_secret_file(args.private_key_out, priv_bytes)
     except BaseException:
-        try:
-            os.remove(args.public_metadata_out)
-        except OSError:
-            pass
+        print(
+            f"activation_envelope_issuer: ERROR - private key publication failed before its final path was "
+            f"created; no private key file exists. Public metadata at {args.public_metadata_out!r} was already "
+            "published and is deliberately LEFT IN PLACE - it is public data that cannot sign anything without "
+            "a matching private key, and this command never deletes an existing pathname it does not currently "
+            "control the identity of (see docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md's 'metadata orphan policy').",
+            file=sys.stderr,
+        )
         raise
     finally:
         priv_bytes = None
 
-    # Once we reach here, the private key has been durably, successfully
-    # published - the ceremony has materially succeeded. Nothing below
-    # this line may ever delete it.
+    # Once we reach here, `key_publication.published` is true - the
+    # private key's final link succeeded and the ceremony has materially
+    # succeeded, REGARDLESS of either file's `directory_sync_confirmed`
+    # (a warning for that was already printed by _atomic_write_secret_file
+    # itself if it failed). Nothing below this line may ever delete either
+    # file.
     print(f"activation_envelope_issuer: generated activation-issuer key id={args.key_id}")
     print(f"activation_envelope_issuer: public key fingerprint (sha256)={fingerprint}")
     print(f"activation_envelope_issuer: private key written to {args.private_key_out} (raw {PRIVATE_KEY_RAW_BYTES} bytes - "
           "KEEP OFFLINE, never commit, never transmit)")
     print(f"activation_envelope_issuer: public metadata written to {args.public_metadata_out}")
+    if not metadata_publication.directory_sync_confirmed or not key_publication.directory_sync_confirmed:
+        print(
+            "activation_envelope_issuer: NOTE - see the durability warning(s) above: both files are complete "
+            "and valid, but directory-entry crash durability could not be confirmed for at least one of them.",
+            file=sys.stderr,
+        )
     if os.name == "nt":
         print(
             "activation_envelope_issuer: WARNING - this is a Windows filesystem; POSIX 0600 permissions "
@@ -650,7 +785,27 @@ def inspect_signed_manifest_bundle(path: str) -> Tuple[int, bytes]:
     manifest version, without parsing endpoints at all.
 
     Raises BundleInspectionError on ANY malformed/truncated/oversized
-    input - never returns a partial result."""
+    input - never returns a partial result.
+
+    PR #95 review fix (round 2, item 3): the file's SIZE ON DISK is checked
+    against `_SIGNED_MANIFEST_MAX_TOTAL_BYTES` via `os.path.getsize` BEFORE
+    the file is read into memory at all - an obviously over-bound file is
+    rejected without ever allocating a buffer for its contents. The bound
+    is derived directly from the SAME existing codec constants used below
+    (outer header + `_SIGNED_MANIFEST_MAX_CANONICAL_BYTES` +
+    `_SIGNED_MANIFEST_SIGNATURE_LENGTH`), never a second independently-
+    chosen limit."""
+    try:
+        file_size = os.path.getsize(path)
+    except OSError as exc:
+        raise BundleInspectionError(f"failed to stat bootstrap bundle {path!r}: {exc.__class__.__name__}") from None
+    if file_size > _SIGNED_MANIFEST_MAX_TOTAL_BYTES:
+        raise BundleInspectionError(
+            f"bootstrap bundle {path!r} is {file_size} bytes, exceeding the maximum plausible "
+            f"SignedManifestCodec container size ({_SIGNED_MANIFEST_MAX_TOTAL_BYTES} bytes) - "
+            "refusing to read it into memory"
+        )
+
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
@@ -680,8 +835,17 @@ def inspect_signed_manifest_bundle(path: str) -> Tuple[int, bytes]:
     offset += canonical_len
 
     signature_len = _read_i32()
-    if signature_len < 0 or signature_len > _SIGNED_MANIFEST_MAX_SIGNATURE_BYTES:
-        raise BundleInspectionError(f"implausible signature length: {signature_len}")
+    # PR #95 review fix (round 2, item 2) - SignedManifestCodec's own
+    # container only bounds signature length generically (0..256), but the
+    # REAL client trust boundary (Ed25519ManifestVerifier) requires exactly
+    # a 64-byte Ed25519 signature. This is still metadata inspection only -
+    # no cryptographic verification happens here - but a bundle whose
+    # declared signature length could never be a valid Ed25519 signature is
+    # rejected up front rather than silently accepted as "plausible".
+    if signature_len != _SIGNED_MANIFEST_SIGNATURE_LENGTH:
+        raise BundleInspectionError(
+            f"signature length must be exactly {_SIGNED_MANIFEST_SIGNATURE_LENGTH} bytes (Ed25519), got {signature_len}"
+        )
     if offset + signature_len > len(raw):
         raise BundleInspectionError("bootstrap bundle is truncated (signature section shorter than declared)")
     offset += signature_len
@@ -847,20 +1011,29 @@ def cmd_issue(args) -> int:
         # operation inside this rollback region (the transaction commit
         # point). Nothing fallible happens after it inside this try block.
         artifact_sha256 = hashlib.sha256(artifact).hexdigest()
-        _atomic_write_secret_file(args.out, artifact)
+        publication = _atomic_write_secret_file(args.out, artifact)
     except BaseException as exc:
         _revoke_or_report_critical(args, activation_id, exc)
         return 1
     finally:
         credential = None  # best-effort - drop the local reference promptly
 
-    # --- COMMIT POINT PASSED: the envelope artifact durably exists and the
-    # --- activation remains ACTIVE. Nothing below this line may revoke it -
-    # --- a failure here is purely cosmetic/presentational.
+    # --- COMMIT POINT PASSED: `publication.published` is true - the
+    # --- envelope artifact durably exists and the activation remains
+    # --- ACTIVE, REGARDLESS of `publication.directory_sync_confirmed`
+    # --- (a warning for that was already printed above, inside
+    # --- _atomic_write_secret_file, if it failed). Nothing below this
+    # --- line may revoke the activation or imply the artifact is invalid.
     print(f"activation_envelope_issuer: activation_id={activation_id} issuerKeyId={issuer_key_id}")
     print(f"activation_envelope_issuer: envelope issuedAt={issued_at} expiresAt={expires_at} max_devices={args.max_devices}")
     print(f"activation_envelope_issuer: issuer public key fingerprint (sha256)={public_key_fingerprint_sha256_hex(public_key)}")
     print(f"activation_envelope_issuer: envelope artifact written to {args.out} (sha256={artifact_sha256})")
+    if not publication.directory_sync_confirmed:
+        print(
+            "activation_envelope_issuer: NOTE - see the durability warning above: the envelope artifact is "
+            "complete and valid, but directory-entry crash durability could not be confirmed.",
+            file=sys.stderr,
+        )
     if bundle_ref is not None:
         print(f"activation_envelope_issuer: bootstrap bundle manifestVersion={bundle_ref.manifest_version} contentHash(sha256)={bundle_ref.content_hash.hex()}")
     return 0

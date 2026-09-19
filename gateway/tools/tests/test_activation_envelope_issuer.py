@@ -497,11 +497,15 @@ class GenerateKeyTests(unittest.TestCase):
                 issuer.cmd_generate_key(args)
             self.assertFalse(os.path.exists(inside_repo_path))
 
-    def test_private_key_publication_failure_removes_the_just_published_metadata(self):
-        # PR #95 review fix item 7 - metadata is published FIRST; if the
-        # PRIVATE key's own publication then fails, the metadata that was
-        # already written must be cleaned up so no half-published pair
-        # (metadata without a key) remains.
+    def test_private_key_pre_publication_failure_leaves_metadata_as_a_harmless_orphan(self):
+        # PR #95 review fix (round 2, item "remove the metadata cleanup
+        # race") - metadata is published FIRST; if the PRIVATE key's OWN
+        # publication then fails BEFORE its final link, the metadata is
+        # deliberately LEFT IN PLACE rather than deleted - an unconditional
+        # os.remove() of that pathname would be a TOCTOU cleanup race (a
+        # concurrent actor could have replaced it). A metadata-only orphan
+        # is harmless: it is public data that cannot sign anything without
+        # a matching private key, which does not exist here.
         with tempfile.TemporaryDirectory() as tmp:
             priv_path = os.path.join(tmp, "issuer.key")
             meta_path = os.path.join(tmp, "issuer.meta.json")
@@ -513,14 +517,48 @@ class GenerateKeyTests(unittest.TestCase):
             def _fail_on_second_call(path, data):
                 calls["n"] += 1
                 if calls["n"] == 2:
-                    raise OSError("simulated private-key publication failure")
+                    raise OSError("simulated private-key pre-publication failure")
                 return original_publish(path, data)
 
             with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=_fail_on_second_call):
                 with self.assertRaises(OSError):
                     issuer.cmd_generate_key(args)
-            self.assertFalse(os.path.exists(priv_path))
-            self.assertFalse(os.path.exists(meta_path))  # cleaned up
+            self.assertFalse(os.path.exists(priv_path))  # no private key was ever created
+            self.assertTrue(os.path.exists(meta_path))  # deliberately left in place - harmless public orphan
+            # The orphaned metadata is unusable without a matching private
+            # key, and contains no private material regardless.
+            identity = issuer.read_issuer_metadata_file(meta_path)
+            self.assertEqual("test-key-1", identity.issuer_key_id)
+
+    def test_no_arbitrary_metadata_pathname_is_ever_deleted_on_private_key_failure(self):
+        # Stronger proof than the above: even if a DIFFERENT file now
+        # occupies the metadata pathname (simulating a concurrent actor
+        # having replaced it after our own publish), this code path must
+        # never delete it - it performs no os.remove() of that path at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
+
+            original_publish = issuer._atomic_write_secret_file
+            calls = {"n": 0}
+
+            def _fail_on_second_call(path, data):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    # Simulate a concurrent actor replacing the metadata
+                    # pathname's CONTENT right before our own private-key
+                    # publication fails.
+                    with open(meta_path, "w", encoding="utf-8") as handle:
+                        handle.write("REPLACED-BY-ANOTHER-ACTOR")
+                    raise OSError("simulated private-key pre-publication failure")
+                return original_publish(path, data)
+
+            with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=_fail_on_second_call):
+                with self.assertRaises(OSError):
+                    issuer.cmd_generate_key(args)
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                self.assertEqual("REPLACED-BY-ANOTHER-ACTOR", handle.read())
 
     def test_metadata_publication_failure_leaves_no_private_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -532,6 +570,81 @@ class GenerateKeyTests(unittest.TestCase):
                     issuer.cmd_generate_key(args)
             self.assertFalse(os.path.exists(priv_path))
             self.assertFalse(os.path.exists(meta_path))
+
+
+class PublicationCommitPointTests(unittest.TestCase):
+    """PR #95 review fix (round 2) - the LOGICAL commit point is the
+    successful no-clobber final-path link, not the function returning
+    cleanly. A failure of any POST-link housekeeping/durability step must
+    never be reported as if publication itself failed."""
+
+    def test_directory_fsync_failure_after_successful_link_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            with mock.patch.object(issuer, "_confirm_directory_durability", return_value=False):
+                result = issuer._atomic_write_secret_file(path, b"data")
+            self.assertTrue(result.published)
+            self.assertFalse(result.directory_sync_confirmed)
+            with open(path, "rb") as handle:
+                self.assertEqual(b"data", handle.read())
+
+    def test_directory_durability_confirmation_succeeds_in_a_normal_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            self.assertTrue(issuer._confirm_directory_durability(tmp, path))
+
+    def test_directory_fsync_failure_emits_a_non_secret_warning_and_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            stderr = io.StringIO()
+            with mock.patch("os.fsync", side_effect=OSError("simulated directory fsync failure")):
+                with redirect_stderr(stderr):
+                    confirmed = issuer._confirm_directory_durability(tmp, path)
+            self.assertFalse(confirmed)
+            self.assertIn("WARNING", stderr.getvalue())
+            self.assertIn("durability", stderr.getvalue())
+            self.assertIn(path, stderr.getvalue())
+
+    def test_issue_command_directory_fsync_failure_does_not_revoke_and_leaves_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "activations.json")
+            lock = os.path.join(tmp, "activations.lock")
+            key_path = _write_test_key_file(tmp)
+            metadata_path = _write_metadata_file(tmp)
+            activations_module = issuer._activations_module()
+            activations_module.init_store(store, lock)
+            args = mock.Mock(
+                store=store, lock=lock, issuer_metadata_file=metadata_path, private_key_file=key_path,
+                max_devices=1, activation_expires_in_days=None, envelope_valid_for_hours=48.0,
+                endpoint_hint=[], bootstrap_bundle=None, out=os.path.join(tmp, "envelope.bin"),
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(issuer, "_confirm_directory_durability", return_value=False):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = issuer.cmd_issue(args)
+            self.assertEqual(0, rc)  # NOT a failure - publication succeeded
+            self.assertTrue(os.path.exists(args.out))
+            records = activations_module.list_all(store, lock)
+            self.assertEqual(1, len(records))
+            self.assertEqual(activations_module.ACTIVE, records[0]["status"])  # never revoked
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("durability", combined)
+            self.assertNotIn("REVOKED", combined)
+
+    def test_generate_key_directory_fsync_failure_leaves_both_files_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(issuer, "_confirm_directory_durability", return_value=False):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = issuer.cmd_generate_key(args)
+            self.assertEqual(0, rc)
+            self.assertTrue(os.path.exists(priv_path))
+            self.assertTrue(os.path.exists(meta_path))
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("durability", combined)
 
 
 class AtomicNoClobberPublicationTests(unittest.TestCase):
@@ -699,6 +812,89 @@ class BundleInspectionTests(unittest.TestCase):
     def test_does_not_parse_or_require_any_endpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._sign_and_package_manifest(tmp, manifest_version=1)
+            version, _ = issuer.inspect_signed_manifest_bundle(path)
+            self.assertEqual(1, version)
+
+    def _package_with_raw_signature(self, tmp, signature_bytes, manifest_version=3):
+        manifest = manifest_signing.Manifest(
+            manifest_version=manifest_version, issued_at_epoch_millis=1000, expires_at_epoch_millis=9_000_000_000,
+            endpoints=[], signing_key_id="test-manifest-key",
+        )
+        canonical = manifest_signing.canonical_bytes(manifest)
+        artifact = manifest_signing.pack_signed_manifest(canonical, signature_bytes)
+        path = os.path.join(tmp, "bundle.bin")
+        with open(path, "wb") as handle:
+            handle.write(artifact)
+        return path
+
+    def test_exact_64_byte_signature_accepted(self):
+        # PR #95 review fix (round 2, item 2) - the real client trust
+        # boundary (Ed25519ManifestVerifier) requires an exact 64-byte
+        # signature; this is still metadata inspection only, so an
+        # arbitrary 64 bytes (not a real signature) is structurally
+        # accepted here - no cryptographic check happens in this function.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._package_with_raw_signature(tmp, b"\x42" * 64)
+            version, _ = issuer.inspect_signed_manifest_bundle(path)
+            self.assertEqual(3, version)
+
+    def test_zero_length_signature_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._package_with_raw_signature(tmp, b"")
+            with self.assertRaises(issuer.BundleInspectionError):
+                issuer.inspect_signed_manifest_bundle(path)
+
+    def test_63_byte_signature_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._package_with_raw_signature(tmp, b"\x00" * 63)
+            with self.assertRaises(issuer.BundleInspectionError):
+                issuer.inspect_signed_manifest_bundle(path)
+
+    def test_65_byte_signature_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._package_with_raw_signature(tmp, b"\x00" * 65)
+            with self.assertRaises(issuer.BundleInspectionError):
+                issuer.inspect_signed_manifest_bundle(path)
+
+    def test_256_byte_signature_rejected(self):
+        # 256 is SignedManifestCodec's own generic container ceiling, and
+        # would have passed the OLD "0..256" range check - it must now be
+        # rejected since it can never be a valid Ed25519 signature.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._package_with_raw_signature(tmp, b"\x00" * 256)
+            with self.assertRaises(issuer.BundleInspectionError):
+                issuer.inspect_signed_manifest_bundle(path)
+
+    def test_oversized_bundle_file_rejected_before_being_read_into_memory(self):
+        # PR #95 review fix (round 2, item 3) - a pre-read os.path.getsize()
+        # check must reject an obviously over-bound file before it is ever
+        # opened for a full read.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "huge.bin")
+            with open(path, "wb") as handle:
+                handle.seek(issuer._SIGNED_MANIFEST_MAX_TOTAL_BYTES)  # sparse file - no real disk write
+                handle.write(b"\x00")
+            with mock.patch("builtins.open", side_effect=AssertionError("must not open the file for reading at all")) as mocked_open:
+                with self.assertRaises(issuer.BundleInspectionError):
+                    issuer.inspect_signed_manifest_bundle(path)
+                mocked_open.assert_not_called()
+
+    def test_bundle_at_exactly_the_max_total_size_is_not_rejected_for_size_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "at_max.bin")
+            # Build a real, well-formed container whose total size is
+            # comfortably under the max (constructing one AT the exact byte
+            # is unnecessary - this proves the size gate uses > not >=
+            # incorrectly by using a large-but-valid real container).
+            manifest = manifest_signing.Manifest(
+                manifest_version=1, issued_at_epoch_millis=1000, expires_at_epoch_millis=9_000_000_000,
+                endpoints=[], signing_key_id="k" * 32,
+            )
+            canonical = manifest_signing.canonical_bytes(manifest)
+            artifact = manifest_signing.pack_signed_manifest(canonical, b"\x00" * 64)
+            with open(path, "wb") as handle:
+                handle.write(artifact)
+            self.assertLessEqual(os.path.getsize(path), issuer._SIGNED_MANIFEST_MAX_TOTAL_BYTES)
             version, _ = issuer.inspect_signed_manifest_bundle(path)
             self.assertEqual(1, version)
 

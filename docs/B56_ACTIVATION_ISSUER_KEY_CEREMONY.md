@@ -58,21 +58,46 @@ predating this ceremony's safer pattern). Instead:
   description, the failing exception's class name, and the activation ID)
   are ever printed on a failure path.
 
-### Real atomic no-clobber file publication
+### Real atomic no-clobber file publication - and its precise durability model
 
 Every sensitive output (the private key, the public metadata, and a signed
 envelope artifact) is published through the SAME primitive
-(`_atomic_write_secret_file`/`_publish_no_clobber`): write to a sibling
-temp file, `fsync` it, then publish it to the final path using `os.link` -
-which the operating system itself guarantees fails atomically with
-`FileExistsError` if the final path already exists, closing a real
+(`_atomic_write_secret_file`/`_publish_no_clobber`), in two explicit
+phases:
+
+```text
+The secret payload is fully written and fsynced before the atomic no-clobber
+final-path publication. A successful final link is the logical transaction
+commit point. Directory fsync is attempted to confirm crash durability;
+failure of that post-publication durability confirmation is surfaced as an
+operator warning and does not roll back an already-published activation/key.
+```
+
+Concretely: the payload is written to a sibling temp file and `fsync`ed
+FIRST (this is PRE-publication - failures here may freely propagate,
+nothing has been committed yet), then published to the final path using
+`os.link` - which the operating system itself guarantees fails atomically
+with `FileExistsError` if the final path already exists, closing a real
 TOCTOU race an earlier `if os.path.exists(...): ... ; os.replace(...)`
 pattern was vulnerable to (a concurrent writer creating the destination in
 the gap between the check and the replace would have been silently
 overwritten). If the underlying filesystem cannot provide this no-clobber
 guarantee at all (`os.link` raises anything other than `FileExistsError`),
 the tool fails closed with an error - it never falls back to an
-overwrite-capable write.
+overwrite-capable write. This `os.link` call succeeding is the ONE logical
+commit point - the final path exists and is complete from that instant on.
+
+A `fsync` of the CONTAINING DIRECTORY is then attempted, as an additional,
+SEPARATE confirmation that the new directory *entry* (not the file's own
+already-fsynced contents) will survive a crash. This is deliberately never
+called "confirmed" when it did not succeed: if it fails, the file remains
+published (it is NOT deleted, and no already-created activation is
+revoked because of it) and the tool prints a clear, non-secret
+`WARNING - durability: ...` message. For a real production ceremony, such
+a warning should be treated as an operator condition worth investigating
+(e.g. a degraded filesystem) BEFORE distributing the resulting artifact -
+but it never makes the already-published private key or envelope vanish
+logically, and it never triggers a rollback.
 
 ### Private-key read-time hygiene
 
@@ -109,13 +134,28 @@ This never prints the private key. It prints only: the key id, the public
 key's SHA-256 fingerprint, and the two output paths.
 
 `generate-key` publishes the PUBLIC metadata file first and the PRIVATE key
-file second, as the final, sensitive commit - if metadata publication
-fails, no private key was ever written; if the private key's own
-publication then fails, the just-published metadata is removed
-(best-effort) so the command's failure never leaves a half-published
-(metadata-without-a-key) pair on disk. Once the private key file itself
-has successfully published, nothing later in the command (a print
-statement, for example) can ever delete it.
+file second - the successful no-clobber final-path link of the PRIVATE
+KEY is the sensitive commit point. If metadata publication fails, no
+private key was ever written. If the private key's own publication then
+fails BEFORE its final link succeeds, the command returns failure and the
+already-published metadata is deliberately LEFT IN PLACE, never deleted:
+
+```text
+Metadata-only orphan after private-key pre-publication failure is harmless
+public data and intentionally not deleted automatically, avoiding a cleanup
+TOCTOU race.
+```
+
+An unconditional `os.remove()` of the metadata pathname would delete
+WHATEVER currently occupies that path - which, in a genuine race, could be
+a completely different file a concurrent actor placed there after this
+command's own publish. The metadata is public data that cannot sign
+anything by itself, and `issue` already requires its recorded public key
+to match a private key's OWN derived public key - so an orphaned metadata
+file with no matching private key is simply unusable, never a security
+risk. Once the private key file's final link has succeeded, neither file
+is ever deleted for any reason (including a later directory-fsync warning
+or a cosmetic print failure).
 
 ## issue consumes the generated metadata file - the key id is never independently typed
 
@@ -151,21 +191,24 @@ called** - no activation is created, no envelope is written.
 
 ## The transaction commit point
 
-The durable, atomic write of the signed envelope artifact
-(`_atomic_write_secret_file(args.out, artifact)`) is the LAST load-bearing
-operation inside `issue`'s rollback region. Everything fallible - building
-the envelope, canonicalizing it, signing it, encoding the outer container,
-computing its SHA-256 - happens strictly BEFORE that write. The rule this
-enforces:
+The LOGICAL commit point is the successful no-clobber final-path
+publication of the signed envelope artifact - precisely, the moment
+`_publish_no_clobber`'s `os.link(tmp, args.out)` call succeeds inside
+`_atomic_write_secret_file(args.out, artifact)`. Everything fallible -
+building the envelope, canonicalizing it, signing it, encoding the outer
+container, computing its SHA-256, and the pre-publication temp-file
+write/fsync - happens strictly BEFORE that link. The rule this enforces:
 
-- **Before** that write succeeds: any failure (including the newly-issued
+- **Before** that link succeeds: any failure (including the newly-issued
   activation record failing to read back at all, which is itself treated
   as an invariant violation) revokes the activation that was just created
   via the existing `revoke_activation()`, and no envelope artifact exists.
-- **After** that write succeeds: the activation stays `ACTIVE` and the
-  artifact stays on disk, permanently - a later, purely cosmetic failure
-  (e.g. a print statement) can never cause a rollback of a transaction that
-  already durably committed.
+- **After** that link succeeds: the activation stays `ACTIVE` and the
+  artifact stays on disk, permanently - this includes a failure of the
+  POST-publication directory-fsync durability confirmation (surfaced only
+  as a warning, per the durability model above) and any later, purely
+  cosmetic failure (e.g. a print statement) - neither can ever cause a
+  rollback of a transaction that has already logically committed.
 
 ## Post-issuance failures never leak diagnostic text
 
