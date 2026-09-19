@@ -33,6 +33,18 @@ This file adds a signed envelope wrapper around an activation
 issue_activation() already created - it does not reimplement or duplicate
 any part of that store.
 
+## issuerKeyId is bound to the private key, never independently typed (PR #95 review fix)
+
+`issue` does NOT accept a free-standing `--issuer-key-id`. It accepts
+`--issuer-metadata-file`, the EXACT public-metadata JSON `generate-key`
+produced alongside the private key, and requires the public key derived
+from `--private-key-file` to match the metadata's own `publicKeyBase64`
+byte-for-byte before anything else happens. Without this, an operator
+could accidentally sign with private key A while labeling the envelope
+`issuerKeyId=B` - a validly-signed envelope no Android trust-anchor
+population could ever verify. See `read_issuer_metadata_file` and
+`cmd_issue`'s own identity-binding check.
+
 ## Private key handling (B12's `--private-key-b64` weakness NOT repeated)
 
 manifest_signing.py's historical `--private-key-b64`/JSON-stdout
@@ -56,16 +68,21 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import dataclasses
 import hashlib
+import hmac
 import json
+import math
 import os
+import re
 import secrets
+import stat
 import struct
 import sys
 import tempfile
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _GATEWAY_DIR = os.path.abspath(os.path.join(_THIS_DIR, ".."))
@@ -91,15 +108,40 @@ MAX_ISSUER_KEY_ID_UTF8_BYTES = 64  # ActivationIssuerKeyId.MAX_LENGTH_BYTES
 MAX_CREDENTIAL_CHARS = 256  # ActivationCredential.MAX_LENGTH
 CONTENT_HASH_LENGTH = 32  # ActivationBundleRef.CONTENT_HASH_LENGTH (SHA-256)
 PRIVATE_KEY_RAW_BYTES = 32
+PUBLIC_KEY_RAW_BYTES = 32
 
-_ACTIVATION_ID_RE_SRC = r"^[0-9a-f]{32}$"
-_CREDENTIAL_RE_SRC = r"^[A-Za-z0-9_-]+$"
+# PR #95 review fix (item 11) - defensive symmetry with the Android side's
+# own encoder/decoder bounds (ActivationEnvelopeCanonicalizer.MAX_CANONICAL_BYTES,
+# ActivationEnvelopeCodec.MAX_ENCODED_BYTES). This Python encoder must never
+# emit an artifact the Android decoder would reject purely for size - these
+# are the SAME numbers, never a second, independently-chosen limit, and
+# never smaller than Android's own bounds.
+MAX_CANONICAL_BYTES = 16_384
+MAX_ENCODED_BYTES = 32_768
+
+# Envelope lifetime / activation-expiry sanity bounds - generous but finite,
+# so a NaN/Infinity/absurd value can never reach timestamp arithmetic.
+_MAX_ENVELOPE_VALID_FOR_HOURS = 24 * 366  # ~1 year
+_MAX_ACTIVATION_EXPIRES_IN_DAYS = 366 * 10  # ~10 years
+
+# On POSIX, a private key file must not be group/other readable/writable/
+# executable - same "unsafe mode" discipline gateway/api/activations.py's
+# own _validate_existing_mode_is_safe already applies to the activation
+# store. Windows has no POSIX mode bits at all - see read_private_key_file's
+# own truthful platform-limitation note; this mask is never applied there.
+_UNSAFE_PRIVATE_KEY_MODE_MASK = 0o077
+
+_ACTIVATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # SignedManifestCodec's own bounds (gateway/tools/manifest_signing.py /
 # android SignedManifestCodec.kt) - reused verbatim by
 # inspect_signed_manifest_bundle, never a second independently-chosen limit.
 _SIGNED_MANIFEST_MAX_CANONICAL_BYTES = 1_000_000
 _SIGNED_MANIFEST_MAX_SIGNATURE_BYTES = 256
+
+_ISSUER_METADATA_REQUIRED_FIELDS = frozenset({"issuerKeyId", "publicKeyBase64", "publicKeyFingerprintSha256Hex"})
 
 
 def _activations_module():
@@ -126,6 +168,36 @@ class BundleInspectionError(Exception):
     """The optional --bootstrap-bundle file failed the strict read-only
     outer-container check below - never a trust decision, purely "this
     artifact is not a well-formed SignedManifestCodec container"."""
+
+
+# --- shared validation helpers - used by BOTH generate-key and issue ---
+
+def validate_issuer_key_id(value: str) -> None:
+    """The ONE issuer-key-id validation rule, matching Android's
+    ActivationIssuerKeyId contract exactly (PR #95 review fix, item 2):
+    not blank/whitespace-only, and its UTF-8 BYTE length (not Python
+    `len()`, which counts code points) must not exceed
+    MAX_ISSUER_KEY_ID_UTF8_BYTES. Used by generate-key's --key-id AND by
+    read_issuer_metadata_file - a single shared helper so the two can
+    never drift apart."""
+    if not isinstance(value, str) or not value.strip():
+        raise IssuerError("issuerKeyId must not be blank or whitespace-only")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise IssuerError(f"issuerKeyId is not valid UTF-8 text: {exc}") from None
+    if len(encoded) > MAX_ISSUER_KEY_ID_UTF8_BYTES:
+        raise IssuerError(f"issuerKeyId exceeds max UTF-8 byte length ({MAX_ISSUER_KEY_ID_UTF8_BYTES}): {len(encoded)}")
+
+
+def _utf8_bytes_or_raise(value: str, field_name: str) -> bytes:
+    """Encodes `value` as UTF-8, turning a (rare - e.g. a lone surrogate
+    from surrogateescape-decoded input) UnicodeEncodeError into a clean
+    IssuerError instead of an uncaught traceback (PR #95 review fix, item 3)."""
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise IssuerError(f"{field_name} is not valid UTF-8 text: {exc}") from None
 
 
 # --- ActivationEnvelope canonical encoding - byte-for-byte mirror of ---
@@ -157,15 +229,13 @@ class ActivationEnvelope:
     issuer_key_id: str
 
     def __post_init__(self):
-        import re
-
-        if not re.match(_ACTIVATION_ID_RE_SRC, self.activation_id):
+        if not _ACTIVATION_ID_RE.match(self.activation_id):
             raise IssuerError("activationId must be 32 lowercase hex characters")
         if not self.credential:
             raise IssuerError("credential must not be empty")
         if len(self.credential) > MAX_CREDENTIAL_CHARS:
             raise IssuerError(f"credential exceeds max length ({MAX_CREDENTIAL_CHARS})")
-        if not re.match(_CREDENTIAL_RE_SRC, self.credential):
+        if not _CREDENTIAL_RE.match(self.credential):
             raise IssuerError("credential must be URL-safe base64 (no padding)")
         if self.not_before_epoch_millis >= self.expires_at_epoch_millis:
             raise IssuerError("notBeforeEpochMillis must be before expiresAtEpochMillis")
@@ -176,9 +246,12 @@ class ActivationEnvelope:
         if len(set(self.bootstrap_endpoint_hints)) != len(self.bootstrap_endpoint_hints):
             raise IssuerError("bootstrapEndpointHints contains a duplicate EndpointId")
         for hint in self.bootstrap_endpoint_hints:
-            if not hint:
-                raise IssuerError("bootstrapEndpointHint must not be blank")
-            hint_bytes = hint.encode("utf-8")
+            # Matches Android EndpointId's own isNotBlank() contract exactly
+            # (PR #95 review fix, item 3) - " " must be rejected here too,
+            # not just an empty string.
+            if not hint.strip():
+                raise IssuerError("bootstrapEndpointHint must not be blank or whitespace-only")
+            hint_bytes = _utf8_bytes_or_raise(hint, "bootstrapEndpointHint")
             if len(hint_bytes) > MAX_ENDPOINT_HINT_UTF8_BYTES:
                 raise IssuerError(f"bootstrapEndpointHint '{hint}' exceeds max UTF-8 byte length ({MAX_ENDPOINT_HINT_UTF8_BYTES}): {len(hint_bytes)}")
         if self.bootstrap_capability_hint is not None:
@@ -186,11 +259,7 @@ class ActivationEnvelope:
             # the CLI (there is no --capability-hint flag), enforced here
             # too so a future programmatic caller cannot silently violate it.
             raise IssuerError("bootstrapCapabilityHint must be None in B56-4A - B56-6 owns this field")
-        if not self.issuer_key_id:
-            raise IssuerError("issuerKeyId must not be blank")
-        issuer_key_id_bytes = self.issuer_key_id.encode("utf-8")
-        if len(issuer_key_id_bytes) > MAX_ISSUER_KEY_ID_UTF8_BYTES:
-            raise IssuerError(f"issuerKeyId exceeds max UTF-8 byte length ({MAX_ISSUER_KEY_ID_UTF8_BYTES})")
+        validate_issuer_key_id(self.issuer_key_id)
 
 
 def _write_string(buf: bytearray, s: str) -> None:
@@ -237,7 +306,14 @@ def canonical_bytes(envelope: ActivationEnvelope) -> bytes:
 
     _write_bytes(buf, envelope.nonce)
     _write_string(buf, envelope.issuer_key_id)
-    return bytes(buf)
+    bytes_out = bytes(buf)
+    # PR #95 review fix (item 11) - defensive symmetry: never produce what
+    # Android's own decoder would reject purely for size. Every field's own
+    # construction-time bound should already make this unreachable; this is
+    # a hard backstop, not the primary defense.
+    if len(bytes_out) > MAX_CANONICAL_BYTES:
+        raise IssuerError(f"canonical envelope encoding exceeds MAX_CANONICAL_BYTES ({MAX_CANONICAL_BYTES}): {len(bytes_out)}")
+    return bytes_out
 
 
 def sign_envelope(envelope: ActivationEnvelope, private_key: Ed25519PrivateKey) -> bytes:
@@ -259,7 +335,11 @@ def pack_signed_envelope(canonical: bytes, signature: bytes) -> bytes:
     buf += canonical
     buf += struct.pack(">i", len(signature))
     buf += signature
-    return bytes(buf)
+    artifact = bytes(buf)
+    # PR #95 review fix (item 11) - same defensive symmetry as canonical_bytes.
+    if len(artifact) > MAX_ENCODED_BYTES:
+        raise IssuerError(f"encoded envelope artifact exceeds MAX_ENCODED_BYTES ({MAX_ENCODED_BYTES}): {len(artifact)}")
+    return artifact
 
 
 # --- private key file handling - NO CLI secret, ever ---
@@ -269,7 +349,31 @@ def read_private_key_file(path: str) -> Ed25519PrivateKey:
     bytes from `path`. Never accepts JSON, never accepts Base64 via argv -
     fails closed on wrong length/type/read failure. The key bytes are
     never logged, printed, or included in any exception message this
-    function raises."""
+    function raises.
+
+    PR #95 review fix (item 8) - read-time hygiene, BEFORE the bytes are
+    ever used: `path` must be a regular file, and on POSIX its mode must
+    not be group/other-accessible (`_UNSAFE_PRIVATE_KEY_MODE_MASK`) - the
+    same "refuse an unsafe existing mode" discipline
+    gateway/api/activations.py's own store already applies. Windows has no
+    POSIX mode bits at all; this check is skipped there and the module's
+    own docs/CLI output are truthful about NOT providing an ACL guarantee
+    on that platform - never claimed here either.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise IssuerError(f"failed to stat private key file {path!r}: {exc.__class__.__name__}") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise IssuerError(f"private key file {path!r} is not a regular file")
+    if os.name != "nt":
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & _UNSAFE_PRIVATE_KEY_MODE_MASK:
+            raise IssuerError(
+                f"refusing to read private key file {path!r}: its POSIX mode {oct(mode)} is "
+                "group/other-accessible - `chmod 600` it (owner read/write only) before retrying"
+            )
+
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
@@ -283,6 +387,66 @@ def read_private_key_file(path: str) -> Ed25519PrivateKey:
         raise IssuerError(f"private key file {path!r} does not contain a valid Ed25519 private key") from None
     finally:
         raw = None  # best-effort - CPython bytes are immutable, but drop the reference promptly
+
+
+@dataclasses.dataclass(frozen=True)
+class IssuerIdentity:
+    issuer_key_id: str
+    public_key_bytes: bytes  # exactly PUBLIC_KEY_RAW_BYTES bytes
+
+
+def read_issuer_metadata_file(path: str) -> IssuerIdentity:
+    """Strictly parses the EXACT public metadata JSON `generate-key`
+    produces (PR #95 review fix, item 1) - requires exactly the three
+    fields `issuerKeyId`/`publicKeyBase64`/`publicKeyFingerprintSha256Hex`,
+    validates each, and cross-checks that the fingerprint actually matches
+    SHA-256(publicKeyBase64) - a metadata file that is internally
+    inconsistent (e.g. hand-edited) is rejected rather than trusted. This
+    function never reads or needs the private key; `cmd_issue` separately
+    verifies the private key's OWN derived public key matches
+    `public_key_bytes` returned here before any activation is created."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise IssuerError(f"failed to read issuer metadata file {path!r}: {exc.__class__.__name__}") from None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise IssuerError(f"issuer metadata file {path!r} is not valid JSON: {exc}") from None
+    if not isinstance(data, dict) or set(data.keys()) != _ISSUER_METADATA_REQUIRED_FIELDS:
+        raise IssuerError(
+            f"issuer metadata file {path!r} must contain EXACTLY the fields "
+            f"{sorted(_ISSUER_METADATA_REQUIRED_FIELDS)} - no more, no fewer"
+        )
+
+    issuer_key_id = data["issuerKeyId"]
+    if not isinstance(issuer_key_id, str):
+        raise IssuerError("issuer metadata issuerKeyId must be a string")
+    validate_issuer_key_id(issuer_key_id)
+
+    public_key_b64 = data["publicKeyBase64"]
+    if not isinstance(public_key_b64, str):
+        raise IssuerError("issuer metadata publicKeyBase64 must be a string")
+    try:
+        public_key_bytes = base64.b64decode(public_key_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise IssuerError(f"issuer metadata publicKeyBase64 is not valid strict base64: {exc}") from None
+    if len(public_key_bytes) != PUBLIC_KEY_RAW_BYTES:
+        raise IssuerError(f"issuer metadata publicKeyBase64 must decode to exactly {PUBLIC_KEY_RAW_BYTES} bytes, got {len(public_key_bytes)}")
+
+    fingerprint = data["publicKeyFingerprintSha256Hex"]
+    if not isinstance(fingerprint, str) or not _FINGERPRINT_RE.match(fingerprint):
+        raise IssuerError("issuer metadata publicKeyFingerprintSha256Hex must be exactly 64 lowercase hex characters")
+
+    computed_fingerprint = hashlib.sha256(public_key_bytes).hexdigest()
+    if not hmac.compare_digest(computed_fingerprint, fingerprint):
+        raise IssuerError(
+            f"issuer metadata file {path!r} is internally inconsistent: SHA-256(publicKeyBase64) does not "
+            "match publicKeyFingerprintSha256Hex - refusing to trust a corrupted/hand-edited metadata file"
+        )
+
+    return IssuerIdentity(issuer_key_id=issuer_key_id, public_key_bytes=public_key_bytes)
 
 
 def _resolve_ancestors(path: str):
@@ -315,14 +479,11 @@ def _refuse_if_exists(path: str) -> None:
         raise IssuerError(f"refusing to overwrite existing file: {path!r}")
 
 
-def _atomic_write_secret_file(path: str, data: bytes) -> None:
-    """Same discipline as gateway/api/activations.py's _atomic_write_store:
-    write to a sibling temp file (mode 0600 from the start via os.open),
-    fsync, os.replace, fsync the containing directory. Never a partial or
-    best-effort write; never overwrites an existing file (checked by the
-    caller before this is invoked, and enforced again here via O_EXCL on
-    the FINAL path through the rename target check)."""
-    directory = os.path.dirname(os.path.abspath(path)) or "."
+def _write_temp_secret_file(directory: str, data: bytes) -> str:
+    """Writes `data` to a fresh, 0600-where-supported sibling temp file in
+    `directory`, fsyncs it, and returns its path - NEVER the final
+    publication step (see `_publish_no_clobber`). On any failure the temp
+    file is removed before the exception propagates."""
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".activation-envelope-issuer.", suffix=".tmp")
     try:
@@ -338,15 +499,62 @@ def _atomic_write_secret_file(path: str, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        if os.path.exists(path):
-            raise IssuerError(f"refusing to overwrite existing file: {path!r}")
-        os.replace(tmp_path, path)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+    return tmp_path
+
+
+def _publish_no_clobber(tmp_path: str, final_path: str) -> None:
+    """PR #95 review fix (item 4) - a REAL atomic no-clobber publication
+    primitive, replacing the previous TOCTOU-vulnerable
+    `if os.path.exists(...): ... ; os.replace(...)` pattern (a concurrent
+    writer could create `final_path` in the window between that check and
+    the replace, and `os.replace` would then silently overwrite it).
+
+    `os.link` creates a NEW directory entry (`final_path`) pointing at
+    `tmp_path`'s existing inode - the OS itself guarantees this fails
+    atomically with `FileExistsError` if `final_path` already exists,
+    rather than requiring this code to check-then-act. `tmp_path` is
+    always unlinked afterward - once `final_path` exists as a hard link to
+    the SAME inode, removing the temp name does not remove the data, which
+    now lives under `final_path`.
+
+    FAILS CLOSED: if `os.link` raises any OTHER `OSError` (e.g. the
+    platform/filesystem does not support hardlinks, or `tmp_path` and
+    `final_path` are on different filesystems), this raises `IssuerError`
+    rather than silently falling back to an overwrite-capable operation
+    like `os.replace`.
+    """
+    try:
+        os.link(tmp_path, final_path)
+    except FileExistsError:
+        raise IssuerError(f"refusing to overwrite existing file: {final_path!r}") from None
+    except OSError as exc:
+        raise IssuerError(
+            f"atomic no-clobber publication is not supported for {final_path!r} "
+            f"({exc.__class__.__name__}) - refusing to fall back to an overwrite-capable write"
+        ) from None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _atomic_write_secret_file(path: str, data: bytes) -> None:
+    """Writes `data` to `path` with REAL atomic no-clobber semantics (see
+    `_publish_no_clobber`) - temp sibling file -> write -> fsync -> atomic
+    publish-only-if-absent -> fsync the containing directory. Used for the
+    private key, the public metadata, and the signed envelope artifact -
+    the SAME primitive for all three sensitive outputs (PR #95 review fix,
+    item 4)."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    tmp_path = _write_temp_secret_file(directory, data)
+    _publish_no_clobber(tmp_path, path)
     dir_fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(dir_fd)
@@ -367,6 +575,7 @@ def public_key_base64(public_key: Ed25519PublicKey) -> str:
 
 
 def cmd_generate_key(args) -> int:
+    validate_issuer_key_id(args.key_id)
     _refuse_if_exists(args.private_key_out)
     _refuse_if_exists(args.public_metadata_out)
     _refuse_if_inside_git_repo(args.private_key_out)
@@ -374,16 +583,6 @@ def cmd_generate_key(args) -> int:
 
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key()
-    priv_bytes = private_key.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    try:
-        _atomic_write_secret_file(args.private_key_out, priv_bytes)
-    finally:
-        priv_bytes = None
-
     fingerprint = public_key_fingerprint_sha256_hex(public_key)
     metadata = {
         "issuerKeyId": args.key_id,
@@ -391,8 +590,36 @@ def cmd_generate_key(args) -> int:
         "publicKeyFingerprintSha256Hex": fingerprint,
     }
     metadata_bytes = (json.dumps(metadata, indent=2) + "\n").encode("utf-8")
+
+    # PR #95 review fix (item 7) - PUBLIC metadata is published FIRST.
+    # If this fails, NO private key file has ever been written - the
+    # "command failure before private-key commit -> no private key file
+    # remains" invariant holds trivially by ordering alone.
     _atomic_write_secret_file(args.public_metadata_out, metadata_bytes)
 
+    # PRIVATE key is published SECOND - the final, sensitive commit. If
+    # this fails, best-effort clean up the metadata we just published so
+    # this command's failure never leaves a half-published (metadata
+    # without a key) artifact pair on disk.
+    priv_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    try:
+        _atomic_write_secret_file(args.private_key_out, priv_bytes)
+    except BaseException:
+        try:
+            os.remove(args.public_metadata_out)
+        except OSError:
+            pass
+        raise
+    finally:
+        priv_bytes = None
+
+    # Once we reach here, the private key has been durably, successfully
+    # published - the ceremony has materially succeeded. Nothing below
+    # this line may ever delete it.
     print(f"activation_envelope_issuer: generated activation-issuer key id={args.key_id}")
     print(f"activation_envelope_issuer: public key fingerprint (sha256)={fingerprint}")
     print(f"activation_envelope_issuer: private key written to {args.private_key_out} (raw {PRIVATE_KEY_RAW_BYTES} bytes - "
@@ -489,24 +716,53 @@ def _validate_hints_order_preserving(hints: Sequence[str]) -> Tuple[str, ...]:
     if len(set(hints)) != len(hints):
         raise IssuerError("--endpoint-hint values must not contain a duplicate")
     for hint in hints:
-        if not hint:
-            raise IssuerError("--endpoint-hint must not be blank")
-        hint_bytes = hint.encode("utf-8")
+        # Matches Android EndpointId's isNotBlank() exactly (PR #95 review
+        # fix, item 3) - a whitespace-only hint like " " must be rejected
+        # here, BEFORE issuance, not discovered later as an Android decode
+        # failure on an already-signed, already-issued envelope.
+        if not hint.strip():
+            raise IssuerError("--endpoint-hint must not be blank or whitespace-only")
+        hint_bytes = _utf8_bytes_or_raise(hint, "--endpoint-hint")
         if len(hint_bytes) > MAX_ENDPOINT_HINT_UTF8_BYTES:
             raise IssuerError(f"--endpoint-hint {hint!r} exceeds max UTF-8 byte length ({MAX_ENDPOINT_HINT_UTF8_BYTES}): {len(hint_bytes)}")
     return tuple(hints)  # ORIGINAL ORDER - never sorted/deduplicated-and-reordered
 
 
+def _require_finite_positive(value: float, name: str, max_value: float) -> None:
+    """PR #95 review fix (item 9) - `argparse type=float` happily accepts
+    `nan`/`inf`/`-inf` text; a plain `value <= 0 or value > max_value`
+    check does NOT reject NaN (every comparison with NaN is False). This
+    is the ONE place both time arguments are validated, BEFORE
+    issue_activation() is ever called."""
+    if not math.isfinite(value) or value <= 0 or value > max_value:
+        raise IssuerError(f"{name} must be a finite, positive number no greater than {max_value} (got {value!r})")
+
+
 # --- issue ---
 
 def cmd_issue(args) -> int:
-    # Step 1-4: validate EVERY local/operator input BEFORE touching the
+    # Steps 1-4: validate EVERY local/operator input BEFORE touching the
     # activation store - see module's atomicity requirement.
-    if args.envelope_valid_for_hours <= 0 or args.envelope_valid_for_hours > 24 * 366:
-        raise IssuerError(f"--envelope-valid-for-hours must be a positive, bounded number of hours (got {args.envelope_valid_for_hours})")
+    _require_finite_positive(args.envelope_valid_for_hours, "--envelope-valid-for-hours", _MAX_ENVELOPE_VALID_FOR_HOURS)
+    if args.activation_expires_in_days is not None:
+        _require_finite_positive(args.activation_expires_in_days, "--activation-expires-in-days", _MAX_ACTIVATION_EXPIRES_IN_DAYS)
 
     private_key = read_private_key_file(args.private_key_file)
     public_key = private_key.public_key()
+    derived_public_key_bytes = public_key.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+
+    # PR #95 review fix (item 1) - the issuer key id comes ONLY from the
+    # metadata generated alongside the private key, never an independently
+    # operator-typed value, and the private key's OWN derived public key
+    # must match that metadata's public key byte-for-byte. Any mismatch
+    # fails BEFORE issue_activation() - no activation is ever created.
+    identity = read_issuer_metadata_file(args.issuer_metadata_file)
+    if not hmac.compare_digest(identity.public_key_bytes, derived_public_key_bytes):
+        raise IssuerError(
+            "--private-key-file does not match the public key recorded in --issuer-metadata-file - "
+            "refusing to sign an envelope with issuerKeyId that no client could ever verify against this key"
+        )
+    issuer_key_id = identity.issuer_key_id
 
     _refuse_if_exists(args.out)
     _refuse_if_inside_git_repo(args.out)
@@ -521,9 +777,6 @@ def cmd_issue(args) -> int:
             raise IssuerError(f"--bootstrap-bundle rejected: {exc}") from None
         bundle_ref = BundleRef(manifest_version=manifest_version, content_hash=content_hash)
 
-    if not args.issuer_key_id:
-        raise IssuerError("--issuer-key-id must not be blank")
-
     # Step 5: only now call the EXISTING, unmodified issuance authority.
     activations_module = _activations_module()
     try:
@@ -533,18 +786,27 @@ def cmd_issue(args) -> int:
     except (activations_module.ActivationStoreError, ValueError) as exc:
         raise IssuerError(f"issue_activation failed: {exc}") from None
 
-    # Everything from here on MUST either succeed all the way through step
-    # 9 (durable artifact write) or revoke the activation just created -
-    # never leave a plaintext-credential activation ACTIVE with no
-    # delivered envelope. See module's CRITICAL ATOMICITY requirement.
+    # Everything from here on MUST either succeed all the way through the
+    # durable artifact write (the TRANSACTION COMMIT POINT - PR #95 review
+    # fix, item 6) or revoke the activation just created - never leave a
+    # plaintext-credential activation ACTIVE with no delivered envelope,
+    # and never revoke an activation whose envelope WAS already durably
+    # published. See module's CRITICAL ATOMICITY requirement.
     try:
+        # PR #95 review fix (item 10) - a newly-issued activation that
+        # cannot be read back at all is an invariant violation, not a
+        # silently-ignored edge case; this must trigger the same rollback
+        # path as any other post-issue failure.
+        record = activations_module.find_by_activation_id(args.store, args.lock, activation_id)
+        if record is None:
+            raise IssuerError(f"invariant violation: newly-issued activation_id={activation_id} could not be read back from the store")
+
         issued_at = int(time.time() * 1000)
         not_before = issued_at
         requested_expires_at = issued_at + int(args.envelope_valid_for_hours * 3600 * 1000)
 
         server_expires_at = None
-        record = activations_module.find_by_activation_id(args.store, args.lock, activation_id)
-        if record is not None and record.get("expires_at"):
+        if record.get("expires_at"):
             from datetime import datetime
 
             server_expires_at = int(datetime.fromisoformat(record["expires_at"]).timestamp() * 1000)
@@ -574,21 +836,28 @@ def cmd_issue(args) -> int:
             bootstrap_endpoint_hints=hints,
             bootstrap_capability_hint=None,
             nonce=secrets.token_bytes(NONCE_LENGTH),
-            issuer_key_id=args.issuer_key_id,
+            issuer_key_id=issuer_key_id,
         )
 
         canonical = canonical_bytes(envelope)
         signature = private_key.sign(canonical)
         artifact = pack_signed_envelope(canonical, signature)
-        _atomic_write_secret_file(args.out, artifact)
+        # PR #95 review fix (item 6) - the hash is computed BEFORE
+        # publication; the atomic write below is the LAST load-bearing
+        # operation inside this rollback region (the transaction commit
+        # point). Nothing fallible happens after it inside this try block.
         artifact_sha256 = hashlib.sha256(artifact).hexdigest()
+        _atomic_write_secret_file(args.out, artifact)
     except BaseException as exc:
         _revoke_or_report_critical(args, activation_id, exc)
         return 1
     finally:
         credential = None  # best-effort - drop the local reference promptly
 
-    print(f"activation_envelope_issuer: activation_id={activation_id} issuerKeyId={args.issuer_key_id}")
+    # --- COMMIT POINT PASSED: the envelope artifact durably exists and the
+    # --- activation remains ACTIVE. Nothing below this line may revoke it -
+    # --- a failure here is purely cosmetic/presentational.
+    print(f"activation_envelope_issuer: activation_id={activation_id} issuerKeyId={issuer_key_id}")
     print(f"activation_envelope_issuer: envelope issuedAt={issued_at} expiresAt={expires_at} max_devices={args.max_devices}")
     print(f"activation_envelope_issuer: issuer public key fingerprint (sha256)={public_key_fingerprint_sha256_hex(public_key)}")
     print(f"activation_envelope_issuer: envelope artifact written to {args.out} (sha256={artifact_sha256})")
@@ -598,16 +867,25 @@ def cmd_issue(args) -> int:
 
 
 def _revoke_or_report_critical(args, activation_id: str, original_exc: BaseException) -> None:
-    """CRITICAL ATOMICITY - see module docs. Never prints the credential.
-    Always non-zero exit; the caller (`cmd_issue`) already returns 1."""
-    print(f"activation_envelope_issuer: ERROR - envelope creation/signing/output failed after activation "
-          f"{activation_id} was created: {original_exc}", file=sys.stderr)
+    """CRITICAL ATOMICITY - see module docs. PR #95 review fix (item 5):
+    NEVER prints `str(original_exc)` (or any revocation-failure exception's
+    message) - by this point `issue_activation()` has already produced the
+    plaintext credential, and a future lower-layer exception's message
+    could conceivably embed sensitive input. Only bounded, structurally
+    non-secret diagnostics are printed: a fixed phase description, the
+    exception's CLASS NAME, and the (non-secret) activation_id. Always
+    non-zero exit; the caller (`cmd_issue`) already returns 1."""
+    print(
+        f"activation_envelope_issuer: ERROR - envelope creation/signing/output failed after activation "
+        f"{activation_id} was created (failure type: {original_exc.__class__.__name__})",
+        file=sys.stderr,
+    )
     try:
         _activations_module().revoke_activation(args.store, args.lock, activation_id)
     except Exception as revoke_exc:  # noqa: BLE001 - must never propagate a raw traceback here
         print(
             f"activation_envelope_issuer: CRITICAL - failed to auto-revoke activation_id={activation_id} "
-            f"after the error above ({revoke_exc}). MANUAL REVOCATION REQUIRED: run "
+            f"(revocation failure type: {revoke_exc.__class__.__name__}). MANUAL REVOCATION REQUIRED: run "
             f"'activation_tokens.py --store {args.store} --lock {args.lock} revoke {activation_id}' now.",
             file=sys.stderr,
         )
@@ -636,7 +914,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue = sub.add_parser("issue", help="issue a new activation and a signed ActivationEnvelope for it")
     issue.add_argument("--store", required=True, help="path to activations.json (same store activation_tokens.py uses)")
     issue.add_argument("--lock", help="path to the activation store lock file (default: <store>.lock)")
-    issue.add_argument("--issuer-key-id", required=True, help="ActivationEnvelope.issuerKeyId - identifies which activation-issuer public key must verify this envelope")
+    issue.add_argument("--issuer-metadata-file", required=True, help="the EXACT public-metadata JSON generate-key produced alongside --private-key-file - its issuerKeyId is used, and its public key MUST match the private key")
     issue.add_argument("--private-key-file", required=True, help="path to a raw 32-byte Ed25519 private key file - NEVER pass the key itself on the command line")
     issue.add_argument("--max-devices", type=int, default=1, help="device limit for the new activation (default: 1)")
     issue.add_argument("--activation-expires-in-days", type=float, default=None, help="optional server-side activation entitlement expiry, in days from now")

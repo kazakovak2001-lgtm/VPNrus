@@ -13,6 +13,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import stat
 import struct
 import sys
 import tempfile
@@ -28,7 +30,7 @@ for _path in (_GATEWAY_DIR, _TOOLS_DIR):
         sys.path.insert(0, _path)
 
 import activation_envelope_issuer as issuer  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 import manifest_signing  # noqa: E402
@@ -37,12 +39,34 @@ import manifest_signing  # noqa: E402
 # Deterministic TEST-ONLY key - same one embedded in
 # ActivationEnvelopePythonCompatibilityTest.kt. Never a production key.
 _TEST_PRIVATE_KEY_BYTES = bytes(range(32))
+_TEST_ISSUER_KEY_ID = "test-activation-issuer-key-1"
 
 
-def _write_test_key_file(directory):
-    path = os.path.join(directory, "test-issuer-private-key.bin")
+def _write_test_key_file(directory, key_bytes=_TEST_PRIVATE_KEY_BYTES, name="test-issuer-private-key.bin"):
+    path = os.path.join(directory, name)
     with open(path, "wb") as handle:
-        handle.write(_TEST_PRIVATE_KEY_BYTES)
+        handle.write(key_bytes)
+    os.chmod(path, 0o600)
+    return path
+
+
+def _write_metadata_file(directory, private_key_bytes=_TEST_PRIVATE_KEY_BYTES, issuer_key_id=_TEST_ISSUER_KEY_ID,
+                          name="test-issuer-metadata.json", corrupt_fingerprint=False, corrupt_public_key=False):
+    priv = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+    pub_bytes = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    if corrupt_public_key:
+        pub_bytes = bytes((b ^ 0xFF) for b in pub_bytes)
+    fingerprint = hashlib.sha256(pub_bytes).hexdigest()
+    if corrupt_fingerprint:
+        fingerprint = "0" * 64
+    metadata = {
+        "issuerKeyId": issuer_key_id,
+        "publicKeyBase64": base64.b64encode(pub_bytes).decode("ascii"),
+        "publicKeyFingerprintSha256Hex": fingerprint,
+    }
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle)
     return path
 
 
@@ -57,7 +81,7 @@ def _make_test_envelope(**overrides):
         bootstrap_endpoint_hints=("frankfurt-gw", "stockholm-gw"),
         bootstrap_capability_hint=None,
         nonce=bytes(range(16)),
-        issuer_key_id="test-activation-issuer-key-1",
+        issuer_key_id=_TEST_ISSUER_KEY_ID,
     )
     fields.update(overrides)
     return issuer.ActivationEnvelope(**fields)
@@ -76,7 +100,6 @@ class CanonicalEncodingLayoutTests(unittest.TestCase):
 
     def test_no_bundle_ref_writes_false_boolean_and_nothing_else(self):
         canon = issuer.canonical_bytes(_make_test_envelope(bootstrap_bundle_ref=None))
-        # Re-decode manually up to the boolean flag to assert it's exactly 0x00.
         offset = 4 + len(issuer.DOMAIN_TAG) + 4  # domain tag + its length prefix + format version
         offset += 4 + len("a1b2c3d4e5f60718293a4b5c6d7e8f90")  # activationId
         offset += 4 + len("TESTcredential_urlsafe-0123456789ABCDEFGHIJ")  # credential
@@ -126,8 +149,18 @@ class CanonicalEncodingLayoutTests(unittest.TestCase):
 
     def test_issuer_key_id_is_the_final_field(self):
         canon = issuer.canonical_bytes(_make_test_envelope())
-        key_id_bytes = "test-activation-issuer-key-1".encode("utf-8")
+        key_id_bytes = _TEST_ISSUER_KEY_ID.encode("utf-8")
         self.assertTrue(canon.endswith(struct.pack(">i", len(key_id_bytes)) + key_id_bytes))
+
+    def test_canonical_bytes_never_exceed_android_max_canonical_bytes(self):
+        # Build a near-worst-case envelope (max hints, each at the max
+        # UTF-8 byte length, plus a bundle ref) and confirm it stays within
+        # Android's own MAX_CANONICAL_BYTES - PR #95 review fix item 11.
+        hints = tuple(f"h{i:03d}-" + "x" * 121 for i in range(32))  # 128 bytes each
+        ref = issuer.BundleRef(manifest_version=2_000_000_000, content_hash=b"\xff" * 32)
+        env = _make_test_envelope(bootstrap_endpoint_hints=hints, bootstrap_bundle_ref=ref, credential="A" * 256)
+        canon = issuer.canonical_bytes(env)
+        self.assertLessEqual(len(canon), issuer.MAX_CANONICAL_BYTES)
 
 
 class SigningTests(unittest.TestCase):
@@ -179,6 +212,40 @@ class OuterCodecLayoutTests(unittest.TestCase):
         with self.assertRaises(issuer.IssuerError):
             issuer.pack_signed_envelope(canon, b"\x00" * 63)
 
+    def test_encoded_artifact_never_exceeds_android_max_encoded_bytes(self):
+        priv = Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES)
+        hints = tuple(f"h{i:03d}-" + "x" * 121 for i in range(32))
+        ref = issuer.BundleRef(manifest_version=2_000_000_000, content_hash=b"\xff" * 32)
+        env = _make_test_envelope(bootstrap_endpoint_hints=hints, bootstrap_bundle_ref=ref, credential="A" * 256)
+        artifact = issuer.pack_signed_envelope(issuer.canonical_bytes(env), issuer.sign_envelope(env, priv))
+        self.assertLessEqual(len(artifact), issuer.MAX_ENCODED_BYTES)
+
+
+class IssuerKeyIdValidationTests(unittest.TestCase):
+    def test_accepts_a_normal_key_id(self):
+        issuer.validate_issuer_key_id("prod-activation-issuer-2026-09")  # must not raise
+
+    def test_rejects_blank(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer.validate_issuer_key_id("")
+
+    def test_rejects_whitespace_only(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer.validate_issuer_key_id("   ")
+
+    def test_accepts_exactly_64_utf8_bytes(self):
+        issuer.validate_issuer_key_id("x" * 64)  # must not raise
+
+    def test_rejects_65_utf8_bytes(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer.validate_issuer_key_id("x" * 65)
+
+    def test_rejects_multibyte_text_exceeding_byte_bound_even_if_char_count_is_low(self):
+        # Each of these characters is multi-byte in UTF-8 - 64 of them
+        # exceeds 64 BYTES even though the Python string length is 64.
+        with self.assertRaises(issuer.IssuerError):
+            issuer.validate_issuer_key_id("é" * 64)
+
 
 class PrivateKeyFileTests(unittest.TestCase):
     def test_reads_exactly_32_bytes(self):
@@ -195,6 +262,7 @@ class PrivateKeyFileTests(unittest.TestCase):
             path = os.path.join(tmp, "bad.bin")
             with open(path, "wb") as handle:
                 handle.write(b"\x00" * 31)
+            os.chmod(path, 0o600)
             with self.assertRaises(issuer.IssuerError):
                 issuer.read_private_key_file(path)
 
@@ -209,12 +277,135 @@ class PrivateKeyFileTests(unittest.TestCase):
             secret_looking_bytes = b"\xaa" * 31
             with open(path, "wb") as handle:
                 handle.write(secret_looking_bytes)
+            os.chmod(path, 0o600)
             try:
                 issuer.read_private_key_file(path)
                 self.fail("expected IssuerError")
             except issuer.IssuerError as exc:
                 self.assertNotIn(secret_looking_bytes.hex(), str(exc))
                 self.assertNotIn(base64.b64encode(secret_looking_bytes).decode(), str(exc))
+
+    def test_rejects_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_private_key_file(tmp)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not meaningful on Windows")
+    def test_rejects_group_readable_permissions_on_posix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_test_key_file(tmp)
+            os.chmod(path, 0o640)  # group-readable
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_private_key_file(path)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not meaningful on Windows")
+    def test_rejects_world_writable_permissions_on_posix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_test_key_file(tmp)
+            os.chmod(path, 0o602)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_private_key_file(path)
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not meaningful on Windows")
+    def test_accepts_owner_only_permissions_on_posix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_test_key_file(tmp)
+            os.chmod(path, 0o600)
+            issuer.read_private_key_file(path)  # must not raise
+
+
+class IssuerMetadataFileTests(unittest.TestCase):
+    def test_parses_a_well_formed_metadata_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_metadata_file(tmp)
+            identity = issuer.read_issuer_metadata_file(path)
+            self.assertEqual(_TEST_ISSUER_KEY_ID, identity.issuer_key_id)
+            self.assertEqual(32, len(identity.public_key_bytes))
+
+    def test_rejects_extra_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meta.json")
+            priv = Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES)
+            pub_bytes = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+            data = {
+                "issuerKeyId": _TEST_ISSUER_KEY_ID,
+                "publicKeyBase64": base64.b64encode(pub_bytes).decode(),
+                "publicKeyFingerprintSha256Hex": hashlib.sha256(pub_bytes).hexdigest(),
+                "extraField": "unexpected",
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_missing_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meta.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"issuerKeyId": _TEST_ISSUER_KEY_ID}, handle)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_malformed_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meta.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{not json")
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_public_key_wrong_length(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meta.json")
+            data = {
+                "issuerKeyId": _TEST_ISSUER_KEY_ID,
+                "publicKeyBase64": base64.b64encode(b"\x00" * 31).decode(),
+                "publicKeyFingerprintSha256Hex": hashlib.sha256(b"\x00" * 31).hexdigest(),
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_non_strict_base64(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meta.json")
+            data = {
+                "issuerKeyId": _TEST_ISSUER_KEY_ID,
+                "publicKeyBase64": "not!!valid==base64",
+                "publicKeyFingerprintSha256Hex": "0" * 64,
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_fingerprint_wrong_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meta.json")
+            priv = Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES)
+            pub_bytes = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+            data = {
+                "issuerKeyId": _TEST_ISSUER_KEY_ID,
+                "publicKeyBase64": base64.b64encode(pub_bytes).decode(),
+                "publicKeyFingerprintSha256Hex": "NOT-HEX",
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_fingerprint_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_metadata_file(tmp, corrupt_fingerprint=True)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
+
+    def test_rejects_invalid_issuer_key_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_metadata_file(tmp, issuer_key_id="   ")
+            with self.assertRaises(issuer.IssuerError):
+                issuer.read_issuer_metadata_file(path)
 
 
 class GenerateKeyTests(unittest.TestCase):
@@ -239,6 +430,21 @@ class GenerateKeyTests(unittest.TestCase):
             pub_bytes = base64.b64decode(metadata["publicKeyBase64"])
             self.assertEqual(32, len(pub_bytes))
             self.assertEqual(hashlib.sha256(pub_bytes).hexdigest(), metadata["publicKeyFingerprintSha256Hex"])
+            # The generated key/metadata must themselves pass read_issuer_metadata_file/read_private_key_file.
+            identity = issuer.read_issuer_metadata_file(meta_path)
+            priv = issuer.read_private_key_file(priv_path)
+            derived_pub = priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+            self.assertEqual(identity.public_key_bytes, derived_pub)
+
+    def test_rejects_invalid_key_id_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="   ", private_key_out=priv_path, public_metadata_out=meta_path)
+            with self.assertRaises(issuer.IssuerError):
+                issuer.cmd_generate_key(args)
+            self.assertFalse(os.path.exists(priv_path))
+            self.assertFalse(os.path.exists(meta_path))
 
     def test_never_prints_the_private_key_bytes_or_its_base64(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,13 +484,10 @@ class GenerateKeyTests(unittest.TestCase):
             args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
             with self.assertRaises(issuer.IssuerError):
                 issuer.cmd_generate_key(args)
-            # Original file must be untouched.
             with open(priv_path, "rb") as handle:
                 self.assertEqual(b"\x00" * 32, handle.read())
 
     def test_refuses_output_paths_inside_a_git_repository(self):
-        # This repository's own tree IS a git working tree - a path inside
-        # gateway/tools itself must be refused.
         inside_repo_path = os.path.join(_TOOLS_DIR, "should-never-be-written.key")
         self.addCleanup(lambda: os.path.exists(inside_repo_path) and os.remove(inside_repo_path))
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,6 +496,100 @@ class GenerateKeyTests(unittest.TestCase):
             with self.assertRaises(issuer.IssuerError):
                 issuer.cmd_generate_key(args)
             self.assertFalse(os.path.exists(inside_repo_path))
+
+    def test_private_key_publication_failure_removes_the_just_published_metadata(self):
+        # PR #95 review fix item 7 - metadata is published FIRST; if the
+        # PRIVATE key's own publication then fails, the metadata that was
+        # already written must be cleaned up so no half-published pair
+        # (metadata without a key) remains.
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
+
+            original_publish = issuer._atomic_write_secret_file
+            calls = {"n": 0}
+
+            def _fail_on_second_call(path, data):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("simulated private-key publication failure")
+                return original_publish(path, data)
+
+            with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=_fail_on_second_call):
+                with self.assertRaises(OSError):
+                    issuer.cmd_generate_key(args)
+            self.assertFalse(os.path.exists(priv_path))
+            self.assertFalse(os.path.exists(meta_path))  # cleaned up
+
+    def test_metadata_publication_failure_leaves_no_private_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
+            with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=OSError("simulated metadata publication failure")):
+                with self.assertRaises(OSError):
+                    issuer.cmd_generate_key(args)
+            self.assertFalse(os.path.exists(priv_path))
+            self.assertFalse(os.path.exists(meta_path))
+
+
+class AtomicNoClobberPublicationTests(unittest.TestCase):
+    def test_publishes_when_target_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            issuer._atomic_write_secret_file(path, b"hello")
+            with open(path, "rb") as handle:
+                self.assertEqual(b"hello", handle.read())
+
+    def test_refuses_and_leaves_existing_target_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"original")
+            with self.assertRaises(issuer.IssuerError):
+                issuer._atomic_write_secret_file(path, b"attacker-controlled-overwrite")
+            with open(path, "rb") as handle:
+                self.assertEqual(b"original", handle.read())
+
+    def test_real_toctou_race_another_writer_creates_target_after_preflight_check(self):
+        """Simulates EXACTLY the race the old exists()+os.replace() pattern
+        was vulnerable to: preflight (_refuse_if_exists) sees the target
+        absent, then another process/thread creates it BEFORE the final
+        atomic publish runs. The real no-clobber primitive must still
+        refuse, and the other writer's content must survive byte-for-byte."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            issuer._refuse_if_exists(path)  # preflight: sees it absent
+
+            # "Another writer" creates the target in the window between
+            # preflight and the final publish call.
+            with open(path, "wb") as handle:
+                handle.write(b"created-by-another-writer")
+
+            with self.assertRaises(issuer.IssuerError):
+                issuer._atomic_write_secret_file(path, b"attacker-or-issuer-controlled-content")
+
+            with open(path, "rb") as handle:
+                self.assertEqual(b"created-by-another-writer", handle.read())
+
+    def test_temp_file_is_removed_on_publish_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"existing")
+            with self.assertRaises(issuer.IssuerError):
+                issuer._atomic_write_secret_file(path, b"new-data")
+            leftover_temp_files = [f for f in os.listdir(tmp) if f.startswith(".activation-envelope-issuer.")]
+            self.assertEqual([], leftover_temp_files)
+
+    def test_fails_closed_when_link_is_unsupported_never_falls_back_to_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            with mock.patch.object(os, "link", side_effect=OSError("simulated: hardlinks unsupported on this filesystem")):
+                with self.assertRaises(issuer.IssuerError):
+                    issuer._atomic_write_secret_file(path, b"data")
+            self.assertFalse(os.path.exists(path))  # never silently written via a fallback
 
 
 class EndpointHintValidationTests(unittest.TestCase):
@@ -324,6 +621,23 @@ class EndpointHintValidationTests(unittest.TestCase):
         with self.assertRaises(issuer.IssuerError):
             issuer._validate_hints_order_preserving([""])
 
+    def test_rejects_whitespace_only_hint(self):
+        # PR #95 review fix item 3 - Android EndpointId requires
+        # isNotBlank(); a single space must be rejected here too, not just
+        # an empty string.
+        with self.assertRaises(issuer.IssuerError):
+            issuer._validate_hints_order_preserving([" "])
+        with self.assertRaises(issuer.IssuerError):
+            issuer._validate_hints_order_preserving(["\t\n  "])
+
+    def test_every_accepted_hint_would_construct_as_an_android_endpoint_id(self):
+        # A structural proxy for "Android EndpointId(value) would not
+        # throw": non-blank after strip, <=128 UTF-8 bytes.
+        hints = issuer._validate_hints_order_preserving(["frankfurt-gw", "stockholm-gw"])
+        for hint in hints:
+            self.assertTrue(hint.strip())
+            self.assertLessEqual(len(hint.encode("utf-8")), 128)
+
 
 class BundleInspectionTests(unittest.TestCase):
     def _sign_and_package_manifest(self, tmp, manifest_version=3):
@@ -354,7 +668,7 @@ class BundleInspectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, artifact = self._sign_and_package_manifest(tmp)
             _, content_hash = issuer.inspect_signed_manifest_bundle(path)
-            wrong_hash = hashlib.sha256(artifact[8:]).digest()  # hash of canonical+sig section only
+            wrong_hash = hashlib.sha256(artifact[8:]).digest()
             self.assertNotEqual(wrong_hash, content_hash)
 
     def test_rejects_malformed_bundle(self):
@@ -384,11 +698,45 @@ class BundleInspectionTests(unittest.TestCase):
 
     def test_does_not_parse_or_require_any_endpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
-            # manifest with zero endpoints still inspects cleanly - this is
-            # metadata inspection, never a manifest-content verifier.
             path, _ = self._sign_and_package_manifest(tmp, manifest_version=1)
             version, _ = issuer.inspect_signed_manifest_bundle(path)
             self.assertEqual(1, version)
+
+
+class FiniteTimeArgumentValidationTests(unittest.TestCase):
+    def test_accepts_a_sane_positive_value(self):
+        issuer._require_finite_positive(48.0, "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+
+    def test_rejects_nan(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer._require_finite_positive(float("nan"), "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+
+    def test_rejects_positive_infinity(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer._require_finite_positive(float("inf"), "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+
+    def test_rejects_negative_infinity(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer._require_finite_positive(float("-inf"), "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+
+    def test_rejects_zero_and_negative(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer._require_finite_positive(0.0, "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+        with self.assertRaises(issuer.IssuerError):
+            issuer._require_finite_positive(-1.0, "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+
+    def test_rejects_beyond_max(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer._require_finite_positive(issuer._MAX_ENVELOPE_VALID_FOR_HOURS + 1, "--envelope-valid-for-hours", issuer._MAX_ENVELOPE_VALID_FOR_HOURS)
+
+
+def _fcntl_available():
+    try:
+        import fcntl  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 def _run_issue(args):
@@ -406,15 +754,6 @@ def _run_issue(args):
         return 1
 
 
-def _fcntl_available():
-    try:
-        import fcntl  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
 @unittest.skipUnless(_fcntl_available(), "requires a POSIX fcntl environment - see run_tests.sh")
 class IssueCommandTests(unittest.TestCase):
     """Uses the REAL gateway.api.activations store (temp dir only) - never mocked, per module requirements."""
@@ -425,6 +764,7 @@ class IssueCommandTests(unittest.TestCase):
         self.store = os.path.join(self.tmp.name, "activations.json")
         self.lock = os.path.join(self.tmp.name, "activations.lock")
         self.key_path = _write_test_key_file(self.tmp.name)
+        self.metadata_path = _write_metadata_file(self.tmp.name)
         activations_module = issuer._activations_module()
         activations_module.init_store(self.store, self.lock)
         self.activations_module = activations_module
@@ -433,7 +773,7 @@ class IssueCommandTests(unittest.TestCase):
         args = mock.Mock(
             store=self.store,
             lock=self.lock,
-            issuer_key_id="test-activation-issuer-key-1",
+            issuer_metadata_file=self.metadata_path,
             private_key_file=self.key_path,
             max_devices=1,
             activation_expires_in_days=None,
@@ -459,8 +799,6 @@ class IssueCommandTests(unittest.TestCase):
 
         with open(args.out, "rb") as handle:
             artifact = handle.read()
-        # A client-verifiable envelope: correctly formed outer container,
-        # correct signature length, decodable canonical section.
         self.assertGreater(len(artifact), 0)
         canonical_len = struct.unpack_from(">i", artifact, 4)[0]
         sig_len = struct.unpack_from(">i", artifact, 8 + canonical_len)[0]
@@ -471,18 +809,80 @@ class IssueCommandTests(unittest.TestCase):
         signature = artifact[12 + canonical_len:12 + canonical_len + sig_len]
         priv.public_key().verify(signature, canonical)  # raises if invalid
 
+    def test_issuer_key_id_comes_from_metadata_not_a_cli_argument(self):
+        parser = issuer.build_parser()
+        import argparse
+
+        subparsers_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        issue_parser = subparsers_action.choices["issue"]
+        option_strings = {opt for action in issue_parser._actions for opt in action.option_strings}
+        self.assertNotIn("--issuer-key-id", option_strings)
+        self.assertIn("--issuer-metadata-file", option_strings)
+
+    def test_wrong_private_key_for_metadata_is_rejected_before_issue_activation(self):
+        other_key_bytes = bytes((b ^ 0xFF) for b in _TEST_PRIVATE_KEY_BYTES)
+        wrong_key_path = _write_test_key_file(self.tmp.name, key_bytes=other_key_bytes, name="wrong-key.bin")
+        args = self._base_args(private_key_file=wrong_key_path)
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+        self.assertFalse(os.path.exists(args.out))
+
+    def test_metadata_fingerprint_mismatch_rejected_before_issue_activation(self):
+        bad_metadata_path = _write_metadata_file(self.tmp.name, name="bad-meta.json", corrupt_fingerprint=True)
+        args = self._base_args(issuer_metadata_file=bad_metadata_path)
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
+    def test_metadata_public_key_not_matching_private_key_rejected_before_issue_activation(self):
+        # A metadata file whose OWN internal fingerprint is consistent, but
+        # whose public key doesn't match --private-key-file at all.
+        other_key_bytes = bytes((b ^ 0x11) for b in _TEST_PRIVATE_KEY_BYTES)
+        mismatched_metadata_path = _write_metadata_file(self.tmp.name, private_key_bytes=other_key_bytes, name="mismatched-meta.json")
+        args = self._base_args(issuer_metadata_file=mismatched_metadata_path)
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
+    def test_correct_matching_private_key_and_metadata_succeeds(self):
+        args = self._base_args()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = issuer.cmd_issue(args)
+        self.assertEqual(0, rc)
+        records = self.activations_module.list_all(self.store, self.lock)
+        self.assertEqual(self.activations_module.ACTIVE, records[0]["status"])
+
+    def test_whitespace_only_endpoint_hint_rejected_before_issue_activation(self):
+        args = self._base_args(endpoint_hint=[" "])
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
+    def test_nan_envelope_valid_for_hours_rejected_before_issue_activation(self):
+        args = self._base_args(envelope_valid_for_hours=float("nan"))
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
+    def test_infinite_envelope_valid_for_hours_rejected_before_issue_activation(self):
+        args = self._base_args(envelope_valid_for_hours=float("inf"))
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
+    def test_nan_activation_expires_in_days_rejected_before_issue_activation(self):
+        args = self._base_args(activation_expires_in_days=float("nan"))
+        rc = _run_issue(args)
+        self.assertEqual(1, rc)
+        self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
     def test_credential_never_appears_in_stdout_or_stderr(self):
         args = self._base_args()
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             issuer.cmd_issue(args)
-        record = self.activations_module.list_all(self.store, self.lock)[0]
-        digest_map_credentials = []  # we don't have the raw credential here by design - re-derive via a fresh issue
         combined = stdout.getvalue() + stderr.getvalue()
-        # We cannot know the raw credential without re-deriving it, but we
-        # CAN assert the envelope artifact bytes (which DO contain it) never
-        # appear, and that no base64/hex blob resembling token_urlsafe(32)
-        # output (43 chars, URL-safe alphabet) appears verbatim.
         with open(args.out, "rb") as handle:
             artifact = handle.read()
         self.assertNotIn(base64.b64encode(artifact).decode(), combined)
@@ -497,8 +897,6 @@ class IssueCommandTests(unittest.TestCase):
         self.assertEqual(1, rc)
         with open(args.out, "rb") as handle:
             self.assertEqual(b"existing", handle.read())
-        # The pre-flight overwrite check happens BEFORE issue_activation() -
-        # no activation should have been created at all.
         self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
 
     def test_envelope_expiry_never_extends_beyond_server_activation_expiry(self):
@@ -506,8 +904,11 @@ class IssueCommandTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
             rc = issuer.cmd_issue(args)
         self.assertEqual(1, rc)
-        self.assertIn("server-side expiry", stderr.getvalue())
-        # Atomicity: the activation created for this attempt must be revoked, not left ACTIVE.
+        # PR #95 review fix item 5 - the exception MESSAGE (which would
+        # have contained "server-side expiry") is no longer printed, only
+        # its class name and the activation_id - see the secret-redaction
+        # tests for the load-bearing proof of that rule.
+        self.assertIn("IssuerError", stderr.getvalue())
         records = self.activations_module.list_all(self.store, self.lock)
         self.assertEqual(1, len(records))
         self.assertEqual(self.activations_module.REVOKED, records[0]["status"])
@@ -529,7 +930,7 @@ class IssueCommandTests(unittest.TestCase):
             issuer.cmd_issue(args2)
         with open(args1.out, "rb") as h1, open(args2.out, "rb") as h2:
             a1, a2 = h1.read(), h2.read()
-        self.assertNotEqual(a1, a2)  # different activation_id/credential/nonce guarantee this
+        self.assertNotEqual(a1, a2)
 
     def test_capability_hint_is_always_absent_no_cli_option_exists(self):
         import argparse
@@ -561,7 +962,7 @@ class IssueCommandTests(unittest.TestCase):
         self.assertEqual(0, rc)
         with open(bundle_path, "rb") as handle:
             bundle_bytes_after = handle.read()
-        self.assertEqual(bundle_bytes_before, bundle_bytes_after)  # byte-for-byte untouched
+        self.assertEqual(bundle_bytes_before, bundle_bytes_after)
 
     def test_bootstrap_bundle_hash_and_version_flow_into_the_envelope(self):
         priv = Ed25519PrivateKey.generate()
@@ -582,18 +983,16 @@ class IssueCommandTests(unittest.TestCase):
             issuer.cmd_issue(args)
         with open(args.out, "rb") as handle:
             artifact = handle.read()
-        self.assertIn(expected_hash, artifact)  # the exact hash bytes are embedded in the canonical section
-        self.assertIn(struct.pack(">i", 9), artifact)  # manifestVersion=9 present somewhere in canonical ints
+        self.assertIn(expected_hash, artifact)
+        self.assertIn(struct.pack(">i", 9), artifact)
 
     def test_malformed_bootstrap_bundle_rejected_before_activation_issuance(self):
         bundle_path = os.path.join(self.tmp.name, "bad-bundle.bin")
         with open(bundle_path, "wb") as handle:
             handle.write(b"not a real signed manifest")
         args = self._base_args(bootstrap_bundle=bundle_path)
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            rc = _run_issue(args)
+        rc = _run_issue(args)
         self.assertEqual(1, rc)
-        # No activation was ever created - rejected before step 5.
         self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
 
     def test_trailing_bytes_in_bootstrap_bundle_rejected_before_activation_issuance(self):
@@ -609,10 +1008,23 @@ class IssueCommandTests(unittest.TestCase):
         with open(bundle_path, "wb") as handle:
             handle.write(artifact + b"\xff")
         args = self._base_args(bootstrap_bundle=bundle_path)
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            rc = _run_issue(args)
+        rc = _run_issue(args)
         self.assertEqual(1, rc)
         self.assertEqual([], self.activations_module.list_all(self.store, self.lock))
+
+    def test_missing_newly_issued_record_enters_rollback_path(self):
+        # PR #95 review fix item 10 - simulate find_by_activation_id
+        # returning None right after issue_activation() succeeded.
+        args = self._base_args()
+        with mock.patch.object(self.activations_module, "find_by_activation_id", return_value=None):
+            with mock.patch.object(issuer, "_activations_module", return_value=self.activations_module):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    rc = issuer.cmd_issue(args)
+        self.assertEqual(1, rc)
+        records = self.activations_module.list_all(self.store, self.lock)
+        self.assertEqual(1, len(records))
+        self.assertEqual(self.activations_module.REVOKED, records[0]["status"])
+        self.assertFalse(os.path.exists(args.out))
 
     def test_post_issue_signing_failure_revokes_the_new_activation(self):
         args = self._base_args()
@@ -626,6 +1038,44 @@ class IssueCommandTests(unittest.TestCase):
         self.assertEqual(self.activations_module.REVOKED, records[0]["status"])
         self.assertFalse(os.path.exists(args.out))
         self.assertNotIn("credential", stdout.getvalue().lower())
+
+    def test_post_issue_exception_secret_marker_never_printed(self):
+        # PR #95 review fix item 5 - even if a lower-layer exception's
+        # MESSAGE contains something secret-looking, it must never reach
+        # stdout/stderr; only the exception's class name is ever printed.
+        secret_marker = "SECRET-MARKER-zK9qLp3vXeR7"
+
+        class _FakeSensitiveError(RuntimeError):
+            pass
+
+        args = self._base_args()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(issuer, "canonical_bytes", side_effect=_FakeSensitiveError(secret_marker)):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = issuer.cmd_issue(args)
+        self.assertEqual(1, rc)
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn(secret_marker, combined)
+        self.assertIn("_FakeSensitiveError", combined)  # class name IS reported
+
+    def test_revocation_exception_secret_marker_never_printed(self):
+        secret_marker = "SECRET-MARKER-revoke-9f3ak2"
+
+        class _FakeSensitiveRevokeError(RuntimeError):
+            pass
+
+        args = self._base_args()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(issuer, "canonical_bytes", side_effect=RuntimeError("simulated failure")):
+            with mock.patch.object(self.activations_module, "revoke_activation", side_effect=_FakeSensitiveRevokeError(secret_marker)):
+                with mock.patch.object(issuer, "_activations_module", return_value=self.activations_module):
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = issuer.cmd_issue(args)
+        self.assertEqual(1, rc)
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn(secret_marker, combined)
+        self.assertIn("_FakeSensitiveRevokeError", combined)
+        self.assertIn("MANUAL REVOCATION REQUIRED", combined)
 
     def test_post_issue_output_write_failure_revokes_the_new_activation(self):
         args = self._base_args()
@@ -652,16 +1102,24 @@ class IssueCommandTests(unittest.TestCase):
         self.assertIn("MANUAL REVOCATION REQUIRED", combined)
         records = self.activations_module.list_all(self.store, self.lock)
         self.assertEqual(1, len(records))
-        # Since the mocked revoke_activation "failed", the record is still
-        # ACTIVE - this is the documented, reported-not-silent failure mode.
         self.assertEqual(self.activations_module.ACTIVE, records[0]["status"])
         for record in records:
-            combined_lower = combined.lower()
-            self.assertIn(record["activation_id"], combined)  # non-secret id IS reported
-        # No credential-shaped (43-char url-safe base64) token appears.
-        import re
-
+            self.assertIn(record["activation_id"], combined)
         self.assertIsNone(re.search(r"[A-Za-z0-9_-]{43}", combined))
+
+    def test_transaction_commit_point_a_failure_after_successful_publication_never_revokes(self):
+        # PR #95 review fix item 6 - once the atomic write has genuinely
+        # succeeded, a LATER failure (simulated here as the print() calls
+        # that follow it) must never revoke the activation or imply the
+        # artifact should be removed.
+        args = self._base_args()  # no bootstrap bundle -> exactly 4 post-commit print() calls
+        with mock.patch("builtins.print", side_effect=[None, None, None, RuntimeError("simulated cosmetic failure")]):
+            with self.assertRaises(RuntimeError):
+                issuer.cmd_issue(args)
+        records = self.activations_module.list_all(self.store, self.lock)
+        self.assertEqual(1, len(records))
+        self.assertEqual(self.activations_module.ACTIVE, records[0]["status"])
+        self.assertTrue(os.path.exists(args.out))
 
 
 if __name__ == "__main__":

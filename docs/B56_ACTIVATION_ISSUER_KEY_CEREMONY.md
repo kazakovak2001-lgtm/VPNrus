@@ -52,18 +52,49 @@ predating this ceremony's safer pattern). Instead:
   fingerprint) is written to a **separate** file and contains no private
   material at all - see `test_activation_envelope_issuer.py`'s
   `GenerateKeyTests` for the automated proof.
+- `issue` never accepts a raw exception message from anything that runs
+  after the credential exists in memory (see "Post-issuance failures never
+  leak diagnostic text" below) - only bounded, non-secret fields (a phase
+  description, the failing exception's class name, and the activation ID)
+  are ever printed on a failure path.
+
+### Real atomic no-clobber file publication
+
+Every sensitive output (the private key, the public metadata, and a signed
+envelope artifact) is published through the SAME primitive
+(`_atomic_write_secret_file`/`_publish_no_clobber`): write to a sibling
+temp file, `fsync` it, then publish it to the final path using `os.link` -
+which the operating system itself guarantees fails atomically with
+`FileExistsError` if the final path already exists, closing a real
+TOCTOU race an earlier `if os.path.exists(...): ... ; os.replace(...)`
+pattern was vulnerable to (a concurrent writer creating the destination in
+the gap between the check and the replace would have been silently
+overwritten). If the underlying filesystem cannot provide this no-clobber
+guarantee at all (`os.link` raises anything other than `FileExistsError`),
+the tool fails closed with an error - it never falls back to an
+overwrite-capable write.
+
+### Private-key read-time hygiene
+
+Before `issue` ever uses a private key file, it requires the file to be a
+regular file and, on POSIX platforms, rejects a mode that is
+group/other-readable, -writable, or -executable (the same "unsafe existing
+mode" discipline `gateway/api/activations.py`'s own store already applies)
+- `chmod 600` a real production key file before use.
 
 ### Platform limitation - be truthful about it
 
 `generate-key`/`issue`'s output files are written with POSIX `0600`
-permissions where the platform supports it (`os.chmod`). **On Windows,
-`os.chmod`'s single owner-write bit is not an equivalent ACL guarantee** -
-it does not restrict which other local accounts can read the file the way
-POSIX group/other permission bits do. The tool prints an explicit warning
-when run on Windows; an operator generating a real production key on
-Windows must additionally apply a real NTFS ACL (or, preferably, perform
-the ceremony on a Linux/WSL machine, matching the existing B12 manifest key
-ceremony's own recommended environment).
+permissions where the platform supports it (`os.chmod`), and the POSIX
+mode check above only runs on POSIX. **On Windows, `os.chmod`'s single
+owner-write bit is not an equivalent ACL guarantee** - it does not
+restrict which other local accounts can read the file the way POSIX
+group/other permission bits do, and no mode check is performed there at
+all. The tool prints an explicit warning when run on Windows; an operator
+generating a real production key on Windows must additionally apply a real
+NTFS ACL (or, preferably, perform the ceremony on a Linux/WSL machine,
+matching the existing B12 manifest key ceremony's own recommended
+environment).
 
 ## Safe key-generation command shape
 
@@ -76,6 +107,77 @@ python3 gateway/tools/activation_envelope_issuer.py generate-key \
 
 This never prints the private key. It prints only: the key id, the public
 key's SHA-256 fingerprint, and the two output paths.
+
+`generate-key` publishes the PUBLIC metadata file first and the PRIVATE key
+file second, as the final, sensitive commit - if metadata publication
+fails, no private key was ever written; if the private key's own
+publication then fails, the just-published metadata is removed
+(best-effort) so the command's failure never leaves a half-published
+(metadata-without-a-key) pair on disk. Once the private key file itself
+has successfully published, nothing later in the command (a print
+statement, for example) can ever delete it.
+
+## issue consumes the generated metadata file - the key id is never independently typed
+
+`issue` does **not** accept a free-standing `--issuer-key-id`. It accepts
+`--issuer-metadata-file`, the EXACT public-metadata JSON `generate-key`
+produced alongside `--private-key-file`:
+
+```text
+python3 gateway/tools/activation_envelope_issuer.py issue \
+  --store <activations.json> \
+  --issuer-metadata-file <path>/activation-issuer-<key-id>.meta.json \
+  --private-key-file <path-OUTSIDE-this-repo>/activation-issuer-<key-id>.key \
+  --envelope-valid-for-hours <N> \
+  --out <signed-envelope.bin>
+```
+
+Before anything else happens (before any activation is created), `issue`:
+
+1. strictly parses the metadata file, requiring EXACTLY the three fields
+   `issuerKeyId`/`publicKeyBase64`/`publicKeyFingerprintSha256Hex`, and
+   verifies the fingerprint field actually matches SHA-256 of the metadata's
+   own `publicKeyBase64` (a hand-edited/corrupted metadata file is rejected,
+   not trusted);
+2. derives the public key from `--private-key-file` and requires it to
+   match the metadata's `publicKeyBase64` byte-for-byte.
+
+Without this, an operator could accidentally sign with private key A while
+labeling the resulting envelope `issuerKeyId=B` - a validly-signed envelope
+that no Android trust-anchor population could ever verify, because Android
+selects which public key to check against purely by `issuerKeyId`. Any
+mismatch here exits non-zero **before `issue_activation()` is ever
+called** - no activation is created, no envelope is written.
+
+## The transaction commit point
+
+The durable, atomic write of the signed envelope artifact
+(`_atomic_write_secret_file(args.out, artifact)`) is the LAST load-bearing
+operation inside `issue`'s rollback region. Everything fallible - building
+the envelope, canonicalizing it, signing it, encoding the outer container,
+computing its SHA-256 - happens strictly BEFORE that write. The rule this
+enforces:
+
+- **Before** that write succeeds: any failure (including the newly-issued
+  activation record failing to read back at all, which is itself treated
+  as an invariant violation) revokes the activation that was just created
+  via the existing `revoke_activation()`, and no envelope artifact exists.
+- **After** that write succeeds: the activation stays `ACTIVE` and the
+  artifact stays on disk, permanently - a later, purely cosmetic failure
+  (e.g. a print statement) can never cause a rollback of a transaction that
+  already durably committed.
+
+## Post-issuance failures never leak diagnostic text
+
+Once `issue_activation()` has produced the plaintext credential, no raw
+exception message from anything that runs afterward (signing, encoding,
+writing the artifact, or the revocation call itself) is ever printed - only
+a fixed phase description, the failing exception's CLASS NAME, and the
+(non-secret) `activation_id`. This is deliberately conservative: today's
+exception messages in that code path are benign, but a future change to a
+lower layer could raise an exception whose message happens to embed
+sensitive input, and this rule means that would never reach stdout/stderr
+regardless.
 
 ## Public fingerprint verification
 
