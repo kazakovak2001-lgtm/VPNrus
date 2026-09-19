@@ -2599,3 +2599,20 @@ a bootstrap manifest through this path (see
 networking, no UI, no server/gateway changes. See ROADMAP's B56 row and
 `RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md` section 16 for the full
 design.)
+
+---
+Last updated: 2026-09-19 (B56-3 - new stable edge invariant: both
+production control-plane vhosts (`gateway/edge/nginx-pocvpn.conf` -
+Germany, `gateway/edge/nginx-pocvpn-stockholm.conf` - Stockholm) now carry
+native nginx `limit_req`/`limit_conn` Level 1 abuse damping on
+`/v1/activate` (30r/m, burst=20) and `/v1/manifest` (120r/m, burst=60),
+sharing one 20-connection-per-IP concurrency zone, keyed on
+`$binary_remote_addr` only, rejecting with an explicit `429`. This is the
+one and only rate-limiting boundary for these two routes - no application-
+level duplicate limiter exists or should be added. Values are initial
+conservative-but-CGNAT-generous defaults, not empirically tuned, and this
+is abuse damping only, never DDoS protection or a censorship/whitelist
+mechanism (see ROADMAP's B56 row and
+`RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md` section 22). Every other
+route, the ACME bootstrap vhost, and the CDN/XHTTP origin config are
+unaffected. No application code changed.)
