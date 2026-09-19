@@ -32,7 +32,15 @@ import java.util.Base64
  * [CANONICAL_ALPHABET] rejects anything outside `[A-Za-z0-9_-]` BEFORE
  * decoding - this alone rejects standard-alphabet `+`/`/`, `=` padding, and
  * whitespace, since the canonical encoding form ([encode]) never emits any
- * of those.
+ * of those. That alone is NOT sufficient, though (PR #92 correction):
+ * `java.util.Base64`'s decoder accepts non-zero unused/padding bits in the
+ * final group, so distinct strings such as `"AA"` and `"AB"` decode to the
+ * SAME byte (`[0]`) - alphabet validity does not imply there is only one
+ * canonical string per byte sequence. [decode] therefore RE-ENCODES the
+ * decoded bytes and rejects the input unless it comes back byte-for-byte
+ * identical to what [encode] itself would have produced - the accepted
+ * textual format is exactly "RFC 4648 Base64URL alphabet, no padding,
+ * canonical encoding", never a decoder-permissive alias of it.
  *
  * Out of scope for B56-1, deferred to B56-7: QR generation/scanning,
  * Android deep-link handling, clipboard UI, file import UI. This object
@@ -60,6 +68,11 @@ object ActivationEnvelopeTextCodec {
         val bytes = try {
             DECODER.decode(text)
         } catch (e: IllegalArgumentException) {
+            return SignedActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
+        }
+        // PR #92 correction: reject non-canonical unused/pad-bit aliases -
+        // see class docs. Cheap relative to the decode already performed.
+        if (ENCODER.encodeToString(bytes) != text) {
             return SignedActivationEnvelopeDecodeResult.Failure(ActivationEnvelopeParseFailure.TruncatedOrMalformed)
         }
         return ActivationEnvelopeCodec.decode(bytes)

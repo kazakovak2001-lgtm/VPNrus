@@ -188,8 +188,17 @@ class ActivationEnvelope(
     private val capabilityHintBytes: ByteArray? = bootstrapCapabilityHint?.copyOf()
     private val nonceBytes: ByteArray = nonce.copyOf()
 
-    /** Order-preserving, immutable snapshot taken at construction time - mutating a caller-owned source list afterward never affects this instance. */
-    val bootstrapEndpointHints: List<EndpointId> get() = hintsList
+    /**
+     * Order-preserving snapshot taken at construction time - mutating a
+     * caller-owned source list afterward never affects this instance.
+     * Returns a FRESH copy on every read (PR #92 correction): Kotlin's
+     * `List` is only a read-only-view INTERFACE, not a guarantee that the
+     * underlying runtime object (typically an `ArrayList`) cannot be cast
+     * back to `MutableList` and mutated - so [hintsList] itself is never
+     * handed out directly. Bounded to [MAX_ENDPOINT_HINTS] (32) entries, so
+     * the copy-out cost is negligible.
+     */
+    val bootstrapEndpointHints: List<EndpointId> get() = hintsList.toList()
 
     /** Always a fresh copy, or null - mutating the returned array never affects this instance. */
     val bootstrapCapabilityHint: ByteArray? get() = capabilityHintBytes?.copyOf()

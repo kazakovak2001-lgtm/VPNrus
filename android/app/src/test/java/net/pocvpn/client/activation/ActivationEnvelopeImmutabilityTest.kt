@@ -106,6 +106,33 @@ class ActivationEnvelopeImmutabilityTest {
         assertArrayEquals(canonicalBefore, ActivationEnvelopeCanonicalizer.canonicalBytes(envelope))
     }
 
+    // PR #92 second pass, issue 1: the ACCESSOR itself must never hand out a
+    // mutable backing list. `List<T>` is only a read-only-view interface -
+    // the runtime object behind `.toList()` is normally an `ArrayList`,
+    // which an unchecked cast back to `MutableList` can still mutate.
+    @Test
+    @Suppress("UNCHECKED_CAST")
+    fun `mutating the object returned by the bootstrapEndpointHints accessor does not change the envelope`() {
+        val envelope = envelope(hints = listOf(EndpointId("gw-a"), EndpointId("gw-b")))
+        val canonicalBefore = ActivationEnvelopeCanonicalizer.canonicalBytes(envelope)
+
+        val exposed = envelope.bootstrapEndpointHints
+        val mutated = runCatching {
+            (exposed as MutableList<EndpointId>).apply {
+                clear()
+                add(EndpointId("gw-z"))
+            }
+            true
+        }.getOrDefault(false)
+
+        // Whether or not the cast/mutation itself succeeds at runtime is
+        // incidental - what matters is that IF it succeeds, it must have
+        // mutated only the returned copy, never this envelope's signed state.
+        assertEquals(listOf(EndpointId("gw-a"), EndpointId("gw-b")), envelope.bootstrapEndpointHints)
+        assertArrayEquals(canonicalBefore, ActivationEnvelopeCanonicalizer.canonicalBytes(envelope))
+        assertTrue("test sanity: the cast must actually succeed on this JVM for the assertions above to be meaningful", mutated)
+    }
+
     // 5. mutating source trust-anchor map or public-key byte array after anchor construction does not alter verification behavior
     @Test
     fun `mutating source trust-anchor map after construction does not alter verification behavior`() {
