@@ -138,6 +138,19 @@ fun mapRestrictionClassToFailureReason(restrictionClass: RestrictionClass): Diag
 fun mapManifestSourceToManifestSourceKind(source: ManifestSource?): ManifestSourceKind = when (source) {
     ManifestSource.LAST_KNOWN_GOOD -> ManifestSourceKind.LAST_KNOWN_GOOD
     ManifestSource.EMBEDDED_BOOTSTRAP -> ManifestSourceKind.EMBEDDED_BOOTSTRAP
+    // B56-2/PR #93 review fix - EndpointManifestRepository.trustedState()/
+    // trustedSource() (the only real callers this mapper serves) never
+    // return IMPORTED_SIGNED_BOOTSTRAP: it is delivery provenance reported
+    // once at import time by SignedBootstrapBundleImporter.import()'s own
+    // Accepted.source, never a trustedState() outcome - so this branch is
+    // unreachable via THIS mapper's current call sites. It maps to the
+    // matching ManifestSourceKind.IMPORTED_SIGNED_BOOTSTRAP truthfully
+    // (never collapsed into NONE, which would falsely claim "no known
+    // source") so that if a future caller ever hands this mapper an
+    // import-time provenance value, the diagnostic stays accurate instead
+    // of erasing a real, known source - see
+    // ManifestSource.IMPORTED_SIGNED_BOOTSTRAP's own docs.
+    ManifestSource.IMPORTED_SIGNED_BOOTSTRAP -> ManifestSourceKind.IMPORTED_SIGNED_BOOTSTRAP
     null -> ManifestSourceKind.NONE
 }
 

@@ -154,4 +154,18 @@ class EndpointManifestRepository(
 enum class ManifestSource {
     LAST_KNOWN_GOOD,
     EMBEDDED_BOOTSTRAP,
+
+    /**
+     * B56-2 - DELIVERY PROVENANCE ONLY, never a durable trust tier. Reported
+     * by [SignedBootstrapBundleImporter] at the
+     * moment an out-of-band candidate is *offered*, purely so diagnostics can
+     * explain where an accepted candidate arrived from (QR/file vs. HTTPS).
+     * It is NEVER a value [EndpointManifestRepository.trustedState] itself
+     * returns: once [EndpointManifestRepository.offer] accepts an imported
+     * candidate, it is stored in the SAME [LastKnownGoodManifestStore] as any
+     * other accepted candidate, and every later [EndpointManifestRepository.trustedState]
+     * call reports it as ordinary [LAST_KNOWN_GOOD] - see
+     * SignedBootstrapBundleImporterTest's explicit proof of this.
+     */
+    IMPORTED_SIGNED_BOOTSTRAP,
 }
