@@ -1,12 +1,18 @@
 # B56 Activation-Issuer Key Ceremony
 
 Status as of this document: **B56-4A tooling implemented and cross-language
-verified. NO production ceremony has been performed.** No production
-activation-issuer private key exists, no production public key is embedded
-in `net.pocvpn.client.activation.ActivationIssuerTrustAnchors`, and
-`gateway/tools/activation_envelope_issuer.py` has never been run against a
-real production activation store. See "What B56-4B still has to do" below
-for the exact remaining steps.
+verified. B56-4B1 production key ceremony COMPLETED** - see "Production
+ceremony - 2026-09-20" below. A real production activation-issuer keypair
+was generated exactly once, on an operator-controlled offline WSL/Linux
+machine; the PRIVATE key was never displayed, never committed, and remains
+outside this repository; the PUBLIC key is committed through
+`net.pocvpn.client.activation.ProductionActivationIssuerTrustAnchors` and
+cross-verified against the real private key (see that section). **No
+redeemable production `ActivationEnvelope` has been issued** -
+`gateway/tools/activation_envelope_issuer.py issue` has never been run
+against a real production activation store, and the production store itself
+was never touched by this ceremony. See "What B56-4B still has to do" below
+for the remaining steps (B56-4B2 onward).
 
 ## Purpose separation from the manifest signing key
 
@@ -339,48 +345,123 @@ permissions where supported, never printed to stdout/stderr) but cannot
 enforce anything about what happens to the file afterward - that remains an
 operator/delivery-channel responsibility.
 
-## B56-4A has NOT performed the production ceremony
+## B56-4A did NOT perform the production ceremony (historical, superseded by B56-4B1 below)
 
-Confirmed explicitly, to keep `ActivationIssuerTrustAnchors`'s own
-"no production activation-issuer key is populated here or anywhere in this
-slice" statement true after this document exists:
+Confirmed explicitly at the time B56-4A merged, to keep
+`ActivationIssuerTrustAnchors`'s then-current "no production
+activation-issuer key is populated here or anywhere in this slice"
+statement true:
 
 - No `generate-key` invocation against a real, retained private key file
-  has been run as part of B56-4A.
-- No production public key/fingerprint is recorded in this document or
+  had been run as part of B56-4A.
+- No production public key/fingerprint was recorded in this document or
   anywhere else in this repository.
-- `FixedActivationIssuerTrustAnchors`'s only populated instances remain
+- `FixedActivationIssuerTrustAnchors`'s only populated instances were
   test-only (see `ActivationIssuerTrustAnchorsTest`,
   `ActivationEnvelopePythonCompatibilityTest` - both use a deterministic,
   clearly-labeled TEST-ONLY key, never committed as a retained secret since
   its "secrecy" is irrelevant - it exists purely to prove the encoding is
   byte-for-byte compatible).
-- No Android production trust-anchor population change was made.
+- No Android production trust-anchor population change had been made.
 
-## What B56-4B still has to do
+**This is no longer the current state** - see "Production ceremony -
+2026-09-20" below, where B56-4B1 performed the real ceremony and committed
+`ProductionActivationIssuerTrustAnchors`. This section is kept as an
+accurate historical record of B56-4A's own scope.
 
-1. Run `generate-key` for real, on an operator-controlled offline machine
-   (Linux/WSL recommended - see platform-limitation note above), with the
-   private key file written OUTSIDE any git working tree and never
-   transmitted electronically.
-2. Record the printed public key fingerprint out-of-band (this document's
-   "Production ceremony" section, once it exists, mirroring
-   `B12_MANIFEST_KEY_CEREMONY.md`'s own).
-3. Add the production public key bytes + `issuerKeyId` to Android's
-   `FixedActivationIssuerTrustAnchors` population (currently test-only) and
-   ship that in a client build.
-4. Perform a REAL cross-verification against that production key (not the
-   deterministic test key this PR's fixtures use) - sign a real test
-   envelope offline, verify it decodes/verifies correctly against the
-   shipped Android trust anchor, exactly mirroring this PR's
-   `ActivationEnvelopePythonCompatibilityTest` methodology.
-5. Decide and document the real operational rotation/retirement schedule
-   (this document's "Rotation model" section is the mechanism; B56-4B picks
-   actual dates/cadence).
-6. Only after all of the above: `activation_envelope_issuer.py issue` may
-   be run against a real production activation store to mint the first
-   real, redeemable `ActivationEnvelope`.
+## Production ceremony — 2026-09-20
 
-None of this is performed by B56-4A. This tooling slice exists specifically
-so all of the above can be reviewed and exercised against test-only key
-material BEFORE any production secret is ever generated.
+Performed as B56-4B1, on an operator-controlled offline WSL/Linux machine,
+using the merged B56-4A `generate-key` command exactly once against a
+directory outside any git working tree (`~/.nova-secrets/activation-issuer/`,
+mode `700`; the private key file itself is mode `600`).
+
+- **issuerKeyId**: `prod-activation-issuer-2026-09-20`
+- **publicKeyBase64**: `HZLHOiOrEXM3VXvpIudoBORhJBXUXh7lNcRry5Gcg1M=`
+- **publicKeyFingerprintSha256Hex**:
+  `b7ba79ed8284e1eade23f19f842f1dee1ca5d1b2c69ef367fc227afdf4d809c5`
+- **Ceremony date**: 2026-09-20.
+- The PRIVATE key exists ONLY outside this repository, in the
+  operator-controlled ceremony location described above. It was never
+  printed, logged, displayed, hashed-and-reported, base64-encoded for
+  display, copied into any Git checkout, or transmitted anywhere.
+- **No redeemable production `ActivationEnvelope` was issued.** This
+  ceremony ran ONLY `generate-key` - `issue` was never invoked, and
+  `gateway.api.activations.issue_activation()` was never called.
+- **The production activation store was not touched** - no
+  `activations.json` was read, created, or modified as part of this
+  ceremony.
+- **Cross-verification result: PASSED.** A synthetic, clearly non-redeemable
+  test envelope (`activationId=b564b100000000000000000000000001`,
+  `credential=B56_4B1_NON_REDEEMABLE_TEST_CREDENTIAL`, fixed test
+  timestamps, no bootstrap bundle ref, no bootstrap capability hint) was
+  signed OFFLINE with the real production private key using the
+  already-reviewed `canonical_bytes`/`sign_envelope`/`pack_signed_envelope`
+  primitives directly (never `issue`). The resulting artifact decodes
+  through the existing `ActivationEnvelopeCodec` and verifies `Valid`
+  through the existing `Ed25519ActivationEnvelopeVerifier` against
+  `ProductionActivationIssuerTrustAnchors.trustAnchors()` (the real
+  committed production public key) - see
+  `ProductionActivationIssuerTrustAnchorsTest` (Kotlin), which also proves
+  32-byte key length, the fingerprint match above, single-byte-tamper
+  rejection, and that manifest trust anchors are never involved. This
+  fixture is explicitly labeled a
+  `NON_REDEEMABLE PRODUCTION-KEY CROSS-VERIFICATION FIXTURE` in that test's
+  own docs and was never inserted into any activation store.
+
+### Offline backup status
+
+```text
+PRODUCTION_ISSUER_OFFLINE_BACKUP_PENDING
+```
+
+The private key's only retained copy is the primary copy in the
+operator-controlled WSL secret directory above. No removable/offline backup
+has been created yet. **An operator-controlled offline backup MUST be
+created before the first redeemable production `ActivationEnvelope` is ever
+issued** (B56-4B2) - this ceremony does not invent or claim one.
+
+### Rotation / review policy
+
+```text
+key-id:            prod-activation-issuer-2026-09-20
+review:            2027-03-20
+planned rotation no later than: 2027-09-20
+immediate rotation: on suspected compromise
+```
+
+This is an operational policy (when to plan the next ceremony), not a
+cryptographic expiry - envelope validity remains separately bounded by each
+signed envelope's own `expiresAtEpochMillis`. The rotation MECHANISM is the
+"Rotation model" section above: `FixedActivationIssuerTrustAnchors` already
+supports trusting an old and a new key simultaneously during a rotation
+window.
+
+## What B56-4B2+ still has to do
+
+B56-4B1 (this ceremony) completed steps 1-4 below for real. Remaining:
+
+5. ~~Decide and document the real operational rotation/retirement
+   schedule~~ - done above (review 2027-03-20, rotate no later than
+   2027-09-20).
+6. Create a real operator-controlled offline backup of the production
+   private key (see "Offline backup status" above - currently
+   `PRODUCTION_ISSUER_OFFLINE_BACKUP_PENDING`).
+7. Only after step 6: `activation_envelope_issuer.py issue` may be run
+   against a real production activation store to mint the first real,
+   redeemable `ActivationEnvelope` (B56-4B2).
+8. B56-5 owns wiring `ProductionActivationIssuerTrustAnchors` into real
+   bootstrap/runtime composition - not started by B56-4B1.
+
+Historical record (completed by B56-4B1):
+
+1. ~~Run `generate-key` for real, on an operator-controlled offline
+   machine~~ - done, see "Production ceremony - 2026-09-20" above.
+2. ~~Record the printed public key fingerprint out-of-band~~ - done, same
+   section.
+3. ~~Add the production public key bytes + `issuerKeyId` to Android's
+   `FixedActivationIssuerTrustAnchors` population~~ - done via
+   `ProductionActivationIssuerTrustAnchors` (not yet wired into any runtime
+   composition - that remains B56-5).
+4. ~~Perform a REAL cross-verification against that production key~~ -
+   done, see "Production ceremony - 2026-09-20" above.
