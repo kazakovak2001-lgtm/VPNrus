@@ -6,7 +6,7 @@ It is a design proposal, produced against the real repository state as of
 Decision Gate and Recommended Implementation Slices sections for what would
 actually need to be built, and in what order, if this proposal is approved.
 
-**Revision note (correction pass):** the first version of this document
+**Revision note (correction pass 1):** the first version of this document
 (reviewed on PR #91) left one load-bearing gap: it defined credential
 delivery and offline verification, but never actually gave a bootstrapping
 device a way to reach `/v1/activate` if every endpoint the app already knew
@@ -14,12 +14,28 @@ about was blocked - the imported package could only reorder already-known,
 already-trusted candidates, never add a genuinely new reachable one, and no
 restricted-transport fallback existed for the case where none of them work.
 That left the original "needs the API to activate, needs to be routed to
-reach the API" cycle partially intact. This revision closes that gap by
+reach the API" cycle partially intact. This revision closed that gap by
 splitting the single package into two independently authenticated objects
 (section 5-7) and by adding a two-level bootstrap reachability model
-(section 11). Every section below reflects the corrected design; nothing
-from the first version survives silently unreviewed - where a prior
-decision was reused, it is re-justified here, not just repeated.
+(section 11).
+
+**Revision note (correction pass 2):** correction pass 1 left one narrower
+gap inside Level 2 itself: it let a Level-2 bootstrap capability be either
+pre-issued in the package or requested live from a capability-issuance
+endpoint, without saying which of those two is *required* for the actual
+hard-failure case Level 2 exists to solve. If live issuance were ever the
+only path, Level 2 would recreate its own bootstrap cycle ("need a
+capability to enter the restricted lane, need the restricted lane's own
+issuance endpoint reachable to get a capability"). Section 7/11 now define
+two explicit package modes - a **Standard Activation Package** (Level 1
+only, no capability) and a **Level-2-Capable Recovery Package** (carries a
+pre-issued capability, so entering Level 2 never depends on reaching
+anything first) - and state plainly that live issuance is an optional
+optimization, never a hard prerequisite for the recovery path.
+
+Every section below reflects the corrected design; nothing from an earlier
+pass survives silently unreviewed - where a prior decision was reused, it is
+re-justified here, not just repeated.
 
 This document was produced applying the `vpn-architecture` review discipline
 in-session (per `CLAUDE.md` rule 7 - no `Agent`/`Task` subagent dispatch is
@@ -328,6 +344,42 @@ a device that will almost certainly still reach a known origin does not need
 one, and omitting it keeps the QR/package small (Correction 9 - this is an
 out-of-band *recovery* mechanism, not a mandatory part of every activation).
 
+**Correction pass 2 - two explicit package modes.** The fields above are one
+schema; which of them are populated defines which mode a given package is,
+and the mode determines what the client is entitled to assume it can do
+without any live network dependency:
+
+- **Standard Activation Package** - the common case, used whenever Level 1
+  is expected to work. Contains `envelope` and, optionally, `bootstrapBundle`
+  (for endpoint refresh only, not for Level 2). `bootstrapCapabilityHint` is
+  absent. Flow: package -> (optionally freshen the trusted manifest via the
+  bundle) -> Level 1 direct bootstrap -> `/v1/activate`. This mode never
+  touches Level 2 at all.
+- **Level-2-Capable Recovery Package** - used when direct control-plane
+  reachability may already be unavailable at the time the package is
+  issued (e.g. handed out by support to a user who has already reported
+  Level 1 failing). It **must** contain all three: a valid `envelope`, a
+  valid `bootstrapBundle` naming at least one manifest-authorized Level-2
+  listener candidate (section 9/11), and a non-null `bootstrapCapabilityHint`
+  carrying a **pre-issued**, short-lived bootstrap capability already scoped
+  to that listener. Because the capability is pre-issued and travels inside
+  the package itself, entering Level 2 with this package never requires
+  reaching any issuance endpoint first - see section 11 for why this is the
+  one property that actually closes the hard-failure case Level 2 exists
+  for.
+
+A package whose bundle names a Level-2 listener but carries no pre-issued
+capability is not malformed - it is simply **not** a Level-2-Capable Recovery
+Package, and the client must never treat it as one: it may still *attempt*
+Level 2 via live capability issuance (section 11's optional optimization),
+but it carries no guarantee that issuance will succeed, and its own local
+diagnostics must say so (`LEVEL2_NO_PREISSUED_CAPABILITY`, section 20 -
+informational, not a rejection) rather than silently implying the same
+hard-recovery guarantee a true recovery package carries. Only a package
+that actually satisfies all three required fields above is entitled to be
+labeled a Level-2-Capable Recovery Package by the issuer, and only that
+label carries the "works even if nothing else is reachable" guarantee.
+
 Explicit answers to the task's checklist, corrected where Correction 1
 changes them:
 
@@ -497,14 +549,9 @@ two authorities kept deliberately separate:**
   minted, time-boxed token (reusing existing HMAC/Ed25519 primitives, no new
   cryptography) that a Level-2 listener can check locally without touching
   the activation store. It is bound to the `ActivationEnvelope`'s signature/
-  `activationId` (so a capability cannot be requested without presenting a
-  validly-signed envelope first) but is **not** the activation credential
-  itself and **grants no entitlement** - it only opens a narrow pipe.
-  `bootstrapCapabilityHint` (section 7) is where a *pre-issued* capability,
-  if the issuer chose to hand one out at package-creation time, would travel
-  - optional, because a capability can equally be requested live (envelope
-  presented to a narrow, rate-limited capability-issuance endpoint) at
-  bootstrap time instead of being pre-baked into the package.
+  `activationId` (so a capability cannot be minted without a validly-signed
+  envelope behind it) but is **not** the activation credential itself and
+  **grants no entitlement** - it only opens a narrow pipe.
 - The **entitlement question** ("does this device actually get provisioned")
   stays exactly what it already is - `/v1/activate`'s existing
   `decide_and_bind`/`provision_with_activation`, reached *through* the
@@ -515,6 +562,46 @@ two authorities kept deliberately separate:**
   (today's existing risk, unchanged) cannot open the Level-2 lane without
   also presenting a validly-signed envelope. Two independent, narrower
   blast radii instead of one wider one.
+
+**Correction pass 2 - how the capability actually reaches the client is not
+a free choice, because Level 2 exists specifically for the case where the
+client cannot reach anything else:**
+
+- **Pre-issued capability (mandatory for the hard recovery path).** A
+  **Level-2-Capable Recovery Package** (section 7) carries its bootstrap
+  capability already minted, inside `bootstrapCapabilityHint`, at the moment
+  the package is issued. This is the **only** path this design treats as
+  guaranteed to work when every direct control-plane route is already
+  blocked: the client never needs to reach a capability-issuance endpoint,
+  a manifest origin, or anything else before it can present itself to the
+  Level-2 listener - it needs only the package it already has, plus the
+  Level-2 listener address the package's own `SignedBootstrapBundle`
+  supplied (section 9/16). This is the property that actually closes the
+  gap this correction pass exists to close: without a pre-issued
+  capability, "Level 2" would just be another thing behind a reachability
+  requirement, i.e. exactly the recreated cycle ("need a capability -> need
+  to reach the issuer -> issuer unreachable -> cannot enter Level 2") the
+  task explicitly warned against.
+- **Live capability issuance (optional optimization only).** When Level 1
+  is *partially* working - some manifest-known origins reachable, just not
+  ones the client happened to try first, or a capability-issuance endpoint
+  specifically stays reachable even when `/v1/activate` itself does not -
+  a client may request a fresh, short-TTL capability on demand instead of
+  relying on a pre-issued one. This is strictly an optimization (fresher
+  TTL, no need to have anticipated Level 2 at issuance time) and is
+  reached, when available, over the *same* Level 1 reachability machinery
+  (section 19) - it is not a third bootstrap level.
+  **Explicit invariant: live capability issuance MUST NOT be required for
+  the hard Level-2 recovery path.** A client that has a genuine
+  Level-2-Capable Recovery Package must be able to enter Level 2 using
+  *only* that package, with zero additional live dependency. Live issuance
+  is consulted, if at all, only as a way to *refresh* an expiring
+  pre-issued capability while some connectivity still exists (section
+  "Capability/package expiry" below) - never as the sole way to obtain the
+  first one.
+- A **Standard Activation Package** never needs either path: it has no
+  Level-2 listener in its bundle at all, so the question of how its
+  capability would arrive does not arise.
 
 **Correction 6 - server-side enforcement boundary, defined but not built:**
 
@@ -540,6 +627,49 @@ nginx change, no capability-issuance endpoint is created by this PR. It
 exists so that if Level 1 is approved and later found insufficient in the
 field (B54), Level 2 has a concrete, already-reviewed target to build
 against instead of an open question.
+
+**Correction pass 2 - network authority for the Level-2 listener itself.**
+The Level-2 listener's address is, unambiguously, a network fact - exactly
+the category of thing section 6/16 already restrict to the manifest signing
+key. It is therefore authorized **only** via a `SignedBootstrapBundle`
+naming it as an endpoint/binding, verified and adopted through the
+**existing**, unmodified `EndpointManifestRepository.offer()` - never
+through the bootstrap capability, and never through the
+`ActivationEnvelope`. The pre-issued (or live-issued) capability itself
+carries no host/IP/port and authorizes nothing beyond "may open a pipe to
+whichever Level-2 listener the bundle already named" - it cannot, by
+itself, point a client at an endpoint the manifest trust boundary has not
+already vouched for. This keeps activation-issuer authority and manifest
+authority separate exactly as section 6 already requires, with zero
+exception carved out for Level 2.
+
+**Correction pass 2 - capability/package expiry relationship**, defined
+explicitly rather than left implicit:
+
+- **`capability.expiresAt` <= `envelope.expiresAt`**, always. A capability
+  is scoped to attempt bootstrap for a still-valid envelope; it is
+  meaningless (and must be rejected, `LEVEL2_CAPABILITY_EXPIRED`, section
+  20) once the envelope itself would already be rejected as `PACKAGE_EXPIRED`.
+- **Capability TTL is significantly shorter than normal activation
+  entitlement lifetime** - the capability is a narrow, single-purpose
+  transport credential, not a second copy of the activation's own
+  `expires_at`; recommended default on the order of hours to a few days,
+  never matching the activation's own (typically much longer) validity
+  window.
+- **An expired capability does not invalidate the underlying activation
+  credential.** `credential`/`activationId` remain exactly as valid as
+  `decide_and_bind` already says they are, independent of whether any
+  Level-2 capability tied to the same envelope has expired - these are two
+  unrelated expiry clocks, never conflated (mirroring the existing
+  `PACKAGE_EXPIRED`-vs-`ACTIVATION_EXPIRED` distinction from section 7).
+- **A refreshed recovery package/capability may be issued without creating
+  a new activation entitlement**, provided product policy allows it - this
+  is an operator re-running the existing envelope-wrapping/capability-
+  issuance tooling (section 18) against the *same* `activationId` and the
+  *same* underlying credential, never a call to `issue_activation()` again.
+  Nothing here silently extends the activation's own `expires_at` -
+  refreshing a capability changes only the capability's own expiry, and
+  the server-side activation store is never touched by this operation.
 
 ## 12. Redemption transaction
 
@@ -719,12 +849,26 @@ existing rejection reached from a new call site), `CLOCK_UNCERTAIN`,
 `BOOTSTRAP_MANIFEST_UNAVAILABLE` (`TrustedManifestState.NoneTrusted`,
 unchanged), `NO_TRUSTED_BOOTSTRAP_CANDIDATE`,
 `ALL_LEVEL1_PATHS_UNREACHABLE` (renamed from `ALL_BOOTSTRAP_PATHS_UNREACHABLE`
-to be precise about which level exhausted), `LEVEL2_UNAVAILABLE` (new - no
-capability, or no configured Level 2 lane, or the lane itself rejected the
-capability), `BOOTSTRAP_AUTH_REJECTED` (`decide_and_bind`'s `INVALID`),
-`ACTIVATION_REVOKED`, `ACTIVATION_EXPIRED`, `DEVICE_LIMIT_REACHED`,
-`PROFILE_PROVISIONING_FAILED`, `BOOTSTRAP_RATE_LIMITED` (Level 1, once
-section 22 ships).
+to be precise about which level exhausted), `LEVEL2_UNAVAILABLE` (no
+Level-2 listener named by any trusted bundle, or no capability of any kind
+available and live issuance also failed/unreachable), `BOOTSTRAP_AUTH_REJECTED`
+(`decide_and_bind`'s `INVALID`), `ACTIVATION_REVOKED`, `ACTIVATION_EXPIRED`,
+`DEVICE_LIMIT_REACHED`, `PROFILE_PROVISIONING_FAILED`, `BOOTSTRAP_RATE_LIMITED`
+(Level 1, once section 22 ships).
+
+**Correction pass 2 - new, Level-2/package-mode-specific failures**, each
+mapping to a check section 7/11 actually defines:
+`LEVEL2_NO_PREISSUED_CAPABILITY` (informational, not a rejection - the
+package is a valid Standard Activation Package or an under-provisioned
+recovery attempt; Level 2 may still be tried via live issuance, but the
+hard-recovery guarantee does not apply, section 7), `LEVEL2_CAPABILITY_EXPIRED`
+(`capability.expiresAt` has passed - independent of, and never conflated
+with, `PACKAGE_EXPIRED`/`ACTIVATION_EXPIRED`), `LEVEL2_CAPABILITY_INVALID`
+(malformed/wrong-scope/signature-mismatch capability - rejected by the
+Level-2 listener before any relay happens), `LEVEL2_LIVE_ISSUANCE_UNAVAILABLE`
+(the optional live-issuance optimization was attempted and failed/was
+unreachable - never itself a hard failure for a package that already had a
+pre-issued capability).
 
 ## 21. Threat model
 
@@ -776,6 +920,32 @@ compromise" as a single category:**
   by its own short TTL, narrow destination allowlist, and the fact that it
   grants transport, not entitlement - a stolen capability alone cannot
   provision a device without also having the real credential.
+- **Correction pass 2 - stolen Level-2-Capable Recovery Package (theft/replay
+  update, more consequential than a Standard Activation Package theft, and
+  now stated explicitly rather than left implied)**: because this package
+  mode bundles three things at once, a thief who obtains one gets (1) the
+  activation bearer credential (the same exposure a Standard Activation
+  Package theft already carries, section 7), (2) a short-lived bootstrap
+  capability that opens the narrow Level-2 lane, and (3) the public signed
+  endpoint information naming that lane's listener (already public/
+  non-secret by design, section 6, so its disclosure alone is not a new
+  exposure). Item (2) is the genuinely new exposure a recovery package adds
+  over a standard one: it lets the thief *reach* the Level-2 lane, not just
+  possess a credential that needs some reachable path to redeem. This is
+  still bounded, in combination, by: `max_devices` (device binding is still
+  first-use, atomic, race-free - section 12/13), activation `expires_at`/
+  revocation (section 15), the capability's own short TTL (materially
+  shorter than the credential's own validity window, per the expiry
+  relationship above - a stolen recovery package's *extra* exposure window
+  is therefore narrower than its credential's, not wider), and the Level-2
+  listener's own request/bandwidth/connection limits (section 11/22, bounds
+  what a thief can do with the lane even during the capability's short
+  life). Net effect: theft of a recovery package is strictly more
+  consequential than theft of a standard package (it grants transport
+  access a standard package's theft does not), but that additional
+  consequence is itself bounded by a shorter-lived, narrower-scope
+  mechanism than the credential's own already-accepted exposure - never an
+  unbounded new risk.
 - **Reverse engineer**: assume APK-embedded activation-issuer public keys,
   manifest public keys, and embedded bootstrap manifest are all recoverable
   - none are secrets. Only the per-envelope `credential` is secret, and it
@@ -996,12 +1166,24 @@ its own, later, separately-gated slice:
    (Level 1 only)/`BootstrapLaneClient`, wired to the existing
    `ReachabilityEngine`/`EndpointManifestRepository`, behind a debug-only
    entry point first.
-6. **B56-6** - Level 2 restricted bootstrap transport: capability
-   issuance/validation, the dedicated listener, its destination allowlist
-   and abuse limits (section 11) - explicitly gated on an owner decision
-   (below) about whether it ships in the same rollout as Level 1 or only
-   after field evidence justifies it. Independently reviewable and
-   independently deferrable without blocking B56-1 through B56-5.
+6. **B56-6** - Level 2 restricted bootstrap transport, corrected scope
+   (correction pass 2): the dedicated listener and its destination
+   allowlist (section 11); the pre-issued bootstrap capability *format*
+   (bound to envelope identity, no network fact, section 11); capability
+   issuance (both the package-time pre-issuance path used by
+   Level-2-Capable Recovery Packages, and the optional live-issuance
+   endpoint); capability validation at the listener (TTL/scope/signature
+   checks, section 11); recovery-package attachment (the issuance CLI's
+   ability to mint a package that is a genuine Level-2-Capable Recovery
+   Package - envelope + bundle naming a listener + pre-issued capability,
+   all three, section 7); TTL/binding rules (`capability.expiresAt` <=
+   `envelope.expiresAt`, section 11); rate/bandwidth/connection limits
+   (section 11/22); and tests for stolen/replayed/expired capability
+   (section 21/28). Explicitly gated on an owner decision (below) about
+   whether it ships in the same rollout as Level 1 or only after field
+   evidence justifies it. Independently reviewable and independently
+   deferrable without blocking B56-1 through B56-5 - a Standard Activation
+   Package needs none of this.
 7. **B56-7** - QR/deep-link/import UX + recovery UX (section 25/20),
    release-facing only after B56-1/2/5 are merged and reviewed (B56-6 not
    required for a release if Level 2 is deferred).
@@ -1023,11 +1205,27 @@ its own; Level 2 is additive hardening for the harder reachability case.
 
 ## Decision Gate
 
-**Verdict: B - ARCHITECTURE READY WITH EXPLICIT OWNER DECISIONS.**
+**Verdict: B - ARCHITECTURE READY WITH EXPLICIT OWNER DECISIONS.** (Unchanged
+by correction pass 2 - the pass 2 clarification closed a narrower gap
+*inside* the already-defined Level 2, it did not surface a new blocker, so
+the verdict re-evaluated below is confirmed, not merely repeated.)
 
-Re-decided from scratch, not carried over from the first version. Every
-load-bearing architectural question Correction 1-11 raised now has a
-defined answer:
+**Correction pass 2's own gap, now closed**: Level 2 previously left
+ambiguous whether reaching a capability-issuance endpoint was itself a
+hidden prerequisite for entering the restricted lane - which would have
+recreated a bootstrap cycle inside the fallback meant to solve one. Section
+7/11 now make this explicit: a **Level-2-Capable Recovery Package** always
+carries its capability pre-issued, so the hard-failure path never depends on
+reaching anything beyond the package itself; live issuance is stated as an
+optional optimization only, never a requirement. This was a real gap worth
+closing, but it was a clarification within an already-sound Level 2 design
+(the auth model, trust separation, and enforcement boundary from correction
+pass 1 all needed no change) - not a new architectural unknown, hence no
+verdict change.
+
+Re-decided from scratch in correction pass 1, reconfirmed here. Every
+load-bearing architectural question Correction 1-11 (pass 1) and the
+Level-2-capability question (pass 2) raised now has a defined answer:
 
 - Credential delivery: solved (`ActivationEnvelope`, section 6/7).
 - Fresh endpoint recovery when known endpoints are blocked: solved
@@ -1047,7 +1245,12 @@ defined answer:
   asked about (section 16), all resolved by the existing rollback guard.
 - Threat model: corrected with distinguished blast radii per authority
   (section 21), including the previously-understated issuer-service
-  compromise case.
+  compromise case, and the recovery-package theft/replay case (pass 2).
+- Level-2 capability delivery: resolved (pass 2, section 7/11) - a
+  Level-2-Capable Recovery Package is always self-sufficient (pre-issued
+  capability), live issuance is explicitly optional-only, and the
+  capability itself is confirmed to carry no network-fact authority
+  (section 11's "network authority" clarification).
 
 No unresolved cryptographic or trust-model blocker remains. This stays a
 **B**, not an A, because the following are genuinely product/operational
