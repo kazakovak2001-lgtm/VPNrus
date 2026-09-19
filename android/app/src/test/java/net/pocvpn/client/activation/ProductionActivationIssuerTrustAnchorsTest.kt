@@ -3,6 +3,7 @@ package net.pocvpn.client.activation
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.MessageDigest
@@ -12,17 +13,18 @@ import java.util.Base64
  * B56-4B1 - REAL production-key cross-verification. Proves that the
  * production activation-issuer PUBLIC key committed in
  * [ProductionActivationIssuerTrustAnchors] is the actual counterpart of the
- * real private key generated in the offline ceremony (see
- * `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md`'s "Production ceremony -
- * 2026-09-20" section), using ONLY the EXISTING, unmodified
- * [ActivationEnvelopeCodec] / [Ed25519ActivationEnvelopeVerifier] /
- * [FixedActivationIssuerTrustAnchors] pipeline - no fixture-only verifier.
+ * real private key generated in the (final, network-isolated) offline
+ * ceremony (see `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md`'s "Production
+ * ceremony - 2026-09-20 (final, network-isolated)" section), using ONLY the
+ * EXISTING, unmodified [ActivationEnvelopeCodec] /
+ * [Ed25519ActivationEnvelopeVerifier] / [FixedActivationIssuerTrustAnchors]
+ * pipeline - no fixture-only verifier.
  *
  * ## NON_REDEEMABLE PRODUCTION-KEY CROSS-VERIFICATION FIXTURE
  *
  * [SYNTHETIC_ENVELOPE_ARTIFACT_BASE64] below was produced OFFLINE by signing
- * a synthetic [ActivationEnvelope] with the REAL production private key
- * through the already-reviewed
+ * a synthetic [ActivationEnvelope] with the REAL, final production private
+ * key (`prod-activation-issuer-2026-09-20-r2`) through the already-reviewed
  * `gateway/tools/activation_envelope_issuer.py` canonical
  * encoding/signing primitives (`canonical_bytes`/`sign_envelope`/
  * `pack_signed_envelope`) - NOT the `issue` command, so
@@ -80,8 +82,8 @@ class ProductionActivationIssuerTrustAnchorsTest {
         val envelope = (result as ActivationEnvelopeVerificationResult.Valid).envelope
 
         assertEquals(ProductionActivationIssuerTrustAnchors.PRIMARY_KEY_ID, envelope.issuerKeyId.value)
-        assertEquals("b564b100000000000000000000000001", envelope.activationId.value)
-        assertEquals("B56_4B1_NON_REDEEMABLE_TEST_CREDENTIAL", envelope.credential.value)
+        assertEquals("b564b100000000000000000000000002", envelope.activationId.value)
+        assertEquals("B56_4B1_R2_NON_REDEEMABLE_TEST_CREDENTIAL", envelope.credential.value)
     }
 
     @Test
@@ -114,18 +116,29 @@ class ProductionActivationIssuerTrustAnchorsTest {
         assertFalse(manifestTrustAnchorsInterface.isInstance(ProductionActivationIssuerTrustAnchors.trustAnchors()))
     }
 
+    @Test
+    fun `the abandoned first-candidate key id is not present in the production anchor map`() {
+        // The first ceremony pass's candidate key (no offline-isolation
+        // provenance established) must never appear in the merged trust
+        // anchor set - see ProductionActivationIssuerTrustAnchors class docs.
+        val anchors = ProductionActivationIssuerTrustAnchors.trustAnchors()
+        assertNull(anchors.publicKeyFor(ActivationIssuerKeyId("prod-activation-issuer-2026-09-20")))
+    }
+
     companion object {
         /**
          * From `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md`'s "Production
-         * ceremony - 2026-09-20" section - the real ceremony's own printed
-         * fingerprint, recorded out-of-band. Never the private key.
+         * ceremony - 2026-09-20 (final, network-isolated)" section - the
+         * real ceremony's own printed fingerprint, recorded out-of-band.
+         * Never the private key.
          */
         private const val CEREMONY_FINGERPRINT_SHA256_HEX =
-            "b7ba79ed8284e1eade23f19f842f1dee1ca5d1b2c69ef367fc227afdf4d809c5"
+            "88ccf8198af0d7775946253eb958f60f5174c652f6e28a4daecd857ab293e840"
 
         /**
          * NON_REDEEMABLE PRODUCTION-KEY CROSS-VERIFICATION FIXTURE - see class
-         * docs. Signed offline with the real production private key via
+         * docs. Signed offline with the real, final production private key
+         * (`prod-activation-issuer-2026-09-20-r2`) via
          * `gateway/tools/activation_envelope_issuer.py`'s
          * canonical_bytes/sign_envelope/pack_signed_envelope primitives
          * directly (never `issue`, never `issue_activation()`, never any
@@ -133,6 +146,6 @@ class ProductionActivationIssuerTrustAnchorsTest {
          * fixed test values, not a real redeemable activation.
          */
         private const val SYNTHETIC_ENVELOPE_ARTIFACT_BASE64 =
-            "AAAAAQAAAMgAAAAbTk9WQV9BQ1RJVkFUSU9OX0VOVkVMT1BFX1YxAAAAAQAAACBiNTY0YjEwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMQAAACZCNTZfNEIxX05PTl9SRURFRU1BQkxFX1RFU1RfQ1JFREVOVElBTAAAAaMYXFAAAAABoxhcUAAAAAGjGJM+gAAAAAAAAAAAABAAAQIDBAUGBwgJCgsMDQ4PAAAAIXByb2QtYWN0aXZhdGlvbi1pc3N1ZXItMjAyNi0wOS0yMAAAAEBPF6HlNSvfLoBdK+yhOfofzoTObNR7VVVOq4x0U1L9TLEaAhr2ip71wU2BZOfof00Rs8SHfRLiM5D5uwDLmtkC"
+            "AAAAAQAAAM4AAAAbTk9WQV9BQ1RJVkFUSU9OX0VOVkVMT1BFX1YxAAAAAQAAACBiNTY0YjEwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMgAAAClCNTZfNEIxX1IyX05PTl9SRURFRU1BQkxFX1RFU1RfQ1JFREVOVElBTAAAAaMYXFAAAAABoxhcUAAAAAGjGJM+gAAAAAAAAAAAABAAAQIDBAUGBwgJCgsMDQ4PAAAAJHByb2QtYWN0aXZhdGlvbi1pc3N1ZXItMjAyNi0wOS0yMC1yMgAAAEA54GayKSVm2ergRoq/ceb9PHB4MSLw+rIW/FUaIFbcm+XxAtJVz9kvQwvtXC5JZR77uDYJrEtMAkgP8mxgCp0A"
     }
 }
