@@ -2521,3 +2521,27 @@ needed (no pre-B27 relay history exists on any real device). Still
 FOUNDATION - no real ingress of either kind is deployed, Russia
 hard-whitelist bypass remains UNVERIFIED, and this slice does not claim
 CDN whitelist bypass works.)
+
+---
+Last updated: 2026-09-19 (B56-1 - added the activation authority as a new,
+independent boundary alongside the existing manifest/network authority: a
+new `net.pocvpn.client.activation` package holds `ActivationEnvelope`/
+`SignedActivationEnvelope` (activation entitlement metadata, signed by a
+future delegated activation-issuer key - never a host/IP/port/SNI/gateway/
+transport fact), `ActivationEnvelopeCanonicalizer` (deterministic canonical
+encoding, mirroring `ManifestCanonicalizer`'s discipline, prefixed with a
+fixed domain-separation tag `NOVA_ACTIVATION_ENVELOPE_V1` so its canonical
+bytes can never be confused with `EndpointManifest`'s), `ActivationEnvelopeCodec`/
+`ActivationEnvelopeTextCodec` (wire/text container, mirroring
+`SignedManifestCodec`), `ActivationIssuerTrustAnchors`/
+`FixedActivationIssuerTrustAnchors` (a trust-anchor type deliberately
+DISJOINT from `ManifestTrustAnchors`/`FixedManifestTrustAnchors` - activation-
+issuer keys and manifest signing keys are separate sets by construction, not
+convention), and `Ed25519ActivationEnvelopeVerifier` (same BouncyCastle
+Ed25519 primitives as `Ed25519ManifestVerifier`, own typed
+`ActivationEnvelopeFailureKind` set). Pure Kotlin/JVM, no Android framework
+dependency, no network/UI code added. This slice does NOT implement
+`SignedBootstrapBundle` or the `NovaActivationPackage` container (schemaVersion
+stays a container-level concern for a later slice) - see ROADMAP's B56 row
+and `RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md` for the full design and
+remaining slice breakdown.)
