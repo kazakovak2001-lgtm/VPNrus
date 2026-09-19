@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.util.Base64
 
 plugins {
     id("com.android.application")
@@ -93,6 +94,10 @@ android {
         // both currently resolve to the same production origin pair, on
         // purpose (B20 does not add a distinct staging manifest source).
         buildConfigField("String", "MANIFEST_URLS", "\"${resolveManifestUrls()}\"")
+        // Field-test isolation flag (see the `fieldTest` build type below) -
+        // false everywhere except that one build type, so no debug/release
+        // code path can accidentally read this as true.
+        buildConfigField("boolean", "FIELD_TEST_ONLY", "false")
     }
 
     buildTypes {
@@ -122,6 +127,39 @@ android {
             // file - a release build always points at the real production
             // origins.
             buildConfigField("String", "MANIFEST_URLS", "\"$PRODUCTION_MANIFEST_URLS\"")
+        }
+        // Disposable Russia field-test build (see docs/FIELD_TEST_RUSSIA.md).
+        // A dedicated BUILD TYPE, not a product flavor - deliberately: a
+        // flavor would rename compileDebugKotlin/assembleDebug/etc. for
+        // EVERY variant (a flavor dimension is required, so even the normal
+        // debug/release task names would change), which risks breaking any
+        // existing tooling/CI/documentation that names those tasks. A build
+        // type adds compileFieldTestKotlin/assembleFieldTest ALONGSIDE the
+        // existing debug/release task names, completely unchanged.
+        //
+        // Its own source set (src/fieldTest/**) is the REAL isolation
+        // boundary (task's own "must not affect the normal release build",
+        // "cannot accidentally become normal behavior"): FieldTestActivity/
+        // FieldTestViewModel/FieldTestTunnelController/FieldTestIdentity are
+        // never compiled into debug or release at all - not merely
+        // unreachable behind a flag. src/fieldTest/AndroidManifest.xml also
+        // swaps the launcher activity for this build type only.
+        create("fieldTest") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".fieldtest"
+            versionNameSuffix = "-FIELD_TEST_ONLY-v2"
+            isDebuggable = true
+            // No dedicated release-signing mechanism exists in this
+            // repository (no signingConfigs block, no committed keystore) -
+            // reuses the existing debug signing config so this disposable
+            // diagnostic APK is installable exactly like any other debug
+            // build, never a fabricated/ad-hoc signing setup.
+            signingConfig = signingConfigs.getByName("debug")
+            buildConfigField("boolean", "FIELD_TEST_ONLY", "true")
+            // The isolated AWG 3.1 shared keys are injected only into this
+            // disposable variant from gitignored gateway-dev.properties.
+            buildConfigField("String", "FIELD_TEST_FRANKFURT_HPK", "\"${gatewayDevProp("fieldTestFrankfurtHeaderProtectionKey")}\"")
+            buildConfigField("String", "FIELD_TEST_STOCKHOLM_HPK", "\"${gatewayDevProp("fieldTestStockholmHeaderProtectionKey")}\"")
         }
     }
 
@@ -283,4 +321,20 @@ dependencies {
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+}
+
+// A source checkout without operator-local keys can compile and run unit
+// tests, but must never produce an apparently usable field-test APK.
+val verifyFieldTestGatewayKeys = tasks.register("verifyFieldTestGatewayKeys") {
+    doLast {
+        for (name in listOf("fieldTestFrankfurtHeaderProtectionKey", "fieldTestStockholmHeaderProtectionKey")) {
+            val decoded = runCatching { Base64.getDecoder().decode(gatewayDevProp(name)) }.getOrNull()
+            require(decoded?.size == 32) {
+                "Missing or invalid $name in gitignored android/app/gateway-dev.properties"
+            }
+        }
+    }
+}
+tasks.matching { it.name == "packageFieldTest" }.configureEach {
+    dependsOn(verifyFieldTestGatewayKeys)
 }
