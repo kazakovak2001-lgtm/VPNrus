@@ -2576,3 +2576,26 @@ ROADMAP's B56 row for the corrected implementation status. Gradle
 integration (`./gradlew :app:compileDebugKotlin` / `:app:testDebugUnitTest`)
 was subsequently verified for real outside the review sandbox - 111/111
 relevant tests pass; see that row for detail.)
+
+---
+Last updated: 2026-09-19 (B56-2 - added exactly one new client-side import
+boundary, `net.pocvpn.client.reachability.SignedBootstrapBundleImporter`;
+NO new trust boundary. A `SignedBootstrapBundle` is not a distinct
+cryptographic artifact - for this slice it IS `SignedManifest`, decoded with
+the existing unmodified `SignedManifestCodec` and adopted through the
+existing unmodified `EndpointManifestRepository.offer()` - the ONE function
+that can ever cause a new endpoint fact to become trusted. This importer
+owns only delivery-provenance classification (the new
+`ManifestSource.IMPORTED_SIGNED_BOOTSTRAP` diagnostic value - never a
+`trustedState()` outcome, never a durable trust tier) and relabels
+`offer()`'s existing typed rejection kinds into this slice's own
+`BootstrapBundleImportRejectionKind` vocabulary. No second Ed25519 verifier,
+no second `ManifestTrustAnchors` set, no second LKG store, and no
+import-specific rollback rule were added; `offer()`'s body is byte-for-byte
+unchanged. The activation authority (`net.pocvpn.client.activation`,
+B56-1) remains fully disjoint - an activation-issuer key can never authorize
+a bootstrap manifest through this path (see
+`SignedBootstrapBundleImporterTest`'s explicit cross-trust regression). No
+networking, no UI, no server/gateway changes. See ROADMAP's B56 row and
+`RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md` section 16 for the full
+design.)
