@@ -61,9 +61,10 @@ predating this ceremony's safer pattern). Instead:
 ### Real atomic no-clobber file publication - and its precise durability model
 
 Every sensitive output (the private key, the public metadata, and a signed
-envelope artifact) is published through the SAME primitive
-(`_atomic_write_secret_file`/`_publish_no_clobber`), in two explicit
-phases:
+envelope artifact) is published through the SAME two functions
+(`publish_secret_no_clobber`, then separately `confirm_post_publication`),
+in two explicit phases with the ROLLBACK BOUNDARY drawn precisely at the
+line between them (PR #95 review fix, round 3):
 
 ```text
 The secret payload is fully written and fsynced before the atomic no-clobber
@@ -86,18 +87,30 @@ guarantee at all (`os.link` raises anything other than `FileExistsError`),
 the tool fails closed with an error - it never falls back to an
 overwrite-capable write. This `os.link` call succeeding is the ONE logical
 commit point - the final path exists and is complete from that instant on.
+`publish_secret_no_clobber` returns IMMEDIATELY once that link succeeds -
+it performs no further fallible work of its own - which is what lets
+`issue`'s and `generate-key`'s own rollback/revocation regions end right
+there, with zero risk of a later, purely additional confirmation step
+being mistaken for a publication failure.
 
-A `fsync` of the CONTAINING DIRECTORY is then attempted, as an additional,
-SEPARATE confirmation that the new directory *entry* (not the file's own
-already-fsynced contents) will survive a crash. This is deliberately never
-called "confirmed" when it did not succeed: if it fails, the file remains
-published (it is NOT deleted, and no already-created activation is
-revoked because of it) and the tool prints a clear, non-secret
-`WARNING - durability: ...` message. For a real production ceremony, such
-a warning should be treated as an operator condition worth investigating
-(e.g. a degraded filesystem) BEFORE distributing the resulting artifact -
-but it never makes the already-published private key or envelope vanish
-logically, and it never triggers a rollback.
+This second, entirely separate function, `confirm_post_publication`, is
+called AFTERWARD, OUTSIDE any rollback/revocation region, and does two
+purely additional things - removing the now-redundant temp hardlink name,
+and a `fsync` of the file's CONTAINING DIRECTORY, an additional, SEPARATE
+confirmation that the new directory *entry* (not the file's own
+already-fsynced contents) will survive a crash. Neither step is ever
+called "confirmed" when it did not succeed, and this function itself
+**never raises, under any circumstance** - including if the attempt to
+print its own warning fails (a closed stderr, `BrokenPipeError`, or any
+other exception from the output channel is itself swallowed). If either
+step fails, the already-published file is NOT deleted, no already-created
+activation is revoked because of it, and the tool prints a best-effort,
+non-secret `WARNING - durability: ...` message when it can. For a real
+production ceremony, such a warning should be treated as an operator
+condition worth investigating (e.g. a degraded filesystem) BEFORE
+distributing the resulting artifact - but it never makes the
+already-published private key or envelope vanish logically, and it never
+triggers a rollback.
 
 ### Private-key read-time hygiene
 
@@ -193,22 +206,28 @@ called** - no activation is created, no envelope is written.
 
 The LOGICAL commit point is the successful no-clobber final-path
 publication of the signed envelope artifact - precisely, the moment
-`_publish_no_clobber`'s `os.link(tmp, args.out)` call succeeds inside
-`_atomic_write_secret_file(args.out, artifact)`. Everything fallible -
-building the envelope, canonicalizing it, signing it, encoding the outer
-container, computing its SHA-256, and the pre-publication temp-file
-write/fsync - happens strictly BEFORE that link. The rule this enforces:
+`os.link(tmp, args.out)` succeeds inside `publish_secret_no_clobber(args.out, artifact)`.
+Everything fallible - building the envelope, canonicalizing it, signing
+it, encoding the outer container, computing its SHA-256, and the
+pre-publication temp-file write/fsync - happens strictly BEFORE that
+link, and `cmd_issue`'s activation-revocation `try` block ends
+IMMEDIATELY after calling `publish_secret_no_clobber` (round 3 review
+fix) - `confirm_post_publication`, the ONLY thing that runs afterward,
+is called OUTSIDE that block and never raises. The rule this enforces:
 
 - **Before** that link succeeds: any failure (including the newly-issued
   activation record failing to read back at all, which is itself treated
   as an invariant violation) revokes the activation that was just created
   via the existing `revoke_activation()`, and no envelope artifact exists.
-- **After** that link succeeds: the activation stays `ACTIVE` and the
-  artifact stays on disk, permanently - this includes a failure of the
-  POST-publication directory-fsync durability confirmation (surfaced only
-  as a warning, per the durability model above) and any later, purely
-  cosmetic failure (e.g. a print statement) - neither can ever cause a
-  rollback of a transaction that has already logically committed.
+- **After** that link succeeds: `revoke_activation()` is structurally
+  unreachable from any code path - the activation stays `ACTIVE` and the
+  artifact stays on disk, permanently. This includes a failure of the
+  POST-publication directory-fsync durability confirmation or of the
+  redundant-temp-file cleanup (both surfaced only as a best-effort,
+  non-throwing warning, per the durability model above), and any later,
+  purely cosmetic failure (e.g. an unrelated print statement) - none of
+  these can ever cause a rollback of a transaction that has already
+  logically committed.
 
 ## Post-issuance failures never leak diagnostic text
 

@@ -495,7 +495,7 @@ def _refuse_if_exists(path: str) -> None:
 def _write_temp_secret_file(directory: str, data: bytes) -> str:
     """Writes `data` to a fresh, 0600-where-supported sibling temp file in
     `directory`, fsyncs it, and returns its path - NEVER the final
-    publication step (see `_publish_no_clobber`). On any failure the temp
+    publication step (see `publish_secret_no_clobber`). On any failure the temp
     file is removed before the exception propagates."""
     os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".activation-envelope-issuer.", suffix=".tmp")
@@ -521,155 +521,149 @@ def _write_temp_secret_file(directory: str, data: bytes) -> str:
     return tmp_path
 
 
-@dataclasses.dataclass(frozen=True)
-class PublicationResult:
-    """PR #95 review fix (round 2) - a closed, explicit representation of
-    the TWO publication phases, so a caller can never confuse "the file is
-    durably published" with "every housekeeping/durability nicety around
-    it also succeeded":
-
-      PRE-PUBLICATION: temp file creation/write/fsync, before the final
-      no-clobber link. Failures here may freely raise/propagate - nothing
-      has been committed yet.
-
-      COMMITTED PUBLICATION: the atomic no-clobber `os.link(tmp, final)`
-      call itself succeeds. The instant that call returns, `final_path`
-      exists and is complete - `published` is true from that point on, and
-      NOTHING afterward (removing the now-redundant temp hardlink name,
-      fsyncing the containing directory) may ever be reported back as if
-      publication itself failed.
-
-    `published` is true iff the final no-clobber link succeeded.
-    `directory_sync_confirmed` is true iff the POST-publication directory
-    fsync (a separate, additional crash-durability guarantee for the
-    directory ENTRY, not the file's own contents - those are already
-    fsynced pre-publication) also succeeded; false means that step could
-    not be confirmed, surfaced as a printed warning, never a rollback
-    trigger.
-    `temp_cleanup_confirmed` is true iff the now-redundant temporary
-    hardlink name was successfully removed after publication (cosmetic
-    only - once `published` is true, the data lives at `final_path`
-    regardless of whether the temp name itself still lingers).
-    """
-
-    published: bool
-    directory_sync_confirmed: bool
-    temp_cleanup_confirmed: bool
-
-
 def _print_durability_warning(message: str) -> None:
-    """Fixed, non-secret prefix - every durability warning goes through
-    here so it is trivially greppable and consistently worded."""
-    print(f"activation_envelope_issuer: WARNING - durability: {message}", file=sys.stderr)
-
-
-def _publish_no_clobber(tmp_path: str, final_path: str) -> PublicationResult:
-    """PR #95 review fix (item 4, corrected in round 2) - a REAL atomic
-    no-clobber publication primitive, replacing the previous TOCTOU-
-    vulnerable `if os.path.exists(...): ... ; os.replace(...)` pattern (a
-    concurrent writer could create `final_path` in the window between that
-    check and the replace, and `os.replace` would then silently overwrite
-    it).
-
-    `os.link` creates a NEW directory entry (`final_path`) pointing at
-    `tmp_path`'s existing inode - the OS itself guarantees this fails
-    atomically with `FileExistsError` if `final_path` already exists,
-    rather than requiring this code to check-then-act.
-
-    FAILS CLOSED PRE-PUBLICATION: if `os.link` itself raises (including any
-    OTHER `OSError` - e.g. the platform/filesystem does not support
-    hardlinks, or `tmp_path`/`final_path` are on different filesystems),
-    this raises `IssuerError` - `final_path` was never created, so this is
-    still squarely a pre-publication failure and may propagate freely.
-
-    ONCE `os.link` SUCCEEDS, publication is COMMITTED - `final_path` exists
-    and is complete. Removing the now-redundant `tmp_path` hardlink name is
-    pure housekeeping; a failure to do so is reported in the returned
-    `PublicationResult`, NEVER raised - `final_path` is entirely unaffected
-    either way (a hard link and its original name refer to the SAME inode,
-    so a leftover temp name is harmless clutter, not a partial write).
-    """
+    """PR #95 review fix (round 3) - BEST-EFFORT ONLY, by construction: a
+    diagnostic warning must NEVER itself become a transaction failure. Any
+    exception raised while attempting to print it (closed stderr,
+    `BrokenPipeError`, a patched/custom stream raising `RuntimeError`,
+    etc.) is swallowed here - silently, since there is nothing safer left
+    to do once even the warning channel itself is failing, and this
+    function is only ever called AFTER the artifact it describes has
+    already been successfully published."""
     try:
-        os.link(tmp_path, final_path)
+        print(f"activation_envelope_issuer: WARNING - durability: {message}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def publish_secret_no_clobber(path: str, data: bytes) -> str:
+    """PR #95 review fix (round 3) - PRE-COMMIT and COMMIT ONLY, and
+    NOTHING else. Writes `data` to a fresh sibling temp file (0600 where
+    supported), fsyncs it, then atomically publishes it to `path` via a
+    no-clobber `os.link` - the OS itself guarantees this fails atomically
+    with `FileExistsError` if `path` already exists, closing the TOCTOU
+    race an earlier `if os.path.exists(...): ... ; os.replace(...)`
+    pattern was vulnerable to (a concurrent writer creating the
+    destination in the gap between the check and the replace would have
+    been silently overwritten). If the underlying filesystem cannot
+    provide this no-clobber guarantee at all (`os.link` raises anything
+    other than `FileExistsError`), this fails closed - it never falls back
+    to an overwrite-capable write.
+
+    Raises `IssuerError` ONLY for a PRE-COMMIT failure (the temp write/
+    fsync, or the final link itself failing/being refused) - `path` was
+    never created in that case, so propagating freely is correct.
+
+    THE INSTANT `os.link` SUCCEEDS, THIS FUNCTION RETURNS - it performs NO
+    further fallible work (no temp-name cleanup, no directory fsync, no
+    diagnostics) before doing so. This is deliberate: a caller's
+    rollback/revocation `try` block can end its commit-covered region
+    IMMEDIATELY after calling this function, with ZERO risk of a
+    post-commit housekeeping failure being misinterpreted as a
+    publication failure and triggering a rollback of work that has
+    already succeeded. `path` is successfully published and its file
+    contents were fsynced before this function returns - directory-entry
+    crash durability is a SEPARATE, later confirmation; see
+    `confirm_post_publication`, which the caller must invoke afterward,
+    OUTSIDE any rollback region, using the `tmp_path` this function
+    returns.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    tmp_path = _write_temp_secret_file(directory, data)
+    try:
+        os.link(tmp_path, path)
     except FileExistsError:
-        # PRE-publication failure - final_path was never created. tmp_path
-        # is still ours alone at this point; clean it up before raising so
-        # a rejected publication never leaves stray temp files behind.
+        # PRE-commit failure - `path` was never created. `tmp_path` is
+        # still ours alone; clean it up before raising.
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-        raise IssuerError(f"refusing to overwrite existing file: {final_path!r}") from None
+        raise IssuerError(f"refusing to overwrite existing file: {path!r}") from None
     except OSError as exc:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise IssuerError(
-            f"atomic no-clobber publication is not supported for {final_path!r} "
+            f"atomic no-clobber publication is not supported for {path!r} "
             f"({exc.__class__.__name__}) - refusing to fall back to an overwrite-capable write"
         ) from None
 
-    # --- COMMITTED: final_path now exists. Nothing below may raise. ---
+    # --- COMMITTED: `path` now exists and is complete. Return immediately;
+    # --- no further fallible work happens in this function. ---
+    return tmp_path
+
+
+@dataclasses.dataclass(frozen=True)
+class PostPublicationResult:
+    """POST-commit-only outcome of `confirm_post_publication` - see that
+    function's own docs. NEITHER field ever implies the published file is
+    anything other than successfully published and fsynced; both report
+    SEPARATE, purely additional confirmations that may or may not also
+    have succeeded."""
+
+    temp_cleanup_confirmed: bool
+    directory_sync_confirmed: bool
+
+
+def confirm_post_publication(path: str, tmp_path: str) -> PostPublicationResult:
+    """PR #95 review fix (round 3) - POST-COMMIT ONLY. The caller MUST
+    only invoke this AFTER `publish_secret_no_clobber(path, ...)` has
+    already returned successfully, and OUTSIDE any rollback/revocation
+    region - this function itself NEVER raises, under any circumstance,
+    including from its own warning output (`_print_durability_warning` is
+    itself best-effort). It does two purely additional, independent
+    things, neither of which can ever un-publish `path` or imply it
+    should be treated as unpublished:
+
+      1. removes the now-redundant `tmp_path` hardlink (cosmetic only -
+         `path` and `tmp_path` refer to the SAME inode, so removing the
+         temp name can never affect `path`'s own content);
+      2. attempts to fsync `path`'s containing directory - an ADDITIONAL,
+         separate crash-durability confirmation for the directory ENTRY
+         itself, not `path`'s file contents (already fsynced by
+         `publish_secret_no_clobber` before it returned).
+
+    A failure in either step is reported ONLY via the returned dataclass
+    plus a best-effort printed warning - NEVER an exception, and never a
+    reason to revoke anything or delete `path`. `path` remains
+    successfully published and its file contents remain fsynced
+    regardless of what this function's return value says; only
+    directory-entry crash durability may be reported as unconfirmed - see
+    module docs for why this distinction is never blurred into a single
+    "durably exists" claim.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+
     temp_cleanup_confirmed = True
     try:
         os.unlink(tmp_path)
     except OSError as exc:
         temp_cleanup_confirmed = False
         _print_durability_warning(
-            f"failed to remove the now-redundant temporary file {tmp_path!r} after successfully publishing "
-            f"{final_path!r} ({exc.__class__.__name__}) - {final_path!r} is complete and valid; the leftover "
-            "temp file is harmless clutter and may be removed manually"
+            f"failed to remove the now-redundant temporary file after successfully publishing {path!r} "
+            f"({exc.__class__.__name__}) - {path!r} is successfully published and its file contents were "
+            "already fsynced; the leftover temp file is harmless clutter and may be removed manually"
         )
-    return PublicationResult(published=True, directory_sync_confirmed=False, temp_cleanup_confirmed=temp_cleanup_confirmed)
 
-
-def _confirm_directory_durability(directory: str, published_path: str) -> bool:
-    """POST-publication crash-durability confirmation for the DIRECTORY
-    ENTRY at `published_path` - a separate, additional guarantee from the
-    file's own contents (already fsynced before publication). NEVER
-    raises: on failure this prints a non-secret `_print_durability_warning`
-    and returns False. `published_path` already exists and is complete
-    either way - this step's failure is an operator condition worth
-    investigating before distributing/relying on the artifact, never a
-    reason to consider publication itself to have failed."""
+    directory_sync_confirmed = True
     try:
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
-        return True
     except OSError as exc:
+        directory_sync_confirmed = False
         _print_durability_warning(
-            f"directory fsync failed for {directory!r} after {published_path!r} was already successfully "
-            f"published ({exc.__class__.__name__}) - the file's own contents were fsynced before publication "
-            "and it is complete and readable now, but crash-durability of the DIRECTORY ENTRY pointing to it "
-            "could not be confirmed; investigate before distributing/relying on this artifact"
+            f"directory fsync failed for {directory!r} after {path!r} was already successfully published "
+            f"({exc.__class__.__name__}) - {path!r} is successfully published and its file contents were "
+            "fsynced before publication; directory-entry crash durability could not be confirmed - "
+            "investigate before distributing/relying on this artifact"
         )
-        return False
 
-
-def _atomic_write_secret_file(path: str, data: bytes) -> PublicationResult:
-    """Writes `data` to `path` with REAL atomic no-clobber semantics (see
-    `_publish_no_clobber`) - temp sibling file -> write -> fsync -> atomic
-    publish-only-if-absent -> best-effort post-publication directory-fsync
-    durability confirmation. Used for the private key, the public
-    metadata, and the signed envelope artifact - the SAME primitive for
-    all three sensitive outputs (PR #95 review fix, item 4).
-
-    Raises `IssuerError` ONLY for a PRE-publication failure (temp write, or
-    the final link itself). Once `_publish_no_clobber` returns, `path`
-    exists and this function NEVER raises - the trailing directory-fsync
-    step is a post-publication durability confirmation only; see
-    `PublicationResult`/`_confirm_directory_durability`'s own docs for why
-    its failure is a returned warning flag, never an exception.
-    """
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    tmp_path = _write_temp_secret_file(directory, data)
-    result = _publish_no_clobber(tmp_path, path)  # raises IssuerError only if PRE-publication
-    directory_sync_confirmed = _confirm_directory_durability(directory, path)
-    return dataclasses.replace(result, directory_sync_confirmed=directory_sync_confirmed)
+    return PostPublicationResult(temp_cleanup_confirmed=temp_cleanup_confirmed, directory_sync_confirmed=directory_sync_confirmed)
 
 
 # --- generate-key ---
@@ -701,18 +695,20 @@ def cmd_generate_key(args) -> int:
     }
     metadata_bytes = (json.dumps(metadata, indent=2) + "\n").encode("utf-8")
 
-    # PR #95 review fix (item 7) - PUBLIC metadata is published FIRST.
-    # If this fails, NO private key file has ever been written - the
-    # "command failure before private-key commit -> no private key file
-    # remains" invariant holds trivially by ordering alone.
-    metadata_publication = _atomic_write_secret_file(args.public_metadata_out, metadata_bytes)
+    # PR #95 review fix (round 3) - PUBLIC metadata is published FIRST via
+    # publish_secret_no_clobber, which returns as soon as its commit (the
+    # final link) succeeds and does NO further fallible work. If this
+    # fails, NO private key file has ever been written - the "command
+    # failure before private-key commit -> no private key file remains"
+    # invariant holds trivially by ordering alone.
+    metadata_tmp_path = publish_secret_no_clobber(args.public_metadata_out, metadata_bytes)
 
-    # PRIVATE key is published SECOND. The SENSITIVE COMMIT POINT is the
-    # successful no-clobber final-path link inside _atomic_write_secret_file
-    # - NOT this function returning cleanly (round 2 review fix). If the
-    # private key's link NEVER succeeds (a pre-publication failure - see
-    # PublicationResult's own docs), no private key file exists at all, and
-    # we deliberately do NOT delete the metadata we already published: an
+    # PRIVATE key is published SECOND. The SENSITIVE COMMIT POINT is
+    # precisely the successful no-clobber final-path link inside
+    # publish_secret_no_clobber - not this function returning, not any
+    # later housekeeping. If the private key's link NEVER succeeds (a
+    # PRE-commit failure), no private key file exists at all, and we
+    # deliberately do NOT delete the metadata we already published: an
     # unconditional `os.remove(args.public_metadata_out)` would delete
     # WHATEVER currently occupies that pathname - which could, in a real
     # race, be a completely different file a concurrent actor placed there
@@ -729,7 +725,7 @@ def cmd_generate_key(args) -> int:
         encryption_algorithm=serialization.NoEncryption(),
     )
     try:
-        key_publication = _atomic_write_secret_file(args.private_key_out, priv_bytes)
+        key_tmp_path = publish_secret_no_clobber(args.private_key_out, priv_bytes)
     except BaseException:
         print(
             f"activation_envelope_issuer: ERROR - private key publication failed before its final path was "
@@ -743,12 +739,15 @@ def cmd_generate_key(args) -> int:
     finally:
         priv_bytes = None
 
-    # Once we reach here, `key_publication.published` is true - the
-    # private key's final link succeeded and the ceremony has materially
-    # succeeded, REGARDLESS of either file's `directory_sync_confirmed`
-    # (a warning for that was already printed by _atomic_write_secret_file
-    # itself if it failed). Nothing below this line may ever delete either
-    # file.
+    # --- PRIVATE KEY COMMIT HAS HAPPENED. Nothing below this line may ever
+    # --- delete either file, no matter what a post-commit confirmation
+    # --- step or a later print statement does. Both
+    # --- confirm_post_publication calls below NEVER raise (see their own
+    # --- docs) - they exist purely to report additional, non-essential
+    # --- durability/cleanup confirmations, never to gate success.
+    metadata_publication = confirm_post_publication(args.public_metadata_out, metadata_tmp_path)
+    key_publication = confirm_post_publication(args.private_key_out, key_tmp_path)
+
     print(f"activation_envelope_issuer: generated activation-issuer key id={args.key_id}")
     print(f"activation_envelope_issuer: public key fingerprint (sha256)={fingerprint}")
     print(f"activation_envelope_issuer: private key written to {args.private_key_out} (raw {PRIVATE_KEY_RAW_BYTES} bytes - "
@@ -756,8 +755,9 @@ def cmd_generate_key(args) -> int:
     print(f"activation_envelope_issuer: public metadata written to {args.public_metadata_out}")
     if not metadata_publication.directory_sync_confirmed or not key_publication.directory_sync_confirmed:
         print(
-            "activation_envelope_issuer: NOTE - see the durability warning(s) above: both files are complete "
-            "and valid, but directory-entry crash durability could not be confirmed for at least one of them.",
+            "activation_envelope_issuer: NOTE - see the durability warning(s) above: both files are "
+            "successfully published and their contents are fsynced, but directory-entry crash durability "
+            "could not be confirmed for at least one of them.",
             file=sys.stderr,
         )
     if os.name == "nt":
@@ -951,11 +951,13 @@ def cmd_issue(args) -> int:
         raise IssuerError(f"issue_activation failed: {exc}") from None
 
     # Everything from here on MUST either succeed all the way through the
-    # durable artifact write (the TRANSACTION COMMIT POINT - PR #95 review
-    # fix, item 6) or revoke the activation just created - never leave a
-    # plaintext-credential activation ACTIVE with no delivered envelope,
-    # and never revoke an activation whose envelope WAS already durably
-    # published. See module's CRITICAL ATOMICITY requirement.
+    # successful no-clobber publication of the artifact (the TRANSACTION
+    # COMMIT POINT - PR #95 review fix) or revoke the activation just
+    # created - never leave a plaintext-credential activation ACTIVE with
+    # no delivered envelope, and never revoke an activation whose envelope
+    # was already successfully published (its file contents fsynced
+    # before that commit) merely because a later, purely additional
+    # confirmation step failed. See module's CRITICAL ATOMICITY requirement.
     try:
         # PR #95 review fix (item 10) - a newly-issued activation that
         # cannot be read back at all is an invariant violation, not a
@@ -1006,24 +1008,30 @@ def cmd_issue(args) -> int:
         canonical = canonical_bytes(envelope)
         signature = private_key.sign(canonical)
         artifact = pack_signed_envelope(canonical, signature)
-        # PR #95 review fix (item 6) - the hash is computed BEFORE
-        # publication; the atomic write below is the LAST load-bearing
-        # operation inside this rollback region (the transaction commit
-        # point). Nothing fallible happens after it inside this try block.
+        # PR #95 review fix (round 3) - the hash is computed BEFORE
+        # publication, and publish_secret_no_clobber is the LAST
+        # operation inside this rollback region: it returns as soon as
+        # its commit (the final no-clobber link) succeeds and performs NO
+        # further fallible work - see its own docs. This is what makes it
+        # safe for this `try` block to end immediately afterward: there is
+        # no post-commit housekeeping left inside the rollback region at
+        # all for a stray failure to be misattributed to.
         artifact_sha256 = hashlib.sha256(artifact).hexdigest()
-        publication = _atomic_write_secret_file(args.out, artifact)
+        artifact_tmp_path = publish_secret_no_clobber(args.out, artifact)
     except BaseException as exc:
         _revoke_or_report_critical(args, activation_id, exc)
         return 1
     finally:
         credential = None  # best-effort - drop the local reference promptly
 
-    # --- COMMIT POINT PASSED: `publication.published` is true - the
-    # --- envelope artifact durably exists and the activation remains
-    # --- ACTIVE, REGARDLESS of `publication.directory_sync_confirmed`
-    # --- (a warning for that was already printed above, inside
-    # --- _atomic_write_secret_file, if it failed). Nothing below this
-    # --- line may revoke the activation or imply the artifact is invalid.
+    # --- COMMIT HAS HAPPENED: the envelope artifact is successfully
+    # --- published and its file contents were fsynced, and the activation
+    # --- remains ACTIVE. `revoke_activation()` can no longer be reached
+    # --- from any code path below this line - confirm_post_publication
+    # --- NEVER raises (see its own docs), so nothing here can trigger a
+    # --- rollback of a transaction that has already committed.
+    publication = confirm_post_publication(args.out, artifact_tmp_path)
+
     print(f"activation_envelope_issuer: activation_id={activation_id} issuerKeyId={issuer_key_id}")
     print(f"activation_envelope_issuer: envelope issuedAt={issued_at} expiresAt={expires_at} max_devices={args.max_devices}")
     print(f"activation_envelope_issuer: issuer public key fingerprint (sha256)={public_key_fingerprint_sha256_hex(public_key)}")
@@ -1031,7 +1039,8 @@ def cmd_issue(args) -> int:
     if not publication.directory_sync_confirmed:
         print(
             "activation_envelope_issuer: NOTE - see the durability warning above: the envelope artifact is "
-            "complete and valid, but directory-entry crash durability could not be confirmed.",
+            "successfully published and its file contents are fsynced, but directory-entry crash durability "
+            "could not be confirmed.",
             file=sys.stderr,
         )
     if bundle_ref is not None:

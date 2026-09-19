@@ -511,7 +511,7 @@ class GenerateKeyTests(unittest.TestCase):
             meta_path = os.path.join(tmp, "issuer.meta.json")
             args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
 
-            original_publish = issuer._atomic_write_secret_file
+            original_publish = issuer.publish_secret_no_clobber
             calls = {"n": 0}
 
             def _fail_on_second_call(path, data):
@@ -520,7 +520,7 @@ class GenerateKeyTests(unittest.TestCase):
                     raise OSError("simulated private-key pre-publication failure")
                 return original_publish(path, data)
 
-            with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=_fail_on_second_call):
+            with mock.patch.object(issuer, "publish_secret_no_clobber", side_effect=_fail_on_second_call):
                 with self.assertRaises(OSError):
                     issuer.cmd_generate_key(args)
             self.assertFalse(os.path.exists(priv_path))  # no private key was ever created
@@ -540,7 +540,7 @@ class GenerateKeyTests(unittest.TestCase):
             meta_path = os.path.join(tmp, "issuer.meta.json")
             args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
 
-            original_publish = issuer._atomic_write_secret_file
+            original_publish = issuer.publish_secret_no_clobber
             calls = {"n": 0}
 
             def _fail_on_second_call(path, data):
@@ -554,7 +554,7 @@ class GenerateKeyTests(unittest.TestCase):
                     raise OSError("simulated private-key pre-publication failure")
                 return original_publish(path, data)
 
-            with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=_fail_on_second_call):
+            with mock.patch.object(issuer, "publish_secret_no_clobber", side_effect=_fail_on_second_call):
                 with self.assertRaises(OSError):
                     issuer.cmd_generate_key(args)
             with open(meta_path, "r", encoding="utf-8") as handle:
@@ -565,25 +565,36 @@ class GenerateKeyTests(unittest.TestCase):
             priv_path = os.path.join(tmp, "issuer.key")
             meta_path = os.path.join(tmp, "issuer.meta.json")
             args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
-            with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=OSError("simulated metadata publication failure")):
+            with mock.patch.object(issuer, "publish_secret_no_clobber", side_effect=OSError("simulated metadata publication failure")):
                 with self.assertRaises(OSError):
                     issuer.cmd_generate_key(args)
             self.assertFalse(os.path.exists(priv_path))
             self.assertFalse(os.path.exists(meta_path))
 
 
+def _write_secret_file_for_test(path, data):
+    """Test-only convenience combining the two real production stages
+    (publish_secret_no_clobber + confirm_post_publication) - mirrors what
+    cmd_issue/cmd_generate_key do, for tests that only care about the
+    combined end-to-end file-write behavior, not the phase split itself."""
+    tmp_path = issuer.publish_secret_no_clobber(path, data)
+    return issuer.confirm_post_publication(path, tmp_path)
+
+
 class PublicationCommitPointTests(unittest.TestCase):
-    """PR #95 review fix (round 2) - the LOGICAL commit point is the
-    successful no-clobber final-path link, not the function returning
-    cleanly. A failure of any POST-link housekeeping/durability step must
-    never be reported as if publication itself failed."""
+    """PR #95 review fix (round 3) - the ROLLBACK BOUNDARY itself now ends
+    IMMEDIATELY after `publish_secret_no_clobber` returns (its commit -
+    the successful no-clobber link - and NOTHING else). Every POST-commit
+    step (`confirm_post_publication`, including its own warning output)
+    happens strictly OUTSIDE any region that could call
+    `revoke_activation()`, and NEVER raises under any circumstance."""
 
     def test_directory_fsync_failure_after_successful_link_does_not_raise(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.bin")
-            with mock.patch.object(issuer, "_confirm_directory_durability", return_value=False):
-                result = issuer._atomic_write_secret_file(path, b"data")
-            self.assertTrue(result.published)
+            tmp_path = issuer.publish_secret_no_clobber(path, b"data")
+            with mock.patch("os.fsync", side_effect=OSError("simulated directory fsync failure")):
+                result = issuer.confirm_post_publication(path, tmp_path)
             self.assertFalse(result.directory_sync_confirmed)
             with open(path, "rb") as handle:
                 self.assertEqual(b"data", handle.read())
@@ -591,21 +602,164 @@ class PublicationCommitPointTests(unittest.TestCase):
     def test_directory_durability_confirmation_succeeds_in_a_normal_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.bin")
-            self.assertTrue(issuer._confirm_directory_durability(tmp, path))
+            tmp_path = issuer.publish_secret_no_clobber(path, b"data")
+            result = issuer.confirm_post_publication(path, tmp_path)
+            self.assertTrue(result.directory_sync_confirmed)
+            self.assertTrue(result.temp_cleanup_confirmed)
 
-    def test_directory_fsync_failure_emits_a_non_secret_warning_and_returns_false(self):
+    def test_directory_fsync_failure_emits_a_non_secret_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.bin")
+            tmp_path = issuer.publish_secret_no_clobber(path, b"data")
             stderr = io.StringIO()
             with mock.patch("os.fsync", side_effect=OSError("simulated directory fsync failure")):
                 with redirect_stderr(stderr):
-                    confirmed = issuer._confirm_directory_durability(tmp, path)
-            self.assertFalse(confirmed)
+                    result = issuer.confirm_post_publication(path, tmp_path)
+            self.assertFalse(result.directory_sync_confirmed)
             self.assertIn("WARNING", stderr.getvalue())
             self.assertIn("durability", stderr.getvalue())
             self.assertIn(path, stderr.getvalue())
 
+    def test_warning_output_itself_raising_never_propagates(self):
+        # PR #95 review fix (round 3) - _print_durability_warning must be
+        # best-effort even when the PRINT CALL ITSELF raises (a closed
+        # stderr, BrokenPipeError, a patched/custom stream raising
+        # RuntimeError, etc.) - confirm_post_publication must still return
+        # normally, never propagate that failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            tmp_path = issuer.publish_secret_no_clobber(path, b"data")
+            with mock.patch("os.fsync", side_effect=OSError("simulated directory fsync failure")):
+                with mock.patch("builtins.print", side_effect=RuntimeError("simulated broken stream")):
+                    result = issuer.confirm_post_publication(path, tmp_path)  # must not raise
+            self.assertFalse(result.directory_sync_confirmed)
+            with open(path, "rb") as handle:
+                self.assertEqual(b"data", handle.read())
+
+    def test_temp_cleanup_failure_does_not_raise_and_does_not_invalidate_final_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            tmp_path = issuer.publish_secret_no_clobber(path, b"data")
+            with mock.patch("os.unlink", side_effect=OSError("simulated temp-cleanup failure")):
+                result = issuer.confirm_post_publication(path, tmp_path)  # must not raise
+            self.assertFalse(result.temp_cleanup_confirmed)
+            with open(path, "rb") as handle:
+                self.assertEqual(b"data", handle.read())
+
+    def test_directory_fsync_and_warning_output_both_failing_still_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.bin")
+            tmp_path = issuer.publish_secret_no_clobber(path, b"data")
+            with mock.patch("os.fsync", side_effect=OSError("fsync failure")):
+                with mock.patch("os.unlink", side_effect=OSError("unlink failure")):
+                    with mock.patch("builtins.print", side_effect=RuntimeError("warning output failure")):
+                        result = issuer.confirm_post_publication(path, tmp_path)  # must not raise
+            self.assertFalse(result.directory_sync_confirmed)
+            self.assertFalse(result.temp_cleanup_confirmed)
+            with open(path, "rb") as handle:
+                self.assertEqual(b"data", handle.read())
+
     def test_issue_command_directory_fsync_failure_does_not_revoke_and_leaves_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "activations.json")
+            lock = os.path.join(tmp, "activations.lock")
+            key_path = _write_test_key_file(tmp)
+            metadata_path = _write_metadata_file(tmp)
+            activations_module = issuer._activations_module()
+            activations_module.init_store(store, lock)
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)  # separate directory from the store, so the fsync-failure injection below targets ONLY the envelope's own directory
+            args = mock.Mock(
+                store=store, lock=lock, issuer_metadata_file=metadata_path, private_key_file=key_path,
+                max_devices=1, activation_expires_in_days=None, envelope_valid_for_hours=48.0,
+                endpoint_hint=[], bootstrap_bundle=None, out=os.path.join(out_dir, "envelope.bin"),
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(activations_module, "revoke_activation") as revoke_spy:
+                with mock.patch.object(issuer, "_activations_module", return_value=activations_module):
+                    with _fail_only_directory_fsync(out_dir):
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            rc = issuer.cmd_issue(args)
+                revoke_spy.assert_not_called()
+            self.assertEqual(0, rc)  # NOT a failure - publication succeeded
+            self.assertTrue(os.path.exists(args.out))
+            records = activations_module.list_all(store, lock)
+            self.assertEqual(1, len(records))
+            self.assertEqual(activations_module.ACTIVE, records[0]["status"])  # never revoked
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("durability", combined)
+            self.assertNotIn("REVOKED", combined)
+
+    def test_issue_command_warning_output_raising_after_commit_never_reaches_revoke(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "activations.json")
+            lock = os.path.join(tmp, "activations.lock")
+            key_path = _write_test_key_file(tmp)
+            metadata_path = _write_metadata_file(tmp)
+            activations_module = issuer._activations_module()
+            activations_module.init_store(store, lock)
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)
+            args = mock.Mock(
+                store=store, lock=lock, issuer_metadata_file=metadata_path, private_key_file=key_path,
+                max_devices=1, activation_expires_in_days=None, envelope_valid_for_hours=48.0,
+                endpoint_hint=[], bootstrap_bundle=None, out=os.path.join(out_dir, "envelope.bin"),
+            )
+            with mock.patch.object(activations_module, "revoke_activation") as revoke_spy:
+                with mock.patch.object(issuer, "_activations_module", return_value=activations_module):
+                    with _fail_only_directory_fsync(out_dir):
+                        with mock.patch("builtins.print", side_effect=RuntimeError("simulated broken stream")):
+                            with self.assertRaises(RuntimeError):
+                                # The warning failure propagates out of the
+                                # unguarded print() calls made by cmd_issue
+                                # ITSELF (its own success-message prints,
+                                # not confirm_post_publication's, which
+                                # never raises) - the important invariant
+                                # under test is what happens NEXT: it must
+                                # never reach revoke_activation().
+                                issuer.cmd_issue(args)
+                revoke_spy.assert_not_called()
+            records = activations_module.list_all(store, lock)
+            self.assertEqual(1, len(records))
+            self.assertEqual(activations_module.ACTIVE, records[0]["status"])
+            self.assertTrue(os.path.exists(args.out))
+
+    def test_generate_key_directory_fsync_failure_leaves_both_files_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with _fail_only_directory_fsync(tmp):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = issuer.cmd_generate_key(args)
+            self.assertEqual(0, rc)
+            self.assertTrue(os.path.exists(priv_path))
+            self.assertTrue(os.path.exists(meta_path))
+            combined = stdout.getvalue() + stderr.getvalue()
+            self.assertIn("durability", combined)
+
+    def test_generate_key_post_commit_warning_output_failure_leaves_both_files_intact(self):
+        # Same scenario as above, but the warning PRINT ITSELF also fails -
+        # neither file may ever be deleted, and cmd_generate_key must not
+        # crash trying to report the durability warning (its own success
+        # prints happen after, and are allowed to surface an unguarded
+        # print failure, but MUST NOT have deleted anything by that point).
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_path = os.path.join(tmp, "issuer.key")
+            meta_path = os.path.join(tmp, "issuer.meta.json")
+            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
+            with _fail_only_directory_fsync(tmp):
+                with mock.patch("builtins.print", side_effect=RuntimeError("simulated broken stream")):
+                    with self.assertRaises(RuntimeError):
+                        issuer.cmd_generate_key(args)
+            self.assertTrue(os.path.exists(priv_path))
+            self.assertTrue(os.path.exists(meta_path))
+
+    def test_pre_link_publication_failure_still_revokes_the_activation(self):
+        # Sanity check that the refactor did NOT weaken the existing,
+        # correct PRE-commit rollback behavior - a failure before the link
+        # succeeds must still revoke.
         with tempfile.TemporaryDirectory() as tmp:
             store = os.path.join(tmp, "activations.json")
             lock = os.path.join(tmp, "activations.lock")
@@ -618,40 +772,21 @@ class PublicationCommitPointTests(unittest.TestCase):
                 max_devices=1, activation_expires_in_days=None, envelope_valid_for_hours=48.0,
                 endpoint_hint=[], bootstrap_bundle=None, out=os.path.join(tmp, "envelope.bin"),
             )
-            stdout, stderr = io.StringIO(), io.StringIO()
-            with mock.patch.object(issuer, "_confirm_directory_durability", return_value=False):
-                with redirect_stdout(stdout), redirect_stderr(stderr):
+            with mock.patch.object(issuer, "publish_secret_no_clobber", side_effect=issuer.IssuerError("simulated pre-link failure")):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     rc = issuer.cmd_issue(args)
-            self.assertEqual(0, rc)  # NOT a failure - publication succeeded
-            self.assertTrue(os.path.exists(args.out))
+            self.assertEqual(1, rc)
             records = activations_module.list_all(store, lock)
             self.assertEqual(1, len(records))
-            self.assertEqual(activations_module.ACTIVE, records[0]["status"])  # never revoked
-            combined = stdout.getvalue() + stderr.getvalue()
-            self.assertIn("durability", combined)
-            self.assertNotIn("REVOKED", combined)
-
-    def test_generate_key_directory_fsync_failure_leaves_both_files_intact(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            priv_path = os.path.join(tmp, "issuer.key")
-            meta_path = os.path.join(tmp, "issuer.meta.json")
-            args = mock.Mock(key_id="test-key-1", private_key_out=priv_path, public_metadata_out=meta_path)
-            stdout, stderr = io.StringIO(), io.StringIO()
-            with mock.patch.object(issuer, "_confirm_directory_durability", return_value=False):
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    rc = issuer.cmd_generate_key(args)
-            self.assertEqual(0, rc)
-            self.assertTrue(os.path.exists(priv_path))
-            self.assertTrue(os.path.exists(meta_path))
-            combined = stdout.getvalue() + stderr.getvalue()
-            self.assertIn("durability", combined)
+            self.assertEqual(activations_module.REVOKED, records[0]["status"])
+            self.assertFalse(os.path.exists(args.out))
 
 
 class AtomicNoClobberPublicationTests(unittest.TestCase):
     def test_publishes_when_target_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "out.bin")
-            issuer._atomic_write_secret_file(path, b"hello")
+            _write_secret_file_for_test(path, b"hello")
             with open(path, "rb") as handle:
                 self.assertEqual(b"hello", handle.read())
 
@@ -661,7 +796,7 @@ class AtomicNoClobberPublicationTests(unittest.TestCase):
             with open(path, "wb") as handle:
                 handle.write(b"original")
             with self.assertRaises(issuer.IssuerError):
-                issuer._atomic_write_secret_file(path, b"attacker-controlled-overwrite")
+                issuer.publish_secret_no_clobber(path, b"attacker-controlled-overwrite")
             with open(path, "rb") as handle:
                 self.assertEqual(b"original", handle.read())
 
@@ -681,7 +816,7 @@ class AtomicNoClobberPublicationTests(unittest.TestCase):
                 handle.write(b"created-by-another-writer")
 
             with self.assertRaises(issuer.IssuerError):
-                issuer._atomic_write_secret_file(path, b"attacker-or-issuer-controlled-content")
+                issuer.publish_secret_no_clobber(path, b"attacker-or-issuer-controlled-content")
 
             with open(path, "rb") as handle:
                 self.assertEqual(b"created-by-another-writer", handle.read())
@@ -692,7 +827,7 @@ class AtomicNoClobberPublicationTests(unittest.TestCase):
             with open(path, "wb") as handle:
                 handle.write(b"existing")
             with self.assertRaises(issuer.IssuerError):
-                issuer._atomic_write_secret_file(path, b"new-data")
+                issuer.publish_secret_no_clobber(path, b"new-data")
             leftover_temp_files = [f for f in os.listdir(tmp) if f.startswith(".activation-envelope-issuer.")]
             self.assertEqual([], leftover_temp_files)
 
@@ -701,7 +836,7 @@ class AtomicNoClobberPublicationTests(unittest.TestCase):
             path = os.path.join(tmp, "out.bin")
             with mock.patch.object(os, "link", side_effect=OSError("simulated: hardlinks unsupported on this filesystem")):
                 with self.assertRaises(issuer.IssuerError):
-                    issuer._atomic_write_secret_file(path, b"data")
+                    issuer.publish_secret_no_clobber(path, b"data")
             self.assertFalse(os.path.exists(path))  # never silently written via a fallback
 
 
@@ -933,6 +1068,41 @@ def _fcntl_available():
         return True
     except ImportError:
         return False
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _fail_only_directory_fsync(target_directory):
+    """Precisely simulates 'temp write succeeds, final link succeeds,
+    directory fsync fails' end-to-end through the real cmd_issue/
+    cmd_generate_key call graph - WITHOUT also breaking the temp file's
+    own pre-commit fsync or (for cmd_issue) the UNRELATED activation
+    store's own directory-fsync call (gateway.api.activations._atomic_write_store
+    opens ITS OWN O_RDONLY directory fd too) - a blanket
+    `mock.patch("os.fsync", side_effect=...)` would break all of those.
+    Tags ONLY the read-only file descriptor(s) opened for EXACTLY
+    `target_directory` (the envelope/key/metadata output's own containing
+    directory) and fails `os.fsync` for those alone."""
+    real_open = os.open
+    real_fsync = os.fsync
+    target_abs = os.path.abspath(target_directory)
+    directory_fds = set()
+
+    def _tagging_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if flags == os.O_RDONLY and os.path.abspath(path) == target_abs:
+            directory_fds.add(fd)
+        return fd
+
+    def _selective_fsync(fd):
+        if fd in directory_fds:
+            raise OSError("simulated directory fsync failure")
+        return real_fsync(fd)
+
+    with mock.patch("os.open", side_effect=_tagging_open), mock.patch("os.fsync", side_effect=_selective_fsync):
+        yield
 
 
 def _run_issue(args):
@@ -1276,7 +1446,7 @@ class IssueCommandTests(unittest.TestCase):
     def test_post_issue_output_write_failure_revokes_the_new_activation(self):
         args = self._base_args()
         stdout, stderr = io.StringIO(), io.StringIO()
-        with mock.patch.object(issuer, "_atomic_write_secret_file", side_effect=OSError("simulated disk failure")):
+        with mock.patch.object(issuer, "publish_secret_no_clobber", side_effect=OSError("simulated disk failure")):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 rc = issuer.cmd_issue(args)
         self.assertEqual(1, rc)
