@@ -2572,5 +2572,7 @@ length (not Kotlin character count) so every constructible
 `ActivationEnvelopeTextCodec` also gained a pre-Base64-decode text-length
 bound derived from `ActivationEnvelopeCodec.MAX_ENCODED_BYTES` and strict
 canonical-alphabet checking. No architectural boundary moved; see
-ROADMAP's B56 row for the corrected implementation status and the still-
-open Gradle-integration verification gap.)
+ROADMAP's B56 row for the corrected implementation status. Gradle
+integration (`./gradlew :app:compileDebugKotlin` / `:app:testDebugUnitTest`)
+was subsequently verified for real outside the review sandbox - 111/111
+relevant tests pass; see that row for detail.)
