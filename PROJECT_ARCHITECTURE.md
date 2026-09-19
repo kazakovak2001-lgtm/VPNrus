@@ -2623,3 +2623,22 @@ mechanism (see ROADMAP's B56 row and
 `RESILIENT_BOOTSTRAP_ACTIVATION_ARCHITECTURE.md` section 22). Every other
 route, the ACME bootstrap vhost, and the CDN/XHTTP origin config are
 unaffected. No application code changed.)
+
+---
+Last updated: 2026-09-19 (B56-4A - new stable operator-tooling boundary:
+`gateway/tools/activation_envelope_issuer.py` is a SEPARATE signing
+authority/CLI from `gateway/tools/manifest_signing.py`, never sharing key
+material, never crossing into `ManifestTrustAnchors`. It calls the
+EXISTING `gateway.api.activations.issue_activation()`/`revoke_activation()`
+directly - it is not a second activation-issuance authority, only a signed-
+envelope wrapper around that existing store. Its private-key input is
+file-based only (`--private-key-file`, exactly 32 raw bytes) - the repo's
+FIRST activation/manifest-signing tool to avoid the older
+`--private-key-b64`/stdout-JSON pattern `manifest_signing.py` still uses;
+future signing-key tooling in this repo should follow this file's pattern,
+not that older one. `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md` is the
+durable ceremony/rotation/revocation runbook for this authority, mirroring
+`B12_MANIFEST_KEY_CEREMONY.md`'s role for the manifest key. NO production
+activation-issuer key exists yet and NO production public key is in
+Android's `ActivationIssuerTrustAnchors` - see that doc for the remaining
+B56-4B steps. No networking, no UI, no server/gateway changes.)

@@ -1,0 +1,222 @@
+# B56 Activation-Issuer Key Ceremony
+
+Status as of this document: **B56-4A tooling implemented and cross-language
+verified. NO production ceremony has been performed.** No production
+activation-issuer private key exists, no production public key is embedded
+in `net.pocvpn.client.activation.ActivationIssuerTrustAnchors`, and
+`gateway/tools/activation_envelope_issuer.py` has never been run against a
+real production activation store. See "What B56-4B still has to do" below
+for the exact remaining steps.
+
+## Purpose separation from the manifest signing key
+
+This is a **second, independent** Ed25519 signing authority - never the
+same key, never the same tool, never cross-verifiable:
+
+| | Activation authority | Network (manifest) authority |
+|---|---|---|
+| Signs | `ActivationEnvelope` | `EndpointManifest` / `SignedBootstrapBundle` |
+| Verified by | `Ed25519ActivationEnvelopeVerifier` + `ActivationIssuerTrustAnchors` | `Ed25519ManifestVerifier` + `ManifestTrustAnchors` |
+| Operator tool | `gateway/tools/activation_envelope_issuer.py` (B56-4A, this doc) | `gateway/tools/manifest_signing.py` (B11/B12, unchanged - see `B12_MANIFEST_KEY_CEREMONY.md`) |
+| Domain-separation tag | `NOVA_ACTIVATION_ENVELOPE_V1` | (implicit - separate canonical format/codec entirely) |
+| Content | Activation entitlement metadata only - **never** a host/IP/port/SNI/transport fact | Endpoint routing facts |
+
+The two key material files, the two trust-anchor types
+(`ActivationIssuerTrustAnchors` vs. `ManifestTrustAnchors`), and the two
+operator CLIs are **disjoint by construction** - `activation_envelope_issuer.py`
+never imports or touches `manifest_signing.py`'s key material, never signs a
+manifest, and never adds an activation key to `ManifestTrustAnchors`. See
+`ActivationIssuerTrustAnchorsTest` and
+`ActivationEnvelopePythonCompatibilityTest`'s explicit cross-trust
+regression for the compile-time/runtime proof of this separation.
+
+## The private key never enters the repo, the VPS, argv, or stdout
+
+`activation_envelope_issuer.py` deliberately does **not** repeat
+`manifest_signing.py`'s historical `--private-key-b64`/JSON-stdout
+`generate-key` weakness (see that file's own `generate-key`/`sign` commands,
+predating this ceremony's safer pattern). Instead:
+
+- `generate-key --private-key-out PATH` writes the raw 32 private key bytes
+  directly to a file - **never** printed, logged, or included in any
+  exception message.
+- `issue --private-key-file PATH` reads that same raw-32-byte file - the
+  key is **never** passed as a CLI argument, **never** read from an
+  environment variable, **never** accepted as Base64/JSON.
+- Both commands refuse to write an output file that already exists, and
+  refuse to write into any directory that is (or is inside) a git working
+  tree - a real production private key file must live somewhere entirely
+  outside this repository's checkout, on an operator-controlled offline
+  machine.
+- Public metadata (`issuerKeyId`, `publicKeyBase64`, a SHA-256
+  fingerprint) is written to a **separate** file and contains no private
+  material at all - see `test_activation_envelope_issuer.py`'s
+  `GenerateKeyTests` for the automated proof.
+
+### Platform limitation - be truthful about it
+
+`generate-key`/`issue`'s output files are written with POSIX `0600`
+permissions where the platform supports it (`os.chmod`). **On Windows,
+`os.chmod`'s single owner-write bit is not an equivalent ACL guarantee** -
+it does not restrict which other local accounts can read the file the way
+POSIX group/other permission bits do. The tool prints an explicit warning
+when run on Windows; an operator generating a real production key on
+Windows must additionally apply a real NTFS ACL (or, preferably, perform
+the ceremony on a Linux/WSL machine, matching the existing B12 manifest key
+ceremony's own recommended environment).
+
+## Safe key-generation command shape
+
+```text
+python3 gateway/tools/activation_envelope_issuer.py generate-key \
+  --key-id <issuer-key-id> \
+  --private-key-out <path-OUTSIDE-this-repo>/activation-issuer-<key-id>.key \
+  --public-metadata-out <path-OUTSIDE-this-repo>/activation-issuer-<key-id>.meta.json
+```
+
+This never prints the private key. It prints only: the key id, the public
+key's SHA-256 fingerprint, and the two output paths.
+
+## Public fingerprint verification
+
+Exactly like `B12_MANIFEST_KEY_CEREMONY.md`'s own convention: record the
+printed SHA-256 fingerprint of the public key (hex) somewhere out-of-band
+(this document, an operator runbook, a signed commit message) so anyone
+verifying which physical key ceremony produced a given
+`ActivationIssuerTrustAnchors` entry can confirm it independently of the
+committed Kotlin source - **never** by comparing private key material.
+
+## Rotation model
+
+`ActivationIssuerTrustAnchors`/`FixedActivationIssuerTrustAnchors` is a
+`Map<ActivationIssuerKeyId, ByteArray>` - it already supports more than one
+simultaneously-trusted public key, exactly like
+`EmbeddedBootstrapManifest.trustAnchors()` currently trusts two manifest
+keys (`prod-manifest-key-2026-09-01` and `-09-14`) during its own rotation
+window. The same pattern applies here:
+
+1. Generate a new activation-issuer keypair (new `issuerKeyId`) with
+   `generate-key`, offline, well before the old key's planned retirement.
+2. Add the new key's public bytes to Android's
+   `FixedActivationIssuerTrustAnchors` **alongside** the old one (both
+   trusted simultaneously) - a client build with both keys present accepts
+   an envelope signed by **either**.
+3. Once every envelope that could still be presented (bounded by the
+   longest `--envelope-valid-for-hours` ever issued under the old key) has
+   expired, remove the old key's public bytes from a later Android build.
+
+There is no "gap" where both an old and a new envelope are simultaneously
+un-verifiable, and no envelope-specific rotation logic exists in
+`SignedBootstrapBundleImporter`/the verifier itself - rotation is entirely
+a trust-anchor-set change, exactly like the manifest key's own rotation.
+
+## Revocation implications
+
+Revoking an **activation** (`activation_tokens.py revoke <activation_id>`,
+unchanged) makes the credential inside an already-issued
+`ActivationEnvelope` useless the moment the server-side entitlement check
+runs - but it does **not** retroactively invalidate the envelope's Ed25519
+signature. A previously-issued, still-cryptographically-valid envelope for
+a revoked activation will still decode and verify client-side; it simply
+fails to redeem successfully against the (now-revoked) server entitlement.
+This is the same shape as any bearer-credential system: signature validity
+is a property of the envelope's own history, not of the credential's
+current live status - there is no envelope revocation list in B56-4A or
+B56-4B.
+
+Revoking an **activation-issuer key itself** (suspected key compromise) is
+the rotation procedure above run in reverse: remove the compromised key's
+public bytes from a new Android build's `FixedActivationIssuerTrustAnchors`
+as soon as possible. Any envelope that key ever signed - for a still-ACTIVE
+activation or not - stops verifying entirely once that public key is no
+longer trusted, since verification (not just redemption) fails closed on
+an unknown `issuerKeyId`.
+
+## Issuer-service compromise vs. key-only compromise
+
+- **Key-only compromise** (the private key file leaks, but the operator's
+  issuance workflow/store is untouched): an attacker can mint arbitrarily
+  many envelopes for entitlements that do not exist server-side (since
+  `issue_activation()` is what actually creates the redeemable credential -
+  a leaked signing key alone lets an attacker sign a *plausible-looking*
+  envelope, but it can only ever wrap a credential that
+  `gateway.api.activations.issue_activation()` genuinely created and
+  `decide_and_bind` will genuinely accept). The blast radius of a pure key
+  leak is therefore bounded by the SAME device-binding/max_devices/expiry
+  rules every other activation credential is already bound by - it is not
+  a network-fact or reachability compromise (no host/IP/port/SNI can ever
+  be signed into an envelope - see structural test coverage).
+- **Issuer-service/store compromise** (an attacker who can run
+  `activation_envelope_issuer.py issue` itself, or write directly to
+  `activations.json`): strictly worse - this is equivalent to compromising
+  `activation_tokens.py`'s own operator access today, since B56-4A adds no
+  new privilege beyond calling the SAME `issue_activation()`. There is
+  nothing B56-4A introduces that widens this existing operator-trust
+  boundary; the mitigation is the same one that already applies to
+  `activation_tokens.py`: protect operator/CLI access to the production
+  store and its lock file, not anything specific to the envelope signing
+  key.
+
+Both scenarios are explicit, out-of-scope-for-automated-mitigation
+operator-trust assumptions, same as the rest of this codebase's activation
+tooling - B56-4A does not add self-service or remote issuance (see its own
+module docstring: no daemon, no HTTP endpoint).
+
+## The envelope is a bearer secret
+
+A signed `ActivationEnvelope` contains the plaintext activation credential
+(`ActivationEnvelope.credential`) - anyone who obtains a copy of the
+envelope artifact can redeem it exactly as if they had the raw credential
+string. It must be handled with the same care as the raw credential itself:
+never committed, never logged, transmitted only over a channel the intended
+recipient controls (B56-7's job, not this tool's). The issuer CLI enforces
+this at the tooling boundary (atomic non-overwriting writes, restrictive
+permissions where supported, never printed to stdout/stderr) but cannot
+enforce anything about what happens to the file afterward - that remains an
+operator/delivery-channel responsibility.
+
+## B56-4A has NOT performed the production ceremony
+
+Confirmed explicitly, to keep `ActivationIssuerTrustAnchors`'s own
+"no production activation-issuer key is populated here or anywhere in this
+slice" statement true after this document exists:
+
+- No `generate-key` invocation against a real, retained private key file
+  has been run as part of B56-4A.
+- No production public key/fingerprint is recorded in this document or
+  anywhere else in this repository.
+- `FixedActivationIssuerTrustAnchors`'s only populated instances remain
+  test-only (see `ActivationIssuerTrustAnchorsTest`,
+  `ActivationEnvelopePythonCompatibilityTest` - both use a deterministic,
+  clearly-labeled TEST-ONLY key, never committed as a retained secret since
+  its "secrecy" is irrelevant - it exists purely to prove the encoding is
+  byte-for-byte compatible).
+- No Android production trust-anchor population change was made.
+
+## What B56-4B still has to do
+
+1. Run `generate-key` for real, on an operator-controlled offline machine
+   (Linux/WSL recommended - see platform-limitation note above), with the
+   private key file written OUTSIDE any git working tree and never
+   transmitted electronically.
+2. Record the printed public key fingerprint out-of-band (this document's
+   "Production ceremony" section, once it exists, mirroring
+   `B12_MANIFEST_KEY_CEREMONY.md`'s own).
+3. Add the production public key bytes + `issuerKeyId` to Android's
+   `FixedActivationIssuerTrustAnchors` population (currently test-only) and
+   ship that in a client build.
+4. Perform a REAL cross-verification against that production key (not the
+   deterministic test key this PR's fixtures use) - sign a real test
+   envelope offline, verify it decodes/verifies correctly against the
+   shipped Android trust anchor, exactly mirroring this PR's
+   `ActivationEnvelopePythonCompatibilityTest` methodology.
+5. Decide and document the real operational rotation/retirement schedule
+   (this document's "Rotation model" section is the mechanism; B56-4B picks
+   actual dates/cadence).
+6. Only after all of the above: `activation_envelope_issuer.py issue` may
+   be run against a real production activation store to mint the first
+   real, redeemable `ActivationEnvelope`.
+
+None of this is performed by B56-4A. This tooling slice exists specifically
+so all of the above can be reviewed and exercised against test-only key
+material BEFORE any production secret is ever generated.
