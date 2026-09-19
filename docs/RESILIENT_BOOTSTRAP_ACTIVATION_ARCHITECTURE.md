@@ -375,10 +375,23 @@ Level 2 via live capability issuance (section 11's optional optimization),
 but it carries no guarantee that issuance will succeed, and its own local
 diagnostics must say so (`LEVEL2_NO_PREISSUED_CAPABILITY`, section 20 -
 informational, not a rejection) rather than silently implying the same
-hard-recovery guarantee a true recovery package carries. Only a package
-that actually satisfies all three required fields above is entitled to be
-labeled a Level-2-Capable Recovery Package by the issuer, and only that
-label carries the "works even if nothing else is reachable" guarantee.
+property a true recovery package carries. Only a package that actually
+satisfies all three required fields above is entitled to be labeled a
+Level-2-Capable Recovery Package by the issuer - and even then, what that
+label actually guarantees is precise, not absolute (see section 11's
+"network authority" and "what a recovery package does and does not
+guarantee" subsections): it removes any prerequisite live dependency on
+capability issuance or the normal Level-1 control plane, never a guarantee
+of connectivity itself. A Level-2-Capable Recovery Package can enter
+Level 2 using only the imported package, **provided at least one
+manifest-authorized Level-2 listener is reachable from the current
+network** - if every signed Level-2 listener candidate is also blocked or
+unreachable, bootstrap still fails closed (`ALL_LEVEL2_LISTENERS_UNREACHABLE`,
+section 20), exactly as Level 1 already fails closed when every direct
+control-plane candidate is unreachable (section 20's existing
+`ALL_LEVEL1_PATHS_UNREACHABLE`). Nothing in this design claims guaranteed
+connectivity, a guaranteed hard-whitelist bypass, or guaranteed Russia
+connectivity - see section 27, unchanged.
 
 Explicit answers to the task's checklist, corrected where Correction 1
 changes them:
@@ -570,18 +583,34 @@ client cannot reach anything else:**
 - **Pre-issued capability (mandatory for the hard recovery path).** A
   **Level-2-Capable Recovery Package** (section 7) carries its bootstrap
   capability already minted, inside `bootstrapCapabilityHint`, at the moment
-  the package is issued. This is the **only** path this design treats as
-  guaranteed to work when every direct control-plane route is already
-  blocked: the client never needs to reach a capability-issuance endpoint,
-  a manifest origin, or anything else before it can present itself to the
-  Level-2 listener - it needs only the package it already has, plus the
-  Level-2 listener address the package's own `SignedBootstrapBundle`
-  supplied (section 9/16). This is the property that actually closes the
-  gap this correction pass exists to close: without a pre-issued
-  capability, "Level 2" would just be another thing behind a reachability
-  requirement, i.e. exactly the recreated cycle ("need a capability -> need
-  to reach the issuer -> issuer unreachable -> cannot enter Level 2") the
-  task explicitly warned against.
+  the package is issued. **Precise invariant** (not a connectivity
+  guarantee - see "What a recovery package does and does not guarantee"
+  immediately below): the client never needs to reach a capability-issuance
+  endpoint, a manifest origin, or the normal Level-1 control plane before it
+  can present itself to the Level-2 listener - it needs only the package it
+  already has, plus the Level-2 listener address the package's own
+  `SignedBootstrapBundle` supplied (section 9/16). This is the property that
+  actually closes the gap this correction pass exists to close: without a
+  pre-issued capability, "Level 2" would just be another thing behind a
+  reachability requirement, i.e. exactly the recreated cycle ("need a
+  capability -> need to reach the issuer -> issuer unreachable -> cannot
+  enter Level 2") the task explicitly warned against.
+
+  **What a recovery package does and does not guarantee.** A
+  Level-2-Capable Recovery Package removes any prerequisite live dependency
+  on capability issuance or the normal Level-1 control plane. It can enter
+  Level 2 using only the imported package, **provided at least one
+  manifest-authorized Level-2 listener is reachable from the current
+  network.** It does not, and cannot, guarantee that such a listener is
+  reachable - if every signed Level-2 listener candidate the bundle named is
+  itself blocked or unreachable on the current network, bootstrap fails
+  closed (`ALL_LEVEL2_LISTENERS_UNREACHABLE`, section 20), exactly as Level 1
+  already fails closed when every direct control-plane candidate is
+  unreachable. This design makes no claim of guaranteed connectivity,
+  guaranteed hard-whitelist bypass, or guaranteed Russia connectivity -
+  removing the *capability-issuance* dependency is not the same as removing
+  the network's own reachability constraints, and this document never
+  conflates the two (see section 27).
 - **Live capability issuance (optional optimization only).** When Level 1
   is *partially* working - some manifest-known origins reachable, just not
   ones the client happened to try first, or a capability-issuance endpoint
@@ -850,8 +879,9 @@ existing rejection reached from a new call site), `CLOCK_UNCERTAIN`,
 unchanged), `NO_TRUSTED_BOOTSTRAP_CANDIDATE`,
 `ALL_LEVEL1_PATHS_UNREACHABLE` (renamed from `ALL_BOOTSTRAP_PATHS_UNREACHABLE`
 to be precise about which level exhausted), `LEVEL2_UNAVAILABLE` (no
-Level-2 listener named by any trusted bundle, or no capability of any kind
-available and live issuance also failed/unreachable), `BOOTSTRAP_AUTH_REJECTED`
+Level-2 listener named by any trusted bundle at all, or no capability of any
+kind available and live issuance also failed/unreachable - i.e. Level 2
+cannot even be attempted), `BOOTSTRAP_AUTH_REJECTED`
 (`decide_and_bind`'s `INVALID`), `ACTIVATION_REVOKED`, `ACTIVATION_EXPIRED`,
 `DEVICE_LIMIT_REACHED`, `PROFILE_PROVISIONING_FAILED`, `BOOTSTRAP_RATE_LIMITED`
 (Level 1, once section 22 ships).
@@ -861,14 +891,26 @@ mapping to a check section 7/11 actually defines:
 `LEVEL2_NO_PREISSUED_CAPABILITY` (informational, not a rejection - the
 package is a valid Standard Activation Package or an under-provisioned
 recovery attempt; Level 2 may still be tried via live issuance, but the
-hard-recovery guarantee does not apply, section 7), `LEVEL2_CAPABILITY_EXPIRED`
+package does not carry the Level-2-Capable Recovery Package property,
+section 7), `LEVEL2_CAPABILITY_EXPIRED`
 (`capability.expiresAt` has passed - independent of, and never conflated
 with, `PACKAGE_EXPIRED`/`ACTIVATION_EXPIRED`), `LEVEL2_CAPABILITY_INVALID`
 (malformed/wrong-scope/signature-mismatch capability - rejected by the
 Level-2 listener before any relay happens), `LEVEL2_LIVE_ISSUANCE_UNAVAILABLE`
 (the optional live-issuance optimization was attempted and failed/was
 unreachable - never itself a hard failure for a package that already had a
-pre-issued capability).
+pre-issued capability), and, distinct from `LEVEL2_UNAVAILABLE` above,
+**`ALL_LEVEL2_LISTENERS_UNREACHABLE`** (section 11 - the package has a
+valid, unexpired capability and its bundle names one or more Level-2
+listener candidates, so Level 2 genuinely *can* be attempted, but every one
+of those manifest-authorized listener candidates was actually dialed and
+found unreachable on the current network. This is the terminal, fail-closed
+outcome of the scenario the "what a recovery package does and does not
+guarantee" note in section 11 describes: a self-contained package cannot
+manufacture a reachable listener where the network permits none, and this
+failure says so explicitly rather than being folded into the broader
+`LEVEL2_UNAVAILABLE` case, which means something different - no capability/
+listener knowledge at all, rather than "tried, and every candidate failed").
 
 ## 21. Threat model
 
