@@ -256,6 +256,25 @@ class B46HysteriaRuntimeTest {
         assertTrue(runtime.status.value.lastError is B46HysteriaSpikeError.BinaryMissing)
     }
 
+    // no secret is passed in child argv (PRE-MERGE HARDENING CORRECTION regression guard)
+    @Test
+    fun `child process args never contain the auth secret - only a config-file path`() = runTest {
+        val launcher = FakeB46HysteriaProcessLauncher()
+        val runtime = newRuntime(launcher = launcher, scope = this)
+        runtime.starting()
+        runtime.tunEstablished()
+        runtime.startBridge(1, 1400, "127.0.0.1:1")
+
+        val config = testConfig() // auth = "test-secret-auth-value"
+        runtime.startChild(existingBinaryPath(), tempWorkingDir(), config, FakeB46HysteriaVpnProtector())
+
+        val args = launcher.lastArgs
+        assertTrue("expected --config-file in args: $args", args != null && args.contains("--config-file"))
+        assertEquals("expected exactly 2 args (--config-file <path>)", 2, args!!.size)
+        assertFalse("no arg may contain the auth secret: $args", args.any { it.contains(config.auth) })
+        assertFalse("no arg may be --auth: $args", args.contains("--auth"))
+    }
+
     // child log-line observation (QUIC handshake / SOCKS5 listener), additive to the state machine
     @Test
     fun `child log lines set quicHandshakeConnected and socksListenerReady without touching phase`() = runTest {

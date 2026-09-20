@@ -118,7 +118,7 @@ class B46HysteriaVpnService : VpnService() {
             }
         }
 
-        val dataPlaneConfig = when (val resolution = B46HysteriaDataPlaneConfig.resolve()) {
+        val dataPlaneConfig = when (val resolution = B46HysteriaDataPlaneConfig.resolve(filesDir)) {
             is B46HysteriaDataPlaneConfig.Result.Valid -> resolution.config
             is B46HysteriaDataPlaneConfig.Result.Invalid -> {
                 failStartup(B46HysteriaSpikeError.RuntimeSpawnFailed(resolution.reason))
@@ -187,6 +187,10 @@ class B46HysteriaVpnService : VpnService() {
         statusCollectionJob?.cancel()
         statusCollectionJob = null
         this.runtime = null
+        // Failure cleanup deletes the runtime credential exactly like the
+        // normal-stop path below - a startup failure must never leave the
+        // provisioned secret sitting at rest indefinitely.
+        B46HysteriaRuntimeCredential.delete(filesDir)
     }
 
     private fun handleStop() {
@@ -201,6 +205,11 @@ class B46HysteriaVpnService : VpnService() {
         // Stop() (inside runtime.stop(), above) has already run.
         runCatching { tunFd?.close() }
         tunFd = null
+
+        // The runtime-provisioned secret (see B46HysteriaRuntimeCredential's
+        // own doc) is deleted on every normal stop too - provisioned once
+        // per session, never left at rest longer than one test session.
+        B46HysteriaRuntimeCredential.delete(filesDir)
 
         _status.value = B46HysteriaSpikeStatus.STOPPED
         stopSelf()

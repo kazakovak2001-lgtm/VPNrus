@@ -259,11 +259,87 @@ to fix any of them.
   reference), random `openssl rand -base64 24` auth password, mode-700
   temp directory, mode-600 key/config. Auth password was never printed to
   any terminal/log visible in this session - generated, consumed, and
-  transferred entirely via redirected files and `scp`, deleted after
-  staging into `b46harness/b46-hysteria-dataplane.properties` (gitignored).
-  Server fully stopped and its temp directory removed at the end of this
-  slice; confirmed via `ps aux`/`ls` that nothing was left running or on
-  disk.
+  transferred entirely via redirected files and `scp`. Server fully
+  stopped and its temp directory removed at the end of this slice;
+  confirmed via `ps aux`/`ls` that nothing was left running or on disk.
+
+### Pre-merge hardening correction (secret-delivery anti-pattern, found in review)
+
+The physical run above originally staged the temporary server's `auth`
+password into `b46harness/b46-hysteria-dataplane.properties`, which
+`build.gradle.kts` then compiled directly into
+`BuildConfig.B46_HYSTERIA_AUTH` - i.e. **the secret was baked into the
+built debug APK**, not merely held in memory as an earlier draft of this
+document incorrectly claimed. That the specific credential was disposable
+and the temporary server has since been torn down does not make the
+pattern acceptable to merge: a `BuildConfig` field is compiled into every
+build using that properties file, and would resurface the same problem for
+any future disposable-credential test run.
+
+**This was corrected before merge, not after physically re-validating end
+to end from scratch.** `BuildConfig` now carries only public/non-secret
+values (server host, port, SNI, insecure flag, expected exit IP - see
+`build.gradle.kts`). `auth` (and any future obfuscation secret) is instead
+read at **runtime** from a single app-private file,
+`<filesDir>/b46-secret/credential.properties`, that the operator provisions
+**after install** via `adb push` to `/data/local/tmp` followed by a
+`run-as net.pocvpn.b46harness` copy into app-private storage (mode 600) -
+see `B46HysteriaRuntimeCredential.kt` for the exact protocol and
+`B46HysteriaDataPlaneConfig.kt` for how it's merged with the public
+`BuildConfig` values. The file is deleted on every stop path (normal and
+failure), matching the same "provisioned once per session, deleted on
+cleanup" discipline already used for the per-session child config file and
+protect socket. `B46HysteriaChildConfig.toString()`/`redactedSummary()`
+remain redacted as before - unaffected by this change, since the secret
+was already never logged, only ever compiled in.
+
+A short physical sanity cycle (new disposable credential, new temporary
+server, one start/protect/QUIC/probe/stop cycle) was **attempted** to
+re-validate the new runtime-provisioned credential path end to end, but
+**not completed** - see "Post-hardening physical sanity cycle: BLOCKED"
+below. The full two-cycle/restart/protect-failure/screen-lock evidence
+above is unaffected by this change (it exercises the data plane and
+protect(fd) mechanism, not credential delivery) and was not re-run.
+
+### Post-hardening physical sanity cycle: BLOCKED (rule already removed, not reopened)
+
+Before attempting to provision a new disposable credential and temporary
+server, the existing UDP 34443 reachability to the Stockholm gateway
+(`16.170.208.231`) was re-checked first, per explicit instruction not to
+reopen that port without confirming the owner-added AWS Security Group
+rule was still present: a bounded `tcpdump` was started on the gateway and
+a real UDP packet was sent from the phone. **No packet arrived** - the
+temporary AWS Security Group rule (UDP 34443, source `86.49.237.32/32`)
+added earlier in this task has evidently already been removed (either by
+the repository owner directly, or it was never as persistent as assumed -
+either way, this session did not add or remove any cloud firewall rule at
+any point in this pass).
+
+Per explicit instruction, this session **did not reopen the rule** and
+**stopped before the server-side physical sanity cycle**. The reachability
+check's own temporary artifacts (a `tcpdump` capture directory) were
+cleaned up on the gateway; nothing else was touched there.
+
+**What this means:**
+
+- The credential-hardening code change itself (BuildConfig field removal,
+  `B46HysteriaRuntimeCredential`, the deletion-on-cleanup wiring, and the
+  10 new focused tests) is complete, reviewed by its own test suite, and
+  believed correct by construction (no live server was needed to prove the
+  file-based credential resolution/fail-closed/cleanup logic - those are
+  pure Kotlin/`java.io.File` unit tests, all passing).
+- What is **not** re-proven by a fresh physical run is the specific
+  end-to-end claim "the harness can read a runtime-provisioned credential
+  file and successfully complete a real QUIC handshake with it" - that
+  still rests on the ORIGINAL physical evidence earlier in this document,
+  which used the (now-corrected) BuildConfig-based credential path, not
+  this file-based one. The two mechanisms differ only in *where the secret
+  string comes from* (a `BuildConfig` constant vs. a `Properties` file read
+  at the same point in the same code path); nothing about the TUN/
+  tun2socks/protect(fd)/QUIC mechanics changes.
+- Completing this specific re-validation requires either the repository
+  owner temporarily reopening the AWS Security Group rule again, or
+  choosing an already-open port/gateway for a fresh disposable test.
 
 ## Physical run evidence
 
@@ -355,10 +431,18 @@ comparable to Nova's own release APK size - no release-size claim is made.
 
 ## Owner follow-up required
 
-**Remove the temporary AWS Security Group inbound rule** added for this
-slice (Stockholm, `16.170.208.231`, UDP 34443, source `86.49.237.32/32`) -
-it is no longer needed now that the temporary server itself has been
-stopped and removed.
+**AWS Security Group rule status, re-checked during the credential-hardening
+pass:** a fresh reachability check (bounded `tcpdump` + a real UDP packet
+from the phone) found the temporary rule (Stockholm, `16.170.208.231`, UDP
+34443, source `86.49.237.32/32`) **no longer passing traffic** - it appears
+to already be gone. This session did not remove it (nor did it ever add or
+remove any cloud firewall rule at any point). If it is still present in the
+AWS console for some other reason (e.g. reachability failed for an
+unrelated cause), it should still be removed since it is not needed with
+the temporary server already stopped; if it is already gone, no action is
+needed. Re-opening it is required only if a future physical sanity cycle
+for the runtime-credential-file path (see "Post-hardening physical sanity
+cycle: BLOCKED" above) is wanted.
 
 ## Production safety (verified, not merely claimed)
 

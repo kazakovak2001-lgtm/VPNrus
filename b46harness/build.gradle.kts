@@ -31,10 +31,20 @@ plugins {
 // any production integration could even be attempted.
 
 // B46-2P - a SEPARATE, debug-only, gitignored local properties file
-// carrying the temporary Hysteria2 test server's endpoint/credential (see
-// docs/B46_2P_HYSTERIA2_ANDROID_PHYSICAL_VALIDATION.md). Never committed,
-// never printed. Empty string defaults (never null); the config resolver
-// fails closed with a typed error when these are blank.
+// carrying the temporary Hysteria2 test server's PUBLIC/non-secret
+// endpoint values only (see
+// docs/B46_2P_HYSTERIA2_ANDROID_PHYSICAL_VALIDATION.md). Never committed.
+// Empty string defaults (never null); the config resolver fails closed
+// with a typed error when these are blank.
+//
+// PRE-MERGE HARDENING CORRECTION (2026-09-20): this file - and the
+// BuildConfig fields below - used to also carry `auth`, compiled directly
+// into `BuildConfig.B46_HYSTERIA_AUTH` and therefore into the built debug
+// APK. That is a real credential-delivery anti-pattern (secret material
+// baked into a build artifact) and has been removed. `auth` (and any
+// future obfuscation secret) is NEVER read from this properties file or
+// exposed via BuildConfig - see B46HysteriaRuntimeCredential.kt for the
+// real runtime-provisioned, app-private replacement.
 val b46HysteriaDataPlaneProperties = Properties().apply {
     val f = file("b46-hysteria-dataplane.properties")
     if (f.exists()) f.inputStream().use { load(it) }
@@ -52,9 +62,10 @@ android {
         versionCode = 1
         versionName = "0.1-b46-2p"
 
+        // Public/non-secret test values ONLY - see the correction note
+        // above. No `auth`/obfuscation-secret field exists here.
         buildConfigField("String", "B46_HYSTERIA_SERVER_HOST", "\"${b46HysteriaDataPlaneProp("serverHost")}\"")
         buildConfigField("String", "B46_HYSTERIA_SERVER_PORT", "\"${b46HysteriaDataPlaneProp("serverPort")}\"")
-        buildConfigField("String", "B46_HYSTERIA_AUTH", "\"${b46HysteriaDataPlaneProp("auth")}\"")
         buildConfigField("String", "B46_HYSTERIA_SNI", "\"${b46HysteriaDataPlaneProp("sni")}\"")
         buildConfigField("String", "B46_HYSTERIA_INSECURE", "\"${b46HysteriaDataPlaneProp("insecure").ifBlank { "true" }}\"")
         buildConfigField("String", "B46_HYSTERIA_EXPECTED_EXIT_IP", "\"${b46HysteriaDataPlaneProp("expectedExitIp")}\"")
