@@ -1,6 +1,6 @@
 # B45B-4P — Shadowsocks 2022 Selection Wiring: Physical Validation Attempt
 
-## Status: CLIENT/DATA-PLANE VALIDATION ONLY — PRODUCTION MANIFEST TRUST/DEPLOYMENT NOT VALIDATED. The real, proven data-plane root cause (§7) is now FIXED in code (§8) and physically PASSES end to end via the existing debug harness (real TCP+UDP, real 152.70.43.1 exit, real server-side traffic, two clean connect/disconnect cycles). The production SELECTION path (Diagnostics → Home connect button, through VpnController/the real trusted manifest) has NOT been physically re-validated end to end, because doing so requires deploying a new signed manifest to production, which was explicitly not authorized in this session (§8). B45B-4P is NOT yet fully PHYSICALLY PASSED - see §8 for the precise scope of what is and is not proven.
+## Status: PHYSICALLY PASSED. The proven data-plane root cause (§7) is fixed in code (§8), signed manifest v4 was deployed to both production hosts with owner/pre-deployment approval (§9), and the FULL real production pipeline - live HTTPS `/v1/manifest` fetch → LKG v4 → trusted Frankfurt `SHADOWSOCKS_2022` binding → Smart Connect → `VpnController` → `TransportConfig.Shadowsocks` → `ShadowsocksTransport` → `ShadowsocksVpnService` → real `sslocal` - is physically proven end to end via the normal Home connect button (§9): real TCP+UDP data plane, real `152.70.43.1` exit IP, real server-side traffic, two clean connect/disconnect cycles, no crash/ANR, clean AWG sanity check. See §9 for the full evidence trail. B45 as a whole remains NOT complete (ABI parity, Wi-Fi/cellular handover, Russia/restricted-network behavior, and other B45 items are untouched by this slice).
 
 This is a truthful record of a real physical validation attempt of the B45B-4
 selection wiring, run end to end through the production pipeline (Smart
@@ -424,3 +424,109 @@ tests, full suite green) and its fail-closed half is proven physically
 unmodified manifest). What remains unproven physically is the
 happy-path production pipeline with a deployed binding present - that is
 a deployment-approval decision, not a code or testing gap.
+
+## 9. Lifecycle hygiene fix + production manifest v4 deployment + FINAL production-path PASS (this session)
+
+**Lifecycle hygiene fix (commit `8f70d9b`).** `pendingConnectTransportBinding`
+(the pinned Shadowsocks `EndpointTransportBinding` introduced in §8) now
+follows the exact same "cleared on every terminal teardown, preserved
+across automatic network-change recovery" discipline
+`pendingConnectConfig`/`pendingConnectPrivateKeyRepository` already use -
+cleared in `onVpnPermissionResult(granted=false)`, `disconnect()`, and
+`teardownActiveAttemptLocked()` (shared by `abandonAttemptForFailover`/
+`abandonAttemptWithTerminalError`); never cleared by
+`restartActiveTransportForNetworkChange`. Not a live bug (every
+`connect()` already overwrites the field fresh), but the new pinned-
+attempt authority must obey the same lifecycle as its siblings. 5 new
+focused regression tests added (permission-denied/disconnect/terminal-
+error/failover-abandon all clear it; network-change recovery preserves
+it) via a small internal test-only observation seam
+(`pendingConnectTransportBindingForTest`) - the field itself stays
+private. Focused suite green; `compileDebugKotlin` clean.
+
+**Production manifest v4 deployment (owner-approved).** Before deploying,
+independently re-verified the already-committed artifact
+(`gateway/tools/endpoint-manifest-2026-09-20-v4.bin`) byte-for-byte:
+SHA-256 `304722f23ed2c97f94cb0af5122c3bfd4c5d47e3188bb1e991fcd25b1be8a9ad`
+(exact match, no re-signing needed), outer format 1, `manifestVersion=4`,
+`signingKeyId=prod-manifest-key-2026-09-14`, signature length 64 and
+Ed25519-**valid**, exact EOF, exactly ONE Frankfurt `SHADOWSOCKS_2022`
+binding (`152.70.43.1:28388`, method `2022-blake3-aes-256-gcm`), ZERO
+Stockholm Shadowsocks bindings, no credential/key material anywhere.
+Re-fetched both hosts' live `/v1/manifest` immediately before deployment
+- both still v3, byte-identical (sha256 `9c4ebbd1...`), unchanged since
+the prior check.
+
+Deployed to both hosts with the exact procedure specified: current
+`/etc/pocvpn/endpoint-manifest.bin` inspected (`root:pocvpn-api`, mode
+`640`, both hosts) and backed up in place
+(`endpoint-manifest.bin.v3-backup-20260920`, sha256 confirmed
+`9c4ebbd1...` on both); v4 uploaded to a temporary path, remote SHA-256
+verified exact (`304722f2...`) before touching the live file; owner/mode
+set to match (`root:pocvpn-api`/`640`); atomic `mv` over the live path.
+No service restart was needed or performed on either host - both public
+`/v1/manifest` endpoints served the new bytes immediately after the
+rename (`pocvpn-api` reads the file fresh per request, as designed).
+Nothing else (nginx, AWG, Xray, ssserver, firewall, nftables, activation
+store, credentials) was touched on either host.
+
+Post-deployment verification, both hosts: fetched `/v1/manifest` fresh,
+confirmed exact SHA-256 `304722f2...` match, independently re-decoded and
+re-verified the Ed25519 signature (valid) and `manifestVersion=4` from
+the downloaded bytes (not the local file) on both Frankfurt and
+Stockholm. No rollback was needed.
+
+**Phone adopts v4 via the real production pipeline.** Diagnostics →
+"Refresh manifest" → `Manifest version: 4 (source=LAST_KNOWN_GOOD)`,
+`Endpoint frankfurt: ... transports=[AMNEZIA_WG, XRAY_REALITY, TLS_TCP,
+SHADOWSOCKS_2022]`, `Transport scores: ...SHADOWSOCKS_2022=20` (a real,
+positive score - previously `-2147483648`) - the new fail-closed
+eligibility gate now genuinely passes against real, deployed, signed
+data.
+
+**FINAL production-path physical proof (device OPPO CPH2173,
+`c618ee06`, same fixed APK/credential/sslocal artifact as §8).** Used
+ONLY the normal production pipeline this time (Diagnostics → "Force
+SHADOWSOCKS_2022 on next connect" → Home power button) - the debug
+harness was NOT used for this acceptance run.
+
+- First connect: real `sslocal` PID `20907`. Log line (public facts
+  only): `starting: endpointId=frankfurt host=152.70.43.1 port=28388
+  method=2022-blake3-aes-256-gcm` - **the real signed target, never
+  51820**. Real TUN (`tun0=10.202.46.1/24`), real fd handoff, real
+  protect bridge (implicit in a real running process/data plane - see
+  §7/§8 for the explicit protect-bridge instrumentation evidence, same
+  code path, unchanged).
+- DNS LinkProperties (`dumpsys connectivity`, `Nova Shadowsocks 2022`
+  network): `DnsAddresses: [/1.1.1.1,/1.0.0.1]`.
+- `https://icanhazip.com` (hostname, DNS+TCP+TLS): **`152.70.43.1`**.
+- Direct-IP control (`https://1.1.1.1`): `HTTP 301`, 0.24s.
+- Server-side (`tcpdump -i any port 28388`, live throughout): real TCP
+  three-way handshakes, data, and clean FIN teardowns; real UDP/28388
+  traffic (104+ packets).
+- UDP/DNS proof: a fresh raw DNS query (transaction id `0x5678`) via
+  toybox `nc -u` to `1.1.1.1:53` through the tunnel returned a genuine
+  61-byte response - matching transaction id, response bit set, RCODE=0,
+  2 answers.
+- First disconnect (normal Home power button): `sslocal` gone, `tun0`
+  gone, `files/shadowsocks/` empty.
+- Second connect (re-forced `SHADOWSOCKS_2022`, normal Home button): real
+  `sslocal` PID `21258` - **a genuinely new PID**. Same signed target
+  (`host=152.70.43.1 port=28388 method=2022-blake3-aes-256-gcm`).
+  `https://icanhazip.com` again returned `152.70.43.1`. Real server-side
+  TCP/UDP traffic again observed.
+- Second disconnect: same clean result as the first.
+- Crash/ANR scan across the whole session: none found.
+- Transport preference: automatically back to `Auto` after the second
+  connect consumed the one-shot "Force" preference (unchanged behavior).
+- AWG sanity connect/disconnect (normal Home screen, after all
+  Shadowsocks testing): connected cleanly (`tun0=10.77.0.12/32`) and
+  disconnected cleanly - no stale Shadowsocks VPN ownership.
+
+**Conclusion.** The full, real, unmodified production pipeline - live
+manifest fetch, signed-binding trust, Smart Connect eligibility,
+`VpnController`, the Shadowsocks adapter, and `sslocal` - is now
+physically proven end to end on real hardware, with a real Frankfurt
+data plane (TCP and UDP), the correct signed port (`28388`, never
+`51820`), and clean two-cycle lifecycle behavior. **B45B-4P is
+PHYSICALLY PASSED.**
