@@ -89,17 +89,18 @@ class ShadowsocksVpnService : VpnService() {
                     ?: EndpointId(ProductionGateway.ID)
                 val host = intent.getStringExtra(EXTRA_HOST)
                 val port = intent.getIntExtra(EXTRA_PORT, -1)
+                val expectedMethod = intent.getStringExtra(EXTRA_METHOD)
                 val routingMode = intent.getStringExtra(EXTRA_ROUTING_MODE)
                     ?.let { runCatching { RoutingMode.valueOf(it) }.getOrNull() }
                     ?: RoutingMode.FULL_VPN
 
-                if (host.isNullOrBlank() || port !in 1..65535) {
-                    Log.e(TAG, "refusing to start: missing/invalid host or port")
+                if (host.isNullOrBlank() || port !in 1..65535 || expectedMethod.isNullOrBlank()) {
+                    Log.e(TAG, "refusing to start: missing/invalid host, port, or method")
                     publish(sessionId, ShadowsocksRuntimePhase.FAILED)
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                startIfNotAlreadyRunning(sessionId, endpointId, host, port, routingMode)
+                startIfNotAlreadyRunning(sessionId, endpointId, host, port, expectedMethod, routingMode)
                 return START_NOT_STICKY
             }
             else -> return START_NOT_STICKY
@@ -116,12 +117,17 @@ class ShadowsocksVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long, endpointId: EndpointId, host: String, port: Int, routingMode: RoutingMode) {
+    private fun startIfNotAlreadyRunning(sessionId: Long, endpointId: EndpointId, host: String, port: Int, expectedMethod: String, routingMode: RoutingMode) {
         if (runtime?.status?.value?.phase == ShadowsocksRuntimePhase.RUNNING) {
             Log.w(TAG, "already running - ignoring duplicate start")
             return
         }
         activeSessionId = sessionId
+        // B45B-4P (correction) - bounded, once-per-attempt, PUBLIC facts only
+        // (endpointId/host/port/method identifier - never the key): the
+        // physical proof this attempt targets the real signed Shadowsocks
+        // port, never the AWG peer port this same endpoint also advertises.
+        Log.i(TAG, "starting: endpointId=${endpointId.value} host=$host port=$port method=$expectedMethod")
 
         serviceScope.launch {
             // Credential absent/corrupted -> fail closed (Phase 7/16) -
@@ -141,6 +147,17 @@ class ShadowsocksVpnService : VpnService() {
                     return@launch
                 }
                 is Shadowsocks2022CredentialGetResult.Present -> result.credential
+            }
+
+            // B45B-4P (correction) - the signed manifest's PUBLIC method and
+            // the endpoint-scoped SECRET credential's own method must agree
+            // before sslocal is ever spawned. Both identifiers are safe to
+            // log (never the key itself) - see EXTRA_METHOD's own docs.
+            if (credential.method != expectedMethod) {
+                Log.e(TAG, "refusing to start: signed profile method ($expectedMethod) does not match credential method (${credential.method})")
+                publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.ProfileMethodMismatch(expectedMethod, credential.method))
+                stopSelf()
+                return@launch
             }
 
             val resolution = ShadowsocksNativeBinaryResolver.resolve(applicationInfo.nativeLibraryDir)
@@ -272,6 +289,12 @@ class ShadowsocksVpnService : VpnService() {
         const val EXTRA_ENDPOINT_ID = "net.pocvpn.client.vpn.shadowsocks.extra.ENDPOINT_ID"
         const val EXTRA_HOST = "net.pocvpn.client.vpn.shadowsocks.extra.HOST"
         const val EXTRA_PORT = "net.pocvpn.client.vpn.shadowsocks.extra.PORT"
+        // B45B-4P (correction) - PUBLIC signed-method identifier (e.g.
+        // "2022-blake3-aes-256-gcm"), never key material - see
+        // TransportConfig.Shadowsocks.method's own docs. Verified against the
+        // endpoint-scoped SECRET credential's own method before sslocal is
+        // ever spawned (see startIfNotAlreadyRunning's own docs).
+        const val EXTRA_METHOD = "net.pocvpn.client.vpn.shadowsocks.extra.METHOD"
         const val EXTRA_ROUTING_MODE = "net.pocvpn.client.vpn.shadowsocks.extra.ROUTING_MODE"
 
         private val _status = MutableStateFlow<ShadowsocksServiceStatus?>(null)

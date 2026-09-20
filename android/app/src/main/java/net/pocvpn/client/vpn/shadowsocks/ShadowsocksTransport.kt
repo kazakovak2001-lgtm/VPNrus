@@ -86,6 +86,7 @@ class ShadowsocksTransport(
                 .putExtra(ShadowsocksVpnService.EXTRA_ENDPOINT_ID, config.endpointId.value)
                 .putExtra(ShadowsocksVpnService.EXTRA_HOST, config.host)
                 .putExtra(ShadowsocksVpnService.EXTRA_PORT, config.port)
+                .putExtra(ShadowsocksVpnService.EXTRA_METHOD, config.method)
                 .putExtra(ShadowsocksVpnService.EXTRA_ROUTING_MODE, config.routingMode.name)
             context.startService(intent)
         } catch (t: Throwable) {

@@ -2,6 +2,7 @@ package net.pocvpn.client.transport
 
 import net.pocvpn.client.identity.ClientKeyRepository
 import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.relay.VpnAttemptContext
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.TransportSelectionDecision
@@ -73,6 +74,19 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
             // candidate (MainViewModel.attemptRelayedAttempt) passes
             // [VpnAttemptContext.Relayed] explicitly.
             val attemptContext: VpnAttemptContext = VpnAttemptContext.Direct,
+            // B45B-4P (correction) - non-null exactly when the caller
+            // pinned a real, trusted EndpointTransportBinding for THIS
+            // attempt (manual mode: MainViewModel.trustedTransportBindingFor;
+            // auto mode: GatewayAttemptCandidate.transportBinding, the EXACT
+            // binding AutoGatewaySelector scored - never re-looked-up).
+            // Unlike [gatewayConfigSnapshot] (AWG-only, see that field's own
+            // docs), this field is the ONLY host/port/metadata authority
+            // VpnController.buildTransportConfig's SHADOWSOCKS_2022 branch
+            // ever reads - it must never fall back to
+            // GatewayConfiguration.endpointHost/endpointPort (the AWG peer
+            // address). null (the default) for every kind that does not
+            // consume it - byte-for-byte unaffected.
+            val endpointTransportBinding: EndpointTransportBinding? = null,
         ) : Resolution()
         data class NotSelectable(val decision: TransportSelectionDecision) : Resolution()
     }
@@ -97,12 +111,20 @@ class TransportOrchestrator(private val registry: TransportRegistry) {
         endpointId: EndpointId = EndpointId(ProductionGateway.ID),
         gatewayConfigSnapshot: GatewayConfigSnapshot? = null,
         attemptContext: VpnAttemptContext = VpnAttemptContext.Direct,
+        endpointTransportBinding: EndpointTransportBinding? = null,
     ): Resolution {
         val selected = decision as? TransportSelectionDecision.SelectTransport
             ?: return Resolution.NotSelectable(decision)
         val transport = registry.createTransport(selected.kind)
             ?: return Resolution.NotSelectable(decision)
-        return Resolution.Resolved(transport, selected.kind, endpointId, gatewayConfigSnapshot, attemptContext = attemptContext)
+        return Resolution.Resolved(
+            transport,
+            selected.kind,
+            endpointId,
+            gatewayConfigSnapshot,
+            attemptContext = attemptContext,
+            endpointTransportBinding = endpointTransportBinding,
+        )
     }
 
     /** Deterministic ordering of currently-available transports, for a future failover sequence (not yet acted on). */

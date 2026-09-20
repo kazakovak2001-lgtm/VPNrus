@@ -125,7 +125,7 @@ class ShadowsocksAdapterValidationActivity : AppCompatActivity() {
                 val repository = Shadowsocks2022CredentialRepositoryFactory.create(applicationContext, endpointId)
                 repository.storeCredential(validation.credential)
 
-                pendingConfig = TransportConfig.Shadowsocks(endpointId = endpointId, host = host, port = port)
+                pendingConfig = TransportConfig.Shadowsocks(endpointId = endpointId, host = host, port = port, method = method)
                 publishStatus("credential provisioned into production repository")
             } catch (t: Throwable) {
                 publishStatus("provision failed: ${t.javaClass.simpleName}")

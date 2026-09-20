@@ -62,6 +62,7 @@ class ShadowsocksTransportDisconnectTest {
             endpointId = net.pocvpn.client.reachability.EndpointId("frankfurt"),
             host = "152.70.43.1",
             port = 28388,
+            method = "2022-blake3-aes-256-gcm",
         )
         transport.connect(config)
         assertTrue(transport.observeState().value() is TransportState.Error)
@@ -86,6 +87,7 @@ class ShadowsocksTransportDisconnectTest {
             endpointId = net.pocvpn.client.reachability.EndpointId("frankfurt"),
             host = "152.70.43.1",
             port = 28388,
+            method = "2022-blake3-aes-256-gcm",
         )
         transport.connect(config)
         transport.disconnect()
@@ -104,6 +106,7 @@ class ShadowsocksTransportDisconnectTest {
             endpointId = net.pocvpn.client.reachability.EndpointId("frankfurt"),
             host = "152.70.43.1",
             port = 28388,
+            method = "2022-blake3-aes-256-gcm",
         )
         // connect() never even reaches the service (permission denied) - this
         // is the "partial/failed startup" case the physical bug report asked

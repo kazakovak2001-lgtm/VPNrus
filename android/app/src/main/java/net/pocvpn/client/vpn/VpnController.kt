@@ -27,6 +27,7 @@ import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
 import net.pocvpn.client.reachability.CoarseNetworkSignals
 import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.reachability.signedTransportProfile
 import net.pocvpn.client.reachability.NetworkFingerprintKeyProvider
 import net.pocvpn.client.reachability.NetworkFingerprinter
 import net.pocvpn.client.reachability.PathHistoryStore
@@ -428,6 +429,17 @@ class VpnController(
     // connect()/disconnect()/doConnectAttempt, all under connectMutex - same
     // discipline as [pendingConnectKind]/[pendingConnectEndpointId].
     private var pendingConnectConfig: net.pocvpn.client.vpn.config.GatewayConfigSnapshot? = null
+
+    // B45B-4P (correction) - the PINNED, trusted EndpointTransportBinding for
+    // the CURRENT/most recent connect() attempt, when [connect]'s resolved
+    // value carried one (see TransportOrchestrator.Resolution.Resolved
+    // .endpointTransportBinding's own docs). Same "resolved exactly once, at
+    // connect() time, never re-derived later in this same attempt" discipline
+    // as [pendingConnectConfig] - a manifest refresh mid-attempt must never
+    // change what THIS attempt already pinned. null for every kind that does
+    // not consume it (AMNEZIA_WG/XRAY_REALITY/TLS_TCP/XRAY_XHTTP keep reading
+    // their own existing address authorities, byte-for-byte unaffected).
+    private var pendingConnectTransportBinding: net.pocvpn.client.reachability.EndpointTransportBinding? = null
     private var activeTransportConfig: TransportConfig? = null
 
     // B22 - the private-gateway keypair repository for the CURRENT/most
@@ -658,6 +670,7 @@ class VpnController(
             // requested - never re-derived later in this same attempt (see
             // [resolveGatewayConfiguration]'s own docs). null for manual mode.
             pendingConnectConfig = resolved.gatewayConfigSnapshot
+            pendingConnectTransportBinding = resolved.endpointTransportBinding
             pendingConnectPrivateKeyRepository = resolved.privateKeyRepository
             // B25 (task A/B) - pinned exactly once, here, before permission
             // is even requested - never re-derived later in this same
@@ -1217,24 +1230,52 @@ class VpnController(
             }
 
             TransportKind.SHADOWSOCKS_2022 -> {
-                // B45B-4 - deliberately carries no key material (mirrors
-                // TransportConfig.Shadowsocks's own docs): the AEAD-2022
-                // secret is resolved from Shadowsocks2022CredentialRepository
-                // inside ShadowsocksVpnService at connect() time, scoped to
-                // endpointId, never threaded through this config object.
-                // Unreachable unless shadowsocksTransport != null (that's the
-                // only way SHADOWSOCKS_2022 ever enters supportedKinds).
-                // host/port come from THIS attempt's own GatewayConfigSnapshot
-                // (config.endpointHost/endpointPort) - the SAME manifest-
-                // derived-per-candidate-binding source AWG's own peer address
-                // already uses (see AutoGatewaySelector.snapshotFor's own
-                // docs: every candidate, of any transport, carries a snapshot
-                // built from ITS OWN manifest binding) - never a second,
-                // independently-resolved address for this transport.
+                // B45B-4P (correction) - PROVEN ROOT CAUSE of the original
+                // physical data-plane failure: config.endpointHost/
+                // endpointPort (GatewayConfigSnapshot) are AWG-only (see
+                // AutoGatewaySelector.snapshotFor's own docs) - using them
+                // here silently dialed the AWG peer port instead of the real
+                // Shadowsocks listener. host/port/method now come EXCLUSIVELY
+                // from [pendingConnectTransportBinding] - the pinned, trusted
+                // manifest binding for THIS attempt (manual:
+                // MainViewModel.trustedTransportBindingFor; auto:
+                // GatewayAttemptCandidate.transportBinding) - never from
+                // GatewayConfiguration/the AWG snapshot, never re-resolved
+                // from a catalog. Deliberately still carries no key material
+                // (mirrors TransportConfig.Shadowsocks's own docs): the
+                // AEAD-2022 secret is resolved from
+                // Shadowsocks2022CredentialRepository inside
+                // ShadowsocksVpnService at connect() time, scoped to
+                // endpointId. Fails closed (never silently falls back to the
+                // AWG snapshot) for: no pinned binding, wrong endpoint/kind,
+                // or an invalid/legacy/missing signed profile - a debug
+                // "Force SHADOWSOCKS_2022" preference never bypasses this.
+                val binding = pendingConnectTransportBinding
+                    ?: throw ShadowsocksProfileNotReadyException("no pinned Shadowsocks transport binding for this attempt")
+                require(binding.kind == TransportKind.SHADOWSOCKS_2022) {
+                    "pinned transport binding is ${binding.kind}, not SHADOWSOCKS_2022"
+                }
+                val profile = when (
+                    val result = binding.signedTransportProfile(pendingConnectEndpointId)
+                ) {
+                    is net.pocvpn.client.reachability.SignedTransportProfileReadResult.Parsed -> {
+                        (result.profile as? net.pocvpn.client.reachability.SignedTransportProfile.Shadowsocks2022)
+                            ?: throw ShadowsocksProfileNotReadyException(
+                                "no typed Shadowsocks2022 signed profile for endpoint ${pendingConnectEndpointId.value} (legacy/wrong-kind binding)",
+                            )
+                    }
+                    net.pocvpn.client.reachability.SignedTransportProfileReadResult.Missing ->
+                        throw ShadowsocksProfileNotReadyException("signed Shadowsocks profile missing for endpoint ${pendingConnectEndpointId.value}")
+                    net.pocvpn.client.reachability.SignedTransportProfileReadResult.Unsupported ->
+                        throw ShadowsocksProfileNotReadyException("signed Shadowsocks profile version unsupported for endpoint ${pendingConnectEndpointId.value}")
+                    net.pocvpn.client.reachability.SignedTransportProfileReadResult.Invalid ->
+                        throw ShadowsocksProfileNotReadyException("signed Shadowsocks profile invalid for endpoint ${pendingConnectEndpointId.value}")
+                }
                 TransportConfig.Shadowsocks(
                     endpointId = pendingConnectEndpointId,
-                    host = config.endpointHost,
-                    port = config.endpointPort,
+                    host = binding.host,
+                    port = binding.port,
+                    method = profile.profile.method,
                     routingMode = routingMode,
                 )
             }
@@ -1610,6 +1651,9 @@ class VpnController(
  * reason XrayRuntimeResolver itself already produces.
  */
 private class XrayProfileNotReadyException(reason: String) : Exception(reason)
+
+/** B45B-4P (correction) - thrown by buildTransportConfig's SHADOWSOCKS_2022 branch; caught the SAME way XrayProfileNotReadyException already is (VpnError.ConfigurationMappingFailure), never a silent fallback to the AWG snapshot. */
+private class ShadowsocksProfileNotReadyException(reason: String) : Exception(reason)
 
 /**
  * B8B3D - pure, file-scope (not a VpnController member) specifically so it

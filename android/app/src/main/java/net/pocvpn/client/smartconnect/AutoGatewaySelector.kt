@@ -43,6 +43,15 @@ data class GatewayAttemptCandidate(
     val configSnapshot: GatewayConfigSnapshot,
     val score: Long,
     val reasons: List<String>,
+    // B45B-4P (correction) - the EXACT manifest EndpointTransportBinding this
+    // candidate was scored against (the SAME `binding` snapshotFor() already
+    // consumes for configSnapshot below) - never re-looked-up by endpointId/
+    // kind after scoring. AWG execution still reads configSnapshot (unchanged);
+    // SHADOWSOCKS_2022 execution reads THIS field instead (see
+    // VpnController.buildTransportConfig's own docs) - the same
+    // candidate-immutability discipline RelayAttemptCandidate.exitBinding
+    // already documents.
+    val transportBinding: EndpointTransportBinding,
 )
 
 /**
@@ -241,6 +250,7 @@ object AutoGatewaySelector {
                 configSnapshot = snapshotFor(gateway, binding, tunnelIp),
                 score = result.score,
                 reasons = result.reasons,
+                transportBinding = binding,
             )
         }
     }

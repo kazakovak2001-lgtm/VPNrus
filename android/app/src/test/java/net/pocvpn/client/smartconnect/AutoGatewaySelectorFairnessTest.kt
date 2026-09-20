@@ -62,6 +62,7 @@ class AutoGatewaySelectorFairnessTest {
                 ),
                 score = score,
                 reasons = listOf("test"),
+                transportBinding = EndpointTransportBinding(transport, "203.0.113.10", 51820),
             ),
         )
 
