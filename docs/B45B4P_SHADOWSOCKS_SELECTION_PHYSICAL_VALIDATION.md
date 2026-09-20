@@ -1,6 +1,6 @@
 # B45B-4P — Shadowsocks 2022 Selection Wiring: Physical Validation Attempt
 
-## Status: NOT PASSED — data-plane proof still failing; the disconnect/ownership bug found in the first attempt is now fixed (§5b); the DNS fix is physically proven (§7) and the real root cause of the data-plane failure is now identified (§7)
+## Status: CLIENT/DATA-PLANE VALIDATION ONLY — PRODUCTION MANIFEST TRUST/DEPLOYMENT NOT VALIDATED. The real, proven data-plane root cause (§7) is now FIXED in code (§8) and physically PASSES end to end via the existing debug harness (real TCP+UDP, real 152.70.43.1 exit, real server-side traffic, two clean connect/disconnect cycles). The production SELECTION path (Diagnostics → Home connect button, through VpnController/the real trusted manifest) has NOT been physically re-validated end to end, because doing so requires deploying a new signed manifest to production, which was explicitly not authorized in this session (§8). B45B-4P is NOT yet fully PHYSICALLY PASSED - see §8 for the precise scope of what is and is not proven.
 
 This is a truthful record of a real physical validation attempt of the B45B-4
 selection wiring, run end to end through the production pipeline (Smart
@@ -299,3 +299,128 @@ selection-wiring runtime evidence (§3), the DNS-fix LinkProperties proof
 (§5b, §7) are established facts. The data-plane failure now has a proven,
 specific, deterministic root cause (§7) rather than an unknown one - the
 next slice's job is the host/port design fix, not further diagnosis.
+
+## 8. The signed-binding fix - CLIENT/DATA-PLANE VALIDATION ONLY — PRODUCTION MANIFEST TRUST/DEPLOYMENT NOT VALIDATED (this session)
+
+**Architecture fix (code, PR head `e9bb662...`).** §7's proven root cause
+(Shadowsocks host/port silently reused AWG's `GatewayConfigSnapshot`) is
+fixed by threading a real, trusted, pinned `EndpointTransportBinding`
+through the whole attempt instead - see that commit's own message for the
+full design. Summary: `TransportOrchestrator.Resolution.Resolved` gains
+`endpointTransportBinding`; `AutoGatewaySelector.GatewayAttemptCandidate`
+carries the exact binding it was scored against; a new
+`MainViewModel.trustedTransportBindingFor` resolves a manual attempt's
+binding from ONLY the currently trusted manifest (never the AWG catalog,
+never the credential repository, never a hardcoded endpoint) and fails
+closed with no fallback when absent; `isShadowsocksAvailableFor` now also
+requires a real, typed `SignedTransportProfile.Shadowsocks2022` binding
+(a device-local secret alone can no longer make the transport AVAILABLE);
+`VpnController.buildTransportConfig`'s `SHADOWSOCKS_2022` branch builds
+host/port/method exclusively from the pinned binding's signed profile and
+fails closed for missing/wrong-kind/Legacy/invalid; a new public `method`
+field on `TransportConfig.Shadowsocks` is threaded to
+`ShadowsocksVpnService`, which verifies it against the secret credential's
+own method and fails closed (`ProfileMethodMismatch`) before ever spawning
+`sslocal`. Full regression suite: **1608/1609 green** (the one failure,
+`EffectiveConfigDiffTest`, is a pre-existing environment-dependent test
+reading this isolated worktree's own `gateway-dev.properties`, unrelated
+to this change - confirmed by inspection, not investigated further per
+this task's own scope).
+
+**Manifest signing key search and result.** The live production manifest
+(fetched and Ed25519-verified fresh from BOTH `152.70.43.1` and
+`16.170.208.231` - byte-identical, sha256 `9c4ebbd1...`, `manifestVersion=3`,
+`signingKeyId=prod-manifest-key-2026-09-14`) has no `SHADOWSOCKS_2022`
+binding for Frankfurt. The matching private key
+(`prod-manifest-key-2026-09-14`) was NOT found in the first-pass search
+(only the older `prod-manifest-key-2026-09-01` bootstrap key was found at
+`~/.nova-vpn-offline-secrets/`). A second, explicitly authorized,
+non-secret-content search located it at
+`/root/.local/share/vpnrus/manifest-signing-2026-09-14.key` (WSL, 32 raw
+bytes). Before any signing, its derived public key was verified in-memory
+to exactly match the embedded trusted public key
+(`uLUd4zaRNPxI858n3I03DXT4zBkXvJ5B2duow4eaiYM=`) - the private key bytes
+were never printed, logged, or included anywhere in this repository.
+
+**Manifest v4 - signed, independently verified, prepared, NOT deployed.**
+Built from the live v3 topology (not the possibly-stale local JSON,
+though in this case they matched byte-for-byte), changing only
+`manifestVersion` (3→4), a fresh issued/expiry window, and ONE new
+Frankfurt binding: `SHADOWSOCKS_2022 @ 152.70.43.1:28388`, metadata
+`shadowsocks2022Profile={"version":1,"method":"2022-blake3-aes-256-gcm"}`.
+Stockholm and every other fact (both ingress endpoints, XHTTP/CDN
+profile, AWG/XRAY_REALITY/TLS_TCP bindings on both gateways) preserved
+byte-for-byte. Signed with the verified production key; independently
+re-decoded afterward and re-confirmed: signature valid, version 4,
+signingKeyId correct, Frankfurt's new binding exactly
+`host=152.70.43.1 port=28388 method=2022-blake3-aes-256-gcm`, no secret
+material, Stockholm unchanged. Artifacts committed to this PR
+(`gateway/tools/production_manifest_2026-09-20_v4.json`,
+`gateway/tools/endpoint-manifest-2026-09-20-v4.bin`) as a **prepared,
+ready-to-deploy artifact only**. **Per explicit instruction this session,
+it was NOT deployed** - neither Frankfurt's nor Stockholm's
+`/etc/pocvpn/endpoint-manifest.bin` was touched, and no production
+trust-anchor/verifier logic was modified or weakened.
+
+**Physical consequence of not deploying:** on the real device, the real
+production selection path (Diagnostics → Home connect button, through
+`MainViewModel`/`VpnController` reading the real, live, unmodified
+manifest) now correctly, physically, and verifiably refuses
+`SHADOWSOCKS_2022` - proving the new fail-closed eligibility logic works
+against real data, but NOT proving the full corrected pipeline end to end
+against a deployed binding (that requires the still-pending deployment
+approval).
+
+**Data-plane proof, via the existing DEBUG-ONLY validation harness
+(`ShadowsocksAdapterValidationActivity`) - this path never touches
+`VpnController`/the manifest/trust anchors at all (it calls
+`ShadowsocksTransport.connect()` directly with an explicit
+`TransportConfig.Shadowsocks(host, port, method)`), so it was safe to use
+without deploying anything.** Device: OPPO CPH2173 (`c618ee06`,
+arm64-v8a, Android 14). APK rebuilt from this session's fixed code,
+installed `-r -t` (app data/credential preserved - the same
+`frankfurt` credential provisioned in the prior session was reused,
+never re-displayed). `sslocal` SHA-256 unchanged:
+`b8c8526055586d0175d12cdc9432a78146eff986b68aac3dc6d85dfd82716e79`.
+
+- First connect: `sslocal` PID `16621`, `tun0=10.202.46.1/24`, real TUN-fd
+  handoff, real protect bridge. Bounded, non-secret log line proved the
+  real target: `starting: endpointId=frankfurt host=152.70.43.1 port=28388
+  method=2022-blake3-aes-256-gcm` - **never 51820**.
+- `https://icanhazip.com` (hostname, requires DNS+TCP+TLS): **`152.70.43.1`**
+  - the real Frankfurt exit IP.
+- Direct-IP control (`https://1.1.1.1`): `HTTP 301` in 0.23s - real,
+  fast, working TCP independent of DNS.
+- Server-side (`tcpdump -i any port 28388`, live during the attempt): real
+  TCP three-way handshakes and bidirectional payload bytes, AND 127 real
+  UDP/28388 packets, from the phone's real public IP - definitive
+  independent proof, not merely "Protected" on the client.
+- UDP/DNS proof: a raw DNS query (transaction id `0x1234`) sent via
+  toybox `nc -u` to `1.1.1.1:53` through the tunnel returned a genuine
+  61-byte response - matching transaction id, response bit set, RCODE=0,
+  2 answers - while the server simultaneously showed the corresponding
+  UDP/28388 traffic.
+- First disconnect (normal harness DISCONNECT button): `sslocal` gone,
+  `tun0` gone, `files/shadowsocks/` empty (no `protect_path`/
+  `tun_fd_path`/`runtime_config.json`).
+- Second connect: `sslocal` PID `16934` - **a genuinely new PID**.
+  `https://icanhazip.com` again returned `152.70.43.1`.
+- Second disconnect: same clean result as the first.
+- Crash/ANR scan across the whole session: none found. No credential/key
+  ever appeared in logcat.
+- AWG sanity connect/disconnect (normal Home screen, after all
+  Shadowsocks testing): connected cleanly (`tun0=10.77.0.12/32`, AWG's own
+  address) and disconnected cleanly - no stale Shadowsocks VPN ownership.
+
+**Conclusion.** The exact, specific, previously-proven root cause (wrong
+port) is now fixed in code, and the fix's real-world effect - a real
+Shadowsocks data plane, real TCP AND UDP, real Frankfurt exit IP, real
+server-side traffic - is physically demonstrated end to end on real
+hardware. The architectural correctness of routing that fix through the
+production selection pipeline (signed-binding pinning, fail-closed
+eligibility) is proven at the unit level (30+ new/updated regression
+tests, full suite green) and its fail-closed half is proven physically
+(the real device correctly refuses Shadowsocks against the real,
+unmodified manifest). What remains unproven physically is the
+happy-path production pipeline with a deployed binding present - that is
+a deployment-approval decision, not a code or testing gap.
