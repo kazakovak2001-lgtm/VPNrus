@@ -107,3 +107,12 @@ research/b46-2p-android-physical/**/novaminimal-android-arm64
 research/b46-2p-android-physical/**/*.pem
 research/b46-2p-android-physical/**/*.key
 research/b46-2p-android-physical/**/*-sources.jar
+
+# B46-3A - native (non-gomobile) tun2socks bridge coexistence research (see
+# docs/B46_3A_HYSTERIA_NATIVE_BRIDGE_COEXISTENCE.md). Locally-built Go
+# c-shared artifact + JNI shim .so, reproducible from pinned source under
+# research/b46-3a-hysteria-native-bridge/ - never committed.
+research/b46-3a-hysteria-native-bridge/out/
+research/b46-3a-hysteria-native-bridge/native/libnovatun2socks.h
+android/app/src/debug/jniLibs/arm64-v8a/libnovatun2socks.so
+android/app/src/debug/jniLibs/arm64-v8a/libnovatun2socks_jni.so
