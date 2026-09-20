@@ -248,9 +248,14 @@ to fix any of them.
   initially reproduced (same tcpdump comparison method). The repository
   owner added a **temporary** inbound Security Group rule (UDP 34443,
   source `86.49.237.32/32`) - re-confirmed reachable via a fresh `tcpdump`
-  capture showing the phone's real UDP packet arriving. **This AWS rule is
-  still in place and must be removed after this document is read** - see
-  "Owner follow-up required" below.
+  capture showing the phone's real UDP packet arriving, which is what made
+  the successful physical Hysteria2 test below possible. **That temporary
+  rule has since been removed** (see "Post-hardening physical sanity
+  cycle: BLOCKED" below, where a later reachability re-check during the
+  credential-hardening pass found it no longer passing traffic, and the
+  repository owner separately confirmed it was removed) - **current state:
+  UDP 34443 is CLOSED on this gateway; no B46-2P temporary ingress rule
+  remains open.**
 - Temporary server: stock upstream `hysteria` binary (server mode only,
   never the client architecture under test), same pinned commit, built
   fresh on the gateway. Ephemeral self-signed ECDSA P-256 cert (an initial
@@ -346,8 +351,27 @@ evidence above:
 None of these four required re-running the physical QUIC/data-plane
 evidence recorded above - they are credential-lifecycle, logging, and
 build-configuration corrections, verified by 20 new unit/Go tests (70
-total Kotlin tests, 8 total Go tests, all passing) rather than a live
-server.
+total Kotlin tests, 8 total Go tests, all passing at the time this round
+landed) rather than a live server.
+
+### Pre-merge manual-review correction (round 4, no live server needed)
+
+A further manual review found that round 3's `B46ChildLogFilter` used
+substring matching (`containsMatchIn`), so a line containing a valid safe
+marker PLUS arbitrary appended content was still logged in full - e.g.
+`"connected: udpEnabled=true tx=0 auth=DO_NOT_LOG"` would have passed,
+since `"connected: udpEnabled="` is a substring of it. Replaced with
+strict, anchored, full-line shape validation (`Regex.matches`, never
+`containsMatchIn`) against the exact schemas `novaminimal_main.go` is
+known to emit, with an optional Go `log`-package timestamp prefix and no
+unrestricted `.*` anywhere that could admit arbitrary trailing text. 11
+new/rewritten tests replace the old, now-corrected test that had
+incorrectly asserted "a safe marker with extra content is intentionally
+allowed through" - that was a real gap, not an intentional boundary. No
+live server was needed; this is a log-filter-only correction.
+
+**Current total test count (as of this round): 79/79 Kotlin tests pass,
+8/8 Go tests pass.**
 
 ### Post-hardening physical sanity cycle: BLOCKED (rule already removed, not reopened)
 
@@ -477,20 +501,30 @@ comparable to Nova's own release APK size - no release-size claim is made.
 - No generated binary artifact (AAR, `.so`, server binary, TLS key, auth,
   temp config, pcap) is committed - all covered by `.gitignore`.
 
-## Owner follow-up required
+## AWS Security Group rule - resolved, no owner follow-up remaining
 
-**AWS Security Group rule status, re-checked during the credential-hardening
-pass:** a fresh reachability check (bounded `tcpdump` + a real UDP packet
-from the phone) found the temporary rule (Stockholm, `16.170.208.231`, UDP
-34443, source `86.49.237.32/32`) **no longer passing traffic** - it appears
-to already be gone. This session did not remove it (nor did it ever add or
-remove any cloud firewall rule at any point). If it is still present in the
-AWS console for some other reason (e.g. reachability failed for an
-unrelated cause), it should still be removed since it is not needed with
-the temporary server already stopped; if it is already gone, no action is
-needed. Re-opening it is required only if a future physical sanity cycle
-for the runtime-credential-file path (see "Post-hardening physical sanity
-cycle: BLOCKED" above) is wanted.
+**Historical sequence, for the record:**
+
+1. During the original physical test, the repository owner temporarily
+   added an inbound Security Group rule (Stockholm, `16.170.208.231`, UDP
+   34443, source `86.49.237.32/32`).
+2. That rule is what made the successful Stockholm Hysteria2 physical test
+   documented above possible (real QUIC handshake, real data plane, two
+   restart cycles, controlled protect-failure cycle, screen-lock smoke
+   test - all real evidence, all still valid).
+3. After that physical testing concluded, the temporary Hysteria2 test
+   server itself was stopped and its temp directory removed.
+4. The temporary AWS Security Group rule was subsequently removed as well
+   - first observed indirectly during the credential-hardening pass (a
+   fresh reachability check: bounded `tcpdump` + a real UDP packet from the
+   phone found the rule **no longer passing traffic**), and separately
+   **confirmed directly by the repository owner**.
+
+**Current state: UDP 34443 on the Stockholm gateway is CLOSED. No B46-2P
+temporary ingress rule remains open.** No owner action is required. Any
+future physical sanity cycle for the runtime-credential-file path (see
+"Post-hardening physical sanity cycle: BLOCKED" above) would require a
+NEW temporary rule to be added again at that time.
 
 ## Production safety (verified, not merely claimed)
 
