@@ -13,6 +13,7 @@ package main
 
 import (
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,4 +141,65 @@ func TestProtectViaUnixSocket_NoListenerFailsClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a dial error when nothing is listening, got nil")
 	}
+}
+
+// PRE-MERGE HARDENING CORRECTION (2026-09-20, manual review, round 3):
+// authSecret/obfsSecret are package-level vars redact() reads - save and
+// restore them around each test so these tests never leak state into any
+// other test in this file/package (Go test binaries run all tests in one
+// process by default).
+func withSecrets(t *testing.T, auth, obfs string, fn func()) {
+	t.Helper()
+	prevAuth, prevObfs := authSecret, obfsSecret
+	authSecret, obfsSecret = auth, obfs
+	defer func() { authSecret, obfsSecret = prevAuth, prevObfs }()
+	fn()
+}
+
+// 5. auth redaction
+func TestRedact_AuthOnly(t *testing.T) {
+	withSecrets(t, "super-secret-auth-value", "", func() {
+		in := "hysteria client construction/handshake failed: auth failed for super-secret-auth-value on connect"
+		out := redact(in)
+		if strings.Contains(out, "super-secret-auth-value") {
+			t.Fatalf("redact() must remove the auth secret, got: %q", out)
+		}
+		if !strings.Contains(out, "***REDACTED***") {
+			t.Fatalf("expected a redaction marker in output, got: %q", out)
+		}
+	})
+}
+
+// 6. obfs redaction
+func TestRedact_ObfsOnly(t *testing.T) {
+	withSecrets(t, "", "super-secret-obfs-value", func() {
+		in := "salamander handshake failed using psk super-secret-obfs-value: timeout"
+		out := redact(in)
+		if strings.Contains(out, "super-secret-obfs-value") {
+			t.Fatalf("redact() must remove the obfs secret, got: %q", out)
+		}
+	})
+}
+
+// 7. auth + obfs simultaneous redaction
+func TestRedact_AuthAndObfsSimultaneously(t *testing.T) {
+	withSecrets(t, "super-secret-auth-value", "super-secret-obfs-value", func() {
+		in := "failed: auth=super-secret-auth-value obfs=super-secret-obfs-value both present in one error"
+		out := redact(in)
+		if strings.Contains(out, "super-secret-auth-value") {
+			t.Fatalf("redact() must remove the auth secret when both are set, got: %q", out)
+		}
+		if strings.Contains(out, "super-secret-obfs-value") {
+			t.Fatalf("redact() must remove the obfs secret when both are set, got: %q", out)
+		}
+	})
+}
+
+func TestRedact_NoSecretsSetIsANoOp(t *testing.T) {
+	withSecrets(t, "", "", func() {
+		in := "plain error text with nothing secret in it"
+		if got := redact(in); got != in {
+			t.Fatalf("expected redact() to be a no-op with no secrets set, got: %q", got)
+		}
+	})
 }

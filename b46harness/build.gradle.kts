@@ -107,6 +107,27 @@ android {
     }
 }
 
+// PRE-MERGE HARDENING CORRECTION (2026-09-20, manual review, round 3):
+// this whole module is documented everywhere as DEBUG/RESEARCH ONLY, but
+// being a real `com.android.application` module it still had AGP's
+// implicit `release` build type/variant by default - a standalone harness
+// that could, in principle, be assembled and distributed as a release APK
+// contradicts that stated boundary, even though nothing in this repository
+// ever does so today. Disabled outright via the current AGP 8.7
+// `androidComponents.beforeVariants` Variant API (`ApplicationVariantBuilder.enable`) -
+// the release variant is never created, so `:b46harness:assembleRelease`
+// produces no APK at all (not merely an empty/broken one). This is scoped
+// to `b46harness` alone via `project(":b46harness")` at the Gradle level -
+// it cannot affect `:app`'s own release variant, and this module is never
+// added as a dependency of `:app` (see this file's own header comment) so
+// there is no path by which a `b46harness` release artifact could ever
+// reach a real Nova distribution.
+androidComponents {
+    beforeVariants(selector().withBuildType("release")) { variantBuilder ->
+        variantBuilder.enable = false
+    }
+}
+
 // The pinned tun2socks AAR (research/b46-2p-android-physical/tun2socks-bridge/README.md),
 // gomobile-bound. Locally-built, gitignored - not committed. When absent,
 // this module still compiles: B46Tun2SocksBridgeAdapter loads the real

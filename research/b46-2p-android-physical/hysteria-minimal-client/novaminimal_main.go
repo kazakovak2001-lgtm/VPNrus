@@ -23,10 +23,12 @@
 //     for host-side research reproducibility only and are not used on
 //     Android.
 //  2. --config-file <path>: reads server/auth/sni/insecure/obfsSalamander/
-//     socksListen/protectPath from a JSON file instead of argv, so the auth
-//     password never appears in argv, environment, process title, or
-//     logcat. The Android acceptance child is launched with ONLY
-//     --config-file - no --auth flag is used on Android.
+//     socksListen/protectPath from a JSON file instead of argv, so neither
+//     the auth password nor the obfsSalamander password ever appears in
+//     argv, environment, process title, or logcat (both are redacted out
+//     of any logged error text - see redact()). The Android acceptance
+//     child is launched with ONLY --config-file - no --auth flag is used
+//     on Android.
 //
 // No existing upstream Hysteria file is modified by this file's presence;
 // see README.md for exact grafting instructions.
@@ -60,15 +62,24 @@ const protectRPCTimeout = 5 * time.Second
 // routing loop).
 var protectFD func(fd int) error
 
-// authSecret is redacted out of any error text before it is logged (Part B
-// requirement: never expose auth/config-file contents in logs).
+// authSecret and obfsSecret are redacted out of any error text before it is
+// logged (Part B requirement: never expose auth/obfs/config-file contents
+// in logs). PRE-MERGE HARDENING CORRECTION (2026-09-20, manual review,
+// round 3): obfsSecret was missing here - only authSecret was ever
+// redacted, despite obfsSalamander being an equally secret-shaped value
+// (see novaminimalConfig's own doc comment, which already said so).
 var authSecret string
+var obfsSecret string
 
 func redact(s string) string {
-	if authSecret == "" {
-		return s
+	out := s
+	if authSecret != "" {
+		out = strings.ReplaceAll(out, authSecret, "***REDACTED***")
 	}
-	return strings.ReplaceAll(s, authSecret, "***REDACTED***")
+	if obfsSecret != "" {
+		out = strings.ReplaceAll(out, obfsSecret, "***REDACTED***")
+	}
+	return out
 }
 
 func logf(format string, args ...interface{}) {
@@ -214,13 +225,19 @@ func main() {
 		*sni = cfg.SNI
 		*insecure = cfg.Insecure
 		*obfsPassword = cfg.ObfsSalamander
+		obfsSecret = cfg.ObfsSalamander
 		if cfg.SocksListen != "" {
 			*socksListen = cfg.SocksListen
 		}
 		*protectPath = cfg.ProtectPath
 		logf("loaded config-file: %s", cfg.redactedSummary())
-	} else if *auth != "" {
-		authSecret = *auth
+	} else {
+		if *auth != "" {
+			authSecret = *auth
+		}
+		if *obfsPassword != "" {
+			obfsSecret = *obfsPassword
+		}
 	}
 
 	if *serverAddr == "" {

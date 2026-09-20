@@ -301,6 +301,54 @@ below. The full two-cycle/restart/protect-failure/screen-lock evidence
 above is unaffected by this change (it exercises the data plane and
 protect(fd) mechanism, not credential delivery) and was not re-run.
 
+### Pre-merge manual-review corrections (round 3, no live server needed)
+
+A manual review (CodeRabbit remained stalled/unresponsive throughout this
+round) found four further narrow issues, all fixed in this same PR before
+any merge, none requiring a live server or re-running the physical
+evidence above:
+
+1. **Runtime credential consumption was best-effort, not verified.**
+   `B46HysteriaDataPlaneConfig.resolve()` called a plain `delete()` and
+   returned `Valid` regardless of whether the file was actually gone
+   afterward - the stated "successful parse -> credential consumed ->
+   file no longer exists -> only then Valid" invariant wasn't actually
+   enforced. Replaced with `B46HysteriaRuntimeCredential.consumeDelete()`,
+   which attempts deletion AND verifies the file is genuinely absent
+   before allowing `resolve()` to return `Valid`; if verification fails,
+   `resolve()` returns `Invalid` with a typed, non-secret reason and the
+   caller never reaches TUN/bridge/child startup for that attempt. The
+   same fix extends to `B46HysteriaRuntime.onProcessExitedUnexpectedly()`,
+   which now deletes the generated per-child config file and protect
+   socket immediately on an unexpected child exit (previously they could
+   survive until an explicit Stop).
+2. **Unknown child stderr/stdout content was still written to logcat**
+   at `Log.d` level, despite the code's own comment already admitting it
+   was "never assumed to contain no secret." Only a known-safe,
+   allowlisted event shape is now ever passed to `Log.*` - all other
+   content is delivered ONLY to the internal state machine, never to
+   logcat, via a small pure decision function (`B46ChildLogFilter`) kept
+   deliberately separate from `android.util.Log` so it is directly unit
+   tested without Robolectric.
+3. **`obfsSalamander` was never redacted in the Go child.** Only
+   `authSecret` was stripped out of logged error text; `obfsSecret` is now
+   tracked and redacted the same way, from both `--config-file` and (for
+   host-research use) the `--obfs-salamander` flag.
+4. **The standalone harness module still had AGP's implicit `release`
+   build variant/type**, despite being documented everywhere as
+   DEBUG/RESEARCH ONLY. Disabled via `androidComponents.beforeVariants`
+   (`ApplicationVariantBuilder.enable = false`) - `:b46harness:assembleRelease`
+   no longer exists as a task at all for this module, so no release
+   harness APK can ever be produced, accidentally or otherwise. `:app`'s
+   own release variant is completely unaffected (this module is never a
+   dependency of `:app`).
+
+None of these four required re-running the physical QUIC/data-plane
+evidence recorded above - they are credential-lifecycle, logging, and
+build-configuration corrections, verified by 20 new unit/Go tests (70
+total Kotlin tests, 8 total Go tests, all passing) rather than a live
+server.
+
 ### Post-hardening physical sanity cycle: BLOCKED (rule already removed, not reopened)
 
 Before attempting to provision a new disposable credential and temporary

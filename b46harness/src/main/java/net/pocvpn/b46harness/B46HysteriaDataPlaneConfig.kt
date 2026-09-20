@@ -50,7 +50,14 @@ internal object B46HysteriaDataPlaneConfig {
      * (the part that actually matters here) with deterministic inputs,
      * without needing Robolectric or a real `BuildConfig`.
      */
-    internal fun resolve(filesDir: File, host: String, port: String, sni: String, insecureStr: String): Result {
+    internal fun resolve(
+        filesDir: File,
+        host: String,
+        port: String,
+        sni: String,
+        insecureStr: String,
+        deleter: B46HysteriaRuntimeCredential.Deleter? = null,
+    ): Result {
         if (host.isBlank() || port.isBlank()) {
             return Result.Invalid(
                 "B46_HYSTERIA_SERVER_HOST/PORT are blank - create b46harness/b46-hysteria-dataplane.properties " +
@@ -83,20 +90,27 @@ internal object B46HysteriaDataPlaneConfig {
             protectPath = "", // filled in by B46HysteriaRuntime.startChild once the protect socket path is known
         )
 
-        // PRE-MERGE HARDENING CORRECTION (2026-09-20): one-shot consumption.
-        // The runtime credential file is provisioning INPUT, not session
-        // state - once its secret values have been successfully copied into
-        // `config` (in memory, above), the file itself must not remain at
-        // rest for the rest of the session. Deleted HERE, immediately,
-        // BEFORE the caller does anything with `config` (TUN/bridge/child
-        // startup all happen strictly after `resolve()` returns) - never
-        // deferred to `stop()`/failure cleanup, which would leave it on
-        // disk for the whole session even on the success path. Idempotent;
-        // a later `stop()`/`failStartup()` calling `delete()` again is a
-        // safe no-op.
-        B46HysteriaRuntimeCredential.delete(filesDir)
-
-        return Result.Valid(config)
+        // PRE-MERGE HARDENING CORRECTION (2026-09-20, manual review, round 3):
+        // one-shot consumption, now VERIFIED, not best-effort. The runtime
+        // credential file is provisioning INPUT, not session state - once
+        // its secret values have been successfully copied into `config` (in
+        // memory, above), the file itself must not remain at rest for the
+        // rest of the session. `consumeDelete` attempts deletion AND checks
+        // the file is actually gone before this function is allowed to
+        // return `Valid` - a best-effort `delete()` that swallowed failure
+        // could previously return `Valid` while the secret was still on
+        // disk. If verified deletion fails, this fails closed with a typed,
+        // non-secret reason and the caller (B46HysteriaVpnService) never
+        // reaches TUN/bridge/child startup for this attempt.
+        val consumeResult = if (deleter != null) {
+            B46HysteriaRuntimeCredential.consumeDelete(filesDir, deleter)
+        } else {
+            B46HysteriaRuntimeCredential.consumeDelete(filesDir)
+        }
+        return when (consumeResult) {
+            is B46HysteriaRuntimeCredential.ConsumeResult.Ok -> Result.Valid(config)
+            is B46HysteriaRuntimeCredential.ConsumeResult.Failed -> Result.Invalid(consumeResult.reason)
+        }
     }
 
     /** Empty until set via the properties file - used only for the acceptance doc's exit-IP check, never for routing decisions. Not secret. */

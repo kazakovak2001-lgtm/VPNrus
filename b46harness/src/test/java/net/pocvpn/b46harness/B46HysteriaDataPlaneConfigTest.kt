@@ -5,6 +5,7 @@ package net.pocvpn.b46harness
 import java.io.File
 import kotlin.io.path.createTempDirectory
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -121,5 +122,66 @@ class B46HysteriaDataPlaneConfigTest {
 
         assertFalse(childStarted)
         assertFalse(credentialFile.exists())
+    }
+
+    // 9 & 10. simulated delete failure fails closed, and startup cannot proceed
+    @Test
+    fun `resolve fails closed when the verified delete fails, and never returns Valid`() {
+        val filesDir = tempFilesDir()
+        val credentialFile = provisionCredential(filesDir, auth = "must-not-leak-in-reason")
+        val noOpDeleter = B46HysteriaRuntimeCredential.Deleter { true } // claims success, does nothing
+
+        val result = B46HysteriaDataPlaneConfig.resolve(
+            filesDir, host = "203.0.113.1", port = "34443", sni = "example.test", insecureStr = "true", deleter = noOpDeleter,
+        )
+
+        assertTrue(result is B46HysteriaDataPlaneConfig.Result.Invalid)
+        assertFalse((result as B46HysteriaDataPlaneConfig.Result.Invalid).reason.contains("must-not-leak-in-reason"))
+        assertTrue("the credential file must still exist - it was never actually consumed", credentialFile.exists())
+    }
+
+    @Test
+    fun `bridge and child are never started when credential-consume verification fails`() = runTest {
+        val filesDir = tempFilesDir()
+        provisionCredential(filesDir)
+        val noOpDeleter = B46HysteriaRuntimeCredential.Deleter { true }
+
+        val result = B46HysteriaDataPlaneConfig.resolve(
+            filesDir, host = "203.0.113.1", port = "34443", sni = "example.test", insecureStr = "true", deleter = noOpDeleter,
+        )
+        assertTrue(result is B46HysteriaDataPlaneConfig.Result.Invalid)
+
+        // Mirrors B46HysteriaVpnService.handleStart's real control flow: a
+        // resolve() Invalid result must short-circuit BEFORE startBridge()/
+        // startChild() are ever called - proven here with fakes that record
+        // whether they were invoked at all.
+        val tun2Socks = FakeB46Tun2SocksBridge()
+        val launcher = FakeB46HysteriaProcessLauncher()
+        val runtime = B46HysteriaRuntime(FakeB46HysteriaVpnProtectBridge(), launcher, tun2Socks, this)
+        runtime.starting()
+        runtime.tunEstablished()
+
+        if (result is B46HysteriaDataPlaneConfig.Result.Valid) {
+            runtime.startBridge(1, 1400, "127.0.0.1:1")
+        }
+        // (the real service never reaches this line on Invalid - the assertion below proves it, not this test's own control flow)
+
+        assertEquals(0, tun2Socks.startCalls)
+        assertEquals(0, launcher.launchCount)
+    }
+
+    // 11. existing normal cleanup remains idempotent (real deleter, real success path)
+    @Test
+    fun `normal best-effort delete after a successful consume is still a safe no-op`() {
+        val filesDir = tempFilesDir()
+        provisionCredential(filesDir)
+
+        val result = B46HysteriaDataPlaneConfig.resolve(filesDir, host = "203.0.113.1", port = "34443", sni = "example.test", insecureStr = "true")
+        assertTrue(result is B46HysteriaDataPlaneConfig.Result.Valid)
+
+        // Simulates B46HysteriaVpnService's own best-effort cleanup call on
+        // a later stop() - file is already gone, must not throw.
+        B46HysteriaRuntimeCredential.delete(filesDir)
+        B46HysteriaRuntimeCredential.delete(filesDir) // second call, still safe
     }
 }

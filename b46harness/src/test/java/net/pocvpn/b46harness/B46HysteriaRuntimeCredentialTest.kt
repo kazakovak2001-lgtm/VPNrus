@@ -133,4 +133,59 @@ class B46HysteriaRuntimeCredentialTest {
 
         assertFalse(B46HysteriaRuntimeCredential.credentialFile(filesDir).exists())
     }
+
+    // 8. successful credential consume requires ACTUAL (verified) deletion
+    @Test
+    fun `consumeDelete with the real deleter reports Ok only when the file is actually gone`() {
+        val filesDir = tempFilesDir()
+        val file = writeCredential(filesDir, "auth=real-secret-value\n")
+        assertTrue(file.exists())
+
+        val result = B46HysteriaRuntimeCredential.consumeDelete(filesDir)
+
+        assertTrue(result is B46HysteriaRuntimeCredential.ConsumeResult.Ok)
+        assertFalse(file.exists())
+    }
+
+    @Test
+    fun `consumeDelete on an already-absent file reports Ok - nothing left to verify`() {
+        val filesDir = tempFilesDir() // nothing provisioned
+
+        val result = B46HysteriaRuntimeCredential.consumeDelete(filesDir)
+
+        assertTrue(result is B46HysteriaRuntimeCredential.ConsumeResult.Ok)
+    }
+
+    // 9. simulated delete failure fails closed
+    @Test
+    fun `consumeDelete with a deleter that does not actually remove the file fails closed`() {
+        val filesDir = tempFilesDir()
+        val file = writeCredential(filesDir, "auth=real-secret-value\n")
+        // A fake deleter that CLAIMS success (returns true) without
+        // actually touching the filesystem - simulates the exact failure
+        // mode a real filesystem could produce (delete() returns true but
+        // the file is still there for some other reason) without relying
+        // on host-filesystem permission quirks (unreliable across OSes,
+        // as this project already found with chmod - see
+        // B46HysteriaChildConfig.kt's own history).
+        val noOpDeleter = B46HysteriaRuntimeCredential.Deleter { true }
+
+        val result = B46HysteriaRuntimeCredential.consumeDelete(filesDir, deleter = noOpDeleter)
+
+        assertTrue(result is B46HysteriaRuntimeCredential.ConsumeResult.Failed)
+        assertTrue(file.exists()) // still there - the fail-closed report is honest
+        // The reason must never contain the secret value.
+        assertFalse((result as B46HysteriaRuntimeCredential.ConsumeResult.Failed).reason.contains("real-secret-value"))
+    }
+
+    @Test
+    fun `consumeDelete with a deleter that throws still fails closed rather than crashing`() {
+        val filesDir = tempFilesDir()
+        writeCredential(filesDir, "auth=real-secret-value\n")
+        val throwingDeleter = B46HysteriaRuntimeCredential.Deleter { throw java.io.IOException("simulated I/O failure") }
+
+        val result = B46HysteriaRuntimeCredential.consumeDelete(filesDir, deleter = throwingDeleter)
+
+        assertTrue(result is B46HysteriaRuntimeCredential.ConsumeResult.Failed)
+    }
 }
