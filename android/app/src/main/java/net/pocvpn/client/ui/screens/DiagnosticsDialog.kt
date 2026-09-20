@@ -173,6 +173,17 @@ fun DiagnosticsDialog(
                     TextButton(onClick = { onSetTransportForce(TransportKind.XRAY_XHTTP) }, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_force_xhttp))
                     }
+                    // B45B-4P - physical validation only: SHADOWSOCKS_2022 has no
+                    // production UI entry point yet (Smart Connect never
+                    // auto-selects it before every other transport is
+                    // exhausted - see PREFERRED_ORDER). This reuses the exact
+                    // same generic onSetTransportForce/debugSetTransportPreference
+                    // plumbing every other button above already uses - never a
+                    // second selection mechanism - and is gated by the same
+                    // isDebugBuild condition the whole dialog already requires.
+                    TextButton(onClick = { onSetTransportForce(TransportKind.SHADOWSOCKS_2022) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_shadowsocks))
+                    }
                     TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_simulate_awg_failure))
                     }

@@ -24,7 +24,14 @@ import org.json.JSONObject
 
 private const val TAG = "ShadowsocksValidation"
 private const val STAGING_FILE_NAME = "ss_test_cred_staging.json"
-private const val VALIDATION_ENDPOINT_ID = "b45b3p-validation"
+// B45B-4P - pointed at the real Frankfurt endpoint id so this harness's
+// "Provision" button stores a credential into the SAME real, endpoint-scoped
+// Shadowsocks2022CredentialRepository the main app's own selection pipeline
+// (MainViewModel.buildTransportRegistry/isShadowsocksAvailableFor) reads for
+// this exact endpoint id - never a second/parallel credential store. This is
+// debug-only tooling for physical device testing against the real endpoint;
+// it has no effect on any release build.
+private const val VALIDATION_ENDPOINT_ID = "frankfurt"
 
 /**
  * B45B-3P - isolated, debug-only PHYSICAL VALIDATION HARNESS for the
@@ -91,7 +98,13 @@ class ShadowsocksAdapterValidationActivity : AppCompatActivity() {
      */
     private fun provisionCredential() {
         scope.launch(Dispatchers.IO) {
-            val stagingFile = File(getExternalFilesDir(null), STAGING_FILE_NAME)
+            // B45B-4P physical validation - internal filesDir instead of the
+            // external files dir (never committed): this Android 14 device
+            // enforces per-app storage isolation that `adb`/`run-as` cannot
+            // bypass even as the app's own UID (a known platform limitation,
+            // not a security downgrade - the staging file is still deleted
+            // immediately after use, same as before).
+            val stagingFile = File(filesDir, STAGING_FILE_NAME)
             if (!stagingFile.exists()) {
                 publishStatus("provision failed: staging file not present")
                 return@launch
@@ -112,7 +125,7 @@ class ShadowsocksAdapterValidationActivity : AppCompatActivity() {
                 val repository = Shadowsocks2022CredentialRepositoryFactory.create(applicationContext, endpointId)
                 repository.storeCredential(validation.credential)
 
-                pendingConfig = TransportConfig.Shadowsocks(endpointId = endpointId, host = host, port = port)
+                pendingConfig = TransportConfig.Shadowsocks(endpointId = endpointId, host = host, port = port, method = method)
                 publishStatus("credential provisioned into production repository")
             } catch (t: Throwable) {
                 publishStatus("provision failed: ${t.javaClass.simpleName}")

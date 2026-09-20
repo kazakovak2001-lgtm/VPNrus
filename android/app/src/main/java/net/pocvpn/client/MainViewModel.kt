@@ -1,6 +1,7 @@
 package net.pocvpn.client
 
 import android.content.Context
+import net.pocvpn.client.reachability.signedTransportProfile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -1020,8 +1021,47 @@ class MainViewModel(
      * never claiming support for an ABI/binary this checkout does not
      * actually package.
      */
-    private fun isShadowsocksAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
-        shadowsocksBinaryEligibility.isEligible && endpointId in shadowsocksAvailableEndpoints.value
+    private fun isShadowsocksAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean {
+        if (!shadowsocksBinaryEligibility.isEligible) return false
+        if (endpointId !in shadowsocksAvailableEndpoints.value) return false
+        // B45B-4P (correction) - a device-local secret credential must NEVER
+        // by itself authorize an endpoint/port (see this task's own "root
+        // cause" note): SHADOWSOCKS_2022 is AVAILABLE only when the CURRENTLY
+        // trusted manifest also names a real, typed SHADOWSOCKS_2022 binding
+        // for this exact endpoint - never a Legacy/missing/invalid profile, a
+        // wrong-kind binding, or another endpoint's binding. A debug "Force
+        // SHADOWSOCKS_2022" preference reads THIS same function (via
+        // buildTransportRegistry -> TransportDescriptor.status) and gets no
+        // bypass.
+        val binding = trustedTransportBindingFor(endpointId, TransportKind.SHADOWSOCKS_2022) ?: return false
+        val profile = binding.signedTransportProfile(endpointId)
+        return profile is net.pocvpn.client.reachability.SignedTransportProfileReadResult.Parsed &&
+            profile.profile is net.pocvpn.client.reachability.SignedTransportProfile.Shadowsocks2022
+    }
+
+    /**
+     * B45B-4P (correction) - the ONE place a trusted, signed
+     * [net.pocvpn.client.reachability.EndpointTransportBinding] is resolved
+     * for a manual-mode attempt, reading ONLY [manifestRepository]'s
+     * currently trusted manifest ([net.pocvpn.client.reachability.EndpointManifestRepository.trusted]) -
+     * never [net.pocvpn.client.vpn.config.ProductionGatewayCatalog], never
+     * AWG's own `GatewayConfiguration`, never a hardcoded endpoint, never the
+     * credential repository. Returns null (fail closed) whenever
+     * [manifestRepository] is unwired, nothing is currently trusted, this
+     * endpoint isn't named at all, or it has no binding for [kind] - the
+     * caller must never fabricate a fallback binding. A debug-only "Force"
+     * preference calls the SAME code path as a real manual selection (this
+     * function has no debug-only branch) - it can never bypass manifest
+     * trust.
+     */
+    private fun trustedTransportBindingFor(
+        endpointId: net.pocvpn.client.reachability.EndpointId,
+        kind: TransportKind,
+    ): net.pocvpn.client.reachability.EndpointTransportBinding? {
+        val manifest = manifestRepository?.trusted() ?: return null
+        val endpoint = manifest.endpoints.firstOrNull { it.id == endpointId } ?: return null
+        return endpoint.bindingFor(kind)
+    }
 
     /**
      * B8O3 - the kind of the transport actually running/last attempted
@@ -2723,7 +2763,29 @@ class MainViewModel(
                 // is actually connecting to.
                 val registry = buildTransportRegistry(endpointId)
                 val orchestrator = TransportOrchestrator(registry)
-                when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId)) {
+                // B45B-4P (correction) - SHADOWSOCKS_2022 is the only kind
+                // whose execution consumes a pinned EndpointTransportBinding
+                // (see VpnController.buildTransportConfig's own docs) - every
+                // other kind keeps its existing address authority untouched.
+                // isShadowsocksAvailableFor already required this same
+                // binding to exist for `kind` to have been selectable at all,
+                // but it is re-resolved here (not cached) so a manifest
+                // mutation between eligibility-check and this exact attempt
+                // can never silently redirect it - the FRESH read here is
+                // what gets pinned into Resolution.Resolved, never a stale one.
+                val transportBinding = if (kind == TransportKind.SHADOWSOCKS_2022) {
+                    trustedTransportBindingFor(endpointId, kind) ?: run {
+                        supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.UnsupportedTransportSelected(kind.name)))
+                        controller.rejectPreflight(
+                            VpnError.UnsupportedTransportSelected(kind.name),
+                            "No trusted signed Shadowsocks binding for endpoint ${endpointId.value}",
+                        )
+                        return
+                    }
+                } else {
+                    null
+                }
+                when (val resolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(kind), endpointId, endpointTransportBinding = transportBinding)) {
                     is TransportOrchestrator.Resolution.Resolved -> {
                         supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
                             net.pocvpn.client.diagnostics.support.PathKind.DIRECT, resolution.kind,
@@ -3419,7 +3481,12 @@ class MainViewModel(
         val registry = buildTransportRegistry(candidate.endpointId)
         val orchestrator = TransportOrchestrator(registry)
         val decision = TransportSelectionDecision.SelectTransport(candidate.transport)
-        when (val resolution = orchestrator.resolve(decision, candidate.endpointId, candidate.configSnapshot)) {
+        // B45B-4P (correction) - the EXACT binding this candidate was scored
+        // against (AutoGatewaySelector.buildCandidates already pinned it into
+        // candidate.transportBinding - never re-looked-up here). Harmless to
+        // pass for every transport (only VpnController's SHADOWSOCKS_2022
+        // branch ever reads it - see that function's own docs).
+        when (val resolution = orchestrator.resolve(decision, candidate.endpointId, candidate.configSnapshot, endpointTransportBinding = candidate.transportBinding)) {
             is TransportOrchestrator.Resolution.Resolved -> {
                 supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
                     net.pocvpn.client.diagnostics.support.PathKind.DIRECT, resolution.kind,

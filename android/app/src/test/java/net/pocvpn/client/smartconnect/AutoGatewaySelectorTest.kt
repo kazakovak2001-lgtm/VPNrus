@@ -38,6 +38,7 @@ import net.pocvpn.client.vpn.config.ProductionGatewayDescriptor
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -341,6 +342,7 @@ class AutoGatewaySelectorTest {
                 configSnapshot = snapshot,
                 score = (pairs.size - i).toLong(),
                 reasons = emptyList(),
+                transportBinding = net.pocvpn.client.reachability.EndpointTransportBinding(kind = kind, host = "x", port = 1),
             )
         }
         assertTrue(many.size > AutoGatewaySelector.MAX_ATTEMPTS)
@@ -1328,6 +1330,19 @@ class AutoGatewaySelectorTest {
             shadowsocksAvailableFor = { true },
         )
         assertEquals(setOf(TransportKind.AMNEZIA_WG, TransportKind.SHADOWSOCKS_2022), withShadowsocks.map { it.transport }.toSet())
+
+        // B45B-4P (correction, mandatory regression) - the candidate must
+        // carry the EXACT binding it was scored against (host/port), never
+        // the AWG candidate's own configSnapshot host/port - the same
+        // eventual authority VpnController.buildTransportConfig reads.
+        val ssCandidate = withShadowsocks.first { it.transport == TransportKind.SHADOWSOCKS_2022 }
+        assertEquals(TransportKind.SHADOWSOCKS_2022, ssCandidate.transportBinding.kind)
+        assertEquals("203.0.113.55", ssCandidate.transportBinding.host)
+        assertEquals(8388, ssCandidate.transportBinding.port)
+        // Distinct from the AWG candidate's own binding for the SAME gateway -
+        // proves this isn't a single shared/aliased binding across kinds.
+        val awgCandidate = withShadowsocks.first { it.transport == TransportKind.AMNEZIA_WG }
+        assertNotEquals(awgCandidate.transportBinding.port, ssCandidate.transportBinding.port)
     }
 
     @Test

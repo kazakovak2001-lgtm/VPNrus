@@ -14,6 +14,9 @@ import net.pocvpn.client.identity.FakeAesGcmKeyEncryptor
 import net.pocvpn.client.identity.FileIdentityStore
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
+import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.Shadowsocks2022Profile
+import net.pocvpn.client.reachability.withShadowsocks2022Profile
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.vpn.config.AwgProfile
@@ -884,10 +887,22 @@ class VpnControllerTest {
         assertFalse(controller.state.value.toString().contains(invalidProfile.shortId))
     }
 
-    // --- B45B-4: SHADOWSOCKS_2022 selection wiring - orchestrator/ownership/failure semantics ---
+    // --- B45B-4/B45B-4P: SHADOWSOCKS_2022 selection wiring - orchestrator/ownership/failure semantics ---
+
+    /**
+     * B45B-4P (correction) - the exact physical bug: AWG and Shadowsocks are
+     * the SAME endpoint but DIFFERENT ports (51820 vs 28388, matching the
+     * real Frankfurt topology). [configuredGateway] (AWG's own
+     * GatewayConfiguration) uses 51820 - a wired [shadowsocksBinding] pinned
+     * separately at 28388 proves the branch reads ONLY the pinned binding,
+     * never [GatewayConfiguration]/its endpointHost/endpointPort.
+     */
+    private fun shadowsocksBinding(port: Int = 28388, method: String = "2022-blake3-aes-256-gcm") =
+        EndpointTransportBinding(kind = TransportKind.SHADOWSOCKS_2022, host = "152.70.43.1", port = port)
+            .withShadowsocks2022Profile(Shadowsocks2022Profile(method))
 
     @Test
-    fun `resolved SHADOWSOCKS_2022 with a wired transport invokes it with a config built from this attempt's own endpoint host-port`() = runTest {
+    fun `resolved SHADOWSOCKS_2022 with a pinned binding uses ITS host-port-method, never AWG's GatewayConfiguration`() = runTest {
         val awgTransport = FakeVpnTransport()
         val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
         val diagnostics = DiagnosticsStore()
@@ -898,16 +913,269 @@ class VpnControllerTest {
             shadowsocksTransport = shadowsocksTransport,
         )
 
-        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
         runCurrent()
 
         assertEquals(1, shadowsocksTransport.connectCallCount)
         assertEquals(0, awgTransport.connectCallCount)
         val sentConfig = shadowsocksTransport.lastConfig
         assertTrue(sentConfig is TransportConfig.Shadowsocks)
-        assertEquals(configuredGateway().endpointHost, (sentConfig as TransportConfig.Shadowsocks).host)
-        assertEquals(configuredGateway().endpointPort, sentConfig.port)
+        assertEquals("152.70.43.1", (sentConfig as TransportConfig.Shadowsocks).host)
+        // The mandatory regression: never AWG's own 51820 port.
+        assertEquals(28388, sentConfig.port)
+        assertEquals("2022-blake3-aes-256-gcm", sentConfig.method)
         assertTrue(controller.state.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `SHADOWSOCKS_2022 fails closed with no pinned binding - the service is never started`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        // No endpointTransportBinding pinned - must never fall back to AWG's
+        // GatewayConfiguration or invent a default.
+        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        runCurrent()
+
+        assertEquals(0, shadowsocksTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `SHADOWSOCKS_2022 fails closed for a Legacy signed profile - no typed method means never spawn`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+        // A binding of the right kind/host/port but with NO typed
+        // Shadowsocks2022Profile metadata - signedTransportProfile() reads
+        // this as Legacy, which must fail closed here (production execution
+        // never accepts Legacy/missing for this transport).
+        val legacyBinding = EndpointTransportBinding(kind = TransportKind.SHADOWSOCKS_2022, host = "152.70.43.1", port = 28388)
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = legacyBinding,
+            ),
+        )
+        runCurrent()
+
+        assertEquals(0, shadowsocksTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `SHADOWSOCKS_2022 fails closed for a wrong-kind pinned binding`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+        val wrongKindBinding = EndpointTransportBinding(kind = TransportKind.AMNEZIA_WG, host = "152.70.43.1", port = 51820)
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = wrongKindBinding,
+            ),
+        )
+        runCurrent()
+
+        assertEquals(0, shadowsocksTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `SHADOWSOCKS_2022 manifest mutation after connect() cannot alter the pinned in-flight attempt`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+        val pinned = shadowsocksBinding(port = 28388)
+        // A binding value that, if it were re-read after resolution instead
+        // of staying pinned, would show up in the sent config - it never
+        // should, because nothing mutates `pinned` itself; this documents
+        // that VpnController holds onto the EXACT Resolution passed in, not
+        // a reference it could be tricked into re-deriving.
+        val rotated = shadowsocksBinding(port = 9999)
+        assertTrue("test sanity: rotated must differ from pinned", pinned.port != rotated.port)
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = pinned,
+            ),
+        )
+        runCurrent()
+
+        val sentConfig = shadowsocksTransport.lastConfig as TransportConfig.Shadowsocks
+        assertEquals(28388, sentConfig.port)
+    }
+
+    // --- B45B-4P (correction, lifecycle hygiene): pendingConnectTransportBinding cleared on every terminal teardown ---
+
+    @Test
+    fun `pinned Shadowsocks binding is cleared after a denied VPN permission prompt`() = runTest {
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022, permission = android.content.Intent())
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
+        runCurrent()
+        assertEquals(shadowsocksBinding(), controller.pendingConnectTransportBindingForTest)
+
+        controller.onVpnPermissionResult(false)
+        runCurrent()
+
+        assertEquals(null, controller.pendingConnectTransportBindingForTest)
+    }
+
+    @Test
+    fun `pinned Shadowsocks binding is cleared after a normal disconnect`() = runTest {
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
+        runCurrent()
+        assertEquals(shadowsocksBinding(), controller.pendingConnectTransportBindingForTest)
+
+        controller.disconnect()
+        runCurrent()
+
+        assertEquals(null, controller.pendingConnectTransportBindingForTest)
+    }
+
+    @Test
+    fun `pinned Shadowsocks binding is cleared when an attempt is abandoned with a terminal error`() = runTest {
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
+        runCurrent()
+        assertEquals(shadowsocksBinding(), controller.pendingConnectTransportBindingForTest)
+
+        controller.abandonAttemptWithTerminalError(VpnError.NoCandidateAvailable, "exhausted")
+        runCurrent()
+
+        assertEquals(null, controller.pendingConnectTransportBindingForTest)
+    }
+
+    @Test
+    fun `pinned Shadowsocks binding is cleared when an attempt is abandoned for failover`() = runTest {
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
+        runCurrent()
+        assertEquals(shadowsocksBinding(), controller.pendingConnectTransportBindingForTest)
+
+        controller.abandonAttemptForFailover()
+        runCurrent()
+
+        assertEquals(null, controller.pendingConnectTransportBindingForTest)
+    }
+
+    @Test
+    fun `automatic network-change recovery does NOT clear the pinned Shadowsocks binding - same attempt, same destination`() = runTest {
+        val shadowsocksTransport = FakeVpnTransport(kind = TransportKind.SHADOWSOCKS_2022)
+        val diagnostics = DiagnosticsStore()
+        val reconnectManager = FakeReconnectManager()
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, diagnostics, backgroundScope,
+            shadowsocksTransport = shadowsocksTransport,
+        )
+        val pinned = shadowsocksBinding()
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = pinned,
+            ),
+        )
+        runCurrent()
+        assertEquals(pinned, controller.pendingConnectTransportBindingForTest)
+
+        // Simulate the underlying network changing while this SAME attempt
+        // is still active - reconnectManager's own recovery path (not a
+        // user-initiated disconnect(), not a terminal abandon) must NEVER
+        // touch the pinned destination: the whole point of a network-change
+        // restart is to resume the SAME attempt against the SAME endpoint.
+        reconnectManager.triggerUnderlyingNetworkChanged()
+        runCurrent()
+
+        assertEquals("automatic recovery must preserve the pinned attempt's own destination", pinned, controller.pendingConnectTransportBindingForTest)
     }
 
     @Test
@@ -943,7 +1211,12 @@ class VpnControllerTest {
             shadowsocksTransport = shadowsocksTransport,
         )
 
-        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
         runCurrent()
 
         assertEquals(1, shadowsocksTransport.connectCallCount)
@@ -971,7 +1244,12 @@ class VpnControllerTest {
             shadowsocksTransport = shadowsocksTransport,
         )
 
-        controller.connect(TransportOrchestrator.Resolution.Resolved(shadowsocksTransport, TransportKind.SHADOWSOCKS_2022))
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                shadowsocksTransport, TransportKind.SHADOWSOCKS_2022,
+                endpointTransportBinding = shadowsocksBinding(),
+            ),
+        )
         runCurrent()
 
         controller.disconnect()

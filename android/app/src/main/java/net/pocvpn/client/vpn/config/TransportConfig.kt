@@ -112,17 +112,25 @@ sealed class TransportConfig {
 
     /**
      * B45B-3 - config for the isolated ShadowsocksTransport/ShadowsocksVpnService
-     * adapter shell. TransportKind.SHADOWSOCKS_2022 stays NOT_IMPLEMENTED in
-     * TransportRegistry, so nothing in production ever constructs this yet -
-     * only tests. Deliberately carries no key material: the AEAD-2022 secret
-     * is resolved from Shadowsocks2022CredentialRepository at connect() time,
-     * scoped to [endpointId], never threaded through this config object or
-     * any Intent extra (see ShadowsocksTransport's own docs).
+     * adapter shell. Deliberately carries no key material: the AEAD-2022
+     * secret is resolved from Shadowsocks2022CredentialRepository at connect()
+     * time, scoped to [endpointId], never threaded through this config object
+     * or any Intent extra (see ShadowsocksTransport's own docs).
+     *
+     * B45B-4P (correction) - [host]/[port]/[method] are PUBLIC/SIGNED facts
+     * (the trusted manifest's EndpointTransportBinding + its typed
+     * Shadowsocks2022Profile - see VpnController.buildTransportConfig's own
+     * docs for exactly how they are resolved and pinned). [method] is threaded
+     * through so ShadowsocksVpnService can verify it against the endpoint-scoped
+     * SECRET credential's own method before ever spawning sslocal (fail closed
+     * on a mismatch) - it is not secret itself (it names an algorithm, e.g.
+     * `2022-blake3-aes-256-gcm`, never key material).
      */
     data class Shadowsocks(
         val endpointId: EndpointId,
         val host: String,
         val port: Int,
+        val method: String,
         val routingMode: RoutingMode = RoutingMode.FULL_VPN,
     ) : TransportConfig()
 }

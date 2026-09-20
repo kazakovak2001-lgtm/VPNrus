@@ -74,6 +74,14 @@ internal class RealShadowsocksVpnProtectBridge : ShadowsocksVpnProtectBridge {
         state = ShadowsocksProtectBridgeState.RUNNING
 
         acceptThread = thread(name = "shadowsocks-protect-accept", isDaemon = true) {
+            // B45B-4P - bounded, once-per-session, non-secret (no fd number,
+            // no config/key material): confirms the bridge is actually
+            // listening. Retained (unlike the original physical-validation
+            // session's per-connection instrumentation, removed below as
+            // release-build spam - see this slice's own task notes) because
+            // "the bridge never started" remains a genuinely useful signal
+            // to distinguish from "sslocal never dialed it".
+            Log.i(TAG, "accept loop started, listening at ${socketPath.absolutePath}")
             acceptLoop(server, protector)
         }
     }
@@ -113,6 +121,7 @@ internal class RealShadowsocksVpnProtectBridge : ShadowsocksVpnProtectBridge {
                     Log.w(TAG, "protector.protect() threw", t)
                     false
                 }
+                if (!succeeded) Log.w(TAG, "protect() returned false")
                 writeResponse(peer, succeeded)
             }
             runCatching { Os.close(receivedFd) }

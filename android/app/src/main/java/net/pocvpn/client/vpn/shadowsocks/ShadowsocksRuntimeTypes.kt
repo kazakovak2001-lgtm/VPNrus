@@ -18,6 +18,8 @@ internal enum class ShadowsocksRuntimePhase {
 internal sealed interface ShadowsocksRuntimeError {
     data class CredentialAbsent(val endpointId: String) : ShadowsocksRuntimeError
     data class CredentialCorrupted(val reason: String) : ShadowsocksRuntimeError
+    /** B45B-4P (correction) - the trusted manifest's signed method and the endpoint-scoped secret credential's own method disagree; both values are PUBLIC method identifiers only, never key material. */
+    data class ProfileMethodMismatch(val signedMethod: String, val credentialMethod: String) : ShadowsocksRuntimeError
     data class BinaryMissing(val reason: String) : ShadowsocksRuntimeError
     /** B45B-3P - a previous abnormal process death (SIGABRT/SIGKILL) left ephemeral runtime files this start attempt could not clear before writing a new plaintext config - see ShadowsocksRuntime's own sweepStaleEphemeralState docs. */
     data class StaleStateCleanupFailed(val reason: String) : ShadowsocksRuntimeError
