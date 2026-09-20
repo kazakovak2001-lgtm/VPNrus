@@ -1,4 +1,4 @@
-package net.pocvpn.client.debug.b46hysteria
+package net.pocvpn.b46harness
 
 /**
  * B46-2A/B46-2B - PREPARATION ONLY, NOT A PRODUCTION TRANSPORT.
@@ -25,11 +25,12 @@ package net.pocvpn.client.debug.b46hysteria
  * (Nova must own the TUN; Hysteria2 cannot receive an external fd directly)
  * means there are now genuinely TWO independently-verifiable milestones
  * between "the TUN device exists" and "the Hysteria2 process is started":
- * (1) the TUN fd exists ([TUN_ESTABLISHED]), and (2) the sing-tun-driven
- * bridge (Option A) has ACCEPTED the (duplicated - see the architecture
- * doc's Section 8 fd-ownership model) TUN fd, its stack has started
- * successfully, and its handler infrastructure is able to receive/demux a
- * flow ([TUN_BRIDGE_READY]). Collapsing these would let a caller believe
+ * (1) the TUN fd exists ([TUN_ESTABLISHED]), and (2) the bridge (B46-2P:
+ * the B46-2C-selected xjasonlyu/tun2socks in-process AAR, never sing-tun -
+ * see docs/B46_2C_PERMISSIVE_HYSTERIA_PATH.md's own decision gate) has
+ * ACCEPTED the (duplicated - see that doc's own TUN-ownership model) TUN
+ * fd, its stack has started successfully, and its handler infrastructure
+ * is able to receive/demux a flow ([TUN_BRIDGE_READY]). Collapsing these would let a caller believe
  * the bridge is live merely because the TUN exists, which B46-2B's own
  * synthetic proof shows are NOT the same event (bridge construction/start
  * can itself fail even after the fd exists) - so this is a real,
@@ -71,11 +72,11 @@ enum class B46HysteriaSpikePhase {
 sealed interface B46HysteriaSpikeError {
     data class TunEstablishFailed(val reason: String) : B46HysteriaSpikeError
 
-    /** The sing-tun-driven relay (Option A, B46-2B) failed to construct/start against the TUN fd. */
+    /** The tun2socks bridge (B46-2C-selected xjasonlyu/tun2socks in-process AAR, never sing-tun) failed to construct/start against the TUN fd. */
     data class BridgeStartFailed(val reason: String) : B46HysteriaSpikeError
 
     /**
-     * The bridge (an in-process sing-tun-driven stack/worker, per the
+     * The bridge (an in-process tun2socks/gVisor-driven stack/worker, per the
      * architecture doc's chosen process boundary - never a separate child
      * process for this component) failed on its own. Named `BridgeFailed`,
      * not `BridgeExited`: an in-process worker failing is not a process
@@ -129,6 +130,13 @@ data class B46HysteriaSpikeStatus(
     val fdControlFailureCount: Int = 0,
     val exitCode: Int? = null,
     val lastError: B46HysteriaSpikeError? = null,
+    // B46-2P additions (additive, non-breaking) - observability only, never
+    // gate a phase transition by themselves (DATA_PLANE_READY still only
+    // ever comes from a real probe success, per [dataPlaneReady]'s own doc).
+    /** True once the child's own log line proved a real Hysteria2 QUIC handshake ("connected: udpEnabled=..."). */
+    val quicHandshakeConnected: Boolean = false,
+    /** True once the child's own log line proved its local SOCKS5 listener is up ("SOCKS5_LISTENING ..."). */
+    val socksListenerReady: Boolean = false,
 ) {
     companion object {
         val IDLE = B46HysteriaSpikeStatus(phase = B46HysteriaSpikePhase.IDLE)
@@ -175,7 +183,7 @@ object B46HysteriaSpikeTransitions {
         requireStartingOrLater(current).copy(phase = B46HysteriaSpikePhase.TUN_ESTABLISHED)
 
     /**
-     * B46-2B: the sing-tun-driven relay (Option A) has been constructed
+     * B46-2P: the tun2socks bridge (B46-2C-selected architecture) has been constructed
      * against the already-established TUN fd and started - a genuinely
      * separate, independently-verifiable milestone from [tunEstablished]
      * (see the phase enum's own doc). Only reachable from
@@ -263,6 +271,13 @@ object B46HysteriaSpikeTransitions {
         exitCode = exitCode,
         lastError = B46HysteriaSpikeError.RuntimeExitedUnexpectedly(exitCode),
     )
+
+    /** B46-2P: records a child log-line observation without touching phase - see the status fields' own doc. */
+    fun withChildLogObservation(
+        current: B46HysteriaSpikeStatus,
+        quicHandshakeConnected: Boolean = current.quicHandshakeConnected,
+        socksListenerReady: Boolean = current.socksListenerReady,
+    ): B46HysteriaSpikeStatus = current.copy(quicHandshakeConnected = quicHandshakeConnected, socksListenerReady = socksListenerReady)
 
     private fun requirePhase(current: B46HysteriaSpikeStatus, expected: B46HysteriaSpikePhase): B46HysteriaSpikeStatus {
         check(current.phase == expected) { "expected phase $expected, was ${current.phase}" }

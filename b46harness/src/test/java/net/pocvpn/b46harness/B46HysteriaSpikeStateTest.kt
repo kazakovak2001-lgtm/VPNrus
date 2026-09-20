@@ -1,4 +1,4 @@
-package net.pocvpn.client.debug.b46hysteria
+package net.pocvpn.b46harness
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

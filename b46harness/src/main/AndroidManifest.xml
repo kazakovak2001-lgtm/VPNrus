@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  B46-2P - PHYSICAL ANDROID VALIDATION, DEBUG/RESEARCH ONLY.
+
+  This is the manifest of a SEPARATE, standalone application
+  (net.pocvpn.b46harness), never Nova's own `:app`
+  (net.pocvpn.client) - see build.gradle.kts's own header comment for why
+  (Xray's AAR and this module's own tun2socks AAR are both gomobile-bound
+  and cannot coexist in one app's classpath/native-library set).
+
+  Never wired into Nova's production TransportRegistry, SmartConnect,
+  AutoGatewaySelector, TransportOrchestrator, VpnController, or
+  MainViewModel - this manifest and this module are the entire surface of
+  the B46-2P harness.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="B46-2P Hysteria2 Physical Validation">
+
+        <activity
+            android:name="net.pocvpn.b46harness.B46HysteriaActivity"
+            android:exported="true"
+            android:label="B46-2P Hysteria2 Physical Validation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="net.pocvpn.b46harness.B46HysteriaVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>
