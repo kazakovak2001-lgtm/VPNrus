@@ -1,6 +1,6 @@
 # B45B-4P — Shadowsocks 2022 Selection Wiring: Physical Validation Attempt
 
-## Status: NOT PASSED — data-plane proof still failing; the disconnect/ownership bug found in the first attempt is now fixed (§5b)
+## Status: NOT PASSED — data-plane proof still failing; the disconnect/ownership bug found in the first attempt is now fixed (§5b); the DNS fix is physically proven (§7) and the real root cause of the data-plane failure is now identified (§7)
 
 This is a truthful record of a real physical validation attempt of the B45B-4
 selection wiring, run end to end through the production pipeline (Smart
@@ -177,10 +177,125 @@ proof) - that failure is unchanged and still open.
 - Wi-Fi/cellular handover (Q7)
 - Russia/restricted-network behavior
 - Hard-whitelist behavior
-- The actual root cause of the data-plane failure in §4
-- The ownership/cleanup bug in §5
+- ~~The actual root cause of the data-plane failure in §4~~ — now identified, see §7
+- The ownership/cleanup bug in §5 — fixed, see §5b
+
+## 7. DNS fix physically re-verified; the real data-plane root cause is now identified (this session)
+
+Re-run on the same PR head plus one small, non-secret diagnostic-logging
+commit (`1138851116d9cc1df50c99cb208772a43b017ec3` — no behavior change),
+device OPPO CPH2173 (`c618ee06`, arm64-v8a, Android 14), reusing the exact
+pinned `sslocal` artifact (SHA-256
+`b8c8526055586d0175d12cdc9432a78146eff986b68aac3dc6d85dfd82716e79`,
+independently rebuilt bit-for-bit reproducible in this session too).
+
+**DNS fix (`VpnDnsPolicy.servers.forEach { builder.addDnsServer(it) }`)
+is physically proven at the Android network layer.** With the Shadowsocks
+tunnel up, `dumpsys connectivity`'s `NetworkAgentInfo` for the
+`Nova Shadowsocks 2022` VPN network showed real, non-empty
+`DnsAddresses: [ /1.1.1.1,/1.0.0.1 ]` on `LinkProperties{InterfaceName: tun0}`
+— configuration-level proof the fix reaches Android's real VPN interface.
+This alone does not prove resolution works end to end (see below - the
+underlying data plane is still broken), but it closes the specific gap the
+fix targeted (an interface with a route but no DNS server of that family).
+
+**Selection, process, TUN, and protect bridge are all real and working.**
+Two full connect/disconnect cycles were run through the real production
+pipeline (Diagnostics → "Force SHADOWSOCKS_2022 on next connect" [a
+one-shot preference, consumed by the very next connect attempt — must be
+re-set before every connect] → Home power button):
+- First cycle: `sslocal` PID 5092 (rebuilt-artifact PID: 7078/9060 across
+  re-attempts), `tun0` = `10.202.46.1/24`, `--protocol tun
+  --tun-device-fd-from-path ... --tun-interface-address 10.202.46.1/24
+  --vpn -U` confirmed via `/proc/<pid>/cmdline`.
+- Second cycle: `sslocal` PID 10630 — a genuinely new PID, confirming a
+  fresh process per connection, not a reused/stale one.
+- Both disconnects (normal Home power button, never `force-stop`) left:
+  no `sslocal` process, no `tun0` interface, and an empty
+  `files/shadowsocks/` working directory (`protect_path`/`tun_fd_path`/
+  `runtime_config.json` all gone) — the §5b cleanup fix holds under two
+  independent real cycles.
+- No `FATAL EXCEPTION`, `ANR in`, or `Force finishing activity` anywhere
+  in the session's logcat.
+- A quick post-test AmneziaWG connect/disconnect confirmed Shadowsocks
+  left no stale VPN ownership blocking another transport.
+
+**The data plane still fails — zero bytes ever reach the real server —
+and the root cause is now proven, not merely observed.** Server-side
+`tcpdump -i any port 28388` (two independent 180s windows, one per
+connect cycle) captured **zero packets** on both TCP and UDP, and
+`journalctl -u b45a-ssserver.service --since <test-start>` showed **no
+entries** for either window. On-device: a domain HTTPS request
+(`https://icanhazip.com`) and a direct-IP request (`https://1.1.1.1`)
+both failed (DNS resolution timeout / TCP connection timeout) — ruling
+out a DNS-only failure (Case B) in favor of a wider data-plane failure
+(Case C), consistent with the server-side silence.
+
+Minimal non-secret diagnostic logging was added to
+`ShadowsocksVpnProtectBridge` (`accept loop started`, `accepted a peer
+connection`, `protect() result=<bool>`) and proved **`sslocal` was
+actively and repeatedly reaching the protect bridge, with
+`protect()` returning `true` every single time** (~15 successful
+protect calls observed across one ~15s curl attempt) — ruling out the
+protect path, the TUN handoff, and `VpnService.protect()` itself as the
+cause. A baseline test with the Shadowsocks tunnel disconnected
+confirmed the phone's own WiFi network can reach `152.70.43.1:28388`
+directly (`nc -4 -w 6 152.70.43.1 28388` connected) — ruling out a
+network/firewall/server-reachability problem.
+
+**Root cause (code-read, deterministic): `sslocal` is being told to
+connect to the wrong port.** In
+`VpnController.kt`'s `TransportConfig.Shadowsocks` builder:
+
+```kotlin
+TransportConfig.Shadowsocks(
+    endpointId = pendingConnectEndpointId,
+    host = config.endpointHost,
+    port = config.endpointPort,
+    routingMode = routingMode,
+)
+```
+
+`config.endpointHost`/`config.endpointPort` come from
+`GatewayConfigSnapshot`, built by `AutoGatewaySelector.snapshotFor`,
+whose own docstring says: *"this snapshot's `endpointHost`/`endpointPort`
+are ONLY ever consumed by `VpnController`'s AWG execution path
+(`GatewayConfigSnapshotValidator`/`TransportConfig.Awg`)"* — i.e. these
+fields carry the AmneziaWG peer's UDP port (`51820` for Frankfurt, per
+this same session's own Diagnostics dump: `Gateway: 152.70.43.1:51820`),
+never a Shadowsocks port. Frankfurt's signed manifest does not declare a
+`SHADOWSOCKS_2022` transport binding at all (Diagnostics:
+`Endpoint frankfurt: ... transports=[AMNEZIA_WG, XRAY_REALITY, TLS_TCP]`),
+so there is no manifest-derived Shadowsocks port to fall back to either.
+`Shadowsocks2022Credential` (`identity/Shadowsocks2022Credential.kt`)
+only carries `method` + `key` — no host/port — so the credential
+repository (correctly populated by this session's own provisioning,
+`host=152.70.43.1 port=28388`) is never consulted for the connection
+address at all. The result: `sslocal` is launched with
+`--tun-interface-address` correct but dials `152.70.43.1:51820` (or
+whatever the AWG binding resolves to), not `152.70.43.1:28388` — a
+silent, deterministic misconfiguration that explains the exact symptom
+observed (real process, real TUN, real protect bridge, zero server-side
+bytes) on every attempt so far, including the original B45B-4P attempt
+and this session's re-run.
+
+**No fix was implemented in this session.** This is a genuine
+architectural gap - there is currently no Shadowsocks-specific host/port
+authority anywhere in the codebase (not the manifest, not the credential
+repository) - not a one-line bug. A correct fix requires a real design
+decision (e.g. extend `Shadowsocks2022Credential`/its on-disk store
+format to carry host+port, with a migration, mirroring what the debug
+`ShadowsocksAdapterValidationActivity` staging JSON already informally
+assumes; or add a genuine manifest-driven Shadowsocks transport binding)
+that is out of scope for a same-session "smallest fix" per this task's
+own discipline. Only the non-secret diagnostic logging that helped prove
+this (commit `1138851116d9cc1df50c99cb208772a43b017ec3`) was pushed to
+this PR.
 
 **B45 is not complete. B45B-4P selection/runtime/data-plane integration is
-not proven end to end.** Only the reproducible-artifact provenance (§1) and
-the selection-wiring runtime evidence (§3, up to but not including a working
-data plane) are established facts from this session.
+not proven end to end.** The reproducible-artifact provenance (§1), the
+selection-wiring runtime evidence (§3), the DNS-fix LinkProperties proof
+(§7), and the disconnect/cleanup fix under two independent real cycles
+(§5b, §7) are established facts. The data-plane failure now has a proven,
+specific, deterministic root cause (§7) rather than an unknown one - the
+next slice's job is the host/port design fix, not further diagnosis.
