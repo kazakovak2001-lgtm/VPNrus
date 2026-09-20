@@ -440,6 +440,11 @@ class VpnController(
     // not consume it (AMNEZIA_WG/XRAY_REALITY/TLS_TCP/XRAY_XHTTP keep reading
     // their own existing address authorities, byte-for-byte unaffected).
     private var pendingConnectTransportBinding: net.pocvpn.client.reachability.EndpointTransportBinding? = null
+
+    /** Test-only observation seam - no production code path reads this; buildTransportConfig reads [pendingConnectTransportBinding] directly. Exists only so lifecycle tests can prove the field is cleared on every terminal teardown path without making the field itself public. */
+    internal val pendingConnectTransportBindingForTest: net.pocvpn.client.reachability.EndpointTransportBinding?
+        get() = pendingConnectTransportBinding
+
     private var activeTransportConfig: TransportConfig? = null
 
     // B22 - the private-gateway keypair repository for the CURRENT/most
@@ -712,6 +717,11 @@ class VpnController(
             // gatewayStatus() for a request nothing is acting on any more.
             pendingConnectConfig = null
             pendingConnectPrivateKeyRepository = null
+            // B45B-4P (correction, lifecycle hygiene) - same "abandoned
+            // attempt, must not linger" reasoning as pendingConnectConfig
+            // immediately above: this pinned attempt is over, and the NEXT
+            // connect() always sets this fresh before it is ever read again.
+            pendingConnectTransportBinding = null
             return
         }
         connectMutex.withLock { doConnectAttempt(pendingConnectKind) }
@@ -742,6 +752,12 @@ class VpnController(
             // for manual mode) before it is ever read again.
             pendingConnectConfig = null
             pendingConnectPrivateKeyRepository = null
+            // B45B-4P (correction, lifecycle hygiene) - same reasoning as
+            // pendingConnectConfig immediately above, applied to the newer
+            // pinned Shadowsocks transport-binding authority: a user-
+            // initiated disconnect ends this attempt, so the pinned binding
+            // must not linger for a later, unrelated connect() to observe.
+            pendingConnectTransportBinding = null
             // B25 - the session that owned this context/stage is gone; the
             // NEXT connect() always pins these fresh (see connect()'s own
             // docs) - never left to linger and be read by sessionHealth for
@@ -848,6 +864,10 @@ class VpnController(
         activeTransportConfig = null
         pendingConnectConfig = null
         pendingConnectPrivateKeyRepository = null
+        // B45B-4P (correction, lifecycle hygiene) - shared by
+        // abandonAttemptForFailover/abandonAttemptWithTerminalError, same
+        // "attempt is over" reasoning as pendingConnectConfig above.
+        pendingConnectTransportBinding = null
         pendingAttemptContext = VpnAttemptContext.Direct
         _relayStage.value = null
     }
