@@ -74,6 +74,10 @@ internal class RealShadowsocksVpnProtectBridge : ShadowsocksVpnProtectBridge {
         state = ShadowsocksProtectBridgeState.RUNNING
 
         acceptThread = thread(name = "shadowsocks-protect-accept", isDaemon = true) {
+            // B45B-4P debug-only diagnostic instrumentation (non-secret: no
+            // fd number, no config/key material) - temporary, to determine
+            // whether sslocal ever reaches this bridge at all.
+            Log.i(TAG, "accept loop started, listening at ${socketPath.absolutePath}")
             acceptLoop(server, protector)
         }
     }
@@ -86,6 +90,7 @@ internal class RealShadowsocksVpnProtectBridge : ShadowsocksVpnProtectBridge {
                 if (running) Log.w(TAG, "accept() failed on protect bridge", err)
                 break
             }
+            Log.i(TAG, "accepted a peer connection")
             handleOneRequest(peer, protector)
         }
     }
@@ -113,6 +118,7 @@ internal class RealShadowsocksVpnProtectBridge : ShadowsocksVpnProtectBridge {
                     Log.w(TAG, "protector.protect() threw", t)
                     false
                 }
+                Log.i(TAG, "protect() result=$succeeded")
                 writeResponse(peer, succeeded)
             }
             runCatching { Os.close(receivedFd) }
