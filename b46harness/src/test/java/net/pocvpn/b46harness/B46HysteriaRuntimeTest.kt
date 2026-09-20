@@ -93,6 +93,73 @@ class B46HysteriaRuntimeTest {
         assertTrue(runtime.status.value.lastError is B46HysteriaSpikeError.RuntimeExitedUnexpectedly)
     }
 
+    // 4. unexpected child exit deletes the generated child config (PRE-MERGE HARDENING CORRECTION round 2)
+    @Test
+    fun `unexpected child exit deletes the generated child config file`() = runTest {
+        val launcher = FakeB46HysteriaProcessLauncher()
+        val runtime = newRuntime(launcher = launcher, scope = this)
+        runtime.starting()
+        runtime.tunEstablished()
+        runtime.startBridge(1, 1400, "127.0.0.1:1")
+        val workingDir = tempWorkingDir()
+        runtime.startChild(existingBinaryPath(), workingDir, testConfig(), FakeB46HysteriaVpnProtector())
+        val configFile = File(workingDir, "b46-hysteria-config.json")
+        assertTrue("config file should exist right after a successful startChild", configFile.exists())
+
+        launcher.lastLaunched!!.simulateUnexpectedExit(exitCode = 1)
+
+        assertFalse("the child died - its config file (containing auth/obfs) must not remain at rest", configFile.exists())
+    }
+
+    // 5. unexpected child exit deletes the protect socket artifact
+    @Test
+    fun `unexpected child exit deletes the protect socket file`() = runTest {
+        val launcher = FakeB46HysteriaProcessLauncher()
+        val runtime = newRuntime(launcher = launcher, scope = this)
+        runtime.starting()
+        runtime.tunEstablished()
+        runtime.startBridge(1, 1400, "127.0.0.1:1")
+        val workingDir = tempWorkingDir()
+        // The fake protect bridge doesn't create a real socket file, so
+        // create one ourselves at the exact path the real runtime uses, to
+        // prove the RUNTIME's own cleanup call (not the bridge's) deletes it.
+        val protectSocketFile = File(workingDir, "b46-protect.sock")
+        workingDir.mkdirs()
+        protectSocketFile.writeText("")
+        runtime.startChild(existingBinaryPath(), workingDir, testConfig(), FakeB46HysteriaVpnProtector())
+        assertTrue(protectSocketFile.exists())
+
+        launcher.lastLaunched!!.simulateUnexpectedExit(exitCode = 1)
+
+        assertFalse("the protect socket artifact must not remain after the child has already died", protectSocketFile.exists())
+    }
+
+    // 6. later explicit stop() from ERROR is still safe/idempotent after this early cleanup
+    @Test
+    fun `stop after unexpected child exit is safe, idempotent, and never double-deletes or throws`() = runTest {
+        val launcher = FakeB46HysteriaProcessLauncher()
+        val protectBridge = FakeB46HysteriaVpnProtectBridge()
+        val runtime = newRuntime(launcher = launcher, protectBridge = protectBridge, scope = this)
+        runtime.starting()
+        runtime.tunEstablished()
+        runtime.startBridge(1, 1400, "127.0.0.1:1")
+        runtime.startChild(existingBinaryPath(), tempWorkingDir(), testConfig(), FakeB46HysteriaVpnProtector())
+
+        launcher.lastLaunched!!.simulateUnexpectedExit(exitCode = 1)
+        assertEquals(B46HysteriaSpikePhase.ERROR, runtime.status.value.phase)
+        assertEquals(1, protectBridge.stopCalls) // already stopped once by onProcessExitedUnexpectedly
+
+        runtime.stop() // must not throw despite configFile/protectSocketFile already being null
+
+        assertEquals(B46HysteriaSpikePhase.STOPPED, runtime.status.value.phase)
+        assertEquals(2, protectBridge.stopCalls) // stop()'s own call - protectBridge.stop() itself is idempotent
+
+        runtime.stop() // second call: canStop() is now false, must be a pure no-op
+
+        assertEquals(B46HysteriaSpikePhase.STOPPED, runtime.status.value.phase)
+        assertEquals(2, protectBridge.stopCalls) // not called a third time
+    }
+
     // FD-protect negative ACK -> fail closed, never FD_CONTROL_READY
     @Test
     fun `FD-protect negative ack does not reach FD_CONTROL_READY and records a failure`() = runTest {

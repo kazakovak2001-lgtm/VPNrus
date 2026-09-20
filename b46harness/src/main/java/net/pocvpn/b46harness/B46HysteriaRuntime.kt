@@ -204,11 +204,29 @@ internal class B46HysteriaRuntime(
         _status.value = B46HysteriaSpikeTransitions.stopped()
     }
 
+    /**
+     * PRE-MERGE HARDENING CORRECTION (2026-09-20): an unexpected child exit
+     * used to leave the secret-bearing per-child artifacts (the generated
+     * `--config-file`, containing `auth`/`obfsSalamander`, and the protect
+     * socket) on disk until an explicit `stop()` eventually ran - the child
+     * that would have read them is already dead, so there is no reason for
+     * either to still exist. Deleted here, immediately, same as the normal
+     * `stop()` path does. TUN/tun2socks ownership is deliberately left
+     * alone - the required `ERROR -> STOPPING -> STOPPED` recovery path
+     * (see [B46HysteriaSpikeTransitions.canStart]'s own doc) still owns
+     * tearing those down, only the secret-bearing files are handled early.
+     * References are cleared so a later `stop()` safely no-ops on them
+     * (`File?.delete()` on `null` is a no-op) rather than double-deleting.
+     */
     private fun onProcessExitedUnexpectedly(exitCode: Int) {
         val phase = _status.value.phase
         if (phase != B46HysteriaSpikePhase.STOPPING && phase != B46HysteriaSpikePhase.STOPPED) {
             protectBridge.stop()
+            configFile?.delete()
+            protectSocketFile?.delete()
             process = null
+            configFile = null
+            protectSocketFile = null
             _status.value = B46HysteriaSpikeTransitions.runtimeExitedUnexpectedly(_status.value, exitCode)
         }
     }
