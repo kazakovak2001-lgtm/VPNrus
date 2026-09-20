@@ -1,5 +1,5 @@
 // Command native builds the Nova tun2socks native bridge as a Go
-// -buildmode=c-archive artifact (B46-3A). It is a thin cgo export layer
+// -buildmode=c-shared artifact (B46-3A). It is a thin cgo export layer
 // around the exact xjasonlyu/tun2socks engine lifecycle already reviewed
 // and pinned in B46-2P/B46-2C (github.com/xjasonlyu/tun2socks/v2, MIT,
 // commit 5d9fac67bb1095a5d2bd959216f85e6434524731 / pseudo-version
@@ -8,12 +8,17 @@
 //
 // Unlike the B46-2P AAR (research/b46-2p-android-physical/tun2socks-bridge),
 // this is NOT built with `gomobile bind`. It is built with the plain Go
-// toolchain's `-buildmode=c-archive`, which emits a standard C ABI
-// (a .h header + a .a static archive) and pulls in only the ordinary Go
-// runtime - no go.Seq/go.Universe/go.error bridging classes, no
-// gomobile-generated Java, no second libgojni.so. A small JNI shim
-// (../jni/nova_tun2socks_jni.c) links against this archive and is the only
-// piece exposed to the JVM, as net.pocvpn.client.vpn.hysteria.NativeTun2SocksBridge.
+// toolchain's `-buildmode=c-shared` (NOT `-buildmode=c-archive`: that mode
+// was attempted first and is rejected outright by the Go toolchain itself
+// for GOOS=android - "-buildmode=c-archive not supported on android/arm64",
+// see docs/B46_3A_HYSTERIA_NATIVE_BRIDGE_COEXISTENCE.md Part A - so
+// `c-shared` was used instead, per that document's own fallback). This
+// emits a standard C ABI (a .h header + a .so shared object) and pulls in
+// only the ordinary Go runtime - no go.Seq/go.Universe/go.error bridging
+// classes, no gomobile-generated Java, no second libgojni.so. A small JNI
+// shim (../jni/nova_tun2socks_jni.c) links against this .so and is the
+// only piece exposed to the JVM, as
+// net.pocvpn.client.vpn.hysteria.NativeTun2SocksBridge.
 //
 // Not production code. Not wired into Nova's release transport selection.
 // See docs/B46_3A_HYSTERIA_NATIVE_BRIDGE_COEXISTENCE.md.
