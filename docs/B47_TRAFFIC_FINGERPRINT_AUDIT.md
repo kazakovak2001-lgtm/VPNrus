@@ -409,3 +409,7 @@ Proceed to B47-1P only when all of the following are available:
 - explicit capture handling/redaction rules.
 
 Do not change Smart Connect order, transport profiles, TLS fingerprints, XHTTP padding, DNS, certificates, or gateway behavior based solely on this source audit and single-host probes. Require packet evidence first.
+
+## 23. B47-1P execution status
+
+The deterministic physical-capture procedure is prepared in [`B47_1P_ANDROID_PACKET_CAPTURE_BASELINE.md`](B47_1P_ANDROID_PACKET_CAPTURE_BASELINE.md). On 2026-09-21, ADB was available but reported no attached device, and the workstation had no Wireshark, `tshark`, `dumpcap`, or `tcpdump`. No physical capture was performed, no B47 inference was promoted to `MEASURED`, and no risk rating changed. B47-1P remains blocked until the documented device, capture-point, credential, synchronization, and parsing gates are satisfied.
