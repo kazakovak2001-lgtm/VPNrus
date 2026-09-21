@@ -11,19 +11,19 @@
   on a real device targeting SDK 35+) refuse `adb shell am start` against
   a non-exported component even from the shell UID - exporting is required
   for this activity's own stated purpose ("manually exercising... on a
-  physical device" via adb). Still harmless to export: this is a
-  DEBUG-BUILD-ONLY activity (absent from any release APK, per this file's
-  own scoping above), it performs no action without explicit Intent
-  extras a bare launch never supplies, and it saves/reads only real,
-  already-provisioned credentials - never fabricates one (see the
-  Activity's own class docs).
+  physical device" via adb). B53 found that its save-profile extras perform
+  a credential-store write during onCreate, so a normal app must not be an
+  eligible caller even in debug. android.permission.DUMP preserves the
+  shell/ADB validation workflow while excluding ordinary third-party apps.
+  The component remains absent from release.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <activity
             android:name="net.pocvpn.client.debug.XrayDiagnosticsActivity"
             android:exported="true"
-            android:label="Xray Diagnostics (debug)" />
+            android:label="Xray Diagnostics (debug)"
+            android:permission="android.permission.DUMP" />
 
         <!-- B45A - SPIKE ONLY, NOT A PRODUCTION TRANSPORT. Debug-only manual
              entry point for the independent shadowsocks-rust Android
