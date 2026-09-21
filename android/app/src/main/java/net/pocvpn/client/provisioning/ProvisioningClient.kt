@@ -135,6 +135,20 @@ object ProvisioningClient {
         executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost))
 
     /**
+     * B46-4A - POST /v1/hysteria-profile: SAME existing activation credential
+     * and SAME existing device public key as [fetchXrayProfile] - no new
+     * identity, no new credential system (per task's own "provisioning
+     * authority" instruction). The activation credential authorizes
+     * issuance/retrieval only; the response's own `auth_secret` is the
+     * distinct, Hysteria2-specific DATA-PLANE credential (never the
+     * activation credential reused as wire auth - see
+     * [Hysteria2ProfileProvisioner]'s own doc). Does not persist the result -
+     * the caller decides whether/when to save it.
+     */
+    fun fetchHysteria2Profile(publicKey: String, bearerToken: String, endpointHost: String): Hysteria2ProfileResult =
+        executeHysteria2Profile(buildHysteria2ProfileRequest(publicKey, bearerToken, endpointHost))
+
+    /**
      * B26 (task D) - POST /v1/ingress-profile: the SAME request shape as
      * [fetchXrayProfile]/[fetchXrayTlsProfile] (existing activation
      * credential + existing device public key, optional `transport`
@@ -371,6 +385,13 @@ object ProvisioningClient {
             body = buildXrayTlsRequestBody(publicKey),
         )
 
+    internal fun buildHysteria2ProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
+        OutgoingRequest(
+            url = "https://$endpointHost/v1/hysteria-profile",
+            headers = authHeaders(bearerToken),
+            body = buildRequestBody(publicKey),
+        )
+
     private fun authHeaders(credential: String): Map<String, String> = mapOf(
         "Content-Type" to "application/json",
         "Authorization" to "Bearer $credential",
@@ -384,6 +405,9 @@ object ProvisioningClient {
 
     private fun executeXrayTlsProfile(request: OutgoingRequest): XrayTlsProfileResult =
         executeGeneric(request, XrayTlsProfileResult::NetworkError, ::mapXrayTlsProfileResponse)
+
+    private fun executeHysteria2Profile(request: OutgoingRequest): Hysteria2ProfileResult =
+        executeGeneric(request, Hysteria2ProfileResult::NetworkError, ::mapHysteria2ProfileResponse)
 
     private fun <T> executeGeneric(
         request: OutgoingRequest,
@@ -496,6 +520,94 @@ object ProvisioningClient {
         }
         503 -> XrayProfileResult.ServiceUnavailable
         else -> XrayProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * B46-4A - POST /v1/hysteria-profile response mapping - `internal` so
+     * each status/error_code combination is unit-testable without a live
+     * HTTP connection. Mirrors [mapXrayProfileResponse]'s own shape, plus
+     * `expired` (gateway/api/hysteria_provisioning.py's own error codes -
+     * see that module for the authoritative list).
+     */
+    internal fun mapHysteria2ProfileResponse(status: Int, rawBody: String): Hysteria2ProfileResult = when (status) {
+        200, 201 -> parseHysteria2ProfileSuccessBody(rawBody)
+        401 -> Hysteria2ProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> Hysteria2ProfileResult.Revoked
+            "expired" -> Hysteria2ProfileResult.Expired
+            "device_not_bound" -> Hysteria2ProfileResult.DeviceNotBound
+            else -> Hysteria2ProfileResult.Unauthorized
+        }
+        503 -> Hysteria2ProfileResult.ServiceUnavailable
+        else -> Hysteria2ProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * B46-4A - the ONE place an untrusted POST /v1/hysteria-profile response
+     * body is parsed. Every field is structurally validated before this
+     * function ever returns a [Hysteria2ProfileResult.Success] - a caller
+     * downstream (`Hysteria2ProfileProvisioner`) never needs to re-validate.
+     * The raw body is never logged by this function or any caller.
+     */
+    private fun parseHysteria2ProfileSuccessBody(raw: String): Hysteria2ProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return Hysteria2ProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val profileVersion = json.optInt("profile_version", -1)
+        if (profileVersion != 1) {
+            return Hysteria2ProfileResult.MalformedResponse("unsupported profile_version: $profileVersion")
+        }
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val authSecret = json.optString("auth_secret", "")
+        val sni = json.optString("sni", "")
+        val obfuscationMode = json.optString("obfuscation_mode", "")
+        val obfuscationSecret = if (json.isNull("obfuscation_secret")) null else json.optString("obfuscation_secret", "").ifBlank { null }
+        val issuedAt = if (json.has("issued_at_epoch_seconds") && !json.isNull("issued_at_epoch_seconds")) json.optLong("issued_at_epoch_seconds") else null
+        val expiresAt = if (json.has("expires_at_epoch_seconds") && !json.isNull("expires_at_epoch_seconds")) json.optLong("expires_at_epoch_seconds") else null
+
+        if (serverAddress.isBlank()) {
+            return Hysteria2ProfileResult.MalformedResponse("server_address missing or blank")
+        }
+        if (serverPort !in 1..65535) {
+            return Hysteria2ProfileResult.MalformedResponse("server_port missing or out of range")
+        }
+        if (authSecret.isBlank()) {
+            return Hysteria2ProfileResult.MalformedResponse("auth_secret missing or blank")
+        }
+        if (authSecret.length > net.pocvpn.client.identity.Hysteria2CredentialValidator.MAX_SECRET_LENGTH) {
+            return Hysteria2ProfileResult.MalformedResponse("auth_secret exceeds max length")
+        }
+        if (sni.isBlank()) {
+            return Hysteria2ProfileResult.MalformedResponse("sni missing or blank")
+        }
+        if (obfuscationMode !in net.pocvpn.client.reachability.SUPPORTED_HYSTERIA2_OBFUSCATION_MODES) {
+            return Hysteria2ProfileResult.MalformedResponse("unsupported obfuscation_mode: $obfuscationMode")
+        }
+        if (obfuscationMode == "SALAMANDER" && obfuscationSecret.isNullOrBlank()) {
+            return Hysteria2ProfileResult.MalformedResponse("obfuscation_mode SALAMANDER requires a non-blank obfuscation_secret")
+        }
+        if (obfuscationMode == "NONE" && obfuscationSecret != null) {
+            return Hysteria2ProfileResult.MalformedResponse("obfuscation_mode NONE must not carry an obfuscation_secret")
+        }
+        if (issuedAt != null && expiresAt != null && expiresAt <= issuedAt) {
+            return Hysteria2ProfileResult.MalformedResponse("expires_at_epoch_seconds must be after issued_at_epoch_seconds")
+        }
+
+        return Hysteria2ProfileResult.Success(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            authSecret = authSecret,
+            sni = sni,
+            obfuscationMode = obfuscationMode,
+            obfuscationSecret = obfuscationSecret,
+            profileVersion = profileVersion,
+            issuedAtEpochSeconds = issuedAt,
+            expiresAtEpochSeconds = expiresAt,
+        )
     }
 
     /**

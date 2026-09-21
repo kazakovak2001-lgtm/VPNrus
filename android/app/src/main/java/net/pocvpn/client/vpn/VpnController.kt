@@ -257,6 +257,16 @@ class VpnController(
     // own docs); registry-level AVAILABLE/NOT_IMPLEMENTED is the real gate on
     // whether Smart Connect ever resolves this kind in the first place.
     private val shadowsocksTransport: VpnTransport? = null,
+    // B46-4A - additive, defaults to null (same "no wiring, no behavior"
+    // seam every other optional collaborator in this class already uses).
+    // The SAME real Hysteria2Transport instance the Smart Connect registry
+    // (MainViewModel.buildTransportRegistry) also registers - never a
+    // second, independently-constructed one (mirrors shadowsocksTransport's
+    // own docs). Registry-level AVAILABLE/NOT_IMPLEMENTED is the real gate
+    // on whether Smart Connect ever resolves this kind in the first place;
+    // this wiring only decides whether THIS controller can build a
+    // TransportConfig for HYSTERIA2 at all.
+    private val hysteria2Transport: VpnTransport? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -290,6 +300,10 @@ class VpnController(
         // build a TransportConfig.Shadowsocks (see buildTransportConfig's own
         // `when`) when a real ShadowsocksTransport was actually wired.
         if (shadowsocksTransport != null) add(TransportKind.SHADOWSOCKS_2022)
+        // B46-4A - same shape as the others: this controller can only ever
+        // build a TransportConfig.Hysteria2 (see buildTransportConfig's own
+        // `when`) when a real Hysteria2Transport was actually wired.
+        if (hysteria2Transport != null) add(TransportKind.HYSTERIA2)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -552,7 +566,13 @@ class VpnController(
                             // docs - so this is a genuine terminal failure, never
                             // fabricated, and must be recorded under the SAME
                             // typed category for Auto-gateway advancement to work.
-                            newTransport.kind == TransportKind.SHADOWSOCKS_2022
+                            newTransport.kind == TransportKind.SHADOWSOCKS_2022 ||
+                            // B46-4A - same reasoning: Hysteria2Transport's own
+                            // observeState() only reports Error after
+                            // Hysteria2VpnService's own real fail-closed checks
+                            // (credential/ABI-binary/child-process/tun) - a
+                            // genuine terminal failure, never fabricated.
+                            newTransport.kind == TransportKind.HYSTERIA2
                         )
                 ) {
                     diagnostics.recordError(VpnError.HandshakeTimeout)
@@ -1022,9 +1042,9 @@ class VpnController(
                             false
                         }
                     } else {
-                        // B8I6/B33/B45B-4 - XRAY_REALITY/TLS_TCP/XRAY_XHTTP/
-                        // SHADOWSOCKS_2022 (the only other kinds reaching
-                        // here): never fabricate a stronger
+                        // B8I6/B33/B45B-4/B46-4A - XRAY_REALITY/TLS_TCP/XRAY_XHTTP/
+                        // SHADOWSOCKS_2022/HYSTERIA2 (the only other kinds
+                        // reaching here): never fabricate a stronger
                         // success signal than the transport itself provides -
                         // no forced Connected here, ever. As of B33,
                         // VlessRealityTransport/VlessTlsTransport's own
@@ -1296,6 +1316,53 @@ class VpnController(
                     host = binding.host,
                     port = binding.port,
                     method = profile.profile.method,
+                    routingMode = routingMode,
+                )
+            }
+
+            TransportKind.HYSTERIA2 -> {
+                // B46-4A - mirrors SHADOWSOCKS_2022's own B45B-4P correction
+                // exactly: host/port/sni/obfuscationMode come EXCLUSIVELY
+                // from [pendingConnectTransportBinding] - the pinned,
+                // trusted manifest binding for THIS attempt - never a
+                // hardcoded Stockholm host/port, never re-resolved from a
+                // catalog. Carries no auth/obfuscation secret: those are
+                // resolved from Hysteria2CredentialRepository inside
+                // Hysteria2VpnService at connect() time, scoped to
+                // endpointId. Fails closed for: no pinned binding, wrong
+                // endpoint/kind, or an invalid/legacy/missing signed
+                // profile - a debug "Force HYSTERIA2" preference never
+                // bypasses this.
+                val binding = pendingConnectTransportBinding
+                    ?: throw Hysteria2ProfileNotReadyException("no pinned Hysteria2 transport binding for this attempt")
+                require(binding.kind == TransportKind.HYSTERIA2) {
+                    "pinned transport binding is ${binding.kind}, not HYSTERIA2"
+                }
+                val profile = when (
+                    val result = binding.signedTransportProfile(pendingConnectEndpointId)
+                ) {
+                    is net.pocvpn.client.reachability.SignedTransportProfileReadResult.Parsed -> {
+                        (result.profile as? net.pocvpn.client.reachability.SignedTransportProfile.Hysteria2)
+                            ?: throw Hysteria2ProfileNotReadyException(
+                                "no typed Hysteria2 signed profile for endpoint ${pendingConnectEndpointId.value} (legacy/wrong-kind binding)",
+                            )
+                    }
+                    net.pocvpn.client.reachability.SignedTransportProfileReadResult.Missing ->
+                        throw Hysteria2ProfileNotReadyException("signed Hysteria2 profile missing for endpoint ${pendingConnectEndpointId.value}")
+                    net.pocvpn.client.reachability.SignedTransportProfileReadResult.Unsupported ->
+                        throw Hysteria2ProfileNotReadyException("signed Hysteria2 profile version unsupported for endpoint ${pendingConnectEndpointId.value}")
+                    net.pocvpn.client.reachability.SignedTransportProfileReadResult.Invalid ->
+                        throw Hysteria2ProfileNotReadyException("signed Hysteria2 profile invalid for endpoint ${pendingConnectEndpointId.value}")
+                }
+                if (routingMode != RoutingMode.FULL_VPN) {
+                    throw Hysteria2ProfileNotReadyException("HYSTERIA2 supports FULL_VPN only this slice, requested $routingMode")
+                }
+                TransportConfig.Hysteria2(
+                    endpointId = pendingConnectEndpointId,
+                    host = binding.host,
+                    port = binding.port,
+                    sni = profile.profile.sni,
+                    obfuscationMode = profile.profile.obfuscationMode,
                     routingMode = routingMode,
                 )
             }
@@ -1674,6 +1741,9 @@ private class XrayProfileNotReadyException(reason: String) : Exception(reason)
 
 /** B45B-4P (correction) - thrown by buildTransportConfig's SHADOWSOCKS_2022 branch; caught the SAME way XrayProfileNotReadyException already is (VpnError.ConfigurationMappingFailure), never a silent fallback to the AWG snapshot. */
 private class ShadowsocksProfileNotReadyException(reason: String) : Exception(reason)
+
+/** B46-4A - thrown by buildTransportConfig's HYSTERIA2 branch; caught the SAME way ShadowsocksProfileNotReadyException already is (VpnError.ConfigurationMappingFailure), never a silent fallback to the AWG snapshot or a hardcoded host/port. */
+private class Hysteria2ProfileNotReadyException(reason: String) : Exception(reason)
 
 /**
  * B8B3D - pure, file-scope (not a VpnController member) specifically so it

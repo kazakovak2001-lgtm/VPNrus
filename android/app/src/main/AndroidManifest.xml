@@ -68,5 +68,22 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- B46-4A - production, process-isolated Hysteria2 adapter. Started
+             only by Hysteria2Transport; HYSTERIA2 stays NOT_IMPLEMENTED in
+             TransportRegistry's default set (see
+             MainViewModel.isHysteria2AvailableFor's own docs) until a real
+             trusted signed binding + endpoint-scoped credential + arm64-v8a
+             native child eligibility all hold. Same non-exported,
+             BIND_VPN_SERVICE-only security boundary as every other VpnService
+             above - no debug Activity is required for production. -->
+        <service
+            android:name=".vpn.hysteria.Hysteria2VpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

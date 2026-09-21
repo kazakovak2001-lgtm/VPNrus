@@ -201,6 +201,57 @@ data class TransportCapabilities(
             maturity = TransportMaturity.EXPERIMENTAL,
         )
 
+        /**
+         * B46-4A - Hysteria2Transport/Hysteria2VpnService as an isolated
+         * adapter shell: real code exists (process-isolated three-boundary
+         * runtime, real VpnService TUN, real protect(fd), typed
+         * signed-binding + credential gating) but is deliberately NOT
+         * registered AVAILABLE in `TransportRegistry` merely by this
+         * factory existing - see `MainViewModel.isHysteria2AvailableFor`'s
+         * own docs for the full eligibility gate. `usesUdp`/`usesFullTunnel`
+         * are `true` because B46-3C physically proved a real end-to-end
+         * QUIC/UDP data plane through a real Android `VpnService` TUN on
+         * OPPO CPH2173 (DNS, TCP, direct-IP TCP, UDP, expected exit,
+         * server-side correlation - see
+         * docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md's "research
+         * evidence inherited" section). Every other field stays at its
+         * safe, truthful default:
+         *  - `supportsRoaming` is `false` - B46-3C's own physical evidence
+         *    covers a stationary session plus two clean reconnect cycles,
+         *    never a live network handover; [net.pocvpn.client.vpn.UnderlyingNetworkRecovery.RESTART_SESSION]
+         *    is used until seamless roaming is separately, physically
+         *    proven.
+         *  - `supportsSplitRouting` is `false` - this slice wires FULL_VPN
+         *    only (see `Hysteria2Transport`'s own routing-mode doc); a
+         *    caller requesting a different `RoutingMode` fails closed
+         *    rather than silently downgrading to full tunnel.
+         *  - `supportsIpv6`/`supportsTrafficStatistics`/`supportsProbing`
+         *    are `false` - none was implemented or evidenced this slice.
+         *  - `suitableForRestrictiveNetworks` is deliberately `false`: no
+         *    qualifying B54 `FIELD_MEASURED` restricted-network evidence
+         *    exists yet for HYSTERIA2 (B54 PR #108 still represents
+         *    Hysteria2 as pending/non-production) - this field must never
+         *    be set from the protocol's intended purpose or marketing
+         *    framing, only from real field evidence.
+         *  - `maturity` is `EXPERIMENTAL`: real adapter code exists with
+         *    real (lab/architecture) device evidence, but zero production
+         *    deployment/normal-selection physical validation yet.
+         */
+        fun hysteria2AdapterShell(): TransportCapabilities = TransportCapabilities(
+            usesUdp = true,
+            usesTcp = false,
+            supportsPort443 = true,
+            supportsObfuscation = true,
+            suitableForRestrictiveNetworks = false,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.EXPERIMENTAL,
+        )
+
         /** A transport with no implementation at all: every capability is truthfully false/unknown. */
         fun notImplemented(): TransportCapabilities = TransportCapabilities(
             usesUdp = false,
