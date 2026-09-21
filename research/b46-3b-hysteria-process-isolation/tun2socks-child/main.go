@@ -39,8 +39,32 @@
 //     report it (see ackResponse's own doc comment).
 //  4. Child blocks until SIGTERM/SIGINT, then calls the real, ordered
 //     engine.Stop() and exits 0 - deterministic termination, never left
-//     running headless. If the control connection itself closes first
-//     (parent process died), that is treated the same as a stop signal.
+//     running headless.
+//
+// PARENT-DEATH / ORPHAN PROTECTION (B46-3B lifecycle-hardening pass - an
+// earlier version of this file's own doc comment INCORRECTLY claimed "if
+// the control connection itself closes first (parent process died), that
+// is treated the same as a stop signal" - that was never actually
+// implemented; the short-lived control connections are both closed long
+// before this process reaches waitForStopSignal(), so there was no
+// mechanism at all to detect parent death, and a Linux child CAN outlive
+// its parent). The real mechanism, installed as the very first thing
+// main() does: `prctl(PR_SET_PDEATHSIG, SIGTERM)` (see
+// installParentDeathSignal) - the Linux kernel itself delivers SIGTERM to
+// this process the instant its parent (the Nova app's own OS process)
+// exits, for ANY reason (crash, force-stop, OOM kill), without this
+// process needing to poll anything. The classic race - the parent already
+// having died in the gap between fork/exec and this prctl() call landing -
+// is closed by capturing this process's own parent pid as the very first
+// statement of main() (before flag.Parse(), before anything else) and
+// re-checking os.Getppid() immediately after the prctl() syscall returns:
+// if it no longer matches, the parent is already gone (reparented to
+// init/zygote) and this process self-terminates immediately rather than
+// trusting a signal that would now never arrive. `PR_SET_PDEATHSIG` is a
+// standard Linux prctl option (since Linux 2.1.57) and Android's kernel is
+// Linux - no Android-specific unavailability is expected, but this is
+// PROVEN physically, not assumed (see docs/B46_3B_HYSTERIA_PROCESS_ISOLATION.md
+// Part 3-B's own physical parent-death test).
 //
 // FD OWNERSHIP CONTRACT (load-bearing, reused verbatim from B46-2C/B46-2P/
 // B46-3A): the fd this process receives over SCM_RIGHTS is ALREADY a
@@ -73,7 +97,19 @@ const (
 	controlDialTimeout = 5 * time.Second
 	controlReadTimeout = 5 * time.Second
 	ancillaryBufSize   = 32 // one fd (4 or 8 bytes of cmsg header + fd) - generous headroom.
+
+	// PR_SET_PDEATHSIG - Linux prctl(2) option: "the parent-death signal is
+	// sent when the thread's parent process dies" - not exported by the
+	// standard "syscall" package's constant set, so pinned here as a plain
+	// literal (matches the kernel UAPI header <linux/prctl.h>, stable ABI).
+	prSetPdeathsig = 1
 )
+
+// parentPidAtStartup is captured as a package-level initializer, which Go
+// runs before main() - as close to process start as this program can get,
+// to keep the parent-death race window (see installParentDeathSignal's own
+// doc) as small as possible.
+var parentPidAtStartup = os.Getppid()
 
 // controlHeader is the non-secret JSON control payload sent alongside the
 // SCM_RIGHTS fd. Neither field is a credential - MTU is a plain integer,
@@ -97,6 +133,15 @@ type ackResponse struct {
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
+	// Installed FIRST, before anything else - see this file's own top-level
+	// doc comment ("PARENT-DEATH / ORPHAN PROTECTION") and
+	// installParentDeathSignal's own doc for exactly why this ordering, and
+	// why a failure here is treated as fatal rather than logged-and-ignored.
+	if err := installParentDeathSignal(); err != nil {
+		log.Printf("B46_3B_CHILD_PARENT_DEATH_GUARD_FAILED: %v", err)
+		os.Exit(1)
+	}
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: tun2socks-child <control-unix-socket-path>")
@@ -250,4 +295,33 @@ func waitForStopSignal() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	<-sigCh
+}
+
+// installParentDeathSignal asks the Linux kernel to deliver SIGTERM to this
+// process the instant its parent (the Nova app process) exits, for ANY
+// reason - see this file's own top-level "PARENT-DEATH / ORPHAN PROTECTION"
+// doc comment for the full rationale. Uses a raw prctl(2) syscall (not
+// exposed by the standard "syscall" package's own constant/wrapper set) -
+// GOOS=android shares the same Linux syscall table/numbering as GOOS=linux
+// in the Go toolchain, so syscall.SYS_PRCTL/syscall.RawSyscall work
+// identically here; confirmed by an actual successful build+physical test,
+// not assumed (see docs/B46_3B_HYSTERIA_PROCESS_ISOLATION.md).
+//
+// Race protection: `parentPidAtStartup` was captured at package-init time,
+// before main() (and therefore before this function) ever ran. If the real
+// parent already exited in the gap between this process's own fork/exec
+// and this prctl() call actually landing, this process has ALREADY been
+// reparented (to init/zygote) by the time we get here - os.Getppid() will
+// no longer equal parentPidAtStartup, and no future SIGTERM will ever
+// arrive for an event that has already happened. That case is detected
+// explicitly and reported as an error (the caller treats it as fatal)
+// rather than silently trusting a signal that cannot come.
+func installParentDeathSignal() error {
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetPdeathsig, uintptr(syscall.SIGTERM), 0); errno != 0 {
+		return fmt.Errorf("prctl(PR_SET_PDEATHSIG): %w", errno)
+	}
+	if current := os.Getppid(); current != parentPidAtStartup {
+		return fmt.Errorf("parent pid changed between process start and PR_SET_PDEATHSIG (was %d, now %d) - parent already exited", parentPidAtStartup, current)
+	}
+	return nil
 }

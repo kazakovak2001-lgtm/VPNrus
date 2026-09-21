@@ -3,6 +3,16 @@
 Status: **`B46-3B PROCESS-ISOLATED ARCHITECTURE PHYSICALLY PASSED`** for
 process isolation, load-order regression, lifecycle/restart, controlled
 child death, and cleanup - all confirmed on real hardware (Part 9/10/15/16/18).
+A follow-up review found three real lifecycle gaps in that first pass
+(unexpected child death not propagated, a duplicated-TUN-fd leak on
+pre-handoff failures, and a false "parent death is handled" doc claim with
+no actual mechanism behind it) - all three are now fixed, tested (17 JVM
+unit tests, up from 11), and physically re-confirmed on the same OPPO
+device, including a NEW real parent-death/orphan-prevention proof. See
+Part 24 ("Lifecycle hardening pass") for the full audit, fixes, and
+physical evidence - it does not erase or contradict the original Part
+9/10/15/16/18 evidence, which remains true; it adds ownership/crash-
+resilience the first pass had not yet proven.
 Live Hysteria2 data-plane proof (DNS/TCP/UDP through a real server,
 protect boundary, exit correlation, screen-off) was NOT attempted in this
 pass (Part 21) - this verdict covers architecture feasibility only, not
@@ -449,3 +459,220 @@ through a real server, the protect boundary, exit/server correlation,
 screen-off behavior - see Part 21's own named gaps). This is an
 architecture-feasibility result: the specific failure B46-3A found is
 structurally eliminated, not merely avoided by luck.
+
+## Part 24 - Lifecycle hardening pass (post-physical-pass review)
+
+A follow-up code review of the first physical pass (Parts 1-23 above)
+found three real lifecycle gaps - none of them affect the process-
+isolation result itself (Part 9's own evidence is unchanged and still
+true), but all three matter for whether this architecture is actually
+production-feasible, not merely "doesn't crash once."
+
+### Gap 1 - unexpected child death was not propagated
+
+**Finding:** `RealTun2SocksChildProcess` already had a working
+`onExit(callback)` watcher-thread mechanism, but `Tun2SocksChildRuntime`
+never registered a callback on it. If the child died on its own (crash,
+OOM-kill, external signal), the app process survived (already proven
+physically) but the runtime/service state could still say `Started`, the
+original TUN fd was never closed, and the session only ever became
+`Failed` after a LATER, EXPLICIT `ACTION_STOP` - never automatically. The
+original `Tun2SocksIsolatedChildDeathInstrumentedTest` only proved "SIGKILL
+child -> app survives -> explicit STOP still works," which is not
+sufficient lifecycle ownership.
+
+**Fix:** `Tun2SocksChildRuntime.start()` now registers
+`launched.onExit { code -> handleChildExit(code) }` on every successful
+start. A new `terminalClaimed` boolean, guarded by a dedicated
+`stateLock`, is the single source of truth for "exactly one terminal
+transition per session": whichever of `stop()` or `handleChildExit()`
+reaches the guarded block FIRST clears `process`/`childPid` and performs
+real cleanup; the other sees the claim already taken and no-ops. This
+makes the classic race (a `stop()` call and a genuinely unexpected child
+death happening at nearly the same moment) safe by construction rather
+than by luck of scheduling. `Tun2SocksChildRuntime.onUnexpectedExit`
+exposes this to the owning service; `Tun2SocksProcessIsolatedSpikeVpnService`
+registers it once (in `init`) and runs the SAME real cleanup `handleStop`
+does (close the original TUN fd, clear ownership, report a terminal
+`Failed` status) - all under a new `tunFdLock` shared with the normal
+`handleStart`/`handleStop` paths, so an explicit stop and an automatic
+unexpected-exit detection can never race on closing/nulling the same TUN
+fd field either.
+
+### Gap 2 - duplicated TUN fd leaked on pre-handoff failures
+
+**Finding:** The service always did
+`ParcelFileDescriptor.dup(...).detachFd()` then called
+`runtime.start(dupFd, ...)`. The intended contract said the duplicate
+becomes the child's responsibility after a successful SCM_RIGHTS handoff -
+but `controlChannel.bind()` failure and `launcher.launch()` failure both
+return `Failed` from `start()` BEFORE `sendStartRequestAndAwaitAck` (the
+only place that actually closes the fd) is ever called, and the service
+never closed the duplicate on a `Failed` result either. Real fd leak.
+
+**Fix:** Ownership is now structurally unambiguous, exactly per the
+task's own preferred model: `Tun2SocksChildRuntime.start()` owns the
+supplied duplicated fd from the INSTANT it is called. A new injectable
+`Tun2SocksDupFdCloser` seam (`RealTun2SocksDupFdCloser`, backed by
+`ParcelFileDescriptor.adoptFd(fd).close()`) is called on every failure
+path BEFORE `sendStartRequestAndAwaitAck` is reached (already-running,
+invalid mtu, empty socks address, bind failure, launch failure - an
+already-invalid `fd < 0` is the one exception, since it was never a real
+fd to own). Once `sendStartRequestAndAwaitAck` is called, it alone owns
+closing the fd (unchanged - `ParcelFileDescriptor.adoptFd(fd).use { }`
+already closed it exactly once on every one of its own internal branches).
+The caller (`Tun2SocksProcessIsolatedSpikeVpnService`) never needs to
+guess whether handoff happened and no longer touches the duplicate fd at
+all after calling `start()`.
+
+The interface seam (`Tun2SocksDupFdCloser`) exists specifically because
+`ParcelFileDescriptor` is an Android framework class this project's
+`testOptions.unitTests.isReturnDefaultValues` stubs to `null`/defaults
+rather than throw - a `FakeTun2SocksDupFdCloser` records calls instead, so
+JVM unit tests can assert exactly which fds were closed and how many
+times without touching any real OS resource.
+
+**Test coverage added** (all 9 branches the task asked for, each proving
+no double-close and no leak):
+
+| # | Scenario | Assertion |
+|---|---|---|
+| 1 | bind failure | `closer.closedFds == [fd]`, launcher never called |
+| 2 | process launch failure | `closer.closedFds == [fd]`, control channel closed |
+| 3 | child never connects | folded into the "ack failure" test (`Tun2SocksChildAck.Failed`) - `closer.closedFds` stays empty (already closed by the control-channel call itself) |
+| 4 | header send failure | same as #3 |
+| 5 | ack timeout after handoff | same as #3 |
+| 6 | child returns failure ack | separate test, engine-level rejection reason passed through |
+| 7 | successful start | `closer.closedFds` stays empty - the runtime itself never double-closes a successfully-handed-off fd |
+| 8 | normal stop | already-covered idempotency/graceful-then-forceful tests, now also asserting `onUnexpectedExit` is never fired |
+| 9 | unexpected death | new tests - notified exactly once, state cleared, idempotent `stop()` afterward, a fresh `start()` is possible again |
+
+### Gap 3 - parent-death/orphan contract was falsely documented
+
+**Finding:** `main.go`'s own doc comment claimed "if the control connection
+itself closes first (parent process died), that is treated the same as a
+stop signal" - this was never actually implemented. Both control
+connections close long before the child reaches `waitForStopSignal()`
+(which only listens for `SIGTERM`/`SIGINT`), so there was no real
+parent-death detection at all, and a Linux child CAN outlive its parent.
+
+**Design decision:** `prctl(PR_SET_PDEATHSIG, SIGTERM)` - evaluated first,
+not blindly implemented: this is a standard Linux kernel mechanism (since
+Linux 2.1.57), and Android's kernel is Linux, so no Android-specific
+unavailability was expected - confirmed rather than assumed, by an actual
+build + two real tests (host-level and physical, both below). A
+persistent liveness socket (the task's other named option) was not
+selected: it would need a THIRD long-lived connection (the two existing
+ones are both deliberately short-lived, per this file's own protocol doc)
+with its own teardown/ownership design, for a problem the kernel already
+solves natively and more directly.
+
+**Implementation** (`research/b46-3b-hysteria-process-isolation/tun2socks-child/main.go`):
+`parentPidAtStartup := os.Getppid()` is captured as a package-level
+variable initializer - the earliest point Go itself runs any code, before
+`main()`. `installParentDeathSignal()` is the FIRST statement inside
+`main()` (before `flag.Parse()`, before anything else): it issues the raw
+`prctl(PR_SET_PDEATHSIG, SIGTERM)` syscall via `syscall.RawSyscall`, then
+immediately re-checks `os.Getppid()` against `parentPidAtStartup` - if they
+differ, the real parent already exited in the gap between this process's
+own exec and the `prctl()` call landing (reparented to init/zygote), so no
+future `SIGTERM` will ever arrive for an event that already happened; this
+is treated as fatal (the child logs
+`B46_3B_CHILD_PARENT_DEATH_GUARD_FAILED` and exits) rather than silently
+trusting a signal that cannot come. The false doc-comment claim was
+corrected to describe the REAL mechanism instead.
+
+**Host-level proof** (WSL2 Ubuntu, before ever touching the device - a
+throwaway harness, `research/b46-3b-hysteria-process-isolation/proof/parent_death_proof.sh`,
+source only, not committed as a binary/shipped artifact): spawns the
+child under a `setsid`-wrapped parent shell, confirms the child is alive,
+`SIGKILL`s the parent, and polls for the child's own disappearance:
+
+```
+parent(setsid) pid=525  child pid=529
+PROOF_RESULT: child GONE after 23ms - PASS
+```
+
+**Physical proof** (same OPPO CPH2173): a purpose-built harness (NOT a
+self-contained instrumentation pass/fail test - the task's own instruction
+is explicit that a test cannot observe its own process's death from the
+inside; `Tun2SocksIsolatedParentDeathHarnessInstrumentedTest` only starts a
+real session and then ends, letting `am instrument` completion's own real
+`ActivityManager` kill of the app process BE the real parent-death event,
+observed from a SEPARATE, external `adb shell` session afterward):
+
+```
+D/Tun2SocksChildProcess: [stderr] B46_3B_CHILD_STARTED: pid=19046 mtu=1500 socksAddr=127.0.0.1:41999
+I/ActivityManager: Force stopping net.pocvpn.client appid=10668 user=0: finished inst
+I/ActivityManager: Killing 19012:net.pocvpn.client/u0a668 (adj 0): stop net.pocvpn.client due to finished inst
+
+$ adb shell pidof net.pocvpn.client
+(empty - app process confirmed gone)
+
+$ adb shell ls -la /proc/19046
+ls: /proc/19046: No such file or directory
+
+$ adb shell ps -A | grep novatun2sockschild
+(no output - zero matching processes anywhere on the device)
+```
+
+The real app process (pid `19012`) died; the real child process (pid
+`19046`) - which was never told to stop, never received an explicit
+`ACTION_STOP`, and had no other mechanism watching it - died automatically
+and left no orphan. This is the load-bearing physical proof for Gap 3's
+fix.
+
+### Physical re-confirmation after all three fixes
+
+All fixes were re-verified on the SAME OPPO CPH2173 device, on the SAME
+`:app:checkDebugDuplicateClasses`/`:app:assembleDebug`-green build
+(`app-debug.apk` SHA-256
+`ac490798d54825902963f5607110e1305a64ccabc0db9a82312667e1d4a85a1d`;
+`libnovatun2sockschild.so` SHA-256
+`3ee51b0bbfec55f3b1f05c7b55057110fda1d9b64187822b6efeb9621349621f`):
+
+- **`Tun2SocksIsolatedProcessMapsInstrumentedTest`** - still `OK (1 test)`,
+  no regression from the runtime refactor.
+- **`Tun2SocksIsolatedLoadOrderInstrumentedTest`** - still `OK (2 tests)`,
+  both orderings, no regression.
+- **`Tun2SocksIsolatedChildDeathInstrumentedTest` (rewritten "V2" -
+  no longer calls `ACTION_STOP` right after the kill)** - `OK (1 test)`.
+  Real logcat evidence of the FULL automatic chain, no manual stop
+  involved until the final idempotency check:
+
+  ```
+  D/Tun2SocksChildProcess: [stderr] B46_3B_CHILD_STARTED: pid=18387 mtu=1500 socksAddr=127.0.0.1:41999
+  I/Tun2SocksChildRuntime: child started: pid=18387
+  W/Tun2SocksChildRuntime: child exited unexpectedly: code=137
+  W/Tun2SocksIsolatedSpike: tun2socks child exited unexpectedly: code=137
+  D/Vpn: setting state=DISCONNECTED, reason=agentDisconnect
+  ```
+
+  (`code=137` = `128 + 9` = the real `SIGKILL` exit status, confirming the
+  runtime's own unexpected-death detection fired for the REAL reason, not
+  a coincidental timeout.) The test itself additionally asserted, and
+  confirmed true: the TUN interface (`ip link show` no longer contains
+  `tun0`) and the control socket file are both gone BEFORE any
+  `ACTION_STOP` was sent - genuinely automatic teardown, not merely a
+  later explicit cleanup.
+- **Parent-death/orphan test** - PASSED, see above.
+- **JVM unit tests** - 17/17 green (`Tun2SocksChildRuntimeTest`, up from
+  11 - 6 new tests covering Gap 1/Gap 2 exactly per the task's own
+  required list).
+
+### Remaining risks
+
+- The parent-death proof used `am force-stop`-via-instrumentation-teardown
+  as the real kill mechanism (a genuine, uncontrolled process kill) rather
+  than a raw `SIGKILL` directly on the app's own PID - both are real
+  process-death events the kernel treats identically for `PR_SET_PDEATHSIG`
+  purposes, but a direct-`SIGKILL` variant was not separately exercised in
+  this pass.
+- `terminalClaimed`'s correctness rests on Kotlin's `synchronized` block
+  being a real reentrant JVM monitor (true for the HotSpot/ART VM this
+  project targets) - documented as a structural assumption, not proven
+  with a dedicated concurrency stress test beyond the deterministic
+  fake-triggered race test.
+- No change in this pass to the live-data-plane gaps already named in
+  Part 21 (DNS/TCP/UDP/protect/exit-correlation/screen-off) - still fully
+  out of scope until B46-3C.

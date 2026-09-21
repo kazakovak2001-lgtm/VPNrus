@@ -14,7 +14,8 @@ private const val SPIKE_SESSION_NAME = "B46-3B process-isolated tun2socks spike 
 private const val TUN_ADDRESS = "10.205.48.1"
 private const val TUN_PREFIX_LENGTH = 24
 private const val TUN_ROUTE = "10.205.48.0"
-private const val CONTROL_SOCKET_FILENAME = "b46-3b-tun2socks-control.sock"
+/** Public (not private) so instrumentation tests can check the control socket's real cleanup without duplicating this literal. */
+const val TUN2SOCKS_CONTROL_SOCKET_FILENAME = "b46-3b-tun2socks-control.sock"
 
 /** Result the spike service reports back through [Tun2SocksProcessIsolatedSpikeVpnService.status]. */
 sealed interface Tun2SocksIsolatedSpikeStatus {
@@ -39,16 +40,35 @@ sealed interface Tun2SocksIsolatedSpikeStatus {
  * FD ownership contract (load-bearing, reused verbatim from B46-2C/B46-2P/
  * B46-3A/B46-3B's own [Tun2SocksChildRuntime]): this service is the SOLE
  * owner of the original [ParcelFileDescriptor] Android hands back from
- * `Builder.establish()`. Only a DUPLICATE is ever handed to
- * [Tun2SocksChildRuntime.start] (which itself hands it to the child via
- * SCM_RIGHTS, see that class's own doc); this service never closes that
- * duplicate itself, and closes the ORIGINAL exactly once, on its own
- * [handleStop]/[onDestroy]/[onRevoke].
+ * `Builder.establish()`. The DUPLICATE handed to [Tun2SocksChildRuntime.start]
+ * is owned by that call from the instant it is invoked (see its own FD
+ * OWNERSHIP CONTRACT doc) - this service never touches that fd number
+ * again after the call, on ANY outcome; it only ever closes the ORIGINAL,
+ * exactly once, on its own [handleStop]/[onDestroy]/[onRevoke].
+ *
+ * UNEXPECTED CHILD DEATH (B46-3B lifecycle-hardening pass): registers
+ * [Tun2SocksChildRuntime.onUnexpectedExit] once, in [init] - if the child
+ * ever exits without this service's own [handleStop] having initiated it,
+ * [handleUnexpectedChildExit] runs the SAME real cleanup [handleStop] does
+ * (close the original TUN fd, clear ownership, report a terminal
+ * [Tun2SocksIsolatedSpikeStatus.Failed]) automatically, without waiting for
+ * a caller to notice and issue an explicit `ACTION_STOP`.
  */
 class Tun2SocksProcessIsolatedSpikeVpnService : VpnService() {
 
+    // Touched from both this service's own onStartCommand-driven calls and
+    // Tun2SocksChildRuntime's background watcher thread (via
+    // handleUnexpectedChildExit) - guarded by tunFdLock so a concurrent
+    // "explicit stop" and "unexpected child death" never race on closing/
+    // nulling the same field (double-close, or one thread's close() lost
+    // to a torn/stale read from the other).
+    private val tunFdLock = Any()
     private var tunFd: ParcelFileDescriptor? = null
     private val runtime = Tun2SocksChildRuntime()
+
+    init {
+        runtime.onUnexpectedExit = { exitCode -> handleUnexpectedChildExit(exitCode) }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -85,20 +105,20 @@ class Tun2SocksProcessIsolatedSpikeVpnService : VpnService() {
             _status.value = Tun2SocksIsolatedSpikeStatus.Failed("Builder.establish() returned null - VPN permission not granted?")
             return
         }
-        tunFd = established
-        _originalTunFd = established.fileDescriptor
+        synchronized(tunFdLock) {
+            tunFd = established
+            _originalTunFd = established.fileDescriptor
+        }
 
         val dupFd = ParcelFileDescriptor.dup(established.fileDescriptor).detachFd()
-        val controlSocketPath = File(filesDir, CONTROL_SOCKET_FILENAME)
+        val controlSocketPath = File(filesDir, TUN2SOCKS_CONTROL_SOCKET_FILENAME)
 
         when (val result = runtime.start(dupFd, mtu, socksAddr, binaryPath, controlSocketPath)) {
             is Tun2SocksChildResult.Ok -> _status.value = Tun2SocksIsolatedSpikeStatus.Started(result.pid)
             is Tun2SocksChildResult.Failed -> {
                 Log.w(TAG, "child start failed: ${result.reason}")
                 _status.value = Tun2SocksIsolatedSpikeStatus.Failed(result.reason)
-                runCatching { tunFd?.close() }
-                tunFd = null
-                _originalTunFd = null
+                closeOriginalTunFd()
             }
         }
     }
@@ -108,11 +128,36 @@ class Tun2SocksProcessIsolatedSpikeVpnService : VpnService() {
         if (stopResult is Tun2SocksChildResult.Failed) {
             Log.w(TAG, "child stop reported: ${stopResult.reason}")
         }
-        runCatching { tunFd?.close() }
-        tunFd = null
-        _originalTunFd = null
+        closeOriginalTunFd()
         _status.value = Tun2SocksIsolatedSpikeStatus.Idle
         stopSelf()
+    }
+
+    private fun closeOriginalTunFd() {
+        synchronized(tunFdLock) {
+            runCatching { tunFd?.close() }
+            tunFd = null
+            _originalTunFd = null
+        }
+    }
+
+    /**
+     * Runs on [Tun2SocksChildRuntime]'s own background watcher thread (see
+     * that class's own doc on [Tun2SocksChildRuntime.onUnexpectedExit]) -
+     * never invoked for an expected [handleStop]-initiated exit, only for
+     * the child dying on its own. Performs the SAME real cleanup
+     * [handleStop] does, but does NOT call `runtime.stop()` again - the
+     * runtime has ALREADY cleared its own `process`/`pid` state by the time
+     * this callback fires (see [Tun2SocksChildRuntime.handleChildExit]),
+     * and calling `stop()` here would just be a harmless no-op that also
+     * risks racing with a caller's own concurrent explicit `ACTION_STOP` -
+     * simpler and equally correct to leave `runtime.stop()`'s own
+     * idempotency to handle that path if it happens.
+     */
+    private fun handleUnexpectedChildExit(exitCode: Int) {
+        Log.w(TAG, "tun2socks child exited unexpectedly: code=$exitCode")
+        closeOriginalTunFd()
+        _status.value = Tun2SocksIsolatedSpikeStatus.Failed("child exited unexpectedly (code=$exitCode)")
     }
 
     override fun onDestroy() {
