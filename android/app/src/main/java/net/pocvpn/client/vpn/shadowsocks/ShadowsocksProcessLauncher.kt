@@ -1,14 +1,11 @@
 package net.pocvpn.client.vpn.shadowsocks
 
-import android.util.Log
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
-
-private const val TAG = "ShadowsocksProcess"
 
 /** A running sslocal process handle - abstracted from java.lang.Process so [ShadowsocksRuntime] is unit-testable against a fake. */
 internal interface ShadowsocksSpawnedProcess {
@@ -48,13 +45,13 @@ private class RealShadowsocksSpawnedProcess(private val process: Process) : Shad
     private var exitCallback: ((Int) -> Unit)? = null
 
     init {
-        // Never logs process stdout/stderr content at more than debug
-        // visibility, and never routes it into support/diagnostics exports
-        // (Phase 8) - the runtime config itself is never written to argv,
-        // but stdout/stderr could in principle echo other detail, so this
-        // stays a plain logcat-only drain, same discipline as the spike.
-        drainStreamAsync(process.inputStream, "stdout")
-        drainStreamAsync(process.errorStream, "stderr")
+        // Drain both pipes so the subprocess cannot block on a full buffer,
+        // but deliberately discard their content. A third-party runtime may
+        // echo configuration or credential-adjacent detail on an error path;
+        // production logcat is not an acceptable sink even at DEBUG level.
+        // The debug-only B45A spike owns its separate evidence logger.
+        drainStreamAsync(process.inputStream)
+        drainStreamAsync(process.errorStream)
         thread(name = "shadowsocks-process-watcher", isDaemon = true) {
             val code = try {
                 process.waitFor()
@@ -94,10 +91,10 @@ private class RealShadowsocksSpawnedProcess(private val process: Process) : Shad
         }
     }
 
-    private fun drainStreamAsync(stream: java.io.InputStream, label: String) {
-        thread(name = "shadowsocks-$label-drain", isDaemon = true) {
+    private fun drainStreamAsync(stream: java.io.InputStream) {
+        thread(name = "shadowsocks-output-drain", isDaemon = true) {
             try {
-                stream.bufferedReader().forEachLine { line -> Log.d(TAG, "[$label] $line") }
+                stream.bufferedReader().forEachLine { /* drain without logging */ }
             } catch (_: java.io.IOException) {
                 // Stream closed because the process exited - expected.
             }

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 31+ cloud-backup and device-to-device policy. allowBackup=false is not
+  uniformly authoritative for OEM D2D migration, so both transports are
+  denied explicitly. Restored ciphertext must never outlive its device-bound
+  Android Keystore key or become authority on another device.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="device_root" path="." />
+        <exclude domain="device_file" path="." />
+        <exclude domain="device_database" path="." />
+        <exclude domain="device_sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>
