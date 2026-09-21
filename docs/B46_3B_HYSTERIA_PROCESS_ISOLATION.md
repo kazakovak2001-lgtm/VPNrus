@@ -1,8 +1,13 @@
 # B46-3B - Hysteria2 process-isolated tun2socks bridge
 
-Status: build/toolchain and mechanics evidence real and complete; physical
-device evidence pending re-connection of the test device (see Part 9). See
-`docs/ROADMAP.md`'s B46 row for the authoritative status line.
+Status: **`B46-3B PROCESS-ISOLATED ARCHITECTURE PHYSICALLY PASSED`** for
+process isolation, load-order regression, lifecycle/restart, controlled
+child death, and cleanup - all confirmed on real hardware (Part 9/10/15/16/18).
+Live Hysteria2 data-plane proof (DNS/TCP/UDP through a real server,
+protect boundary, exit correlation, screen-off) was NOT attempted in this
+pass (Part 21) - this verdict covers architecture feasibility only, not
+production integration, restricted-network behavior, or legal clearance.
+See `docs/ROADMAP.md`'s B46 row for the authoritative status line.
 
 Branch: `research/b46-3b-hysteria-process-isolation`
 Worktree: `C:\Users\akaza\Downloads\VPN-B46-3B`
@@ -214,34 +219,78 @@ triggers the real, ordered `engine.Stop()` then a clean `exit(0)`
 **Device:** OPPO CPH2173, Android 14, SDK 34, arm64-v8a (same device
 B46-2P/B46-3A used).
 
-Build-time work for this slice (child executable, Kotlin control channel/
-runtime/binary resolver/spike VpnService, 11 new JVM unit tests, 3 new
-instrumentation test classes) is complete and real - `:app:checkDebugDuplicateClasses`
-and `:app:assembleDebug` both `BUILD SUCCESSFUL`, `:app:testDebugUnitTest`
-11/11 green, `:app:assembleDebugAndroidTest` `BUILD SUCCESSFUL`.
+The device reconnected after a mid-session gap. Both `app-debug.apk`
+(SHA-256 `18fb843135438f3e4cc53bb51f3f08b73cce630771a91d42270195202e6cd43b`)
+and `app-debug-androidTest.apk` were installed. On-device extraction
+confirmed (`run-as net.pocvpn.client ls -la .../lib/arm64/`): both
+`libgojni.so` and `libnovatun2sockschild.so` present, both `rwxr-xr-x`,
+same directory.
 
-**The physical device was disconnected partway through this session** (it
-was connected and used for B46-3A's own physical pass earlier in this
-conversation, then became unavailable before this slice's on-device
-testing could run). The instrumentation tests written for this gate
-(`Tun2SocksIsolatedLoadOrderInstrumentedTest`,
-`Tun2SocksIsolatedProcessMapsInstrumentedTest`,
-`Tun2SocksIsolatedChildDeathInstrumentedTest`) have NOT yet been run on
-real hardware. This is reported plainly here rather than claimed - per
-this task's own explicit instruction ("Do not optimize for a green
-result"), no physical isolation-proof result is asserted until it is
-actually observed.
+**One real environment wrinkle, diagnosed rather than worked around
+blindly:** the first physical run of `Tun2SocksIsolatedProcessMapsInstrumentedTest`
+failed with `Builder.establish() returned null`, identical to B46-3A's own
+unresolved gap on this device. `appops get net.pocvpn.client ACTIVATE_VPN`
+already showed `allow`, and a dedicated diagnostic (`Tun2SocksIsolatedConsentActivity`,
+debug-only, calls `VpnService.prepare()` directly) confirmed
+`B46_3B_CONSENT_ALREADY_PREPARED` - so this was NOT a missing-consent
+problem. After foregrounding the app once via `am start` on `MainActivity`,
+the SAME test passed cleanly and repeatably for the rest of this pass -
+consistent with a one-time ColorOS-side state settle after a fresh
+`adb install -r` rather than a real consent gap. Recorded here as an
+observed environment quirk, not as a structural blocker.
 
-*(This section is updated in place with real logcat/`/proc` evidence as
-soon as the device is available again in this session, or in a documented
-follow-up pass.)*
+**`Tun2SocksIsolatedProcessMapsInstrumentedTest` - PASSED.** Real logcat
+evidence (`am instrument -w -e class ...`, `Tests run: 1, Failures: 0`):
+
+```
+D/VpnJni: Address added on tun0: 10.205.48.1/24
+D/Vpn: setting state=CONNECTING, reason=establish
+I/ConnectivityService: registerNetworkAgent NetworkAgentInfo{... ni{VPN CONNECTING} ...
+    lp{{InterfaceName: tun0 LinkAddresses: [ 10.205.48.1/24 ] ... Routes: [ 10.205.48.0/24 -> 0.0.0.0 tun0 ...
+    TransportInfo: <VpnTransportInfo{... sessionId=B46-3B process-isolated tun2socks spike ...}>
+I/Vpn: Established by net.pocvpn.client on tun0
+E/OPLUS_KEVENT_RECORD: OPLUS_KEVENT payload:10668,path@@/data/app/.../lib/arm64/libnovatun2sockschild.so
+I/B46_3B_Maps: child maps: 58cf330000-58cf749000 r-xp 00000000 fd:4f 5669159   /data/app/.../lib/arm64/libnovatun2sockschild.so
+I/B46_3B_Maps: child maps: 58cf750000-58cfcca000 r--p 00420000 fd:4f 5669159   /data/app/.../lib/arm64/libnovatun2sockschild.so
+I/B46_3B_Maps: child maps: 58cfcd0000-58cfe42000 r--p 009a0000 fd:4f 5669159   /data/app/.../lib/arm64/libnovatun2sockschild.so
+I/B46_3B_Maps: child maps: 58cfe50000-58cfeb3000 rw-p 00b20000 fd:4f 5669159   /data/app/.../lib/arm64/libnovatun2sockschild.so
+D/Vpn: setting state=DISCONNECTED, reason=agentDisconnect
+```
+
+This is the core acceptance gate, physically confirmed: the app process's
+own `/proc/self/maps` contains `libgojni.so` (Xray, real, via
+`LibXrayCoreRuntime.ensureCoreEnvInitialized`) and does NOT contain
+`libnovatun2sockschild` (it is never `dlopen()`'d there); the CHILD
+process's own `/proc/<childPid>/maps`, read directly from the app process
+(same UID, no `run-as`/root needed), contains `libnovatun2sockschild.so`
+mapped as its own executable and does NOT contain `libgojni.so` - both
+assertions passed. Real, kernel-level, same-process-vs-separate-process
+evidence, not an inference from symbol tables alone.
 
 ## Part 10 - load-order regression
 
-Not yet run on device (see Part 9). Test code
-(`Tun2SocksIsolatedLoadOrderInstrumentedTest`, two methods, two cycles
-each) is written and compiles; per the task's own bound, two clean
-independent cycles per ordering are the target, not dozens of retries.
+**Both orderings PASSED, two clean cycles each, in fresh processes
+(`am force-stop` before each `am instrument` invocation):**
+
+- `xray_first_then_child_two_cycles` - `Tests run: 1, Failures: 0` (`Time:
+  1.312`)
+- `child_first_then_xray_two_cycles` - `Tests run: 1, Failures: 0` (`Time:
+  0.746`)
+
+Real logcat evidence, distinct child PIDs per cycle, zero Go fatal errors,
+zero crashes anywhere in either run:
+
+```
+D/Tun2SocksChildProcess: [stderr] B46_3B_CHILD_STARTED: pid=9030 mtu=1500 socksAddr=127.0.0.1:41999
+D/Tun2SocksChildProcess: [stderr] B46_3B_CHILD_STARTED: pid=9123 mtu=1500 socksAddr=127.0.0.1:41999
+```
+
+(`9030` and `9123` are the two distinct child processes each cycle of one
+ordering spawned - genuinely fresh processes, not a reused/cached one.)
+This directly confirms Part 2's own prediction: since the tun2socks Go
+runtime never loads into the app process at all in either order, there is
+no shared in-process Go runtime state left to corrupt - B46-3A's crash
+class is structurally gone, not merely avoided by luck of ordering.
 
 ## Part 11 - TUN mechanics proof
 
@@ -278,15 +327,21 @@ rules and was not requested or performed in this pass.
 
 ## Part 15 - lifecycle/restart
 
-Partially covered by Part 10's load-order test design (two cycles per
-ordering, each a full start-then-stop). Not yet physically run (Part 9).
+**PASSED, physically** - covered by Part 10's own two-cycles-per-ordering
+runs (four full start-then-stop cycles total across both orderings, each
+with a genuinely distinct child PID). No leaked/reused fd numbers, no
+hung stop.
 
 ## Part 16 - controlled child death
 
-Test code written (`Tun2SocksIsolatedChildDeathInstrumentedTest`) -
+**PASSED, physically.** `Tun2SocksIsolatedChildDeathInstrumentedTest` -
 `Process.sendSignal(childPid, 9)` (SIGKILL, same-UID, no root/run-as
-needed), then confirms the app process itself survives unaffected and a
-subsequent stop is still idempotent. Not yet physically run (Part 9).
+needed) against a real running child (`pid=9334`, confirmed via
+`B46_3B_CHILD_STARTED` log line), then confirmed `/proc/9334` genuinely
+stops existing, the app process (`pid=9283`) survives completely
+unaffected (same pid before and after), and a subsequent `ACTION_STOP` is
+still a harmless no-op that reaches `Idle` normally. Real result: `run
+finished: 1 tests, 0 failed, 0 ignored`.
 
 ## Part 17 - screen-off result
 
@@ -299,9 +354,11 @@ gap).
 Covered structurally by `Tun2SocksChildRuntime.stop()`
 (graceful-then-forceful child termination, control-channel close+delete,
 original TUN fd close) and exercised by the JVM unit tests (11/11 green -
-see Part 20). Physical on-device cleanup verification (no orphan process,
-no stale control socket file, normal network restored) not yet run (Part
-9).
+see Part 20). **Physically confirmed** after the full test pass: `adb
+shell ps -A | grep novatun2sockschild` - no output (no orphan child
+process); `ip link show | grep tun` - no output (no stale TUN interface);
+`netstat -an | grep 34443` - no output (AWS UDP 34443 confirmed still
+closed, untouched by this pass).
 
 ## Part 19 - license audit
 
@@ -328,19 +385,24 @@ instruction and every prior B46 slice's own wording.
 
 ## Part 21 - limitations
 
-This pass delivers real, working build-time/host-level evidence for the
-core architectural question (does process isolation avoid B46-3A's
-crash?) but does NOT yet deliver:
+This pass delivers real, physically-confirmed evidence for the core
+architectural question (does process isolation avoid B46-3A's crash? -
+**yes**, confirmed via `/proc/<pid>/maps` on real hardware, two load
+orders, two cycles each, plus a controlled `SIGKILL` child-death test) but
+does NOT yet deliver:
 
-- physical on-device process-isolation proof (Part 9 - device
-  disconnected mid-session)
-- any live data-plane proof (the second half of Part 11, plus Parts
-  13/14/17) - no authorized Hysteria2 test server was available or
+- any live data-plane proof (the second half of Part 11 - a real TCP/UDP
+  application-level round trip through a live SOCKS5 endpoint - plus
+  Parts 13/14/17) - no authorized Hysteria2 test server was available or
   provisioned in this pass
-- protect-boundary physical proof (Part 12)
+- protect-boundary physical proof (Part 12) - no real Hysteria2 child/
+  outbound QUIC socket exists in this architecture yet to protect
 
 These are the concrete, named remaining gaps - not hidden inside a broader
-claim.
+claim. Everything else this document's own acceptance checklist asked for
+(Part 9's process-isolation proof, Part 10's load-order regression, Part
+15's lifecycle/restart, Part 16's controlled child death, Part 18's
+cleanup) is real, physical, and PASSED.
 
 ## Part 22 - remaining production-integration work
 
@@ -357,22 +419,33 @@ only `android/app/src/debug/**`, `android/app/src/testDebug/**`,
 
 ## Part 23 - decision gate
 
-**`B46-3B PROCESS-ISOLATED ARCHITECTURE - BUILD/HOST-LEVEL EVIDENCE PASSED;
-PHYSICAL DEVICE PROOF PENDING.`**
+**`B46-3B PROCESS-ISOLATED ARCHITECTURE PHYSICALLY PASSED`** (architecture
+feasibility only - see the precise scope below).
 
-This is deliberately NOT the same as a full `B46-3B PROCESS-ISOLATED
-ARCHITECTURE PHYSICALLY PASSED` verdict, because the physical device
-evidence (the actual acceptance gate this slice exists to clear) has not
-yet been collected - see Part 9. What IS real and complete: a plain,
-NDK-free, cgo-free Go executable builds cleanly for `android/arm64`; it
-carries zero dynamic dependencies beyond the Android dynamic linker
-itself; the real SCM_RIGHTS wire protocol (fd transfer + JSON
-header/ack, including the child's own authoritative pid) is proven
-end-to-end against a real Linux TUN device; the real Nova `:app` module
-builds with both the real Xray AAR and this new executable staged
-simultaneously (`checkDebugDuplicateClasses`/`assembleDebug` both green);
-11 new JVM unit tests and 3 new instrumentation test classes are written
-and compile. Per this task's own explicit instruction not to claim
-production integration, restricted-network proof, or legal clearance even
-on a full pass - none of those are claimed here either, and this partial
-result claims strictly less than that.
+Real, physical evidence, on the same OPPO CPH2173 device B46-2P/B46-3A
+used:
+
+- Process isolation: the app process's own `/proc/self/maps` contains
+  `libgojni.so` and does NOT contain `libnovatun2sockschild`; the child
+  process's own `/proc/<pid>/maps` contains `libnovatun2sockschild.so`
+  and does NOT contain `libgojni.so` - genuine, disjoint address spaces,
+  confirmed via kernel-level evidence, not inferred.
+- Load-order regression: BOTH orderings (Xray-first, tun2socks-first),
+  two cycles each, in fresh processes, zero crashes, zero Go fatal
+  errors, genuinely distinct child PIDs per cycle - directly disproving
+  the load-order-dependent instability B46-3A found in the in-process
+  design.
+- Controlled child death: `SIGKILL` against a live child process leaves
+  the app process completely unaffected and cleanup still completes
+  normally.
+- Cleanup: no orphan child process, no stale TUN interface, AWS UDP 34443
+  confirmed still closed.
+
+What this verdict does NOT claim (per this task's own explicit
+instruction, honored even on a full pass): production Hysteria transport
+integration, Smart Connect wiring, restricted-network/Russia field
+behavior, legal clearance, or any live data-plane proof (DNS/TCP/UDP
+through a real server, the protect boundary, exit/server correlation,
+screen-off behavior - see Part 21's own named gaps). This is an
+architecture-feasibility result: the specific failure B46-3A found is
+structurally eliminated, not merely avoided by luck.

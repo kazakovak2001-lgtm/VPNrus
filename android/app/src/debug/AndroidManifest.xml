@@ -78,5 +78,13 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- B46-3B - DEBUG/RESEARCH ONLY device-diagnostic tool, see
+             Tun2SocksIsolatedConsentActivity's own doc comment. Never
+             wired into any production flow. -->
+        <activity
+            android:name="net.pocvpn.client.debug.b46_3b.Tun2SocksIsolatedConsentActivity"
+            android:exported="true"
+            android:label="B46-3B VPN Consent Probe (debug, not production)" />
     </application>
 </manifest>
