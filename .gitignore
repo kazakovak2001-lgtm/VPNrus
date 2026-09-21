@@ -107,3 +107,12 @@ research/b46-2p-android-physical/**/novaminimal-android-arm64
 research/b46-2p-android-physical/**/*.pem
 research/b46-2p-android-physical/**/*.key
 research/b46-2p-android-physical/**/*-sources.jar
+
+# B46-3B - process-isolated tun2socks child research (see
+# docs/B46_3B_HYSTERIA_PROCESS_ISOLATION.md). Locally-built plain Go
+# executable, reproducible from pinned source under
+# research/b46-3b-hysteria-process-isolation/ - never committed.
+research/b46-3b-hysteria-process-isolation/out/
+research/b46-3b-hysteria-process-isolation/proof/proof
+research/b46-3b-hysteria-process-isolation/proof/*.sock
+android/app/src/debug/jniLibs/arm64-v8a/libnovatun2sockschild.so

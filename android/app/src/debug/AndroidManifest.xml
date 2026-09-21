@@ -60,5 +60,23 @@
             android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
             android:exported="true"
             android:label="Shadowsocks Adapter Validation (debug, not production)" />
+
+        <!-- B46-3B - SPIKE ONLY, NOT A PRODUCTION TRANSPORT. Debug-only real
+             VpnService proving the PROCESS-ISOLATED native tun2socks
+             bridge's fd-lifecycle mechanics - see
+             docs/B46_3B_HYSTERIA_PROCESS_ISOLATION.md. The tun2socks Go
+             runtime itself never runs in this app process - this service
+             only spawns a separate OS process and hands it a duplicated
+             TUN fd over a real Unix-domain SCM_RIGHTS control channel.
+             Never wired into TransportRegistry/TransportOrchestrator/
+             SmartConnect. -->
+        <service
+            android:name="net.pocvpn.client.vpn.hysteria.Tun2SocksProcessIsolatedSpikeVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
