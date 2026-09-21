@@ -60,5 +60,20 @@
             android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
             android:exported="true"
             android:label="Shadowsocks Adapter Validation (debug, not production)" />
+
+        <!-- B46-3C - RESEARCH ONLY, NOT A PRODUCTION TRANSPORT. Debug-only
+             real VpnService proving the COMPLETE process-isolated
+             Hysteria2 data-plane path - see
+             docs/B46_3C_HYSTERIA_PROCESS_ISOLATED_DATAPLANE.md. Never
+             wired into TransportRegistry/TransportOrchestrator/
+             SmartConnect. -->
+        <service
+            android:name="net.pocvpn.client.vpn.hysteria.Tun2SocksHysteriaDataPlaneSpikeVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
