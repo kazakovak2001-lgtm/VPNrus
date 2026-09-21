@@ -7,14 +7,14 @@ package net.pocvpn.client.vpn.hysteria
  * `B46Tun2SocksBridge`/`FakeB46Tun2SocksBridge`'s own split in the B46-2P
  * harness (`b46harness/src/main/java/net/pocvpn/b46harness/B46Tun2SocksBridgeAdapter.kt`).
  */
-internal interface NativeTun2SocksLibrary {
+interface NativeTun2SocksLibrary {
     fun start(fd: Int, mtu: Int, socksAddr: String): NativeBridgeResult
     fun stop(): NativeBridgeResult
     fun isStarted(): Boolean
 }
 
 /** Delegates straight to the real JNI-backed [NativeTun2SocksBridge] singleton. */
-internal object RealNativeTun2SocksLibrary : NativeTun2SocksLibrary {
+object RealNativeTun2SocksLibrary : NativeTun2SocksLibrary {
     override fun start(fd: Int, mtu: Int, socksAddr: String): NativeBridgeResult =
         NativeTun2SocksBridge.start(fd, mtu, socksAddr)
 
@@ -35,7 +35,7 @@ internal object RealNativeTun2SocksLibrary : NativeTun2SocksLibrary {
  * reused from B46-2P/B46-2C): [fd] must already be a duplicate of the
  * VpnService's TUN fd. This class never dups or closes the original.
  */
-internal class NativeTun2SocksController(
+class NativeTun2SocksController(
     private val library: NativeTun2SocksLibrary = RealNativeTun2SocksLibrary,
 ) {
     private var startedLocally = false

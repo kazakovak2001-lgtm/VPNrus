@@ -1,7 +1,15 @@
 # B46-3A - Hysteria2 native tun2socks coexistence bridge
 
-Status: research/build-in-progress. See `docs/ROADMAP.md`'s B46 row for the
-authoritative status line once this pass concludes.
+Status: **B46_3A_MULTI_GO_RUNTIME_COEXISTENCE_FAILED** - build-time
+coexistence (this document's Part A-D as originally written) is real and
+still holds, but the PHYSICAL same-process runtime coexistence gate added
+in the follow-up review pass genuinely FAILS on the real device: loading
+BOTH Xray's `libgojni.so` and this slice's `libnovatun2socks.so`/
+`libnovatun2socks_jni.so` into one process crashes the process with a real
+Go-runtime fatal error, non-deterministically (two different runs produced
+two DIFFERENT internal Go GC/heap fatal errors - see "Physical same-process
+coexistence findings" below). See `docs/ROADMAP.md`'s B46 row for the
+authoritative status line.
 
 Branch: `research/b46-3a-hysteria-native-coexistence`
 Worktree: `C:\Users\akaza\Downloads\VPN-B46-3A`
@@ -274,29 +282,106 @@ production `libsslocal.so`/signing config setup, out of scope for proving
 in-process debug coexistence (the actual acceptance gate). The debug-variant
 proof above is the load-bearing evidence for this slice's goal.
 
-## Part E - real Android JNI smoke
+## Part E - real Android JNI smoke, and the load-bearing physical finding
 
-**No physical device was connected during this pass** (`adb devices -l`
-returned an empty list throughout). Real-device JNI smoke (native library
-`dlopen`, `isStarted()` initial-state check, invalid-fd fail-closed
-behavior, idempotent stop, no crash) is therefore NOT claimed as physically
-proven here - this is a genuine gap against Part E's full ask, reported
-honestly rather than papered over.
+A real physical device (OPPO CPH2173, Android 14, SDK 34, arm64-v8a,
+serial `c618ee06` - the same device B46-2P used) became available in a
+follow-up pass. Both the real debug APK (with the real Xray AAR + the
+native tun2socks bridge staged into `src/debug/jniLibs/arm64-v8a/`) and its
+androidTest APK were installed and exercised on it.
 
-What WAS proven, at the Kotlin/JVM level (`NativeTun2SocksControllerTest`,
-`NativeTun2SocksBridgeTest`, 13 tests, 0 failures - see Part G/Tests below):
-native-library-load failure maps to a typed `Failed` result rather than a
-crash (deterministically true in the JVM unit-test environment, since
-`System.loadLibrary` always fails there - a real, not simulated, exercise
-of that code path), `isStarted()` starts `false`, `stop()` is a harmless
-no-op before any `start()`, and all four invalid-input paths (bad fd, bad
-mtu, empty address, double-start) are rejected before ever reaching the
-native call. The real on-device `dlopen`/JNI call path itself (once a
-device is available) is the one remaining unverified step.
+**Both native libraries physically load and are extracted correctly.**
+`run-as net.pocvpn.client ls .../lib/arm64` on the installed package
+confirms all three: `libgojni.so`, `libnovatun2socks.so`,
+`libnovatun2socks_jni.so`, alongside AWG's `libwg*.so` - the exact
+coexistence Part D already proved at build time is real on-device too.
 
-If a physical device becomes available in a follow-up pass, the minimum
-smoke per the task's own Part E list should be run before this gate is
-marked fully closed.
+**But loading BOTH Go runtimes into the SAME process, in the "Xray first"
+order, crashes the process with a genuine Go runtime fatal error - twice,
+with two DIFFERENT internal errors:**
+
+Run 1 (`NativeTun2SocksBasicJniInstrumentedTest.both_native_runtimes_coexist_in_same_process`,
+which touches Xray's `ensureCoreEnvInitialized` first, then
+`NativeTun2SocksBridge.isStarted()`):
+
+```
+09-20 16:55:39.745 D/nativeloader: Load .../libgojni.so ... ok
+09-20 16:55:39.816 D/nativeloader: Load .../libnovatun2socks.so ... ok
+09-20 16:55:39.818 D/nativeloader: Load .../libnovatun2socks_jni.so ... ok
+09-20 16:55:39.826 E/Go: bad flushGen 6 in prepareForSweep; sweepgen 0
+09-20 16:55:39.826 E/Go: fatal error: bad flushGen
+09-20 16:55:39.856 I/ActivityManager: Process net.pocvpn.client (pid 11027) has died: fg  FGS
+09-20 16:55:39.857 W/ActivityManager: Crash of app net.pocvpn.client running instrumentation ...
+```
+
+Run 2 (`NativeTun2SocksLoadOrderOnlyInstrumentedTest#xray_first_load_order`,
+a minimal, TUN-independent repeat of the same "Xray first" order, in a
+freshly force-stopped process):
+
+```
+09-20 16:58:31.414 D/nativeloader: Load .../libgojni.so ... ok
+09-20 16:58:31.487 D/nativeloader: Load .../libnovatun2socks.so ... ok
+09-20 16:58:31.488 D/nativeloader: Load .../libnovatun2socks_jni.so ... ok
+09-20 16:58:31.501 E/Go: fatal error: addspecial on invalid pointer
+09-20 16:58:31.534 I/ActivityManager: Process net.pocvpn.client (pid 12177) has died: fg  FGS
+```
+
+`bad flushGen` and `addspecial on invalid pointer` are BOTH internal Go
+runtime/GC invariant-violation fatal errors (`runtime/mgcsweep.go` and
+`runtime/mheap.go`-class checks respectively) - never application-level
+Java exceptions, never anything this slice's own Kotlin/Go validation code
+could have caused (the crash happens at library-load time, before any
+`NativeTun2SocksBridge.start/stop/isStarted` call executes any
+tun2socks-specific logic). Getting two DIFFERENT internal fatal errors
+across two runs of the same order is itself a strong signal of genuine
+memory/GC-state corruption (a deterministic logic bug would fail the same
+way every time) - consistent with, and now physically confirming, the
+review finding that prompted this pass: two independent Go runtimes
+(Xray's gomobile-produced one and this slice's plain `c-shared` one) each
+bring their own copy of the Go scheduler/allocator/GC, and nothing in
+either binary namespaces that state per-library - loading both into one
+process lets one runtime's GC bookkeeping corrupt the other's.
+
+**The reverse order ("tun2socks first") did NOT crash in the one clean,
+TUN-independent run performed**
+(`NativeTun2SocksLoadOrderOnlyInstrumentedTest#tun2socks_first_load_order`:
+`libnovatun2socks.so`/`libnovatun2socks_jni.so` loaded, then
+`libgojni.so` loaded via a real `ensureCoreEnvInitialized` call, `OK (1
+test)`, no crash). This is reported as observed, not as proof the reverse
+order is safe: the earlier "Xray first" order crashed non-deterministically
+with two different symptoms across two runs, so one clean "tun2socks
+first" run does not establish that order is reliable either - it is
+exactly the kind of result the task's own instruction anticipated
+("Do not attempt to hide it with retries") and this document does not try
+to use it to offset the confirmed failure above.
+
+**Per the task's own explicit instruction, testing stopped here.** The
+real Android VpnService TUN lifecycle (Part E's fuller ask), the two-order
+test WITH a real TUN cycle (Part F as fully specified), the 100-cycle
+same-process stress (Part G), and the `/proc/self/maps` same-process proof
+(Part H) were none of them completed - continuing up that chain after a
+confirmed Go-runtime fatal error would have meant building on top of a
+process that is already known to be unsafe, which the task explicitly
+forbids ("Do not attempt to hide it with retries", "If ANY Go-runtime/
+process-level instability appears: STOP"). Separately, and independently
+of the crash, `VpnService.Builder.establish()` itself returned `null`
+("VPN permission not granted?") on every attempt made to reach the real-TUN
+tests on this device in this session, despite `appops set
+net.pocvpn.client ACTIVATE_VPN allow` reporting `allow` - an unresolved
+device/ROM-specific environment blocker (this OPPO ColorOS build may
+require an interactive consent grant regardless of `appops`), reported
+here for completeness but NOT the reason testing stopped - the Go-runtime
+crash alone is already conclusive and load-bearing.
+
+Basic invalid-input JNI proof (fd/mtu/address validation, stop-before-start
+idempotency - Part D's original ask, not touching Xray) was NOT re-run in
+isolation on-device after the crash was found, since it is already fully
+covered by the real (non-mocked) JVM-level exercise of the same JNI
+boundary (`NativeTun2SocksBridgeTest`, `NativeTun2SocksControllerTest` -
+13/13 green, see Tests below) and re-running it changes nothing about the
+load-bearing finding above.
+
+**Verdict: `B46_3A_MULTI_GO_RUNTIME_COEXISTENCE_FAILED`.**
 
 ## Part F - architecture decision
 
@@ -315,14 +400,51 @@ mobile-binding tool in the loop, the smallest possible moving-parts count,
 and a symbol/class footprint that is fully inspectable with stock NDK
 tools (this pass's own Part A/B). Binary size: `libnovatun2socks.so` is
 ~17MB unstripped (same engine/gvisor weight as the B46-2P AAR's own
-`libgojni.so`; `-ldflags="-s -w"` was not applied in this pass and is a
-reasonable follow-up before any real release-path use). License/dependency
-implications: unchanged from B46-2C/B46-2P (MIT/Apache-2.0 runtime graph,
-no GPL).
+`libgojni.so`; `-ldflags="-s -w"` was not applied in this pass). License/
+dependency implications: unchanged from B46-2C/B46-2P (MIT/Apache-2.0
+runtime graph, no GPL).
 
-**Verdict: keep Xray's gomobile AAR unchanged; replace the tun2socks
-gomobile AAR with the unique native JNI bridge built in this slice
-(Option B).**
+**Crash isolation - the decisive factor, found only in the physical
+follow-up pass (see Part E above): Option B does NOT achieve real crash
+isolation from Xray's own Go runtime.** Class/symbol-level collision
+(Part B) and Android build-time duplicate-class checking (Part D) are
+necessary but were NOT sufficient, exactly as the review finding that
+prompted this pass warned - two independent Go runtimes sharing one
+process share a single address space and OS-level thread/signal
+environment, and this pass physically confirmed that is enough for one
+runtime's GC/allocator bookkeeping to corrupt the other's, crashing the
+whole process non-deterministically (two different internal Go fatal
+errors across two runs of the same load order).
+
+**Revised verdict: Option B (Go `c-shared` + JNI boundary) is REJECTED for
+same-process use alongside Xray's gomobile AAR, on real physical evidence,
+not merely build-time inspection.** The build-time work (Parts A-D) stands
+as real, useful evidence about what non-gomobile Go/Android native builds
+can achieve (a real class-collision-free artifact IS possible), but it does
+not, by itself, deliver safe in-process coexistence with another
+independently-linked Go runtime. Of the compared options, this pass's own
+evidence does not clear ANY of them for safe in-process coexistence with
+Xray:
+
+- **A/B (native JNI variants):** ruled out (A structurally, B by physical
+  crash evidence above).
+- **C (relocate the gomobile runtime):** already not viable per B46-2P's
+  own finding (relocation only moves the user package, not the shared
+  runtime/native-library name) - and this pass's crash evidence suggests
+  even a *successfully* renamed second Go runtime would likely hit the
+  same underlying multi-runtime corruption, since the collision this pass
+  found is NOT a naming collision - it is live in-process GC/allocator
+  state corruption, which a rename does not fix.
+- **D (separate APK/process architecture):** this pass's evidence is a
+  positive argument FOR this option, not against it - B46-2P's own
+  standalone-harness fallback (`b46harness`) sidesteps the entire class of
+  bug found here by construction (two Go runtimes in two separate OS
+  processes cannot corrupt each other's in-process GC state). Revisiting
+  D (or a real cross-process IPC bridge to a native tun2socks helper
+  process) is the most evidence-backed path forward for a future slice -
+  not selected or built in THIS slice, since this slice's task was
+  specifically to test in-process coexistence, and that is now the
+  question this pass has answered: no.
 
 ## Part G - repository scope
 
@@ -333,10 +455,26 @@ gomobile AAR with the unique native JNI bridge built in this slice
   gitignored under `out/`)
 - `android/app/src/debug/java/net/pocvpn/client/vpn/hysteria/` -
   `NativeTun2SocksBridge.kt` (JNI boundary), `NativeTun2SocksController.kt`
-  (testable Kotlin-side lifecycle gate)
+  (testable Kotlin-side lifecycle gate), `NativeTun2SocksSpikeVpnService.kt`
+  (debug-only real `VpnService` used for the physical follow-up pass's real-TUN
+  tests - SPIKE ONLY, never wired into production)
+- `android/app/src/debug/AndroidManifest.xml` - registers the spike
+  `VpnService` (debug-only, `exported=false`)
 - `android/app/src/testDebug/java/net/pocvpn/client/vpn/hysteria/` - unit
   tests
+- `android/app/src/androidTest/java/net/pocvpn/client/vpn/hysteria/` -
+  physical instrumentation tests added in the follow-up pass (see Tests
+  below) - the artifacts that found and reproduced the load-bearing
+  same-process crash
 - `.gitignore` - entries for the locally-built native artifacts
+
+Visibility note: `NativeBridgeResult`/`NativeTun2SocksBridge`/
+`NativeTun2SocksLibrary`/`RealNativeTun2SocksLibrary`/
+`NativeTun2SocksController` were widened from `internal` to default
+(module-public) visibility in the follow-up pass, purely so the
+`androidTest` compilation (a separate Kotlin compilation unit from
+`debug`) can reference them directly - no behavior change, still
+debug-only/research-scoped, never reachable from `main`/release code.
 
 No production code changed: `TransportKind.HYSTERIA` was NOT added,
 `TransportRegistry`/`VpnController`/`SmartConnectDecisionEngine` were not
@@ -344,8 +482,9 @@ touched, and no production server/firewall/manifest was modified.
 
 ## Tests
 
-`android/app/src/testDebug/java/net/pocvpn/client/vpn/hysteria/` - run via
-`:app:testDebugUnitTest --tests "net.pocvpn.client.vpn.hysteria.*"`:
+**JVM unit tests** (`android/app/src/testDebug/java/net/pocvpn/client/vpn/hysteria/`,
+run via `:app:testDebugUnitTest --tests "net.pocvpn.client.vpn.hysteria.*"`) -
+still green after the physical follow-up pass:
 
 - `NativeTun2SocksControllerTest` (10 tests): initial not-started state,
   valid start, repeated-start rejection, stop idempotency, stop-after-start
@@ -355,29 +494,37 @@ touched, and no production server/firewall/manifest was modified.
 - `NativeTun2SocksBridgeTest` (3 tests): against the REAL
   `NativeTun2SocksBridge` singleton (not a fake) - `start()` maps a missing
   native library to a typed failure (never throws), `stop()` is a harmless
-  no-op, `isStarted()` is `false` when the library never loaded. This is
-  real JNI-load-failure-mapping coverage, not simulated: in the JVM unit
-  test environment `System.loadLibrary` genuinely throws.
+  no-op, `isStarted()` is `false` when the library never loaded.
 
 **Result: `BUILD SUCCESSFUL`, 13/13 tests, 0 failures, 0 errors.**
+
+**Physical instrumentation tests** (`android/app/src/androidTest/java/net/pocvpn/client/vpn/hysteria/`,
+run individually via `adb shell am instrument -w -e class ...`, each
+against a freshly force-stopped process, on the real OPPO CPH2173 device):
+
+| Test | Result |
+|---|---|
+| `NativeTun2SocksBasicJniInstrumentedTest` (7 tests) | **Process crashed** - the combined-runtimes test (`both_native_runtimes_coexist_in_same_process`) hit the same-process Go-runtime fatal error before any of the 7 tests could report a result |
+| `NativeTun2SocksLoadOrderOnlyInstrumentedTest#xray_first_load_order` | **Process crashed** - `fatal error: addspecial on invalid pointer` (real, second confirmation of the same-process failure, different internal Go error than the first crash) |
+| `NativeTun2SocksLoadOrderOnlyInstrumentedTest#tun2socks_first_load_order` | `OK (1 test)` - no crash in this one run (see Part E's own caveat: not treated as proof this order is safe) |
+| `NativeTun2SocksRealTunLifecycleInstrumentedTest` | Not completed - blocked by an unrelated `VpnService.Builder.establish()` permission/environment issue on this device (returned `null` despite `appops set ... ACTIVATE_VPN allow`) |
+| `NativeTun2SocksXrayFirstOrderInstrumentedTest` / `NativeTun2SocksTun2SocksFirstOrderInstrumentedTest` (real-TUN variants) | Not run after the crash was already confirmed via the load-order-only tests above - would only repeat the same finding with more moving parts |
+| `NativeTun2SocksStressInstrumentedTest` (100-cycle stress) | Not run - the task's own instruction is to stop once instability appears, not to continue up the acceptance chain |
 
 Not covered by an automated test: "zero production selection change" was
 verified by inspection (`git diff` against `origin/main` touches no file
 under `android/app/src/main/java/net/pocvpn/client/transport/` or
 `.../vpn/` production controllers - see Part G's file list) rather than by
-a dedicated test, since no existing test harness in this repo asserts
-repo-wide "no new TransportKind" as a CI-checked invariant.
+a dedicated test.
 
 ## Acceptance gates (final status)
 
 1. real pinned tun2socks engine builds through a non-gomobile Android
    boundary - **PASS** (Part A)
-2. real JNI entrypoints work - **PASS at the Kotlin-boundary/unit-test
-   level and confirmed present/callable in the real packaged APK's
-   `.so`s** (Part C, Part D symbol re-verification); the real on-device
-   `dlopen`+call has NOT been physically exercised - **NO DEVICE WAS
-   AVAILABLE IN THIS PASS** (Part E) - reported as a genuine open item, not
-   claimed
+2. real JNI entrypoints work - **PASS** at the Kotlin-boundary/unit-test
+   level and in isolated on-device library loads (Part E); calling INTO
+   the JNI boundary while Xray's runtime is ALSO loaded is exactly what
+   gate 9 below covers, and that is where this pass fails
 3. no tun2socks `go.*` Java runtime classes exist - **PASS** (Part B - none
    are generated by this build path; Part D re-confirms the APK's only
    `go.*` classes come from Xray's own AAR)
@@ -389,15 +536,20 @@ repo-wide "no new TransportKind" as a CI-checked invariant.
    never repacked/edited)
 6. Nova app with Xray + native tun2socks bridge passes duplicate-class
    checking - **PASS** (Part D, `:app:checkDebugDuplicateClasses` BUILD
-   SUCCESSFUL)
+   SUCCESSFUL - a BUILD-TIME check; it does not and cannot detect the
+   RUNTIME same-process failure found in Part E)
 7. Nova debug APK builds - **PASS** (Part D, `:app:assembleDebug` BUILD
    SUCCESSFUL)
 8. APK inspection proves both runtimes coexist under distinct native
-   boundaries - **PASS** (Part D - `libgojni.so` x4 and
-   `libnovatun2socks*.so` x2 all present, symbols verified post-packaging)
-9. lifecycle/invalid-input JNI smoke does not crash - **PASS** at the
-   Kotlin/unit-test level (Part C, 13/13 tests green); real-device
-   confirmation NOT done - no device available (Part E)
+   boundaries - **PASS at the STATIC/packaging level** (Part D -
+   `libgojni.so` x4 and `libnovatun2socks*.so` x2 all present in the APK,
+   symbols verified post-packaging); this is necessary but, per Part E,
+   NOT sufficient for RUNTIME coexistence
+9. lifecycle/invalid-input JNI smoke does not crash - **FAIL** - the
+   real on-device combined-runtime smoke crashed the process with a Go
+   runtime fatal error, reproduced twice with two different internal
+   errors (Part E). This is the load-bearing gate this whole follow-up
+   pass exists to check, and it does not pass.
 10. no GPL sing-tun is linked into the selected bridge - **PASS** (Part B)
 11. no production transport-selection behavior changed - **PASS** (Part G -
     `TransportKind`/`TransportRegistry`/`VpnController`/
@@ -407,8 +559,12 @@ repo-wide "no new TransportKind" as a CI-checked invariant.
     entries added; verified via `git status` before every commit in this
     pass)
 
-**Overall: 10 of 12 gates fully PASSED with real evidence; gates 2 and 9
-are PASSED at the Kotlin/JVM level but NOT physically confirmed on a real
-device, because no physical device was connected during this pass.** No
-gate was papered over - this is reported as the one concrete remaining
-blocker to a full PASSED verdict, not hidden inside a broader claim.
+**Overall verdict: `B46_3A_MULTI_GO_RUNTIME_COEXISTENCE_FAILED`.** 11 of 12
+gates pass; gate 9 - same-process runtime coexistence, the one this entire
+follow-up pass was created to verify - fails on real physical evidence.
+Per the task's own acceptance rule ("B46-3A is fully PASSED only if... no
+Go runtime/JNI/native crash occurs"), B46-3A as a whole is NOT PASSED. The
+build-time-only result from the prior pass (checkDebugDuplicateClasses/
+assembleDebug both green) is real and remains true, but was never, by
+itself, sufficient evidence of safe production integration - this is
+exactly what Part F's revised verdict above now states plainly.

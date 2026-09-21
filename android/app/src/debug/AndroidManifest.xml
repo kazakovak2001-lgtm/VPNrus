@@ -60,5 +60,21 @@
             android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
             android:exported="true"
             android:label="Shadowsocks Adapter Validation (debug, not production)" />
+
+        <!-- B46-3A - SPIKE ONLY, NOT A PRODUCTION TRANSPORT. Debug-only real
+             VpnService proving ONLY the native (non-gomobile) tun2socks
+             bridge's fd-lifecycle mechanics against a genuine TUN interface -
+             see docs/B46_3A_HYSTERIA_NATIVE_BRIDGE_COEXISTENCE.md Part E.
+             Same scoping discipline as B45ASpikeVpnService above: never
+             wired into TransportRegistry/TransportOrchestrator/SmartConnect,
+             reachable only from the instrumentation test suite/adb. -->
+        <service
+            android:name="net.pocvpn.client.vpn.hysteria.NativeTun2SocksSpikeVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

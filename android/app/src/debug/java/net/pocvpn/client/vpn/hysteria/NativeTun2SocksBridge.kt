@@ -29,12 +29,12 @@ package net.pocvpn.client.vpn.hysteria
  * successful [start].
  */
 /** Result of a native bridge lifecycle call - never a raw exception/crash. */
-internal sealed interface NativeBridgeResult {
+sealed interface NativeBridgeResult {
     object Ok : NativeBridgeResult
     data class Failed(val reason: String) : NativeBridgeResult
 }
 
-internal object NativeTun2SocksBridge {
+object NativeTun2SocksBridge {
 
     // novaErr* codes mirrored from research/b46-3a-hysteria-native-bridge/native/main.go.
     private const val NOVA_OK = 0
