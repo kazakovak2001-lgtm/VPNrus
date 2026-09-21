@@ -41,6 +41,22 @@ needs the raw value again. This is a genuine advantage `password`/`userpass`
 auth (which requires the RAW secret to sit in the Hysteria server's own
 config file) cannot offer.
 
+SALAMANDER OBFUSCATION IS NOT PROVISIONED HERE (B46-4A review fix, Finding
+8): upstream `apernet/hysteria`'s Salamander obfuscation is a LISTENER-LEVEL
+server config setting (`obfs: {type: salamander, salamander: {password:
+...}}`) - one static password for the whole server process, applied before
+any QUIC handshake and therefore before any per-connection `auth` exchange.
+It cannot vary per connecting device the way `auth.type: http` can select a
+per-device `auth_secret`. An earlier version of this module minted a
+per-device "obfuscation secret" anyway - that was never a real capability
+this server architecture could act on. This module mints and stores ONLY
+the Hysteria2 wire `auth_secret`; the signed client-side profile's
+`obfuscationMode` stays `NONE` for this production slice (see
+`net.pocvpn.client.reachability.Hysteria2ProfileMetadata`'s own doc). A
+future slice may reintroduce Salamander support via a real SHARED,
+endpoint-level secret distributed and rotated independently of this
+per-device store.
+
 Record shape (this store, keyed by the SAME credential-digest scheme
 activations.py uses - never the raw activation credential):
     {
@@ -48,8 +64,6 @@ activations.py uses - never the raw activation credential):
         {"device_public_key": "<AmneziaWG/WireGuard public key>",
          "auth_secret_hash": "<64-hex sha256(salt || auth_secret)>",
          "auth_secret_salt": "<32-hex random salt>",
-         "obfuscation_secret_hash": "<64-hex sha256(salt || secret)> | null",
-         "obfuscation_secret_salt": "<32-hex random salt> | null",
          "created_at": "<ISO 8601 UTC>"},
         ...
       ]
@@ -78,7 +92,7 @@ from . import activations, hysteria_store
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUIRED_IDENTITY_FIELDS = frozenset(
-    {"device_public_key", "auth_secret_hash", "auth_secret_salt", "obfuscation_secret_hash", "obfuscation_secret_salt", "created_at"},
+    {"device_public_key", "auth_secret_hash", "auth_secret_salt", "created_at"},
 )
 
 # provision_hysteria_identity outcomes - mirrors xray_provisioning.py's own
@@ -90,7 +104,6 @@ NOT_ELIGIBLE_DEVICE_NOT_BOUND = "not_eligible_device_not_bound"
 ISSUED = "issued"
 
 AUTH_SECRET_BYTES = 32  # 256 bits - secrets.token_hex(32) below -> 64 hex chars.
-OBFUSCATION_SECRET_BYTES = 32
 _SALT_BYTES = 16
 
 
@@ -105,13 +118,15 @@ class HysteriaStoreWriteError(Exception):
 @dataclass(frozen=True)
 class HysteriaIdentityResult:
     outcome: str
-    # Set only for ISSUED. auth_secret/obfuscation_secret are the ONE-TIME
-    # RAW values - present only in the in-memory result of a mint/idempotent
-    # lookup this same process just performed; never re-derivable from the
-    # store afterward (only the hash is durable). obfuscation_secret is None
-    # when this endpoint was not configured to use Salamander obfuscation.
+    # Set only for ISSUED. auth_secret is the fresh RAW value this exact
+    # call just minted (see provision_hysteria_identity's own "retry-safe
+    # rotation, not idempotence" doc) - present only in this in-memory
+    # result, never re-derivable from the store afterward (only the hash is
+    # durable). Every successful call rotates: a retry gets a NEW secret,
+    # not a recalled old one. No per-device obfuscation secret is minted -
+    # see this module's own "SALAMANDER OBFUSCATION IS NOT PROVISIONED HERE"
+    # doc (Finding 8).
     auth_secret: str = ""
-    obfuscation_secret: str | None = None
 
 
 def _utc_now_iso():
@@ -151,20 +166,36 @@ def provision_hysteria_identity(
     credential, public_key,
     activation_store_path, activation_lock_path,
     hysteria_store_path, hysteria_lock_path,
-    use_obfuscation,
     now=None,
 ):
-    """Durable credential decide/mint. Idempotent: a retry for the same
-    (credential, public_key) returns the SAME auth_secret it minted the
-    first time (re-derivable ONLY because this process still holds the
-    freshly-generated raw value in its own local store-write branch below -
-    a retry that lands on the ALREADY-existing-identity branch instead
-    cannot return the original raw secret, since only its hash is durable;
-    see [HysteriaIdentityResult]'s own doc and the design doc's "retry
-    semantics" section for how the client is expected to handle this: a
-    lost/never-received response must re-provision, which mints a FRESH
-    secret and durably invalidates the old hash, rather than the server
-    ever being asked to recall a secret it deliberately does not retain).
+    """Durable credential mint/rotate. **RETRY-SAFE ROTATION, NOT BYTE-IDENTICAL
+    IDEMPOTENCE**: an earlier version of this function treated a retry for an
+    already-existing (credential, public_key) as a no-op returning an EMPTY
+    `auth_secret` - since only the SALTED HASH is ever durable, that left a
+    device that never received its first response (dropped response,
+    app killed mid-request, network failure) with NO way to recover a usable
+    secret, permanently. That was a real bug, not a documentation gap.
+
+    The corrected contract: EVERY successful call - first mint or any later
+    retry - generates a FRESH random secret, atomically REPLACES the stored
+    hash/salt for that exact (digest, public_key) record, and returns the
+    fresh RAW secret. The previous secret (if any) stops authenticating the
+    instant this call durably commits - [verify_hysteria_auth] only ever
+    compares against whatever hash is CURRENTLY stored, so an old, now-
+    orphaned secret simply no longer matches anything. This is safe for a
+    legitimate client retry (it always has exactly one live secret to use -
+    whichever this call's own response carries) and does NOT weaken
+    security: rotation-on-retry is functionally equivalent to the client
+    proactively rotating its own credential, something it is already
+    entitled to do given a valid, bound activation.
+
+    Concurrency: the surrounding [activations.per_activation_lock] (digest-
+    scoped) already serializes every provisioning call for the SAME
+    activation, including concurrent retries for the SAME device - two
+    concurrent callers can never race to mint two different "current"
+    secrets; whichever acquires the lock second sees (and replaces) the
+    first's freshly-written record deterministically, and only ITS own
+    response secret remains valid afterward.
     """
     now = now or datetime.now(timezone.utc)
     digest = activations.credential_digest(credential)
@@ -177,30 +208,27 @@ def provision_hysteria_identity(
         with hysteria_store.exclusive_lock(hysteria_lock_path, create=False):
             data = hysteria_store.read_and_validate_under_lock(hysteria_store_path)
             identities = data.get(digest, [])
-
-            for identity in identities:
-                if identity["device_public_key"] == public_key:
-                    # Idempotent retry - never mutate, never mint a second
-                    # secret. The raw secret is NOT recoverable here (only
-                    # its hash is durable) - see this function's own doc.
-                    return HysteriaIdentityResult(outcome=ISSUED)
+            other_devices = [identity for identity in identities if identity["device_public_key"] != public_key]
 
             auth_secret = secrets.token_hex(AUTH_SECRET_BYTES)
             auth_salt = secrets.token_hex(_SALT_BYTES)
-            obfuscation_secret = secrets.token_hex(OBFUSCATION_SECRET_BYTES) if use_obfuscation else None
-            obfuscation_salt = secrets.token_hex(_SALT_BYTES) if use_obfuscation else None
 
             new_identity = {
                 "device_public_key": public_key,
                 "auth_secret_hash": _hash_secret(auth_secret, auth_salt),
                 "auth_secret_salt": auth_salt,
-                "obfuscation_secret_hash": _hash_secret(obfuscation_secret, obfuscation_salt) if use_obfuscation else None,
-                "obfuscation_secret_salt": obfuscation_salt,
                 "created_at": _utc_now_iso(),
             }
-            data[digest] = identities + [new_identity]
+            # atomic_write_store_or_raise never partially writes - see
+            # hysteria_store.atomic_write_store's own crash-safety doc: on
+            # any failure the tmp file is discarded and the PRIOR store
+            # (still containing the device's still-valid previous secret's
+            # hash) is left completely untouched. This function propagates
+            # that failure (never swallows it) so a caller never believes a
+            # rotation happened when it did not.
+            data[digest] = other_devices + [new_identity]
             hysteria_store.atomic_write_store_or_raise(hysteria_store_path, data)
-            return HysteriaIdentityResult(outcome=ISSUED, auth_secret=auth_secret, obfuscation_secret=obfuscation_secret)
+            return HysteriaIdentityResult(outcome=ISSUED, auth_secret=auth_secret)
 
 
 @dataclass(frozen=True)

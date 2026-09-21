@@ -23,7 +23,7 @@ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SALT_RE = re.compile(r"^[0-9a-f]{32}$")
 _REQUIRED_IDENTITY_FIELDS = frozenset(
-    {"device_public_key", "auth_secret_hash", "auth_secret_salt", "obfuscation_secret_hash", "obfuscation_secret_salt", "created_at"},
+    {"device_public_key", "auth_secret_hash", "auth_secret_salt", "created_at"},
 )
 _UNSAFE_MODE_MASK = 0o137  # same rejection rule as activations.py/xray_provisioning.py's own
 
@@ -70,15 +70,6 @@ def parse_store(raw):
                 raise HysteriaStoreLockError("hysteria identity entry has an invalid auth_secret_hash")
             if not isinstance(auth_salt, str) or not _SALT_RE.match(auth_salt):
                 raise HysteriaStoreLockError("hysteria identity entry has an invalid auth_secret_salt")
-
-            obfs_hash = identity.get("obfuscation_secret_hash")
-            obfs_salt = identity.get("obfuscation_secret_salt")
-            if obfs_hash is not None and not (isinstance(obfs_hash, str) and _HASH_RE.match(obfs_hash)):
-                raise HysteriaStoreLockError("hysteria identity entry has an invalid obfuscation_secret_hash")
-            if obfs_salt is not None and not (isinstance(obfs_salt, str) and _SALT_RE.match(obfs_salt)):
-                raise HysteriaStoreLockError("hysteria identity entry has an invalid obfuscation_secret_salt")
-            if (obfs_hash is None) != (obfs_salt is None):
-                raise HysteriaStoreLockError("hysteria identity entry's obfuscation hash/salt must both be present or both absent")
 
             created_at = identity.get("created_at")
             if not isinstance(created_at, str):

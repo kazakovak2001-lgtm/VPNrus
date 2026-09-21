@@ -79,7 +79,7 @@ class SmartConnectDecisionEngineTest {
 
 
     @Test
-    fun `preferred order explicitly contains every transport kind, SHADOWSOCKS_2022 appended last`() {
+    fun `preferred order explicitly contains every transport kind, HYSTERIA2 appended last`() {
         // B45B-4 - SHADOWSOCKS_2022 selection wiring: appended to the END of
         // PREFERRED_ORDER, never inserted earlier or reordering an existing
         // entry (task requirement - "do not reorder AMNEZIA_WG/XRAY_REALITY
@@ -95,6 +95,7 @@ class SmartConnectDecisionEngineTest {
                 TransportKind.XRAY_XHTTP,
                 TransportKind.TLS_TCP,
                 TransportKind.SHADOWSOCKS_2022,
+                TransportKind.HYSTERIA2,
             ),
             SmartConnectDecisionEngine.PREFERRED_ORDER,
         )

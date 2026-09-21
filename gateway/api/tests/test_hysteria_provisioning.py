@@ -3,7 +3,9 @@ and verify_hysteria_auth, mirroring test_xray_provisioning.py's own shape."""
 import os
 import sys
 import tempfile
+import threading
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,12 +44,11 @@ class HysteriaProvisioningTestBase(unittest.TestCase):
             credential, public_key, self.activation_store_path, self.activation_lock_path,
         )
 
-    def _provision(self, credential, public_key, use_obfuscation=False):
+    def _provision(self, credential, public_key):
         return hysteria_module.provision_hysteria_identity(
             credential, public_key,
             self.activation_store_path, self.activation_lock_path,
             self.hysteria_store_path, self.hysteria_lock_path,
-            use_obfuscation,
         )
 
 
@@ -84,7 +85,7 @@ class EligibilityTests(HysteriaProvisioningTestBase):
             credential, self.key_a,
             self.activation_store_path, self.activation_lock_path,
             self.hysteria_store_path, self.hysteria_lock_path,
-            use_obfuscation=False, now=far_future,
+            now=far_future,
         )
         self.assertEqual(result.outcome, hysteria_module.NOT_ELIGIBLE_EXPIRED)
 
@@ -108,18 +109,20 @@ class IssuanceTests(HysteriaProvisioningTestBase):
         result = self._provision(credential, self.key_a)
         self.assertEqual(result.outcome, hysteria_module.ISSUED)
         self.assertRegex(result.auth_secret, r"^[0-9a-f]{64}$")
-        self.assertIsNone(result.obfuscation_secret)
 
-    def test_obfuscation_secret_issued_only_when_requested(self):
+    def test_no_per_device_obfuscation_secret_is_ever_minted(self):
+        """Review fix (Finding 8) - upstream Salamander obfuscation is a
+        listener-level server setting, never per-device; provisioning one
+        would be fiction. HysteriaIdentityResult has no obfuscation_secret
+        field at all any more - this test documents that removal by name so
+        a future reintroduction is a deliberate, reviewed decision."""
         _activation_id, credential = activations_module.issue_activation(
             self.activation_store_path, self.activation_lock_path, max_devices=1,
         )
         self._bind_and_confirm(credential, self.key_a)
 
-        result = self._provision(credential, self.key_a, use_obfuscation=True)
-        self.assertEqual(result.outcome, hysteria_module.ISSUED)
-        self.assertRegex(result.obfuscation_secret, r"^[0-9a-f]{64}$")
-        self.assertNotEqual(result.auth_secret, result.obfuscation_secret)
+        result = self._provision(credential, self.key_a)
+        self.assertFalse(hasattr(result, "obfuscation_secret"))
 
     def test_raw_secret_is_never_persisted_at_rest(self):
         _activation_id, credential = activations_module.issue_activation(
@@ -132,7 +135,15 @@ class IssuanceTests(HysteriaProvisioningTestBase):
             raw_store_text = handle.read()
         self.assertNotIn(result.auth_secret, raw_store_text)
 
-    def test_retry_for_the_same_device_does_not_mint_a_second_identity(self):
+    def test_retry_for_the_same_device_rotates_to_a_fresh_recoverable_secret(self):
+        """Review fix - the previous version of this test (and of
+        provision_hysteria_identity itself) treated a retry as a no-op that
+        returned an EMPTY auth_secret, permanently stranding a device whose
+        first response was lost. Retry must instead be RECOVERABLE: it
+        returns a fresh, valid, non-empty secret every time, never an empty
+        one - see [RetrySafeRotationTests] below for the full rotation
+        contract (old-secret invalidation, new-secret validity, single
+        stored record)."""
         _activation_id, credential = activations_module.issue_activation(
             self.activation_store_path, self.activation_lock_path, max_devices=1,
         )
@@ -142,9 +153,10 @@ class IssuanceTests(HysteriaProvisioningTestBase):
         second = self._provision(credential, self.key_a)
         self.assertEqual(first.outcome, hysteria_module.ISSUED)
         self.assertEqual(second.outcome, hysteria_module.ISSUED)
-        # A retry never re-mints (and cannot recover the original raw
-        # secret - see provision_hysteria_identity's own doc); the store
-        # itself must still contain exactly one identity for this device.
+        self.assertTrue(second.auth_secret)
+        self.assertRegex(second.auth_secret, r"^[0-9a-f]{64}$")
+        # Rotation REPLACES, never appends - the store still contains
+        # exactly one identity for this device, not a growing history.
         digest = activations_module.credential_digest(credential)
         data = hysteria_store.read_store_shared(self.hysteria_store_path, self.hysteria_lock_path)
         self.assertEqual(len(data[digest]), 1)
@@ -161,13 +173,149 @@ class IssuanceTests(HysteriaProvisioningTestBase):
         self.assertNotEqual(result_a.auth_secret, result_b.auth_secret)
 
 
+class RetrySafeRotationTests(HysteriaProvisioningTestBase):
+    """Review fix (Finding 2) - full regression coverage for the corrected
+    retry-safe rotation contract: rotation is NOT byte-identical idempotence
+    (documented as such), but every legitimate retry recovers a working
+    secret and the previous one is durably invalidated."""
+
+    def _issue_activation_and_bind(self, **issue_kwargs):
+        activation_id, credential = activations_module.issue_activation(
+            self.activation_store_path, self.activation_lock_path, max_devices=1, **issue_kwargs,
+        )
+        self._bind_and_confirm(credential, self.key_a)
+        return activation_id, credential
+
+    def _verify(self, secret, now=None):
+        return hysteria_module.verify_hysteria_auth(
+            secret,
+            self.activation_store_path, self.activation_lock_path,
+            self.hysteria_store_path, self.hysteria_lock_path,
+            now=now,
+        )
+
+    def test_initial_provisioning_returns_a_working_secret(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        result = self._provision(credential, self.key_a)
+        self.assertEqual(result.outcome, hysteria_module.ISSUED)
+        self.assertTrue(self._verify(result.auth_secret).ok)
+
+    def test_retry_returns_a_different_valid_secret(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        first = self._provision(credential, self.key_a)
+        second = self._provision(credential, self.key_a)
+        self.assertNotEqual(first.auth_secret, second.auth_secret)
+        self.assertTrue(self._verify(second.auth_secret).ok)
+
+    def test_old_secret_stops_authenticating_after_rotation(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        first = self._provision(credential, self.key_a)
+        self.assertTrue(self._verify(first.auth_secret).ok)
+
+        self._provision(credential, self.key_a)  # rotate
+
+        self.assertFalse(self._verify(first.auth_secret).ok)
+
+    def test_new_secret_authenticates_after_rotation(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        self._provision(credential, self.key_a)
+        second = self._provision(credential, self.key_a)
+
+        self.assertTrue(self._verify(second.auth_secret).ok)
+
+    def test_store_still_contains_no_raw_secret_after_rotation(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        first = self._provision(credential, self.key_a)
+        second = self._provision(credential, self.key_a)
+
+        with open(self.hysteria_store_path, "r", encoding="utf-8") as handle:
+            raw_store_text = handle.read()
+        self.assertNotIn(first.auth_secret, raw_store_text)
+        self.assertNotIn(second.auth_secret, raw_store_text)
+
+    def test_a_failed_atomic_write_preserves_the_previous_valid_credential(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        first = self._provision(credential, self.key_a)
+        self.assertTrue(self._verify(first.auth_secret).ok)
+
+        with unittest.mock.patch.object(
+            hysteria_module.hysteria_store, "atomic_write_store_or_raise",
+            side_effect=hysteria_module.hysteria_store.HysteriaStoreLockError("simulated durable-write failure"),
+        ):
+            with self.assertRaises(hysteria_module.hysteria_store.HysteriaStoreLockError):
+                self._provision(credential, self.key_a)
+
+        # The failed rotation must never have partially applied - the
+        # original secret is still exactly as valid as before the attempt.
+        self.assertTrue(self._verify(first.auth_secret).ok)
+
+    def test_concurrent_retries_serialize_and_exactly_one_final_secret_survives(self):
+        _activation_id, credential = self._issue_activation_and_bind()
+        results = []
+        lock = threading.Lock()
+
+        def worker():
+            result = self._provision(credential, self.key_a)
+            with lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(r.outcome == hysteria_module.ISSUED for r in results))
+        # Exactly one secret among the five concurrent attempts is the
+        # final, durably-stored one - every attempt fully serialized
+        # through the per-activation lock, never interleaved/corrupted.
+        valid_secrets = [r.auth_secret for r in results if self._verify(r.auth_secret).ok]
+        self.assertEqual(len(valid_secrets), 1)
+        digest = activations_module.credential_digest(credential)
+        data = hysteria_store.read_store_shared(self.hysteria_store_path, self.hysteria_lock_path)
+        self.assertEqual(len(data[digest]), 1)
+
+    def test_revoked_activation_cannot_rotate_or_reissue(self):
+        activation_id, credential = self._issue_activation_and_bind()
+        first = self._provision(credential, self.key_a)
+        self.assertTrue(self._verify(first.auth_secret).ok)
+
+        activations_module.revoke_activation(self.activation_store_path, self.activation_lock_path, activation_id)
+
+        result = self._provision(credential, self.key_a)
+        self.assertEqual(result.outcome, hysteria_module.NOT_ELIGIBLE_REVOKED)
+        self.assertEqual(result.auth_secret, "")
+        # The already-issued secret is ALSO invalidated the instant the
+        # activation is revoked - live consultation, not just future mints.
+        self.assertFalse(self._verify(first.auth_secret).ok)
+
+    def test_expired_activation_cannot_rotate_or_reissue(self):
+        activation_id, credential = activations_module.issue_activation(
+            self.activation_store_path, self.activation_lock_path, max_devices=1, expires_in_days=1,
+        )
+        self._bind_and_confirm(credential, self.key_a)
+        first = self._provision(credential, self.key_a)
+        self.assertEqual(first.outcome, hysteria_module.ISSUED)
+
+        far_future = datetime.now(timezone.utc) + timedelta(days=2)
+        result = hysteria_module.provision_hysteria_identity(
+            credential, self.key_a,
+            self.activation_store_path, self.activation_lock_path,
+            self.hysteria_store_path, self.hysteria_lock_path,
+            now=far_future,
+        )
+        self.assertEqual(result.outcome, hysteria_module.NOT_ELIGIBLE_EXPIRED)
+        self.assertEqual(result.auth_secret, "")
+
+
 class AuthVerificationTests(HysteriaProvisioningTestBase):
-    def _issue(self, use_obfuscation=False):
+    def _issue(self):
         _activation_id, credential = activations_module.issue_activation(
             self.activation_store_path, self.activation_lock_path, max_devices=1,
         )
         self._bind_and_confirm(credential, self.key_a)
-        result = self._provision(credential, self.key_a, use_obfuscation=use_obfuscation)
+        result = self._provision(credential, self.key_a)
         return credential, result
 
     def _verify(self, secret, now=None):

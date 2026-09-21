@@ -6,22 +6,32 @@ import net.pocvpn.client.identity.Hysteria2CredentialValidationResult
 import net.pocvpn.client.identity.Hysteria2CredentialValidator
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.SignedTransportProfile
+import net.pocvpn.client.reachability.SignedTransportProfileReadResult
+import net.pocvpn.client.reachability.signedTransportProfile
 
 /**
  * B46-4A - the real Android client control-plane path for Hysteria2: POST
  * /v1/hysteria-profile -> validate the response actually names the endpoint
- * THIS request targeted -> validate its own credential content -> construct
- * an endpoint-bound [Hysteria2Credential] -> save through
- * [Hysteria2CredentialRepository] -> typed outcome. No Smart Connect changes
- * belong inside this provisioner (per task instruction) - it never touches
- * `TransportRegistry`/`MainViewModel.buildTransportRegistry`.
+ * THIS request targeted AND agrees with the already-trusted signed profile
+ * -> validate its own credential content -> construct an endpoint-bound
+ * [Hysteria2Credential] -> save through [Hysteria2CredentialRepository] ->
+ * typed outcome. No Smart Connect changes belong inside this provisioner
+ * (per task instruction) - it never touches `TransportRegistry`/
+ * `MainViewModel.buildTransportRegistry`.
  *
- * [endpointBinding] is the caller's own already-pinned fact (from the signed
- * manifest) - NEVER re-derived from the HTTP response. [provision]
- * cross-checks the response's own `server_address`/`server_port` against
- * [endpointBinding]'s host/port and fails closed with [Hysteria2ProvisioningOutcome.Mismatched]
- * on any disagreement - mirrors [net.pocvpn.client.relay.IngressProfileProvisioner]'s
- * own "pinned-fact mismatch fails closed" discipline exactly.
+ * B46-4A review fix (Finding 3/Finding 5) - [provision] now requires a real,
+ * currently-trusted, typed [SignedTransportProfile.Hysteria2] for
+ * [endpointBinding] BEFORE it ever calls the network - a Legacy/missing/
+ * invalid/wrong-kind profile fails closed as [Hysteria2ProvisioningOutcome.NoTrustedBinding]
+ * without dialing any host (never "provisioning against an arbitrary
+ * host"). Once that trusted profile is resolved, EVERY public fact the
+ * server's response claims - `server_address`, `server_port`, `sni`,
+ * `obfuscation_mode` - is cross-checked against it; the control-plane
+ * response is authority for SECRET material only (`auth_secret`,
+ * `obfuscation_secret`), never for public routing/policy facts. Mirrors
+ * [net.pocvpn.client.relay.IngressProfileProvisioner]'s own "pinned-fact
+ * mismatch fails closed" discipline exactly.
  *
  * NO RAW ACTIVATION CREDENTIAL AS HYSTERIA AUTH (per task instruction):
  * [activationCredential] authorizes this HTTP call only - it is never stored,
@@ -40,12 +50,30 @@ class Hysteria2ProfileProvisioner(
         publicKey: String,
         activationCredential: String,
     ): Hysteria2ProvisioningOutcome {
+        val trustedProfile = when (val read = endpointBinding.signedTransportProfile(endpointId)) {
+            is SignedTransportProfileReadResult.Parsed -> (read.profile as? SignedTransportProfile.Hysteria2)?.profile
+                ?: return Hysteria2ProvisioningOutcome.NoTrustedBinding("no typed Hysteria2 signed profile for endpoint ${endpointId.value} (legacy/wrong-kind binding)")
+            SignedTransportProfileReadResult.Missing -> return Hysteria2ProvisioningOutcome.NoTrustedBinding("signed Hysteria2 profile missing for endpoint ${endpointId.value}")
+            SignedTransportProfileReadResult.Unsupported -> return Hysteria2ProvisioningOutcome.NoTrustedBinding("signed Hysteria2 profile version unsupported for endpoint ${endpointId.value}")
+            SignedTransportProfileReadResult.Invalid -> return Hysteria2ProvisioningOutcome.NoTrustedBinding("signed Hysteria2 profile invalid for endpoint ${endpointId.value}")
+        }
+
         val result = fetchHysteria2Profile(publicKey, activationCredential, endpointBinding.host)
         return when (result) {
             is Hysteria2ProfileResult.Success -> {
                 if (result.serverAddress != endpointBinding.host || result.serverPort != endpointBinding.port) {
                     return Hysteria2ProvisioningOutcome.Mismatched(
                         "response server ${result.serverAddress}:${result.serverPort} does not match the pinned binding ${endpointBinding.host}:${endpointBinding.port}",
+                    )
+                }
+                if (result.sni != trustedProfile.sni) {
+                    return Hysteria2ProvisioningOutcome.Mismatched(
+                        "response sni '${result.sni}' does not match the trusted signed profile's sni '${trustedProfile.sni}'",
+                    )
+                }
+                if (result.obfuscationMode != trustedProfile.obfuscationMode) {
+                    return Hysteria2ProvisioningOutcome.Mismatched(
+                        "response obfuscationMode '${result.obfuscationMode}' does not match the trusted signed profile's obfuscationMode '${trustedProfile.obfuscationMode}'",
                     )
                 }
                 val validated = Hysteria2CredentialValidator.validate(endpointId, result.authSecret, result.obfuscationSecret)
@@ -55,6 +83,24 @@ class Hysteria2ProfileProvisioner(
                     Hysteria2CredentialValidationResult.AuthSecretTooLong -> return Hysteria2ProvisioningOutcome.CredentialRejected("server's auth secret exceeds the max accepted length")
                     Hysteria2CredentialValidationResult.BlankObfuscationSecret -> return Hysteria2ProvisioningOutcome.CredentialRejected("server returned a blank obfuscation secret")
                     Hysteria2CredentialValidationResult.ObfuscationSecretTooLong -> return Hysteria2ProvisioningOutcome.CredentialRejected("server's obfuscation secret exceeds the max accepted length")
+                }
+                // B46-4A review fix (Finding 3) - the trusted signed mode is
+                // the ONLY authority Hysteria2VpnService consults at connect
+                // time, but this provisioner still refuses to SAVE a
+                // credential that already disagrees with it (e.g. a NONE
+                // profile whose response somehow carried an obfuscation
+                // secret) - never persist a credential that could not pass
+                // the service's own runtime consistency gate.
+                val credentialHasObfuscationSecret = credential.obfuscationSecret != null
+                val credentialConsistent = when (trustedProfile.obfuscationMode) {
+                    "NONE" -> !credentialHasObfuscationSecret
+                    "SALAMANDER" -> credentialHasObfuscationSecret
+                    else -> false
+                }
+                if (!credentialConsistent) {
+                    return Hysteria2ProvisioningOutcome.CredentialRejected(
+                        "credential's obfuscation-secret presence ($credentialHasObfuscationSecret) disagrees with the trusted signed obfuscationMode (${trustedProfile.obfuscationMode})",
+                    )
                 }
                 repository.storeCredential(credential)
                 Hysteria2ProvisioningOutcome.Saved
@@ -79,4 +125,6 @@ sealed class Hysteria2ProvisioningOutcome {
     object Unavailable : Hysteria2ProvisioningOutcome()
     data class Mismatched(val reason: String) : Hysteria2ProvisioningOutcome()
     data class CredentialRejected(val reason: String) : Hysteria2ProvisioningOutcome()
+    /** B46-4A review fix (Finding 3/5) - no real, currently-trusted signed Hysteria2 profile exists for this endpoint; the network was never dialed. */
+    data class NoTrustedBinding(val reason: String) : Hysteria2ProvisioningOutcome()
 }

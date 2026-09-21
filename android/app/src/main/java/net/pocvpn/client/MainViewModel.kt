@@ -462,6 +462,14 @@ class MainViewModel(
     // REAL value once (Build.SUPPORTED_ABIS + the real nativeLibraryDir).
     private val hysteria2BinaryEligibility: net.pocvpn.client.vpn.hysteria.Hysteria2BinaryEligibility =
         net.pocvpn.client.vpn.hysteria.Hysteria2BinaryEligibility.UnsupportedAbi(emptyList()),
+    // B46-4A review fix (Finding 5) - additive test/composition seam: the
+    // ONE place activateDevice() constructs a [net.pocvpn.client.provisioning.Hysteria2ProfileProvisioner]
+    // for a resolved credential repository. Defaults to the real network
+    // fetch (mirrors [net.pocvpn.client.provisioning.ProvisioningClient::fetchHysteria2Profile]'s
+    // own production default) - overridden only by tests, so a test never
+    // needs a live network call to exercise the provisioning composition.
+    private val hysteria2ProfileProvisionerFactory: (net.pocvpn.client.identity.Hysteria2CredentialRepository) -> net.pocvpn.client.provisioning.Hysteria2ProfileProvisioner =
+        { repository -> net.pocvpn.client.provisioning.Hysteria2ProfileProvisioner(repository) },
     private val xrayTlsProfileRepository: XrayTlsProfileRepository? = null,
     // B13 consolidated review fix - additive, defaults to null (same "no
     // wiring, no behavior" seam as every other optional dependency above).
@@ -972,6 +980,11 @@ class MainViewModel(
         // buildTransportRegistry - never a second, independently-constructed
         // one (see that field's own docs).
         shadowsocksTransport = shadowsocksTransport,
+        // B46-4A review fix (Finding 4) - the SAME real Hysteria2Transport
+        // instance registered in buildTransportRegistry - never a second,
+        // independently-constructed one (mirrors shadowsocksTransport's own
+        // docs exactly).
+        hysteria2Transport = hysteria2Transport,
         // B13 - the SAME pathHistoryStore/fingerprintKeyProvider instances
         // reachabilityDiagnostics() below already reads (never a second,
         // independently-constructed pair) - this is the live-connect-path
@@ -1934,6 +1947,15 @@ class MainViewModel(
     private val _xrayProfileProvisioningState = MutableStateFlow<XrayProfileProvisioningOutcome?>(null)
     val xrayProfileProvisioningState: StateFlow<XrayProfileProvisioningOutcome?> = _xrayProfileProvisioningState.asStateFlow()
 
+    // B46-4A review fix (Finding 5) - same shape as [_xrayProfileProvisioningState]
+    // above: null until the first activateDevice() call that reaches Hysteria2
+    // provisioning (only after a successful AWG activation, and only when
+    // both a credential repository AND a trusted signed HYSTERIA2 binding
+    // exist for the target endpoint - see [net.pocvpn.client.provisioning.Hysteria2ProfileProvisioner]'s
+    // own docs for the full fail-closed contract).
+    private val _hysteria2ProfileProvisioningState = MutableStateFlow<net.pocvpn.client.provisioning.Hysteria2ProvisioningOutcome?>(null)
+    val hysteria2ProfileProvisioningState: StateFlow<net.pocvpn.client.provisioning.Hysteria2ProvisioningOutcome?> = _hysteria2ProfileProvisioningState.asStateFlow()
+
     init {
         viewModelScope.launch {
             _publicKey.value = clientKeyRepository.getPublicKey()
@@ -2487,6 +2509,43 @@ class MainViewModel(
                                 if (repository != null && XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready) {
                                     xrayTlsAvailableEndpoints.update { it + targetEndpointId }
                                 }
+                            }
+                        }
+                        // B46-4A review fix (Finding 5) - same "runs only
+                        // after AWG activation already fully succeeded,
+                        // reuses the SAME key/credential, never touches
+                        // AWG's own success/state either way" reasoning as
+                        // targetXrayProvisioner above - the disciplined
+                        // model every other transport's provisioning
+                        // already follows. Requires BOTH a wired
+                        // Hysteria2CredentialRepository for [targetEndpointId]
+                        // AND a trusted signed HYSTERIA2 binding for it
+                        // (Hysteria2ProfileProvisioner itself re-checks the
+                        // binding, defense in depth) - never provisions
+                        // against an arbitrary/untrusted host. A one-shot
+                        // attempt per activateDevice() call, never a
+                        // repeated background polling loop. Failure here
+                        // never rolls back the AWG activation this whole
+                        // branch already committed to Success below.
+                        val hysteria2Repository = hysteria2CredentialRepositories[targetEndpointId]
+                        val hysteria2Binding = trustedTransportBindingFor(targetEndpointId, TransportKind.HYSTERIA2)
+                        if (hysteria2Repository != null && hysteria2Binding != null) {
+                            val hysteria2Outcome = withContext(ioDispatcher) {
+                                hysteria2ProfileProvisionerFactory(hysteria2Repository)
+                                    .provision(targetEndpointId, hysteria2Binding, key, trimmedCredential)
+                            }
+                            _hysteria2ProfileProvisioningState.value = hysteria2Outcome
+                            if (hysteria2Outcome == net.pocvpn.client.provisioning.Hysteria2ProvisioningOutcome.Saved) {
+                                // B46-4A review fix - the real, event-driven
+                                // moment HYSTERIA2 becomes selectable for
+                                // THIS endpoint - never polled, never
+                                // inferred from elapsed time (mirrors
+                                // xrayAvailableEndpoints' own docs). A
+                                // failed provision here never adds the
+                                // endpoint - HYSTERIA2 stays NOT_IMPLEMENTED
+                                // exactly as isHysteria2AvailableFor already
+                                // requires.
+                                hysteria2AvailableEndpoints.update { it + targetEndpointId }
                             }
                         }
                         ProvisioningUiState.Success(result)
@@ -4273,6 +4332,28 @@ class MainViewModel(
                     gateway.endpointId to net.pocvpn.client.identity.Shadowsocks2022CredentialRepositoryFactory.create(context, gateway.endpointId)
                 },
                 shadowsocksBinaryEligibility = net.pocvpn.client.vpn.shadowsocks.ShadowsocksAdapterEligibilityChecker.check(
+                    deviceAbis = android.os.Build.SUPPORTED_ABIS.toList(),
+                    nativeLibraryDir = context.applicationInfo.nativeLibraryDir,
+                ),
+                // B46-4A review fix (Finding 4) - mirrors the SHADOWSOCKS_2022
+                // wiring immediately above exactly: the SAME real
+                // Hysteria2Transport instance for BOTH Smart Connect
+                // selection (buildTransportRegistry) and execution
+                // (VpnController below) - never a duplicate instance, never
+                // a duplicate credential-store authority. One endpoint-scoped
+                // Hysteria2CredentialRepository per catalog gateway; ABI/
+                // binary eligibility computed ONCE from the real device/APK
+                // facts. An earlier version of this Factory declared the
+                // hysteria2* constructor parameters but never actually
+                // passed real values here - HYSTERIA2 could never become
+                // AVAILABLE in a real running app no matter what the signed
+                // manifest said. See HysteriaProductionCompositionTest for
+                // the regression proof.
+                hysteria2Transport = net.pocvpn.client.vpn.hysteria.Hysteria2Transport(context),
+                hysteria2CredentialRepositories = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                    gateway.endpointId to net.pocvpn.client.identity.Hysteria2CredentialRepositoryFactory.create(context, gateway.endpointId)
+                },
+                hysteria2BinaryEligibility = net.pocvpn.client.vpn.hysteria.Hysteria2AdapterEligibilityChecker.check(
                     deviceAbis = android.os.Build.SUPPORTED_ABIS.toList(),
                     nativeLibraryDir = context.applicationInfo.nativeLibraryDir,
                 ),

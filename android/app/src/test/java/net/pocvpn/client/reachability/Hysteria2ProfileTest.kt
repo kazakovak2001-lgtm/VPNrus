@@ -40,7 +40,7 @@ class Hysteria2ProfileTest {
 
     @Test
     fun `signedTransportProfile returns a typed Hysteria2 profile bound to the exact endpoint identity supplied by caller`() {
-        val profile = Hysteria2Profile(sni = "hy2.example.com", obfuscationMode = "SALAMANDER")
+        val profile = Hysteria2Profile(sni = "hy2.example.com", obfuscationMode = "NONE")
         val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
             .withHysteria2Profile(profile)
 
@@ -55,6 +55,57 @@ class Hysteria2ProfileTest {
         val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
             .copy(metadata = mapOf("hysteria2Profile" to "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"SOME_FUTURE_MODE\"}"))
         assertEquals(Hysteria2ProfileReadResult.Invalid, binding.hysteria2Profile())
+    }
+
+    @Test
+    fun `SALAMANDER is not yet representable - fails closed as Invalid (Finding 8 - not a real per-device server capability)`() {
+        val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .copy(metadata = mapOf("hysteria2Profile" to "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"SALAMANDER\"}"))
+        assertEquals(Hysteria2ProfileReadResult.Invalid, binding.hysteria2Profile())
+    }
+
+    @Test
+    fun `a normal encoded profile with no trailing content parses (EOF fix)`() {
+        val raw = "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"NONE\"}"
+        val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .copy(metadata = mapOf("hysteria2Profile" to raw))
+        val result = binding.hysteria2Profile()
+        assertTrue(result is Hysteria2ProfileReadResult.Parsed)
+        assertEquals(Hysteria2Profile("hy2.example.com", "NONE"), (result as Hysteria2ProfileReadResult.Parsed).profile)
+    }
+
+    @Test
+    fun `trailing whitespace after the object is accepted (nextClean skips it before EOF)`() {
+        val raw = "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"NONE\"}   \n"
+        val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .copy(metadata = mapOf("hysteria2Profile" to raw))
+        assertTrue(binding.hysteria2Profile() is Hysteria2ProfileReadResult.Parsed)
+    }
+
+    @Test
+    fun `trailing non-whitespace garbage after the object is rejected as Invalid`() {
+        val raw = "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"NONE\"}garbage"
+        val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .copy(metadata = mapOf("hysteria2Profile" to raw))
+        assertEquals(Hysteria2ProfileReadResult.Invalid, binding.hysteria2Profile())
+    }
+
+    @Test
+    fun `a second JSON value appended after the first is rejected as Invalid`() {
+        val raw = "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"NONE\"}{\"extra\":true}"
+        val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .copy(metadata = mapOf("hysteria2Profile" to raw))
+        assertEquals(Hysteria2ProfileReadResult.Invalid, binding.hysteria2Profile())
+    }
+
+    @Test
+    fun `encode then parse round-trips successfully through withHysteria2Profile - hysteria2Profile (Finding 1 regression proof)`() {
+        val profile = Hysteria2Profile(sni = "roundtrip.example.com", obfuscationMode = "NONE")
+        val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .withHysteria2Profile(profile)
+        val result = binding.hysteria2Profile()
+        assertTrue("expected Parsed, got $result", result is Hysteria2ProfileReadResult.Parsed)
+        assertEquals(profile, (result as Hysteria2ProfileReadResult.Parsed).profile)
     }
 
     @Test
