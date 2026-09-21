@@ -92,7 +92,7 @@ loaded in the app process during real data-plane traffic (Part 15).
 
 | Field | Value |
 |---|---|
-| Git commit (this branch, at test time) | see Part 24 for the exact commit this doc/tests were committed at |
+| Git commit | `eaa9673fee11bd5326f7faeb3feac048353a9bf7` (`research/b46-3c-hysteria-process-isolated-dataplane`) |
 | APK SHA-256 (debug) | `62cef2c506d6f2ebf6ed483ab679ec1638dffb0c88ed02fac0a3a6c19dd9ec4f` |
 | Target ABI | `arm64-v8a` |
 | `tun2socks-child` artifact | `libnovatun2sockschild.so`, SHA-256 `3ee51b0bbfec55f3b1f05c7b55057110fda1d9b64187822b6efeb9621349621f` - **byte-identical** to B46-3B's own hardened artifact (same source, same pins, same build command - confirmed by direct hash comparison, not merely "should be the same") |
