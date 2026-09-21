@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""B54 repository-safe field observation validator and canonical serializer."""
+"""B54 repository-safe field observation validator and canonical serializer.
+
+Enum fields that name a real Nova production type (network.type,
+network.rawRestrictionClass/stabilizedRestrictionClass, path.transport,
+path.gatewaySelectionMode, path.routingMode) are validated against that
+production type's actual values, not a second, drifted taxonomy:
+  - network.type            -> android NetworkType
+  - network.*RestrictionClass -> android smartconnect.RestrictionClass
+  - path.transport          -> android transport.TransportKind
+  - path.gatewaySelectionMode -> android vpn.config.GatewaySelectionMode
+  - path.routingMode        -> android vpn.policy.RoutingMode
+
+Everything else (evidenceClass, result, proofLevel, exitProof, ...) is a
+B54-only vocabulary with no production counterpart and is documented as such
+in docs/B54_RESTRICTED_NETWORK_FIELD_VALIDATION_MATRIX.md.
+"""
 
 from __future__ import annotations
 
@@ -12,11 +27,31 @@ from pathlib import Path
 from typing import Any
 
 EVIDENCE_CLASSES = {"FIELD_MEASURED", "LAB_MEASURED", "SIMULATED", "SOURCE_CONFIRMED", "NOT_TESTED", "BLOCKED"}
-RESULTS = {"PASS_END_TO_END", "PASS_CONNECTION_ONLY", "FAIL", "NOT_TESTED", "BLOCKED"}
-NETWORK_TYPES = {"WIFI", "CELLULAR", "ETHERNET", "OTHER", "UNKNOWN"}
-TRANSPORTS = {"AMNEZIA_WG", "XRAY_REALITY", "XRAY_CDN_XHTTP", "SHADOWSOCKS_2022", "HYSTERIA2", "UNKNOWN"}
-RESTRICTIONS = {"OPEN", "UDP_RESTRICTED", "TCP_ONLY", "HARD_WHITELIST_SUSPECTED", "UNKNOWN", "NOT_TESTED"}
+RESULTS = {
+    "PASS_END_TO_END", "PASS_CONNECTION_ONLY",
+    "FAIL_CONNECT", "FAIL_HANDSHAKE", "FAIL_DATA_PLANE", "FAIL_DNS", "FAIL_UDP", "FAIL_EXIT_MISMATCH", "FAIL_CLEANUP",
+    "BLOCKED_TEST_ENVIRONMENT", "NOT_TESTED",
+}
+# Mirrors android NetworkType (network/NetworkType.kt) exactly.
+NETWORK_TYPES = {"WIFI", "CELLULAR", "ETHERNET", "OTHER", "NONE"}
+# Mirrors android TransportKind (transport/TransportKind.kt) exactly. No HYSTERIA2:
+# it is not a production TransportKind yet (see PENDING_TRANSPORTS below).
+TRANSPORTS = {"AMNEZIA_WG", "XRAY_REALITY", "QUIC", "TLS_TCP", "XRAY_XHTTP", "SHADOWSOCKS_2022"}
+# A transport under evaluation that is NOT a production TransportKind. Recording one
+# here never substitutes for path.transport and can never claim field validation.
+PENDING_TRANSPORTS = {"HYSTERIA2"}
+# Mirrors android smartconnect.RestrictionClass (smartconnect/RestrictionClassifier.kt) exactly.
+RESTRICTIONS = {
+    "NO_NETWORK", "CAPTIVE_PORTAL", "INTERNET_NOT_VALIDATED", "GATEWAY_HTTPS_UNREACHABLE",
+    "POSSIBLE_UDP_OR_AWG_FILTERING", "POSSIBLE_HARD_WHITELIST", "NETWORK_RECOVERING",
+    "NO_RESTRICTION_OBSERVED", "UNKNOWN",
+}
+# Mirrors android vpn.config.GatewaySelectionMode exactly.
+GATEWAY_SELECTION_MODES = {"AUTO", "MANUAL_MANAGED", "PRIVATE"}
+# Mirrors android vpn.policy.RoutingMode exactly.
+ROUTING_MODES = {"FULL_VPN", "ADAPTIVE", "APPS"}
 PROOF_LEVELS = {"L0_CONNECTION_ONLY", "L1_TUNNEL_ESTABLISHED", "L2_DATA_PLANE", "L3_CORRELATED_DATA_PLANE", "UNKNOWN"}
+EXIT_PROOFS = {"MATCHED", "MISMATCHED", "NOT_TESTED", "UNKNOWN"}
 UNKNOWN = {None, "", "UNKNOWN", "NOT_TESTED"}
 
 _SECRET_PATTERNS = (
@@ -74,8 +109,20 @@ def validate(record: dict[str, Any]) -> list[str]:
     if network.get("type") not in NETWORK_TYPES: errors.append("invalid network.type")
     if network.get("rawRestrictionClass") not in RESTRICTIONS: errors.append("invalid network.rawRestrictionClass")
     if network.get("stabilizedRestrictionClass") not in RESTRICTIONS: errors.append("invalid network.stabilizedRestrictionClass")
-    if path.get("transport") not in TRANSPORTS: errors.append("invalid path.transport")
+    if path.get("gatewaySelectionMode") not in GATEWAY_SELECTION_MODES: errors.append("invalid path.gatewaySelectionMode")
+    if path.get("routingMode") not in ROUTING_MODES: errors.append("invalid path.routingMode")
     if proof.get("level") not in PROOF_LEVELS: errors.append("invalid proof.level")
+    if proof.get("exitProof") not in EXIT_PROOFS: errors.append("invalid proof.exitProof")
+
+    pending_transport = path.get("pendingTransportKind")
+    transport = path.get("transport")
+    if pending_transport is not None:
+        if pending_transport not in PENDING_TRANSPORTS: errors.append("invalid path.pendingTransportKind")
+        if transport is not None: errors.append("path.pendingTransportKind and path.transport are mutually exclusive")
+        if evidence not in {"LAB_MEASURED", "SIMULATED"}: errors.append("path.pendingTransportKind requires LAB_MEASURED or SIMULATED evidence, never FIELD_MEASURED")
+        if result not in {"NOT_TESTED", "BLOCKED_TEST_ENVIRONMENT"}: errors.append("path.pendingTransportKind is not a production TransportKind and cannot claim production field validation")
+    elif transport not in TRANSPORTS:
+        errors.append("invalid path.transport")
 
     timestamp = record.get("timestampUtc")
     try:
@@ -93,21 +140,25 @@ def validate(record: dict[str, Any]) -> list[str]:
     if evidence == "SIMULATED" and record.get("claimScope") == "REAL_NETWORK":
         errors.append("SIMULATED evidence cannot claim REAL_NETWORK scope")
 
-    data_plane = bool(proof.get("dnsRoundTrip") or proof.get("tcpRoundTrip") or proof.get("udpRoundTrip"))
+    # A substantive application-level flow (TCP or UDP) actually crossing the tunnel.
+    # DNS is diagnostic signal only: a resolver round-trip alone is never proof of the
+    # VPN's Internet data plane, so it is deliberately excluded here.
+    substantive_data_plane = bool(proof.get("tcpRoundTrip") or proof.get("udpRoundTrip"))
     if result == "PASS_END_TO_END":
         if evidence != "FIELD_MEASURED": errors.append("PASS_END_TO_END real-network claim requires FIELD_MEASURED evidence")
-        if proof.get("level") not in {"L2_DATA_PLANE", "L3_CORRELATED_DATA_PLANE"} or not data_plane:
-            errors.append("PASS_END_TO_END requires measured data-plane proof")
+        if proof.get("level") not in {"L2_DATA_PLANE", "L3_CORRELATED_DATA_PLANE"}: errors.append("PASS_END_TO_END requires L2 or L3 proof.level")
+        if not proof.get("connectionEstablished"): errors.append("PASS_END_TO_END requires proof.connectionEstablished")
+        if not substantive_data_plane: errors.append("PASS_END_TO_END requires a substantive TCP or UDP application data-plane flow; DNS alone is not sufficient")
+        if proof.get("exitProof") != "MATCHED": errors.append("PASS_END_TO_END requires a matched exit proof for a VPN-path claim")
     if result == "PASS_CONNECTION_ONLY" and proof.get("level") in {"L2_DATA_PLANE", "L3_CORRELATED_DATA_PLANE"}:
         errors.append("PASS_CONNECTION_ONLY cannot carry end-to-end proof level")
+    if proof.get("exitProof") == "MISMATCHED" and result in {"PASS_END_TO_END", "PASS_CONNECTION_ONLY"}:
+        errors.append("exit mismatch cannot produce a passing result (use FAIL_EXIT_MISMATCH)")
 
     restricted_context = record.get("scenario", {}).get("restrictedContext") if isinstance(record.get("scenario"), dict) else None
     if restricted_context == "RUSSIA_FIELD":
         if evidence != "FIELD_MEASURED" or network.get("countryCode") != "RU" or network.get("operator") in UNKNOWN:
             errors.append("RUSSIA_FIELD requires FIELD_MEASURED RU evidence with a real operator")
-
-    if path.get("transport") == "HYSTERIA2" and result not in {"NOT_TESTED", "BLOCKED"}:
-        errors.append("HYSTERIA2 remains pending production integration and cannot claim validation")
 
     if any(_secret_shaped(value) for value in _values(record)):
         errors.append("record contains secret/address-shaped repository-unsafe metadata")
