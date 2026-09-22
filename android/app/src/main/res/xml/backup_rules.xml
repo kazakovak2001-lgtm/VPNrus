@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 23-30 Auto Backup policy. Nova state is device-bound: credential
+  ciphertext depends on Android Keystore keys, while topology, identity,
+  routing, and history must be rebuilt and revalidated on a new install.
+  Exclude every backup domain rather than maintaining a fragile file list.
+-->
+<full-backup-content>
+    <exclude domain="root" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="external" path="." />
+    <exclude domain="device_root" path="." />
+    <exclude domain="device_file" path="." />
+    <exclude domain="device_database" path="." />
+    <exclude domain="device_sharedpref" path="." />
+</full-backup-content>

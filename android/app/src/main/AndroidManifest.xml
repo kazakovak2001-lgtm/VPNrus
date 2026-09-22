@@ -20,6 +20,8 @@
     <application
         android:name=".NovaVpnApplication"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:label="@string/app_name"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
