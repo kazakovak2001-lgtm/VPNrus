@@ -172,6 +172,33 @@ def post_hysteria_profile(
     return raw_request(port, "POST", "/v1/hysteria-profile", headers, body)
 
 
+def post_hysteria_auth(
+    port,
+    body_obj=None,
+    raw_body=None,
+    content_type="application/json",
+    set_content_length=True,
+    extra_headers=None,
+):
+    """Against /internal/hysteria-auth (B46-4P Option A) - NO
+    Authorization header at all: this is the Hysteria2 server's own
+    auth.type: http callback, never an activation-credential-authenticated
+    route."""
+    if raw_body is not None:
+        body = raw_body
+    else:
+        body = json.dumps({} if body_obj is None else body_obj).encode("utf-8")
+
+    headers = {}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    if set_content_length:
+        headers["Content-Length"] = str(len(body))
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "POST", "/internal/hysteria-auth", headers, body)
+
+
 def post_ingress_profile(
     port,
     credential=None,

@@ -34,7 +34,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, hysteria_provisioning, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
+from . import activations, hysteria_auth_backend, hysteria_provisioning, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -44,6 +44,19 @@ _PATH_ACTIVATE = "/v1/activate"
 _PATH_XRAY_PROFILE = "/v1/xray-profile"
 _PATH_INGRESS_PROFILE = "/v1/ingress-profile"
 _PATH_HYSTERIA_PROFILE = "/v1/hysteria-profile"
+# B46-4P - Option A (chosen architecture, see
+# docs/B46_4P_HYSTERIA2_PRODUCTION_DEPLOYMENT.md's "Auth backend
+# architecture" section): the Hysteria2 server's own `auth.type: http`
+# callback, served by THIS SAME process rather than a second unit/port.
+# Never proxied by nginx (no vhost location block exists or may ever be
+# added for this path - see that doc's own rationale) and never reachable
+# publicly by construction: server.py hardcodes this whole process's bind
+# host to 127.0.0.1, the SAME structural guarantee every other route here
+# already relies on - no additional loopback check is needed in this
+# handler for that reason alone. Deliberately under `/internal/`, not
+# `/v1/`, to keep it visually distinct from every client-facing route in
+# this file at a glance.
+_PATH_HYSTERIA_AUTH = "/internal/hysteria-auth"
 _PATH_MANIFEST = "/v1/manifest"
 _PATH_RELAY_HEALTH = "/v1/relay-health"
 
@@ -168,6 +181,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_hysteria_profile()
+            elif self.path == _PATH_HYSTERIA_AUTH:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_hysteria_auth()
             elif self.path == _PATH_MANIFEST:
                 if method != "GET":
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
@@ -825,6 +843,71 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # rotation, not idempotence" doc) - the response always carries
         # whichever secret is now the CURRENT one.
         return self._success(HTTPStatus.OK, payload)
+
+    # --- POST /internal/hysteria-auth (B46-4P Option A) ---
+    def _handle_hysteria_auth(self):
+        """The Hysteria2 server's own `auth.type: http` callback (see
+        gateway/api/hysteria_auth_backend.py's own docstring for the exact
+        wire contract this mirrors: POST {"addr","auth","tx"} ->
+        {"ok","id"}). Deliberately NOT wrapped in the _RequestError/
+        _error() pattern every other route uses: hysteria_auth_backend.
+        handle_auth_request already returns a complete, correct
+        (status, body) pair for EVERY input, malformed or not (always 200,
+        by design - see that module's own "never give a probing client a
+        distinguishable signal" doc), so there is no separate error path
+        to map here.
+
+        No Authorization: Bearer credential is expected or checked - the
+        presented Hysteria2 wire secret in the JSON body IS the credential
+        this call verifies, a fundamentally different shape from every
+        other route in this file (which authenticate an ALREADY-KNOWN
+        activation credential). Rate-limited by the SAME global_limiter
+        every other route shares - defense in depth against a
+        malfunctioning or compromised local Hysteria2 process hammering
+        this endpoint, even though it is not reachable from outside this
+        host (see _PATH_HYSTERIA_AUTH's own docs on the loopback-bind
+        guarantee).
+        """
+        if not self.server.global_limiter.allow("global"):
+            return self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"ok": False, "id": ""})
+
+        content_length = self.headers.get("Content-Length")
+        try:
+            length = int(content_length) if content_length is not None else 0
+        except ValueError:
+            length = 0
+        # hysteria_auth_backend's OWN _MAX_BODY_BYTES (8192), NOT this
+        # file's unrelated _MAX_BODY_BYTES (1024, sized for the smaller
+        # activation-credential/public-key bodies every other route here
+        # accepts) - that module's own auth field alone is bounded at 4096
+        # chars, so capping at 1024 here would silently truncate, and
+        # therefore misreject, an otherwise-valid larger request before
+        # handle_auth_request ever saw it.
+        length = max(0, min(length, hysteria_auth_backend._MAX_BODY_BYTES))
+        raw_body = self.rfile.read(length) if length else b""
+
+        cfg = self.server.config
+        if not (cfg.activation_store_path and cfg.hysteria2_store_path):
+            # Not configured on this deployment - same fail-closed,
+            # non-distinguishing shape hysteria_auth_backend itself
+            # already uses for every other rejection reason, never a
+            # separate 503 that would leak "not configured" to whatever
+            # reaches this loopback-only path.
+            status, body = 200, {"ok": False, "id": ""}
+        else:
+            def _verify(secret):
+                return hysteria_provisioning.verify_hysteria_auth(
+                    secret,
+                    cfg.activation_store_path, cfg.activation_lock_path,
+                    cfg.hysteria2_store_path, cfg.hysteria2_lock_path,
+                )
+            try:
+                status, body = hysteria_auth_backend.handle_auth_request(raw_body, _verify)
+            except hysteria_provisioning.HysteriaStoreError:
+                logger.error("hysteria_auth_store_error")
+                status, body = 200, {"ok": False, "id": ""}
+
+        return self._write_json(status, body)
 
     # --- GET /v1/relay-health (B26 task B) ---
     def _handle_relay_health(self):

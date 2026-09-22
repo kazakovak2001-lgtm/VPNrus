@@ -14,7 +14,7 @@ No AWS/security-group/server changes have been made. No Xray/AWG lab infrastruct
 | 2 | Backend Hysteria2 provisioning/API dispatch | **DONE** (as of item 1) | `hysteria_provisioning.provision_hysteria_identity`/`verify_hysteria_auth` (already existed, B46-4A) are now actually reachable through the route above. |
 | 3 | Stockholm UDP production-port audit/choice | **NOT STARTED** (design candidates only) | Requires inspecting real Stockholm host state (`ss`/`iptables`/Security Group on the live server) - no server access available in this environment (confirmed: no working SSH credential - see the prior read-only audit). `gateway/hysteria/README.md`'s own "Port choice" section lists technical candidates only; historical `34443` was a temporary test port, since removed, never a production decision. |
 | 4 | Production TLS/certificate handling | **NOT STARTED** (design ready) | Live audit (this pass, read-only `openssl s_client`): Stockholm's existing port-443 cert is issued for the bare IP only, not a DNS hostname - unusable as a real Hysteria2 SNI target. `gateway/hysteria/README.md`'s own "TLS / SNI" section documents this finding and recommends (does not create) a new subdomain under the already-owned `aknova.pp.ua` zone. No DNS record created, no certificate issued. |
-| 5 | systemd/service lifecycle | **IMPLEMENTED - NOT DEPLOYED** | `gateway/systemd/nova-hysteria2.service` is a real, `systemd-analyze verify`-clean unit template (mirrors `nova-xray.service`'s hardening exactly, re-justified per-directive, not copy-pasted) - not installed/enabled/started on any host. The loopback auth-backend listener this unit's config depends on is a SEPARATE, still-open design question (Option A: extend `pocvpn-api.service`; Option B: a new unit) - see `gateway/hysteria/README.md`'s "Auth backend listener" section - neither is implemented yet. |
+| 5 | systemd/service lifecycle | **IMPLEMENTED - NOT DEPLOYED** | `gateway/systemd/nova-hysteria2.service` is a real, `systemd-analyze verify`-clean unit template (mirrors `nova-xray.service`'s hardening exactly, re-justified per-directive, not copy-pasted) - not installed/enabled/started on any host. The loopback auth-backend listener this unit's config depends on is now RESOLVED as Option A (extend `pocvpn-api.service`) - see "Auth backend architecture" below - and actually implemented in `gateway/api/handler.py` (`POST /internal/hysteria-auth`), real-tested (9 new tests), but not yet deployed (requires a `pocvpn-api.service` redeploy). |
 | 6 | Native binary packaging | **PARTIAL - split into two independent tracks** | **Server-side supply chain: IMPLEMENTED - NOT DEPLOYED.** `gateway/hysteria/fetch-hysteria-server.sh` + `VERSION` (real, verified pinned commit/tag/checksum - cross-checked this pass against a genuine download, not fabricated) now exist, mirroring `gateway/xray/`'s own pattern; a GAP was found and documented (the official binary appears to link GPL-3.0-or-later `sing-tun` even in server mode - see VERSION/README's own "Licensing decision required" section) - not resolved, owner decision needed before install. **Android native binary packaging: still NOT STARTED**, unchanged from before this slice - `libnovahysteriachild.so`/`libnovatun2sockschild.so` remain in their B46-3B/B46-3C research locations, not touched this pass (Android was explicitly out of scope for this slice). |
 | 7 | Signed production manifest binding | **NOT STARTED** (preparation documented) | No `EndpointTransportBinding(HYSTERIA2, ...)` has been signed into any manifest artifact - confirmed empirically absent from the LIVE manifest (fetched and byte-scanned in the prior audit pass). This pass documents (does not execute) exactly what the offline signing ceremony (`gateway/tools/manifest_signing.py`) will need - see "Manifest signing preparation" below. |
 | 8 | Client/server facts come from trusted signed topology, never blindly taken from the provisioning response | **DONE (verified this pass)** | `Hysteria2ProfileProvisioner.provision` (`android/app/src/main/java/net/pocvpn/client/provisioning/Hysteria2ProfileProvisioner.kt:53-78`) resolves the trusted `SignedTransportProfile.Hysteria2` FIRST and fails closed (`NoTrustedBinding`) before ever dialing the network; once resolved, the response's own `server_address`/`server_port`/`sni`/`obfuscation_mode` are cross-checked against that pinned profile and rejected (`Mismatched`) on any disagreement - the control-plane response is authority for SECRET material only. `MainViewModel`'s manual-connect path (`MainViewModel.kt:2932`) re-resolves the SAME `trustedTransportBindingFor` call at execution time, so a manually forced HYSTERIA2 selection gets no shortcut around the trusted signed binding either. No code change was needed for this item - already correct from B46-4A. |
@@ -110,6 +110,108 @@ Strict scope: **no server was connected to, no production deployment performed.*
 
 Cannot proceed until #3/#4/#5/#6(deployment)/#7 are genuinely green.
 
+## Architecture-gates slice: licensing audit, auth backend decision, endpoint contract
+
+Strict scope, same as every prior B46-4P pass: **no SSH, no DNS, no AWS changes, no firewall, no TLS issuance, no systemd install, no signing, no live manifest update.** This pass closes two open architectural questions with real evidence and one implementation, and produces a precise, git-only contract for the three items (#3/#4/#7) that still require a production decision or a live deployment.
+
+## Licensing decision gate
+
+Full technical audit performed against upstream source/release/API at the exact pinned commit (`e1366b173ccf5706e1e4630fe8aa654a4b574085` / `app/v2.12.3`) - see `gateway/hysteria/README.md`'s own "Licensing decision gate" section for the complete evidence table (Hysteria2's `app` module is MIT; `apernet/sing-tun` - the module actually linked - is GPL-3.0-or-later, verified by fetching its `LICENSE` file directly at its pinned pseudo-version commit; the dependency is statically linked into one monolithic binary regardless of which subcommand runs, confirmed via `file` and a direct byte-scan for `sing-tun.*` symbols; `app/cmd/server.go`'s own import list does NOT reference `tun`/`sing-tun` at the source level - only `app/cmd/client.go` does, with no build tag gating it out of the binary; no official server-only release variant exists).
+
+**This remains a technical evidence report, not a legal conclusion.** The repository owner/legal must decide: whether running this exact statically-linked multi-command binary (with only the `server` subcommand ever invoked, and Nova's own server-side Python code entirely separate and never linked into it) triggers GPLv3's own distribution/copyleft obligations for the surrounding proprietary deployment - and, if so, whether to invest in a stripped server-only rebuild instead. **Status: BLOCKED - licensing review**, not resolved by this or any prior pass.
+
+## Auth backend architecture
+
+**Decided and implemented this pass: Option A** (extend `pocvpn-api.service`, not a separate unit).
+
+| Criterion | Option A (extend `pocvpn-api.service`) | Option B (separate `nova-hysteria-auth.service`) |
+|---|---|---|
+| Security - network exposure | Inherits the SAME hardcoded `127.0.0.1`-only bind `server.py` already enforces for every route - no new listener, no new attack surface to reason about. | Would need its own bind-host decision, own review of whether it could ever be misconfigured to listen elsewhere - a new surface. |
+| Security - secret handling | Reuses the SAME `hysteria_store.py`/`activations.py` file access `/v1/hysteria-profile` already has - no new file permission model. | Would need its OWN read access to the identical two stores - no actual isolation gained, since both processes would need to reach the SAME files. |
+| Isolation / blast radius | A compromise of `pocvpn-api.service` already reaches the Hysteria2 store today (via `/v1/hysteria-profile`) - Option A adds no NEW data this process couldn't already reach. | Would only meaningfully reduce blast radius if the new process held a secret `pocvpn-api` does NOT already have - it does not (same stores). No real isolation benefit found. |
+| Reliability - restart behavior | A `pocvpn-api.service` restart (`Restart=on-failure`, `RestartSec=2`) briefly interrupts NEW Hysteria2 connection attempts only - existing QUIC sessions are unaffected (Hysteria2 authenticates once per connection, not per packet). | New connection auth would survive a `pocvpn-api.service` restart - a real, small reliability edge, but for a ~2s window on a low-frequency endpoint. |
+| Reliability - dependency ordering | None needed - same process, same lifecycle, already running before Hysteria2 would ever start (existing `pocvpn-api.service` predates any Hysteria2 deployment). | Would need explicit `After=`/`Requires=` ordering against a new unit - one more thing to get right and keep right. |
+| Operational complexity | Zero new units, zero new env files, zero new log streams/monitoring targets - the existing `pocvpn-api` observability (`_log_request`, rate limiters) already covers the new route. | One more systemd unit, one more env file, one more log stream, one more thing to monitor/alert on/document in runbooks - for a route with no isolation benefit over Option A. |
+| Existing architecture fit | Matches this project's own established pattern exactly: `/v1/xray-profile`, `/v1/hysteria-profile`, and (on the ingress host) `/v1/ingress-profile` are ALL served by the same kind of single `pocvpn-api`-shaped process per role - never a dedicated per-feature listener. | Would be the FIRST exception to that pattern in this codebase, with no evidence-backed reason found for why Hysteria2's auth callback specifically needs one. |
+| Performance | Auth is a low-frequency, per-connection-establishment event (not per-packet) - `ThreadingHTTPServer`'s existing per-request-thread model already handles this with no changes needed. | Same low frequency - a dedicated process would not measurably improve latency/throughput here; not a real differentiator. |
+
+**Evidence-based conclusion**: Option A is the correct architecture. No security/isolation dimension favors Option B once the actual data-access overlap is accounted for (both options reach the identical two stores; Option B's usual isolation argument - the one that DOES justify `nova-xray-ingress.service` being separate from `nova-xray.service`, namely a distinct REALITY private key per gateway role - does not apply here, since there is no per-role secret split for the Hysteria2 auth backend). Option A also has a real, if small, reliability trade-off (new-connection auth is briefly unavailable during a `pocvpn-api.service` restart) - accepted as the correct trade against Option B's real operational-complexity cost and its complete absence of an offsetting security benefit.
+
+**Implemented this pass** (git-only, not deployed): `gateway/api/handler.py`'s `POST /internal/hysteria-auth`, wired to the already-existing `gateway/api/hysteria_auth_backend.handle_auth_request` + `hysteria_provisioning.verify_hysteria_auth`. 9 new end-to-end tests (`gateway/api/tests/test_hysteria_auth_endpoint.py`) prove the full chain against a real running server: issuance → provisioning → auth success, wrong-secret rejection, live revocation (auth stops working immediately, zero Hysteria2 server reload - the entire point of choosing `auth.type: http`), retry-safe-rotation invalidating the old secret, malformed-body handling, no-Authorization-header operation (this route authenticates via the presented wire secret in the body, never an activation credential), and not-configured fail-closed behavior. **Status: DESIGN COMPLETE AND IMPLEMENTED - NOT DEPLOYED** (real code, zero live server change - `pocvpn-api.service` on Stockholm still runs the old code until an operator redeploys it).
+
+## Production endpoint contract
+
+| Field | Status | Value / finding |
+|---|---|---|
+| Hostname | **NOT DECIDED** (design ready) | Neither existing Stockholm hostname is reusable: `edge-sthlm.aknova.pp.ua` is a Cloudflare-fronted HTTPS/TCP origin for the XHTTP ingress role (wrong protocol shape for raw UDP/QUIC); `control.aknova.pp.ua` (a real, live, working hostname+cert found this pass by direct probe - NOT represented in any nginx file tracked in this repository, a documentation-drift finding) is this gateway's own control-plane/API identity, and reusing it for an unrelated protocol would be a confusing identity overload. Recommended shape only: `hysteria-sthlm.aknova.pp.ua` (mirrors the existing `<role>-sthlm.aknova.pp.ua` convention `edge-sthlm`/`origin-sthlm` already establish) - checked this pass, currently unclaimed (DNS `NXDOMAIN`). **Not created.** |
+| UDP port | **NOT DECIDED** (Variant 2 - explicit deployment decision, per this slice's own instruction) | No project convention names a specific port for a new UDP transport (AWG's `51820` is its own historical/protocol-specific choice; Xray's TCP `2053` was a one-off "avoid known ports" decision documented in `gateway/xray/README.md` - neither generalizes to a rule). Historical `34443` was a temporary test port, since closed - not a precedent. **Formalized as an explicit, un-hardcoded placeholder**: `NOVA_HYSTERIA2_LISTEN_PORT` (already the real env var name `gateway/hysteria/render_server_config.py` reads - no number is baked in anywhere in git). |
+| SNI | **NOT DECIDED** | Follows directly from Hostname above - whatever hostname is minted becomes the SNI value in both the Hysteria2 server's own TLS cert and the signed manifest's `hysteria2Profile.sni` field. |
+| TLS cert path | **NOT DECIDED** (mechanism proven, specific paths not) | `render_server_config.py`'s `tls_cert_file`/`tls_key_file` fields are real, validated (absolute-path, fail-closed on blank/relative), and env-driven (`NOVA_HYSTERIA2_TLS_CERT_FILE`/`_KEY_FILE`) - no path is hardcoded. The actual files do not exist yet (no cert issued). |
+| Certificate ownership | **Convention decided, not yet applied** | Same Let's Encrypt-via-certbot lifecycle this gateway already uses for its other certs (the bare-IP vhost's own 160h-renewal automation, `gateway/edge/pocvpn-cert-check.service`) - `control.aknova.pp.ua`'s own cert (found live, 90-day validity) proves normal-hostname Let's Encrypt issuance already works on this exact host, whatever the exact issuance mechanism (not tracked in this repo). |
+| Renewal mechanism | **NOT VERIFIED for a new hostname** | `control.aknova.pp.ua`'s cert is currently valid and mid-lifecycle (`2026-09-14`..`2026-12-13`) - proves SOME renewal automation exists for it live, but its exact mechanism/hook is not tracked in this repository and was not reverse-engineered this pass. A new Hysteria2 hostname would need its own renewal hook confirmed working after issuance - a post-deployment verification item (see checklist below). |
+| Hysteria2 server config expectation | **Implemented, env-driven, fail-closed** | `render_server_config.py`'s `HysteriaServerConfig` dataclass has no default for any of these four fields - a deploy-time render with any one missing/malformed raises `HysteriaServerConfigRenderError` before any file is written. |
+
+## TLS contract
+
+Explicit, to avoid ever silently overclaiming readiness:
+
+- **What already exists**: this project's Let's Encrypt/certbot renewal automation is proven working, live, TWICE on this exact host (Stockholm's bare-IP cert AND `control.aknova.pp.ua`'s hostname cert, both currently valid) - the MECHANISM is not a risk. `Hysteria2ChildRuntime`'s hard `insecure=false` production gate (B46-4A) already refuses to start without a real, valid TLS setup - this cannot be silently weakened to make a test connection "work".
+- **What must be created (owner + explicit approval, not this pass)**: a new DNS record for the chosen hostname, pointed directly at Stockholm's IP (no Cloudflare fronting - Hysteria2 needs a genuine UDP/QUIC path to the origin); a new Let's Encrypt certificate for that hostname; a renewal hook covering it; read permission for the `nova-hysteria2` service account on the resulting `privkey.pem` (Let's Encrypt's own default is root-only - flagged, not resolved, in `gateway/hysteria/README.md`'s own "Certificate file permissions" note).
+- **What must be verified after deployment (not claimed here)**: the issued cert's SAN actually matches the chosen hostname; `openssl s_client -connect <host>:<port>` (adapted for QUIC/UDP, which `s_client` itself cannot directly probe - a real Hysteria2 client-side connection attempt is the actual proof) succeeds with `insecure=false`; the cert renews automatically before its first real expiry with no manual step; the `nova-hysteria2` process can actually read the key file under its own non-root UID at start time.
+
+## Manifest contract
+
+Exact model for the future (NOT executed) signing ceremony, verified this pass directly against the real, live `gateway/tools/manifest_signing.py` schema and `gateway/tools/production_manifest_2026-09-20_v4.json` (the real, currently-live manifest's own tracked JSON source - confirmed this pass to carry `signingKeyId="prod-manifest-key-2026-09-14"`, matching the live-fetched manifest exactly, and confirmed the `stockholm` endpoint's current `transports` list is `[0, 1, 3]` = `AMNEZIA_WG`/`XRAY_REALITY`/`TLS_TCP` only - no `5` (`SHADOWSOCKS_2022`) or `6` (`HYSTERIA2`) yet):
+
+```text
+server identity            -> Stockholm's own IP/host (already known, unchanged)
+    |
+hostname                   -> NEW, NOT YET MINTED (see "Production endpoint contract")
+    |
+UDP port                   -> NOT YET DECIDED (NOVA_HYSTERIA2_LISTEN_PORT placeholder)
+    |
+TLS/SNI                    -> depends on hostname above; cert NOT YET ISSUED
+    |
+Hysteria2 server            -> gateway/hysteria/ (fetch/config/systemd - IMPLEMENTED, NOT DEPLOYED)
+    |
+signed manifest             -> gateway/tools/manifest_signing.py (offline ceremony - NOT RUN)
+    |                          adds ONE new TransportBinding to the EXISTING "stockholm" endpoint:
+    |                            kindOrdinal = 6           (HYSTERIA2 - confirmed last-appended ordinal)
+    |                            host        = <Stockholm's existing address>
+    |                            port        = <from UDP port decision above>
+    |                            metadata    = {"hysteria2Profile":
+    |                                            "{\"version\":1,\"sni\":\"<from hostname decision>\",\"obfuscationMode\":\"NONE\"}"}
+    |                          (no other Hysteria2-specific field exists in the schema -
+    |                           confirmed by reading Hysteria2ProfileMetadata.kt directly)
+    |
+Android trusted binding      -> EndpointManifestRepository.trusted() + Ed25519ManifestVerifier
+    |                          (existing mechanism, unchanged, untouched by this slice)
+    |
+credential provisioning      -> POST /v1/hysteria-profile (live in code since the prior B46-4P slice)
+    |                          -> POST /internal/hysteria-auth (live in code as of THIS slice)
+    |
+Hysteria2 eligibility         -> MainViewModel.isHysteria2AvailableFor (existing, unchanged, B46-4A)
+```
+
+Each arrow's source of truth is a single, distinct artifact - no step is inferred from another. **No live manifest was read-written this pass. No signing was performed. No new manifest artifact was produced.**
+
+## Pre-deployment checklist
+
+- [ ] licensing review completed (owner/legal - see "Licensing decision gate" above)
+- [ ] auth architecture fixed - **DONE this pass** (Option A, implemented, tested; not yet deployed)
+- [ ] production hostname selected
+- [ ] UDP port selected
+- [ ] DNS ready
+- [ ] TLS certificate ready
+- [ ] server binary checksum verified - **DONE** (`gateway/hysteria/VERSION`, cross-checked against a genuine download)
+- [ ] systemd unit reviewed - **DONE this pass** (`gateway/systemd/nova-hysteria2.service`, `systemd-analyze verify`-clean)
+- [ ] firewall rule prepared
+- [ ] API deployment prepared - **partially DONE** (`gateway/api/handler.py`/`config.py` code is ready; the actual `pocvpn-api.service` redeploy is not performed)
+- [ ] manifest generated
+- [ ] manifest signature verified
+- [ ] Android trusted binding verified
+- [ ] physical OPPO test performed
+
 ## Decision gate
 
-**Do not call this MERGE READY or production-deployed.** Items 1, 2, 8, and 9 of the B46-4P checklist are done and tested. Item 5 (systemd) and the server-side half of item 6 (native binary packaging) are now **IMPLEMENTED - NOT DEPLOYED** (real, tested, reviewable git artifacts; zero live infrastructure change). Items 3 and 4 have real audit findings and technical design recommendations but remain **NOT STARTED** as production decisions - no port was chosen, no hostname/certificate was created. Item 7 remains **NOT STARTED** - preparation only, no signing performed. Item 10 remains **BLOCKED**. A newly-found GPL-licensing question for the server-side Hysteria2 binary (see `gateway/hysteria/VERSION`) also awaits an explicit owner decision, independent of B46-2B/2C's own still-open client-side equivalent. B46-4A's PR #111 remains draft.
+**Do not call this MERGE READY or production-deployed.** Items 1, 2, 8, and 9 of the B46-4P checklist are done and tested. Item 5 (systemd + auth backend) is now **DESIGN COMPLETE AND IMPLEMENTED - NOT DEPLOYED** (the auth-backend architecture question is RESOLVED this pass, Option A, with real working code and tests). The server-side half of item 6 (native binary packaging) is **IMPLEMENTED - NOT DEPLOYED**; the licensing question found alongside it remains **BLOCKED - licensing review**, an explicit, separate gate from deployment readiness. Items 3 and 4 have a precise, git-only-decided contract (env var names, validation, technical recommendations) but remain **NOT STARTED** as production decisions - no port was chosen, no hostname/certificate was created (a real, previously-untracked hostname+cert precedent, `control.aknova.pp.ua`, was found live on Stockholm this pass, raising confidence that minting a new one is low-risk, but nothing was minted). Item 7 remains **NOT STARTED** - the exact manifest diff the future signing ceremony will need is now fully specified, but no signing was performed. Item 10 remains **BLOCKED**. B46-4A's PR #111 remains draft.

@@ -56,37 +56,30 @@ its own "verification"), then independently downloaded the actual binary
 and re-computed its sha256 - **it matched exactly**. See VERSION for the
 full record.
 
-## GAP - Licensing decision required (server side, newly found this pass)
+## Licensing decision gate (server side) - deep audit this pass
 
-The official `hysteria-linux-amd64` release asset was **byte-scanned this
-pass** and does contain `sing-tun` symbols (`sing-tun.New`,
-`sing-tun.NewNat`, ...) - the same GPL-3.0-or-later dependency
-`docs/B46_2B_HYSTERIA_TUN_BRIDGE_ARCHITECTURE.md` and
-`docs/B46_2C_PERMISSIVE_HYSTERIA_PATH.md` already found linked into
-Hysteria2's own Android CHILD binary regardless of whether Nova enables
-its `tun:` config. **This is the same open question, now confirmed on the
-SERVER side too**: this gateway would only ever run `hysteria server`
-(never `client`/`tun` mode), but the prebuilt official binary is one
-multi-purpose executable that appears to link the GPL code either way.
+Full technical evidence report - **no legal conclusion is drawn**. Every
+row below was verified directly against upstream source/release/API at
+the exact pinned commit/release, not inferred from a blog post or a
+generic "is X GPL" search.
 
-**This pass does NOT resolve this** - per B46-2B/2C's own still-open
-licensing gate for the client-side tun path, the repository owner must
-make an explicit, informed decision before this binary is installed on
-any production host:
+| Item | Evidence |
+|---|---|
+| Hysteria2 (`app` module) license | **MIT** - `app/LICENSE.md` at commit `e1366b17...`, fetched and read directly: standard MIT text, copyright "Toby" (upstream maintainer), 2023. |
+| `sing-tun` license | **GPL-3.0-or-later** - `github.com/apernet/sing-tun` (an apernet-maintained fork of `sagernet/sing-tun`), pinned in `app/go.mod` at `v0.2.6-0.20250920121535-299f04629986`. `LICENSE` fetched directly at that exact pseudo-version's commit (`299f04629986`): full GPLv3-or-later text, copyright nekohasekai/sagernet, 2022. No linking exception clause present in that file. |
+| Is the dependency statically linked | **Yes, unconditionally, for the whole binary** - `file` on the downloaded `hysteria-linux-amd64` asset reports "statically linked" (confirmed this pass); Go's own toolchain merges all imported packages into one executable by default (no dynamic `.so` loading for this dependency). |
+| Is it used in server runtime | **No, source-level - but yes, binary-level.** `app/cmd/server.go`'s own import list (fetched and read directly) contains NO reference to `tun`/`sing-tun` at all - the `hysteria server` code path this gateway would actually invoke never calls into that dependency. However, `app/cmd/client.go` (fetched and read directly) DOES import `github.com/apernet/hysteria/app/v2/internal/tun` (which wraps `sing-tun`), and registers itself via a package-level `func init() { rootCmd.AddCommand(clientCmd) }` with **no Go build tag** gating that file - Go's linker therefore includes `client`'s (and transitively `sing-tun`'s) compiled code in the SAME single binary as `server`, regardless of which subcommand is ever invoked at runtime. Confirmed directly by byte-scanning the actual downloaded release asset: real `sing-tun.*` symbols are present (`sing-tun.New`, `sing-tun.NewNat`, ...). |
+| Official alternative server-only artifact | **Does not exist.** The release's own asset list (`hashes.txt`, fetched directly) offers per-OS/arch variants (`hysteria-linux-amd64`, `hysteria-android-arm64`, ...) but no "server-only"/"no-tun" build variant for any platform - every asset is the same multi-command CLI binary. No build-tag-gated alternative source target was found in `app/cmd/` either. |
+| Real impact on Nova VPN | This gateway would run `hysteria server --config ...` exclusively (see `gateway/systemd/nova-hysteria2.service`) - the GPL-covered code path is never executed at runtime by this deployment's own design. The open question is narrower and purely about **distribution**: does shipping/running a single statically-linked binary that CONTAINS GPL-3.0-or-later object code (even though this deployment's own configuration never reaches it) trigger GPLv3's own copyleft/distribution obligations for the surrounding proprietary Nova VPN deployment. This is the exact same shape of question B46-2B/2C already raised and left open for the Android client-side `tun` path - now confirmed to apply symmetrically to the server side. |
+| What must be posed to legal/the repository owner | (1) Does running this exact statically-linked multi-command binary, where only the `server` subcommand is ever invoked, constitute "conveying" or "distribution" of a work that would trigger GPLv3 §5/§6 obligations, given Nova's own server-side code (`gateway/api/*.py`) is entirely separate and never linked into this binary. (2) If legal risk is judged unacceptable, whether to invest in option (b) below (a stripped, server-only rebuild) instead. (3) Whether this question has already been resolved by an existing organizational legal opinion covering the Android client-side finding (B46-2B/2C) that could be extended to this server-side finding directly, rather than requiring an independent review. |
 
-1. Accept the GPL-3.0-or-later linkage as-is (the server process itself
-   never invokes tun-related code paths, but the binary still contains
-   the code).
-2. Build a stripped, server-only binary from this SAME pinned source
-   commit without tun build tags/dependencies (mirroring B46-2C's own
-   "minimal Hysteria2 SOCKS5-only client" approach, but for
-   `app/cmd/server.go` instead) - **not attempted this pass**.
+**Options, unchanged from the prior pass, still not decided:**
+
+1. Accept the GPL-3.0-or-later linkage as-is (the server process itself never invokes tun-related code paths, but the binary still contains the code) - pending the legal answer above.
+2. Build a stripped, server-only binary from this SAME pinned source commit without tun build tags/dependencies (mirroring B46-2C's own "minimal Hysteria2 SOCKS5-only client" approach, but for `app/cmd/server.go` instead) - **not attempted this pass** (would require a Go build environment and a source-level fork/strip, out of this slice's git-only documentation scope).
 3. Some other licensing-compliant distribution path.
 
-`fetch-hysteria-server.sh` still fetches/verifies/installs the official
-pinned asset (that part is real, verified, and reproducible) - this GAP
-blocks the DECISION to actually run it in production, not the git-only
-fetch/pin mechanism itself.
+`fetch-hysteria-server.sh` still fetches/verifies/installs the official pinned asset (that part is real, verified, and reproducible) - this GAP blocks the DECISION to actually run it in production, not the git-only fetch/pin mechanism itself.
 
 ## Server config (`render_server_config.py`)
 
@@ -141,41 +134,34 @@ as-is, never a second, Hysteria2-managed ACME flow.
 |---|---|---|
 | `NOVA_HYSTERIA2_AUTH_BACKEND_URL` | `http://127.0.0.1:8446/internal/hysteria-auth` (see "Auth backend" below) | Loopback-only, never exposed publicly, never touches DNS/firewall/TLS - the same class of decision `gateway/xray/README.md` made for Xray's own `2053` port choice. `8446` continues the existing loopback port sequence already used by `pocvpn-api` process variants (`8443` exit, `8444` ingress, `8445` xhttp-ingress - confirmed by grep, not guessed). |
 
-## Auth backend listener - OPEN DESIGN QUESTION (not resolved this pass)
+## Auth backend listener - RESOLVED this pass (Option A implemented)
 
 `gateway/api/hysteria_auth_backend.py`'s `handle_auth_request` function is
-real, tested, and reachable from Python - but **has no live HTTP route
-anywhere**, not even an internal one. This is a genuine, newly-confirmed
-GAP (distinct from `/v1/hysteria-profile`, which IS live as of the prior
-B46-4P slice). Two architectures are possible; this pass does not choose
-one, per the task's own "if the exact mechanism cannot be safely
-determined from the repository, do not guess" instruction:
+now reachable via a real, live, tested route: `POST /internal/hysteria-auth`
+in `gateway/api/handler.py`, served by the SAME `pocvpn-api.service`
+process `/v1/hysteria-profile` already runs in (Option A - see
+`docs/B46_4P_HYSTERIA2_PRODUCTION_DEPLOYMENT.md`'s "Auth backend
+architecture" section for the full Option A vs. B comparison and its
+evidence). `pocvpn-api` already binds to `127.0.0.1` only (hardcoded in
+`server.py`, not configurable) - the new route inherits that guarantee
+for free, with no new systemd unit, no new process, no new port, and no
+additional application-level loopback check needed. Reused, not
+duplicated: the same `activation_store_path`/`hysteria2_store_path`
+config fields the prior slice's `/v1/hysteria-profile` route already
+uses, and the same `global_limiter` every other route shares.
 
-**Option A (recommended, not yet implemented): extend the existing
-`pocvpn-api.service` process** with one new internal-only route
-(`POST /internal/hysteria-auth`) in `gateway/api/handler.py`. `pocvpn-api`
-already binds to `127.0.0.1` only (confirmed: "never public directly" -
-see `gateway/xray/README.md`'s own "Current gateway occupancy" table) -
-adding a path nginx's vhost never proxies achieves the exact same
-"reachable ONLY from the Hysteria2 server process on the same host"
-property B46-4A's own doc calls for, with **no new systemd unit, no new
-process, no new port** to manage. This is the simpler, more consistent
-option, but it was **not implemented this pass** - the task explicitly
-scoped this slice away from touching `handler.py` except for a genuinely
-necessary contract-mismatch fix, and this is a new capability, not a fix.
+Real, end-to-end tested this pass (`gateway/api/tests/test_hysteria_auth_endpoint.py`,
+9 tests, all passing against a real running `ProvisioningServer`):
+issuance → provisioning → successful auth, wrong-secret rejection,
+revoked-activation rejection (proves live revocation with zero Hysteria2
+server reload - the entire reason `auth.type: http` was chosen over
+`password`/`userpass`), rotated-secret invalidation of the old value,
+malformed-body handling, no-Authorization-header operation, and
+not-configured fail-closed behavior.
 
-**Option B: a separate, dedicated minimal listener unit**, as B46-4A's
-own doc's "Server deployment proposal" section originally sketched
-("started by its own unit"). This project does NOT currently prepare a
-systemd unit for this option - doing so would mean guessing a mechanism
-(a whole second process's own shape, env vars, hardening profile) this
-pass has no repository evidence to safely determine, exactly what the
-task instructions say not to do. If Option B is chosen instead of A, that
-unit still needs to be designed from scratch in a future pass.
-
-**Either way**, `nova-hysteria2.service`'s own `config.yaml` merely
-assumes SOME loopback URL will exist and answer - it does not depend on
-which option is chosen.
+**Still NOT deployed**: this is a real code change, live only once
+`pocvpn-api.service` is actually redeployed with this code and restarted
+- no server was touched this pass.
 
 ## Port choice (#3) - NOT decided by this pass
 
@@ -201,42 +187,74 @@ Technical candidates only, **not a decision**:
 **The repository owner must make this decision after a real port audit
 that this environment cannot perform (no SSH access).**
 
-## TLS / SNI (#4) - NOT decided by this pass
+## TLS / SNI (#4) - NOT decided by this pass, but design confidence raised
 
-Live audit finding (read-only, confirmed this pass and the prior one):
-Stockholm's existing production TLS certificate (port 443, the
-`pocvpn-api` HTTPS edge) is issued **only for the bare IP**
-`16.170.208.231` (`ssl_certificate /etc/letsencrypt/live/16.170.208.231/...`,
-`server_name _;` in `gateway/edge/nginx-pocvpn-stockholm.conf`) - not
-usable as a DNS-name-shaped SNI target, which Android's own
+Live audit finding (read-only): the SPECIFIC vhost tracked in
+`gateway/edge/nginx-pocvpn-stockholm.conf` (`server_name _;`) uses a TLS
+certificate issued **only for the bare IP** `16.170.208.231`
+(`/etc/letsencrypt/live/16.170.208.231/...`) - not usable as a
+DNS-name-shaped SNI target, which Android's own
 `Hysteria2ProfileMetadata.isValidSni` (and standard QUIC/TLS SNI
-practice) expects.
+practice) expects. **This finding still stands for that one vhost file.**
 
-A SECOND real hostname already exists for Stockholm -
-`edge-sthlm.aknova.pp.ua` (`gateway/edge/nginx-pocvpn-cdn-origin-stockholm.conf`),
-with its own real Let's Encrypt cert. **This is NOT reusable for
-Hysteria2 as-is**: it is a Cloudflare-fronted HTTPS/TCP origin for the
-XHTTP ingress role specifically (`Android -> Cloudflare edge -> HTTPS
-origin nginx -> loopback Xray XHTTP inbound` - confirmed from that
-file's own header comment) - a completely different protocol shape
-(TCP/HTTP semantics) from Hysteria2's raw UDP/QUIC, and Cloudflare does
-not front arbitrary UDP/QUIC for a custom protocol the way it fronts
-XHTTP. Reusing this exact hostname/cert for a second, unrelated protocol
-on a different port would also be a confusing identity overload, not a
-clean design.
+**New this pass - a real, working hostname+cert precedent was found
+LIVE on this exact host, not represented in any file tracked in this
+repository:** `https://control.aknova.pp.ua/v1/manifest` was probed
+read-only and resolves DIRECTLY to `16.170.208.231` (confirmed via
+`curl`'s own `%{remote_ip}` - not Cloudflare-proxied, a direct A record),
+presents its OWN dedicated, currently-valid Let's Encrypt certificate
+(`subject=CN=control.aknova.pp.ua`, `SAN: DNS:control.aknova.pp.ua`,
+90-day validity `2026-09-14..2026-12-13` - a NORMAL Let's Encrypt
+lifetime, structurally different from the bare-IP vhost's own 160-hour/
+~6.6-day short-lived IP-certificate program), and `POST /v1/activate`
+through it returns `411` (Length Required) - the SAME real
+`gateway/api/handler.py` code path the bare-IP vhost also reaches, not a
+different backend. **This means Stockholm already runs a live, working
+hostname-based HTTPS vhost that is NOT represented in
+`gateway/edge/nginx-pocvpn-stockholm.conf` as tracked in this repository**
+- a real documentation/repo-drift finding, not something this pass
+attempts to reconcile (no nginx file was edited).
 
-**Technical recommendation only, not a decision**: a NEW, DISTINCT
+This substantially de-risks the earlier "a new hostname needs to be
+minted from scratch" framing: hostname-based TLS on a normal (not
+short-lived-IP) Let's Encrypt certificate is **already proven working on
+this exact host**, today, live - it is not a hypothetical capability.
+`POST /v1/hysteria-profile` and `POST /internal/hysteria-auth` were also
+probed through `control.aknova.pp.ua` this pass and both correctly
+returned `404` (not yet deployed - confirms zero accidental deployment
+happened, consistent with this slice's own constraints).
+
+A SECOND real hostname exists for Stockholm -
+`edge-sthlm.aknova.pp.ua` (`gateway/edge/nginx-pocvpn-cdn-origin-stockholm.conf`,
+tracked in this repo, unlike `control.aknova.pp.ua` above), with its own
+real Let's Encrypt cert. **Neither `edge-sthlm.aknova.pp.ua` nor
+`control.aknova.pp.ua` is reusable for Hysteria2 as-is**:
+`edge-sthlm.aknova.pp.ua` is a Cloudflare-fronted HTTPS/TCP origin for
+the XHTTP ingress role specifically (`Android -> Cloudflare edge ->
+HTTPS origin nginx -> loopback Xray XHTTP inbound`) - a completely
+different protocol shape (TCP/HTTP semantics) from Hysteria2's raw
+UDP/QUIC, and Cloudflare does not front arbitrary UDP/QUIC for a custom
+protocol the way it fronts XHTTP. `control.aknova.pp.ua` is this
+gateway's own control-plane/API identity - reusing it for an unrelated
+raw-UDP protocol on a different port would be a confusing identity
+overload, not a clean design, exactly the same reasoning that already
+ruled out `edge-sthlm.aknova.pp.ua`.
+
+**Technical recommendation only, still not a decision**: a NEW, DISTINCT
 subdomain under the SAME already-owned zone (`aknova.pp.ua` - confirmed
-owned/DNS-managed by this project via the two live hostnames above, plus
-`control.aknova.pp.ua`/`origin-sthlm.aknova.pp.ua` found in the live
-manifest's own `cdnProviderProfile` metadata) would need to be minted -
-e.g. shaped like `hy2-sthlm.aknova.pp.ua` - pointed **directly** at
+owned/DNS-managed by this project via the three live hostnames above,
+plus `origin-sthlm.aknova.pp.ua` found in the live manifest's own
+`cdnProviderProfile` metadata) would need to be minted - e.g. shaped like
+`hy2-sthlm.aknova.pp.ua` (checked this pass: does not currently resolve -
+DNS `NXDOMAIN`, confirmed genuinely unclaimed) - pointed **directly** at
 Stockholm's own IP (no Cloudflare fronting, since Hysteria2 needs a real
-UDP/QUIC path to the origin), with its own dedicated Let's Encrypt
-certificate (HTTP-01 or DNS-01, whichever this project's existing ACME
-tooling already supports - not investigated further this pass).
+UDP/QUIC path to the origin), with its own dedicated, normal-lifetime
+Let's Encrypt certificate issued the SAME way `control.aknova.pp.ua`'s
+evidently already was (exact issuance mechanism - HTTP-01 vs. DNS-01,
+which ACME client/hook - not determinable from this repository's tracked
+files alone, since that vhost's own config is not tracked either).
 **No DNS record was created and no certificate was issued or requested -
-both are explicitly out of scope for this slice.**
+both remain explicitly out of scope for this slice.**
 
 ### Certificate file permissions (operational note, not resolved this pass)
 
