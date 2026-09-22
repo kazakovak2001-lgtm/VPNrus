@@ -667,6 +667,14 @@ private fun buildDiagnosticsLines(
     // "-" means never attempted (e.g. MANIFEST_URL unconfigured for this
     // build), never a decision input.
     val lastManifestRefreshLine = "Last manifest refresh: ${viewModel.lastManifestRefreshOutcome.value ?: "-"}"
+    // B46-4P #9 - purely observational, mirrors lastManifestRefreshLine's own
+    // "-" = never attempted convention: surfaces MainViewModel's EXISTING
+    // hysteria2ProfileProvisioningState (wired since B46-4A's Finding 5,
+    // set once per activateDevice() call that reaches Hysteria2
+    // provisioning) - this line was the only thing missing to make that
+    // state's success/failure outcome visible anywhere in the UI; no new
+    // state mechanism was added to produce it.
+    val hysteria2ProvisioningLine = "Hysteria2 provisioning: ${viewModel.hysteria2ProfileProvisioningState.value?.toString() ?: "-"}"
 
     return listOf(
         "State: ${transportDisplayText(diagnostics.transportState)}",
@@ -706,6 +714,7 @@ private fun buildDiagnosticsLines(
         autoAttemptLine,
         activeGatewayLine,
         lastManifestRefreshLine,
+        hysteria2ProvisioningLine,
         "Provisioning: ${provisioningDisplayText(provisioningState)}",
         "Profile source: ${profileSourceDisplayText(profileSource)}",
         "Handshake: ${diagnostics.lastHandshakeEpochMillis?.let { "${System.currentTimeMillis() - it}ms ago" } ?: "-"}",

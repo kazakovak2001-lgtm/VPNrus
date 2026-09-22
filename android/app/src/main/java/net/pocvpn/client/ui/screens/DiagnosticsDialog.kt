@@ -184,6 +184,24 @@ fun DiagnosticsDialog(
                     TextButton(onClick = { onSetTransportForce(TransportKind.SHADOWSOCKS_2022) }, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_force_shadowsocks))
                     }
+                    // B46-4P #9 - same rationale/plumbing as SHADOWSOCKS_2022's
+                    // own button above: HYSTERIA2 has no production UI entry
+                    // point yet either (Smart Connect's own PREFERRED_ORDER
+                    // never auto-selects it before every other transport is
+                    // exhausted). Reuses the EXACT SAME generic
+                    // onSetTransportForce/debugSetTransportPreference plumbing -
+                    // never a second selection mechanism - and is gated by the
+                    // same isDebugBuild condition the whole dialog already
+                    // requires. Selecting this is NOT a bypass: MainViewModel's
+                    // manual-connect path still requires a real trusted signed
+                    // HYSTERIA2 binding AND a provisioned credential before the
+                    // transport becomes AVAILABLE at all (see
+                    // MainViewModel.isHysteria2AvailableFor's own docs) - this
+                    // button only sets next-connect PREFERENCE, exactly like
+                    // every other Force button here.
+                    TextButton(onClick = { onSetTransportForce(TransportKind.HYSTERIA2) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_hysteria2))
+                    }
                     TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_simulate_awg_failure))
                     }
