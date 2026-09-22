@@ -1,0 +1,90 @@
+# B46-4P - systemd unit TEMPLATE for the pinned SERVER-side Hysteria2
+# process (see gateway/hysteria/README.md/VERSION). This is a TEMPLATE,
+# reviewed but NOT installed against any real host by this slice - see
+# gateway/hysteria/VERSION's own "LICENSING DECISION REQUIRED" GAP, which
+# must be resolved by the repository owner before this unit is ever
+# enabled, and docs/B46_4P_HYSTERIA2_PRODUCTION_DEPLOYMENT.md for the
+# full remaining checklist (port #3, TLS/SNI #4, signed manifest #7 all
+# still open).
+#
+# Unlike nova-xray.service, this process's own config file (rendered by
+# gateway/hysteria/render_server_config.py) contains NO secret at all -
+# no private key, no per-device credential, not even a REALITY-style
+# camouflage target - it only names a listen port, a TLS cert/key FILE
+# PATH (the files themselves are read by the Hysteria2 binary at process
+# start, never by this repository's own Python), and the loopback URL of
+# the auth backend (see "Auth backend" note below). ProtectSystem=strict
+# with NO ReadWritePaths exception, mirroring nova-xray.service's own
+# "this process never writes anything at runtime" reasoning exactly -
+# Hysteria2's own `auth.type: http` design means EVERY per-connection
+# decision is a live outbound HTTP call, never a local write.
+#
+# Auth backend (NOT resolved by this unit - see
+# gateway/hysteria/README.md's "Auth backend listener" section for the
+# still-open design question): this unit's own config.yaml points
+# `auth.http.url` at a loopback HTTP endpoint
+# (gateway/api/hysteria_auth_backend.handle_auth_request). Whether that
+# endpoint is served by a NEW, separate minimal listener unit or by
+# EXTENDING the existing pocvpn-api.service process with one new internal-
+# only route is an open design decision this pass does not make (seeing
+# an actual live HTTP route for it, either way, is a separate, currently-
+# unstarted piece of work - see the README's own GAP note). This unit
+# does not assume either answer; it only assumes SOME loopback URL will
+# exist and be reachable before this service can ever authenticate a
+# real connection.
+[Unit]
+Description=Nova Hysteria2 QUIC server (non-root)
+After=network.target
+
+[Service]
+Type=simple
+User=nova-hysteria2
+Group=nova-hysteria2
+# Pinned, versioned install path - see gateway/hysteria/fetch-hysteria-server.sh.
+# Update this line deliberately when bumping gateway/hysteria/VERSION,
+# never via a floating "latest" symlink (same discipline
+# nova-xray.service's own comment documents for the Xray binary).
+#
+# --disable-update-check: Hysteria2's own root command otherwise makes an
+# outbound call to check for a newer release on every start (see
+# app/cmd/root.go's own --disable-update-check flag, verified against the
+# pinned commit) - an unexpected, non-essential outbound network call
+# this minimal, narrowly-scoped server has no reason to make.
+ExecStart=/opt/pocvpn/hysteria/app/v2.12.3/hysteria server --config /etc/nova-hysteria2/config.yaml --disable-update-check
+Restart=on-failure
+RestartSec=2
+
+# --- hardening: same baseline as nova-xray.service (a real Go binary
+# terminating its own TLS/QUIC listener, no sudo/root-helper boundary to
+# preserve) - each directive re-checked against what THIS binary actually
+# needs, not copied blindly. ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_NETLINK is required beyond nova-xray.service's own set: Hysteria2's
+# QUIC transport (quic-go) queries the kernel's own path MTU / route
+# information via netlink on Linux - omitting it risks silent MTU-
+# discovery failures, not a hardening no-op the way an unused address
+# family would be elsewhere in this file. Not verified against a live
+# run this pass (no server access) - flagged here as a documented,
+# reasoned inclusion, not a copy-pasted guess, and re-verify the very
+# first time this unit is actually started (see
+# docs/B46_4P_HYSTERIA2_PRODUCTION_DEPLOYMENT.md's own checklist).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+
+# ProtectSystem=strict with NO ReadWritePaths exception - this process
+# never writes anything at runtime (see header comment above). The
+# config file and the TLS cert/key files it references are all read-only
+# from this unit's point of view; the binary itself is read-only too.
+ProtectSystem=strict
+ReadOnlyPaths=/etc/nova-hysteria2 /opt/pocvpn/hysteria
+
+[Install]
+WantedBy=multi-user.target

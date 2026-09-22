@@ -1,0 +1,64 @@
+# B46-4P - pinned provenance for the SERVER-side Hysteria2 runtime.
+# Same upstream commit already pinned for the Android child binary (see
+# docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md's "Native binary
+# packaging" section: libnovahysteriachild.so was built from this exact
+# commit) - not an independently-chosen version. Do not float to
+# "latest" - always re-audit deliberately before bumping.
+
+HYSTERIA_REPO=https://github.com/HyNetworks/hysteria.git
+HYSTERIA_TAG=app/v2.12.3
+HYSTERIA_COMMIT=e1366b173ccf5706e1e4630fe8aa654a4b574085
+HYSTERIA_LICENSE=MIT
+
+# The tag->commit mapping above was verified this pass directly against
+# GitHub's own API (not assumed from the tag name):
+#   GET /repos/HyNetworks/hysteria/git/refs/tags/app/v2.12.3
+#     -> annotated tag object 79548712f98735b8d0ec6940e8a99350a0f2304f
+#   GET /repos/HyNetworks/hysteria/git/tags/79548712...
+#     -> object.sha == e1366b173ccf5706e1e4630fe8aa654a4b574085 (exact match)
+# (Note: apernet/hysteria now redirects to HyNetworks/hysteria upstream -
+# same project, same release, GitHub's own org rename.)
+
+# Official upstream release asset for a linux/amd64 server (AWS Stockholm
+# host shape) - NOT a `curl | sh` installer, NOT built from source on the
+# gateway host. Verified for real this pass (not fabricated): the exact
+# byte value below is upstream's OWN published digest, fetched from the
+# release's own hashes.txt asset BEFORE any download of the binary itself
+# (https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.3/hashes.txt,
+# a single combined-digest file - this project's release process differs
+# from Xray-core's per-asset ".dgst" convention, but the verification
+# discipline is identical). The binary asset was then independently
+# downloaded and sha256sum'd locally - it matched the pre-published
+# digest exactly, byte for byte.
+HYSTERIA_RELEASE_ASSET=hysteria-linux-amd64
+HYSTERIA_RELEASE_ASSET_URL=https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.3/hysteria-linux-amd64
+HYSTERIA_RELEASE_ASSET_SHA256=8c7a68a906998b747a0db87586e364f995fbfddb95693ae6e2fdb68a6e920d3e
+HYSTERIA_HASHES_ASSET_URL=https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.3/hashes.txt
+
+# GAP - LICENSING DECISION REQUIRED (found this pass, not previously
+# documented for the SERVER binary): the official prebuilt
+# hysteria-linux-amd64 asset above was byte-scanned this pass and DOES
+# contain "sing-tun" symbols (e.g. "sing-tun.New", "sing-tun.NewNat") -
+# the same GPL-3.0-or-later dependency docs/B46_2B_HYSTERIA_TUN_BRIDGE_ARCHITECTURE.md
+# and docs/B46_2C_PERMISSIVE_HYSTERIA_PATH.md already found linked into
+# Hysteria2's own CHILD binary regardless of whether Nova enables its
+# `tun:` config. This is the SAME question on the SERVER side: this
+# gateway would only ever run `hysteria server` (never `client`/`tun`
+# mode), but the prebuilt official binary is a single multi-purpose
+# executable that appears to link the GPL tun code either way. This pass
+# does NOT resolve this - per B46-2B/2C's own still-open licensing gate
+# for the client-side tun path, the repository owner must make an
+# explicit, informed decision before this asset is actually installed on
+# any production host:
+#   (a) accept the GPL-3.0-or-later linkage as-is (the server process
+#       itself never invokes tun-related code paths, but the BINARY
+#       still contains it);
+#   (b) build a stripped, server-only binary from this SAME pinned
+#       source commit without tun build tags/dependencies (mirroring
+#       B46-2C's own "minimal Hysteria2 SOCKS5-only client" approach,
+#       but for `cmd/server.go` instead) - NOT attempted this pass;
+#   (c) some other licensing-compliant distribution path.
+# fetch-hysteria-server.sh still fetches/verifies/installs the official
+# asset pinned above (that remains real, verified, and reproducible) -
+# this GAP blocks the DECISION to actually run it in production, not the
+# git-only fetch/pin mechanism itself.
