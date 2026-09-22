@@ -266,6 +266,43 @@ fun AppRoot(
                         )
                     },
                     onClearDiagnosticsClick = { viewModel.clearDiagnosticSessions() },
+                    // Beta cut, Day 2 (docs/NOVA_VPN_BETA_CUT.md section 5)
+                    // - minimal Contact Support. Reuses the EXACT SAME
+                    // exportSupportBundleJson() sanitized bundle the
+                    // existing Export button already uses - no second
+                    // capture/redaction path. Pre-fills a real destination
+                    // (ACTION_SENDTO mailto:, so only email apps handle it)
+                    // with the bundle included in the body as optional,
+                    // removable text - never a forced binary attachment. If
+                    // no mail app can handle it (ActivityNotFoundException),
+                    // falls back to the SAME generic share-sheet chooser
+                    // the Export button already uses - a safe fallback,
+                    // never a silent failure.
+                    onContactSupportClick = {
+                        val json = viewModel.exportSupportBundleJson()
+                        val subject = context.getString(net.pocvpn.client.R.string.settings_contact_support_subject)
+                        val body = context.getString(net.pocvpn.client.R.string.settings_contact_support_body_intro) + json
+                        val supportEmail = context.getString(net.pocvpn.client.R.string.settings_contact_support_email)
+                        val mailIntent = android.content.Intent(android.content.Intent.ACTION_SENDTO).apply {
+                            data = android.net.Uri.parse("mailto:")
+                            putExtra(android.content.Intent.EXTRA_EMAIL, arrayOf(supportEmail))
+                            putExtra(android.content.Intent.EXTRA_SUBJECT, subject)
+                            putExtra(android.content.Intent.EXTRA_TEXT, body)
+                        }
+                        try {
+                            context.startActivity(mailIntent)
+                        } catch (_: android.content.ActivityNotFoundException) {
+                            val fallbackIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(android.content.Intent.EXTRA_EMAIL, arrayOf(supportEmail))
+                                putExtra(android.content.Intent.EXTRA_SUBJECT, subject)
+                                putExtra(android.content.Intent.EXTRA_TEXT, body)
+                            }
+                            context.startActivity(
+                                android.content.Intent.createChooser(fallbackIntent, context.getString(net.pocvpn.client.R.string.settings_contact_support)),
+                            )
+                        }
+                    },
                 )
                 else -> HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),

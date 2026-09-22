@@ -105,6 +105,21 @@
     <string name="settings_diagnostics_export">Export diagnostics</string>
     <string name="settings_diagnostics_clear">Clear diagnostics</string>
     <string name="settings_diagnostics_share_title">Nova VPN diagnostics</string>
+    <!-- Beta cut, Day 2 (docs/NOVA_VPN_BETA_CUT.md section 5) - minimal
+         Contact Support: reuses the SAME B29 sanitized bundle/export
+         plumbing above, adds one entry point that pre-fills a real
+         destination instead of leaving the share-sheet target fully
+         open-ended. Not a second, parallel surface - lives in this same
+         Diagnostics section. The attached bundle is optional: the email
+         body includes it below a short human message, and the user can
+         delete that section before sending. contact_support_email is a
+         placeholder on this project's own domain - the repository owner
+         must confirm a real, monitored mailbox exists at this address
+         before Beta ships (not verified by this change). -->
+    <string name="settings_contact_support">Contact Support</string>
+    <string name="settings_contact_support_email" translatable="false">support@aknova.pp.ua</string>
+    <string name="settings_contact_support_subject">Nova VPN Beta support request</string>
+    <string name="settings_contact_support_body_intro">Describe the problem you\'re having below. Sanitized diagnostics are included further down - feel free to remove them if you\'d rather not share.\n\n</string>
 
     <!-- Activation screen -->
     <string name="activation_title">Activate your VPN</string>

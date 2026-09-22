@@ -62,6 +62,10 @@ fun SettingsScreen(
     lastConnectionResult: String,
     onExportDiagnosticsClick: () -> Unit,
     onClearDiagnosticsClick: () -> Unit,
+    // Beta cut, Day 2 - minimal Contact Support (docs/NOVA_VPN_BETA_CUT.md
+    // section 5): reuses this same Diagnostics section, never a second
+    // parallel entry point.
+    onContactSupportClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // B30A - physical-validation fix: this Column has no bound on its
@@ -264,6 +268,14 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurface,
         )
         Spacer(modifier = Modifier.height(12.dp))
+        // Beta cut, Day 2 - the primary action for a non-technical user
+        // with a problem: pre-fills a real support destination, optional
+        // diagnostic bundle included in the body. Export/Clear below
+        // remain for a user who wants the raw bundle without emailing it.
+        androidx.compose.material3.Button(onClick = onContactSupportClick, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.settings_contact_support))
+        }
+        Spacer(modifier = Modifier.height(8.dp))
         androidx.compose.material3.TextButton(onClick = onExportDiagnosticsClick, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.settings_diagnostics_export))
         }
