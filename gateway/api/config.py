@@ -102,6 +102,24 @@ class AppConfig:
     xray_tls_cert_file: str = ""
     xray_tls_key_file: str = ""
 
+    # B46-4P - optional, blank/zero (the default) means POST
+    # /v1/hysteria-profile is not configured and always fails closed with
+    # 503, same convention as xray_store_path/xray_server_port above. Unlike
+    # Xray's REALITY group, there is no reality-key/fingerprint/short-id/flow
+    # here - a Hysteria2 client only ever needs server_address (reuses
+    # endpoint_host), server_port, and sni; obfuscation_mode is a fixed
+    # "NONE" literal in handler.py for this slice (B46-4A Finding 8 - no
+    # per-device Salamander secret is ever minted, so this gateway can never
+    # truthfully offer SALAMANDER). No cert/key file path lives here: this
+    # process never terminates the Hysteria2 QUIC listener itself - the
+    # separate Hysteria2 server process (B46-4P systemd unit) owns its own
+    # TLS certificate/key, exactly like `password`/`userpass`/`http` auth
+    # backends never carry the listener's TLS material either.
+    hysteria2_store_path: str = ""
+    hysteria2_lock_path: str = ""
+    hysteria2_server_port: int = 0
+    hysteria2_sni: str = ""
+
     # B12 - GET /v1/manifest: serves an ALREADY-SIGNED EndpointManifest
     # artifact (see gateway/tools/manifest_signing.py's `sign-and-package`
     # subcommand, run OFFLINE) verbatim, as raw bytes. Blank (the default)
@@ -439,6 +457,53 @@ def load_config(env=None):
                 f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before TLS can be enabled"
             )
 
+    # B46-4P - POST /v1/hysteria-profile's own optional completeness group,
+    # checked independently of Xray's above (same "half-configured is not a
+    # safe middle ground" reasoning as xray_partially_configured - a blank
+    # sni/server_port here would let the endpoint hand a client an
+    # unusable profile that Android's own parseHysteria2ProfileSuccessBody
+    # would then reject anyway).
+    hysteria2_store_path = _get(env, "HYSTERIA2_STORE_PATH")
+    hysteria2_lock_path = _get(env, "HYSTERIA2_LOCK_PATH") or (
+        hysteria2_store_path + ".lock" if hysteria2_store_path else ""
+    )
+    hysteria2_server_port_raw = _get(env, "HYSTERIA2_SERVER_PORT")
+    hysteria2_server_port = 0
+    if hysteria2_server_port_raw:
+        try:
+            hysteria2_server_port = int(hysteria2_server_port_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SERVER_PORT is not an integer: {hysteria2_server_port_raw!r}")
+        if not (1 <= hysteria2_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SERVER_PORT out of range: {hysteria2_server_port}")
+    hysteria2_sni = _get(env, "HYSTERIA2_SNI")
+
+    hysteria2_partially_configured = bool(hysteria2_store_path or hysteria2_server_port)
+    if hysteria2_partially_configured:
+        hysteria2_missing = [
+            name for name, value in (
+                ("HYSTERIA2_STORE_PATH", hysteria2_store_path),
+                ("HYSTERIA2_SERVER_PORT", hysteria2_server_port_raw),
+                ("HYSTERIA2_SNI", hysteria2_sni),
+            ) if not value
+        ]
+        if hysteria2_missing:
+            raise ConfigError(
+                "partial Hysteria2 configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in hysteria2_missing)
+                + " must all be set once any Hysteria2 setting is set (or none of them, to leave /v1/hysteria-profile unconfigured)"
+            )
+        # B46-4A's own eligibility/activation reuse: /v1/hysteria-profile
+        # authorizes itself off the SAME activation store /v1/activate and
+        # /v1/xray-profile already use (gateway/api/hysteria_provisioning.py's
+        # own _check_device_eligibility) - never a second activation system.
+        if not activation_store_path:
+            raise ConfigError(
+                "partial Hysteria2 configuration: "
+                f"{_ENV_PREFIX}ACTIVATION_STORE_PATH must be configured before Hysteria2 can be enabled "
+                "- /v1/hysteria-profile reuses the existing activation store, never a separate one"
+            )
+
     # B12 - see AppConfig.manifest_path's own docs. When set, held to the
     # same "absolute and actually a file" bar as every other file-path
     # config value above (provision_script_path, xray_tls_cert_file, ...) -
@@ -497,6 +562,10 @@ def load_config(env=None):
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        hysteria2_store_path=hysteria2_store_path,
+        hysteria2_lock_path=hysteria2_lock_path,
+        hysteria2_server_port=hysteria2_server_port,
+        hysteria2_sni=hysteria2_sni,
         manifest_path=manifest_path,
         static_relay_clients_file=static_relay_clients_file,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,

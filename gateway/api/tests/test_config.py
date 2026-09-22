@@ -376,6 +376,54 @@ class ManifestConfigTests(unittest.TestCase):
         with self.assertRaises(config_module.ConfigError):
             config_module.load_config(env=env)
 
+    # --- B46-4P: POST /v1/hysteria-profile's own optional completeness group ---
+
+    def _valid_hysteria2_env(self):
+        env = self._valid_env()
+        env.update({
+            "POCVPN_API_ACTIVATION_STORE_PATH": os.path.join(self._tmp.name, "activations.json"),
+            "POCVPN_API_HYSTERIA2_STORE_PATH": os.path.join(self._tmp.name, "hysteria2.json"),
+            "POCVPN_API_HYSTERIA2_SERVER_PORT": "34443",
+            "POCVPN_API_HYSTERIA2_SNI": "hy2.example.invalid",
+        })
+        return env
+
+    def test_hysteria2_completely_unset_is_fine(self):
+        cfg = config_module.load_config(env=self._valid_env())
+        self.assertEqual(cfg.hysteria2_store_path, "")
+        self.assertEqual(cfg.hysteria2_server_port, 0)
+
+    def test_fully_configured_hysteria2_settings_load(self):
+        cfg = config_module.load_config(env=self._valid_hysteria2_env())
+        self.assertEqual(cfg.hysteria2_server_port, 34443)
+        self.assertEqual(cfg.hysteria2_sni, "hy2.example.invalid")
+        self.assertTrue(cfg.hysteria2_lock_path.endswith(".lock"))
+
+    def test_hysteria2_partially_configured_raises(self):
+        env = self._valid_hysteria2_env()
+        del env["POCVPN_API_HYSTERIA2_SNI"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_hysteria2_invalid_port_raises(self):
+        env = self._valid_hysteria2_env()
+        env["POCVPN_API_HYSTERIA2_SERVER_PORT"] = "70000"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_hysteria2_without_activation_store_raises(self):
+        env = self._valid_hysteria2_env()
+        del env["POCVPN_API_ACTIVATION_STORE_PATH"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_hysteria2_explicit_lock_path_overrides_derived_default(self):
+        env = self._valid_hysteria2_env()
+        explicit_lock = os.path.join(self._tmp.name, "custom-hysteria2.lock")
+        env["POCVPN_API_HYSTERIA2_LOCK_PATH"] = explicit_lock
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.hysteria2_lock_path, explicit_lock)
+
 
 if __name__ == "__main__":
     unittest.main()

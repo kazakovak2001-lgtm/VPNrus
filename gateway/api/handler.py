@@ -34,7 +34,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
+from . import activations, hysteria_provisioning, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -43,6 +43,7 @@ _PATH_PEERS = "/v1/peers"
 _PATH_ACTIVATE = "/v1/activate"
 _PATH_XRAY_PROFILE = "/v1/xray-profile"
 _PATH_INGRESS_PROFILE = "/v1/ingress-profile"
+_PATH_HYSTERIA_PROFILE = "/v1/hysteria-profile"
 _PATH_MANIFEST = "/v1/manifest"
 _PATH_RELAY_HEALTH = "/v1/relay-health"
 
@@ -162,6 +163,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_ingress_profile()
+            elif self.path == _PATH_HYSTERIA_PROFILE:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_hysteria_profile()
             elif self.path == _PATH_MANIFEST:
                 if method != "GET":
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
@@ -713,6 +719,111 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
         payload["probe_url"] = f"https://{ingress_cfg.ingress_exit_probe_host}{_PATH_RELAY_HEALTH}"
         payload["probe_token"] = probe_token
+        return self._success(HTTPStatus.OK, payload)
+
+    # --- POST /v1/hysteria-profile (B46-4P - Finding 9's deferred route) ---
+    def _handle_hysteria_profile(self):
+        try:
+            return self._handle_hysteria_profile_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_hysteria_profile_inner(self):
+        """The live counterpart of _handle_xray_profile_inner for Hysteria2:
+        SAME activation credential/device public key, SAME activations.py
+        entitlement decision (via hysteria_provisioning._check_device_eligibility,
+        reusing activations.py directly - never a second activation system),
+        but a DISTINCT identity store (hysteria_provisioning.py/hysteria_store.py)
+        and a DISTINCT, freshly-minted-per-call wire secret (never the
+        activation credential itself - see hysteria_provisioning.py's own
+        "retry-safe rotation" docs). obfuscation_mode is a fixed "NONE"
+        literal and obfuscation_secret is always omitted: B46-4A's Finding 8
+        removed per-device Salamander secret minting because upstream
+        Hysteria2's Salamander obfuscation is a listener-level (whole-server)
+        setting, not a per-connection value this auth backend can select -
+        so this gateway can never truthfully offer SALAMANDER.
+        """
+        cfg = self.server.config
+        if not (cfg.activation_store_path and cfg.hysteria2_store_path and cfg.hysteria2_server_port and cfg.hysteria2_sni):
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "hysteria_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        # Same Authorization: Bearer <activation credential> as /v1/activate
+        # and /v1/xray-profile - this is the SAME activation, never a
+        # separate credential/token type. It authorizes this HTTP call only;
+        # it is never stored as, or reused as, the Hysteria2 wire auth_secret
+        # (see hysteria_provisioning.provision_hysteria_identity's own docs).
+        credential = self._require_bearer_token()
+
+        raw_body = self.rfile.read(content_length)
+        # {"public_key": "..."} - same shape/validation as /v1/peers and
+        # /v1/activate; Hysteria2 has no client-chosen transport variant the
+        # way /v1/xray-profile does, so the plain single-field parser applies.
+        public_key = self._parse_and_validate_body(raw_body)
+        self._log_fields["pubkey_prefix"] = public_key[:8]
+
+        credential_digest = activations.credential_digest(credential)
+        self._log_fields["activation_digest"] = credential_digest[:8]
+
+        if not self.server.per_token_limiter.allow(credential_digest):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        try:
+            result = hysteria_provisioning.provision_hysteria_identity(
+                credential, public_key,
+                cfg.activation_store_path, cfg.activation_lock_path,
+                cfg.hysteria2_store_path, cfg.hysteria2_lock_path,
+            )
+        except hysteria_provisioning.HysteriaStoreError:
+            logger.error("hysteria_store_error")
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "hysteria_store_unavailable")
+
+        self._log_fields["hysteria_outcome"] = result.outcome
+
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_UNKNOWN:
+            # Unknown credential and a credential that hashes to no record
+            # are intentionally indistinguishable - same rule /v1/activate
+            # and /v1/xray-profile already use.
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_REVOKED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_EXPIRED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
+            # This exact device must complete POST /v1/activate first - no
+            # Hysteria2 identity is ever issued for a device this activation
+            # has not already durably entitled.
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_not_bound")
+
+        # Client-safe fields only - never the raw stored hash/salt, never the
+        # activation digest, never another device's identity. Matches
+        # Android's mapHysteria2ProfileResponse/parseHysteria2ProfileSuccessBody
+        # field names exactly (server_address, server_port, auth_secret, sni,
+        # obfuscation_mode, obfuscation_secret).
+        payload = {
+            "profile_version": 1,
+            "server_address": cfg.endpoint_host,
+            "server_port": cfg.hysteria2_server_port,
+            "auth_secret": result.auth_secret,
+            "sni": cfg.hysteria2_sni,
+            "obfuscation_mode": "NONE",
+            "obfuscation_secret": None,
+        }
+        # Always 200 - a first mint and a later retry/rotation are equally
+        # "success" here (see provision_hysteria_identity's own "retry-safe
+        # rotation, not idempotence" doc) - the response always carries
+        # whichever secret is now the CURRENT one.
         return self._success(HTTPStatus.OK, payload)
 
     # --- GET /v1/relay-health (B26 task B) ---

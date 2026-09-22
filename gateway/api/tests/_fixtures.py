@@ -107,6 +107,7 @@ def make_app_config(
     xray_dest="",
     xray_tls_server_port=0, xray_tls_server_name="", xray_tls_fingerprint="",
     xray_tls_cert_file="", xray_tls_key_file="",
+    hysteria2_store_path="", hysteria2_lock_path="", hysteria2_server_port=0, hysteria2_sni="",
     manifest_path="",
     relay_probe_hmac_secret_file="",
 ):
@@ -145,6 +146,10 @@ def make_app_config(
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        hysteria2_store_path=hysteria2_store_path,
+        hysteria2_lock_path=hysteria2_lock_path,
+        hysteria2_server_port=hysteria2_server_port,
+        hysteria2_sni=hysteria2_sni,
         manifest_path=manifest_path,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
     )
@@ -250,6 +255,27 @@ def make_xray_app_config(tmp_dir, provision_script_path, activation_store_path, 
         xray_activation_last_hash_path=kwargs.pop("xray_activation_last_hash_path", os.path.join(tmp_dir, ".xray-last-hash")),
         xray_activation_wrapper_path=wrapper_path,
         xray_dest=kwargs.pop("xray_dest", "www.microsoft.com:443"),
+        **kwargs,
+    )
+
+
+def make_hysteria2_app_config(tmp_dir, provision_script_path, activation_store_path, activation_lock_path, **kwargs):
+    """B46-4P - convenience wrapper: a full app config with
+    /v1/hysteria-profile actually configured (representative, non-secret
+    test values throughout, mirroring make_xray_app_config's own shape).
+    Reuses the SAME activation_store_path/activation_lock_path the caller
+    already set up for /v1/activate - never a second activation system."""
+    hysteria2_store_path = kwargs.pop("hysteria2_store_path", os.path.join(tmp_dir, "hysteria2-identities.json"))
+    hysteria2_lock_path = kwargs.pop("hysteria2_lock_path", os.path.join(tmp_dir, ".hysteria2-identities.lock"))
+    from api import hysteria_store as hysteria_store_module
+    hysteria_store_module.init_store(hysteria2_store_path, hysteria2_lock_path)
+
+    return make_app_config(
+        tmp_dir, provision_script_path,
+        activation_store_path=activation_store_path, activation_lock_path=activation_lock_path,
+        hysteria2_store_path=hysteria2_store_path, hysteria2_lock_path=hysteria2_lock_path,
+        hysteria2_server_port=kwargs.pop("hysteria2_server_port", 34443),
+        hysteria2_sni=kwargs.pop("hysteria2_sni", "hy2.example.invalid"),
         **kwargs,
     )
 
