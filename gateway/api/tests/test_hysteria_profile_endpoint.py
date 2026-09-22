@@ -61,7 +61,15 @@ class HysteriaProfileEndpointTests(unittest.TestCase):
             {"profile_version", "server_address", "server_port", "auth_secret", "sni", "obfuscation_mode", "obfuscation_secret"},
         )
         self.assertEqual(payload["profile_version"], 1)
-        self.assertEqual(payload["server_address"], self.app_config.endpoint_host)
+        # B46-4P (production endpoint contract fix) - server_address is
+        # hysteria2_sni, a DEDICATED hostname distinct from endpoint_host
+        # (still the shared bare-IP other transports use) - see
+        # handler.py's own _handle_hysteria_profile_inner comment for why
+        # reusing endpoint_host would break Android's own trusted-binding
+        # cross-check the moment a real manifest named this dedicated
+        # hostname.
+        self.assertEqual(payload["server_address"], self.app_config.hysteria2_sni)
+        self.assertNotEqual(payload["server_address"], self.app_config.endpoint_host)
         self.assertEqual(payload["server_port"], self.app_config.hysteria2_server_port)
         self.assertEqual(payload["sni"], self.app_config.hysteria2_sni)
         self.assertEqual(payload["obfuscation_mode"], "NONE")

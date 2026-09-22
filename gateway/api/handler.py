@@ -829,9 +829,30 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # Android's mapHysteria2ProfileResponse/parseHysteria2ProfileSuccessBody
         # field names exactly (server_address, server_port, auth_secret, sni,
         # obfuscation_mode, obfuscation_secret).
+        #
+        # B46-4P (production endpoint contract fix) - server_address is
+        # cfg.hysteria2_sni, NEVER cfg.endpoint_host: unlike Xray's REALITY
+        # inbound (whose camouflage `server_name` is deliberately a
+        # DIFFERENT value from the real dial target) or TLS_TCP (which
+        # happens to share endpoint_host because it never needed a
+        # dedicated hostname), Hysteria2's own production endpoint
+        # contract (see docs/B46_4P_HYSTERIA2_PRODUCTION_DEPLOYMENT.md's
+        # "Production endpoint contract") requires a DEDICATED DNS
+        # hostname distinct from the shared endpoint_host (still the bare
+        # IP other transports use) - the exact same hostname the signed
+        # manifest's own hysteria2Profile.sni names and the TLS
+        # certificate is issued for. No camouflage exists for Hysteria2
+        # (see "TLS policy" in docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md -
+        # insecure=true is never representable), so server_address and
+        # sni are correctly the SAME value here - reusing endpoint_host
+        # would have made this endpoint permanently unusable the moment a
+        # real manifest ever named the dedicated hostname: Android's own
+        # Hysteria2ProfileProvisioner.provision cross-checks the
+        # response's server_address against the manifest-pinned binding's
+        # host and fails closed (Mismatched) on any disagreement.
         payload = {
             "profile_version": 1,
-            "server_address": cfg.endpoint_host,
+            "server_address": cfg.hysteria2_sni,
             "server_port": cfg.hysteria2_server_port,
             "auth_secret": result.auth_secret,
             "sni": cfg.hysteria2_sni,

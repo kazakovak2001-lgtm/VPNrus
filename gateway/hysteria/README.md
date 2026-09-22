@@ -7,6 +7,26 @@ only" framing exactly, adapted for Hysteria2's real architectural
 differences (see below) - it does not copy Xray's design where Xray's
 design does not apply.
 
+## Corrections this pass
+
+**Real contract bug found and fixed**: `gateway/api/handler.py`'s
+`_handle_hysteria_profile_inner` was returning `server_address: cfg.endpoint_host`
+- the SAME shared bare-IP field every other transport (Xray REALITY/TLS)
+uses. This slice's own "Production endpoint contract" decision (below)
+requires Hysteria2 to use a DEDICATED hostname distinct from
+`endpoint_host` - had this not been fixed, the very first real deployment
+naming that dedicated hostname in the signed manifest would have made
+Android's `Hysteria2ProfileProvisioner.provision` reject every response
+as `Mismatched` (its own `server_address`-vs-pinned-`host` cross-check
+would never agree with the still-bare-IP response). Fixed: `server_address`
+is now `cfg.hysteria2_sni` - the SAME value as the `sni` field - since,
+unlike REALITY's deliberate camouflage-vs-dial-target split, Hysteria2 has
+no camouflage concept and its dial address and TLS SNI are correctly the
+same value. Covered by an updated assertion in
+`gateway/api/tests/test_hysteria_profile_endpoint.py` (now explicitly
+asserts `server_address != endpoint_host`, not just `== hysteria2_sni`,
+so a future regression back to the old behavior fails loudly).
+
 ## Layout
 
 ```
@@ -240,21 +260,38 @@ raw-UDP protocol on a different port would be a confusing identity
 overload, not a clean design, exactly the same reasoning that already
 ruled out `edge-sthlm.aknova.pp.ua`.
 
-**Technical recommendation only, still not a decision**: a NEW, DISTINCT
+**Formalized proposal, still NOT a final decision**: a NEW, DISTINCT
 subdomain under the SAME already-owned zone (`aknova.pp.ua` - confirmed
 owned/DNS-managed by this project via the three live hostnames above,
 plus `origin-sthlm.aknova.pp.ua` found in the live manifest's own
-`cdnProviderProfile` metadata) would need to be minted - e.g. shaped like
-`hy2-sthlm.aknova.pp.ua` (checked this pass: does not currently resolve -
-DNS `NXDOMAIN`, confirmed genuinely unclaimed) - pointed **directly** at
-Stockholm's own IP (no Cloudflare fronting, since Hysteria2 needs a real
-UDP/QUIC path to the origin), with its own dedicated, normal-lifetime
-Let's Encrypt certificate issued the SAME way `control.aknova.pp.ua`'s
-evidently already was (exact issuance mechanism - HTTP-01 vs. DNS-01,
-which ACME client/hook - not determinable from this repository's tracked
-files alone, since that vhost's own config is not tracked either).
-**No DNS record was created and no certificate was issued or requested -
-both remain explicitly out of scope for this slice.**
+`cdnProviderProfile` metadata):
+
+```text
+NOVA_HYSTERIA2_HOSTNAME=hysteria-sthlm.aknova.pp.ua
+```
+
+Checked this pass: does not currently resolve - DNS `NXDOMAIN`, confirmed
+genuinely unclaimed, matches the existing `<role>-sthlm.aknova.pp.ua`
+naming convention (`edge-sthlm`, `origin-sthlm`) - would be pointed
+**directly** at Stockholm's own IP (no Cloudflare fronting, since
+Hysteria2 needs a real UDP/QUIC path to the origin), with its own
+dedicated, normal-lifetime Let's Encrypt certificate issued the SAME way
+`control.aknova.pp.ua`'s evidently already was (exact issuance mechanism -
+HTTP-01 vs. DNS-01, which ACME client/hook - not determinable from this
+repository's tracked files alone, since that vhost's own config is not
+tracked either). **No DNS record was created and no certificate was
+issued or requested - both remain explicitly out of scope for this
+slice; final production approval of this exact hostname is its own
+decision gate, not something this pass can close unilaterally.**
+
+This SAME value becomes, once decided: the manifest's `hysteria2Profile.sni`,
+the `HYSTERIA2_SNI` env var `gateway/api/config.py` reads, AND the
+`HYSTERIA2_HOSTNAME` value pointed to by DNS - one source of truth, never
+three independently-set values that could drift apart (see
+`gateway/api/handler.py`'s own `_handle_hysteria_profile_inner` comment -
+`server_address` and `sni` in the client-facing response are BOTH
+`cfg.hysteria2_sni`, fixed this pass - see "Corrections this pass"
+below).
 
 ### Certificate file permissions (operational note, not resolved this pass)
 

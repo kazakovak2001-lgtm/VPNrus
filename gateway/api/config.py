@@ -106,15 +106,25 @@ class AppConfig:
     # /v1/hysteria-profile is not configured and always fails closed with
     # 503, same convention as xray_store_path/xray_server_port above. Unlike
     # Xray's REALITY group, there is no reality-key/fingerprint/short-id/flow
-    # here - a Hysteria2 client only ever needs server_address (reuses
-    # endpoint_host), server_port, and sni; obfuscation_mode is a fixed
-    # "NONE" literal in handler.py for this slice (B46-4A Finding 8 - no
-    # per-device Salamander secret is ever minted, so this gateway can never
-    # truthfully offer SALAMANDER). No cert/key file path lives here: this
-    # process never terminates the Hysteria2 QUIC listener itself - the
-    # separate Hysteria2 server process (B46-4P systemd unit) owns its own
-    # TLS certificate/key, exactly like `password`/`userpass`/`http` auth
-    # backends never carry the listener's TLS material either.
+    # here - a Hysteria2 client only ever needs server_address, server_port,
+    # and sni; obfuscation_mode is a fixed "NONE" literal in handler.py for
+    # this slice (B46-4A Finding 8 - no per-device Salamander secret is ever
+    # minted, so this gateway can never truthfully offer SALAMANDER). No
+    # cert/key file path lives here: this process never terminates the
+    # Hysteria2 QUIC listener itself - the separate Hysteria2 server process
+    # (B46-4P systemd unit) owns its own TLS certificate/key, exactly like
+    # `password`/`userpass`/`http` auth backends never carry the listener's
+    # TLS material either.
+    #
+    # hysteria2_sni is used as BOTH the response's server_address AND its
+    # sni field (see handler.py's own _handle_hysteria_profile_inner
+    # comment) - NEVER endpoint_host. Hysteria2's own production endpoint
+    # contract (docs/B46_4P_HYSTERIA2_PRODUCTION_DEPLOYMENT.md) requires a
+    # DEDICATED DNS hostname distinct from endpoint_host (still the bare
+    # IP other transports use) - unlike REALITY's own deliberately-
+    # different camouflage server_name, Hysteria2 has no camouflage
+    # concept, so its dial address and its TLS SNI are correctly the same
+    # value.
     hysteria2_store_path: str = ""
     hysteria2_lock_path: str = ""
     hysteria2_server_port: int = 0
