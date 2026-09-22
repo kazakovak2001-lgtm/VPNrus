@@ -161,6 +161,21 @@ android {
         buildConfigField("boolean", "FIELD_ENROLLMENT_ENABLED", gatewayDevProp("fieldEnrollmentEnabled").ifBlank { "false" })
     }
 
+    signingConfigs {
+        // Only created when real signing material is actually available
+        // (see hasReleaseSigningConfig above) - keeps this block itself
+        // free of any secret value, and never fails a build that has no
+        // signing material configured (e.g. a plain local checkout).
+        if (hasReleaseSigningConfig) {
+            create("release") {
+                storeFile = file(releaseStoreFilePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // B17/B20 - explicit for reviewability: debug builds (including
@@ -184,6 +199,13 @@ android {
         }
         release {
             isMinifyEnabled = false
+            // Day 1/2 Beta cut - sign with the real release key when one is
+            // configured (see hasReleaseSigningConfig above); otherwise
+            // this build type is unchanged from before (unsigned), so a
+            // checkout with no signing material still builds.
+            if (hasReleaseSigningConfig) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             // B17/B20 - explicit, not derived from any gitignored developer
             // file - a release build always points at the real production
             // origins.
