@@ -119,7 +119,14 @@
     <string name="settings_contact_support">Contact Support</string>
     <string name="settings_contact_support_email" translatable="false">support@aknova.pp.ua</string>
     <string name="settings_contact_support_subject">Nova VPN Beta support request</string>
-    <string name="settings_contact_support_body_intro">Describe the problem you\'re having below. Sanitized diagnostics are included further down - feel free to remove them if you\'d rather not share.\n\n</string>
+    <string name="settings_contact_support_body_intro">Describe the problem you\'re having below.\n\n</string>
+    <string name="settings_contact_support_body_intro_with_diagnostics">Describe the problem you\'re having below. Sanitized diagnostics are included further down - feel free to remove them if you\'d rather not share.\n\n</string>
+    <!-- Day 4 - explicit include/exclude choice, required for Beta: sending
+         without diagnostics must be a real path, not just removable text. -->
+    <string name="settings_contact_support_dialog_title">Include diagnostics?</string>
+    <string name="settings_contact_support_dialog_body">Sanitized connection diagnostics can help support fix your problem faster. You can also send your message without them.</string>
+    <string name="settings_contact_support_dialog_include">Include diagnostics</string>
+    <string name="settings_contact_support_dialog_exclude">Don\'t include</string>
 
     <!-- Activation screen -->
     <string name="activation_title">Activate your VPN</string>

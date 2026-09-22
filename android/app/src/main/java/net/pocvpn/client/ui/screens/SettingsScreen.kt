@@ -20,6 +20,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -62,10 +66,12 @@ fun SettingsScreen(
     lastConnectionResult: String,
     onExportDiagnosticsClick: () -> Unit,
     onClearDiagnosticsClick: () -> Unit,
-    // Beta cut, Day 2 - minimal Contact Support (docs/NOVA_VPN_BETA_CUT.md
+    // Beta cut, Day 2/4 - minimal Contact Support (docs/NOVA_VPN_BETA_CUT.md
     // section 5): reuses this same Diagnostics section, never a second
-    // parallel entry point.
-    onContactSupportClick: () -> Unit,
+    // parallel entry point. includeDiagnostics distinguishes the two
+    // required Beta paths (send with or without the bundle) without a
+    // second screen - see the confirmation dialog below.
+    onContactSupportClick: (includeDiagnostics: Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // B30A - physical-validation fix: this Column has no bound on its
@@ -268,12 +274,41 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurface,
         )
         Spacer(modifier = Modifier.height(12.dp))
-        // Beta cut, Day 2 - the primary action for a non-technical user
-        // with a problem: pre-fills a real support destination, optional
-        // diagnostic bundle included in the body. Export/Clear below
-        // remain for a user who wants the raw bundle without emailing it.
-        androidx.compose.material3.Button(onClick = onContactSupportClick, modifier = Modifier.fillMaxWidth()) {
+        // Beta cut, Day 2/4 - the primary action for a non-technical user
+        // with a problem: pre-fills a real support destination. Day 4 adds
+        // an explicit choice (required for Beta: "send without diagnostics"
+        // must be a real path, not just removable text) - one small dialog,
+        // never a second screen/tab. Export/Clear below remain for a user
+        // who wants the raw bundle without emailing it.
+        var showSupportDiagnosticsChoice by remember { mutableStateOf(false) }
+        androidx.compose.material3.Button(
+            onClick = { showSupportDiagnosticsChoice = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             Text(stringResource(R.string.settings_contact_support))
+        }
+        if (showSupportDiagnosticsChoice) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showSupportDiagnosticsChoice = false },
+                title = { Text(stringResource(R.string.settings_contact_support_dialog_title)) },
+                text = { Text(stringResource(R.string.settings_contact_support_dialog_body)) },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        showSupportDiagnosticsChoice = false
+                        onContactSupportClick(true)
+                    }) {
+                        Text(stringResource(R.string.settings_contact_support_dialog_include))
+                    }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        showSupportDiagnosticsChoice = false
+                        onContactSupportClick(false)
+                    }) {
+                        Text(stringResource(R.string.settings_contact_support_dialog_exclude))
+                    }
+                },
+            )
         }
         Spacer(modifier = Modifier.height(8.dp))
         androidx.compose.material3.TextButton(onClick = onExportDiagnosticsClick, modifier = Modifier.fillMaxWidth()) {

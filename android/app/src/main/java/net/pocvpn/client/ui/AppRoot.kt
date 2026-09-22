@@ -278,10 +278,14 @@ fun AppRoot(
                     // falls back to the SAME generic share-sheet chooser
                     // the Export button already uses - a safe fallback,
                     // never a silent failure.
-                    onContactSupportClick = {
-                        val json = viewModel.exportSupportBundleJson()
+                    onContactSupportClick = { includeDiagnostics ->
                         val subject = context.getString(net.pocvpn.client.R.string.settings_contact_support_subject)
-                        val body = context.getString(net.pocvpn.client.R.string.settings_contact_support_body_intro) + json
+                        val body = if (includeDiagnostics) {
+                            val json = viewModel.exportSupportBundleJson()
+                            context.getString(net.pocvpn.client.R.string.settings_contact_support_body_intro_with_diagnostics) + json
+                        } else {
+                            context.getString(net.pocvpn.client.R.string.settings_contact_support_body_intro)
+                        }
                         val supportEmail = context.getString(net.pocvpn.client.R.string.settings_contact_support_email)
                         val mailIntent = android.content.Intent(android.content.Intent.ACTION_SENDTO).apply {
                             data = android.net.Uri.parse("mailto:")
