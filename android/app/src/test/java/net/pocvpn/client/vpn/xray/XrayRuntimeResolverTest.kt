@@ -6,8 +6,11 @@ import net.pocvpn.client.identity.FileXrayProfileStore
 import net.pocvpn.client.identity.FileXrayTlsProfileStore
 import net.pocvpn.client.identity.SecureXrayProfileRepository
 import net.pocvpn.client.identity.SecureXrayTlsProfileRepository
+import net.pocvpn.client.identity.FileXrayXhttpProfileStore
+import net.pocvpn.client.identity.SecureXrayXhttpProfileRepository
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
+import net.pocvpn.client.identity.XrayXhttpProfile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -162,6 +165,161 @@ class XrayTlsRuntimeResolverTest {
         repository.saveProfile(saved)
 
         val resolution = XrayRuntimeResolver.resolveTls(repository) as XrayTlsRuntimeResolution.Rejected
+
+        assertFalse(resolution.reason.contains(saved.uuid))
+    }
+}
+
+/**
+ * B61 - the EXIT-role (Frankfurt, B60) XHTTP counterpart of
+ * [XrayRuntimeResolverTest]/[XrayTlsRuntimeResolverTest]. Proves the real
+ * load -> map -> validate -> render machinery works end to end (the "Ready"
+ * tests below supply literal, TEST-ONLY values for minimumTlsVersion/alpn/
+ * maxEachPostBytes/paddingPlacement - never production values, since B61
+ * found no real source of truth for them - see resolveXhttp's own docs),
+ * and separately proves the PRODUCTION default (no values supplied) always
+ * fails closed with the exact, itemized blocker reason.
+ */
+class XrayXhttpRuntimeResolverTest {
+
+    private val validXhttpProfile = XrayXhttpProfile(
+        server = "edge.aknova.pp.ua",
+        serverPort = 443,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        xhttpHost = "edge.aknova.pp.ua",
+        xhttpPath = "/nova-xhttp/",
+        mode = "packet-up",
+        uplinkHttpMethod = "POST",
+        fingerprint = "chrome",
+    )
+
+    private fun newXhttpRepository(dir: File = Files.createTempDirectory("xray-xhttp-resolver-test").toFile()): SecureXrayXhttpProfileRepository =
+        SecureXrayXhttpProfileRepository(FileXrayXhttpProfileStore(dir), FakeAesGcmKeyEncryptor())
+
+    @Test
+    fun `a valid stored XHTTP profile plus real owner-decided values resolves to Ready`() = runBlocking {
+        val repository = newXhttpRepository()
+        repository.saveProfile(validXhttpProfile)
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(
+            repository,
+            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
+            alpn = "h2",
+            maxEachPostBytes = 524_288,
+            paddingPlacement = XrayXhttpPaddingPlacement.HEADER,
+        )
+
+        assertTrue(resolution is XrayXhttpRuntimeResolution.Ready)
+        val ready = resolution as XrayXhttpRuntimeResolution.Ready
+        assertEquals("edge.aknova.pp.ua", ready.config.server)
+        assertEquals(443, ready.config.serverPort)
+        assertEquals("edge.aknova.pp.ua", ready.config.tlsServerName)
+        assertEquals("edge.aknova.pp.ua", ready.config.xhttpHost)
+        assertEquals("/nova-xhttp/", ready.config.xhttpPath)
+        assertEquals(XrayXhttpMode.PACKET_UP, ready.config.mode)
+        assertEquals(XrayXhttpUplinkHttpMethod.POST, ready.config.uplinkHttpMethod)
+        assertEquals("chrome", ready.config.fingerprint)
+        assertEquals(100, ready.config.paddingMinBytes)
+        assertEquals(1000, ready.config.paddingMaxBytes)
+        assertEquals(XrayConfigRenderer.render(ready.config), ready.renderedConfig)
+    }
+
+    @Test
+    fun `production default (no owner-decided values supplied) always fails closed with the itemized blocker reason`() = runBlocking {
+        val repository = newXhttpRepository()
+        repository.saveProfile(validXhttpProfile)
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository)
+
+        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
+        val reason = (resolution as XrayXhttpRuntimeResolution.Rejected).reason
+        assertTrue(reason.contains("minimumTlsVersion"))
+        assertTrue(reason.contains("alpn"))
+        assertTrue(reason.contains("maxEachPostBytes"))
+        assertTrue(reason.contains("paddingPlacement"))
+    }
+
+    @Test
+    fun `partially-supplied values still name only the still-missing ones`() = runBlocking {
+        val repository = newXhttpRepository()
+        repository.saveProfile(validXhttpProfile)
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(
+            repository,
+            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
+            alpn = "h2",
+        )
+
+        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
+        val reason = (resolution as XrayXhttpRuntimeResolution.Rejected).reason
+        assertFalse(reason.contains("minimumTlsVersion"))
+        assertFalse(reason.contains("alpn"))
+        assertTrue(reason.contains("maxEachPostBytes"))
+        assertTrue(reason.contains("paddingPlacement"))
+    }
+
+    @Test
+    fun `no stored XHTTP profile fails closed`() = runBlocking {
+        val resolution = XrayRuntimeResolver.resolveXhttp(newXhttpRepository())
+
+        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
+        assertEquals("no Xray XHTTP profile configured", (resolution as XrayXhttpRuntimeResolution.Rejected).reason)
+    }
+
+    @Test
+    fun `a corrupted stored XHTTP profile fails closed`() = runBlocking {
+        val dir = Files.createTempDirectory("xray-xhttp-resolver-corrupt-test").toFile()
+        dir.mkdirs()
+        File(dir, "xray_xhttp_profile_${net.pocvpn.client.identity.sanitizeForFileName(net.pocvpn.client.reachability.EndpointId("frankfurt"))}.bin").writeBytes(byteArrayOf(0, 0, 0, 99))
+        val repository = newXhttpRepository(dir)
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository)
+
+        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
+        assertEquals("failed to load Xray XHTTP profile: XrayXhttpProfileCorruptedException", (resolution as XrayXhttpRuntimeResolution.Rejected).reason)
+    }
+
+    @Test
+    fun `an unrecognized wire mode value fails closed`() = runBlocking {
+        val repository = newXhttpRepository()
+        repository.saveProfile(validXhttpProfile.copy(mode = "stream-up"))
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(
+            repository,
+            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
+            alpn = "h2",
+            maxEachPostBytes = 524_288,
+            paddingPlacement = XrayXhttpPaddingPlacement.HEADER,
+        )
+
+        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
+    }
+
+    @Test
+    fun `resolved config never carries the loopback backend address or port`() = runBlocking {
+        val repository = newXhttpRepository()
+        repository.saveProfile(validXhttpProfile)
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(
+            repository,
+            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
+            alpn = "h2",
+            maxEachPostBytes = 524_288,
+            paddingPlacement = XrayXhttpPaddingPlacement.HEADER,
+        ) as XrayXhttpRuntimeResolution.Ready
+
+        assertFalse(resolution.config.server.contains("127.0.0.1"))
+        assertFalse(resolution.renderedConfig.contains("127.0.0.1"))
+        assertFalse(resolution.renderedConfig.contains("2099"))
+    }
+
+    @Test
+    fun `no rejection reason ever contains the XHTTP profile's actual uuid`() = runBlocking {
+        val repository = newXhttpRepository()
+        val saved = validXhttpProfile.copy(mode = "not-a-mode")
+        repository.saveProfile(saved)
+
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository) as XrayXhttpRuntimeResolution.Rejected
 
         assertFalse(resolution.reason.contains(saved.uuid))
     }
