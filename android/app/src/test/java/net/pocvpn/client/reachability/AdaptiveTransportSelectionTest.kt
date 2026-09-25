@@ -94,7 +94,14 @@ class AdaptiveTransportSelectionTest {
 
     @Test
     fun `UDP-limited network moves the XHTTP TCP path first and AWG last`() {
-        assertEquals(listOf("RELAY_XRAY_XHTTP", "XRAY_REALITY", "TLS_TCP", "AMNEZIA_WG"), ranked(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING))
+        assertEquals(listOf("RELAY_XRAY_XHTTP", "XRAY_REALITY", "TLS_TCP", "AMNEZIA_WG"), ranked(RestrictionClass.POSSIBLE_UDP_FILTERING))
+    }
+
+    @Test
+    fun `probe-derived POSSIBLE_UDP_OR_AWG_FILTERING never reorders AWG vs XHTTP - it may come from a failed non-AWG attempt`() {
+        // MainViewModel derives awgHandshakeFresh from the last outcome of ANY transport, so a failed
+        // REALITY/TLS/relay attempt plus a reachable gateway yields this class; it must not demote AWG.
+        assertEquals(ranked(RestrictionClass.UNKNOWN), ranked(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING))
     }
 
     @Test
@@ -115,7 +122,7 @@ class AdaptiveTransportSelectionTest {
     @Test
     fun `candidate order really differs between classifications, not just the enum`() {
         val orders = listOf(
-            RestrictionClass.UNKNOWN, RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING,
+            RestrictionClass.UNKNOWN, RestrictionClass.POSSIBLE_UDP_FILTERING,
             RestrictionClass.POSSIBLE_HARD_WHITELIST, RestrictionClass.POSSIBLE_EARLY_DROP,
         ).map { ranked(it) }
         assertNotEquals(orders[0], orders[1])

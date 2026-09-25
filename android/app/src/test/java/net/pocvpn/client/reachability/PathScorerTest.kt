@@ -542,7 +542,7 @@ class PathScorerTest {
     }
 
     @Test
-    fun `B-WL5 - POSSIBLE_UDP_OR_AWG_FILTERING now penalizes the UDP-only AMNEZIA_WG candidate by exactly one restriction step`() {
+    fun `POSSIBLE_UDP_OR_AWG_FILTERING carries no dedicated restriction-tier branch - AMNEZIA_WG is penalized only via the existing HEALTH_TIER`() {
         val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
         val c = candidate("gw1", TransportKind.AMNEZIA_WG, ReachabilityState.REACHABLE)
         val healthyNoFiltering = PathScorer.score(c, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
@@ -552,11 +552,8 @@ class PathScorerTest {
         )
         val cFiltered = PathCandidateBuilder.buildDirect(endpoint("gw1", TransportKind.AMNEZIA_WG), TransportKind.AMNEZIA_WG, filteredAwg)!!
         val filteredScore = PathScorer.score(cFiltered, registry, TransportCapabilities.amneziaWg(), TransportHealth(state = TransportHealthState.HEALTHY), null, false)
-        // Previously (B28) this class contributed 0 and relied on HEALTH_TIER alone; B-WL5 adds a
-        // bounded, capability-derived -1 restriction step so UDP-only transports stop leading
-        // even before their own health has degraded.
-        assertEquals(healthyNoFiltering.score - 700L, filteredScore.score)
-        assertTrue(filteredScore.reasons.contains(PathScorer.Reason.RESTRICTION_PENALIZES_UDP_TRANSPORT.name))
+        // Same (healthy) transport health -> POSSIBLE_UDP_OR_AWG_FILTERING alone contributes exactly 0 restriction score - the real penalty only shows up once TransportHealth itself reflects the failed handshake (a separate, already-existing HEALTH_TIER path, not exercised here).
+        assertEquals(healthyNoFiltering.score, filteredScore.score)
         assertFalse(filteredScore.reasons.contains(PathScorer.Reason.RESTRICTION_FAVORS_RELAY.name))
         assertFalse(filteredScore.reasons.contains(PathScorer.Reason.RESTRICTION_PENALIZES_DIRECT.name))
     }

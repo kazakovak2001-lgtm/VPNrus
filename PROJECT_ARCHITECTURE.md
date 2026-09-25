@@ -1620,6 +1620,11 @@ exists.
   `AMNEZIA_WG` via the pre-existing `HEALTH_TIER`
   (`TransportHealthCalculator`); a second protocol-specific branch here
   would be exactly the redundant nested if/else the task asked not to add.
+  **Amended by B-WL5 (2026-09-25):** "nonzero ONLY for POSSIBLE_HARD_WHITELIST"
+  no longer holds - the behavior-derived `POSSIBLE_EARLY_DROP` and
+  `POSSIBLE_UDP_FILTERING` classes also contribute (rank still in [-1, 1]; see
+  "Adaptive network layer (B-WL)" below). `POSSIBLE_UDP_OR_AWG_FILTERING` still
+  gets no branch, exactly as stated here.
 - **Eligibility is untouched (requirement 4)**: `PathScorer.isEligible`/
   `ineligibilityReason` gained ZERO new logic. Restriction only affects
   SCORE among already-eligible candidates - a relay candidate that is
@@ -2394,12 +2399,17 @@ DNS/IPv6 invariants held, managed identity/state completely unaffected - see
   host/IP/UUID/key). Empty list = previous behavior exactly.
 - `TransportBehaviorAnalyzer` never uses a byte threshold; early drop is
   connect + handshake + payload + stall-while-sending + no RST. New classes are
-  `POSSIBLE_EARLY_DROP` and `POSSIBLE_FULL_SHUTDOWN` (always `POSSIBLE_`).
-  Confidence is B40's qualitative `RestrictionEvidenceQuality`, not a number.
-- `PathScorer` restriction tier keeps rank in [-1, 1]; transport preferences are
-  derived only from registry `TransportCapabilities`
-  (`usesUdp`/`usesTcp`/`suitableForRestrictiveNetworks`), never from a
-  `TransportKind` list. History/cooldown still outrank it.
+  `POSSIBLE_EARLY_DROP`, `POSSIBLE_UDP_FILTERING` and `POSSIBLE_FULL_SHUTDOWN`
+  (always `POSSIBLE_`), all behavior-derived only. Early drop never maps to
+  `POSSIBLE_HARD_WHITELIST` (no allowed-reference contrast). Confidence is B40's
+  qualitative `RestrictionEvidenceQuality`, not a number.
+- `PathScorer` restriction tier keeps rank in [-1, 1]; transport preferences
+  react only to behavior-derived classes and are derived only from registry
+  `TransportCapabilities` (`usesUdp`/`usesTcp`/`suitableForRestrictiveNetworks`),
+  never from a `TransportKind` list. The probe-derived
+  `POSSIBLE_UDP_OR_AWG_FILTERING` (not UDP-specific: last outcome of ANY
+  transport) keeps rank 0. History/cooldown still outrank the tier. Net effect
+  today: live Auto ranking is unchanged until observations are wired.
 - `TrafficProgressMonitor` is pure and not yet wired; B33 remote confirmation
   and the relay watchdog remain the live post-connect gates.
 - `XrayVlessRealityXhttpConfig` / server `RealityXhttpServerConfig` exist but are

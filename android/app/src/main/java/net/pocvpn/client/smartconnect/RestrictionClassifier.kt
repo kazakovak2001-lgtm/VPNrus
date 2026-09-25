@@ -36,6 +36,15 @@ enum class RestrictionClass {
      */
     POSSIBLE_EARLY_DROP,
     /**
+     * B-WL1 - UDP attempts got no response while TCP handshakes/progress on
+     * the same network succeeded. Deliberately distinct from
+     * [POSSIBLE_UDP_OR_AWG_FILTERING], whose trigger (the last outcome of ANY
+     * transport failing plus a reachable gateway) is not UDP-specific: only
+     * this behavior-derived class drives transport-level (UDP vs TCP) ranking
+     * in PathScorer.
+     */
+    POSSIBLE_UDP_FILTERING,
+    /**
      * B-WL1 - the OS cannot validate internet AND every observed attempt,
      * across at least two distinct destinations, failed before any payload.
      * Still "possible": this app cannot see the operator's side.
@@ -227,10 +236,12 @@ object RestrictionClassifier {
      *       working-flow signal, as strong as rule 4's fresh AWG handshake);
      *  - 5  unvalidated internet + ALL_CONNECT_FAILED across >=2 destinations
      *       -> POSSIBLE_FULL_SHUTDOWN (a refinement of INTERNET_NOT_VALIDATED);
-     *  - 6  early drop reproduced across >=2 distinct destinations, or
-     *       ALL_CONNECT_FAILED while diverse probes also fail -> POSSIBLE_HARD_WHITELIST;
-     *  - 6b early drop (single or reproduced on one destination) -> POSSIBLE_EARLY_DROP;
-     *  - 8  UDP no-response while TCP works -> POSSIBLE_UDP_OR_AWG_FILTERING.
+     *  - 6  ALL_CONNECT_FAILED while diverse probes also fail -> POSSIBLE_HARD_WHITELIST
+     *       (the only behavior branch contrasting blocked vs. otherwise-reachable);
+     *  - 6b early drop (single, repeated, or across destinations) -> POSSIBLE_EARLY_DROP -
+     *       never HARD_WHITELIST: stalls on many foreign destinations say nothing
+     *       about an allowlist without an allowed-reference contrast;
+     *  - 8b UDP no-response while TCP works -> POSSIBLE_UDP_FILTERING.
      */
     private fun decide(
         evidence: RestrictionEvidence,
@@ -252,12 +263,12 @@ object RestrictionClassifier {
             !profile.validatedInternet && pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED -> RestrictionClass.POSSIBLE_FULL_SHUTDOWN to true
             !profile.validatedInternet -> RestrictionClass.INTERNET_NOT_VALIDATED to false
             gatewayUnreachable && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST to false
-            pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP_MULTI_DESTINATION -> RestrictionClass.POSSIBLE_HARD_WHITELIST to true
             pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST to true
-            pattern == TransportBehaviorPattern.EARLY_DROP || pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP -> RestrictionClass.POSSIBLE_EARLY_DROP to true
+            pattern == TransportBehaviorPattern.EARLY_DROP || pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP ||
+                pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP_MULTI_DESTINATION -> RestrictionClass.POSSIBLE_EARLY_DROP to true
             gatewayHttpsReachable == false -> RestrictionClass.GATEWAY_HTTPS_UNREACHABLE to false
             gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING to false
-            pattern == TransportBehaviorPattern.UDP_NO_RESPONSE_TCP_OK -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING to true
+            pattern == TransportBehaviorPattern.UDP_NO_RESPONSE_TCP_OK -> RestrictionClass.POSSIBLE_UDP_FILTERING to true
             else -> RestrictionClass.UNKNOWN to false
         }
     }

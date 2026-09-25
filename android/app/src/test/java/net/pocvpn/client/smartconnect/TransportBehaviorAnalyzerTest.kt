@@ -71,9 +71,9 @@ class TransportBehaviorAnalyzerTest {
     }
 
     @Test
-    fun `test 2 UDP blocked - no UDP response while TCP works - POSSIBLE_UDP_OR_AWG_FILTERING`() {
+    fun `test 2 UDP blocked - no UDP response while TCP works - POSSIBLE_UDP_FILTERING`() {
         val assessment = RestrictionClassifier.assess(evidence(listOf(udpNoResponse(), tcp(destination = "path-reality"))))
-        assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, assessment.classification)
+        assertEquals(RestrictionClass.POSSIBLE_UDP_FILTERING, assessment.classification)
         assertEquals(TransportBehaviorPattern.UDP_NO_RESPONSE_TCP_OK, assessment.transportBehavior?.pattern)
         assertTrue(TransportBehaviorSignal.UDP_NO_RESPONSE in assessment.transportBehavior!!.signals)
         assertEquals(RestrictionEvidenceQuality.LOW, assessment.evidenceQuality)
@@ -102,9 +102,12 @@ class TransportBehaviorAnalyzerTest {
     }
 
     @Test
-    fun `test 4b repeated early drop across distinct destinations - POSSIBLE_HARD_WHITELIST`() {
+    fun `test 4b repeated early drop across distinct destinations - HIGH-confidence POSSIBLE_EARLY_DROP, never HARD_WHITELIST`() {
+        // Stalls on several (foreign) destinations look like per-destination stream filtering; without an
+        // allowed-reference contrast they are no evidence of an allowlist.
         val assessment = RestrictionClassifier.assess(evidence(listOf(earlyDrop("path-a"), earlyDrop("path-b"))))
-        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, assessment.classification)
+        assertEquals(RestrictionClass.POSSIBLE_EARLY_DROP, assessment.classification)
+        assertTrue(RestrictionEvidenceReason.TRANSPORT_EARLY_DROP_MULTI_DESTINATION in assessment.reasons)
         assertEquals(RestrictionEvidenceQuality.HIGH, assessment.evidenceQuality)
         assertTrue(TransportBehaviorSignal.MULTIPLE_DESTINATIONS in assessment.transportBehavior!!.signals)
     }
@@ -189,6 +192,13 @@ class TransportBehaviorAnalyzerTest {
     }
 
     @Test
+    fun `legacy probe-derived UDP-or-AWG evidence stays its own class and is never upgraded to behavior-derived UDP filtering`() {
+        val e = evidence(listOf(udpNoResponse(), tcp(destination = "path-reality"))).copy(awgHandshakeFresh = false, gatewayHttpsReachable = true)
+        // The existing (non-UDP-specific) rule keeps priority and its own class.
+        assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, RestrictionClassifier.classify(e))
+    }
+
+    @Test
     fun `no observations leaves RestrictionClassifier byte-for-byte unchanged`() {
         val noBehavior = RestrictionEvidence(profile(), TransportState.Disconnected, awgHandshakeFresh = false, gatewayHttpsReachable = true, diverseInternetReachable = null)
         assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, RestrictionClassifier.classify(noBehavior))
@@ -206,6 +216,7 @@ class TransportBehaviorAnalyzerTest {
         val names = RestrictionClass.entries.map { it.name }
         assertTrue("POSSIBLE_EARLY_DROP" in names)
         assertTrue("POSSIBLE_FULL_SHUTDOWN" in names)
+        assertTrue("POSSIBLE_UDP_FILTERING" in names)
         listOf("EARLY_DROP", "FULL_SHUTDOWN", "WHITELIST", "DPI_BLOCKED").forEach { assertFalse(it in names) }
     }
 

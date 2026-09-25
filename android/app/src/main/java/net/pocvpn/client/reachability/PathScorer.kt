@@ -53,15 +53,18 @@ import net.pocvpn.client.transport.TransportStatus
  * B28 - restriction-evidence tier: under [RestrictionClass.POSSIBLE_HARD_WHITELIST]
  * a [PathCandidate.Relayed] gets restrictionRank +1 and a [PathCandidate.Direct]
  * -1. B-WL5 extends the same tier (still a rank strictly in [-1, 1], so the
- * proof above is unchanged) with transport-aware preferences for
- * POSSIBLE_UDP_OR_AWG_FILTERING and POSSIBLE_EARLY_DROP, read only from the
+ * proof above is unchanged) with transport-aware preferences for the
+ * behavior-derived POSSIBLE_UDP_FILTERING and POSSIBLE_EARLY_DROP, read only from the
  * candidate's real [TransportCapabilities] - see [restrictionPreference]. Every
- * other class (UNKNOWN/NO_RESTRICTION_OBSERVED/POSSIBLE_FULL_SHUTDOWN included)
- * contributes exactly 0, so normal healthy behavior is unaffected. This is
+ * other class contributes exactly 0 - including the probe-derived
+ * POSSIBLE_UDP_OR_AWG_FILTERING (B28 unchanged: its trigger is the last outcome
+ * of ANY transport, so it must never demote AWG; AMNEZIA_WG is penalized only
+ * via HEALTH_TIER), UNKNOWN, NO_RESTRICTION_OBSERVED and POSSIBLE_FULL_SHUTDOWN - so normal healthy behavior is unaffected. This is
  * scoring only - eligibility ([isEligible]) is completely untouched by
- * restriction evidence, so an ineligible candidate is never promoted by it,
- * and both [net.pocvpn.client.smartconnect.IngressKind] values participate
- * identically (the preference never depends on ingress kind).
+ * restriction evidence, so an ineligible candidate is never promoted by it.
+ * The relay/direct preference never depends on [net.pocvpn.client.smartconnect
+ * .IngressKind]; under POSSIBLE_UDP_FILTERING the client-dialed transport's
+ * capabilities decide, which can differ between ingress kinds.
  *
  * B19 - typed reason tokens (see [Reason]) are appended to [PathScoreResult
  * .reasons] alongside the existing free-text summaries (never replacing
@@ -94,9 +97,9 @@ object PathScorer {
         RESTRICTION_FAVORS_RELAY,
         /** B28 - POSSIBLE_HARD_WHITELIST evidence penalized this DIRECT candidate relative to relayed alternatives. */
         RESTRICTION_PENALIZES_DIRECT,
-        /** B-WL5 - UDP-filtering evidence favored this TCP, restrictive-network-suitable transport. */
+        /** B-WL5 - behavior-derived POSSIBLE_UDP_FILTERING favored this TCP, restrictive-network-suitable transport. */
         RESTRICTION_FAVORS_TCP_TRANSPORT,
-        /** B-WL5 - UDP-filtering evidence penalized this UDP-only transport. */
+        /** B-WL5 - behavior-derived POSSIBLE_UDP_FILTERING penalized this UDP-only transport. */
         RESTRICTION_PENALIZES_UDP_TRANSPORT,
         /** B-WL5 - early-drop evidence penalized this direct, long-lived-TCP-stream transport. */
         RESTRICTION_PENALIZES_EARLY_DROP_PRONE,
@@ -315,13 +318,14 @@ object PathScorer {
      * [TransportCapabilities] for the client-dialed transport), never from a
      * hardcoded TransportKind list:
      *  - POSSIBLE_HARD_WHITELIST: unchanged B28 behavior (relay +1, direct -1).
-     *  - POSSIBLE_UDP_OR_AWG_FILTERING: a UDP-only transport -1; a TCP transport
+     *  - POSSIBLE_UDP_FILTERING (behavior-derived only): a UDP-only transport -1; a TCP transport
      *    declared suitableForRestrictiveNetworks +1 (e.g. XHTTP ahead of RAW
      *    REALITY ahead of AWG); any other TCP transport 0.
      *  - POSSIBLE_EARLY_DROP: relay +1 (an allowed ingress may avoid the
      *    per-destination drop); a direct transport that is neither UDP nor
      *    declared suitableForRestrictiveNetworks -1 (a long-lived direct TCP
      *    stream is exactly what just stalled); everything else 0.
+     *  - POSSIBLE_UDP_OR_AWG_FILTERING: 0 (B28 unchanged - not UDP-specific evidence).
      *  - POSSIBLE_FULL_SHUTDOWN and every other class: 0 - no transport choice
      *    helps a network that carries nothing; the bounded attempt budget and
      *    PathHistoryStore cooldown provide the controlled fallback.
@@ -333,7 +337,7 @@ object PathScorer {
                 is PathCandidate.Relayed -> RestrictionPreference(1, Reason.RESTRICTION_FAVORS_RELAY, "favors relay")
                 is PathCandidate.Direct -> RestrictionPreference(-1, Reason.RESTRICTION_PENALIZES_DIRECT, "penalizes direct")
             }
-            RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING -> when {
+            RestrictionClass.POSSIBLE_UDP_FILTERING -> when {
                 udpOnly -> RestrictionPreference(-1, Reason.RESTRICTION_PENALIZES_UDP_TRANSPORT, "penalizes UDP-only transport")
                 capabilities.usesTcp && capabilities.suitableForRestrictiveNetworks ->
                     RestrictionPreference(1, Reason.RESTRICTION_FAVORS_TCP_TRANSPORT, "favors TCP restrictive-network transport")

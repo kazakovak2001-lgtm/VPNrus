@@ -118,7 +118,9 @@ fun mapRestrictionClassToFailureReason(restrictionClass: RestrictionClass): Diag
     RestrictionClass.NO_NETWORK -> DiagnosticFailureReason.NETWORK_UNAVAILABLE
     RestrictionClass.CAPTIVE_PORTAL -> DiagnosticFailureReason.CAPTIVE_PORTAL
     RestrictionClass.GATEWAY_HTTPS_UNREACHABLE -> DiagnosticFailureReason.GATEWAY_UNREACHABLE
-    RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING -> DiagnosticFailureReason.PROTOCOL_OR_TRANSPORT_BLOCKED
+    RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING,
+    RestrictionClass.POSSIBLE_UDP_FILTERING,
+    -> DiagnosticFailureReason.PROTOCOL_OR_TRANSPORT_BLOCKED
     RestrictionClass.POSSIBLE_HARD_WHITELIST -> DiagnosticFailureReason.POSSIBLE_HARD_WHITELIST
     RestrictionClass.POSSIBLE_EARLY_DROP -> DiagnosticFailureReason.POSSIBLE_EARLY_DROP
     RestrictionClass.POSSIBLE_FULL_SHUTDOWN -> DiagnosticFailureReason.POSSIBLE_FULL_SHUTDOWN

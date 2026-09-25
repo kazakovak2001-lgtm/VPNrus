@@ -30,8 +30,8 @@ Name mapping to the requested classes:
 | Requested | `RestrictionClass` |
 |---|---|
 | NORMAL_NETWORK | `NO_RESTRICTION_OBSERVED` |
-| POSSIBLE_UDP_FILTERING | `POSSIBLE_UDP_OR_AWG_FILTERING` (existing; now also from UDP no-response while TCP works) |
-| POSSIBLE_WHITELIST | `POSSIBLE_HARD_WHITELIST` (existing; now also from early drop reproduced across 2+ destinations) |
+| POSSIBLE_UDP_FILTERING | `POSSIBLE_UDP_FILTERING` (new, behavior-only: UDP no-response while TCP works). The existing probe-derived `POSSIBLE_UDP_OR_AWG_FILTERING` is kept separate because its trigger is the last outcome of ANY transport |
+| POSSIBLE_WHITELIST | `POSSIBLE_HARD_WHITELIST` (existing; now also from ALL_CONNECT_FAILED with validated internet and failing diverse probes) |
 | POSSIBLE_EARLY_DROP | `POSSIBLE_EARLY_DROP` (new) |
 | FULL_SHUTDOWN | `POSSIBLE_FULL_SHUTDOWN` (new; OS cannot validate internet AND every attempt across 2+ destinations failed before payload) |
 | UNKNOWN | `UNKNOWN` |
@@ -39,9 +39,11 @@ Name mapping to the requested classes:
 Early drop = TCP connected + handshake completed + some payload received +
 no progress for the stall window while we kept sending + no RST. There is no
 byte threshold anywhere (tests pin identical results at 1 KB, 16 384 B and
-1 MB). One occurrence gives LOW quality, a repeat on one destination gives
-HIGH `POSSIBLE_EARLY_DROP`, a repeat across distinct destinations gives
-`POSSIBLE_HARD_WHITELIST`. An early drop on one path while another TCP path
+1 MB). One occurrence gives LOW quality; a repeat (on one or several
+destinations) gives HIGH `POSSIBLE_EARLY_DROP`. Early drop is never mapped to
+`POSSIBLE_HARD_WHITELIST`: stalls on many foreign destinations look like
+per-destination stream filtering, and without an allowed-reference contrast
+they say nothing about an allowlist. An early drop on one path while another TCP path
 progresses is contradictory and yields UNKNOWN.
 
 With no observations the classifier is byte-for-byte its previous self.
@@ -53,12 +55,14 @@ facts read only from the registry's real `TransportCapabilities`:
 
 | Class | Effect |
 |---|---|
-| NORMAL / UNKNOWN / FULL_SHUTDOWN | none (existing order: AWG, QUIC, REALITY, XHTTP, TLS, SS2022) |
-| UDP filtering | UDP-only -1; TCP + `suitableForRestrictiveNetworks` (XHTTP) +1 |
+| NORMAL / UNKNOWN / FULL_SHUTDOWN / probe-derived UDP_OR_AWG | none (existing order: AWG, QUIC, REALITY, XHTTP, TLS, SS2022) |
+| `POSSIBLE_UDP_FILTERING` (behavior-only) | UDP-only -1; TCP + `suitableForRestrictiveNetworks` (XHTTP) +1 |
 | Possible whitelist | relay +1, direct -1 (B28, unchanged) |
 | Early drop | relay +1; direct TCP that is not restrictive-network-suitable -1; UDP 0 |
 
-Resulting order with today's capability profiles (tested):
+Both new branches react only to behavior-derived classes, which nothing
+produces at runtime yet, so **live Auto ranking is unchanged** until B-WL1 is
+wired. Resulting order with today's capability profiles (tested):
 NORMAL `AWG, REALITY, relay XHTTP, TLS`; UDP filtering `relay XHTTP, REALITY,
 TLS, AWG`; whitelist and early drop `relay XHTTP, AWG, REALITY, TLS`.
 Repeated retries of a failed candidate are prevented by the existing
@@ -92,7 +96,7 @@ ranks below XHTTP. ECH: FUTURE RESEARCH only.
   candidate list is the signed endpoint manifest, which already separates
   ingress from exit (`roles`, `relayTo`). A per-endpoint profile API is not
   needed for this slice.
-- No production change was made.
+- No server/production infrastructure change was made. Client code changed, but live Auto ranking is unchanged until behavior observations are wired (see section 3).
 
 ## 6. Still missing
 
@@ -108,8 +112,10 @@ ranks below XHTTP. ECH: FUTURE RESEARCH only.
 
 ## 7. Risks
 
-- UDP-filtering ranking now demotes AWG one restriction step before AWG's own
-  health has degraded; history/health still outrank it.
+- Once wired, UDP-filtering ranking demotes AWG one restriction step before
+  AWG's own health has degraded; history/health still outrank it.
+- A future `RealityXhttpServerConfig` deployment opens a new port and needs a
+  firewall/security-group change with explicit owner approval.
 - `POSSIBLE_FULL_SHUTDOWN` leans on Android's validation, which itself may be
   blocked under a whitelist; the rule needs 2+ destinations to limit false
   positives.
