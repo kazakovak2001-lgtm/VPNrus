@@ -34,7 +34,19 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from . import activations, ingress_activation, provision, relay_probe_token, tokens, xray_activation, xray_provisioning
+from datetime import datetime
+
+from . import (
+    activations,
+    hysteria_provisioning,
+    hysteria_store,
+    ingress_activation,
+    provision,
+    relay_probe_token,
+    tokens,
+    xray_activation,
+    xray_provisioning,
+)
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
@@ -45,6 +57,7 @@ _PATH_XRAY_PROFILE = "/v1/xray-profile"
 _PATH_INGRESS_PROFILE = "/v1/ingress-profile"
 _PATH_MANIFEST = "/v1/manifest"
 _PATH_RELAY_HEALTH = "/v1/relay-health"
+_PATH_HYSTERIA_PROFILE = "/v1/hysteria-profile"
 
 # B26 (task B) - the same TransportKind.name strings Android's TransportKind
 # enum uses (see transport/TransportKind.kt - no custom toString(), so
@@ -162,6 +175,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_ingress_profile()
+            elif self.path == _PATH_HYSTERIA_PROFILE:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_hysteria_profile()
             elif self.path == _PATH_MANIFEST:
                 if method != "GET":
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
@@ -525,6 +543,100 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # "success" here, same rule /v1/activate already uses for its own
         # new-bind-vs-existing-bind distinction - but ONLY once activation
         # is confirmed (see the check above).
+        return self._success(HTTPStatus.OK, payload)
+
+    # --- POST /v1/hysteria-profile (B46-4P) ---
+    def _handle_hysteria_profile(self):
+        try:
+            return self._handle_hysteria_profile_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_hysteria_profile_inner(self):
+        """Same request shape and entitlement authority as /v1/xray-profile
+        ({"public_key": ...} + Authorization: Bearer <activation credential>,
+        activations.py's device binding) - see hysteria_provisioning.py.
+        Every successful call ROTATES the device's Hysteria2 wire secret
+        (retry-safe rotation, not idempotence): the per-token limiter below
+        bounds that churn. The response is the ONLY place the raw
+        auth_secret ever leaves this process; it is never logged."""
+        cfg = self.server.config
+        if not (cfg.activation_store_path and cfg.hysteria2_store_path and cfg.hysteria2_server_port):
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "hysteria_not_configured")
+
+        if not self.server.global_limiter.allow("global"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        credential = self._require_bearer_token()
+
+        raw_body = self.rfile.read(content_length)
+        public_key = self._parse_and_validate_body(raw_body)
+        self._log_fields["pubkey_prefix"] = public_key[:8]
+
+        credential_digest = activations.credential_digest(credential)
+        self._log_fields["activation_digest"] = credential_digest[:8]
+
+        if not self.server.per_token_limiter.allow(credential_digest):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        try:
+            result = hysteria_provisioning.provision_hysteria_identity(
+                credential, public_key,
+                cfg.activation_store_path, cfg.activation_lock_path,
+                cfg.hysteria2_store_path, cfg.hysteria2_lock_path,
+            )
+        except (
+            hysteria_provisioning.HysteriaStoreError,
+            hysteria_store.HysteriaStoreLockError,
+            hysteria_store.HysteriaStoreWriteError,
+        ) as exc:
+            logger.error("hysteria_store_error exc_type=%s", type(exc).__name__)
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "hysteria_store_unavailable")
+
+        self._log_fields["hysteria_outcome"] = result.outcome
+
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_UNKNOWN:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_REVOKED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "revoked")
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_EXPIRED:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "expired")
+        if result.outcome == hysteria_provisioning.NOT_ELIGIBLE_DEVICE_NOT_BOUND:
+            raise _RequestError(HTTPStatus.FORBIDDEN, "device_not_bound")
+        if result.outcome != hysteria_provisioning.ISSUED or not result.auth_secret:
+            logger.error("hysteria_unexpected_outcome")
+            raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+        issued_at = int(time.time())
+        expires_at = None
+        if result.activation_expires_at is not None:
+            expires_at = int(datetime.fromisoformat(result.activation_expires_at).timestamp())
+
+        # Exactly the fields ProvisioningClient.parseHysteria2ProfileSuccessBody
+        # (Android) reads. server_address is endpoint_host - the SAME host the
+        # signed HYSTERIA2 EndpointTransportBinding pins; the client refuses
+        # to store a credential whose host/port/sni/obfuscation disagree with
+        # its trusted signed profile. obfuscation_mode is NONE-only (Finding
+        # 8: Salamander is listener-level, never per device).
+        payload = {
+            "profile_version": 1,
+            "server_address": cfg.endpoint_host,
+            "server_port": cfg.hysteria2_server_port,
+            "auth_secret": result.auth_secret,
+            "sni": cfg.hysteria2_sni,
+            "obfuscation_mode": "NONE",
+            "issued_at_epoch_seconds": issued_at,
+            "expires_at_epoch_seconds": expires_at,
+        }
         return self._success(HTTPStatus.OK, payload)
 
     # --- POST /v1/ingress-profile (B25 task G) ---

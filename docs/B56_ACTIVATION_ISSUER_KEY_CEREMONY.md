@@ -491,6 +491,62 @@ issued** (B56-4B2) - this ceremony does not invent or claim one. No air-gapped
 hardware, HSM, or secure-erase of the abandoned candidate's key material has
 occurred either - none of those are claimed here.
 
+### B56-4B2 offline backup procedure (prepared; NOT yet performed)
+
+Status: **BLOCKED ON OPERATOR** - the only copy of the key lives on the
+operator's WSL machine; no automated/cloud session may hold, copy, or see
+it. Nothing below has been executed. Record the outcome in this section
+(date, media count, locations - never contents) when it is.
+
+Custody rules: the private key never goes to a cloud drive, password-manager
+sync, email, chat, CI, Git, the VPS, or the APK; it is never printed,
+`cat`-ed, base64-displayed, or hashed-for-display (the fingerprint is of the
+PUBLIC key only).
+
+1. **Media**: two new USB drives (A, B) dedicated to this key, or one USB +
+   one paper/QR-free-of-network alternative the operator already trusts.
+   Two copies in two physically separate locations the operator controls.
+2. **Encrypt at rest**: inside the same `unshare --net` network-isolated
+   namespace used for generation (verify `ip -br addr` = `lo DOWN`, `ip
+   route` empty), create an encrypted container on each medium (e.g. LUKS2
+   `cryptsetup luksFormat`, or `age -p` / `gpg --symmetric --cipher-algo
+   AES256` on the single 32-byte file) with a long passphrase. The
+   passphrase is stored separately from the media (sealed paper), never
+   beside it.
+3. **Copy**: copy `~/.nova-secrets/activation-issuer/<r2 private key file>`
+   and its public metadata JSON onto each encrypted medium; `chmod 600` the
+   key copy.
+4. **Verify each copy without revealing it** (decrypt/mount inside the
+   isolated namespace, then):
+
+   ```text
+   python3 gateway/tools/activation_envelope_issuer.py verify-key \
+     --private-key-file <mounted backup>/<key file> \
+     --issuer-metadata-file <mounted backup>/<metadata json> \
+     --expected-fingerprint 88ccf8198af0d7775946253eb958f60f5174c652f6e28a4daecd857ab293e840
+   ```
+
+   Required output (public data only):
+   `OK issuerKeyId=prod-activation-issuer-2026-09-20-r2 publicKeyFingerprintSha256Hex=88ccf819...e840`.
+   Any other output = that copy is not a valid backup; redo it.
+5. **Restore drill**: on a clean isolated namespace, restore from backup B
+   only, re-run step 4 against the restored file, then securely delete the
+   restored drill copy (`shred -u`; SSD wear-levelling caveat noted, not
+   claimed as secure erase).
+6. **Record** in this document: date, "2 encrypted copies, 2 locations,
+   verify-key OK on both, restore drill OK" - then flip
+   `PRODUCTION_ISSUER_OFFLINE_BACKUP_PENDING` to `..._DONE`.
+7. **Loss/compromise recovery**: primary lost + backup OK -> restore and
+   continue (same key id). Backup or primary suspected compromised -> treat
+   as key compromise: new ceremony (`-r3`), add the new public key to
+   `ProductionActivationIssuerTrustAnchors` alongside `-r2`, ship, stop
+   issuing under `-r2`, remove `-r2` once every `-r2` envelope has expired
+   (see "Rotation model"); revoke any activations whose envelopes may have
+   been forged via `revoke_activation()`.
+
+Only after step 6: `issue` may mint the first redeemable production
+envelope (see "What B56-4B2+ still has to do").
+
 ### Rotation / review policy
 
 ```text

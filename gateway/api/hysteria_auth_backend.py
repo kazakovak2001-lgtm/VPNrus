@@ -19,11 +19,8 @@ binding alone) enforcing that. It must never require the internet-facing
 nginx edge, and must never itself be internet-routable - a public HTTP
 auth-check endpoint would let anyone probe which arbitrary strings are
 valid Hysteria2 secrets. No code in this module opens a socket or binds a
-port; wiring THAT (a tiny loopback-only HTTP listener, or a Unix socket
-handler, started by its own narrowly-scoped systemd unit) is explicit
-B46-4P deployment work, listed as a remaining action in the design doc -
-this module only provides the pure, testable request-handling function
-that listener will call.
+port; the loopback-only listener that calls it is
+gateway/api/hysteria_auth_server.py (unit: pocvpn-hysteria-auth.service).
 """
 import ipaddress
 import json

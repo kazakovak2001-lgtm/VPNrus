@@ -1488,5 +1488,74 @@ class IssueCommandTests(unittest.TestCase):
         self.assertTrue(os.path.exists(args.out))
 
 
+class VerifyKeyTests(unittest.TestCase):
+    """B56-4B2 - `verify-key` proves a (backup) private key copy matches the
+    issuer metadata / pinned fingerprint and never emits private material."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.key = _write_test_key_file(self._tmp.name)
+        self.meta = _write_metadata_file(self._tmp.name)
+        pub = Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES).public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
+        )
+        self.fingerprint = hashlib.sha256(pub).hexdigest()
+
+    def _run(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = issuer.main(["verify-key", "--private-key-file", self.key, "--issuer-metadata-file", self.meta, *extra])
+        return code, out.getvalue(), err.getvalue()
+
+    def _assert_no_private_material(self, text):
+        self.assertNotIn(_TEST_PRIVATE_KEY_BYTES.hex(), text)
+        self.assertNotIn(base64.b64encode(_TEST_PRIVATE_KEY_BYTES).decode("ascii"), text)
+        self.assertNotIn(base64.urlsafe_b64encode(_TEST_PRIVATE_KEY_BYTES).decode("ascii").rstrip("="), text)
+
+    def test_matching_key_prints_public_data_only(self):
+        code, out, err = self._run("--expected-fingerprint", self.fingerprint)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), f"OK issuerKeyId={_TEST_ISSUER_KEY_ID} publicKeyFingerprintSha256Hex={self.fingerprint}")
+        self._assert_no_private_material(out + err)
+
+    def test_wrong_key_copy_is_rejected(self):
+        self.key = _write_test_key_file(self._tmp.name, key_bytes=bytes(range(1, 33)), name="other.bin")
+        code, out, err = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("does NOT match", err)
+        self.assertEqual(out, "")
+        self._assert_no_private_material(out + err)
+
+    def test_fingerprint_pin_mismatch_is_rejected(self):
+        code, _out, err = self._run("--expected-fingerprint", "0" * 64)
+        self.assertEqual(code, 1)
+        self.assertIn("--expected-fingerprint", err)
+
+    def test_malformed_fingerprint_pin_is_rejected(self):
+        code, _out, _err = self._run("--expected-fingerprint", "xyz")
+        self.assertEqual(code, 1)
+
+    def test_truncated_backup_copy_is_rejected(self):
+        with open(self.key, "wb") as handle:
+            handle.write(_TEST_PRIVATE_KEY_BYTES[:31])
+        code, out, err = self._run()
+        self.assertEqual(code, 1)
+        self._assert_no_private_material(out + err)
+
+    def test_group_readable_backup_copy_is_refused(self):
+        if os.name == "nt":
+            self.skipTest("POSIX modes only")
+        os.chmod(self.key, 0o640)
+        code, _out, err = self._run()
+        self.assertEqual(code, 1)
+        self.assertIn("chmod 600", err)
+
+    def test_never_touches_an_activation_store(self):
+        with mock.patch.object(issuer, "_activations_module", side_effect=AssertionError("store touched")):
+            code, _out, _err = self._run()
+        self.assertEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

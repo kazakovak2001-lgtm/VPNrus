@@ -315,12 +315,22 @@ Run against the real project Android SDK (`%LOCALAPPDATA%\Android\Sdk`, already 
 - No raw secret in any log line, exception message, or HTTP response this slice's code paths can produce (asserted directly by tests on both the Kotlin and Python sides).
 - `gateway/api/handler.py` still has no live `/v1/hysteria-profile` dispatch (Finding 9, deliberately deferred) - the provisioning/store/auth-backend modules cannot be reached by any running process from this slice's changes alone.
 
-## Remaining B46-4P work (deployment gate - explicitly out of scope here)
+## B46-4P step 1 - live route wiring (DONE, git-only, NOT deployed)
 
-1. Wire `gateway/api/handler.py`'s live route table to `hysteria_provisioning`/`hysteria_auth_backend`, including the new `AppConfig` fields their completeness validation needs (Finding 9 - deliberately deferred from B46-4A, see "API code path" above). Still git-only work, zero live deployment.
+Finding 9 is closed in code on branch `claude/hysteria2-activation-production-bwvdpw` (stacked on this PR):
+
+- `gateway/api/config.py`: new all-or-nothing group `POCVPN_API_HYSTERIA2_{STORE_PATH,LOCK_PATH,SERVER_PORT,SNI,AUTH_BACKEND_PORT}`; requires the activation store; absolute store paths; auth-backend port must differ from `API_PORT`. Unset = unconfigured (every existing deployment unchanged).
+- `gateway/api/handler.py`: live `POST /v1/hysteria-profile` dispatch (GET etc. -> 405). Same framing/Bearer/`{"public_key"}` body/global + per-activation rate limits as `/v1/xray-profile`. Outcomes: 503 `hysteria_not_configured` / `hysteria_store_unavailable`, 401 `unauthorized`, 403 `revoked` / `expired` / `device_not_bound`, 200 with exactly the fields `ProvisioningClient.parseHysteria2ProfileSuccessBody` reads (`profile_version=1`, `server_address=ENDPOINT_HOST`, `server_port`, `auth_secret`, `sni`, `obfuscation_mode=NONE`, `issued_at_epoch_seconds`, `expires_at_epoch_seconds` = the activation's own server-side expiry or `null`). The raw secret is never logged.
+- `gateway/api/hysteria_auth_server.py` + `gateway/systemd/pocvpn-hysteria-auth.service`: the loopback-only listener (`127.0.0.1` hard-coded, `POST /auth`) the Hysteria2 server's `auth.type: http` calls. Store failure/oversize/malformed -> `{"ok":false}` (fail closed). Refuses to start unconfigured or with an unreadable store.
+- `gateway/edge/nginx-pocvpn-stockholm.conf`: `location = /v1/hysteria-profile` (POST-only -> `127.0.0.1:8443`), Stockholm only; inert (503) until the env group is set. The auth backend port is never routed at the edge (static test).
+- `gateway/config/api.env.example`: documented group + store init command.
+- Tests: `gateway/api/tests/test_hysteria_profile_endpoint.py` (32 tests: response contract, no raw secret at rest, activation credential != wire secret, 401/403 matrix incl. expired + wrong device, framing, 503 unconfigured/store missing, provision -> real auth listener -> rotation invalidates old secret, revocation denies on next connection without reload, backend store failure denies, loopback-only bind, config completeness matrix, edge route). Full gateway suite: 523 tests, 1 failure pre-existing on `main` (`test_edge_deployment_config` ingress 8444 assertion, unrelated file).
+
+## Remaining B46-4P work (deployment gate - requires operator/production access)
+
 2. Audit current Stockholm UDP/TCP listeners; choose a real UDP port (do not assume 443 is free).
 3. Provision a real TLS certificate + SNI for that listener; confirm `InsecureSkipVerify=false` end to end against it physically.
-4. Write and review the Hysteria2 server systemd unit (sandboxing, resource limits, restart policy) and the loopback-only auth-backend listener unit.
+4. Write and review the Hysteria2 server systemd unit (sandboxing, resource limits, restart policy). The auth-backend listener unit exists (`pocvpn-hysteria-auth.service`) - review/enable it at deploy time.
 5. Move/re-verify `libnovatun2sockschild.so`/`libnovahysteriachild.so` into `src/main/jniLibs/arm64-v8a/` production packaging; re-run the release-artifact inspection checklist.
 6. Compose and run the production manifest-signing ceremony to produce the real, signed `EndpointTransportBinding(HYSTERIA2, ...)` for Stockholm; provision one real test device's Hysteria2 credential against the real deployed server; physically validate Smart Connect/manual-selection end to end through the *normal app UI* (not a debug spike).
 7. Open the chosen firewall/Security Group rule only once the above are green.
@@ -330,6 +340,6 @@ Run against the real project Android SDK (`%LOCALAPPDATA%\Android\Sdk`, already 
 
 B46-4A is complete for its own scope, with one item deliberately deferred: production code exists (client + gateway) and, in this pass, was actually **compiled and its test suite actually run** (1841/1842 Kotlin tests passing, the one failure pre-existing and unrelated; 66/66 Python tests passing); a secure credential/provisioning path exists (verified-not-assumed upstream auth mechanism, no raw activation credential reused as Hysteria auth, no raw secret persisted at rest, retry-safe rotation rather than a broken idempotence claim); no insecure TLS anywhere; no secret Intent path; a signed-binding gate exists and is now genuinely reachable (`MainViewModel.Factory` wires real instances, `activateDevice()` actually calls the provisioner); the signed obfuscation policy is enforced fail-closed; the duplicate-start race and the endpoint-id fallback are closed; normal transport-selection wiring cannot become `AVAILABLE` without a real trusted binding + credential + ABI/binary eligibility. No production infrastructure was changed.
 
-**One condition is explicitly NOT met**: `gateway/api/handler.py` has no live route for `/v1/hysteria-profile` (Finding 9). This does not block "CODE READY" for the client-side and server-identity-logic scope this status describes, but it is the literal first blocker before ANY real device could ever complete provisioning - it is listed first in the B46-4P checklist above, not omitted.
+**Finding 9 update**: the live `/v1/hysteria-profile` route, config group, loopback auth listener, systemd unit and Stockholm edge route now exist in code (see "B46-4P step 1" above) - still NOT deployed; steps 2-8 remain.
 
 **Do not call Hysteria2 production-deployed.** B46-4P is a separate, explicit gate.

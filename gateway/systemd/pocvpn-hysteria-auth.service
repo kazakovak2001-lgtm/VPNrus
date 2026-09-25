@@ -1,0 +1,39 @@
+# B46-4P: loopback-only `auth.type: http` backend for the Hysteria2 server
+# (gateway/api/hysteria_auth_server.py). Reads the SAME /etc/pocvpn/api.env
+# as pocvpn-api.service (one config source, one activation store) and only
+# ever READS the activation and Hysteria2 stores. Binds 127.0.0.1 (hard-coded
+# in code, not configurable); never exposed through nginx. Refuses to start
+# unless the full POCVPN_API_HYSTERIA2_* group is set and the store exists.
+# NOT deployed by this change - see docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md.
+[Unit]
+Description=pocvpn Hysteria2 auth backend (loopback-only, non-root)
+After=network.target
+
+[Service]
+Type=simple
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+EnvironmentFile=/etc/pocvpn/api.env
+ExecStart=/usr/bin/python3 -m api.hysteria_auth_server
+Restart=on-failure
+RestartSec=2
+
+# Unlike pocvpn-api.service this process never uses sudo, so the full
+# no-privilege set applies.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/pocvpn-provision
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

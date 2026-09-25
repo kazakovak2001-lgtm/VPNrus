@@ -1081,6 +1081,33 @@ def _revoke_or_report_critical(args, activation_id: str, original_exc: BaseExcep
 
 # --- CLI wiring ---
 
+def cmd_verify_key(args) -> int:
+    """B56-4B2 - proves a private key file (the primary copy OR an offline
+    backup copy) is the exact key named by the public metadata, WITHOUT
+    signing anything, touching any activation store, or emitting any
+    private material. Output is public data only: issuerKeyId and the
+    public-key SHA-256 fingerprint. With --expected-fingerprint the
+    operator additionally pins the out-of-band recorded fingerprint (e.g.
+    the one in docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md)."""
+    private_key = read_private_key_file(args.private_key_file)
+    derived = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
+    )
+    private_key = None
+    identity = read_issuer_metadata_file(args.issuer_metadata_file)
+    if not hmac.compare_digest(identity.public_key_bytes, derived):
+        raise IssuerError("--private-key-file does NOT match the public key recorded in --issuer-metadata-file")
+    fingerprint = hashlib.sha256(derived).hexdigest()
+    if args.expected_fingerprint is not None:
+        expected = args.expected_fingerprint.strip().lower()
+        if not _FINGERPRINT_RE.match(expected):
+            raise IssuerError("--expected-fingerprint must be exactly 64 hex characters")
+        if not hmac.compare_digest(expected, fingerprint):
+            raise IssuerError("key fingerprint does NOT match --expected-fingerprint")
+    print(f"OK issuerKeyId={identity.issuer_key_id} publicKeyFingerprintSha256Hex={fingerprint}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="activation_envelope_issuer.py",
@@ -1105,6 +1132,11 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument("--bootstrap-bundle", default=None, help="optional path to an ALREADY-signed SignedManifestCodec artifact (from manifest_signing.py) to correlate by exact-byte SHA-256 + manifest version - never re-signed")
     issue.add_argument("--out", required=True, help="output path for the signed envelope artifact - SECRET (contains the plaintext activation credential); refuses to overwrite")
 
+    verify = sub.add_parser("verify-key", help="prove a private key file (primary or backup copy) matches the issuer metadata - prints public data only")
+    verify.add_argument("--private-key-file", required=True, help="path to a raw 32-byte Ed25519 private key file (primary or backup copy)")
+    verify.add_argument("--issuer-metadata-file", required=True, help="the public metadata JSON generate-key produced")
+    verify.add_argument("--expected-fingerprint", default=None, help="optional out-of-band recorded public-key SHA-256 fingerprint (64 hex) to pin")
+
     return parser
 
 
@@ -1117,6 +1149,8 @@ def main(argv=None) -> int:
             return cmd_generate_key(args)
         if args.command == "issue":
             return cmd_issue(args)
+        if args.command == "verify-key":
+            return cmd_verify_key(args)
     except IssuerError as exc:
         print(f"activation_envelope_issuer: error: {exc}", file=sys.stderr)
         return 1

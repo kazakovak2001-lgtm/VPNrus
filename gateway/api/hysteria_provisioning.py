@@ -75,11 +75,10 @@ REUSED, same digest, same lock file activations.py already owns) is always
 the outermost lock; this module's own store lock is a separate, independent
 file, never held while acquiring an activations.py lock.
 
-NOT WIRED TO A RUNNING HYSTERIA2 SERVER YET (B46-4A scope): this module and
-gateway/api/hysteria_auth_backend.py are code-only. No systemd unit, no
-firewall rule, no nginx route, and no production manifest binding are
-created or modified by this slice - see docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md's
-"server deployment proposal" section for what B46-4P still has to do.
+WIRING (B46-4P step 1): reached via handler.py's POST /v1/hysteria-profile
+(provision) and hysteria_auth_server.py's loopback POST /auth (verify). Not
+deployed: no firewall rule, no production manifest binding - see
+docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md's remaining B46-4P work.
 """
 import hashlib
 import os
@@ -127,6 +126,11 @@ class HysteriaIdentityResult:
     # see this module's own "SALAMANDER OBFUSCATION IS NOT PROVISIONED HERE"
     # doc (Finding 8).
     auth_secret: str = ""
+    # B46-4P - set only for ISSUED: the underlying activation's own
+    # server-side expires_at (ISO 8601 UTC) or None for a non-expiring
+    # activation. Advisory for the client only - verify_hysteria_auth
+    # re-checks LIVE activation state on every connection regardless.
+    activation_expires_at: object = None
 
 
 def _utc_now_iso():
@@ -149,17 +153,17 @@ def _check_device_eligibility(credential, public_key, activation_store_path, act
     digest = activations.credential_digest(credential)
     record = data.get(digest)
     if record is None:
-        return NOT_ELIGIBLE_UNKNOWN
+        return NOT_ELIGIBLE_UNKNOWN, None
     if record["status"] != activations.ACTIVE:
-        return NOT_ELIGIBLE_REVOKED
+        return NOT_ELIGIBLE_REVOKED, None
     expires_at = record["expires_at"]
     if expires_at is not None and now >= datetime.fromisoformat(expires_at):
-        return NOT_ELIGIBLE_EXPIRED
+        return NOT_ELIGIBLE_EXPIRED, None
 
     for device in record["bound_devices"]:
         if device["public_key"] == public_key and device["state"] == activations.CONFIRMED:
-            return None  # eligible
-    return NOT_ELIGIBLE_DEVICE_NOT_BOUND
+            return None, expires_at  # eligible
+    return NOT_ELIGIBLE_DEVICE_NOT_BOUND, None
 
 
 def provision_hysteria_identity(
@@ -201,7 +205,9 @@ def provision_hysteria_identity(
     digest = activations.credential_digest(credential)
 
     with activations.per_activation_lock(activation_store_path, digest):
-        ineligible = _check_device_eligibility(credential, public_key, activation_store_path, activation_lock_path, now)
+        ineligible, activation_expires_at = _check_device_eligibility(
+            credential, public_key, activation_store_path, activation_lock_path, now,
+        )
         if ineligible is not None:
             return HysteriaIdentityResult(outcome=ineligible)
 
@@ -228,7 +234,9 @@ def provision_hysteria_identity(
             # rotation happened when it did not.
             data[digest] = other_devices + [new_identity]
             hysteria_store.atomic_write_store_or_raise(hysteria_store_path, data)
-            return HysteriaIdentityResult(outcome=ISSUED, auth_secret=auth_secret)
+            return HysteriaIdentityResult(
+                outcome=ISSUED, auth_secret=auth_secret, activation_expires_at=activation_expires_at,
+            )
 
 
 @dataclass(frozen=True)

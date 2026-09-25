@@ -134,6 +134,33 @@ class AppConfig:
     # per request, never logs them, never returns them.
     relay_probe_hmac_secret_file: str = ""
 
+    # B46-4P - POST /v1/hysteria-profile + the loopback-only Hysteria2
+    # `auth.type: http` backend (hysteria_auth_server.py). One all-or-nothing
+    # completeness group, same convention as Xray TLS above: blank (the
+    # default) means the endpoint fails closed with 503 and the auth backend
+    # refuses to start. server_address handed to the client is ALWAYS
+    # endpoint_host (the host the signed EndpointTransportBinding pins) -
+    # there is deliberately no separate override field that could drift from
+    # the signed manifest; the client cross-checks it and fails closed anyway.
+    hysteria2_store_path: str = ""
+    hysteria2_lock_path: str = ""
+    hysteria2_server_port: int = 0
+    hysteria2_sni: str = ""
+    hysteria2_auth_backend_port: int = 0
+
+
+def _parse_port(env, key):
+    raw = _get(env, key)
+    if not raw:
+        return raw, 0
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{_ENV_PREFIX}{key} is not an integer: {raw!r}")
+    if not (1 <= value <= 65535):
+        raise ConfigError(f"{_ENV_PREFIX}{key} out of range: {value}")
+    return raw, value
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -464,6 +491,47 @@ def load_config(env=None):
         if not os.path.isfile(relay_probe_hmac_secret_file):
             raise ConfigError(f"{_ENV_PREFIX}RELAY_PROBE_HMAC_SECRET_FILE does not exist: {relay_probe_hmac_secret_file!r}")
 
+    # B46-4P - see AppConfig.hysteria2_*'s own docs. All-or-nothing: a
+    # half-configured Hysteria2 group is a startup error, never a silently
+    # disabled or silently defaulted endpoint.
+    hysteria2_store_path = _get(env, "HYSTERIA2_STORE_PATH")
+    hysteria2_lock_path = _get(env, "HYSTERIA2_LOCK_PATH")
+    hysteria2_server_port_raw, hysteria2_server_port = _parse_port(env, "HYSTERIA2_SERVER_PORT")
+    hysteria2_sni = _get(env, "HYSTERIA2_SNI")
+    hysteria2_auth_backend_port_raw, hysteria2_auth_backend_port = _parse_port(env, "HYSTERIA2_AUTH_BACKEND_PORT")
+    hysteria2_values = (
+        ("HYSTERIA2_STORE_PATH", hysteria2_store_path),
+        ("HYSTERIA2_LOCK_PATH", hysteria2_lock_path),
+        ("HYSTERIA2_SERVER_PORT", hysteria2_server_port_raw),
+        ("HYSTERIA2_SNI", hysteria2_sni),
+        ("HYSTERIA2_AUTH_BACKEND_PORT", hysteria2_auth_backend_port_raw),
+    )
+    if any(value for _name, value in hysteria2_values):
+        hysteria2_missing = [name for name, value in hysteria2_values if not value]
+        if hysteria2_missing:
+            raise ConfigError(
+                "partial Hysteria2 configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in hysteria2_missing)
+                + " must all be set once any Hysteria2 setting is set (or none of them, to leave Hysteria2 unconfigured)"
+            )
+        for name, path in (("HYSTERIA2_STORE_PATH", hysteria2_store_path), ("HYSTERIA2_LOCK_PATH", hysteria2_lock_path)):
+            if not os.path.isabs(path):
+                raise ConfigError(f"{_ENV_PREFIX}{name} must be an absolute path: {path!r}")
+        # Hysteria2 credentials are scoped to the EXISTING activation/device
+        # binding - there is no Hysteria2 entitlement without it.
+        if not (activation_store_path and activation_lock_path):
+            raise ConfigError(
+                "partial Hysteria2 configuration: the activation store "
+                f"({_ENV_PREFIX}ACTIVATION_STORE_PATH/{_ENV_PREFIX}ACTIVATION_LOCK_PATH) must be configured before Hysteria2 can be enabled"
+            )
+        if hysteria2_auth_backend_port == api_port:
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT must differ from {_ENV_PREFIX}API_PORT "
+                "- the auth backend is a separate loopback-only listener"
+            )
+        if any(ch.isspace() for ch in hysteria2_sni) or len(hysteria2_sni) > 253:
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SNI is not a plausible hostname: {hysteria2_sni!r}")
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -500,4 +568,9 @@ def load_config(env=None):
         manifest_path=manifest_path,
         static_relay_clients_file=static_relay_clients_file,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
+        hysteria2_store_path=hysteria2_store_path,
+        hysteria2_lock_path=hysteria2_lock_path,
+        hysteria2_server_port=hysteria2_server_port,
+        hysteria2_sni=hysteria2_sni,
+        hysteria2_auth_backend_port=hysteria2_auth_backend_port,
     )
