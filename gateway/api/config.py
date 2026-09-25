@@ -15,6 +15,17 @@ from .wgkey import is_valid_wg_public_key
 
 _ENV_PREFIX = "POCVPN_API_"
 
+# B60 - same ASCII-DNS-hostname shape ingress_config.py's own
+# _DNS_HOSTNAME_RE already validates XHTTP_CLIENT_HOST/XHTTP_HOST against;
+# duplicated locally (not imported) since this module has no other
+# dependency on ingress_config.py and the two config surfaces are
+# deliberately independent (exit role vs. ingress role).
+_DNS_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?=.*[A-Za-z])"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+
 _REQUIRED_KEYS = (
     "ENDPOINT_HOST",
     "ENDPOINT_PORT",
@@ -112,6 +123,19 @@ class AppConfig:
     # optional-group convention.
     xray_xhttp_server_port: int = 0
     xray_xhttp_path: str = ""
+
+    # B60 - the PUBLIC, Cloudflare-facing coordinates POST /v1/xray-profile
+    # (transport=xhttp) reports to an already-activated client. Distinct
+    # from xray_xhttp_server_port above (this process's own loopback-only
+    # Xray inbound, never client-facing) - same "internal listen port vs.
+    # public client-facing endpoint" split the ingress role's own
+    # ingress_xhttp_server_port/ingress_xhttp_client_host+port pair already
+    # uses (see ingress_config.py). Blank/zero (the default) means the
+    # xhttp transport is not offered even if xray_xhttp_server_port is
+    # configured - both groups must be set together, see their shared
+    # validation below.
+    xray_xhttp_client_host: str = ""
+    xray_xhttp_client_port: int = 0
 
     # B12 - GET /v1/manifest: serves an ALREADY-SIGNED EndpointManifest
     # artifact (see gateway/tools/manifest_signing.py's `sign-and-package`
@@ -498,6 +522,47 @@ def load_config(env=None):
                 f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before XHTTP can be enabled"
             )
 
+    # B60 - the public, Cloudflare-facing XHTTP client coordinates - see
+    # AppConfig.xray_xhttp_client_host's own docs for why this is a SEPARATE
+    # group from xray_xhttp_server_port above. Required together with the
+    # server-port group whenever XHTTP is enabled: a loopback inbound with
+    # no public coordinates to hand out is exactly as unusable as the
+    # reverse, so this is the same "half-configured is not a safe middle
+    # ground" rule XHTTP's own server-port group already applies.
+    xray_xhttp_client_host = _get(env, "XRAY_XHTTP_CLIENT_HOST")
+    xray_xhttp_client_port_raw = _get(env, "XRAY_XHTTP_CLIENT_PORT")
+    xray_xhttp_client_port = 0
+    if xray_xhttp_client_port_raw:
+        try:
+            xray_xhttp_client_port = int(xray_xhttp_client_port_raw)
+        except ValueError:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_XHTTP_CLIENT_PORT is not an integer: {xray_xhttp_client_port_raw!r}"
+            )
+        if not (1 <= xray_xhttp_client_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_XHTTP_CLIENT_PORT out of range: {xray_xhttp_client_port}")
+
+    if bool(xray_xhttp_client_host) != bool(xray_xhttp_client_port):
+        raise ConfigError(
+            "partial Xray XHTTP client configuration: "
+            f"{_ENV_PREFIX}XRAY_XHTTP_CLIENT_HOST and {_ENV_PREFIX}XRAY_XHTTP_CLIENT_PORT "
+            "must both be set (or neither)"
+        )
+
+    if xray_xhttp_client_host and not _DNS_HOSTNAME_RE.match(xray_xhttp_client_host):
+        raise ConfigError(f"{_ENV_PREFIX}XRAY_XHTTP_CLIENT_HOST must be an ASCII DNS hostname: {xray_xhttp_client_host!r}")
+
+    # Deliberately NOT required to be set together with
+    # xray_xhttp_server_port/xray_xhttp_path: those two alone are already
+    # sufficient to render and activate the loopback XHTTP Xray inbound
+    # (xray_activation.build_xhttp_config, unchanged by B60) - a deployment
+    # may run that inbound without POST /v1/xray-profile ever offering
+    # "xhttp" as a transport option. handler.py's own request-time check
+    # (all three: server_port AND client_host AND client_port) is what
+    # actually gates whether the endpoint offers XHTTP - never this
+    # startup-time validation, which would otherwise make every pre-B60
+    # XHTTP-server-port-only deployment fail closed at startup.
+
     # B12 - see AppConfig.manifest_path's own docs. When set, held to the
     # same "absolute and actually a file" bar as every other file-path
     # config value above (provision_script_path, xray_tls_cert_file, ...) -
@@ -558,6 +623,8 @@ def load_config(env=None):
         xray_tls_key_file=xray_tls_key_file,
         xray_xhttp_server_port=xray_xhttp_server_port,
         xray_xhttp_path=xray_xhttp_path,
+        xray_xhttp_client_host=xray_xhttp_client_host,
+        xray_xhttp_client_port=xray_xhttp_client_port,
         manifest_path=manifest_path,
         static_relay_clients_file=static_relay_clients_file,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
