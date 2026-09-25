@@ -88,6 +88,22 @@ class TlsServerConfig:
 
 
 @dataclass(frozen=True)
+class XhttpServerConfig:
+    """B35 - operator-chosen settings for a THIRD, independent Xray inbound
+    (alongside, never instead of, REALITY/TLS), intended to sit behind a
+    TLS-terminating reverse proxy (nginx/Cloudflare CDN fronting) rather
+    than be reached directly. Carries no TLS/cert material of its own - see
+    [TlsServerConfig]'s own docs for why cert/key handling never belongs in
+    this process; XHTTP goes further and terminates NO TLS at all inside
+    Xray, listening on loopback only for the reverse proxy to forward
+    plaintext HTTP to (see [_render_xhttp_inbound])."""
+
+    listen_port: int
+    path: str
+    inbound_tag: str = "nova-vless-xhttp-in"
+
+
+@dataclass(frozen=True)
 class RenderedClient:
     activation_id: str
     device_public_key: str
@@ -101,6 +117,13 @@ def _validate_tls_server_config(tls):
         raise XrayConfigRenderError("tls cert_file must be an absolute path")
     if not tls.key_file or not os.path.isabs(tls.key_file):
         raise XrayConfigRenderError("tls key_file must be an absolute path")
+
+
+def _validate_xhttp_server_config(xhttp):
+    if not (1 <= xhttp.listen_port <= 65535):
+        raise XrayConfigRenderError(f"invalid xhttp listen_port: {xhttp.listen_port}")
+    if not xhttp.path or not xhttp.path.startswith("/"):
+        raise XrayConfigRenderError("xhttp path must be non-empty and start with '/'")
 
 
 def _validate_reality_server_config(reality):
@@ -216,13 +239,42 @@ def _render_tls_inbound(clients, tls):
     }
 
 
+def _render_xhttp_inbound(clients, xhttp):
+    """B35 - shares the exact same active VLESS client identity set as
+    REALITY/TLS (see [_active_clients]) - never a second/independent
+    identity system. No `flow` key (matching TLS's own reasoning - see
+    [_vless_clients]) and no TLS settings of any kind: this inbound listens
+    on loopback ONLY, terminating no TLS itself, because a reverse proxy in
+    front of this host (nginx/Cloudflare) is what terminates HTTPS and
+    forwards plain HTTP to it - see [XhttpServerConfig]'s own docs. Binding
+    loopback-only here, rather than 0.0.0.0 like REALITY/TLS, is deliberate
+    defense in depth: this inbound is unusable even if the reverse proxy in
+    front of it is ever misconfigured or absent."""
+    return {
+        "tag": xhttp.inbound_tag,
+        "listen": "127.0.0.1",
+        "port": xhttp.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": _vless_clients(clients, flow=None),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "xhttpSettings": {
+                "path": xhttp.path,
+            },
+        },
+    }
+
+
 def _validate_static_clients(static_clients):
     for client in static_clients:
         if not _UUID_RE.match(client.vless_uuid):
             raise XrayConfigRenderError(f"static client has a malformed vless_uuid: {client.vless_uuid!r}")
 
 
-def render_server_config(activations_data, xray_data, reality, tls=None, flow="", static_clients=()):
+def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=()):
     """Pure function: (parsed activations store, parsed xray identity
     store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
     server config dict, ready for json.dumps. Deterministic - same inputs
@@ -251,6 +303,8 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     _validate_reality_server_config(reality)
     if tls is not None:
         _validate_tls_server_config(tls)
+    if xhttp is not None:
+        _validate_xhttp_server_config(xhttp)
     _validate_static_clients(static_clients)
 
     clients = _active_clients(activations_data, xray_data) + list(static_clients)
@@ -258,6 +312,8 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     inbounds = [_render_reality_inbound(clients, reality, flow)]
     if tls is not None:
         inbounds.append(_render_tls_inbound(clients, tls))
+    if xhttp is not None:
+        inbounds.append(_render_xhttp_inbound(clients, xhttp))
 
     return {
         "log": {"loglevel": "warning"},
@@ -268,19 +324,22 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow="", static_clients=()):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=()):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
-    outside the config file itself. TLS's own inbound carries no secret
-    value at all (cert_file/key_file are non-secret file paths), so nothing
-    else needs redacting there.
+    outside the config file itself. TLS's and XHTTP's own inbounds carry no
+    secret value at all (cert_file/key_file are non-secret file paths, and
+    XHTTP holds no cert material at all - see [XhttpServerConfig]'s own
+    docs), so nothing else needs redacting there.
 
     B25 (task H/M) - every [static_clients] uuid is ALSO redacted in every
     inbound's client list (an infra-level relay identity is exactly as
     secret as an ordinary device's vless uuid - never distinguishable in a
     log/diagnostic dump)."""
-    full = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow, static_clients=static_clients)
+    full = render_server_config(
+        activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=flow, static_clients=static_clients,
+    )
     full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     static_uuids = {client.vless_uuid for client in static_clients}
     if static_uuids:

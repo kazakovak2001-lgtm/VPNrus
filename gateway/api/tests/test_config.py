@@ -328,6 +328,89 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config_module.ConfigError):
             config_module.load_config(env=env)
 
+    # --- B35: XHTTP/CDN fallback's own optional completeness group ---
+
+    def _valid_xhttp_env(self):
+        env = self._valid_xray_env()
+        env.update({
+            "POCVPN_API_XRAY_XHTTP_SERVER_PORT": "2099",
+            "POCVPN_API_XRAY_XHTTP_PATH": "/nova-xhttp",
+        })
+        return env
+
+    def test_xhttp_completely_unset_is_fine_alongside_configured_reality(self):
+        cfg = config_module.load_config(env=self._valid_xray_env())
+        self.assertEqual(cfg.xray_xhttp_server_port, 0)
+        self.assertEqual(cfg.xray_xhttp_path, "")
+
+    def test_fully_configured_xhttp_settings_load(self):
+        cfg = config_module.load_config(env=self._valid_xhttp_env())
+        self.assertEqual(cfg.xray_xhttp_server_port, 2099)
+        self.assertEqual(cfg.xray_xhttp_path, "/nova-xhttp")
+
+    def test_xhttp_partially_configured_raises(self):
+        env = self._valid_xhttp_env()
+        del env["POCVPN_API_XRAY_XHTTP_PATH"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xhttp_port_not_integer_raises(self):
+        env = self._valid_xhttp_env()
+        env["POCVPN_API_XRAY_XHTTP_SERVER_PORT"] = "not-a-port"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xhttp_port_out_of_range_raises(self):
+        env = self._valid_xhttp_env()
+        env["POCVPN_API_XRAY_XHTTP_SERVER_PORT"] = "99999"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xhttp_path_not_starting_with_slash_raises(self):
+        env = self._valid_xhttp_env()
+        env["POCVPN_API_XRAY_XHTTP_PATH"] = "nova-xhttp"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xhttp_port_colliding_with_reality_port_raises(self):
+        env = self._valid_xhttp_env()
+        env["POCVPN_API_XRAY_XHTTP_SERVER_PORT"] = env["POCVPN_API_XRAY_SERVER_PORT"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xhttp_port_colliding_with_tls_port_raises(self):
+        env = self._valid_xhttp_env()
+        env.update({
+            "POCVPN_API_XRAY_TLS_SERVER_PORT": "2053",
+            "POCVPN_API_XRAY_TLS_SERVER_NAME": "203.0.113.1",
+            "POCVPN_API_XRAY_TLS_FINGERPRINT": "chrome",
+            **dict(zip(
+                ("POCVPN_API_XRAY_TLS_CERT_FILE", "POCVPN_API_XRAY_TLS_KEY_FILE"),
+                self._valid_tls_cert_files(),
+            )),
+        })
+        env["POCVPN_API_XRAY_XHTTP_SERVER_PORT"] = "2053"
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_xhttp_without_activation_boundary_configured_raises(self):
+        env = self._valid_env()
+        env.update({
+            "POCVPN_API_XRAY_STORE_PATH": os.path.join(self._tmp.name, "xray.json"),
+            "POCVPN_API_XRAY_SERVER_PORT": "8444",
+            "POCVPN_API_XRAY_SERVER_NAME": "example.invalid",
+            "POCVPN_API_XRAY_FINGERPRINT": "chrome",
+            "POCVPN_API_XRAY_REALITY_PUBLIC_KEY": "A" * 43,
+            "POCVPN_API_XRAY_SHORT_ID": "ab12cd34",
+            "POCVPN_API_XRAY_XHTTP_SERVER_PORT": "2099",
+            "POCVPN_API_XRAY_XHTTP_PATH": "/nova-xhttp",
+        })
+        # Deliberately no activation-boundary fields at all - mirrors
+        # test_tls_without_activation_boundary_configured_raises's own
+        # reasoning, pinning the XHTTP-specific message path distinctly.
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
 
 class ManifestConfigTests(unittest.TestCase):
     """B12 - AppConfig.manifest_path's own optional completeness group."""

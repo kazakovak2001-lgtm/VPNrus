@@ -94,6 +94,22 @@ def build_tls_config(app_config):
     )
 
 
+def build_xhttp_config(app_config):
+    """B35 - the XHTTP/CDN counterpart of [build_reality_config]/
+    [build_tls_config]. Reads no secret and no file path at all - unlike
+    TLS, this inbound holds no cert/key reference of any kind (see
+    [xray_config_renderer.XhttpServerConfig]'s own docs: TLS termination
+    happens entirely in front of this host). Returns None (not an error)
+    when XHTTP is not configured - matching REALITY/TLS's own
+    optional-group convention."""
+    if not app_config.xray_xhttp_server_port:
+        return None
+    return xray_config_renderer.XhttpServerConfig(
+        listen_port=app_config.xray_xhttp_server_port,
+        path=app_config.xray_xhttp_path,
+    )
+
+
 def _read_last_activated_hash(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -127,6 +143,7 @@ def _render_candidate(app_config):
     canonical_json_text, sha256_hex)."""
     reality = build_reality_config(app_config)
     tls = build_tls_config(app_config)
+    xhttp = build_xhttp_config(app_config)
     activations_data = activations.read_store_shared(app_config.activation_store_path, app_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(app_config.xray_store_path, app_config.xray_lock_path)
     # B26 (task G) - a genuinely separate trust domain from activations_data
@@ -134,7 +151,8 @@ def _render_candidate(app_config):
     # cross-referenced against per-user activation/revocation state.
     static_clients = relay_identity_store.load_static_clients(app_config.static_relay_clients_file)
     config_dict = xray_config_renderer.render_server_config(
-        activations_data, xray_data, reality, tls=tls, flow=app_config.xray_flow, static_clients=static_clients,
+        activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=app_config.xray_flow,
+        static_clients=static_clients,
     )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()

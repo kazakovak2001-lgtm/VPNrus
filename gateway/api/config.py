@@ -102,6 +102,17 @@ class AppConfig:
     xray_tls_cert_file: str = ""
     xray_tls_key_file: str = ""
 
+    # B35 - XHTTP/CDN fallback: a THIRD Xray inbound, same activation
+    # pipeline/staging/lock/wrapper as REALITY/TLS above, sharing the SAME
+    # device identities. This inbound carries no TLS material of its own -
+    # it is designed to sit behind a TLS-terminating reverse proxy
+    # (nginx/Cloudflare), which forwards plain HTTP to it on loopback only.
+    # Blank/zero (the default) means POST /v1/xray-profile never offers
+    # "xhttp" as a transport option, exactly like REALITY/TLS's own
+    # optional-group convention.
+    xray_xhttp_server_port: int = 0
+    xray_xhttp_path: str = ""
+
     # B12 - GET /v1/manifest: serves an ALREADY-SIGNED EndpointManifest
     # artifact (see gateway/tools/manifest_signing.py's `sign-and-package`
     # subcommand, run OFFLINE) verbatim, as raw bytes. Blank (the default)
@@ -439,6 +450,46 @@ def load_config(env=None):
                 f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before TLS can be enabled"
             )
 
+    # B35 - XHTTP/CDN fallback, same "all-or-nothing, fail closed at
+    # startup" discipline as TLS's own group above.
+    xray_xhttp_server_port_raw = _get(env, "XRAY_XHTTP_SERVER_PORT")
+    xray_xhttp_server_port = 0
+    if xray_xhttp_server_port_raw:
+        try:
+            xray_xhttp_server_port = int(xray_xhttp_server_port_raw)
+        except ValueError:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_XHTTP_SERVER_PORT is not an integer: {xray_xhttp_server_port_raw!r}"
+            )
+        if not (1 <= xray_xhttp_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_XHTTP_SERVER_PORT out of range: {xray_xhttp_server_port}")
+
+    xray_xhttp_path = _get(env, "XRAY_XHTTP_PATH")
+
+    if bool(xray_xhttp_server_port) != bool(xray_xhttp_path):
+        raise ConfigError(
+            "partial Xray XHTTP configuration: "
+            f"{_ENV_PREFIX}XRAY_XHTTP_SERVER_PORT and {_ENV_PREFIX}XRAY_XHTTP_PATH "
+            "must both be set (or neither, to leave XHTTP unconfigured)"
+        )
+
+    if xray_xhttp_server_port:
+        if not xray_xhttp_path.startswith("/"):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_XHTTP_PATH must start with '/'")
+        # A THIRD, independent xray-core inbound - see
+        # docs/B8O1A_TLS_GATEWAY_INBOUND_AUDIT.md's reasoning, which applies
+        # equally here: never sharing a listen port with REALITY or TLS.
+        if xray_xhttp_server_port in {p for p in (xray_server_port, xray_tls_server_port) if p}:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_XHTTP_SERVER_PORT must differ from "
+                f"{_ENV_PREFIX}XRAY_SERVER_PORT and {_ENV_PREFIX}XRAY_TLS_SERVER_PORT"
+            )
+        if not xray_activation_wrapper_path:
+            raise ConfigError(
+                "partial Xray XHTTP configuration: the shared Xray activation boundary "
+                f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured before XHTTP can be enabled"
+            )
+
     # B12 - see AppConfig.manifest_path's own docs. When set, held to the
     # same "absolute and actually a file" bar as every other file-path
     # config value above (provision_script_path, xray_tls_cert_file, ...) -
@@ -497,6 +548,8 @@ def load_config(env=None):
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        xray_xhttp_server_port=xray_xhttp_server_port,
+        xray_xhttp_path=xray_xhttp_path,
         manifest_path=manifest_path,
         static_relay_clients_file=static_relay_clients_file,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,

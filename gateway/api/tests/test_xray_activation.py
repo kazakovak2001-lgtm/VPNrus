@@ -166,6 +166,84 @@ class TlsCandidateTests(XrayActivationTestBase):
         self.assertEqual(staged["inbounds"][1]["port"], 2053)
 
 
+class XhttpCandidateTests(XrayActivationTestBase):
+    """B35 - build_xhttp_config / activate_if_needed rendering the THIRD
+    inbound when XHTTP is configured, and REALITY/TLS-only behavior
+    unaffected when it's not (mirrors TlsCandidateTests' own structure)."""
+
+    def test_xhttp_unconfigured_build_xhttp_config_returns_none(self):
+        self.assertIsNone(xray_activation_module.build_xhttp_config(self.app_config))
+
+    def test_xhttp_unconfigured_staged_config_has_only_the_reality_inbound(self):
+        self._issue_bind_confirm()
+        result = xray_activation_module.activate_if_needed(self.app_config)
+        self.assertTrue(result.activated)
+        with open(self.app_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
+            staged = json.load(handle)
+        self.assertEqual(len(staged["inbounds"]), 1)
+
+    def test_xhttp_configured_staged_config_has_all_three_inbounds(self):
+        import dataclasses
+        from _fixtures import make_tls_cert_and_key_files
+        cert_file, key_file = make_tls_cert_and_key_files(self._tmp.name)
+        full_config = dataclasses.replace(
+            self.app_config,
+            xray_tls_server_port=2053,
+            xray_tls_server_name="203.0.113.1",
+            xray_tls_fingerprint="chrome",
+            xray_tls_cert_file=cert_file,
+            xray_tls_key_file=key_file,
+            xray_xhttp_server_port=2099,
+            xray_xhttp_path="/nova-xhttp",
+        )
+
+        self._issue_bind_confirm()
+        result = xray_activation_module.activate_if_needed(full_config)
+        self.assertTrue(result.activated)
+
+        with open(full_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
+            staged = json.load(handle)
+        self.assertEqual(len(staged["inbounds"]), 3)
+        self.assertEqual(staged["inbounds"][2]["streamSettings"]["network"], "xhttp")
+        self.assertEqual(staged["inbounds"][2]["port"], 2099)
+        self.assertEqual(staged["inbounds"][2]["listen"], "127.0.0.1")
+
+    def test_xhttp_only_without_tls_is_the_second_inbound(self):
+        import dataclasses
+        xhttp_only_config = dataclasses.replace(
+            self.app_config, xray_xhttp_server_port=2099, xray_xhttp_path="/nova-xhttp",
+        )
+        self._issue_bind_confirm()
+        result = xray_activation_module.activate_if_needed(xhttp_only_config)
+        self.assertTrue(result.activated)
+        with open(xhttp_only_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
+            staged = json.load(handle)
+        self.assertEqual(len(staged["inbounds"]), 2)
+        self.assertEqual(staged["inbounds"][1]["streamSettings"]["network"], "xhttp")
+
+
+class IdempotentActivationTests(XrayActivationTestBase):
+    """B35 - the SAME activation-skip optimization activate_if_needed
+    already provides for REALITY/TLS must hold identically once XHTTP is
+    also configured: an unchanged candidate (including its XHTTP inbound)
+    must never re-invoke the privileged reload wrapper."""
+
+    def test_identical_xhttp_candidate_is_skipped_not_reloaded(self):
+        import dataclasses
+        xhttp_config = dataclasses.replace(
+            self.app_config, xray_xhttp_server_port=2099, xray_xhttp_path="/nova-xhttp",
+        )
+        self._issue_bind_confirm()
+
+        first = xray_activation_module.activate_if_needed(xhttp_config)
+        self.assertTrue(first.activated)
+        self.assertFalse(first.skipped)
+
+        second = xray_activation_module.activate_if_needed(xhttp_config)
+        self.assertTrue(second.activated)
+        self.assertTrue(second.skipped)  # nothing changed - the wrapper is not re-invoked
+
+
 class ConcurrencyTests(XrayActivationTestBase):
     def test_concurrent_activation_attempts_never_corrupt_the_staged_config(self):
         self._issue_bind_confirm()
