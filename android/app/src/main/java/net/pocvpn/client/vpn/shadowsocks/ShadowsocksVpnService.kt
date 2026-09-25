@@ -67,6 +67,31 @@ class ShadowsocksVpnService : VpnService() {
     /** Test seam - same reasoning as [credentialRepositoryFactory] above: lets a test run [teardown]'s dispatch synchronously (e.g. Dispatchers.Unconfined) instead of waiting on a real background dispatcher. Production default unchanged. */
     internal var teardownDispatcher: CoroutineDispatcher = Dispatchers.Default
 
+    /** Test seam - the dispatcher [startIfNotAlreadyRunning]'s start attempt runs on. Production default unchanged. */
+    internal var startDispatcher: CoroutineDispatcher = Dispatchers.Default
+
+    /** Test seam - builds the runtime for one start attempt (fakes in tests). Production default is the real process/bridge stack. */
+    internal var runtimeFactory: (protector: ShadowsocksVpnProtector, scope: CoroutineScope) -> ShadowsocksRuntime = { protector, scope ->
+        ShadowsocksRuntime(
+            launcher = RealShadowsocksProcessLauncher(),
+            tunFdBridge = RealShadowsocksTunFdBridge(),
+            protectBridge = RealShadowsocksVpnProtectBridge(),
+            protector = protector,
+            scope = scope,
+        )
+    }
+
+    /** Test seam - establishes this attempt's TUN (VpnService.Builder in production). */
+    internal var tunEstablisher: () -> ParcelFileDescriptor? = { establishInterface() }
+
+    /** Test seam - locates the sslocal binary. */
+    internal var binaryResolver: () -> ShadowsocksNativeBinaryResolver.Result = {
+        ShadowsocksNativeBinaryResolver.resolve(applicationInfo.nativeLibraryDir)
+    }
+
+    /** Test seam - no-op in production; runs after the runtime is published and before runtime.start(), the window lifecycle tests gate. */
+    internal var beforeRuntimeStart: () -> Unit = {}
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -129,7 +154,7 @@ class ShadowsocksVpnService : VpnService() {
         // port, never the AWG peer port this same endpoint also advertises.
         Log.i(TAG, "starting: endpointId=${endpointId.value} host=$host port=$port method=$expectedMethod")
 
-        serviceScope.launch {
+        serviceScope.launch(startDispatcher) {
             // Credential absent/corrupted -> fail closed (Phase 7/16) -
             // never a silently-empty/default key reaching sslocal.
             val repository = credentialRepositoryFactory(applicationContext, endpointId)
@@ -160,7 +185,7 @@ class ShadowsocksVpnService : VpnService() {
                 return@launch
             }
 
-            val resolution = ShadowsocksNativeBinaryResolver.resolve(applicationInfo.nativeLibraryDir)
+            val resolution = binaryResolver()
             val binaryPath = when (resolution) {
                 is ShadowsocksNativeBinaryResolver.Result.Found -> resolution.file
                 is ShadowsocksNativeBinaryResolver.Result.Missing -> {
@@ -171,7 +196,7 @@ class ShadowsocksVpnService : VpnService() {
                 }
             }
 
-            val established = establishInterface()
+            val established = tunEstablisher()
             if (established == null) {
                 Log.e(TAG, "refusing to start: VpnService.Builder.establish() returned null")
                 publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.TunEstablishFailed("establish() returned null"))
@@ -180,13 +205,7 @@ class ShadowsocksVpnService : VpnService() {
             }
             tunInterface = established
 
-            val newRuntime = ShadowsocksRuntime(
-                launcher = RealShadowsocksProcessLauncher(),
-                tunFdBridge = RealShadowsocksTunFdBridge(),
-                protectBridge = RealShadowsocksVpnProtectBridge(),
-                protector = ShadowsocksVpnProtector { fd -> protect(fd) },
-                scope = serviceScope,
-            )
+            val newRuntime = runtimeFactory(ShadowsocksVpnProtector { fd -> protect(fd) }, serviceScope)
             runtime = newRuntime
 
             statusCollectionJob = serviceScope.launch collector@{
@@ -203,6 +222,7 @@ class ShadowsocksVpnService : VpnService() {
                 }
             }
 
+            beforeRuntimeStart()
             val started = newRuntime.start(
                 binaryPath = binaryPath.absolutePath,
                 // Borrowed, never a second owner - see ShadowsocksRuntime.start's
