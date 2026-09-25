@@ -88,6 +88,24 @@ class TlsServerConfig:
 
 
 @dataclass(frozen=True)
+class RealityXhttpServerConfig:
+    """B-WL2 - an OPTIONAL third inbound: VLESS + REALITY over Xray's XHTTP
+    transport on its own port, alongside (never instead of) the RAW REALITY
+    inbound. It reuses the SAME operator REALITY material (dest/serverNames/
+    privateKey/shortIds) as the RAW inbound - one key set, no second secret -
+    so only transport-level fields live here. Verified against the pinned
+    xray-core v26.7.28 schema: REALITY accepts network "xhttp" (ProtocolName
+    "splithttp"), settings key `xhttpSettings`, `mode` one of
+    auto/packet-up/stream-up/stream-one. Not deployed anywhere by this
+    change - rendering only."""
+
+    listen_port: int
+    path: str
+    mode: str = "auto"
+    inbound_tag: str = "nova-vless-reality-xhttp-in"
+
+
+@dataclass(frozen=True)
 class RenderedClient:
     activation_id: str
     device_public_key: str
@@ -117,6 +135,38 @@ def _validate_reality_server_config(reality):
     for short_id in reality.short_ids:
         if not _SHORT_ID_RE.match(short_id) or len(short_id) % 2 != 0:
             raise XrayConfigRenderError(f"malformed short id: {short_id!r}")
+
+
+_XHTTP_MODES = ("auto", "packet-up", "stream-up", "stream-one")
+
+
+def _is_xhttp_path(path):
+    """Same shape rules as the Android client's isXhttpPath: leading and
+    trailing '/', no '//' prefix, printable ASCII only, no query/fragment/
+    backslash - so client and server can never disagree on a valid path."""
+    return (
+        isinstance(path, str)
+        and 1 <= len(path) <= 512
+        and path.startswith("/")
+        and not path.startswith("//")
+        and path.endswith("/")
+        and all(33 <= ord(ch) <= 126 for ch in path)
+        and "?" not in path
+        and "#" not in path
+        and "\\" not in path
+    )
+
+
+def _validate_reality_xhttp_server_config(reality_xhttp, reality, tls):
+    if not (1 <= reality_xhttp.listen_port <= 65535):
+        raise XrayConfigRenderError(f"invalid reality_xhttp listen_port: {reality_xhttp.listen_port}")
+    taken = {reality.listen_port} | ({tls.listen_port} if tls is not None else set())
+    if reality_xhttp.listen_port in taken:
+        raise XrayConfigRenderError("reality_xhttp listen_port must differ from every other inbound's port")
+    if not _is_xhttp_path(reality_xhttp.path):
+        raise XrayConfigRenderError("reality_xhttp path is not a normalized XHTTP path")
+    if reality_xhttp.mode not in _XHTTP_MODES:
+        raise XrayConfigRenderError(f"unsupported reality_xhttp mode: {reality_xhttp.mode!r}")
 
 
 def _active_clients(activations_data, xray_data):
@@ -188,6 +238,36 @@ def _render_reality_inbound(clients, reality, flow):
     }
 
 
+def _render_reality_xhttp_inbound(clients, reality, reality_xhttp):
+    """B-WL2 - no `flow` key: XTLS Vision is a RAW-TCP optimization and the
+    Android client never sends it over XHTTP (its validator rejects it)."""
+    return {
+        "tag": reality_xhttp.inbound_tag,
+        "listen": "0.0.0.0",
+        "port": reality_xhttp.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": _vless_clients(clients, flow=None),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": reality.dest,
+                "serverNames": list(reality.server_names),
+                "privateKey": reality.private_key,
+                "shortIds": list(reality.short_ids),
+            },
+            "xhttpSettings": {
+                "path": reality_xhttp.path,
+                "mode": reality_xhttp.mode,
+            },
+        },
+    }
+
+
 def _render_tls_inbound(clients, tls):
     """B8O2 - the SAME active-client list REALITY's own inbound uses (see
     [_active_clients]) - device identity is shared across both transports,
@@ -222,7 +302,7 @@ def _validate_static_clients(static_clients):
             raise XrayConfigRenderError(f"static client has a malformed vless_uuid: {client.vless_uuid!r}")
 
 
-def render_server_config(activations_data, xray_data, reality, tls=None, flow="", static_clients=()):
+def render_server_config(activations_data, xray_data, reality, tls=None, flow="", static_clients=(), reality_xhttp=None):
     """Pure function: (parsed activations store, parsed xray identity
     store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
     server config dict, ready for json.dumps. Deterministic - same inputs
@@ -252,12 +332,18 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     if tls is not None:
         _validate_tls_server_config(tls)
     _validate_static_clients(static_clients)
+    if reality_xhttp is not None:
+        _validate_reality_xhttp_server_config(reality_xhttp, reality, tls)
 
     clients = _active_clients(activations_data, xray_data) + list(static_clients)
 
     inbounds = [_render_reality_inbound(clients, reality, flow)]
     if tls is not None:
         inbounds.append(_render_tls_inbound(clients, tls))
+    # B-WL2 - appended last so every pre-B-WL2 inbound index is unchanged;
+    # None (the default) is byte-for-byte the previous output.
+    if reality_xhttp is not None:
+        inbounds.append(_render_reality_xhttp_inbound(clients, reality, reality_xhttp))
 
     return {
         "log": {"loglevel": "warning"},
@@ -268,7 +354,7 @@ def render_server_config(activations_data, xray_data, reality, tls=None, flow=""
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow="", static_clients=()):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, flow="", static_clients=(), reality_xhttp=None):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
@@ -280,8 +366,14 @@ def render_server_config_redacted(activations_data, xray_data, reality, tls=None
     inbound's client list (an infra-level relay identity is exactly as
     secret as an ordinary device's vless uuid - never distinguishable in a
     log/diagnostic dump)."""
-    full = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow, static_clients=static_clients)
-    full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
+    full = render_server_config(
+        activations_data, xray_data, reality, tls=tls, flow=flow, static_clients=static_clients, reality_xhttp=reality_xhttp,
+    )
+    # B-WL2 - every REALITY-bearing inbound (RAW and, if present, XHTTP) shares the key.
+    for inbound in full["inbounds"]:
+        reality_settings = inbound["streamSettings"].get("realitySettings")
+        if reality_settings is not None:
+            reality_settings["privateKey"] = "<redacted>"
     static_uuids = {client.vless_uuid for client in static_clients}
     if static_uuids:
         for inbound in full["inbounds"]:
