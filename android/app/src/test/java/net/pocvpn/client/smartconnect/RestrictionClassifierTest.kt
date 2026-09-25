@@ -190,6 +190,8 @@ class RestrictionClassifierTest {
         val expected = setOf(
             "networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable", "diverseInternetReachable",
             "gatewayProbeEpochMillis", "diverseProbeEpochMillis",
+            // B-WL1 - a list of TransportAttemptObservation, itself field-closed (see TransportBehaviorAnalyzerTest).
+            "transportObservations",
         )
         assertEquals(expected, fieldNames)
     }

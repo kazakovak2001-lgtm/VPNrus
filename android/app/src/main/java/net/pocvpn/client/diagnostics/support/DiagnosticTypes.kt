@@ -112,6 +112,9 @@ enum class DiagnosticFailureReason {
     PROTOCOL_OR_TRANSPORT_BLOCKED,
     DATA_PLANE_NOT_READY,
     POSSIBLE_HARD_WHITELIST,
+    // B-WL1/B-WL10 - behavior-derived restriction classes (coarse, no endpoint data).
+    POSSIBLE_EARLY_DROP,
+    POSSIBLE_FULL_SHUTDOWN,
     RESTRICTED_NETWORK_NO_VIABLE_RELAY,
     INGRESS_UNREACHABLE,
     INGRESS_PROFILE_REQUIRED,
