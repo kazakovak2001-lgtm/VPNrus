@@ -96,11 +96,27 @@ class XhttpServerConfig:
     [TlsServerConfig]'s own docs for why cert/key handling never belongs in
     this process; XHTTP goes further and terminates NO TLS at all inside
     Xray, listening on loopback only for the reverse proxy to forward
-    plaintext HTTP to (see [_render_xhttp_inbound])."""
+    plaintext HTTP to (see [_render_xhttp_inbound]).
+
+    B57 - [mode] is deliberately NOT an operator/env-configurable value
+    (unlike listen_port/path): the physically-proven Stockholm ingress
+    deployment (docs/B35_STOCKHOLM_XHTTP_ROLLOUT_2026-09-14.md) established
+    "packet-up" as the one working client/server contract, and the whole
+    point of this slice is that the server no longer leaves this implicit
+    for a client to independently guess - see _render_xhttp_inbound's own
+    docs. A fixed dataclass default (mirroring inbound_tag's own pattern)
+    keeps this explicit and testable without inventing a new AppConfig/env
+    surface for a value that must never vary. No padding field exists here
+    - verified against the real pinned v26.7.28 binary (`xray run -test`)
+    that packet-up mode validates with no padding settings present at all;
+    Xray-core applies its own internal default padding range in that case
+    (confirmed via XrayVlessXhttpConfig.kt's own comment on the Android
+    side: omitted xPaddingBytes normalizes to 100..1000, never disabled)."""
 
     listen_port: int
     path: str
     inbound_tag: str = "nova-vless-xhttp-in"
+    mode: str = "packet-up"
 
 
 @dataclass(frozen=True)
@@ -124,6 +140,15 @@ def _validate_xhttp_server_config(xhttp):
         raise XrayConfigRenderError(f"invalid xhttp listen_port: {xhttp.listen_port}")
     if not xhttp.path or not xhttp.path.startswith("/"):
         raise XrayConfigRenderError("xhttp path must be non-empty and start with '/'")
+    # B57 - required trailing slash: pinned v26.7.28 appends the session/
+    # sequence path segments directly beneath this base path (see
+    # _render_xhttp_inbound's own docs), and the Android CdnXhttpPolicy
+    # validator already requires this same shape (path.endsWith('/')) -
+    # keeping both sides of the contract identical, not merely "close".
+    if not xhttp.path.endswith("/"):
+        raise XrayConfigRenderError("xhttp path must end with '/'")
+    if xhttp.mode != "packet-up":
+        raise XrayConfigRenderError(f"unsupported xhttp mode: {xhttp.mode!r} (only 'packet-up' is a proven contract)")
 
 
 def _validate_reality_server_config(reality):
@@ -249,7 +274,26 @@ def _render_xhttp_inbound(clients, xhttp):
     forwards plain HTTP to it - see [XhttpServerConfig]'s own docs. Binding
     loopback-only here, rather than 0.0.0.0 like REALITY/TLS, is deliberate
     defense in depth: this inbound is unusable even if the reverse proxy in
-    front of it is ever misconfigured or absent."""
+    front of it is ever misconfigured or absent.
+
+    B57 - `mode` is now rendered explicitly (always "packet-up", see
+    XhttpServerConfig's own docs) rather than left to Xray-core's internal
+    default: the client and server must not independently assume the same
+    value. This is the ONE Xray-inbound-level piece of the protocol
+    contract this module owns - the corresponding HTTP-method restriction
+    (GET downstream / POST uplink) is an nginx-layer concern, not something
+    this renderer enforces or should enforce (nginx has no knowledge of
+    Xray inbound settings, and this module has no knowledge of nginx
+    location blocks); when the Frankfurt nginx vhost is reconciled per the
+    proven Stockholm pattern, it must independently restrict this location
+    to `limit_except GET POST { deny all; }`, matching this mode - see
+    docs/B35_STOCKHOLM_XHTTP_ROLLOUT_2026-09-14.md and
+    gateway/edge/nginx-pocvpn-cdn-origin-stockholm.conf for the proven
+    reference. No ALPN/TLS-fingerprint/TLS-server-name field is rendered
+    here - none of those are properties of this Xray inbound at all (the
+    reverse proxy in front terminates the client-facing TLS entirely
+    outside Xray's own knowledge); they belong to the client/CDN-facing
+    layers, not this module."""
     return {
         "tag": xhttp.inbound_tag,
         "listen": "127.0.0.1",
@@ -263,6 +307,7 @@ def _render_xhttp_inbound(clients, xhttp):
             "network": "xhttp",
             "xhttpSettings": {
                 "path": xhttp.path,
+                "mode": xhttp.mode,
             },
         },
     }

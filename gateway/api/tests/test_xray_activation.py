@@ -195,7 +195,7 @@ class XhttpCandidateTests(XrayActivationTestBase):
             xray_tls_cert_file=cert_file,
             xray_tls_key_file=key_file,
             xray_xhttp_server_port=2099,
-            xray_xhttp_path="/nova-xhttp",
+            xray_xhttp_path="/nova-xhttp/",
         )
 
         self._issue_bind_confirm()
@@ -208,11 +208,13 @@ class XhttpCandidateTests(XrayActivationTestBase):
         self.assertEqual(staged["inbounds"][2]["streamSettings"]["network"], "xhttp")
         self.assertEqual(staged["inbounds"][2]["port"], 2099)
         self.assertEqual(staged["inbounds"][2]["listen"], "127.0.0.1")
+        self.assertEqual(staged["inbounds"][2]["streamSettings"]["xhttpSettings"]["path"], "/nova-xhttp/")
+        self.assertEqual(staged["inbounds"][2]["streamSettings"]["xhttpSettings"]["mode"], "packet-up")
 
     def test_xhttp_only_without_tls_is_the_second_inbound(self):
         import dataclasses
         xhttp_only_config = dataclasses.replace(
-            self.app_config, xray_xhttp_server_port=2099, xray_xhttp_path="/nova-xhttp",
+            self.app_config, xray_xhttp_server_port=2099, xray_xhttp_path="/nova-xhttp/",
         )
         self._issue_bind_confirm()
         result = xray_activation_module.activate_if_needed(xhttp_only_config)
@@ -232,7 +234,7 @@ class IdempotentActivationTests(XrayActivationTestBase):
     def test_identical_xhttp_candidate_is_skipped_not_reloaded(self):
         import dataclasses
         xhttp_config = dataclasses.replace(
-            self.app_config, xray_xhttp_server_port=2099, xray_xhttp_path="/nova-xhttp",
+            self.app_config, xray_xhttp_server_port=2099, xray_xhttp_path="/nova-xhttp/",
         )
         self._issue_bind_confirm()
 

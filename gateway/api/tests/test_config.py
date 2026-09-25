@@ -334,7 +334,7 @@ class ConfigTests(unittest.TestCase):
         env = self._valid_xray_env()
         env.update({
             "POCVPN_API_XRAY_XHTTP_SERVER_PORT": "2099",
-            "POCVPN_API_XRAY_XHTTP_PATH": "/nova-xhttp",
+            "POCVPN_API_XRAY_XHTTP_PATH": "/nova-xhttp/",
         })
         return env
 
@@ -346,7 +346,7 @@ class ConfigTests(unittest.TestCase):
     def test_fully_configured_xhttp_settings_load(self):
         cfg = config_module.load_config(env=self._valid_xhttp_env())
         self.assertEqual(cfg.xray_xhttp_server_port, 2099)
-        self.assertEqual(cfg.xray_xhttp_path, "/nova-xhttp")
+        self.assertEqual(cfg.xray_xhttp_path, "/nova-xhttp/")
 
     def test_xhttp_partially_configured_raises(self):
         env = self._valid_xhttp_env()
@@ -403,7 +403,7 @@ class ConfigTests(unittest.TestCase):
             "POCVPN_API_XRAY_REALITY_PUBLIC_KEY": "A" * 43,
             "POCVPN_API_XRAY_SHORT_ID": "ab12cd34",
             "POCVPN_API_XRAY_XHTTP_SERVER_PORT": "2099",
-            "POCVPN_API_XRAY_XHTTP_PATH": "/nova-xhttp",
+            "POCVPN_API_XRAY_XHTTP_PATH": "/nova-xhttp/",
         })
         # Deliberately no activation-boundary fields at all - mirrors
         # test_tls_without_activation_boundary_configured_raises's own

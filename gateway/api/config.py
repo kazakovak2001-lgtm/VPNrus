@@ -476,6 +476,14 @@ def load_config(env=None):
     if xray_xhttp_server_port:
         if not xray_xhttp_path.startswith("/"):
             raise ConfigError(f"{_ENV_PREFIX}XRAY_XHTTP_PATH must start with '/'")
+        # B57 - required trailing slash: pinned v26.7.28 appends the
+        # session/sequence path segments directly beneath this base path
+        # (see xray_config_renderer._render_xhttp_inbound's own docs), and
+        # the Android CdnXhttpPolicy validator already requires this same
+        # shape - fail closed at startup rather than deploy a server whose
+        # own path value can never satisfy the client-side contract.
+        if not xray_xhttp_path.endswith("/"):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_XHTTP_PATH must end with '/'")
         # A THIRD, independent xray-core inbound - see
         # docs/B8O1A_TLS_GATEWAY_INBOUND_AUDIT.md's reasoning, which applies
         # equally here: never sharing a listen port with REALITY or TLS.

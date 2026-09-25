@@ -204,7 +204,7 @@ class XhttpInboundTests(RendererTestBase):
 
     def setUp(self):
         super().setUp()
-        self.xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp")
+        self.xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp/")
 
     def test_xhttp_none_produces_byte_identical_output_to_pre_b35(self):
         digest = "a" * 64
@@ -264,7 +264,52 @@ class XhttpInboundTests(RendererTestBase):
         xhttp_stream_settings = config["inbounds"][1]["streamSettings"]
         self.assertNotIn("tlsSettings", xhttp_stream_settings)
         self.assertNotIn("security", xhttp_stream_settings)
-        self.assertEqual(xhttp_stream_settings["xhttpSettings"], {"path": "/nova-xhttp"})
+        self.assertEqual(xhttp_stream_settings["xhttpSettings"], {"path": "/nova-xhttp/", "mode": "packet-up"})
+
+    def test_xhttp_path_requires_trailing_slash(self):
+        # B57 - required so the base path exactly matches pinned v26.7.28's
+        # own session/sequence appending behavior and the Android
+        # CdnXhttpPolicy validator's own requirement.
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_xhttp_mode_defaults_to_packet_up(self):
+        self.assertEqual(self.xhttp.mode, "packet-up")
+
+    def test_xhttp_mode_is_rendered_explicitly(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        self.assertEqual(config["inbounds"][1]["streamSettings"]["xhttpSettings"]["mode"], "packet-up")
+
+    def test_unsupported_xhttp_mode_is_rejected(self):
+        # B57 - deliberately not operator-configurable (see
+        # XhttpServerConfig's own docs) - only the one proven contract
+        # value is accepted, fail closed on anything else.
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp/", mode="stream-up")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_xhttp_inbound_renders_no_fields_beyond_the_proven_contract(self):
+        # B57 (Phase 9, test 4) - the rendered inbound must contain
+        # exactly the fields this module owns (tag/listen/port/protocol/
+        # settings/streamSettings.network/xhttpSettings.path+mode) and
+        # nothing from the TLS/Cloudflare/Android-only layers (no cert/key
+        # paths, no public hostname, no ALPN/fingerprint/TLS-server-name,
+        # no Cloudflare-specific field of any kind).
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        xhttp_inbound = config["inbounds"][1]
+        self.assertEqual(set(xhttp_inbound.keys()), {"tag", "listen", "port", "protocol", "settings", "streamSettings"})
+        self.assertEqual(set(xhttp_inbound["streamSettings"].keys()), {"network", "xhttpSettings"})
+        self.assertEqual(set(xhttp_inbound["streamSettings"]["xhttpSettings"].keys()), {"path", "mode"})
+        rendered_text = json.dumps(config)
+        for forbidden in ("cert", "key_file", "privkey", "fullchain", "alpn", "fingerprint", "aknova", "cloudflare", "tlsServerName"):
+            self.assertNotIn(forbidden, rendered_text.lower())
 
     def test_revoked_activation_is_excluded_from_xhttp_inbound(self):
         digest = "a" * 64
@@ -298,7 +343,7 @@ class XhttpInboundTests(RendererTestBase):
         # reopening of the TLS-private-key boundary this whole module's
         # docstring exists to hold.
         field_names = {f.name for f in dataclasses.fields(renderer_module.XhttpServerConfig)}
-        self.assertEqual(field_names, {"listen_port", "path", "inbound_tag"})
+        self.assertEqual(field_names, {"listen_port", "path", "inbound_tag", "mode"})
 
 
 class DeterminismTests(RendererTestBase):
