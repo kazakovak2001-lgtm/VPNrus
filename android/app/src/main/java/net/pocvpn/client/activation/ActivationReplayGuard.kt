@@ -1,6 +1,9 @@
 package net.pocvpn.client.activation
 
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
 /**
@@ -70,9 +73,20 @@ class FileActivationReplayGuard(private val directory: File) : ActivationReplayG
         directory.mkdirs()
         val tmp = File(directory, "$FILE_NAME.tmp")
         tmp.writeText(entries.entries.joinToString("") { "${it.key} ${it.value}\n" })
-        if (!tmp.renameTo(file)) {
+        try {
+            try {
+                Files.move(
+                    tmp.toPath(),
+                    file.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (e: AtomicMoveNotSupportedException) {
+                Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } catch (e: java.io.IOException) {
             tmp.delete()
-            throw java.io.IOException("failed to persist activation replay guard")
+            throw java.io.IOException("failed to persist activation replay guard", e)
         }
     }
 
