@@ -66,8 +66,23 @@ def build_reality_config(app_config):
     module-level/long-lived variable, never logged."""
     if not app_config.xray_reality_private_key_file:
         raise XrayActivationNotConfigured("xray_reality_private_key_file is not configured")
-    with open(app_config.xray_reality_private_key_file, "r", encoding="utf-8") as handle:
-        private_key = handle.read().strip()
+    # Fail-closed defense-in-depth: this is the one place in the whole
+    # /v1/xray-profile request pipeline that opens an externally-permissioned
+    # secret file (every other open() in this pipeline is one of this
+    # process's own pocvpn-api-owned durable stores). A permission/ownership
+    # problem on that file (misconfiguration, deployment drift, a key
+    # rotation race) must surface as the SAME typed, already-handled
+    # XrayConfigRenderError activate_if_needed's caller already maps to a
+    # clean 503 "xray_activation_failed" - never as a raw uncaught
+    # PermissionError/OSError reaching the HTTP dispatcher's generic
+    # catch-all and returning an undifferentiated 500.
+    try:
+        with open(app_config.xray_reality_private_key_file, "r", encoding="utf-8") as handle:
+            private_key = handle.read().strip()
+    except OSError as exc:
+        raise xray_config_renderer.XrayConfigRenderError(
+            f"could not read REALITY private key file: {exc.__class__.__name__}"
+        ) from exc
 
     return xray_config_renderer.RealityServerConfig(
         listen_port=app_config.xray_server_port,
