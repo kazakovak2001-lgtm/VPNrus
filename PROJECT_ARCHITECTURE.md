@@ -2386,6 +2386,26 @@ gateway (real handshake, real bidirectional data plane, distinct exit IP,
 DNS/IPv6 invariants held, managed identity/state completely unaffected - see
 `docs/ROADMAP.md`'s B22 row for the full evidence).
 
+## Shadowsocks service -> runtime lifecycle (hard invariant)
+
+`ShadowsocksVpnService` is the single TUN owner; `ShadowsocksRuntime` owns
+the sslocal process (its own start/stop/completion races are fenced inside
+the runtime). At the service boundary:
+
+- Every START and every teardown entry point (ACTION_STOP, onRevoke,
+  onDestroy) begins a new `GenerationFence` generation **on receipt**.
+- TUN establish, publication of the one committed session (TUN + runtime +
+  status collector, published as one unit), and `ShadowsocksRuntime.start()`
+  run in one critical section, and only while the attempt's generation is
+  current. A teardown therefore runs entirely before it (nothing is
+  established or spawned) or entirely after it (it stops the session) -
+  no sslocal process ever outlives a teardown without an owner.
+- A teardown only stops sessions committed before it was received; a late
+  ACTION_STOP never stops a session a newer START created. Statuses and
+  `stopSelf` come only from the current generation (`stopSelfResult(startId)`
+  for command-scoped paths).
+- `ShadowsocksRuntime.stop()` is never called under the service lock.
+
 ## Production vs debug boundary
 
 - `XrayDiagnosticsActivity` (and any future manual/debug provisioning helper) lives in

@@ -9,6 +9,7 @@ import android.util.Log
 import java.io.File
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -16,12 +17,14 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import net.pocvpn.client.BuildConfig
 import net.pocvpn.client.identity.Shadowsocks2022CredentialGetResult
 import net.pocvpn.client.identity.Shadowsocks2022CredentialRepository
 import net.pocvpn.client.identity.Shadowsocks2022CredentialRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
+import net.pocvpn.client.reachability.GenerationFence
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
@@ -48,15 +51,46 @@ private const val WORKING_DIR_NAME = "shadowsocks"
 class ShadowsocksVpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var runtime: ShadowsocksRuntime? = null
-    private var tunInterface: ParcelFileDescriptor? = null
-    private var statusCollectionJob: Job? = null
+
+    /**
+     * Service -> runtime lifecycle boundary. Every START and every teardown
+     * entry point (ACTION_STOP, onRevoke, onDestroy) begins a new [lifecycle]
+     * generation the moment it is received. A start attempt carries its
+     * generation and may publish anything (TUN, runtime, status, stopSelf)
+     * only while that generation is still current, checked under [lock] in
+     * the same critical section that publishes it.
+     *
+     * TUN establish, [session] publication and ShadowsocksRuntime.start() run
+     * in ONE critical section (see [startIfNotAlreadyRunning]), so a teardown
+     * runs either entirely before it (the attempt sees a stale generation and
+     * never establishes or spawns anything) or entirely after it (the
+     * teardown finds the published session and stops it) - never in between.
+     * A teardown only detaches sessions committed BEFORE it was received, so
+     * a late ACTION_STOP never stops a session a newer START created.
+     *
+     * Deadlock rules:
+     * - Never call ShadowsocksRuntime.stop() (bounded blocking process wait)
+     *   under [lock]: a session is detached under [lock] and released outside
+     *   it ([release]).
+     * - The only runtime call under [lock] is start() on a runtime no other
+     *   thread can reach yet. The status collector takes [lock] from its own
+     *   coroutine, never from inside the runtime.
+     * - Main-thread entry points (onStartCommand, onRevoke, onDestroy) take
+     *   [lock] only for these short sections; the longest is the commit
+     *   (TUN establish + sslocal spawn).
+     */
+    private val lock = Any()
+    private val lifecycle = GenerationFence()
+
+    /** The one committed session. Guarded by [lock]. */
+    private var session: ShadowsocksSession? = null
 
     // B45B-4P fix - the session id [teardown] publishes its terminal STOPPED
     // status under. Set only when a session genuinely proceeds past the
     // "already running" guard in [startIfNotAlreadyRunning] - a duplicate
     // start request that gets ignored must never overwrite the id the
     // ALREADY-running session's own teardown needs to report against.
+    // Guarded by [lock], always set together with its generation.
     private var activeSessionId: Long = 0L
 
     /** Test seam - same contract as NovaXrayVpnService.profileRepositoryFactory. */
@@ -92,7 +126,10 @@ class ShadowsocksVpnService : VpnService() {
                 // own heavier work already is. Safe even if this races with a
                 // later onDestroy()-driven teardown() call - every step inside
                 // teardown() is already null-safe/idempotent by construction.
-                serviceScope.launch(teardownDispatcher) { teardown() }
+                // The generation is taken here, on receipt, so a START
+                // received after this STOP is never torn down by it.
+                val generation = lifecycle.begin()
+                serviceScope.launch(teardownDispatcher) { teardown(generation, startId) }
                 return START_NOT_STICKY
             }
             ACTION_START -> {
@@ -114,7 +151,7 @@ class ShadowsocksVpnService : VpnService() {
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                startIfNotAlreadyRunning(sessionId, endpointId, host, port, expectedMethod, routingMode)
+                startIfNotAlreadyRunning(startId, sessionId, endpointId, host, port, expectedMethod, routingMode)
                 return START_NOT_STICKY
             }
             else -> return START_NOT_STICKY
@@ -122,21 +159,29 @@ class ShadowsocksVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        teardown()
+        teardown(lifecycle.begin(), startId = null)
     }
 
     override fun onDestroy() {
-        teardown()
+        teardown(lifecycle.begin(), startId = null)
         serviceScope.cancel()
         super.onDestroy()
     }
 
-    private fun startIfNotAlreadyRunning(sessionId: Long, endpointId: EndpointId, host: String, port: Int, expectedMethod: String, routingMode: RoutingMode) {
-        if (runtime?.status?.value?.phase == ShadowsocksRuntimePhase.RUNNING) {
-            Log.w(TAG, "already running - ignoring duplicate start")
-            return
+    private fun startIfNotAlreadyRunning(startId: Int, sessionId: Long, endpointId: EndpointId, host: String, port: Int, expectedMethod: String, routingMode: RoutingMode) {
+        val attempt = synchronized(lock) {
+            val current = session
+            // A RUNNING session that a later STOP already doomed is not a
+            // duplicate - this START is the reconnect after that STOP.
+            if (current != null && lifecycle.isCurrent(current.attempt.generation) &&
+                current.runtime.status.value.phase == ShadowsocksRuntimePhase.RUNNING
+            ) {
+                Log.w(TAG, "already running - ignoring duplicate start")
+                return
+            }
+            activeSessionId = sessionId
+            ShadowsocksStartAttempt(lifecycle.begin(), sessionId, startId)
         }
-        activeSessionId = sessionId
         // B45B-4P (correction) - bounded, once-per-attempt, PUBLIC facts only
         // (endpointId/host/port/method identifier - never the key): the
         // physical proof this attempt targets the real signed Shadowsocks
@@ -150,14 +195,12 @@ class ShadowsocksVpnService : VpnService() {
             val credential = when (val result = repository.getCredential()) {
                 is Shadowsocks2022CredentialGetResult.Absent -> {
                     Log.e(TAG, "refusing to start: no credential for endpoint")
-                    publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.CredentialAbsent(endpointId.value))
-                    stopSelf()
+                    failAttempt(attempt, ShadowsocksRuntimeError.CredentialAbsent(endpointId.value))
                     return@launch
                 }
                 is Shadowsocks2022CredentialGetResult.Corrupted -> {
                     Log.e(TAG, "refusing to start: credential corrupted")
-                    publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.CredentialCorrupted(result.reason))
-                    stopSelf()
+                    failAttempt(attempt, ShadowsocksRuntimeError.CredentialCorrupted(result.reason))
                     return@launch
                 }
                 is Shadowsocks2022CredentialGetResult.Present -> result.credential
@@ -169,8 +212,7 @@ class ShadowsocksVpnService : VpnService() {
             // log (never the key itself) - see EXTRA_METHOD's own docs.
             if (credential.method != expectedMethod) {
                 Log.e(TAG, "refusing to start: signed profile method ($expectedMethod) does not match credential method (${credential.method})")
-                publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.ProfileMethodMismatch(expectedMethod, credential.method))
-                stopSelf()
+                failAttempt(attempt, ShadowsocksRuntimeError.ProfileMethodMismatch(expectedMethod, credential.method))
                 return@launch
             }
 
@@ -178,52 +220,95 @@ class ShadowsocksVpnService : VpnService() {
                 is ShadowsocksNativeBinaryResolver.Result.Found -> resolution.file
                 is ShadowsocksNativeBinaryResolver.Result.Missing -> {
                     Log.e(TAG, "refusing to start: binary unavailable: ${resolution.reason}")
-                    publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.BinaryMissing(resolution.reason))
-                    stopSelf()
+                    failAttempt(attempt, ShadowsocksRuntimeError.BinaryMissing(resolution.reason))
                     return@launch
                 }
             }
 
-            val established = tunEstablisher()
-            if (established == null) {
-                Log.e(TAG, "refusing to start: VpnService.Builder.establish() returned null")
-                publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.TunEstablishFailed("establish() returned null"))
-                stopSelf()
-                return@launch
+            // A superseded, not-yet-RUNNING session (a current RUNNING one
+            // made this START a no-op above) is released before this attempt
+            // establishes its own TUN - one TUN owner at a time.
+            val superseded = synchronized(lock) {
+                if (!lifecycle.isCurrent(attempt.generation)) return@launch
+                session.also { session = null }
             }
-            tunInterface = established
+            superseded?.let(::release)
 
-            val newRuntime = runtimeFactory(ShadowsocksVpnProtector { fd -> protect(fd) })
-            runtime = newRuntime
-
-            statusCollectionJob = serviceScope.launch(workDispatcher) collector@{
-                newRuntime.status.collect { status ->
-                    publish(sessionId, status.phase, status.lastError)
-                    if (status.phase == ShadowsocksRuntimePhase.FAILED) {
-                        runtime = null
-                        runCatching { tunInterface?.close() }
-                        tunInterface = null
-                        statusCollectionJob = null
-                        this@collector.cancel()
-                        stopSelf()
-                    }
+            val committed = synchronized(lock) {
+                if (!lifecycle.isCurrent(attempt.generation)) return@launch
+                val established = tunEstablisher()
+                if (established == null) {
+                    Log.e(TAG, "refusing to start: VpnService.Builder.establish() returned null")
+                    publish(attempt.sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.TunEstablishFailed("establish() returned null"))
+                    return@synchronized false
                 }
-            }
+                val newSession = ShadowsocksSession(attempt, established, runtimeFactory(ShadowsocksVpnProtector { fd -> protect(fd) }))
+                newSession.statusCollection = serviceScope.launch(workDispatcher, start = CoroutineStart.LAZY) {
+                    newSession.runtime.status.first { status -> onRuntimeStatus(newSession, status) }
+                }
+                // Published only together with its TUN and collector, never half-built.
+                session = newSession
+                newSession.statusCollection.start()
 
-            val started = newRuntime.start(
-                binaryPath = binaryPath.absolutePath,
-                // Borrowed, never a second owner - see ShadowsocksRuntime.start's
-                // own docs. `established` (this service's own TUN ParcelFileDescriptor)
-                // remains the sole close authority throughout.
-                tunFd = established.fileDescriptor,
-                workingDir = File(filesDir, WORKING_DIR_NAME),
-                tunInterfaceAddressCidr = ShadowsocksTunConfig.CIDR,
-                target = ShadowsocksRuntimeTarget(host, port, credential.method, credential.key.base64),
-            )
-            if (!started) {
-                Log.w(TAG, "ShadowsocksRuntime.start() refused (already running, or immediate failure)")
+                // A teardown/START received since the check above has begun a
+                // newer generation and will release this session as soon as
+                // it gets [lock] - spawning sslocal for it would be wasted.
+                if (!lifecycle.isCurrent(attempt.generation)) return@synchronized true
+                val started = newSession.runtime.start(
+                    binaryPath = binaryPath.absolutePath,
+                    // Borrowed, never a second owner - see ShadowsocksRuntime.start's
+                    // own docs. `established` (this service's own TUN ParcelFileDescriptor)
+                    // remains the sole close authority throughout.
+                    tunFd = established.fileDescriptor,
+                    workingDir = File(filesDir, WORKING_DIR_NAME),
+                    tunInterfaceAddressCidr = ShadowsocksTunConfig.CIDR,
+                    target = ShadowsocksRuntimeTarget(host, port, credential.method, credential.key.base64),
+                )
+                if (!started) {
+                    Log.w(TAG, "ShadowsocksRuntime.start() refused (already running, or immediate failure)")
+                }
+                true
+            }
+            if (!committed) stopSelfResult(attempt.startId)
+        }
+    }
+
+    /** Fails [attempt] before anything was established - reported and acted on only if no newer START/teardown was received since. */
+    private fun failAttempt(attempt: ShadowsocksStartAttempt, error: ShadowsocksRuntimeError) {
+        val current = synchronized(lock) {
+            lifecycle.isCurrent(attempt.generation).also { current ->
+                if (current) publish(attempt.sessionId, ShadowsocksRuntimePhase.FAILED, error)
             }
         }
+        if (current) stopSelfResult(attempt.startId)
+    }
+
+    /**
+     * Status collector of one committed [owned] session; returns true once it
+     * no longer needs collecting. A collector whose session was already
+     * detached (by a teardown or a superseding START, which released it)
+     * never publishes, closes, or stops anything again.
+     */
+    private fun onRuntimeStatus(owned: ShadowsocksSession, status: ShadowsocksRuntimeStatus): Boolean {
+        val current = synchronized(lock) {
+            if (session !== owned) return true
+            val current = lifecycle.isCurrent(owned.attempt.generation)
+            if (current) publish(owned.attempt.sessionId, status.phase, status.lastError)
+            if (status.phase != ShadowsocksRuntimePhase.FAILED) return false
+            session = null
+            current
+        }
+        // The runtime already tore its own process/bridges down on FAILED; the TUN is this service's to close.
+        runCatching { owned.tun.close() }
+        if (current) stopSelfResult(owned.attempt.startId)
+        return true
+    }
+
+    /** Stops everything [detached] owns. Only ever called by whoever detached it from [session] under [lock], so exactly once, and never under [lock]. */
+    private fun release(detached: ShadowsocksSession) {
+        detached.statusCollection.cancel()
+        detached.runtime.stop()
+        runCatching { detached.tun.close() }
     }
 
     @SuppressLint("VpnServicePolicy")
@@ -274,15 +359,19 @@ class ShadowsocksVpnService : VpnService() {
      * [shadowsocksTransportStateFor]) closes that gap - the ONE typed
      * terminal-stop signal, never a second one.
      */
-    private fun teardown() {
-        statusCollectionJob?.cancel()
-        statusCollectionJob = null
-        runtime?.stop()
-        runtime = null
-        runCatching { tunInterface?.close() }
-        tunInterface = null
-        publish(activeSessionId, ShadowsocksRuntimePhase.STOPPED)
-        stopSelf()
+    private fun teardown(generation: Long, startId: Int?) {
+        val detached = synchronized(lock) {
+            session?.takeIf { it.attempt.generation < generation }?.also { session = null }
+        }
+        detached?.let(::release)
+        val current = synchronized(lock) {
+            lifecycle.isCurrent(generation).also { current ->
+                if (current) publish(activeSessionId, ShadowsocksRuntimePhase.STOPPED)
+            }
+        }
+        // A START received after this teardown owns the service now.
+        if (!current) return
+        if (startId == null) stopSelf() else stopSelfResult(startId)
     }
 
     private fun publish(sessionId: Long, phase: ShadowsocksRuntimePhase, error: ShadowsocksRuntimeError? = null) {
@@ -317,3 +406,14 @@ internal data class ShadowsocksServiceStatus(
     val phase: ShadowsocksRuntimePhase,
     val error: ShadowsocksRuntimeError? = null,
 )
+
+private data class ShadowsocksStartAttempt(val generation: Long, val sessionId: Long, val startId: Int)
+
+/** Everything one committed start owns - published to ShadowsocksVpnService's session as one unit and released as one unit. */
+private class ShadowsocksSession(
+    val attempt: ShadowsocksStartAttempt,
+    val tun: ParcelFileDescriptor,
+    val runtime: ShadowsocksRuntime,
+) {
+    lateinit var statusCollection: Job
+}
