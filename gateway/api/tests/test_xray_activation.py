@@ -4,6 +4,7 @@ optimization at the module level (not just observed indirectly through
 the HTTP endpoint, see test_xray_profile_endpoint.py for that)."""
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -242,6 +243,36 @@ class IdempotentActivationTests(XrayActivationTestBase):
         second = xray_activation_module.activate_if_needed(xhttp_config)
         self.assertTrue(second.activated)
         self.assertTrue(second.skipped)  # nothing changed - the wrapper is not re-invoked
+
+
+class RealityKeyPermissionTests(XrayActivationTestBase):
+    """Regression test for a production incident: a REALITY private key
+    file that exists but is not readable by this process (permission
+    misconfiguration, deployment drift, a key-rotation race) must surface
+    as the SAME typed activation failure every other activate_if_needed
+    failure produces - never as an uncaught PermissionError/OSError
+    escaping to the HTTP layer's generic 500 handler. See
+    build_reality_config's own docstring for why this is the one place in
+    the whole /v1/xray-profile pipeline that reads an externally-
+    permissioned secret file."""
+
+    @unittest.skipIf(os.name == "nt", "POSIX file permissions only - not meaningful on Windows")
+    def test_unreadable_reality_key_file_is_a_typed_activation_failure_not_a_crash(self):
+        self._issue_bind_confirm()
+        os.chmod(self.app_config.xray_reality_private_key_file, 0o000)
+        try:
+            if os.access(self.app_config.xray_reality_private_key_file, os.R_OK):
+                self.skipTest("running as a user (e.g. root) that ignores file permissions")
+            result = xray_activation_module.reconcile(self.app_config)
+        finally:
+            os.chmod(
+                self.app_config.xray_reality_private_key_file,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+
+        self.assertFalse(result.activated)
+        self.assertIsNotNone(result.error)
+        self.assertIn("could not read REALITY private key file", str(result.error))
 
 
 class ConcurrencyTests(XrayActivationTestBase):
