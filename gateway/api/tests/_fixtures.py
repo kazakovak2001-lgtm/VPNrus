@@ -107,6 +107,8 @@ def make_app_config(
     xray_dest="",
     xray_tls_server_port=0, xray_tls_server_name="", xray_tls_fingerprint="",
     xray_tls_cert_file="", xray_tls_key_file="",
+    xray_xhttp_server_port=0, xray_xhttp_path="",
+    xray_xhttp_client_host="", xray_xhttp_client_port=0,
     manifest_path="",
     relay_probe_hmac_secret_file="",
 ):
@@ -145,6 +147,10 @@ def make_app_config(
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        xray_xhttp_server_port=xray_xhttp_server_port,
+        xray_xhttp_path=xray_xhttp_path,
+        xray_xhttp_client_host=xray_xhttp_client_host,
+        xray_xhttp_client_port=xray_xhttp_client_port,
         manifest_path=manifest_path,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
     )
