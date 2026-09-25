@@ -374,6 +374,29 @@ class ManifestSchema2DecoderTest {
         assertRejectedAsMalformed(container(canonical.copyOf().also { it[boolAt] = 2 }), "non-canonical boolean")
     }
 
+    // --- endpoint operational state spans known AND unknown bindings -------
+
+    @Test
+    fun `an operational state carried by an unknown binding can never be dropped or hidden`() {
+        val known = EndpointManifest(1, issuedAt, issuedAt + 10_000L, listOf(endpoint("gw", listOf(binding(TransportKind.AMNEZIA_WG)))), keyId)
+        val base = ManifestSchema2Codec.canonicalWire(known)
+        fun state(v: String) = "endpointOperationalState" to v
+        fun wire(knownMeta: List<Pair<String, String>>, unknownMeta: List<Pair<String, String>>) = base.copy(
+            endpoints = listOf(base.endpoints.single().let { e -> e.copy(bindings = listOf(e.bindings.single().copy(metadata = knownMeta), unknown(7, metadata = unknownMeta))) }),
+        )
+        listOf(
+            "RETIRED only on the unknown binding (would resurface as ACTIVE)" to wire(emptyList(), listOf(state("RETIRED"))),
+            "ACTIVE vs DISABLED conflict hidden in the unknown binding" to wire(listOf(state("ACTIVE")), listOf(state("DISABLED"))),
+            "unsupported state only on the unknown binding" to wire(emptyList(), listOf(state("FUTURE_STATE"))),
+            "unsupported state on every binding" to wire(listOf(state("FUTURE_STATE")), listOf(state("FUTURE_STATE"))),
+        ).forEach { (what, w) -> assertRejectedAsMalformed(container(ManifestSchema2Codec.encode(w)), what) }
+
+        // A uniform state across known and unknown bindings is kept on the interpreted endpoint.
+        val retired = SignedManifestCodec.decode(container(ManifestSchema2Codec.encode(wire(listOf(state("RETIRED")), listOf(state("RETIRED"))))))
+        assertEquals(EndpointOperationalState.RETIRED, retired.manifest.endpoints.single().operationalState())
+        assertEquals(ManifestVerificationResult.Valid, verify(retired))
+    }
+
     // --- canonical ordering (no enum-order dependency) --------------------
 
     @Test

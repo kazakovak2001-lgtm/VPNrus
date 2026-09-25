@@ -207,6 +207,7 @@ There is no "try schema 2 if schema 1 fails" path.
 | Binding | wireId, host, port, metadata | same envelope for every kind, known or not. A new kind puts anything extra in signed metadata. |
 | Unknown transport wire ID | whole manifest rejected | binding structurally validated, then ignored and counted |
 | Canonical order on read | not checked (the signature over the re-encoding enforces it) | enforced, strictly ascending: endpoint ids and metadata keys by unsigned UTF-8 byte order (= Unicode code point order, not JVM UTF-16 `compareTo`); roles and transport wire IDs numerically. Duplicates are therefore rejected. |
+| Endpoint operational state | merged over the bindings that declare it | must be uniform over ALL bindings (unknown included) and a supported value |
 | Booleans | any non-zero byte reads as true | only `0`/`1` |
 | Strings | UTF-8, lenient | UTF-8, malformed sequences rejected |
 | Signature is verified over | the re-canonicalization (byte-identical to the received bytes, proven for v1-v4 + bootstrap) | the **exact received canonical bytes** (`SignedManifest.signedCanonicalBytes`) |
@@ -215,7 +216,11 @@ There is no "try schema 2 if schema 1 fails" path.
 Schema-2 flow, in order:
 1. **Structural parse** (`ManifestSchema2Codec.parse`): bounds, exact EOF,
    canonical order, duplicates, and envelope validity of every binding (known
-   or unknown). Wire IDs are not resolved to `TransportKind` here. Anything
+   or unknown). The endpoint operational state (`endpointOperationalState`
+   binding metadata) must be identical on every binding, known or unknown,
+   and must be a supported value. Otherwise a DISABLED/RETIRED state, or a
+   conflict, carried only by an ignored binding would silently turn into
+   ACTIVE. Wire IDs are not resolved to `TransportKind` here. Anything
    wrong, including truncation, raises `IllegalArgumentException`.
 2. **Candidate interpretation** (`interpret`):
    - drop bindings with unknown IDs;
@@ -249,7 +254,10 @@ Still open (unchanged by step 2):
 - the server-side schema-2 channel and path (step 4);
 - the rule that the rollback guard must never compare versions across
   channels;
-- the owner decision on v4 (step 3).
+- the owner decision on v4 (step 3);
+- rollout policy: a validly signed schema-2 manifest whose interpretation
+  drops every usable endpoint is still Accepted and advances the version
+  floor.
 
 Because nothing publishes schema 2 today, the tolerant path is reachable
 only by bytes that carry marker 2.

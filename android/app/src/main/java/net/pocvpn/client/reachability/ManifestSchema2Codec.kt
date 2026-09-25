@@ -238,6 +238,13 @@ object ManifestSchema2Codec {
         if (hasRelay) require(EndpointId(relayTo).value != id) { "endpoint relays to itself" }
         require(region.isNotBlank() && provider.isNotBlank()) { "blank endpoint region/provider" }
         if (hasAsn) require(asnValue > 0) { "non-positive asn" }
+        // The operational state is endpoint-level signed data, stored on every
+        // binding. It is checked over ALL bindings, unknown included, so that
+        // ignoring a binding can never drop or hide a DISABLED/RETIRED state
+        // (or a conflict schema 1 would reject).
+        val states = bindings.map { b -> b.metadata.firstOrNull { it.first == OPERATIONAL_STATE_METADATA_KEY }?.second }
+        require(states.toSet().size == 1) { "endpoint operational state not uniform across bindings" }
+        states.first()?.let { state -> require(EndpointOperationalState.entries.any { it.name == state }) { "unsupported endpoint operational state" } }
         return Schema2WireEndpoint(id, roles, region, provider, if (hasAsn) asnValue else null, bindings, if (hasRelay) relayTo else null)
     }
 

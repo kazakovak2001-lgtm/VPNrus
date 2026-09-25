@@ -41,6 +41,7 @@ data class EndpointManifest(
  * the exact received canonical bytes: [manifest] may omit ignored bindings,
  * so it can never be re-serialized into what was signed. Verification and
  * persistence (SignedManifestCodec.encode) both use these bytes verbatim.
+ * Never mutated after decode (any mutation fails re-verification, which is fail-closed).
  * [tolerance] says what the schema-2 interpretation left out (diagnostics only).
  */
 data class SignedManifest(
