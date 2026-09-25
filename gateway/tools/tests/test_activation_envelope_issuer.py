@@ -1557,5 +1557,70 @@ class VerifyKeyTests(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+class PackageTests(unittest.TestCase):
+    """B56-5 - `package` wraps an issued envelope artifact into the
+    Android NovaActivationPackage text form (byte layout pinned by the
+    Kotlin ActivationEnvelopePythonCompatibilityTest fixture)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.envelope_bytes = issuer.pack_signed_envelope(
+            issuer.canonical_bytes(_make_test_envelope()),
+            issuer.sign_envelope(_make_test_envelope(), Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES)),
+        )
+        self.envelope_path = os.path.join(self._tmp.name, "envelope.bin")
+        with open(self.envelope_path, "wb") as handle:
+            handle.write(self.envelope_bytes)
+
+    def _run(self, *extra, out_name="package.txt"):
+        out_path = os.path.join(self._tmp.name, out_name)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = issuer.main(["package", "--envelope", self.envelope_path, "--out", out_path, *extra])
+        return code, out_path, out.getvalue(), err.getvalue()
+
+    def test_layout_matches_android_parser(self):
+        pkg = issuer.pack_activation_package(self.envelope_bytes, None)
+        tag = b"NOVA_ACTIVATION_PACKAGE_V1"
+        expected = struct.pack(">i", len(tag)) + tag + struct.pack(">i", 1) + struct.pack(">i", len(self.envelope_bytes)) + self.envelope_bytes + struct.pack(">i", 0) + struct.pack(">i", 0)
+        self.assertEqual(pkg, expected)
+        text = issuer.package_text(pkg)
+        self.assertTrue(text.startswith("nova-activation:1:"))
+        self.assertNotIn("=", text)
+
+    def test_bundle_bytes_are_embedded_verbatim(self):
+        bundle = b"\x01" * 100
+        pkg = issuer.pack_activation_package(self.envelope_bytes, bundle)
+        self.assertIn(struct.pack(">i", 100) + bundle + struct.pack(">i", 0), pkg)
+
+    def test_cli_writes_secret_output_0600_and_never_prints_it(self):
+        code, out_path, out, err = self._run()
+        self.assertEqual(code, 0)
+        with open(out_path, encoding="ascii") as handle:
+            text = handle.read()
+        self.assertEqual(text, issuer.package_text(issuer.pack_activation_package(self.envelope_bytes, None)))
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.stat(out_path).st_mode), 0o600)
+        self.assertNotIn(text, out + err)
+        self.assertNotIn(_make_test_envelope().credential, out + err)
+
+    def test_cli_refuses_to_overwrite(self):
+        self.assertEqual(self._run()[0], 0)
+        self.assertEqual(self._run()[0], 1)
+
+    def test_oversized_bundle_is_refused(self):
+        with self.assertRaises(issuer.IssuerError):
+            issuer.pack_activation_package(self.envelope_bytes, b"x" * (issuer.MAX_PACKAGE_BUNDLE_BYTES + 1))
+
+    def test_invalid_bundle_file_is_refused(self):
+        bad = os.path.join(self._tmp.name, "bad.bin")
+        with open(bad, "wb") as handle:
+            handle.write(b"not a signed manifest")
+        code, _p, _o, err = self._run("--bootstrap-bundle", bad)
+        self.assertEqual(code, 1)
+        self.assertIn("--bootstrap-bundle rejected", err)
+
+
 if __name__ == "__main__":
     unittest.main()

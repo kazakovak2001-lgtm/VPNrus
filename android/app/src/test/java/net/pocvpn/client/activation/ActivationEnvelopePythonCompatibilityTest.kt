@@ -139,7 +139,27 @@ class ActivationEnvelopePythonCompatibilityTest {
     private fun hexToBytes(hex: String): ByteArray =
         ByteArray(hex.length / 2) { i -> ((Character.digit(hex[i * 2], 16) shl 4) + Character.digit(hex[i * 2 + 1], 16)).toByte() }
 
+    @Test
+    fun `B56-5 - Python-produced NovaActivationPackage parses, verifies, and re-encodes byte-identically`() {
+        val parsed = ActivationPackageParser.parse(ActivationPackageInput.Text(FIXTURE_A_PACKAGE_TEXT))
+        assertTrue("expected package parse success, got $parsed", parsed is ActivationPackageParseResult.Success)
+        val pkg = (parsed as ActivationPackageParseResult.Success).pkg
+        assertNull(pkg.bootstrapBundle)
+        val result = verifier.verify(pkg.signedEnvelope, trustAnchors, fixtureNowEpochMillis)
+        assertTrue("expected Valid, got $result", result is ActivationEnvelopeVerificationResult.Valid)
+        assertEquals("a1b2c3d4e5f60718293a4b5c6d7e8f90", (result as ActivationEnvelopeVerificationResult.Valid).envelope.activationId.value)
+        assertEquals(FIXTURE_A_PACKAGE_TEXT, ActivationPackageParser.encodeText(pkg))
+    }
+
     companion object {
+        /** B56-5 - fixture A wrapped by Python `activation_envelope_issuer.pack_activation_package` (no bundle). */
+        private const val FIXTURE_A_PACKAGE_TEXT =
+            "nova-activation:1:AAAAGk5PVkFfQUNUSVZBVElPTl9QQUNLQUdFX1YxAAAAAQAAATQAAAABAAAA6AAAABtOT1ZBX0FDVElWQV" +
+            "RJT05fRU5WRUxPUEVfVjEAAAABAAAAIGExYjJjM2Q0ZTVmNjA3MTgyOTNhNGI1YzZkN2U4ZjkwAAAAK1RFU1RjcmVkZW50aWFsX3" +
+            "VybHNhZmUtMDEyMzQ1Njc4OUFCQ0RFRkdISUoAAAGLz-VoAAAAAYvP5WgAAAABi9oyIAAAAAAAAgAAAAxmcmFua2Z1cnQtZ3cAAA" +
+            "AMc3RvY2tob2xtLWd3AAAAABAAAQIDBAUGBwgJCgsMDQ4PAAAAHHRlc3QtYWN0aXZhdGlvbi1pc3N1ZXIta2V5LTEAAABAxxsay3" +
+            "Nq_gQV0ppBjL6JziQPghx2AwlGTIYShLZtDdzNK-j7kPJ99OC0xnZjsxYjwhcPc30sWgCmx9Xb9bQeAwAAAAAAAAAA"
+
         /**
          * Raw 32-byte Ed25519 public key for the deterministic TEST-ONLY
          * private key `bytes(range(32))` - TEST FIXTURE DATA ONLY, never a

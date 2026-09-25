@@ -577,7 +577,11 @@ B56-4B1 (this ceremony) completed steps 1-4 below for real. Remaining:
    against a real production activation store to mint the first real,
    redeemable `ActivationEnvelope` (B56-4B2).
 8. B56-5 owns wiring `ProductionActivationIssuerTrustAnchors` into real
-   bootstrap/runtime composition - not started by B56-4B1.
+   bootstrap/runtime composition - now implemented in code (see
+   `B56_5_ANDROID_ACTIVATION_PACKAGE_RUNTIME.md`). After step 7, wrap the
+   envelope for delivery with `activation_envelope_issuer.py package
+   --envelope <artifact> [--bootstrap-bundle <signed manifest>] --out <file>`
+   (secret output).
 
 Historical record (completed by B56-4B1):
 

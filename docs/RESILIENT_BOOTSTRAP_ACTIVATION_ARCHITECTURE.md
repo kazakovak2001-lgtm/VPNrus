@@ -1204,7 +1204,11 @@ its own, later, separately-gated slice:
    issuance CLI producing `ActivationEnvelope`s via the *existing*
    `issue_activation()`, plus an operator workflow for attaching an
    existing signed `EndpointManifest` as a package's optional bundle.
-5. **B56-5** - `BootstrapCandidateRepository`/`BootstrapReachabilityResolver`
+5. **B56-5** - *(Implementation note: the owner re-scoped B56-5 to Android
+   consumption of the Activation Package - container/parser/verification/
+   bundle staging/`activateDevice()` wiring, see
+   `B56_5_ANDROID_ACTIVATION_PACKAGE_RUNTIME.md`. The resolver work below is
+   still NOT implemented.)* `BootstrapCandidateRepository`/`BootstrapReachabilityResolver`
    (Level 1 only)/`BootstrapLaneClient`, wired to the existing
    `ReachabilityEngine`/`EndpointManifestRepository`, behind a debug-only
    entry point first.

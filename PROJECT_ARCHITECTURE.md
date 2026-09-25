@@ -784,6 +784,25 @@ force-stopped.
   (`xrayAvailableEndpoints`/`xrayTlsAvailableEndpoints`, `Set<EndpointId>`) - one
   endpoint's profile can never make a different endpoint appear available.
 
+## Activation package import (B56-5, hard invariant)
+
+- Two trust domains, never merged: `ActivationIssuerTrustAnchors` (activation
+  entitlement only; production = `ProductionActivationIssuerTrustAnchors`,
+  public key only) vs `ManifestTrustAnchors` (network facts only). An
+  activation-issuer key can never make a manifest/bootstrap bundle trusted.
+- `NovaActivationPackage` (`NOVA_ACTIVATION_PACKAGE_V1`, text `nova-activation:1:`)
+  is an unsigned transport container; the source (QR/deep link/file/clipboard)
+  confers no trust. `ActivationPackageImporter` is the only path from untrusted
+  input to a usable credential: parse -> existing `Ed25519ActivationEnvelopeVerifier`
+  -> local replay guard -> bundle/`bootstrapBundleRef` hash binding -> existing
+  `SignedBootstrapBundleImporter` -> `EndpointManifestRepository.offer()` (same
+  single repository instance; no second manifest verifier/store).
+- A verified credential goes through the SAME `MainViewModel.activateDevice()`
+  as a typed credential (via `ActivationPackageRedeemer`) - no second
+  activation/provisioning path. Activation origins still come from the compiled
+  `ProductionGatewayCatalog`; a staged bundle refreshes the trusted manifest/LKG
+  only.
+
 ## Current gateway state (verify against `docs/ROADMAP.md`'s Gateway Pool row before
 relying on this for anything user-facing - this table is a snapshot, ROADMAP is truth)
 

@@ -1081,6 +1081,65 @@ def _revoke_or_report_critical(args, activation_id: str, original_exc: BaseExcep
 
 # --- CLI wiring ---
 
+# --- B56-5: NovaActivationPackage container (byte-compatible with Android's
+# net.pocvpn.client.activation.ActivationPackageParser). A TRANSPORT wrapper
+# only - it adds no signature and grants no trust; Android verifies the
+# envelope (activation-issuer key) and the bundle (manifest key)
+# independently. V1 always writes an empty Level-2 section (B56-6 reserved).
+PACKAGE_DOMAIN_TAG = "NOVA_ACTIVATION_PACKAGE_V1"
+PACKAGE_SCHEMA_VERSION = 1
+PACKAGE_TEXT_PREFIX = "nova-activation:1:"
+MAX_PACKAGE_BUNDLE_BYTES = 262_144  # NovaActivationPackage.MAX_BUNDLE_BYTES
+
+
+def pack_activation_package(envelope_artifact: bytes, bundle: Optional[bytes]) -> bytes:
+    if not 1 <= len(envelope_artifact) <= MAX_ENCODED_BYTES:
+        raise IssuerError(f"envelope artifact length out of range: {len(envelope_artifact)}")
+    if bundle is not None and not 1 <= len(bundle) <= MAX_PACKAGE_BUNDLE_BYTES:
+        raise IssuerError(f"bootstrap bundle length out of range (max {MAX_PACKAGE_BUNDLE_BYTES}): {len(bundle)}")
+    tag = PACKAGE_DOMAIN_TAG.encode("utf-8")
+    buf = bytearray()
+    buf += struct.pack(">i", len(tag)) + tag
+    buf += struct.pack(">i", PACKAGE_SCHEMA_VERSION)
+    buf += struct.pack(">i", len(envelope_artifact)) + envelope_artifact
+    buf += struct.pack(">i", 0 if bundle is None else len(bundle)) + (bundle or b"")
+    buf += struct.pack(">i", 0)  # reserved Level-2 section - always empty in V1
+    return bytes(buf)
+
+
+def package_text(package_bytes: bytes) -> str:
+    return PACKAGE_TEXT_PREFIX + base64.urlsafe_b64encode(package_bytes).decode("ascii").rstrip("=")
+
+
+def cmd_package(args) -> int:
+    """Wraps an ALREADY-issued envelope artifact (from `issue`) and an
+    optional ALREADY-signed bootstrap bundle into the text form the app
+    imports (QR / deep link / file / clipboard). Signs nothing, touches no
+    store. The output contains the plaintext activation credential, so it
+    is published with the same no-clobber, outside-git, 0600 discipline as
+    the envelope artifact itself, and its content is never printed."""
+    try:
+        with open(args.envelope, "rb") as handle:
+            envelope_artifact = handle.read(MAX_ENCODED_BYTES + 1)
+    except OSError as exc:
+        raise IssuerError(f"failed to read --envelope: {exc.__class__.__name__}") from None
+    bundle = None
+    if args.bootstrap_bundle:
+        try:
+            inspect_signed_manifest_bundle(args.bootstrap_bundle)
+        except BundleInspectionError as exc:
+            raise IssuerError(f"--bootstrap-bundle rejected: {exc}") from None
+        with open(args.bootstrap_bundle, "rb") as handle:
+            bundle = handle.read()
+    _refuse_if_exists(args.out)
+    _refuse_if_inside_git_repo(args.out)
+    text = package_text(pack_activation_package(envelope_artifact, bundle))
+    tmp_path = publish_secret_no_clobber(args.out, text.encode("ascii"))
+    confirm_post_publication(args.out, tmp_path)
+    print(f"activation_envelope_issuer: activation package written to {args.out} ({len(text)} chars, bundle={'yes' if bundle else 'no'}) - SECRET, contains the activation credential")
+    return 0
+
+
 def cmd_verify_key(args) -> int:
     """B56-4B2 - proves a private key file (the primary copy OR an offline
     backup copy) is the exact key named by the public metadata, WITHOUT
@@ -1132,6 +1191,11 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument("--bootstrap-bundle", default=None, help="optional path to an ALREADY-signed SignedManifestCodec artifact (from manifest_signing.py) to correlate by exact-byte SHA-256 + manifest version - never re-signed")
     issue.add_argument("--out", required=True, help="output path for the signed envelope artifact - SECRET (contains the plaintext activation credential); refuses to overwrite")
 
+    pkg = sub.add_parser("package", help="wrap an issued envelope artifact (+ optional signed bootstrap bundle) into a nova-activation:1: package text - SECRET output")
+    pkg.add_argument("--envelope", required=True, help="envelope artifact produced by `issue --out`")
+    pkg.add_argument("--bootstrap-bundle", default=None, help="optional ALREADY-signed SignedManifestCodec artifact; if the envelope carries a bootstrapBundleRef it must be the exact same file")
+    pkg.add_argument("--out", required=True, help="output path for the package text - SECRET; refuses to overwrite or write inside a git tree")
+
     verify = sub.add_parser("verify-key", help="prove a private key file (primary or backup copy) matches the issuer metadata - prints public data only")
     verify.add_argument("--private-key-file", required=True, help="path to a raw 32-byte Ed25519 private key file (primary or backup copy)")
     verify.add_argument("--issuer-metadata-file", required=True, help="the public metadata JSON generate-key produced")
@@ -1149,6 +1213,8 @@ def main(argv=None) -> int:
             return cmd_generate_key(args)
         if args.command == "issue":
             return cmd_issue(args)
+        if args.command == "package":
+            return cmd_package(args)
         if args.command == "verify-key":
             return cmd_verify_key(args)
     except IssuerError as exc:
