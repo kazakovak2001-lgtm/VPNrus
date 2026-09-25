@@ -47,6 +47,10 @@ enum class DiagnosticEventType {
     RESTRICTION_CLASSIFIED,
     RESTRICTION_STABILIZED,
     MANIFEST_SOURCE_SELECTED,
+
+    // B-WL-R6 - the trusted schema-2 manifest carried transport bindings this
+    // build does not know; tags are counts only (never wire ids, hosts or metadata).
+    MANIFEST_UNKNOWN_TRANSPORT_IGNORED,
     CANDIDATE_RANKED,
     CANDIDATE_ATTEMPT_STARTED,
     ENDPOINT_REACHABILITY_RESULT,

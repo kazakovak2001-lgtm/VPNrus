@@ -32,15 +32,32 @@ data class EndpointManifest(
     }
 }
 
-/** A manifest plus the raw signature bytes over its canonical encoding - see ManifestCanonicalizer. */
-data class SignedManifest(val manifest: EndpointManifest, val signature: ByteArray) {
+/**
+ * A manifest plus the raw signature bytes over its canonical encoding - see
+ * ManifestCanonicalizer (schema 1) and ManifestSchema2Codec (schema 2).
+ *
+ * [signedCanonicalBytes] is null for schema 1, whose signed bytes are
+ * reproduced exactly by re-canonicalizing [manifest]. For schema 2 it holds
+ * the exact received canonical bytes: [manifest] may omit ignored bindings,
+ * so it can never be re-serialized into what was signed. Verification and
+ * persistence (SignedManifestCodec.encode) both use these bytes verbatim.
+ * [tolerance] says what the schema-2 interpretation left out (diagnostics only).
+ */
+data class SignedManifest(
+    val manifest: EndpointManifest,
+    val signature: ByteArray,
+    val signedCanonicalBytes: ByteArray? = null,
+    val tolerance: ManifestTolerance = ManifestTolerance.NONE,
+) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is SignedManifest) return false
-        return manifest == other.manifest && signature.contentEquals(other.signature)
+        return manifest == other.manifest && signature.contentEquals(other.signature) &&
+            signedCanonicalBytes.contentEquals(other.signedCanonicalBytes) && tolerance == other.tolerance
     }
 
-    override fun hashCode(): Int = 31 * manifest.hashCode() + signature.contentHashCode()
+    override fun hashCode(): Int =
+        ((31 * manifest.hashCode() + signature.contentHashCode()) * 31 + signedCanonicalBytes.contentHashCode()) * 31 + tolerance.hashCode()
 }
 
 /**

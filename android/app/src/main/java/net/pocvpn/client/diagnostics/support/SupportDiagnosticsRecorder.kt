@@ -122,6 +122,13 @@ class SupportDiagnosticsRecorder(
     fun recordManifestSourceSelected(source: ManifestSourceKind) =
         record(DiagnosticEventType.MANIFEST_SOURCE_SELECTED, mapOf(TAG_SOURCE to source.name))
 
+    /** B-WL-R6 - counts only; nothing else about the ignored bindings is ever recorded. */
+    fun recordManifestUnknownTransportIgnored(ignoredBindings: Int, droppedEndpoints: Int) =
+        record(
+            DiagnosticEventType.MANIFEST_UNKNOWN_TRANSPORT_IGNORED,
+            mapOf(TAG_COUNT to ignoredBindings.toString(), TAG_DROPPED_ENDPOINTS to droppedEndpoints.toString()),
+        )
+
     fun recordCandidateRanked(candidateCount: Int) =
         record(DiagnosticEventType.CANDIDATE_RANKED, mapOf(TAG_COUNT to candidateCount.toString()))
 
@@ -452,6 +459,7 @@ class SupportDiagnosticsRecorder(
         const val TAG_BEHAVIOR_PATTERN = "behaviorPattern"
         const val TAG_SOURCE = "source"
         const val TAG_COUNT = "count"
+        const val TAG_DROPPED_ENDPOINTS = "droppedEndpoints"
         const val TAG_PATH_KIND = "pathKind"
         const val TAG_TRANSPORT_KIND = "transportKind"
         const val TAG_STATE = "state"

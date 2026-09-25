@@ -56,7 +56,12 @@ sealed class ManifestUpdateResult {
  * inside the APK.
  */
 sealed class TrustedManifestState {
-    data class Trusted(val manifest: EndpointManifest, val source: ManifestSource) : TrustedManifestState()
+    /** [tolerance] - what a schema-2 decode of the trusted artifact ignored (diagnostics only; NONE for schema 1). */
+    data class Trusted(
+        val manifest: EndpointManifest,
+        val source: ManifestSource,
+        val tolerance: ManifestTolerance = ManifestTolerance.NONE,
+    ) : TrustedManifestState()
 
     /** LKG absent-or-invalid AND the embedded bootstrap itself failed verification - the fail-closed state. */
     data class NoneTrusted(val bootstrapRejectionReason: String) : TrustedManifestState()
@@ -98,12 +103,12 @@ class EndpointManifestRepository(
     fun trustedState(): TrustedManifestState {
         lkgStore.current()?.let { lkg ->
             if (verifier.verify(lkg, trustAnchors, nowEpochMillis()) is ManifestVerificationResult.Valid) {
-                return TrustedManifestState.Trusted(lkg.manifest, ManifestSource.LAST_KNOWN_GOOD)
+                return TrustedManifestState.Trusted(lkg.manifest, ManifestSource.LAST_KNOWN_GOOD, lkg.tolerance)
             }
         }
         val bootstrapVerification = verifier.verify(bootstrapManifest, trustAnchors, nowEpochMillis())
         return if (bootstrapVerification is ManifestVerificationResult.Valid) {
-            TrustedManifestState.Trusted(bootstrapManifest.manifest, ManifestSource.EMBEDDED_BOOTSTRAP)
+            TrustedManifestState.Trusted(bootstrapManifest.manifest, ManifestSource.EMBEDDED_BOOTSTRAP, bootstrapManifest.tolerance)
         } else {
             val reason = (bootstrapVerification as ManifestVerificationResult.Invalid).reason
             TrustedManifestState.NoneTrusted(bootstrapRejectionReason = reason)

@@ -3252,9 +3252,14 @@ class MainViewModel(
         supportDiagnosticsRecorder?.startSession(
             buildDiagnosticStartContext(rawRestrictionClass = restrictionClass(), stabilizedRestrictionClass = snapshot.restrictionClass),
         )
+        // One trusted-state read for both manifest events.
+        val trustedManifest = manifestRepository?.trustedState() as? net.pocvpn.client.reachability.TrustedManifestState.Trusted
         supportDiagnosticsRecorder?.recordManifestSourceSelected(
-            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(manifestRepository?.trustedSource()),
+            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(trustedManifest?.source),
         )
+        trustedManifest?.tolerance?.takeIf { it.ignoredUnknownBindings > 0 }?.let {
+            supportDiagnosticsRecorder?.recordManifestUnknownTransportIgnored(it.ignoredUnknownBindings, it.droppedEndpoints)
+        }
         supportDiagnosticsRecorder?.recordCandidateRanked(attempts.size)
         if (attempts.isEmpty()) {
             // B28 review fix (blocker 1) - report TRUTHFULLY when this

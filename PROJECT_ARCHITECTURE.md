@@ -2420,9 +2420,17 @@ DNS/IPv6 invariants held, managed identity/state completely unaffected - see
 - `TransportKind.wireId` (stable, explicit, frozen: 0-5 = historical ordinals,
   6 = XRAY_REALITY_XHTTP) is the ONLY value ever signed or persisted
   (manifest codec incl. binding sort order, PathHistoryStore,
-  ConnectionOutcomeStore) - never `ordinal`. An unknown id still rejects the
-  whole manifest; a new kind must never be published in the schema-1 manifest
-  (see docs/B_WL_R6_MANIFEST_TRANSPORT_KIND_ROLLOUT.md).
+  ConnectionOutcomeStore) - never `ordinal`. In schema 1 an unknown id still
+  rejects the whole manifest; a new kind must never be published in the
+  schema-1 manifest (see docs/B_WL_R6_MANIFEST_TRANSPORT_KIND_ROLLOUT.md).
+- Signed manifest schema is the first canonical int; `SignedManifestCodec`
+  dispatches 1 -> `ManifestCanonicalizer` (strict, unchanged), 2 ->
+  `ManifestSchema2Codec` (client-side only, nothing publishes it), else reject.
+  Schema 2 ignores structurally valid unknown-id bindings. Its
+  `SignedManifest.signedCanonicalBytes` are the exact received bytes: the
+  verifier checks the signature over them, then trusts the manifest only if it
+  equals the interpretation re-derived from them; LKG persists them verbatim.
+  A filtered manifest is never re-serialized for verification.
 
 ## Production vs debug boundary
 

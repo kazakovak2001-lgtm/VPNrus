@@ -1,8 +1,13 @@
 # B-WL-R6 - Adding a TransportKind to the signed manifest: compatibility analysis and rollout proposal
 
-Status (2026-09-25): proposal step 1 (stable wire IDs) is IMPLEMENTED and
-tested (see section 5). Steps 2-5 are NOT implemented. `XRAY_REALITY_XHTTP`
-must not appear in any published manifest until the proposal's gates are met.
+Status (2026-09-25):
+- Step 1 (stable wire IDs) is IMPLEMENTED and tested (section 5).
+- Step 2 (tolerant schema-2 decoder, client side) is IMPLEMENTED and tested,
+  NOT DEPLOYED (section 6). No schema-2 manifest exists or is published.
+- Steps 3-5 are NOT implemented.
+
+`XRAY_REALITY_XHTTP` must not appear in any published manifest until the
+proposal's gates are met.
 
 ## 1. How the codec worked before step 1 (verified in source at a2eb56f)
 
@@ -80,7 +85,8 @@ must not appear in any published manifest until the proposal's gates are met.
 1. **Stable wire IDs (client).** DONE - see section 5. The Python signer
    already takes explicit integers (`kindOrdinal` in the source JSON), so it
    needed no change; those integers are the wire IDs in section 5.
-2. **Tolerant schema-2 decoder (client).**
+2. **Tolerant schema-2 decoder (client).** DONE (client-side, test-only
+   fixtures) - see section 6.
    - Parse `FORMAT_VERSION` 1 and 2.
    - For 2: an unknown wire ID becomes an ignored binding, and the signature is
      verified over the received canonical bytes.
@@ -173,18 +179,118 @@ caught by this test.
 client that does not know an ID still rejects the whole manifest; that is
 schema 2's job (section 6).
 
-## 6. Schema 2 (design note, NOT implemented)
+## 6. Schema 2 (implemented client-side, step 2; NOT deployed)
 
-- It is a new canonical `FORMAT_VERSION = 2` served on a new path; schema 1
-  and its path stay unchanged.
-- Bindings are encoded by explicit wire ID (section 5).
-- The tolerant decoder keeps a binding with an unknown wire ID as opaque and
-  ignores it for selection. It keeps rejecting every other malformation.
-- The signature is verified over the exact received canonical bytes, never a
-  re-encoding, because a re-encoding cannot reproduce ignored bindings.
-- Schema 1 must contain only kinds that every supported target client
-  understands.
-- The manifest version is monotonic within each channel. The rollback guard
-  must never compare versions across channels.
-- No production schema-2 manifest exists or is planned before the owner
-  approves it.
+Code: `reachability/ManifestSchema2Codec.kt`; dispatch in
+`SignedManifestCodec`; verification in `Ed25519ManifestVerifier`. Tests:
+`ManifestSchema2DecoderTest`, with fixtures generated deterministically from a
+fixed test key. No production manifest, bootstrap manifest, signer, server or
+fetch path was changed.
+
+### 6.1 Schema 1 vs schema 2
+
+The container is the same for both:
+`[container=1][len][canonical bytes][len][signature]`. The **schema marker** is
+the first big-endian int of the canonical bytes, so the marker is itself
+signed. `SignedManifestCodec` dispatches on it explicitly:
+- 1 -> the schema-1 decoder;
+- 2 -> the schema-2 decoder;
+- any other value, or fewer than 4 canonical bytes -> rejected.
+
+There is no "try schema 2 if schema 1 fails" path.
+
+| | Schema 1 (unchanged) | Schema 2 |
+|---|---|---|
+| Marker | `1` | `2` |
+| Header | version, issuedAt, expiresAt, signingKeyId | same |
+| Roles | int = `EndpointRole.ordinal` (historical) | int from the explicit frozen table `ROLE_WIRE_IDS` (INGRESS 0, GATEWAY 1, EXIT 2 = historical values). An unknown role id is rejected. |
+| Binding | wireId, host, port, metadata | same envelope for every kind, known or not. A new kind puts anything extra in signed metadata. |
+| Unknown transport wire ID | whole manifest rejected | binding structurally validated, then ignored and counted |
+| Canonical order on read | not checked (the signature over the re-encoding enforces it) | enforced, strictly ascending: endpoint ids and metadata keys by unsigned UTF-8 byte order (= Unicode code point order, not JVM UTF-16 `compareTo`); roles and transport wire IDs numerically. Duplicates are therefore rejected. |
+| Booleans | any non-zero byte reads as true | only `0`/`1` |
+| Strings | UTF-8, lenient | UTF-8, malformed sequences rejected |
+| Signature is verified over | the re-canonicalization (byte-identical to the received bytes, proven for v1-v4 + bootstrap) | the **exact received canonical bytes** (`SignedManifest.signedCanonicalBytes`) |
+| LKG persists | the re-canonicalization | the received bytes, verbatim |
+
+Schema-2 flow, in order:
+1. **Structural parse** (`ManifestSchema2Codec.parse`): bounds, exact EOF,
+   canonical order, duplicates, and envelope validity of every binding (known
+   or unknown). Wire IDs are not resolved to `TransportKind` here. Anything
+   wrong, including truncation, raises `IllegalArgumentException`.
+2. **Candidate interpretation** (`interpret`):
+   - drop bindings with unknown IDs;
+   - drop endpoints left with no known binding, and, transitively, any
+     endpoint whose `relayTo` target was dropped;
+   - the counts go into `ManifestTolerance`.
+
+   The result is an UNTRUSTED candidate; nothing reads it before step 3.
+3. **Verification** (`Ed25519ManifestVerifier`): key lookup and time window
+   from the header, then Ed25519 over the exact received bytes.
+4. **Binding the interpretation to the bytes**: only after the signature
+   verifies, the verifier re-derives the interpretation from those verified
+   bytes. It accepts only if that equals the candidate manifest and
+   tolerance. Otherwise the result is `INVALID_SIGNATURE`.
+
+Failure mapping (no new fallback policy):
+- Malformed input, an unsupported schema, duplicates or non-canonical order ->
+  `IllegalArgumentException` -> the existing `MALFORMED` fetch result. The
+  candidate never reaches `offer()`, and LKG/bootstrap stay trusted.
+- An invalid signature, or modified payload, unknown binding or signature ->
+  `offer()` rejects it with `INVALID_SIGNATURE`, and LKG is untouched.
+- A valid schema-2 manifest with an unknown kind is `Accepted`, stored in LKG
+  as the exact received container, and re-verified on every read.
+
+Diagnostics: if the trusted manifest ignored anything, `connectAuto` records
+`MANIFEST_UNKNOWN_TRANSPORT_IGNORED` with two tags, `count` (ignored bindings)
+and `droppedEndpoints`. It records counts only: never wire IDs, hosts,
+metadata, URLs or keys.
+
+Still open (unchanged by step 2):
+- the server-side schema-2 channel and path (step 4);
+- the rule that the rollback guard must never compare versions across
+  channels;
+- the owner decision on v4 (step 3).
+
+Because nothing publishes schema 2 today, the tolerant path is reachable
+only by bytes that carry marker 2.
+
+### 6.2 Why an unknown transport may be ignored but unknown bytes may not
+
+These are two different kinds of ignorance, and they must not be confused.
+
+**Semantic ignorance is safe.** The client does not know what transport kind 7
+means, so it cannot use it. Ignoring a binding it cannot use removes only
+options. The client never gains a path, a host or a trust decision it did not
+already have. Every known binding, endpoint and header field is still exactly
+what the signer signed.
+
+**Cryptographic ignorance is not safe.** The signature covers bytes, not
+meaning. If the client dropped the bytes it does not understand and then
+checked the signature over a re-serialization of what is left, it would be
+verifying a different message from the one that was signed. There are two
+possible outcomes:
+- It fails every time, so the tolerant decoder is useless.
+- The signer is made to sign the filtered form. Then the unknown bytes are
+  not covered by any signature, and anyone on the path can add, change or
+  remove them undetected.
+
+When that client, or a later client that does know kind 7, persists and later
+interprets those bytes, they are attacker-controlled. That breaks the one
+property the manifest exists to provide.
+
+So schema 2 is tolerant only about meaning, never about integrity:
+1. every byte, including every byte of every unknown binding, is covered by
+   the signature and checked in its received form;
+2. unknown bindings must still be structurally well-formed, so there is one
+   unambiguous parse;
+3. what is ignored is decided only after the signature over those bytes
+   verified;
+4. those same bytes, never a re-encoding, are what LKG keeps.
+
+`ManifestSchema2DecoderTest` proves this:
+- modifying an unknown binding's host, port, metadata or wire ID after
+  signing is rejected;
+- stripping the unknown binding, which yields the same interpreted manifest,
+  is rejected;
+- a mutation that verifies over the filtered re-serialization makes 8 tests
+  fail.
