@@ -91,3 +91,40 @@ internal class FakeShadowsocksVpnProtectBridge(var throwOnStart: Boolean = false
 internal class FakeShadowsocksVpnProtector(private val result: Boolean = true) : ShadowsocksVpnProtector {
     override fun protect(fd: Int): Boolean = result
 }
+
+/**
+ * Lifecycle race tests - every handOff call blocks until the test releases
+ * that call's own [Gate]. This gives deterministic control over WHEN a
+ * start()'s asynchronous completion runs relative to stop()/start(); it
+ * never relies on timing. The await timeout only turns a test bug into a
+ * failure instead of a hang.
+ */
+internal class GatedShadowsocksTunFdBridge : ShadowsocksTunFdBridge {
+    class Gate {
+        val reached = java.util.concurrent.CountDownLatch(1)
+        private val released = java.util.concurrent.CountDownLatch(1)
+        @Volatile private var result = ShadowsocksTunFdBridgeState.WAITING
+
+        fun release(result: ShadowsocksTunFdBridgeState) {
+            this.result = result
+            released.countDown()
+        }
+
+        fun awaitReached() = check(reached.await(10, java.util.concurrent.TimeUnit.SECONDS)) { "handOff was never reached" }
+
+        internal fun block(): ShadowsocksTunFdBridgeState {
+            reached.countDown()
+            check(released.await(10, java.util.concurrent.TimeUnit.SECONDS)) { "gate was never released" }
+            return result
+        }
+    }
+
+    private val gates = java.util.concurrent.ConcurrentHashMap<Int, Gate>()
+    private val calls = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** The gate of the [call]-th handOff (0-based), created on first use by either side. */
+    fun gate(call: Int): Gate = gates.computeIfAbsent(call) { Gate() }
+
+    override fun handOff(tunFd: FileDescriptor, socketPath: File, timeoutMillis: Long): ShadowsocksTunFdBridgeState =
+        gate(calls.getAndIncrement()).block()
+}

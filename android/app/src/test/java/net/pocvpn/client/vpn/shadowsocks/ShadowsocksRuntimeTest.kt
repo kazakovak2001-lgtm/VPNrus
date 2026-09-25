@@ -4,11 +4,19 @@ package net.pocvpn.client.vpn.shadowsocks
 
 import java.io.File
 import java.io.FileDescriptor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -412,5 +420,186 @@ class ShadowsocksRuntimeTest {
 
         assertEquals(ShadowsocksRuntimePhase.RUNNING, runtime.status.value.phase)
         assertTrue(workingDir.listFiles { f -> f.name.endsWith(".json") }.isNullOrEmpty())
+    }
+
+    // --- Lifecycle race: a start()'s asynchronous completion (tun-fd handoff
+    // coroutine, process-exit callback) must never overwrite a later stop()
+    // or disturb a later start(). Deterministic: gates/latches decide the
+    // interleaving; the async work runs on a real IO dispatcher in a scope the
+    // test joins, so no test here waits on timing.
+
+    private class RaceFixture {
+        val asyncScope = CoroutineScope(SupervisorJob())
+        val bridge = GatedShadowsocksTunFdBridge()
+        val processes = java.util.Collections.synchronizedList(mutableListOf<FakeShadowsocksSpawnedProcess>())
+        val launcher = FakeShadowsocksProcessLauncher(processFactory = { FakeShadowsocksSpawnedProcess().also { processes += it } })
+        val protectBridge = FakeShadowsocksVpnProtectBridge()
+        val runtime = ShadowsocksRuntime(launcher, bridge, protectBridge, FakeShadowsocksVpnProtector(), asyncScope, ioDispatcher = Dispatchers.IO)
+
+        fun asyncJobs(): List<Job> = asyncScope.coroutineContext.job.children.toList()
+        fun join(jobs: List<Job>) = runBlocking { jobs.joinAll() }
+    }
+
+    private fun configFilesIn(dir: File) = dir.listFiles { f -> f.name.endsWith(".json") }.orEmpty().toList()
+
+    // Test B/E - start -> handoff pending -> stop -> STOPPED -> late completion -> still STOPPED.
+    @Test
+    fun `a startup completion that arrives after stop leaves the runtime STOPPED`() {
+        listOf(ShadowsocksTunFdBridgeState.FD_SENT, ShadowsocksTunFdBridgeState.FAILED).forEach { lateResult ->
+            val f = RaceFixture()
+            val workingDir = tempWorkingDir()
+            assertTrue(f.runtime.start(existingBinaryPath(), TEST_TUN_FD, workingDir, TEST_CIDR, TARGET))
+            f.bridge.gate(0).awaitReached()
+            val startJobs = f.asyncJobs()
+
+            f.runtime.stop()
+            assertEquals(ShadowsocksRuntimePhase.STOPPED, f.runtime.status.value.phase)
+
+            f.bridge.gate(0).release(lateResult)
+            f.join(startJobs)
+
+            assertEquals("$lateResult", ShadowsocksRuntimeStatus.IDLE, f.runtime.status.value)
+            assertEquals("stop() alone tears down - the stale completion must not run a second teardown", 1, f.protectBridge.stopCalls)
+            assertTrue(configFilesIn(workingDir).isEmpty())
+        }
+    }
+
+    // Test B/C - a stale FD_SENT completion must not confirm (RUNNING) the NEXT start, nor delete its config before sslocal read it.
+    @Test
+    fun `a stale FD_SENT completion from a stopped start cannot publish RUNNING for the next start`() {
+        val f = RaceFixture()
+        val workingDir = tempWorkingDir()
+        val binary = existingBinaryPath()
+        assertTrue(f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET))
+        f.bridge.gate(0).awaitReached()
+        val firstStartJobs = f.asyncJobs()
+        f.runtime.stop()
+        assertTrue(f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET))
+        f.bridge.gate(1).awaitReached()
+
+        f.bridge.gate(0).release(ShadowsocksTunFdBridgeState.FD_SENT)
+        f.join(firstStartJobs)
+
+        assertEquals(ShadowsocksRuntimePhase.STARTING, f.runtime.status.value.phase)
+        assertEquals("the second start's config must survive until ITS handoff confirms", 1, configFilesIn(workingDir).size)
+
+        // Test C - the new start is not blocked by the old generation and completes normally.
+        val secondStartJobs = f.asyncJobs()
+        f.bridge.gate(1).release(ShadowsocksTunFdBridgeState.FD_SENT)
+        f.join(secondStartJobs)
+        assertEquals(ShadowsocksRuntimePhase.RUNNING, f.runtime.status.value.phase)
+        assertTrue(configFilesIn(workingDir).isEmpty())
+    }
+
+    @Test
+    fun `a stale FAILED completion from a stopped start cannot tear down the next start`() {
+        val f = RaceFixture()
+        val workingDir = tempWorkingDir()
+        val binary = existingBinaryPath()
+        f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET)
+        f.bridge.gate(0).awaitReached()
+        val firstStartJobs = f.asyncJobs()
+        f.runtime.stop()
+        f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET)
+        f.bridge.gate(1).awaitReached()
+
+        f.bridge.gate(0).release(ShadowsocksTunFdBridgeState.FAILED)
+        f.join(firstStartJobs)
+
+        assertEquals(ShadowsocksRuntimeStatus(ShadowsocksRuntimePhase.STARTING), f.runtime.status.value)
+        assertFalse("the second start's process must not be stopped by a stale completion", f.processes[1].stopRequested)
+        assertEquals(1, f.protectBridge.stopCalls)
+
+        val secondStartJobs = f.asyncJobs()
+        f.bridge.gate(1).release(ShadowsocksTunFdBridgeState.FD_SENT)
+        f.join(secondStartJobs)
+        assertEquals(ShadowsocksRuntimePhase.RUNNING, f.runtime.status.value.phase)
+    }
+
+    @Test
+    fun `a stale process-exit callback from a stopped start cannot fail the next start`() {
+        val f = RaceFixture()
+        val workingDir = tempWorkingDir()
+        val binary = existingBinaryPath()
+        f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET)
+        f.bridge.gate(0).awaitReached()
+        val firstStartJobs = f.asyncJobs()
+        f.runtime.stop()
+        f.bridge.gate(0).release(ShadowsocksTunFdBridgeState.FD_SENT)
+        f.join(firstStartJobs)
+        f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET)
+        f.bridge.gate(1).awaitReached()
+        val secondStartJobs = f.asyncJobs()
+        f.bridge.gate(1).release(ShadowsocksTunFdBridgeState.FD_SENT)
+        f.join(secondStartJobs)
+        assertEquals(ShadowsocksRuntimePhase.RUNNING, f.runtime.status.value.phase)
+
+        f.processes[0].simulateUnexpectedExit(143) // the process stop() terminated, reporting its exit late
+
+        assertEquals(ShadowsocksRuntimeStatus(ShadowsocksRuntimePhase.RUNNING), f.runtime.status.value)
+        assertFalse(f.processes[1].stopRequested)
+
+        f.processes[1].simulateUnexpectedExit(1) // the CURRENT process dying is still reported
+        assertEquals(ShadowsocksRuntimePhase.FAILED, f.runtime.status.value.phase)
+        assertTrue(f.runtime.status.value.lastError is ShadowsocksRuntimeError.ProcessExitedUnexpectedly)
+    }
+
+    // Test E - stop() issued while start() is still inside its synchronous part (spawning sslocal).
+    @Test
+    fun `stop issued while start is still spawning tears the spawned process down after start finishes`() {
+        val launchReached = java.util.concurrent.CountDownLatch(1)
+        val launchRelease = java.util.concurrent.CountDownLatch(1)
+        val process = FakeShadowsocksSpawnedProcess()
+        val launcher = FakeShadowsocksProcessLauncher(processFactory = {
+            launchReached.countDown()
+            check(launchRelease.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            process
+        })
+        val asyncScope = CoroutineScope(SupervisorJob())
+        val protectBridge = FakeShadowsocksVpnProtectBridge()
+        val runtime = ShadowsocksRuntime(launcher, FakeShadowsocksTunFdBridge(), protectBridge, FakeShadowsocksVpnProtector(), asyncScope, ioDispatcher = Dispatchers.IO)
+        val workingDir = tempWorkingDir()
+        val binary = existingBinaryPath()
+
+        val starter = kotlin.concurrent.thread { runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET) }
+        check(launchReached.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        val stopper = kotlin.concurrent.thread { runtime.stop() }
+        // Deterministic hand-over point: stop() has either run to completion
+        // (the pre-fix behavior) or is parked waiting for start() to leave its
+        // critical section. Both are stable states, not a timing guess.
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (stopper.state != Thread.State.TERMINATED && stopper.state != Thread.State.BLOCKED) {
+            check(System.nanoTime() < deadline) { "stop() neither finished nor blocked" }
+            Thread.onSpinWait()
+        }
+        launchRelease.countDown()
+        starter.join()
+        stopper.join()
+        runBlocking { asyncScope.coroutineContext.job.children.toList().joinAll() }
+
+        assertEquals(ShadowsocksRuntimeStatus.IDLE, runtime.status.value)
+        assertTrue("the process spawned by the interrupted start must be terminated", process.stopRequested)
+        assertEquals(1, protectBridge.stopCalls)
+        assertTrue("no plaintext config may outlive stop()", configFilesIn(workingDir).isEmpty())
+    }
+
+    // Test D - start -> start while the first is still STARTING.
+    @Test
+    fun `a second start while STARTING is rejected and does not disturb the first`() {
+        val f = RaceFixture()
+        val workingDir = tempWorkingDir()
+        val binary = existingBinaryPath()
+        assertTrue(f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET))
+        f.bridge.gate(0).awaitReached()
+
+        assertFalse(f.runtime.start(binary, TEST_TUN_FD, workingDir, TEST_CIDR, TARGET))
+        assertEquals(1, f.launcher.launchCount)
+        assertEquals(ShadowsocksRuntimePhase.STARTING, f.runtime.status.value.phase)
+
+        val jobs = f.asyncJobs()
+        f.bridge.gate(0).release(ShadowsocksTunFdBridgeState.FD_SENT)
+        f.join(jobs)
+        assertEquals(ShadowsocksRuntimePhase.RUNNING, f.runtime.status.value.phase)
+        assertNull(f.runtime.status.value.lastError)
     }
 }
