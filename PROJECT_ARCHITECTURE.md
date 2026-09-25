@@ -2386,6 +2386,25 @@ gateway (real handshake, real bidirectional data plane, distinct exit IP,
 DNS/IPv6 invariants held, managed identity/state completely unaffected - see
 `docs/ROADMAP.md`'s B22 row for the full evidence).
 
+## Adaptive network layer (B-WL, 2026-09-25) - invariants
+
+- `RestrictionClassifier` stays the single classification authority. Transport
+  behavior enters only via optional `RestrictionEvidence.transportObservations`
+  (`TransportAttemptObservation`: field-closed, opaque `destinationKey`, no
+  host/IP/UUID/key). Empty list = previous behavior exactly.
+- `TransportBehaviorAnalyzer` never uses a byte threshold; early drop is
+  connect + handshake + payload + stall-while-sending + no RST. New classes are
+  `POSSIBLE_EARLY_DROP` and `POSSIBLE_FULL_SHUTDOWN` (always `POSSIBLE_`).
+  Confidence is B40's qualitative `RestrictionEvidenceQuality`, not a number.
+- `PathScorer` restriction tier keeps rank in [-1, 1]; transport preferences are
+  derived only from registry `TransportCapabilities`
+  (`usesUdp`/`usesTcp`/`suitableForRestrictiveNetworks`), never from a
+  `TransportKind` list. History/cooldown still outrank it.
+- `TrafficProgressMonitor` is pure and not yet wired; B33 remote confirmation
+  and the relay watchdog remain the live post-connect gates.
+- `XrayVlessRealityXhttpConfig` / server `RealityXhttpServerConfig` exist but are
+  not registered, provisioned or deployed.
+
 ## Production vs debug boundary
 
 - `XrayDiagnosticsActivity` (and any future manual/debug provisioning helper) lives in
