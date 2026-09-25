@@ -67,6 +67,20 @@ class ShadowsocksVpnService : VpnService() {
     /** Test seam - same reasoning as [credentialRepositoryFactory] above: lets a test run [teardown]'s dispatch synchronously (e.g. Dispatchers.Unconfined) instead of waiting on a real background dispatcher. Production default unchanged. */
     internal var teardownDispatcher: CoroutineDispatcher = Dispatchers.Default
 
+    /** Test seams - let a JVM test drive the start path (dispatch, binary lookup, TUN establish, runtime construction) with fakes. Production defaults unchanged. */
+    internal var workDispatcher: CoroutineDispatcher = Dispatchers.Default
+    internal var binaryResolver: () -> ShadowsocksNativeBinaryResolver.Result = { ShadowsocksNativeBinaryResolver.resolve(applicationInfo.nativeLibraryDir) }
+    internal var tunEstablisher: () -> ParcelFileDescriptor? = { establishInterface() }
+    internal var runtimeFactory: (ShadowsocksVpnProtector) -> ShadowsocksRuntime = { protector ->
+        ShadowsocksRuntime(
+            launcher = RealShadowsocksProcessLauncher(),
+            tunFdBridge = RealShadowsocksTunFdBridge(),
+            protectBridge = RealShadowsocksVpnProtectBridge(),
+            protector = protector,
+            scope = serviceScope,
+        )
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -129,7 +143,7 @@ class ShadowsocksVpnService : VpnService() {
         // port, never the AWG peer port this same endpoint also advertises.
         Log.i(TAG, "starting: endpointId=${endpointId.value} host=$host port=$port method=$expectedMethod")
 
-        serviceScope.launch {
+        serviceScope.launch(workDispatcher) {
             // Credential absent/corrupted -> fail closed (Phase 7/16) -
             // never a silently-empty/default key reaching sslocal.
             val repository = credentialRepositoryFactory(applicationContext, endpointId)
@@ -160,8 +174,7 @@ class ShadowsocksVpnService : VpnService() {
                 return@launch
             }
 
-            val resolution = ShadowsocksNativeBinaryResolver.resolve(applicationInfo.nativeLibraryDir)
-            val binaryPath = when (resolution) {
+            val binaryPath = when (val resolution = binaryResolver()) {
                 is ShadowsocksNativeBinaryResolver.Result.Found -> resolution.file
                 is ShadowsocksNativeBinaryResolver.Result.Missing -> {
                     Log.e(TAG, "refusing to start: binary unavailable: ${resolution.reason}")
@@ -171,7 +184,7 @@ class ShadowsocksVpnService : VpnService() {
                 }
             }
 
-            val established = establishInterface()
+            val established = tunEstablisher()
             if (established == null) {
                 Log.e(TAG, "refusing to start: VpnService.Builder.establish() returned null")
                 publish(sessionId, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.TunEstablishFailed("establish() returned null"))
@@ -180,16 +193,10 @@ class ShadowsocksVpnService : VpnService() {
             }
             tunInterface = established
 
-            val newRuntime = ShadowsocksRuntime(
-                launcher = RealShadowsocksProcessLauncher(),
-                tunFdBridge = RealShadowsocksTunFdBridge(),
-                protectBridge = RealShadowsocksVpnProtectBridge(),
-                protector = ShadowsocksVpnProtector { fd -> protect(fd) },
-                scope = serviceScope,
-            )
+            val newRuntime = runtimeFactory(ShadowsocksVpnProtector { fd -> protect(fd) })
             runtime = newRuntime
 
-            statusCollectionJob = serviceScope.launch collector@{
+            statusCollectionJob = serviceScope.launch(workDispatcher) collector@{
                 newRuntime.status.collect { status ->
                     publish(sessionId, status.phase, status.lastError)
                     if (status.phase == ShadowsocksRuntimePhase.FAILED) {
