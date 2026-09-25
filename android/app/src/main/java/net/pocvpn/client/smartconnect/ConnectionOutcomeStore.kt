@@ -69,7 +69,8 @@ class FileConnectionOutcomeStore(
 
     private fun readOutcomeOrNull(input: DataInputStream): ConnectionOutcome? {
         val transportOrdinal = input.readInt()
-        val transport = TransportKind.entries.getOrNull(transportOrdinal) ?: return null
+        // B-WL-R6 - stable TransportKind wire id (== historical ordinal for 0-6).
+        val transport = TransportKind.fromWireId(transportOrdinal) ?: return null
         val gatewayId = readString(input)
         val resultOrdinal = input.readInt()
         val result = ConnectionOutcomeResult.entries.getOrNull(resultOrdinal) ?: return null
@@ -96,7 +97,7 @@ class FileConnectionOutcomeStore(
                 out.writeInt(FORMAT_VERSION)
                 out.writeInt(outcomes.size)
                 outcomes.forEach { outcome ->
-                    out.writeInt(outcome.transport.ordinal)
+                    out.writeInt(outcome.transport.wireId)
                     writeString(out, outcome.gatewayId)
                     out.writeInt(outcome.result.ordinal)
                     out.writeBoolean(outcome.handshakeDurationMs != null)

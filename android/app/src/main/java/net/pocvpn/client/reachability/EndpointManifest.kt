@@ -99,7 +99,8 @@ object ManifestCanonicalizer {
         writeString(d, e.provider)
         d.writeBoolean(e.asn != null)
         d.writeInt(e.asn ?: 0)
-        val transportsSorted = e.transports.sortedBy { it.kind.ordinal }
+        // Sorted by the STABLE wire id (identical to the historical ordinal order for ids 0-6).
+        val transportsSorted = e.transports.sortedBy { it.kind.wireId }
         d.writeInt(transportsSorted.size)
         transportsSorted.forEach { writeBinding(d, it) }
         d.writeBoolean(e.relayTo != null)
@@ -144,7 +145,7 @@ object ManifestCanonicalizer {
     }
 
     private fun writeBinding(d: java.io.DataOutputStream, b: EndpointTransportBinding) {
-        d.writeInt(b.kind.ordinal)
+        d.writeInt(b.kind.wireId)
         writeString(d, b.host)
         d.writeInt(b.port)
         val metadataSorted = b.metadata.entries.sortedBy { it.key }
@@ -154,8 +155,11 @@ object ManifestCanonicalizer {
 
     private fun readBinding(d: java.io.DataInputStream): EndpointTransportBinding {
         val kindOrdinal = d.readInt()
-        val kind = net.pocvpn.client.transport.TransportKind.entries.getOrNull(kindOrdinal)
-            ?: throw IllegalArgumentException("unknown TransportKind ordinal $kindOrdinal")
+        // B-WL-R6 - explicit stable wire id; an id this build does not know
+        // still rejects the WHOLE manifest (fail closed) - see
+        // docs/B_WL_R6_MANIFEST_TRANSPORT_KIND_ROLLOUT.md.
+        val kind = net.pocvpn.client.transport.TransportKind.fromWireId(kindOrdinal)
+            ?: throw IllegalArgumentException("unknown TransportKind wire id $kindOrdinal")
         val host = readString(d)
         val port = d.readInt()
         val metadataCount = d.readInt()

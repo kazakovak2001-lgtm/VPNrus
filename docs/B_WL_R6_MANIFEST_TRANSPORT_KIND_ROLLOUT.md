@@ -1,10 +1,10 @@
 # B-WL-R6 - Adding a TransportKind to the signed manifest: compatibility analysis and rollout proposal
 
-Status: analysis + proposal only (2026-09-25). Nothing described in
-"Proposal" is implemented. `XRAY_REALITY_XHTTP` must not appear in any
-published manifest until the proposal's gates are met.
+Status (2026-09-25): proposal step 1 (stable wire IDs) is IMPLEMENTED and
+tested (see section 5). Steps 2-5 are NOT implemented. `XRAY_REALITY_XHTTP`
+must not appear in any published manifest until the proposal's gates are met.
 
-## 1. How the codec works today (verified in source)
+## 1. How the codec worked before step 1 (verified in source at a2eb56f)
 
 - Container: `SignedManifestCodec.decode` reads
   `[format=1][len][canonical bytes][len][signature]` and immediately calls
@@ -77,8 +77,9 @@ published manifest until the proposal's gates are met.
 
 ## 3. Proposal (ordered; each step independently shippable)
 
-1. **Stable wire IDs (client + signer).** Add an explicit wire-ID table and
-   a test that pins every existing ID. No byte changes. Pure refactor.
+1. **Stable wire IDs (client).** DONE - see section 5. The Python signer
+   already takes explicit integers (`kindOrdinal` in the source JSON), so it
+   needed no change; those integers are the wire IDs in section 5.
 2. **Tolerant schema-2 decoder (client).**
    - Parse `FORMAT_VERSION` 1 and 2.
    - For 2: an unknown wire ID becomes an ignored binding, and the signature is
@@ -113,3 +114,77 @@ published manifest until the proposal's gates are met.
   from `AutoGatewaySelector`, and makes `VpnController` throw before
   `connect()`.
 - The kind is appended last in the enum, so every existing wire ID is unchanged.
+
+## 5. Stable wire IDs (implemented, step 1)
+
+**Why ordinal was not a stable protocol ID.** Kotlin's `ordinal` is the
+declaration position. The codec wrote `kind.ordinal` and also sorted bindings
+by it inside the signed canonical bytes. Two unrelated changes would therefore
+silently change what is signed: inserting a constant anywhere but the end, or
+reordering constants. Adding a constant at the end was also a breaking change
+for older clients (section 2).
+
+**Now.** `TransportKind(val wireId: Int)`.
+- The ID is a mandatory constructor argument, so a kind without an explicit ID
+  does not compile.
+- `TransportKind.fromWireId(id)` returns null for an unknown ID.
+- Every place a kind is signed or persisted uses the wire ID:
+  - `ManifestCanonicalizer`: write, read, and binding sort order;
+  - `PathHistoryStore`;
+  - `ConnectionOutcomeStore`.
+- `ordinal` remains only in in-memory candidate ordering in
+  `AutoGatewaySelector`, which never leaves the process.
+
+| TransportKind | Historical ordinal | Stable wire ID | Status |
+|---|---|---|---|
+| AMNEZIA_WG | 0 | 0 | in production manifests v1-v4 and bootstrap |
+| XRAY_REALITY | 1 | 1 | in production manifests v1-v4 and bootstrap |
+| QUIC | 2 | 2 | reserved; never published |
+| TLS_TCP | 3 | 3 | in production manifests v1-v4 and bootstrap |
+| XRAY_XHTTP | 4 | 4 | since manifest v3 (breaks clients older than B35) |
+| SHADOWSOCKS_2022 | 5 | 5 | since manifest v4 (breaks clients older than `d3ce844`) |
+| XRAY_REALITY_XHTTP | 6 (new) | 6 | **reserved; must never appear in a schema-1 manifest** |
+
+IDs are frozen. Never change, remove or reuse one; a new kind takes the next
+unused integer.
+
+**Compatibility proof.** `ManifestWireCompatibilityTest` ran green BEFORE the
+change and again AFTER it, against the real signed production files
+`gateway/tools/endpoint-manifest-*.bin` v1-v4 (SHA-256 pinned in the test; the
+v4 hash matches the deployed file) and the embedded bootstrap manifest. It
+checks:
+- decode followed by re-encode is byte-identical, for both the container and
+  the canonical bytes;
+- every Ed25519 signature still verifies against the embedded trust anchors;
+- ID 6 encodes and decodes on this client;
+- an unknown ID (7, 99, -1, `Int.MAX_VALUE`) still rejects the whole manifest.
+
+**Regression guard.** `TransportKindWireIdTest`:
+- pins the table above;
+- requires IDs to be unique and non-negative;
+- checks the `fromWireId` round-trip;
+- scans the three codecs for any `kind.ordinal`, `transport.ordinal` or
+  `TransportKind.entries`/`values()` indexing.
+
+A mutation run (reintroducing `kind.ordinal` into the manifest writer) was
+caught by this test.
+
+**What this does NOT solve.** A stable ID protects future changes only. A
+client that does not know an ID still rejects the whole manifest; that is
+schema 2's job (section 6).
+
+## 6. Schema 2 (design note, NOT implemented)
+
+- It is a new canonical `FORMAT_VERSION = 2` served on a new path; schema 1
+  and its path stay unchanged.
+- Bindings are encoded by explicit wire ID (section 5).
+- The tolerant decoder keeps a binding with an unknown wire ID as opaque and
+  ignores it for selection. It keeps rejecting every other malformation.
+- The signature is verified over the exact received canonical bytes, never a
+  re-encoding, because a re-encoding cannot reproduce ignored bindings.
+- Schema 1 must contain only kinds that every supported target client
+  understands.
+- The manifest version is monotonic within each channel. The rollback guard
+  must never compare versions across channels.
+- No production schema-2 manifest exists or is planned before the owner
+  approves it.

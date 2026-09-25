@@ -2408,12 +2408,21 @@ DNS/IPv6 invariants held, managed identity/state completely unaffected - see
   `TransportCapabilities` (`usesUdp`/`usesTcp`/`suitableForRestrictiveNetworks`),
   never from a `TransportKind` list. The probe-derived
   `POSSIBLE_UDP_OR_AWG_FILTERING` (not UDP-specific: last outcome of ANY
-  transport) keeps rank 0. History/cooldown still outrank the tier. Net effect
-  today: live Auto ranking is unchanged until observations are wired.
-- `TrafficProgressMonitor` is pure and not yet wired; B33 remote confirmation
-  and the relay watchdog remain the live post-connect gates.
-- `XrayVlessRealityXhttpConfig` / server `RealityXhttpServerConfig` exist but are
-  not registered, provisioned or deployed.
+  transport) keeps rank 0. History/cooldown still outrank the tier.
+- Runtime (B-WL-R1..R4): `VpnController` records observations into a
+  network-scoped in-memory `TransportObservationStore`; `MainViewModel` feeds
+  them to the classifier. Xray outbound counters feed `TrafficProgressMonitor`
+  inside the EXISTING B33 watchdog; a stall only triggers the Xray-native
+  confirmation round trip, teardown still needs two failed round trips.
+- `XRAY_REALITY_XHTTP` (B-WL-R6) is registered but fail-closed: AVAILABLE only
+  with the device's REALITY profile AND a trusted signed binding carrying valid
+  XHTTP path/mode. No published or bootstrap manifest carries it.
+- `TransportKind.wireId` (stable, explicit, frozen: 0-5 = historical ordinals,
+  6 = XRAY_REALITY_XHTTP) is the ONLY value ever signed or persisted
+  (manifest codec incl. binding sort order, PathHistoryStore,
+  ConnectionOutcomeStore) - never `ordinal`. An unknown id still rejects the
+  whole manifest; a new kind must never be published in the schema-1 manifest
+  (see docs/B_WL_R6_MANIFEST_TRANSPORT_KIND_ROLLOUT.md).
 
 ## Production vs debug boundary
 

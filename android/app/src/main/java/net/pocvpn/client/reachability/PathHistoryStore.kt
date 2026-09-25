@@ -79,13 +79,13 @@ class FilePathHistoryStore(
 
     override fun get(networkFingerprint: String, pathId: String, transport: TransportKind): PathHistoryEntry? {
         if (!validKey(networkFingerprint, pathId)) return null
-        return cached[Key(networkFingerprint, pathId, transport.ordinal)]
+        return cached[Key(networkFingerprint, pathId, transport.wireId)]
     }
 
     override fun record(networkFingerprint: String, pathId: String, transport: TransportKind, success: Boolean, nowEpochMillis: Long) {
         if (!validKey(networkFingerprint, pathId)) return
         synchronized(lock) {
-            val key = Key(networkFingerprint, pathId, transport.ordinal)
+            val key = Key(networkFingerprint, pathId, transport.wireId)
             val existing = cached[key]
             val updated = PathHistoryEntry(
                 successCount = ((existing?.successCount ?: 0) + if (success) 1 else 0).coerceAtMost(MAX_COUNTER),
@@ -151,7 +151,8 @@ class FilePathHistoryStore(
         val fingerprint = readString(input)
         val pathId = readString(input)
         val transportOrdinal = input.readInt()
-        if (TransportKind.entries.getOrNull(transportOrdinal) == null) return null
+        // B-WL-R6 - persisted as the stable wire id (== historical ordinal for 0-6: existing files read unchanged).
+        if (TransportKind.fromWireId(transportOrdinal) == null) return null
         val successCount = input.readInt()
         val failureCount = input.readInt()
         val lastOutcomeEpochMillis = input.readLong()
