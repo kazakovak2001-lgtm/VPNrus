@@ -81,8 +81,13 @@ class ShadowsocksVpnService : VpnService() {
      * - VpnService.Builder.establish() (one IPC call);
      * - runtime.start()'s synchronous part (file I/O, protect bind, spawn),
      *   which is milliseconds;
-     * - ShadowsocksRuntime.stop()'s bounded process wait, which teardown
-     *   already did on the same threads before this change.
+     * - ShadowsocksRuntime.stop()'s bounded process wait (up to ~4 s).
+     *
+     * The main thread also takes this lock: ACTION_STOP/ACTION_START
+     * bookkeeping, onRevoke, onDestroy. It can therefore wait behind a
+     * teardown or superseding commit that another thread is running, up to
+     * that ~4 s bound plus a commit. Only overlapping lifecycle commands
+     * cause this; VpnController serializes disconnect -> await -> connect.
      *
      * Never under the lock: credential loading. Nothing the runtime calls
      * back into takes this lock synchronously (status reaches the collector
@@ -378,10 +383,18 @@ class ShadowsocksVpnService : VpnService() {
         if (previous != null && publishStoppedFor != null) publish(publishStoppedFor, ShadowsocksRuntimePhase.STOPPED)
     }
 
-    /** Early start failure: reported and the service stopped only if this attempt is still current - a stale attempt must not stop a newer session (I3). */
+    /**
+     * Early start failure. It is reported, and the service stopped, only if
+     * this attempt is still current: a stale attempt must not stop a newer
+     * session (I3). A current attempt has superseded any older session
+     * (including one whose STOP it made stale), so it releases that
+     * session here. Otherwise the old sslocal and TUN would outlive both
+     * the stop request and the failed start (I2).
+     */
     private fun failAttempt(generation: Long, sessionId: Long, error: ShadowsocksRuntimeError) {
         synchronized(lifecycleLock) {
             if (!lifecycle.isCurrent(generation)) return
+            releaseSessionLocked(publishStoppedFor = runtimeSessionId)
             publish(sessionId, ShadowsocksRuntimePhase.FAILED, error)
         }
         stopSelf()

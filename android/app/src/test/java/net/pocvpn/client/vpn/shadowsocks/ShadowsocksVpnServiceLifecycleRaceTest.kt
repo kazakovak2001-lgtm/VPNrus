@@ -346,6 +346,55 @@ class ShadowsocksVpnServiceLifecycleRaceTest {
         assertEquals(ShadowsocksServiceStatus(b, ShadowsocksRuntimePhase.RUNNING), ShadowsocksVpnService.status.value)
     }
 
+    @Test
+    fun `a stop superseded by a start that then fails early still releases the old session`() {
+        val h = harness()
+        val held = HeldExecutor()
+        h.service.teardownDispatcher = held.asCoroutineDispatcher()
+        val a = session()
+        val b = session()
+        h.start(a)
+        awaitStatus(a, ShadowsocksRuntimePhase.RUNNING)
+
+        h.actionStop() // A's teardown is queued; B's request makes it stale
+        h.service.credentialRepositoryFactory = { _, _ -> absentCredentialRepository() }
+        h.start(b)
+        awaitStatus(b, ShadowsocksRuntimePhase.FAILED)
+        held.runAll()
+        h.drain()
+
+        assertTrue("A must not outlive both the stop and the failed start", h.processes.single().stopRequested)
+        h.assertOwnership(owned = 0)
+        assertEquals(ShadowsocksServiceStatus(b, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.CredentialAbsent("frankfurt")), ShadowsocksVpnService.status.value)
+    }
+
+    @Test
+    fun `a committed but still STARTING session is released when the superseding start cannot establish a TUN`() {
+        val h = harness()
+        val a = session()
+        val b = session()
+        h.handoffGates.gate(0)
+        h.start(a)
+        h.handoffGates.gate(0).awaitReached() // A committed and spawned; STARTING
+
+        h.service.tunEstablisher = { null }
+        h.start(b)
+        awaitStatus(b, ShadowsocksRuntimePhase.FAILED)
+        h.handoffGates.gate(0).release()
+        h.drain()
+
+        assertTrue(h.processes.single().stopRequested)
+        h.assertOwnership(owned = 0)
+        assertEquals(ShadowsocksServiceStatus(b, ShadowsocksRuntimePhase.FAILED, ShadowsocksRuntimeError.TunEstablishFailed("establish() returned null")), ShadowsocksVpnService.status.value)
+    }
+
+    private fun absentCredentialRepository() = object : Shadowsocks2022CredentialRepository {
+        override suspend fun getCredential(): Shadowsocks2022CredentialGetResult = Shadowsocks2022CredentialGetResult.Absent
+        override suspend fun storeCredential(credential: Shadowsocks2022Credential) = Unit
+        override suspend fun deleteCredential() = Unit
+        override suspend fun credentialExists(): Boolean = false
+    }
+
     // --- lifecycle after the fix ------------------------------------------
 
     @Test
