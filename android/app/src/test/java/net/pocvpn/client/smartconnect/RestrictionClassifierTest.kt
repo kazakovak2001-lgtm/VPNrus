@@ -191,7 +191,7 @@ class RestrictionClassifierTest {
             "networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable", "diverseInternetReachable",
             "gatewayProbeEpochMillis", "diverseProbeEpochMillis",
             // B-WL1 - a list of TransportAttemptObservation, itself field-closed (see TransportBehaviorAnalyzerTest).
-            "transportObservations",
+            "transportObservations", "referenceReachable", "referenceProbeEpochMillis",
         )
         assertEquals(expected, fieldNames)
     }

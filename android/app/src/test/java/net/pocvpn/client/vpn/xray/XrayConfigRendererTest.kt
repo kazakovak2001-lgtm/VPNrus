@@ -94,6 +94,8 @@ class XrayConfigRendererTest {
     fun `REALITY rendering is structurally unchanged by the B8O1 TLS-rendering slice`() {
         val expected = JSONObject(
             "{\"log\":{\"loglevel\":\"warning\"}," +
+                // B-WL-R3 - outbound traffic counters, exact shape.
+                "\"stats\":{},\"policy\":{\"system\":{\"statsOutboundUplink\":true,\"statsOutboundDownlink\":true}}," +
                 "\"inbounds\":[{\"tag\":\"nova-tun-in\",\"protocol\":\"tun\",\"port\":0," +
                 "\"settings\":{\"name\":\"nova-xray-tun\",\"desc\":\"Nova\",\"mtu\":1420}}]," +
                 "\"outbounds\":[{\"tag\":\"nova-vless-reality-out\",\"protocol\":\"vless\"," +

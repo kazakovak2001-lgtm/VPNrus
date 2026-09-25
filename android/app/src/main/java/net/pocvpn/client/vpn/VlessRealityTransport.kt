@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -15,6 +16,7 @@ import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
+import net.pocvpn.client.smartconnect.TrafficProgressSnapshot
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
@@ -118,6 +120,7 @@ class VlessRealityTransport(
         // (cancel() takes effect at the next suspension point, not
         // necessarily synchronously).
         val sessionId = nextSessionId.incrementAndGet()
+        currentSessionId = sessionId
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -177,6 +180,12 @@ class VlessRealityTransport(
         }
     }
 
+    // B-WL-R3 - the session this transport most recently started; only that
+    // session's traffic-progress reports are ever surfaced.
+    @Volatile private var currentSessionId: Long? = null
+
+    override fun observeTrafficProgress(): Flow<TrafficProgressSnapshot> = xrayTrafficProgressFor { currentSessionId }
+
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 
     private companion object {
@@ -193,6 +202,14 @@ class VlessRealityTransport(
  * connect()'s collector) so it is unit-testable on the plain JVM with no
  * Context, mirroring isFreshHandshake's own reasoning in VpnController.kt.
  */
+/**
+ * B-WL-R3 - traffic-progress snapshots published by NovaXrayVpnService's
+ * session watchdog for exactly the session [sessionId] returns (same
+ * session-scoping rule as [xrayTransportStateFor]).
+ */
+internal fun xrayTrafficProgressFor(sessionId: () -> Long?): Flow<TrafficProgressSnapshot> =
+    XrayRuntimeState.trafficProgress.mapNotNull { progress -> progress?.takeIf { it.sessionId == sessionId() }?.report }
+
 internal fun xrayTransportStateFor(event: XrayRuntimeEvent?, sessionId: Long): TransportState? {
     if (event == null || event.sessionId != sessionId) return null
     return when (event) {

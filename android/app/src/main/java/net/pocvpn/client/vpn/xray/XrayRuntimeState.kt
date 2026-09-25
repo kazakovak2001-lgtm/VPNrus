@@ -51,6 +51,25 @@ object XrayRuntimeState {
         _events.value = event
     }
 
+    /**
+     * B-WL-R3 - latest traffic-progress report of an Xray session, tagged
+     * with its session id so a transport only ever reads its OWN session's
+     * numbers (same process-local, session-scoped pattern as [events]).
+     */
+    data class TrafficProgress(val sessionId: Long, val report: net.pocvpn.client.smartconnect.TrafficProgressSnapshot)
+
+    private val _trafficProgress = MutableStateFlow<TrafficProgress?>(null)
+    val trafficProgress: StateFlow<TrafficProgress?> = _trafficProgress
+
+    fun publishTrafficProgress(sessionId: Long, report: net.pocvpn.client.smartconnect.TrafficProgressSnapshot) {
+        _trafficProgress.value = TrafficProgress(sessionId, report)
+    }
+
+    /** Called when a NEW session starts: a previous session's numbers must never be read as the new one's (transports' session ids are per-class counters). */
+    fun clearTrafficProgress() {
+        _trafficProgress.value = null
+    }
+
     /** The watchdog calls back only after tearing down a previously Connected relay. */
     internal fun publishRelayHealthLost(sessionId: Long, kind: TransportKind) {
         publish(

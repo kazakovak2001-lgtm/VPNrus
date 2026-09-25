@@ -28,9 +28,12 @@ class FakeVpnTransport(
     // ONLY available transport is something else (e.g. XRAY_REALITY), to
     // prove Smart Connect's AWG-only preflight blocks a non-AWG selection.
     override val kind: TransportKind = TransportKind.AMNEZIA_WG,
+    // B-WL-R1 - additive, defaults to the previous fixed value so every
+    // existing call site is unaffected; lets a test model a TCP-only (Xray)
+    // transport whose attempts are recorded as TCP observations.
+    override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg(),
 ) : VpnTransport {
     override val name: String = "fake"
-    override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
     override val underlyingNetworkRecovery: UnderlyingNetworkRecovery =
         if (kind == TransportKind.AMNEZIA_WG) UnderlyingNetworkRecovery.IN_PLACE else UnderlyingNetworkRecovery.RESTART_SESSION
 
@@ -79,6 +82,10 @@ class FakeVpnTransport(
     fun forceState(state: TransportState) {
         stateFlow.value = state
     }
+
+    // B-WL-R3 - lets a test emit post-connect traffic-progress snapshots.
+    val trafficProgress = kotlinx.coroutines.flow.MutableSharedFlow<net.pocvpn.client.smartconnect.TrafficProgressSnapshot>(extraBufferCapacity = 16)
+    override fun observeTrafficProgress(): Flow<net.pocvpn.client.smartconnect.TrafficProgressSnapshot> = trafficProgress
 
     override suspend fun stats(): TransportStats = TransportStats.Counters(
         bytesReceived = statsBytesReceived,

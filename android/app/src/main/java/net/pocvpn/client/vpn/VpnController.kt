@@ -24,6 +24,12 @@ import net.pocvpn.client.identity.XrayProfileRepositoryResolver
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryResolver
 import net.pocvpn.client.network.NetworkProfile
+import net.pocvpn.client.smartconnect.TrafficProgressSnapshot
+import net.pocvpn.client.smartconnect.TrafficProgressVerdict
+import net.pocvpn.client.smartconnect.TransportAttemptObservation
+import net.pocvpn.client.smartconnect.TransportAttemptObservations
+import net.pocvpn.client.smartconnect.TransportAttemptProtocol
+import net.pocvpn.client.smartconnect.TransportObservationStore
 import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
 import net.pocvpn.client.reachability.CoarseNetworkSignals
 import net.pocvpn.client.reachability.EndpointId
@@ -257,6 +263,13 @@ class VpnController(
     // own docs); registry-level AVAILABLE/NOT_IMPLEMENTED is the real gate on
     // whether Smart Connect ever resolves this kind in the first place.
     private val shadowsocksTransport: VpnTransport? = null,
+    // B-WL-R1 - optional, appended last (every existing positional/named
+    // call site is unaffected): where per-attempt behavior observations are
+    // kept for RestrictionClassifier. Null = nothing recorded, the exact
+    // pre-B-WL-R1 behavior.
+    private val transportObservationStore: TransportObservationStore? = null,
+    // B-WL-R1 - notified after each recorded observation (diagnostics only).
+    private val onTransportObservation: ((TransportAttemptObservation) -> Unit)? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -290,6 +303,10 @@ class VpnController(
         // build a TransportConfig.Shadowsocks (see buildTransportConfig's own
         // `when`) when a real ShadowsocksTransport was actually wired.
         if (shadowsocksTransport != null) add(TransportKind.SHADOWSOCKS_2022)
+        // B-WL-R6 - Direct-only: needs the Direct-mode REALITY profile
+        // resolver (its credentials) - a relay-only composition root never
+        // gains this kind.
+        if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY_XHTTP)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -301,6 +318,20 @@ class VpnController(
     val currentTransportKind: StateFlow<TransportKind?> = _currentTransportKind.asStateFlow()
 
     private val connectMutex = Mutex()
+
+    // B-WL-R3 - latest post-connect traffic-progress verdict of the CURRENT
+    // session (null = no session, or the transport emits no progress signal).
+    // Observational: VpnSessionHealth/Protected gating is unchanged (the B33
+    // remote confirmation remains the Connected gate); an unhealthy verdict
+    // reaches _state only through the transport's own existing teardown path.
+    private val _trafficProgress = MutableStateFlow<TrafficProgressVerdict?>(null)
+    val trafficProgress: StateFlow<TrafficProgressVerdict?> = _trafficProgress.asStateFlow()
+    private var trafficProgressJob: Job? = null
+
+    // B-WL-R1 - true between the start of a TCP-only (Xray) attempt and its
+    // first terminal state (Connected or Error), so exactly one attempt
+    // observation is recorded per attempt, never one per later state change.
+    @Volatile private var tcpAttemptAwaitingOutcome: Boolean = false
 
     private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
     val state: StateFlow<TransportState> = _state.asStateFlow()
@@ -517,12 +548,31 @@ class VpnController(
     private fun switchActiveTransport(newTransport: VpnTransport) {
         if (newTransport === activeTransport && activeObserverJob?.isActive == true) return
         activeObserverJob?.cancel()
+        trafficProgressJob?.cancel()
+        _trafficProgress.value = null
         activeTransport = newTransport
         hasTouchedTransport = false
+        trafficProgressJob = scope.launch {
+            var lastVerdict: TrafficProgressVerdict? = null
+            newTransport.observeTrafficProgress().collect { snapshot: TrafficProgressSnapshot ->
+                if (newTransport !== activeTransport || !hasTouchedTransport) return@collect
+                // One observation per verdict CHANGE, never one per sample.
+                if (snapshot.verdict == lastVerdict) return@collect
+                lastVerdict = snapshot.verdict
+                _trafficProgress.value = snapshot.verdict
+                if (_state.value is TransportState.Connected) {
+                    val protocol = protocolOf(newTransport) ?: return@collect
+                    TransportAttemptObservations.progress(
+                        pendingConnectEndpointId.value, protocol, snapshot, System.currentTimeMillis(),
+                    )?.let(::recordTransportObservation)
+                }
+            }
+        }
         activeObserverJob = scope.launch {
             newTransport.observeState().collect { transportState ->
                 if (!hasTouchedTransport) return@collect
                 if (newTransport !== activeTransport) return@collect
+                recordTcpAttemptOutcomeIfPending(newTransport, transportState)
                 // B33 - an Xray-kind transport's OWN async observeState()
                 // (never doConnectAttempt itself - that branch deliberately
                 // does not fabricate a stronger signal than the transport
@@ -545,6 +595,7 @@ class VpnController(
                     (
                         newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP ||
                             newTransport.kind == TransportKind.XRAY_XHTTP ||
+                            newTransport.kind == TransportKind.XRAY_REALITY_XHTTP ||
                             // B45B-4 - same reasoning: ShadowsocksTransport's own
                             // observeState() only reports Error after
                             // ShadowsocksVpnService's own real fail-closed checks
@@ -684,6 +735,8 @@ class VpnController(
             // never leak into this one's sessionHealth computation.
             pendingAttemptContext = resolved.attemptContext
             _relayStage.value = null
+            _trafficProgress.value = null
+            tcpAttemptAwaitingOutcome = false
             recomputeSessionHealth()
             userInitiatedDisconnect = false
             cancelReconnectLocked()
@@ -734,6 +787,8 @@ class VpnController(
             }
             userInitiatedDisconnect = true
             cancelReconnectLocked()
+            tcpAttemptAwaitingOutcome = false
+            _trafficProgress.value = null
             hasTouchedTransport = true
             activeTransport.disconnect()
             // B8H - the interface this policy was baked into is gone; the
@@ -972,6 +1027,7 @@ class VpnController(
                 // also visible to the catch branch's own outcome recording.
                 val attemptStartEpochMillis = System.currentTimeMillis()
                 return try {
+                    tcpAttemptAwaitingOutcome = kind != TransportKind.AMNEZIA_WG && protocolOf(activeTransport) == TransportAttemptProtocol.TCP
                     hasTouchedTransport = true
                     runCatching { onTransportAttemptStarting?.invoke(pendingConnectEndpointId, kind) }
                     activeTransport.connect(transportConfig)
@@ -992,6 +1048,7 @@ class VpnController(
                         // produced a real handshake.
                         if (awaitFreshHandshake(attemptStartEpochMillis)) {
                             recordCurrentStats()
+                            recordUdpHandshakeObservation(handshakeSucceeded = true)
                             setState(TransportState.Connected)
                             // B25 (task D fix) - see the catch block's own
                             // docs below for why a relayed attempt's outcome
@@ -1010,6 +1067,7 @@ class VpnController(
                             true
                         } else {
                             diagnostics.recordError(VpnError.HandshakeTimeout)
+                            recordUdpHandshakeObservation(handshakeSucceeded = false)
                             // Deliberately does NOT call transport.disconnect() -
                             // failover/kill-switch policy is out of scope for this
                             // slice (see class docs). The interface may still be
@@ -1057,6 +1115,8 @@ class VpnController(
                     }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
+                    // A local backend start failure is not network behavior - no observation.
+                    tcpAttemptAwaitingOutcome = false
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Backend failed to start"))
                     // B25 (task D fix) - a relayed attempt's outcome is
@@ -1219,6 +1279,7 @@ class VpnController(
                     )
                 }
             }
+            TransportKind.XRAY_REALITY_XHTTP -> buildRealityXhttpTransportConfig(routingMode)
             TransportKind.XRAY_XHTTP -> {
                 val context = pendingAttemptContext as? VpnAttemptContext.Relayed
                     ?: throw XrayProfileNotReadyException(
@@ -1361,6 +1422,117 @@ class VpnController(
      * this class. Called ONLY from real evidence (a completed connect()
      * attempt or an exhausted reconnect cycle) - never speculatively.
      */
+    /**
+     * B-WL-R6 - VLESS + REALITY + XHTTP for a Direct attempt, fail-closed at
+     * every step: Direct context only; the pinned manifest binding must be
+     * this kind and carry valid SIGNED XHTTP facts (path/mode); REALITY
+     * credentials (uuid, public key, short id, serverName, fingerprint) come
+     * from the SAME per-device provisioned profile XRAY_REALITY uses; the
+     * dial target is the binding's own host/port (never the RAW REALITY
+     * port); Vision flow is dropped for XHTTP and the result must pass
+     * validateXrayVlessRealityXhttpConfig (REALITY validator + path + no-flow
+     * rule). Any failure throws XrayProfileNotReadyException - never a silent
+     * fallback to another transport's settings.
+     */
+    private suspend fun buildRealityXhttpTransportConfig(routingMode: RoutingMode): TransportConfig.XrayRealityXhttp {
+        if (pendingAttemptContext is VpnAttemptContext.Relayed) {
+            throw XrayProfileNotReadyException("REALITY+XHTTP has no relay composition")
+        }
+        val binding = pendingConnectTransportBinding
+            ?: throw XrayProfileNotReadyException("no pinned REALITY+XHTTP transport binding for this attempt")
+        if (binding.kind != TransportKind.XRAY_REALITY_XHTTP) {
+            throw XrayProfileNotReadyException("pinned transport binding is ${binding.kind}, not XRAY_REALITY_XHTTP")
+        }
+        val signed = when (val result = binding.signedTransportProfile(pendingConnectEndpointId)) {
+            is net.pocvpn.client.reachability.SignedTransportProfileReadResult.Parsed ->
+                (result.profile as? net.pocvpn.client.reachability.SignedTransportProfile.RealityXhttp)?.profile
+            else -> null
+        } ?: throw XrayProfileNotReadyException("signed REALITY+XHTTP profile missing or invalid for endpoint ${pendingConnectEndpointId.value}")
+        val resolver = xrayProfileRepositoryResolver ?: throw XrayProfileNotReadyException("Xray profile repository not wired")
+        val repository = resolver.resolve(pendingConnectEndpointId)
+            ?: throw XrayProfileNotReadyException("no Xray profile repository configured for endpoint ${pendingConnectEndpointId.value}")
+        val reality = when (val resolution = XrayRuntimeResolver.resolve(repository)) {
+            is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
+            is XrayRuntimeResolution.Ready -> resolution.config
+        }
+        val candidate = net.pocvpn.client.vpn.xray.XrayVlessRealityXhttpConfig(
+            reality = reality.copy(server = binding.host, serverPort = binding.port, flow = ""),
+            xhttpPath = signed.xhttpPath,
+            mode = signed.mode,
+        )
+        return when (val validated = net.pocvpn.client.vpn.xray.validateXrayVlessRealityXhttpConfig(candidate)) {
+            is net.pocvpn.client.vpn.xray.XrayRealityXhttpConfigValidationResult.Valid ->
+                TransportConfig.XrayRealityXhttp(validated.config, endpointId = pendingConnectEndpointId, routingMode = routingMode)
+            is net.pocvpn.client.vpn.xray.XrayRealityXhttpConfigValidationResult.Invalid ->
+                throw XrayProfileNotReadyException("REALITY+XHTTP config invalid")
+        }
+    }
+
+    /**
+     * B-WL-R1 - recent behavior observations for the CURRENT network (same
+     * opaque fingerprint PathHistoryStore uses), oldest first; empty when no
+     * store is wired. The only reader is MainViewModel's RestrictionEvidence.
+     */
+    fun recentTransportObservations(): List<TransportAttemptObservation> =
+        transportObservationStore?.recent(currentNetworkKey()) ?: emptyList()
+
+    private fun recordTransportObservation(observation: TransportAttemptObservation) {
+        val store = transportObservationStore ?: return
+        store.record(currentNetworkKey(), observation)
+        runCatching { onTransportObservation?.invoke(observation) }
+    }
+
+    private fun currentNetworkKey(): String {
+        val keyProvider = fingerprintKeyProvider ?: return TransportObservationStore.UNSCOPED_NETWORK_KEY
+        val profileProvider = networkProfileProvider ?: return TransportObservationStore.UNSCOPED_NETWORK_KEY
+        val profile = profileProvider()
+        return NetworkFingerprinter.fingerprint(CoarseNetworkSignals(profile.type, profile.dnsServerAddresses), keyProvider.keyBytes())
+    }
+
+    /** TCP-only / UDP-only by the transport's own declared capabilities; null for mixed (e.g. SHADOWSOCKS_2022) - no single-protocol claim is made. */
+    private fun protocolOf(t: VpnTransport): TransportAttemptProtocol? = when {
+        t.capabilities.usesTcp && !t.capabilities.usesUdp -> TransportAttemptProtocol.TCP
+        t.capabilities.usesUdp && !t.capabilities.usesTcp -> TransportAttemptProtocol.UDP
+        else -> null
+    }
+
+    /** B-WL-R1 - AWG's bounded fresh-handshake wait just decided THIS attempt's UDP outcome. */
+    private suspend fun recordUdpHandshakeObservation(handshakeSucceeded: Boolean) {
+        if (transportObservationStore == null) return
+        recordTransportObservation(
+            TransportAttemptObservations.udpHandshake(
+                pendingConnectEndpointId.value, handshakeSucceeded, activeTransport.stats(), System.currentTimeMillis(),
+            ),
+        )
+    }
+
+    /**
+     * B-WL-R1 - the first terminal state of a TCP-only (Xray) attempt:
+     * Connected is only ever reported after B33 remote confirmation, so it
+     * proves connect + handshake; an Error typed REMOTE_UNCONFIRMED records a
+     * stage-unknown failure (diagnostic only). Any other Error (local config/
+     * tun/core failure) is not network behavior and records nothing.
+     */
+    private suspend fun recordTcpAttemptOutcomeIfPending(transport: VpnTransport, transportState: TransportState) {
+        if (!tcpAttemptAwaitingOutcome) return
+        when (transportState) {
+            is TransportState.Connected -> {
+                tcpAttemptAwaitingOutcome = false
+                recordTransportObservation(
+                    TransportAttemptObservations.tcpConfirmed(pendingConnectEndpointId.value, transport.stats(), System.currentTimeMillis()),
+                )
+            }
+            is TransportState.Error -> {
+                tcpAttemptAwaitingOutcome = false
+                if (transportState.failureKind == TransportFailureKind.REMOTE_UNCONFIRMED) {
+                    recordTransportObservation(TransportAttemptObservations.tcpUnconfirmed(pendingConnectEndpointId.value, System.currentTimeMillis()))
+                }
+            }
+            is TransportState.HandshakeFailed -> tcpAttemptAwaitingOutcome = false
+            else -> Unit
+        }
+    }
+
     private fun recordConnectionOutcome(
         result: ConnectionOutcomeResult,
         errorCategory: ConnectionErrorCategory,

@@ -40,6 +40,12 @@ data class TrafficProgressPolicy(
     }
 }
 
+/**
+ * B-WL-R3 - one published progress judgement of a live session plus the
+ * cumulative byte totals it was computed from (real transport counters only).
+ */
+data class TrafficProgressSnapshot(val verdict: TrafficProgressVerdict, val rxBytes: Long, val txBytes: Long)
+
 enum class TrafficProgressVerdict {
     /** Not enough time/samples yet to decide - never promoted to healthy by default. */
     VERIFYING,

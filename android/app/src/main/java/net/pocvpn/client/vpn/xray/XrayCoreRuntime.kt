@@ -45,6 +45,16 @@ interface XrayCoreRuntime {
      */
     @Throws(Exception::class)
     fun measureDelay(url: String): Long
+
+    /**
+     * B-WL-R3 - mirrors the pinned AAR's `CoreController.queryAllOutboundTrafficStats()`
+     * (AndroidLibXrayLite c634d1b): `tag,direction,value;...` byte deltas since
+     * the previous query (the query resets the counters). Null means "no
+     * counter channel" (e.g. a test double) - never fabricated zeros. Counters
+     * only exist when the rendered config enables them (see
+     * XrayConfigRenderer.putOutboundTrafficStats).
+     */
+    fun queryOutboundTrafficStats(): String? = null
 }
 
 /**
@@ -92,6 +102,9 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
     }
 
     override fun measureDelay(url: String): Long = controller.measureDelay(url)
+
+    override fun queryOutboundTrafficStats(): String? =
+        if (controller.isRunning) controller.queryAllOutboundTrafficStats() else null
 
     /**
      * This adapter shell does not yet surface core lifecycle events anywhere

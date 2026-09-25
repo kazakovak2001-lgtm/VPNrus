@@ -1345,6 +1345,61 @@ class AutoGatewaySelectorTest {
         assertNotEquals(awgCandidate.transportBinding.port, ssCandidate.transportBinding.port)
     }
 
+    // --- B-WL-R6: XRAY_REALITY_XHTTP manifest-driven candidate construction ---
+
+    private fun germanyWithRealityXhttp(metadata: Map<String, String>) = manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(
+        transports = listOf(
+            EndpointTransportBinding(TransportKind.AMNEZIA_WG, ProductionGatewayCatalog.GERMANY.awg.endpointHost, ProductionGatewayCatalog.GERMANY.awg.endpointPort),
+            EndpointTransportBinding(TransportKind.XRAY_REALITY_XHTTP, "203.0.113.77", 2083, metadata),
+        ),
+    )
+
+    private fun realityXhttpCandidates(endpoint: net.pocvpn.client.reachability.EndpointDescriptor, gate: Boolean) = AutoGatewaySelector.buildCandidates(
+        manifestEndpoints = listOf(endpoint), gatewayFactsFor = { catalogById[it] },
+        provisioned = { true }, clientTunnelIp = { "10.77.0.5" },
+        registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.XRAY_REALITY_XHTTP) },
+        xrayAvailableFor = { false }, xrayTlsAvailableFor = { false },
+        reachabilityFor = { id, kind -> reachable(id, kind) },
+        transportHealthFor = { healthy() }, historyFor = { _, _ -> null },
+        realityXhttpAvailableFor = { gate },
+    )
+
+    @Test
+    fun `B-WL-R6 - XRAY_REALITY_XHTTP becomes a candidate only with the device gate AND valid signed XHTTP metadata, pinned to its own binding`() {
+        val signed = germanyWithRealityXhttp(mapOf("realityXhttpPath" to "/nx7/", "realityXhttpMode" to "packet-up"))
+        val withGate = realityXhttpCandidates(signed, gate = true)
+        val candidate = withGate.single { it.transport == TransportKind.XRAY_REALITY_XHTTP }
+        assertEquals("203.0.113.77", candidate.transportBinding.host)
+        assertEquals(2083, candidate.transportBinding.port)
+        assertEquals(setOf(TransportKind.AMNEZIA_WG), realityXhttpCandidates(signed, gate = false).map { it.transport }.toSet())
+    }
+
+    @Test
+    fun `B-WL-R6 - an XRAY_REALITY_XHTTP binding without (or with invalid) signed XHTTP facts is never a candidate - fail closed`() {
+        listOf(
+            emptyMap(),
+            mapOf("realityXhttpPath" to "no-leading-slash/"),
+            mapOf("realityXhttpPath" to "/nx7/", "realityXhttpMode" to "h3-magic"),
+        ).forEach { metadata ->
+            val kinds = realityXhttpCandidates(germanyWithRealityXhttp(metadata), gate = true).map { it.transport }.toSet()
+            assertEquals("metadata=$metadata", setOf(TransportKind.AMNEZIA_WG), kinds)
+        }
+    }
+
+    @Test
+    fun `B-WL-R6 - omitting realityXhttpAvailableFor defaults to excluded - existing call sites unaffected`() {
+        val signed = germanyWithRealityXhttp(mapOf("realityXhttpPath" to "/nx7/"))
+        val kinds = AutoGatewaySelector.buildCandidates(
+            manifestEndpoints = listOf(signed), gatewayFactsFor = { catalogById[it] },
+            provisioned = { true }, clientTunnelIp = { "10.77.0.5" },
+            registryFor = { multiTransportRegistry(TransportKind.AMNEZIA_WG, TransportKind.XRAY_REALITY_XHTTP) },
+            xrayAvailableFor = { true }, xrayTlsAvailableFor = { false },
+            reachabilityFor = { id, kind -> reachable(id, kind) },
+            transportHealthFor = { healthy() }, historyFor = { _, _ -> null },
+        ).map { it.transport }.toSet()
+        assertEquals(setOf(TransportKind.AMNEZIA_WG), kinds)
+    }
+
     @Test
     fun `omitting shadowsocksAvailableFor entirely defaults to excluded - every pre-B45B-4 call site stays byte-for-byte unaffected`() {
         val germany = manifestEndpointFor(ProductionGatewayCatalog.GERMANY).copy(

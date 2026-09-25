@@ -82,6 +82,30 @@ data class TransportCapabilities(
             maturity = TransportMaturity.EXPERIMENTAL,
         )
 
+        /**
+         * B-WL-R6 - VLESS + REALITY + XHTTP adapter shell (same
+         * NovaXrayVpnService/Xray core as REALITY RAW). TCP-only on 443-class
+         * ports, REALITY camouflage + XHTTP request framing, declared
+         * suitable for restrictive networks exactly like the CDN XHTTP shell
+         * - which is what lets PathScorer's capability-driven restriction
+         * tier raise it under POSSIBLE_UDP_FILTERING. EXPERIMENTAL: no
+         * physical-device evidence yet.
+         */
+        fun xrayRealityXhttpAdapterShell(): TransportCapabilities = TransportCapabilities(
+            usesUdp = false,
+            usesTcp = true,
+            supportsPort443 = true,
+            supportsObfuscation = true,
+            suitableForRestrictiveNetworks = true,
+            supportsRoaming = false,
+            supportsFullTunnel = true,
+            supportsSplitRouting = false,
+            supportsIpv6 = false,
+            supportsTrafficStatistics = false,
+            supportsProbing = false,
+            maturity = TransportMaturity.EXPERIMENTAL,
+        )
+
         /** B35 - executable VLESS/XHTTP CDN-fronted adapter shell. */
         fun xrayXhttpAdapterShell(): TransportCapabilities = TransportCapabilities(
             usesUdp = false,

@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import net.pocvpn.client.transport.TransportCapabilities
+import net.pocvpn.client.smartconnect.TrafficProgressSnapshot
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
@@ -60,6 +61,7 @@ class VlessXhttpTransport(
         }
 
         val sessionId = nextSessionId.incrementAndGet()
+        currentSessionId = sessionId
         pendingConfigSessionId?.let(XhttpSessionConfigStore::remove)
 
         observerJob?.cancel()
@@ -144,6 +146,12 @@ class VlessXhttpTransport(
                 )
         }
     }
+
+    // B-WL-R3 - the session this transport most recently started; only that
+    // session's traffic-progress reports are ever surfaced.
+    @Volatile private var currentSessionId: Long? = null
+
+    override fun observeTrafficProgress(): Flow<TrafficProgressSnapshot> = xrayTrafficProgressFor { currentSessionId }
 
     override fun observeState(): Flow<TransportState> =
         state.asStateFlow()

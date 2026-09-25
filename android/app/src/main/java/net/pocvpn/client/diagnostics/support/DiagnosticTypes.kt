@@ -90,6 +90,14 @@ enum class DiagnosticEventType {
     // terminates through the SAME finishProtected()/finishFailed()/
     // finishDisconnected() calls every other session already uses.
     RECONNECT_INCIDENT_STARTED,
+
+    // B-WL-R1/R3 - labels over VpnController's per-attempt behavior
+    // observation, the resulting RestrictionClassifier assessment, and the
+    // post-connect traffic-progress verdict. Enum-valued tags only: no
+    // destination, byte count, host or credential ever enters an event.
+    TRANSPORT_ATTEMPT_OBSERVED,
+    RESTRICTION_ASSESSED,
+    TRAFFIC_PROGRESS_OBSERVED,
 }
 
 /**

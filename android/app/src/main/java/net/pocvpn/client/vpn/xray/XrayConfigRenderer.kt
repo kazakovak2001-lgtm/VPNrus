@@ -57,6 +57,7 @@ object XrayConfigRenderer {
     fun render(config: XrayVlessRealityConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessRealityOutbound(config)))
         return root.toString()
@@ -66,6 +67,7 @@ object XrayConfigRenderer {
     fun render(config: XrayVlessTlsConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessTlsOutbound(config)))
         return root.toString()
@@ -79,6 +81,7 @@ object XrayConfigRenderer {
     fun render(config: XrayVlessXhttpConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessXhttpOutbound(config)))
         return root.toString()
@@ -96,12 +99,37 @@ object XrayConfigRenderer {
     fun render(config: XrayVlessRealityXhttpConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.reality.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessRealityXhttpOutbound(config)))
         return root.toString()
     }
 
-    private fun renderTunInbound(mtu: Int): JSONObject {
+    /**
+     * B-WL-R3 - enables Xray's own per-outbound traffic counters
+     * (`outbound>>>TAG>>>traffic>>>uplink|downlink`), read at runtime through
+     * the pinned AndroidLibXrayLite `CoreController.queryAllOutboundTrafficStats()`
+     * (see [XrayOutboundTrafficAccumulator]). Verified against xray-core
+     * v26.7.28: `stats` (StatsConfig, infra/conf/xray.go) creates the stats
+     * manager, `policy.system.statsOutboundUplink/Downlink` (SystemPolicy,
+     * infra/conf/policy.go) make app/proxyman/outbound register the counters.
+     * Aggregate byte totals only - no destinations, no per-connection data,
+     * no inbound counters. Routing/outbound behavior is unchanged.
+     */
+    private fun putOutboundTrafficStats(root: JSONObject) {
+        root.put("stats", JSONObject())
+        root.put(
+            "policy",
+            JSONObject().put(
+                "system",
+                JSONObject()
+                    .put("statsOutboundUplink", true)
+                    .put("statsOutboundDownlink", true),
+            ),
+        )
+    }
+
+        private fun renderTunInbound(mtu: Int): JSONObject {
         val settings = JSONObject()
             .put("name", TUN_INTERFACE_NAME)
             .put("desc", "Nova")

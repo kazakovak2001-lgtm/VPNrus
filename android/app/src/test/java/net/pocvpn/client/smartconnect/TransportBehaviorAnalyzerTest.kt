@@ -192,9 +192,19 @@ class TransportBehaviorAnalyzerTest {
     }
 
     @Test
-    fun `legacy probe-derived UDP-or-AWG evidence stays its own class and is never upgraded to behavior-derived UDP filtering`() {
+    fun `real UDP no-response plus working TCP refines the probe-derived UDP-or-AWG class into POSSIBLE_UDP_FILTERING`() {
+        // The realistic runtime sequence: AWG attempt times out (awgHandshakeFresh == false), a later
+        // Xray attempt is confirmed, the gateway probe is reachable. The behavior evidence is
+        // UDP-specific, so it wins over the weaker probe-derived rule.
         val e = evidence(listOf(udpNoResponse(), tcp(destination = "path-reality"))).copy(awgHandshakeFresh = false, gatewayHttpsReachable = true)
-        // The existing (non-UDP-specific) rule keeps priority and its own class.
+        assertEquals(RestrictionClass.POSSIBLE_UDP_FILTERING, RestrictionClassifier.classify(e))
+    }
+
+    @Test
+    fun `without UDP behavior evidence the probe-derived rule still yields POSSIBLE_UDP_OR_AWG_FILTERING`() {
+        // A failed non-AWG attempt contributes no UDP observation, so nothing refines the legacy class.
+        val confirmedOnly = tcp(destination = "path-reality", progress = TrafficProgressOutcome.NOT_OBSERVED)
+        val e = evidence(listOf(confirmedOnly)).copy(awgHandshakeFresh = false, gatewayHttpsReachable = true)
         assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, RestrictionClassifier.classify(e))
     }
 

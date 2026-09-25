@@ -102,6 +102,13 @@ data class RestrictionEvidence(
      * byte-for-byte its pre-B-WL1 self.
      */
     val transportObservations: List<TransportAttemptObservation> = emptyList(),
+    /**
+     * B-WL-R2 - majority result of the optional "allowed reference" probes
+     * (RestrictionMonitor.referenceProbes) and its timestamp; null when no
+     * reference is configured or probed, which leaves every rule unchanged.
+     */
+    val referenceReachable: Boolean? = null,
+    val referenceProbeEpochMillis: Long? = null,
 )
 
 /** B40 - qualitative strength of the currently supplied evidence. This is
@@ -234,6 +241,7 @@ object RestrictionClassifier {
      * behavior branches slot in where they are strictly more specific:
      *  - 4b sustained end-to-end progress -> NO_RESTRICTION_OBSERVED (a real
      *       working-flow signal, as strong as rule 4's fresh AWG handshake);
+     *  - 4c ALL_CONNECT_FAILED + a reachable allowed reference -> POSSIBLE_HARD_WHITELIST;
      *  - 5  unvalidated internet + ALL_CONNECT_FAILED across >=2 destinations
      *       -> POSSIBLE_FULL_SHUTDOWN (a refinement of INTERNET_NOT_VALIDATED);
      *  - 6  ALL_CONNECT_FAILED while diverse probes also fail -> POSSIBLE_HARD_WHITELIST
@@ -241,7 +249,8 @@ object RestrictionClassifier {
      *  - 6b early drop (single, repeated, or across destinations) -> POSSIBLE_EARLY_DROP -
      *       never HARD_WHITELIST: stalls on many foreign destinations say nothing
      *       about an allowlist without an allowed-reference contrast;
-     *  - 8b UDP no-response while TCP works -> POSSIBLE_UDP_FILTERING.
+     *  - 8a UDP no-response while TCP works -> POSSIBLE_UDP_FILTERING (before
+     *       rule 8, which it refines with UDP-specific evidence).
      */
     private fun decide(
         evidence: RestrictionEvidence,
@@ -253,6 +262,7 @@ object RestrictionClassifier {
         val gatewayHttpsReachable = freshOrTrusted(evidence.gatewayHttpsReachable, evidence.gatewayProbeEpochMillis, nowEpochMillis, staleAfterMillis)
         val diverseInternetReachable = freshOrTrusted(evidence.diverseInternetReachable, evidence.diverseProbeEpochMillis, nowEpochMillis, staleAfterMillis)
         val gatewayUnreachable = gatewayHttpsReachable == false && evidence.awgHandshakeFresh == false
+        val referenceReachable = freshOrTrusted(evidence.referenceReachable, evidence.referenceProbeEpochMillis, nowEpochMillis, staleAfterMillis)
         val pattern = behavior?.pattern
         return when {
             profile.type == NetworkType.NONE -> RestrictionClass.NO_NETWORK to false
@@ -260,6 +270,11 @@ object RestrictionClassifier {
             evidence.transportState is TransportState.Reconnecting -> RestrictionClass.NETWORK_RECOVERING to false
             evidence.awgHandshakeFresh == true -> RestrictionClass.NO_RESTRICTION_OBSERVED to false
             pattern == TransportBehaviorPattern.SUSTAINED_PROGRESS -> RestrictionClass.NO_RESTRICTION_OBSERVED to true
+            // B-WL-R2 - an allowed reference is reachable while every VPN
+            // endpoint attempt failed before payload: the network carries
+            // traffic, the VPN endpoints do not - the contrast a whitelist
+            // claim needs (checked before the shutdown rule it disproves).
+            pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED && referenceReachable == true -> RestrictionClass.POSSIBLE_HARD_WHITELIST to true
             !profile.validatedInternet && pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED -> RestrictionClass.POSSIBLE_FULL_SHUTDOWN to true
             !profile.validatedInternet -> RestrictionClass.INTERNET_NOT_VALIDATED to false
             gatewayUnreachable && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST to false
@@ -267,8 +282,16 @@ object RestrictionClassifier {
             pattern == TransportBehaviorPattern.EARLY_DROP || pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP ||
                 pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP_MULTI_DESTINATION -> RestrictionClass.POSSIBLE_EARLY_DROP to true
             gatewayHttpsReachable == false -> RestrictionClass.GATEWAY_HTTPS_UNREACHABLE to false
-            gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING to false
+            // B-WL-R2 - checked BEFORE the probe-derived rule 8: when real UDP
+            // no-response + working-TCP behavior exists, it is the more
+            // specific, UDP-only explanation of the same failed AWG outcome
+            // rule 8 would otherwise label with the weaker, not-UDP-specific
+            // class (in the real runtime a failed AWG attempt followed by a
+            // confirmed Xray attempt leaves awgHandshakeFresh == false, so
+            // rule 8 would always preempt it). Without such evidence rule 8
+            // is untouched.
             pattern == TransportBehaviorPattern.UDP_NO_RESPONSE_TCP_OK -> RestrictionClass.POSSIBLE_UDP_FILTERING to true
+            gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING to false
             else -> RestrictionClass.UNKNOWN to false
         }
     }

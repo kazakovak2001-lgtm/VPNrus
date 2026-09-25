@@ -30,4 +30,16 @@ enum class TransportKind {
      * NOT_IMPLEMENTED convention).
      */
     SHADOWSOCKS_2022,
+    /**
+     * B-WL-R6 - VLESS over Xray XHTTP secured by REALITY (TCP/443 class),
+     * distinct from [XRAY_XHTTP] (TLS, CDN-fronted relay ingress) and
+     * [XRAY_REALITY] (REALITY over RAW TCP): a different wire protocol, so a
+     * different value, per this enum's own convention. APPENDED LAST on
+     * purpose: signed manifests encode kinds by ORDINAL (EndpointManifest
+     * .writeBinding/readBinding), so every existing ordinal must stay stable.
+     * Rollout caveat: a client older than this value rejects any manifest
+     * containing a binding of this kind (unknown ordinal), so such a binding
+     * must not be published until those clients are retired.
+     */
+    XRAY_REALITY_XHTTP,
 }

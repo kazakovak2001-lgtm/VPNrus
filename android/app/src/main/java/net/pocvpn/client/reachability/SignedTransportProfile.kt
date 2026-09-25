@@ -37,6 +37,14 @@ sealed interface SignedTransportProfile {
     ) : SignedTransportProfile {
         override val transportKind: TransportKind = TransportKind.SHADOWSOCKS_2022
     }
+
+    /** B-WL-R6 - PUBLIC/SIGNED REALITY+XHTTP facts only (path, mode); REALITY credentials stay in the device's Xray profile. */
+    data class RealityXhttp(
+        override val endpointId: EndpointId,
+        val profile: RealityXhttpBindingProfile,
+    ) : SignedTransportProfile {
+        override val transportKind: TransportKind = TransportKind.XRAY_REALITY_XHTTP
+    }
 }
 
 sealed interface SignedTransportProfileReadResult {
@@ -82,6 +90,18 @@ fun EndpointTransportBinding.signedTransportProfile(endpointId: EndpointId): Sig
             is Shadowsocks2022ProfileReadResult.Parsed -> SignedTransportProfileReadResult.Parsed(
                 SignedTransportProfile.Shadowsocks2022(endpointId, ss.profile),
             )
+        }
+    }
+
+    // B-WL-R6 - a brand-new kind has no legacy semantics to preserve: its
+    // signed XHTTP facts are required, so a missing path is Invalid (fail
+    // closed), never a Legacy fallback.
+    if (kind == TransportKind.XRAY_REALITY_XHTTP) {
+        return when (val profile = realityXhttpProfile()) {
+            is RealityXhttpBindingReadResult.Parsed -> SignedTransportProfileReadResult.Parsed(
+                SignedTransportProfile.RealityXhttp(endpointId, profile.profile),
+            )
+            RealityXhttpBindingReadResult.Missing, RealityXhttpBindingReadResult.Invalid -> SignedTransportProfileReadResult.Invalid
         }
     }
 
