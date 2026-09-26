@@ -63,16 +63,9 @@ class ActivationPackageRedeemer(
         onState: (ActivationPackageUiState) -> Unit,
         activate: suspend (credential: String) -> ActivationAttemptOutcome,
     ): Boolean {
+        val current = pending ?: return false
         if (!busy.tryLock()) return false
         try {
-            // `pending` is read only after `busy` is held - reading it
-            // before the lock (the previous implementation) could capture a
-            // package that a concurrent redeem()/retry() then replaces or
-            // clears while this call was still waiting for the mutex,
-            // activating a stale package. See ActivationPackageRedeemerTest
-            // `retry never activates a package captured before it acquired
-            // the lock`.
-            val current = pending ?: return false
             onState(activatePending(current, onState, activate))
             return true
         } finally {
