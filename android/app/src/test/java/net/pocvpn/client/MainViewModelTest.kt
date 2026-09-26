@@ -684,7 +684,16 @@ class MainViewModelTest {
     }
 
     @Test
-    fun `XHTTP registry requires executable transport and pinned runtime`() = runTest {
+    fun `XHTTP registry requires executable transport and pinned runtime for a known CDN ingress endpoint`() = runTest {
+        // B62 - cdnRuntimeCapabilities.isPinnedXhttpExecutable() now governs
+        // ONLY the CDN/relay ingress role (CdnXhttpRuntimeConfigResolver),
+        // never a Direct/EXIT endpoint's own availability (see
+        // MainViewModelXrayXhttpEndpointAvailabilityTest for that separate,
+        // per-endpoint EXIT-resolver-backed path) - this test now targets a
+        // KNOWN CDN INGRESS endpoint id explicitly, matching what this
+        // predicate actually governs post-B62, rather than the default
+        // (Direct/EXIT) endpoint id it used pre-B62.
+        val ingressEndpointId = net.pocvpn.client.smartconnect.ProductionIngressEndpoints.STOCKHOLM.id
         val xhttp = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
         fun model(runtime: net.pocvpn.client.reachability.CdnClientRuntimeCapabilities, executor: net.pocvpn.client.vpn.VpnTransport?) = MainViewModel(
             clientKeyRepository = FakeClientKeyRepository(),
@@ -696,16 +705,35 @@ class MainViewModelTest {
             xrayXhttpTransport = executor,
         )
         val pinned = net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(1)
-        val ready = model(pinned, xhttp).buildTransportRegistry()
+        val ready = model(pinned, xhttp).buildTransportRegistry(ingressEndpointId)
         assertEquals(TransportStatus.AVAILABLE, ready.descriptorFor(TransportKind.XRAY_XHTTP)?.status)
         assertEquals(xhttp, ready.createTransport(TransportKind.XRAY_XHTTP))
-        val unsupported = model(net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.unsupported(), xhttp).buildTransportRegistry()
+        val unsupported = model(net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.unsupported(), xhttp).buildTransportRegistry(ingressEndpointId)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, unsupported.descriptorFor(TransportKind.XRAY_XHTTP)?.status)
         assertNull(unsupported.createTransport(TransportKind.XRAY_XHTTP))
-        val broadened = model(pinned.copy(alpn = setOf("h2", "h3")), xhttp).buildTransportRegistry()
+        val broadened = model(pinned.copy(alpn = setOf("h2", "h3")), xhttp).buildTransportRegistry(ingressEndpointId)
         assertEquals(TransportStatus.NOT_IMPLEMENTED, broadened.descriptorFor(TransportKind.XRAY_XHTTP)?.status)
         assertNull(broadened.createTransport(TransportKind.XRAY_XHTTP))
-        assertNull(model(pinned, null).buildTransportRegistry().descriptorFor(TransportKind.XRAY_XHTTP))
+        assertNull(model(pinned, null).buildTransportRegistry(ingressEndpointId).descriptorFor(TransportKind.XRAY_XHTTP))
+    }
+
+    @Test
+    fun `XHTTP registry for a Direct EXIT (non-ingress) endpoint is NOT governed by the CDN capability flag`() = runTest {
+        // B62 - the pinned CDN/relay capability alone must never make a
+        // Direct/EXIT endpoint's own XRAY_XHTTP descriptor AVAILABLE; that
+        // now requires a real per-endpoint EXIT profile (see
+        // MainViewModelXrayXhttpEndpointAvailabilityTest).
+        val xhttp = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        val model = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            cdnRuntimeCapabilities = net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(1),
+            xrayXhttpTransport = xhttp,
+        )
+        assertEquals(TransportStatus.NOT_IMPLEMENTED, model.buildTransportRegistry().descriptorFor(TransportKind.XRAY_XHTTP)?.status)
     }
 
     // --- B8I7: production Xray registration + trustworthy Xray connection-state signal ---
