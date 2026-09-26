@@ -115,11 +115,41 @@ class RestrictionMonitor(
 
     private fun triggerProbe() {
         probeJob?.cancel()
-        probeJob = scope.launch {
-            // Concurrent, not sequential - a slow/timed-out diverse probe
-            // must never delay the gateway probe's own result (or vice
-            // versa); each is independently bounded by its own probe's
-            // timeout (see GatewayReachabilityProbe implementations).
+        probeJob = scope.launch { probeNow() }
+    }
+
+    /**
+     * B66.18 - runs a probe right now and suspends until it completes,
+     * updating the SAME [lastProbeResult]/[lastDiverseReachabilityResult]/
+     * epoch state [triggerProbe] itself already updates - never a second,
+     * independent probe mechanism or a second classification path (this
+     * still only ever feeds [RestrictionClassifier] the same evidence
+     * shape). Deliberately does NOT touch [probeJob] itself (that is
+     * [triggerProbe]'s own single-flight bookkeeping, for its
+     * fire-and-forget reactive callers only) - a direct caller of this
+     * function runs it inline, in its own coroutine, and is guaranteed to
+     * see this invocation's own result the instant this suspend function
+     * returns, regardless of any separately-tracked job.
+     *
+     * Exists because a probe [triggerProbe] itself starts reactively (from
+     * the SAME meaningful transport-state transition, e.g. a real AWG
+     * handshake failure, that a failover decision ALSO reacts to) has no
+     * ordering guarantee relative to that decision - two independent Flow
+     * collectors of the same state emission are not guaranteed to resume in
+     * any particular order. A caller that needs genuinely fresh evidence
+     * AT a specific decision point (see MainViewModel's AWG -> Xray target
+     * selection) awaits this directly instead of racing [triggerProbe]'s
+     * own reactive one. Direct structured concurrency
+     * (kotlinx.coroutines.coroutineScope), never scope.launch{}+join() -
+     * this runs IN the caller's own coroutine, so it is guaranteed to have
+     * genuinely completed by the time this suspend function returns,
+     * regardless of caller/dispatcher context (unlike a separately
+     * scheduled child job, which has no such guarantee relative to a
+     * caller that is itself deep inside another Flow collector's own
+     * coroutine).
+     */
+    suspend fun probeNow() {
+        kotlinx.coroutines.coroutineScope {
             val gatewayResult = async { probe.isReachable() }
             val diverseResults = diverseProbes.map { async { it.isReachable() } }
             _lastProbeResult.value = gatewayResult.await()

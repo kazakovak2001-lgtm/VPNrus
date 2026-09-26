@@ -1427,16 +1427,32 @@ class MainViewModel(
      * [stabilizedRestrictionClass] for the SEPARATE, hysteresis-smoothed
      * value the actual DIRECT-vs-RELAY decision authority reads.
      */
+    private fun currentRestrictionEvidence(): net.pocvpn.client.smartconnect.RestrictionEvidence = RestrictionEvidence(
+        networkProfile = networkProfile.value,
+        transportState = transportState.value,
+        awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
+        gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
+        diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
+        gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
+        diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
+    )
+
     fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(
-        RestrictionEvidence(
-            networkProfile = networkProfile.value,
-            transportState = transportState.value,
-            awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
-            gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
-            diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
-            gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
-            diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
-        ),
+        currentRestrictionEvidence(),
+        nowEpochMillis = nowProvider(),
+    )
+
+    /**
+     * B66.18 - the quality-graded counterpart of [restrictionClass], built
+     * from the SAME [currentRestrictionEvidence] (never a second,
+     * independently-assembled evidence snapshot that could disagree with
+     * it). Used ONLY by the AWG -> Xray failover target selection
+     * ([AwgXrayFailoverPolicy.selectXrayFailoverTarget]) - every existing
+     * consumer of [restrictionClass]/[stabilizedRestrictionClass] is
+     * completely unaffected by this addition.
+     */
+    private fun restrictionAssessment(): net.pocvpn.client.smartconnect.RestrictionAssessment = RestrictionClassifier.assess(
+        currentRestrictionEvidence(),
         nowEpochMillis = nowProvider(),
     )
 
@@ -3658,7 +3674,22 @@ class MainViewModel(
      * exactly one place per connect() request (armFailoverWatch()'s own
      * collector, which acts at most once per attempt - see its own docs) -
      * a failed Xray fallback surfaces its own truthful terminal state and
-     * nothing more (no retry, no bounce back to AWG).
+     * nothing more (no retry, no bounce back to AWG, and - B66.18 - no
+     * bounce between XHTTP and REALITY either: this function is still
+     * called from exactly the same one collector site, at most once per
+     * AWG attempt, and does not itself re-arm [armFailoverWatch] for the
+     * Xray attempt it starts, so a SUBSEQUENT failure of that Xray attempt
+     * surfaces its own terminal state with no further automatic hop - the
+     * SAME one-shot property this function already had before B66.18, now
+     * just reused for two possible targets instead of one).
+     *
+     * B66.18 - [targetKind] is [TransportKind.XRAY_REALITY] or
+     * [TransportKind.XRAY_XHTTP] (never anything else - see
+     * [AwgXrayFailoverPolicy.selectXrayFailoverTarget], the ONE place that
+     * decides it), threaded through from the SAME eligibility evaluation
+     * the caller already performed - this function never re-derives the
+     * target itself, it only defensively re-confirms (see below) that the
+     * registry it was handed genuinely has that exact kind AVAILABLE.
      */
     private suspend fun maybeFailoverToXray(
         initialKind: TransportKind,
@@ -3666,17 +3697,18 @@ class MainViewModel(
         registry: TransportRegistry,
         orchestrator: TransportOrchestrator,
         endpointId: net.pocvpn.client.reachability.EndpointId,
+        targetKind: TransportKind,
     ) {
         val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
             initialKind = initialKind,
             preference = preference,
             awgState = controller.state.value,
             awgError = diagnosticsStore.snapshot.value.lastError,
-            xrayAvailable = registry.descriptorFor(TransportKind.XRAY_REALITY)?.status == TransportStatus.AVAILABLE,
+            xrayAvailable = registry.descriptorFor(targetKind)?.status == TransportStatus.AVAILABLE,
         )
         if (!eligible) return
 
-        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY), endpointId)) {
+        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(targetKind), endpointId)) {
             is TransportOrchestrator.Resolution.Resolved -> {
                 supportDiagnosticsRecorder?.recordAttemptFailed()
                 controller.disconnect()
@@ -3687,7 +3719,7 @@ class MainViewModel(
                 controller.connect(xrayResolution)
             }
             // Defensive only: xrayAvailable already guarantees the registry
-            // has a real, resolvable XRAY_REALITY descriptor at this point.
+            // has a real, resolvable descriptor for targetKind at this point.
             is TransportOrchestrator.Resolution.NotSelectable -> Unit
         }
     }
@@ -3951,12 +3983,61 @@ class MainViewModel(
                     attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
                     return@collect
                 }
+                // B66.18 - decide WHICH Xray kind to fail over to BEFORE
+                // gating eligibility on it, so a genuinely UDP/AWG-filtered
+                // network with a real Direct EXIT XHTTP profile (and no
+                // usable REALITY profile) can still fail over - see
+                // AwgXrayFailoverPolicy.selectXrayFailoverTarget's own docs
+                // for exactly why `registry.descriptorFor(...)` (never
+                // MainViewModel's own isXrayXhttpAvailableFor directly) is
+                // the correct, already-endpoint-scoped signal to read here.
+                //
+                // Only for a genuine terminal-failure state (the SAME
+                // HandshakeFailed/Error check isEligibleForXrayFallback
+                // itself applies below) AND only when a Direct EXIT XHTTP
+                // candidate genuinely exists for this endpoint's registry
+                // (a cheap, already-computed, synchronous check - never a
+                // probe) is a fresh probe even considered. This collector
+                // runs for EVERY state emission of a manual/direct attempt
+                // (Connecting, Disconnected, etc, not just a final failure),
+                // and probeNow() performs a real network reachability check -
+                // it must never fire on a non-terminal transition, and must
+                // never fire at all when there is no XHTTP candidate this
+                // decision could possibly change (the overwhelming majority
+                // of connect attempts, where XHTTP is not even wired) - or
+                // every AWG failure would incur an extra, pointless network
+                // probe on top of RestrictionMonitor's own existing reactive
+                // one. For anything else the target stays the pre-existing
+                // XRAY_REALITY default and no probe runs, byte-for-byte the
+                // original (pre-B66.18) cost for the common case.
+                val directXhttpCandidateExists = attempt.registry.descriptorFor(TransportKind.XRAY_XHTTP)?.status == TransportStatus.AVAILABLE
+                val xrayTarget = if (directXhttpCandidateExists && (state is TransportState.HandshakeFailed || state is TransportState.Error)) {
+                    // probeNow() first - RestrictionMonitor's own reactive
+                    // probe (triggerProbe(), fired from the SAME AWG-failure
+                    // state transition via a SEPARATE Flow collector) has no
+                    // ordering guarantee relative to THIS collector's own
+                    // reaction to the exact same transition, so
+                    // restrictionAssessment() below could otherwise read
+                    // stale/absent probe evidence. This never duplicates
+                    // RestrictionClassifier's own logic - it only ensures the
+                    // SAME evidence-gathering probe has genuinely completed
+                    // before that evidence is read.
+                    restrictionMonitor?.probeNow()
+                    val restriction = restrictionAssessment()
+                    AwgXrayFailoverPolicy.selectXrayFailoverTarget(
+                        restrictionClass = restriction.classification,
+                        restrictionEvidenceQuality = restriction.evidenceQuality,
+                        directXhttpAvailable = true,
+                    )
+                } else {
+                    TransportKind.XRAY_REALITY
+                }
                 val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
                     initialKind = attempt.initialKind,
                     preference = attempt.preference,
                     awgState = state,
                     awgError = diagnosticsStore.snapshot.value.lastError,
-                    xrayAvailable = attempt.registry.descriptorFor(TransportKind.XRAY_REALITY)?.status == TransportStatus.AVAILABLE,
+                    xrayAvailable = attempt.registry.descriptorFor(xrayTarget)?.status == TransportStatus.AVAILABLE,
                 )
                 if (!eligible) return@collect
                 pendingFailoverAttempt = null
@@ -3966,6 +4047,7 @@ class MainViewModel(
                     registry = attempt.registry,
                     orchestrator = attempt.orchestrator,
                     endpointId = attempt.endpointId,
+                    targetKind = xrayTarget,
                 )
                 failoverObserverJob?.cancel()
                 failoverObserverJob = null
