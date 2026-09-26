@@ -51,11 +51,13 @@ object XrayConfigRenderer {
     private const val VLESS_OUTBOUND_TAG = "nova-vless-reality-out"
     private const val VLESS_TLS_OUTBOUND_TAG = "nova-vless-tls-out"
     private const val VLESS_XHTTP_OUTBOUND_TAG = "nova-vless-xhttp-out"
+    private const val VLESS_REALITY_XHTTP_OUTBOUND_TAG = "nova-vless-reality-xhttp-out"
     private const val TUN_INTERFACE_NAME = "nova-xray-tun"
 
     fun render(config: XrayVlessRealityConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessRealityOutbound(config)))
         return root.toString()
@@ -65,6 +67,7 @@ object XrayConfigRenderer {
     fun render(config: XrayVlessTlsConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessTlsOutbound(config)))
         return root.toString()
@@ -78,12 +81,55 @@ object XrayConfigRenderer {
     fun render(config: XrayVlessXhttpConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessXhttpOutbound(config)))
         return root.toString()
     }
 
-    private fun renderTunInbound(mtu: Int): JSONObject {
+    /**
+     * B-WL2 - VLESS + REALITY + XHTTP. Same REALITY client fields as [render]
+     * for [XrayVlessRealityConfig]; `flow` is omitted (validation rejects a
+     * non-empty one), and only `path`/`mode` are emitted for XHTTP so every
+     * other SplitHTTPConfig field keeps its v26.7.28 default (padding
+     * 100..1000, POST uplink, path session/seq placement). The HTTP Host is
+     * left to Xray's own client priority (host > serverName > address), i.e.
+     * the REALITY serverName.
+     */
+    fun render(config: XrayVlessRealityXhttpConfig): String {
+        val root = JSONObject()
+        root.put("log", JSONObject().put("loglevel", "warning"))
+        putOutboundTrafficStats(root)
+        root.put("inbounds", JSONArray().put(renderTunInbound(config.reality.mtu)))
+        root.put("outbounds", JSONArray().put(renderVlessRealityXhttpOutbound(config)))
+        return root.toString()
+    }
+
+    /**
+     * B-WL-R3 - enables Xray's own per-outbound traffic counters
+     * (`outbound>>>TAG>>>traffic>>>uplink|downlink`), read at runtime through
+     * the pinned AndroidLibXrayLite `CoreController.queryAllOutboundTrafficStats()`
+     * (see [XrayOutboundTrafficAccumulator]). Verified against xray-core
+     * v26.7.28: `stats` (StatsConfig, infra/conf/xray.go) creates the stats
+     * manager, `policy.system.statsOutboundUplink/Downlink` (SystemPolicy,
+     * infra/conf/policy.go) make app/proxyman/outbound register the counters.
+     * Aggregate byte totals only - no destinations, no per-connection data,
+     * no inbound counters. Routing/outbound behavior is unchanged.
+     */
+    private fun putOutboundTrafficStats(root: JSONObject) {
+        root.put("stats", JSONObject())
+        root.put(
+            "policy",
+            JSONObject().put(
+                "system",
+                JSONObject()
+                    .put("statsOutboundUplink", true)
+                    .put("statsOutboundDownlink", true),
+            ),
+        )
+    }
+
+        private fun renderTunInbound(mtu: Int): JSONObject {
         val settings = JSONObject()
             .put("name", TUN_INTERFACE_NAME)
             .put("desc", "Nova")
@@ -124,6 +170,40 @@ object XrayConfigRenderer {
             .put("tag", VLESS_OUTBOUND_TAG)
             .put("protocol", "vless")
             .put("settings", settings)
+            .put("streamSettings", streamSettings)
+    }
+
+    private fun renderVlessRealityXhttpOutbound(config: XrayVlessRealityXhttpConfig): JSONObject {
+        val reality = config.reality
+        val user = JSONObject()
+            .put("id", reality.uuid)
+            .put("encryption", "none")
+
+        val vnext = JSONObject()
+            .put("address", reality.server)
+            .put("port", reality.serverPort)
+            .put("users", JSONArray().put(user))
+
+        val realitySettings = JSONObject()
+            .put("fingerprint", reality.fingerprint)
+            .put("serverName", reality.serverName)
+            .put("publicKey", reality.realityPublicKey)
+            .put("shortId", reality.shortId)
+
+        val xhttpSettings = JSONObject()
+            .put("path", config.xhttpPath)
+            .put("mode", config.mode.wireValue)
+
+        val streamSettings = JSONObject()
+            .put("network", "xhttp")
+            .put("security", "reality")
+            .put("realitySettings", realitySettings)
+            .put("xhttpSettings", xhttpSettings)
+
+        return JSONObject()
+            .put("tag", VLESS_REALITY_XHTTP_OUTBOUND_TAG)
+            .put("protocol", "vless")
+            .put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
             .put("streamSettings", streamSettings)
     }
 

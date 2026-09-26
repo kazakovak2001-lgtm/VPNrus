@@ -65,6 +65,18 @@ class RestrictionMonitor(
     // this class still triggers a probe purely from real transport-state/
     // network-type transitions (see [start]'s own docs), never a timer.
     private val nowProvider: () -> Long = System::currentTimeMillis,
+    /**
+     * B-WL-R2 - OPTIONAL "allowed reference" destinations (same
+     * [GatewayReachabilityProbe] abstraction, same majority rule as
+     * [diverseProbes]): targets expected to stay reachable on a restricted
+     * network (e.g. an owned endpoint on an allowed network). A reachable
+     * reference while every VPN endpoint fails separates "VPN endpoints are
+     * restricted" from "the network carries nothing". Empty by default - no
+     * production reference target is approved yet, so production behavior is
+     * unchanged. Probes carry no user identifier; see
+     * [HttpsGatewayReachabilityProbe] for the request shape.
+     */
+    private val referenceProbes: List<GatewayReachabilityProbe> = emptyList(),
 ) {
     private val _lastProbeResult = MutableStateFlow<Boolean?>(null)
     val lastProbeResult: StateFlow<Boolean?> = _lastProbeResult.asStateFlow()
@@ -87,6 +99,12 @@ class RestrictionMonitor(
 
     private val _lastDiverseReachabilityEpochMillis = MutableStateFlow<Long?>(null)
     val lastDiverseReachabilityEpochMillis: StateFlow<Long?> = _lastDiverseReachabilityEpochMillis.asStateFlow()
+
+    private val _lastReferenceReachabilityResult = MutableStateFlow<Boolean?>(null)
+    val lastReferenceReachabilityResult: StateFlow<Boolean?> = _lastReferenceReachabilityResult.asStateFlow()
+
+    private val _lastReferenceReachabilityEpochMillis = MutableStateFlow<Long?>(null)
+    val lastReferenceReachabilityEpochMillis: StateFlow<Long?> = _lastReferenceReachabilityEpochMillis.asStateFlow()
 
     private var observeJob: Job? = null
     private var probeJob: Job? = null
@@ -122,10 +140,15 @@ class RestrictionMonitor(
             // timeout (see GatewayReachabilityProbe implementations).
             val gatewayResult = async { probe.isReachable() }
             val diverseResults = diverseProbes.map { async { it.isReachable() } }
+            val referenceResults = referenceProbes.map { async { it.isReachable() } }
             _lastProbeResult.value = gatewayResult.await()
             _lastProbeEpochMillis.value = nowProvider()
             _lastDiverseReachabilityResult.value = DiverseReachabilityEvaluator.evaluate(diverseResults.awaitAll())
             _lastDiverseReachabilityEpochMillis.value = nowProvider()
+            if (referenceProbes.isNotEmpty()) {
+                _lastReferenceReachabilityResult.value = DiverseReachabilityEvaluator.evaluate(referenceResults.awaitAll())
+                _lastReferenceReachabilityEpochMillis.value = nowProvider()
+            }
         }
     }
 }

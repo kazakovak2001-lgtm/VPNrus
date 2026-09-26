@@ -47,6 +47,10 @@ enum class DiagnosticEventType {
     RESTRICTION_CLASSIFIED,
     RESTRICTION_STABILIZED,
     MANIFEST_SOURCE_SELECTED,
+
+    // B-WL-R6 - the trusted schema-2 manifest carried transport bindings this
+    // build does not know; tags are counts only (never wire ids, hosts or metadata).
+    MANIFEST_UNKNOWN_TRANSPORT_IGNORED,
     CANDIDATE_RANKED,
     CANDIDATE_ATTEMPT_STARTED,
     ENDPOINT_REACHABILITY_RESULT,
@@ -90,6 +94,14 @@ enum class DiagnosticEventType {
     // terminates through the SAME finishProtected()/finishFailed()/
     // finishDisconnected() calls every other session already uses.
     RECONNECT_INCIDENT_STARTED,
+
+    // B-WL-R1/R3 - labels over VpnController's per-attempt behavior
+    // observation, the resulting RestrictionClassifier assessment, and the
+    // post-connect traffic-progress verdict. Enum-valued tags only: no
+    // destination, byte count, host or credential ever enters an event.
+    TRANSPORT_ATTEMPT_OBSERVED,
+    RESTRICTION_ASSESSED,
+    TRAFFIC_PROGRESS_OBSERVED,
 }
 
 /**
@@ -112,6 +124,9 @@ enum class DiagnosticFailureReason {
     PROTOCOL_OR_TRANSPORT_BLOCKED,
     DATA_PLANE_NOT_READY,
     POSSIBLE_HARD_WHITELIST,
+    // B-WL1/B-WL10 - behavior-derived restriction classes (coarse, no endpoint data).
+    POSSIBLE_EARLY_DROP,
+    POSSIBLE_FULL_SHUTDOWN,
     RESTRICTED_NETWORK_NO_VIABLE_RELAY,
     INGRESS_UNREACHABLE,
     INGRESS_PROFILE_REQUIRED,

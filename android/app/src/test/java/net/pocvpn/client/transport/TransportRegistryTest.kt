@@ -92,6 +92,7 @@ class TransportRegistryTest {
     fun `all() lists every registered kind regardless of status`() {
         val registry = TransportRegistry.defaults { FakeVpnTransport() }
         assertEquals(TransportKind.entries.toSet(), registry.all().map { it.kind }.toSet())
-        assertTrue(registry.all().size == 6)
+        // B-WL-R6 - XRAY_REALITY_XHTTP registered (NOT_IMPLEMENTED by default).
+        assertTrue(registry.all().size == 7)
     }
 }

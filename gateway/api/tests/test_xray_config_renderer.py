@@ -393,5 +393,88 @@ class StaticClientsTests(RendererTestBase):
         self.assertIn("<redacted-relay-identity>", redacted_text)
 
 
+class RealityXhttpInboundTests(RendererTestBase):
+    """B-WL2 - the OPTIONAL VLESS + REALITY + XHTTP inbound."""
+
+    def setUp(self):
+        super().setUp()
+        digest = "a" * 64
+        self.activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        self.xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        self.tls = renderer_module.TlsServerConfig(
+            listen_port=2053,
+            cert_file="/etc/letsencrypt/live/example/fullchain.pem",
+            key_file="/etc/letsencrypt/live/example/privkey.pem",
+        )
+        self.reality_xhttp = renderer_module.RealityXhttpServerConfig(listen_port=2083, path="/nx7/")
+
+    def _render(self, **kwargs):
+        return renderer_module.render_server_config(self.activations_data, self.xray_data, self.reality, **kwargs)
+
+    def test_no_reality_xhttp_is_byte_for_byte_the_previous_output(self):
+        before = json.dumps(self._render(tls=self.tls, flow="xtls-rprx-vision"), sort_keys=True)
+        after = json.dumps(self._render(tls=self.tls, flow="xtls-rprx-vision", reality_xhttp=None), sort_keys=True)
+        self.assertEqual(before, after)
+
+    def test_inbound_is_appended_last_without_moving_existing_inbounds(self):
+        config = self._render(tls=self.tls, flow="xtls-rprx-vision", reality_xhttp=self.reality_xhttp)
+        self.assertEqual([i["tag"] for i in config["inbounds"]], ["nova-vless-reality-in", "nova-vless-tls-in", "nova-vless-reality-xhttp-in"])
+
+    def test_stream_settings_match_the_pinned_schema(self):
+        inbound = self._render(reality_xhttp=self.reality_xhttp)["inbounds"][-1]
+        stream = inbound["streamSettings"]
+        self.assertEqual(inbound["port"], 2083)
+        self.assertEqual(stream["network"], "xhttp")
+        self.assertEqual(stream["security"], "reality")
+        self.assertEqual(stream["xhttpSettings"], {"path": "/nx7/", "mode": "auto"})
+        self.assertNotIn("tlsSettings", stream)
+
+    def test_reuses_the_single_reality_key_set(self):
+        config = self._render(reality_xhttp=self.reality_xhttp)
+        raw = config["inbounds"][0]["streamSettings"]["realitySettings"]
+        xhttp = config["inbounds"][-1]["streamSettings"]["realitySettings"]
+        for key in ("dest", "serverNames", "privateKey", "shortIds"):
+            self.assertEqual(raw[key], xhttp[key])
+
+    def test_clients_are_shared_and_never_carry_flow(self):
+        config = self._render(flow="xtls-rprx-vision", reality_xhttp=self.reality_xhttp)
+        clients = config["inbounds"][-1]["settings"]["clients"]
+        self.assertEqual([c["id"] for c in clients], [self.uuid_a])
+        self.assertTrue(all("flow" not in c for c in clients))
+        self.assertEqual(config["inbounds"][0]["settings"]["clients"][0]["flow"], "xtls-rprx-vision")
+
+    def test_revoked_activation_is_excluded_from_the_xhttp_inbound_too(self):
+        digest = "a" * 64
+        self.activations_data[digest]["status"] = activations_module.REVOKED
+        config = self._render(reality_xhttp=self.reality_xhttp)
+        self.assertEqual(config["inbounds"][-1]["settings"]["clients"], [])
+
+    def test_redacted_render_hides_the_private_key_in_every_reality_inbound(self):
+        redacted = renderer_module.render_server_config_redacted(
+            self.activations_data, self.xray_data, self.reality, reality_xhttp=self.reality_xhttp,
+        )
+        self.assertNotIn("A" * 43, json.dumps(redacted))
+        self.assertEqual(redacted["inbounds"][-1]["streamSettings"]["realitySettings"]["privateKey"], "<redacted>")
+
+    def test_every_supported_mode_is_accepted_and_others_fail_closed(self):
+        for mode in ("auto", "packet-up", "stream-up", "stream-one"):
+            cfg = renderer_module.RealityXhttpServerConfig(listen_port=2083, path="/nx7/", mode=mode)
+            self.assertEqual(self._render(reality_xhttp=cfg)["inbounds"][-1]["streamSettings"]["xhttpSettings"]["mode"], mode)
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            self._render(reality_xhttp=renderer_module.RealityXhttpServerConfig(listen_port=2083, path="/nx7/", mode="h3-magic"))
+
+    def test_malformed_paths_fail_closed(self):
+        for path in ("", "nx7/", "/nx7", "//nx7/", "/nx7/?a=b", "/nx#7/", "/n x/", "/a\\b/"):
+            with self.assertRaises(renderer_module.XrayConfigRenderError, msg=path):
+                self._render(reality_xhttp=renderer_module.RealityXhttpServerConfig(listen_port=2083, path=path))
+
+    def test_port_collision_with_another_inbound_fails_closed(self):
+        for port in (self.reality.listen_port, self.tls.listen_port):
+            with self.assertRaises(renderer_module.XrayConfigRenderError):
+                self._render(tls=self.tls, reality_xhttp=renderer_module.RealityXhttpServerConfig(listen_port=port, path="/nx7/"))
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            self._render(reality_xhttp=renderer_module.RealityXhttpServerConfig(listen_port=0, path="/nx7/"))
+
+
 if __name__ == "__main__":
     unittest.main()

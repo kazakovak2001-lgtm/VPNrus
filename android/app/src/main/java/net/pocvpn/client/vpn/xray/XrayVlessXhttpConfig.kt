@@ -155,7 +155,7 @@ private fun isXhttpHostname(value: String): Boolean =
                 label.matches(Regex("[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"))
         }
 
-private fun isXhttpPath(value: String): Boolean =
+internal fun isXhttpPath(value: String): Boolean =
     value.length in 1..512 &&
         value.startsWith('/') &&
         !value.startsWith("//") &&

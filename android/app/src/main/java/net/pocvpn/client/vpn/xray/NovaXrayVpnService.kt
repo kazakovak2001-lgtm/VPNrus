@@ -236,7 +236,7 @@ class NovaXrayVpnService : VpnService() {
             // synchronously torn down the session (see that class's own
             // startRelayHealthWatchdog docs) - never before.
             val onRelayHealthLost: suspend () -> Unit = {
-                Log.w(TAG, "relay health watchdog: consecutive probe failures exceeded threshold, session torn down")
+                Log.w(TAG, "session health watchdog: consecutive confirmation failures exceeded threshold, session torn down")
                 XrayRuntimeState.publishRelayHealthLost(sessionId, kind)
                 stopSelf()
             }
@@ -259,6 +259,19 @@ class NovaXrayVpnService : VpnService() {
                 return@launch
             }
 
+            // B-WL-R6 - same fail-closed hand-off as XHTTP above: the
+            // validated REALITY+XHTTP config lives only in the process-local
+            // store; no config = no start.
+            val realityXhttpConfig =
+                if (kind == TransportKind.XRAY_REALITY_XHTTP) RealityXhttpSessionConfigStore.consume(sessionId) else null
+            if (kind == TransportKind.XRAY_REALITY_XHTTP && realityXhttpConfig == null) {
+                Log.e(TAG, "refusing to start: REALITY+XHTTP runtime config missing")
+                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "REALITY+XHTTP runtime config missing"))
+                stopSelf()
+                return@launch
+            }
+
+            XrayRuntimeState.clearTrafficProgress()
             when (
                 val outcome =
                     lifecycleCoordinator.start(
@@ -268,6 +281,8 @@ class NovaXrayVpnService : VpnService() {
                         confirmationContext = confirmationContext,
                         onRelayHealthLost = onRelayHealthLost,
                         xhttpConfig = xhttpConfig,
+                        onTrafficProgress = { report -> XrayRuntimeState.publishTrafficProgress(sessionId, report) },
+                        realityXhttpConfig = realityXhttpConfig,
                     )
             ) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")

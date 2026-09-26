@@ -1,0 +1,14 @@
+[
+  {
+    "operator": "Operator A",
+    "region": "Region 1",
+    "date": "2026-01-01",
+    "networkType": "LTE",
+    "transport": "PROBE_HTTPS",
+    "endpointType": "DOMESTIC_REFERENCE",
+    "result": "NOT_TESTED",
+    "classification": "UNKNOWN",
+    "confidence": "INSUFFICIENT",
+    "notes": "TEMPLATE ONLY - placeholder values, not a measurement"
+  }
+]

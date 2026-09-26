@@ -77,6 +77,8 @@ class NovaXrayServiceLifecycleCoordinator(
         confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
         onRelayHealthLost: suspend () -> Unit = {},
         xhttpConfig: XrayVlessXhttpConfig? = null,
+        onTrafficProgress: (net.pocvpn.client.smartconnect.TrafficProgressSnapshot) -> Unit = {},
+        realityXhttpConfig: XrayVlessRealityXhttpConfig? = null,
     ): XrayCoreStartOutcome = mutex.withLock {
         selectControllerLocked(endpointId).requestStart(
             kind,
@@ -84,6 +86,8 @@ class NovaXrayServiceLifecycleCoordinator(
             confirmationContext,
             onRelayHealthLost,
             xhttpConfig,
+            onTrafficProgress,
+            realityXhttpConfig,
         )
     }
 

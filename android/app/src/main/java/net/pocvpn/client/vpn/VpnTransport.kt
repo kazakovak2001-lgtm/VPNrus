@@ -2,6 +2,8 @@ package net.pocvpn.client.vpn
 
 import android.content.Intent
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
+import net.pocvpn.client.smartconnect.TrafficProgressSnapshot
 import net.pocvpn.client.transport.ProbeContext
 import net.pocvpn.client.transport.ProbeResult
 import net.pocvpn.client.transport.TransportCapabilities
@@ -34,6 +36,19 @@ interface VpnTransport {
 
     suspend fun probe(context: ProbeContext): ProbeResult = ProbeResult.Unsupported
     suspend fun stats(): TransportStats = TransportStats.Unsupported
+
+    /**
+     * B-WL-R3 - post-connect traffic-progress verdicts for the CURRENT
+     * session, produced by the transport's own existing health loop (for
+     * Xray: the B33 session watchdog in XrayCoreController). Empty by
+     * default: a transport that has no progress signal emits nothing, which
+     * VpnController treats as "no progress claim", never as unhealthy.
+     * Deliberately separate from [stats]: [TransportStats.Counters] also
+     * carries AWG handshake-freshness semantics that VpnController's
+     * connect/reconnect gates rely on, which a TCP/Xray byte counter must
+     * never be mistaken for.
+     */
+    fun observeTrafficProgress(): Flow<TrafficProgressSnapshot> = emptyFlow()
 }
 
 enum class UnderlyingNetworkRecovery {

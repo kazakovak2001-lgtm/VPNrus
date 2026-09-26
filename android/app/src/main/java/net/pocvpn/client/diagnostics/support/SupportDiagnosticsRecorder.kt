@@ -122,6 +122,13 @@ class SupportDiagnosticsRecorder(
     fun recordManifestSourceSelected(source: ManifestSourceKind) =
         record(DiagnosticEventType.MANIFEST_SOURCE_SELECTED, mapOf(TAG_SOURCE to source.name))
 
+    /** B-WL-R6 - counts only; nothing else about the ignored bindings is ever recorded. */
+    fun recordManifestUnknownTransportIgnored(ignoredBindings: Int, droppedEndpoints: Int) =
+        record(
+            DiagnosticEventType.MANIFEST_UNKNOWN_TRANSPORT_IGNORED,
+            mapOf(TAG_COUNT to ignoredBindings.toString(), TAG_DROPPED_ENDPOINTS to droppedEndpoints.toString()),
+        )
+
     fun recordCandidateRanked(candidateCount: Int) =
         record(DiagnosticEventType.CANDIDATE_RANKED, mapOf(TAG_COUNT to candidateCount.toString()))
 
@@ -171,6 +178,35 @@ class SupportDiagnosticsRecorder(
 
     fun recordEndpointReachabilityResult(state: ReachabilityState) =
         record(DiagnosticEventType.ENDPOINT_REACHABILITY_RESULT, mapOf(TAG_STATE to state.name))
+
+    /** B-WL-R1 - stage outcomes of one real attempt; the opaque destination key and byte counts are deliberately NOT recorded. */
+    fun recordTransportAttemptObserved(observation: net.pocvpn.client.smartconnect.TransportAttemptObservation) =
+        record(
+            DiagnosticEventType.TRANSPORT_ATTEMPT_OBSERVED,
+            mapOf(
+                TAG_PROTOCOL to observation.protocol.name,
+                TAG_CONNECT to observation.connect.name,
+                TAG_HANDSHAKE to observation.handshake.name,
+                TAG_PROGRESS to observation.progress.name,
+                TAG_TERMINATION to observation.termination.name,
+            ),
+        )
+
+    /** B-WL-R2 - the classification an observation led to, with its qualitative confidence and the pattern behind it. */
+    fun recordRestrictionAssessed(assessment: net.pocvpn.client.smartconnect.RestrictionAssessment) =
+        record(
+            DiagnosticEventType.RESTRICTION_ASSESSED,
+            buildMap {
+                put(TAG_RESTRICTION_CLASS, assessment.classification.name)
+                put(TAG_EVIDENCE_QUALITY, assessment.evidenceQuality.name)
+                put(TAG_CONTRADICTION, assessment.contradictionState.name)
+                assessment.transportBehavior?.let { put(TAG_BEHAVIOR_PATTERN, it.pattern.name) }
+            },
+        )
+
+    /** B-WL-R3 - post-connect traffic-progress verdict of the current session. */
+    fun recordTrafficProgress(verdict: net.pocvpn.client.smartconnect.TrafficProgressVerdict) =
+        record(DiagnosticEventType.TRAFFIC_PROGRESS_OBSERVED, mapOf(TAG_STATE to verdict.name))
 
     fun recordTransportStart(transportKind: TransportKind) =
         record(DiagnosticEventType.TRANSPORT_START, mapOf(TAG_TRANSPORT_KIND to transportKind.name))
@@ -413,8 +449,17 @@ class SupportDiagnosticsRecorder(
 
     private companion object {
         const val TAG_RESTRICTION_CLASS = "restrictionClass"
+        const val TAG_PROTOCOL = "protocol"
+        const val TAG_CONNECT = "connect"
+        const val TAG_HANDSHAKE = "handshake"
+        const val TAG_PROGRESS = "progress"
+        const val TAG_TERMINATION = "termination"
+        const val TAG_EVIDENCE_QUALITY = "evidenceQuality"
+        const val TAG_CONTRADICTION = "contradiction"
+        const val TAG_BEHAVIOR_PATTERN = "behaviorPattern"
         const val TAG_SOURCE = "source"
         const val TAG_COUNT = "count"
+        const val TAG_DROPPED_ENDPOINTS = "droppedEndpoints"
         const val TAG_PATH_KIND = "pathKind"
         const val TAG_TRANSPORT_KIND = "transportKind"
         const val TAG_STATE = "state"

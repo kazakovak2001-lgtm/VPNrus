@@ -493,6 +493,18 @@ class SupportDiagnosticsRecorderTest {
     }
 
     @Test
+    fun `B-WL-R6 - an ignored unknown manifest transport is recorded as counts only`() {
+        val store = InMemoryDiagnosticSessionStore()
+        val recorder = newRecorder(store)
+        recorder.startSession(context())
+        recorder.recordManifestUnknownTransportIgnored(ignoredBindings = 3, droppedEndpoints = 1)
+        recorder.finishProtected()
+
+        val event = store.recent().single().events.single { it.type == DiagnosticEventType.MANIFEST_UNKNOWN_TRANSPORT_IGNORED }
+        assertEquals(mapOf("count" to "3", "droppedEndpoints" to "1"), event.tags)
+    }
+
+    @Test
     fun `mapManifestSourceToManifestSourceKind re-labels every real ManifestSource value truthfully, never a host-derived label`() {
         assertEquals(ManifestSourceKind.LAST_KNOWN_GOOD, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.LAST_KNOWN_GOOD))
         assertEquals(ManifestSourceKind.EMBEDDED_BOOTSTRAP, mapManifestSourceToManifestSourceKind(net.pocvpn.client.reachability.ManifestSource.EMBEDDED_BOOTSTRAP))

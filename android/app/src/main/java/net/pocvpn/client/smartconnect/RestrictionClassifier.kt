@@ -28,6 +28,28 @@ enum class RestrictionClass {
      * (architecture principle 4).
      */
     POSSIBLE_HARD_WHITELIST,
+    /**
+     * B-WL1 - TCP flows connect, handshake and receive an initial payload,
+     * then stop progressing without a reset (see TransportBehaviorAnalyzer).
+     * Behavioral, never a byte-count rule; only ever produced from supplied
+     * [RestrictionEvidence.transportObservations].
+     */
+    POSSIBLE_EARLY_DROP,
+    /**
+     * B-WL1 - UDP attempts got no response while TCP handshakes/progress on
+     * the same network succeeded. Deliberately distinct from
+     * [POSSIBLE_UDP_OR_AWG_FILTERING], whose trigger (the last outcome of ANY
+     * transport failing plus a reachable gateway) is not UDP-specific: only
+     * this behavior-derived class drives transport-level (UDP vs TCP) ranking
+     * in PathScorer.
+     */
+    POSSIBLE_UDP_FILTERING,
+    /**
+     * B-WL1 - the OS cannot validate internet AND every observed attempt,
+     * across at least two distinct destinations, failed before any payload.
+     * Still "possible": this app cannot see the operator's side.
+     */
+    POSSIBLE_FULL_SHUTDOWN,
     NETWORK_RECOVERING,
     NO_RESTRICTION_OBSERVED,
     UNKNOWN,
@@ -73,6 +95,20 @@ data class RestrictionEvidence(
     // before this field existed.
     val gatewayProbeEpochMillis: Long? = null,
     val diverseProbeEpochMillis: Long? = null,
+    /**
+     * B-WL1 - recent per-attempt transport behavior (see
+     * [TransportAttemptObservation]'s own no-secrets contract). Empty by
+     * default, in which case [RestrictionClassifier.classify] is
+     * byte-for-byte its pre-B-WL1 self.
+     */
+    val transportObservations: List<TransportAttemptObservation> = emptyList(),
+    /**
+     * B-WL-R2 - majority result of the optional "allowed reference" probes
+     * (RestrictionMonitor.referenceProbes) and its timestamp; null when no
+     * reference is configured or probed, which leaves every rule unchanged.
+     */
+    val referenceReachable: Boolean? = null,
+    val referenceProbeEpochMillis: Long? = null,
 )
 
 /** B40 - qualitative strength of the currently supplied evidence. This is
@@ -87,6 +123,9 @@ enum class RestrictionEvidenceReason {
     FRESH_AWG_SUCCESS, INTERNET_NOT_VALIDATED, GATEWAY_HTTPS_FAILED,
     DIVERSE_REACHABILITY_FAILED, DIVERSE_REACHABILITY_SUCCEEDED,
     AWG_FAILED, EVIDENCE_STALE, EVIDENCE_INCOMPLETE, EVIDENCE_CONTRADICTORY,
+    // B-WL1 - the transport-behavior pattern that drove (or informed) the class.
+    TRANSPORT_SUSTAINED_PROGRESS, TRANSPORT_EARLY_DROP, TRANSPORT_REPEATED_EARLY_DROP,
+    TRANSPORT_EARLY_DROP_MULTI_DESTINATION, TRANSPORT_UDP_NO_RESPONSE, TRANSPORT_ALL_CONNECT_FAILED,
 }
 
 data class RestrictionAssessment(
@@ -94,6 +133,8 @@ data class RestrictionAssessment(
     val evidenceQuality: RestrictionEvidenceQuality,
     val contradictionState: RestrictionContradictionState,
     val reasons: Set<RestrictionEvidenceReason>,
+    /** B-WL1 - the transport-behavior assessment behind this result; null when no observations were supplied. */
+    val transportBehavior: TransportBehaviorAssessment? = null,
 )
 
 /**
@@ -135,7 +176,8 @@ object RestrictionClassifier {
 
     /** B40 - additive assessment view over the same single classify() authority. */
     fun assess(evidence: RestrictionEvidence, nowEpochMillis: Long = Long.MAX_VALUE, staleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS): RestrictionAssessment {
-        val classification = classify(evidence, nowEpochMillis, staleAfterMillis)
+        val behavior = behaviorOf(evidence, nowEpochMillis, staleAfterMillis)
+        val (classification, behaviorDriven) = decide(evidence, behavior, nowEpochMillis, staleAfterMillis)
         val reasons = linkedSetOf<RestrictionEvidenceReason>()
         val gatewayFresh = freshOrTrusted(evidence.gatewayHttpsReachable, evidence.gatewayProbeEpochMillis, nowEpochMillis, staleAfterMillis)
         val diverseFresh = freshOrTrusted(evidence.diverseInternetReachable, evidence.diverseProbeEpochMillis, nowEpochMillis, staleAfterMillis)
@@ -156,14 +198,20 @@ object RestrictionClassifier {
         }
         val contradiction = evidence.awgHandshakeFresh == true && gatewayFresh == false || gatewayFresh == true && diverseFresh == false
         if (contradiction) reasons += RestrictionEvidenceReason.EVIDENCE_CONTRADICTORY
+        behavior?.let { reasons += behaviorReason(it.pattern) ?: return@let }
         val quality = when {
+            // B-WL1 - a class reached through transport behavior carries that
+            // behavior's own qualitative confidence (single occurrence LOW,
+            // reproduced HIGH), downgraded on contradiction - never the
+            // probe-completeness rule below, which does not describe it.
+            behaviorDriven && behavior != null -> if (contradiction && behavior.quality != RestrictionEvidenceQuality.INSUFFICIENT) RestrictionEvidenceQuality.LOW else behavior.quality
             classification == RestrictionClass.UNKNOWN || reasons.contains(RestrictionEvidenceReason.EVIDENCE_INCOMPLETE) -> RestrictionEvidenceQuality.INSUFFICIENT
             contradiction -> RestrictionEvidenceQuality.LOW
             classification == RestrictionClass.POSSIBLE_HARD_WHITELIST && gatewayFresh != null && diverseFresh != null -> RestrictionEvidenceQuality.HIGH
             evidence.awgHandshakeFresh != null || gatewayFresh != null || diverseFresh != null -> RestrictionEvidenceQuality.MEDIUM
             else -> RestrictionEvidenceQuality.LOW
         }
-        return RestrictionAssessment(classification, quality, if (contradiction) RestrictionContradictionState.PRESENT else RestrictionContradictionState.NONE, reasons)
+        return RestrictionAssessment(classification, quality, if (contradiction) RestrictionContradictionState.PRESENT else RestrictionContradictionState.NONE, reasons, behavior)
     }
 
     /**
@@ -182,22 +230,84 @@ object RestrictionClassifier {
      * supplied a probe timestamp either - computes byte-for-byte the same
      * classification as before this parameter existed.
      */
-    fun classify(evidence: RestrictionEvidence, nowEpochMillis: Long = Long.MAX_VALUE, staleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS): RestrictionClass {
+    fun classify(evidence: RestrictionEvidence, nowEpochMillis: Long = Long.MAX_VALUE, staleAfterMillis: Long = DEFAULT_STALE_AFTER_MILLIS): RestrictionClass =
+        decide(evidence, behaviorOf(evidence, nowEpochMillis, staleAfterMillis), nowEpochMillis, staleAfterMillis).first
+
+    /**
+     * B-WL1 - the single priority chain behind [classify]/[assess]. Returns the
+     * class plus whether transport BEHAVIOR (rather than the pre-existing
+     * probe rules) decided it. With no observations every behavior branch is
+     * skipped and the chain is exactly the documented 1-9 order above. The
+     * behavior branches slot in where they are strictly more specific:
+     *  - 4b sustained end-to-end progress -> NO_RESTRICTION_OBSERVED (a real
+     *       working-flow signal, as strong as rule 4's fresh AWG handshake);
+     *  - 4c ALL_CONNECT_FAILED + a reachable allowed reference -> POSSIBLE_HARD_WHITELIST;
+     *  - 5  unvalidated internet + ALL_CONNECT_FAILED across >=2 destinations
+     *       -> POSSIBLE_FULL_SHUTDOWN (a refinement of INTERNET_NOT_VALIDATED);
+     *  - 6  ALL_CONNECT_FAILED while diverse probes also fail -> POSSIBLE_HARD_WHITELIST
+     *       (the only behavior branch contrasting blocked vs. otherwise-reachable);
+     *  - 6b early drop (single, repeated, or across destinations) -> POSSIBLE_EARLY_DROP -
+     *       never HARD_WHITELIST: stalls on many foreign destinations say nothing
+     *       about an allowlist without an allowed-reference contrast;
+     *  - 8a UDP no-response while TCP works -> POSSIBLE_UDP_FILTERING (before
+     *       rule 8, which it refines with UDP-specific evidence).
+     */
+    private fun decide(
+        evidence: RestrictionEvidence,
+        behavior: TransportBehaviorAssessment?,
+        nowEpochMillis: Long,
+        staleAfterMillis: Long,
+    ): Pair<RestrictionClass, Boolean> {
         val profile = evidence.networkProfile
         val gatewayHttpsReachable = freshOrTrusted(evidence.gatewayHttpsReachable, evidence.gatewayProbeEpochMillis, nowEpochMillis, staleAfterMillis)
         val diverseInternetReachable = freshOrTrusted(evidence.diverseInternetReachable, evidence.diverseProbeEpochMillis, nowEpochMillis, staleAfterMillis)
         val gatewayUnreachable = gatewayHttpsReachable == false && evidence.awgHandshakeFresh == false
+        val referenceReachable = freshOrTrusted(evidence.referenceReachable, evidence.referenceProbeEpochMillis, nowEpochMillis, staleAfterMillis)
+        val pattern = behavior?.pattern
         return when {
-            profile.type == NetworkType.NONE -> RestrictionClass.NO_NETWORK
-            profile.captivePortal == true -> RestrictionClass.CAPTIVE_PORTAL
-            evidence.transportState is TransportState.Reconnecting -> RestrictionClass.NETWORK_RECOVERING
-            evidence.awgHandshakeFresh == true -> RestrictionClass.NO_RESTRICTION_OBSERVED
-            !profile.validatedInternet -> RestrictionClass.INTERNET_NOT_VALIDATED
-            gatewayUnreachable && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST
-            gatewayHttpsReachable == false -> RestrictionClass.GATEWAY_HTTPS_UNREACHABLE
-            gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING
-            else -> RestrictionClass.UNKNOWN
+            profile.type == NetworkType.NONE -> RestrictionClass.NO_NETWORK to false
+            profile.captivePortal == true -> RestrictionClass.CAPTIVE_PORTAL to false
+            evidence.transportState is TransportState.Reconnecting -> RestrictionClass.NETWORK_RECOVERING to false
+            evidence.awgHandshakeFresh == true -> RestrictionClass.NO_RESTRICTION_OBSERVED to false
+            pattern == TransportBehaviorPattern.SUSTAINED_PROGRESS -> RestrictionClass.NO_RESTRICTION_OBSERVED to true
+            // B-WL-R2 - an allowed reference is reachable while every VPN
+            // endpoint attempt failed before payload: the network carries
+            // traffic, the VPN endpoints do not - the contrast a whitelist
+            // claim needs (checked before the shutdown rule it disproves).
+            pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED && referenceReachable == true -> RestrictionClass.POSSIBLE_HARD_WHITELIST to true
+            !profile.validatedInternet && pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED -> RestrictionClass.POSSIBLE_FULL_SHUTDOWN to true
+            !profile.validatedInternet -> RestrictionClass.INTERNET_NOT_VALIDATED to false
+            gatewayUnreachable && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST to false
+            pattern == TransportBehaviorPattern.ALL_CONNECT_FAILED && diverseInternetReachable == false -> RestrictionClass.POSSIBLE_HARD_WHITELIST to true
+            pattern == TransportBehaviorPattern.EARLY_DROP || pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP ||
+                pattern == TransportBehaviorPattern.REPEATED_EARLY_DROP_MULTI_DESTINATION -> RestrictionClass.POSSIBLE_EARLY_DROP to true
+            gatewayHttpsReachable == false -> RestrictionClass.GATEWAY_HTTPS_UNREACHABLE to false
+            // B-WL-R2 - checked BEFORE the probe-derived rule 8: when real UDP
+            // no-response + working-TCP behavior exists, it is the more
+            // specific, UDP-only explanation of the same failed AWG outcome
+            // rule 8 would otherwise label with the weaker, not-UDP-specific
+            // class (in the real runtime a failed AWG attempt followed by a
+            // confirmed Xray attempt leaves awgHandshakeFresh == false, so
+            // rule 8 would always preempt it). Without such evidence rule 8
+            // is untouched.
+            pattern == TransportBehaviorPattern.UDP_NO_RESPONSE_TCP_OK -> RestrictionClass.POSSIBLE_UDP_FILTERING to true
+            gatewayHttpsReachable == true && evidence.awgHandshakeFresh == false -> RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING to false
+            else -> RestrictionClass.UNKNOWN to false
         }
+    }
+
+    private fun behaviorOf(evidence: RestrictionEvidence, nowEpochMillis: Long, staleAfterMillis: Long): TransportBehaviorAssessment? =
+        if (evidence.transportObservations.isEmpty()) null
+        else TransportBehaviorAnalyzer.assess(evidence.transportObservations, nowEpochMillis, staleAfterMillis)
+
+    private fun behaviorReason(pattern: TransportBehaviorPattern): RestrictionEvidenceReason? = when (pattern) {
+        TransportBehaviorPattern.SUSTAINED_PROGRESS -> RestrictionEvidenceReason.TRANSPORT_SUSTAINED_PROGRESS
+        TransportBehaviorPattern.EARLY_DROP -> RestrictionEvidenceReason.TRANSPORT_EARLY_DROP
+        TransportBehaviorPattern.REPEATED_EARLY_DROP -> RestrictionEvidenceReason.TRANSPORT_REPEATED_EARLY_DROP
+        TransportBehaviorPattern.REPEATED_EARLY_DROP_MULTI_DESTINATION -> RestrictionEvidenceReason.TRANSPORT_EARLY_DROP_MULTI_DESTINATION
+        TransportBehaviorPattern.UDP_NO_RESPONSE_TCP_OK -> RestrictionEvidenceReason.TRANSPORT_UDP_NO_RESPONSE
+        TransportBehaviorPattern.ALL_CONNECT_FAILED -> RestrictionEvidenceReason.TRANSPORT_ALL_CONNECT_FAILED
+        TransportBehaviorPattern.INSUFFICIENT -> null
     }
 
     /**

@@ -50,26 +50,21 @@ import net.pocvpn.client.transport.TransportStatus
  * maturity. See PathScorerTest's boundary tests for the worst-case proof at
  * each tier.
  *
- * B28 - restriction-evidence tier: [RestrictionClass.POSSIBLE_HARD_WHITELIST]
- * is the ONLY restriction class that contributes a nonzero restrictionRank
- * (+1 for [PathCandidate.Relayed], -1 for [PathCandidate.Direct]) - every
- * other class (including UNKNOWN/NO_RESTRICTION_OBSERVED/
- * POSSIBLE_UDP_OR_AWG_FILTERING) contributes exactly 0, so normal healthy
- * direct behavior is completely unaffected outside a suspected hard
- * whitelist (requirement 1). POSSIBLE_UDP_OR_AWG_FILTERING deliberately
- * gets NO dedicated branch here: it is itself derived from a real
- * awgHandshakeFresh==false ConnectionOutcome, which ALREADY penalizes the
- * AMNEZIA_WG transport kind via the existing HEALTH_TIER
- * (TransportHealthCalculator) - a second, protocol-specific branch would be
- * exactly the redundant nested-if/else the task asked NOT to add
- * (requirement 2). This is scoring only - eligibility ([isEligible]) is
- * completely untouched by restriction evidence, so a relay candidate that
- * fails eligibility can never be promoted merely because whitelist evidence
- * looks bad (requirement 4), and both [net.pocvpn.client.smartconnect
- * .IngressKind] values participate identically - the bonus depends only on
- * candidate TYPE (Direct vs Relayed), never on which ingress kind, so
- * DIRECT_IP and CDN_FRONTED candidates are ranked among themselves purely by
- * their own reachability/health/history (requirement 3).
+ * B28 - restriction-evidence tier: under [RestrictionClass.POSSIBLE_HARD_WHITELIST]
+ * a [PathCandidate.Relayed] gets restrictionRank +1 and a [PathCandidate.Direct]
+ * -1. B-WL5 extends the same tier (still a rank strictly in [-1, 1], so the
+ * proof above is unchanged) with transport-aware preferences for the
+ * behavior-derived POSSIBLE_UDP_FILTERING and POSSIBLE_EARLY_DROP, read only from the
+ * candidate's real [TransportCapabilities] - see [restrictionPreference]. Every
+ * other class contributes exactly 0 - including the probe-derived
+ * POSSIBLE_UDP_OR_AWG_FILTERING (B28 unchanged: its trigger is the last outcome
+ * of ANY transport, so it must never demote AWG; AMNEZIA_WG is penalized only
+ * via HEALTH_TIER), UNKNOWN, NO_RESTRICTION_OBSERVED and POSSIBLE_FULL_SHUTDOWN - so normal healthy behavior is unaffected. This is
+ * scoring only - eligibility ([isEligible]) is completely untouched by
+ * restriction evidence, so an ineligible candidate is never promoted by it.
+ * The relay/direct preference never depends on [net.pocvpn.client.smartconnect
+ * .IngressKind]; under POSSIBLE_UDP_FILTERING the client-dialed transport's
+ * capabilities decide, which can differ between ingress kinds.
  *
  * B19 - typed reason tokens (see [Reason]) are appended to [PathScoreResult
  * .reasons] alongside the existing free-text summaries (never replacing
@@ -102,6 +97,12 @@ object PathScorer {
         RESTRICTION_FAVORS_RELAY,
         /** B28 - POSSIBLE_HARD_WHITELIST evidence penalized this DIRECT candidate relative to relayed alternatives. */
         RESTRICTION_PENALIZES_DIRECT,
+        /** B-WL5 - behavior-derived POSSIBLE_UDP_FILTERING favored this TCP, restrictive-network-suitable transport. */
+        RESTRICTION_FAVORS_TCP_TRANSPORT,
+        /** B-WL5 - behavior-derived POSSIBLE_UDP_FILTERING penalized this UDP-only transport. */
+        RESTRICTION_PENALIZES_UDP_TRANSPORT,
+        /** B-WL5 - early-drop evidence penalized this direct, long-lived-TCP-stream transport. */
+        RESTRICTION_PENALIZES_EARLY_DROP_PRONE,
     }
 
     data class PathScoreResult(
@@ -209,14 +210,12 @@ object PathScorer {
         // for that read), so the first hop's value is authoritative for the
         // whole candidate.
         val restrictionClass = candidate.hops.firstOrNull()?.reachability?.evidence?.restrictionClass
-        val restrictionRank = restrictionRank(candidate, restrictionClass)
+        val restrictionPreference = restrictionPreference(candidate, capabilities, restrictionClass)
+        val restrictionRank = restrictionPreference?.rank ?: 0
         val restrictionScore = restrictionRank.toLong() * RESTRICTION_TIER
-        if (restrictionRank > 0) {
-            reasons += "restriction=$restrictionClass favors relay"
-            reasons += Reason.RESTRICTION_FAVORS_RELAY.name
-        } else if (restrictionRank < 0) {
-            reasons += "restriction=$restrictionClass penalizes direct"
-            reasons += Reason.RESTRICTION_PENALIZES_DIRECT.name
+        if (restrictionPreference != null) {
+            reasons += "restriction=$restrictionClass ${restrictionPreference.summary}"
+            reasons += restrictionPreference.reason.name
         }
 
         val maturityScore = maturityRank(capabilities.maturity).toLong() * MATURITY_TIER
@@ -309,29 +308,48 @@ object PathScorer {
         }
     }
 
+    private data class RestrictionPreference(val rank: Int, val reason: Reason, val summary: String)
+
     /**
-     * B28 - the ONLY place restriction evidence turns into a scoring
-     * preference (requirement 7's single-decision-authority contract).
-     * Nonzero ONLY for [RestrictionClass.POSSIBLE_HARD_WHITELIST] - every
-     * other class (NORMAL/UNKNOWN included) is 0, so ordinary healthy
-     * direct behavior is never disturbed (requirement 1). +1 for
-     * [PathCandidate.Relayed] (bonus - a relay MAY route around a
-     * suspected fixed allowlist), -1 for [PathCandidate.Direct] (penalty -
-     * a direct path to a foreign EXIT is exactly what a hard whitelist
-     * would block) - symmetric so the tier-algebra proof in the class doc
-     * above covers both directions with the same range. Depends only on
-     * candidate TYPE, never on [net.pocvpn.client.smartconnect.IngressKind]
-     * - DIRECT_IP and CDN_FRONTED relayed candidates receive the identical
-     * +1, so neither ingress kind is ever globally preferred over the
-     * other by this tier (requirement 3); their relative order among
-     * themselves is still decided entirely by the higher REACHABILITY_TIER/
-     * HEALTH_TIER/HISTORY_TIER above.
+     * B-WL5 - extends the B28 rule above with transport-aware preferences for
+     * the other restriction classes, still returning a rank strictly in
+     * [-1, 1] so the class doc's tier-algebra proof holds unchanged. Transport
+     * facts come ONLY from [capabilities] (the registry's real
+     * [TransportCapabilities] for the client-dialed transport), never from a
+     * hardcoded TransportKind list:
+     *  - POSSIBLE_HARD_WHITELIST: unchanged B28 behavior (relay +1, direct -1).
+     *  - POSSIBLE_UDP_FILTERING (behavior-derived only): a UDP-only transport -1; a TCP transport
+     *    declared suitableForRestrictiveNetworks +1 (e.g. XHTTP ahead of RAW
+     *    REALITY ahead of AWG); any other TCP transport 0.
+     *  - POSSIBLE_EARLY_DROP: relay +1 (an allowed ingress may avoid the
+     *    per-destination drop); a direct transport that is neither UDP nor
+     *    declared suitableForRestrictiveNetworks -1 (a long-lived direct TCP
+     *    stream is exactly what just stalled); everything else 0.
+     *  - POSSIBLE_UDP_OR_AWG_FILTERING: 0 (B28 unchanged - not UDP-specific evidence).
+     *  - POSSIBLE_FULL_SHUTDOWN and every other class: 0 - no transport choice
+     *    helps a network that carries nothing; the bounded attempt budget and
+     *    PathHistoryStore cooldown provide the controlled fallback.
      */
-    private fun restrictionRank(candidate: PathCandidate, restrictionClass: RestrictionClass?): Int {
-        if (restrictionClass != RestrictionClass.POSSIBLE_HARD_WHITELIST) return 0
-        return when (candidate) {
-            is PathCandidate.Relayed -> 1
-            is PathCandidate.Direct -> -1
+    private fun restrictionPreference(candidate: PathCandidate, capabilities: TransportCapabilities, restrictionClass: RestrictionClass?): RestrictionPreference? {
+        val udpOnly = capabilities.usesUdp && !capabilities.usesTcp
+        return when (restrictionClass) {
+            RestrictionClass.POSSIBLE_HARD_WHITELIST -> when (candidate) {
+                is PathCandidate.Relayed -> RestrictionPreference(1, Reason.RESTRICTION_FAVORS_RELAY, "favors relay")
+                is PathCandidate.Direct -> RestrictionPreference(-1, Reason.RESTRICTION_PENALIZES_DIRECT, "penalizes direct")
+            }
+            RestrictionClass.POSSIBLE_UDP_FILTERING -> when {
+                udpOnly -> RestrictionPreference(-1, Reason.RESTRICTION_PENALIZES_UDP_TRANSPORT, "penalizes UDP-only transport")
+                capabilities.usesTcp && capabilities.suitableForRestrictiveNetworks ->
+                    RestrictionPreference(1, Reason.RESTRICTION_FAVORS_TCP_TRANSPORT, "favors TCP restrictive-network transport")
+                else -> null
+            }
+            RestrictionClass.POSSIBLE_EARLY_DROP -> when {
+                candidate is PathCandidate.Relayed -> RestrictionPreference(1, Reason.RESTRICTION_FAVORS_RELAY, "favors relay")
+                !capabilities.usesUdp && !capabilities.suitableForRestrictiveNetworks ->
+                    RestrictionPreference(-1, Reason.RESTRICTION_PENALIZES_EARLY_DROP_PRONE, "penalizes early-drop-prone direct TCP")
+                else -> null
+            }
+            else -> null
         }
     }
 

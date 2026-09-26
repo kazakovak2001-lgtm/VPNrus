@@ -25,7 +25,8 @@ object SignedManifestCodec {
     private const val MAX_SIGNATURE_BYTES = 256
 
     fun encode(signed: SignedManifest): ByteArray {
-        val canonicalBytes = ManifestCanonicalizer.canonicalBytes(signed.manifest)
+        // Schema 2: the exact signed bytes, verbatim - never a re-encoding of the filtered manifest.
+        val canonicalBytes = signed.signedCanonicalBytes ?: ManifestCanonicalizer.canonicalBytes(signed.manifest)
         val out = ByteArrayOutputStream()
         DataOutputStream(out).use { d ->
             d.writeInt(FORMAT_VERSION)
@@ -62,7 +63,28 @@ object SignedManifestCodec {
             val signature = ByteArray(sigLen)
             input.readFully(signature)
             require(stream.available() == 0) { "trailing bytes after signed-manifest container (expected EOF): ${stream.available()} extra byte(s)" }
-            return SignedManifest(ManifestCanonicalizer.decode(canonicalBytes), signature)
+            return decodeCanonical(canonicalBytes, signature)
         }
     }
+
+    /**
+     * B-WL-R6 - explicit dispatch on the canonical schema integer (the first
+     * 4 bytes of the signed bytes, so the marker itself is signed). Never
+     * "try schema 2 if schema 1 fails". Schema 1 is the unchanged strict
+     * decoder (an unknown transport wire id still rejects the manifest);
+     * any other value is unsupported and rejected.
+     */
+    private fun decodeCanonical(canonicalBytes: ByteArray, signature: ByteArray): SignedManifest {
+        require(canonicalBytes.size >= 4) { "canonical manifest too short for a schema marker" }
+        return when (val schema = java.nio.ByteBuffer.wrap(canonicalBytes, 0, 4).int) {
+            SCHEMA_1 -> SignedManifest(ManifestCanonicalizer.decode(canonicalBytes), signature)
+            ManifestSchema2Codec.SCHEMA_VERSION -> {
+                val decoded = ManifestSchema2Codec.decode(canonicalBytes)
+                SignedManifest(decoded.manifest, signature, canonicalBytes.copyOf(), decoded.tolerance)
+            }
+            else -> throw IllegalArgumentException("unsupported canonical manifest schema: $schema")
+        }
+    }
+
+    private const val SCHEMA_1 = 1
 }

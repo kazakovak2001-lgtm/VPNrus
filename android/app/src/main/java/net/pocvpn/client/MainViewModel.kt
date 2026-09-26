@@ -580,6 +580,16 @@ class MainViewModel(
     // device's managed-network public key as a peer on the user's own VPS,
     // an identity-linkage bug, not a convenience).
     private val privateGatewayKeyRepository: ClientKeyRepository? = null,
+    // B-WL-R1 - per-attempt behavior evidence for RestrictionClassifier
+    // (see VpnController.recentTransportObservations). Null (the default,
+    // and every existing test call site) records and reads nothing, so
+    // restriction classification is exactly the pre-B-WL-R1 behavior.
+    private val transportObservationStore: net.pocvpn.client.smartconnect.TransportObservationStore? = null,
+    // B-WL-R6 - the ONE VlessRealityXhttpTransport instance, registered for
+    // selection (buildTransportRegistry) and executed through VpnController's
+    // registry-resolved transport, same "one instance" discipline as the
+    // other optional transports above. Null = kind never AVAILABLE.
+    private val realityXhttpTransport: VpnTransport? = null,
 ) : ViewModel() {
     // A debug UI force is intentionally a one-shot input. Keep the marker
     // separate from userTransportPreference so constructor-injected Manual
@@ -967,6 +977,11 @@ class MainViewModel(
             supportDiagnosticsRecorder?.recordTransportAttemptStarted(endpointId, kind)
         },
         onReconnectIncident = { event -> recordReconnectIncidentEvent(event) },
+        transportObservationStore = transportObservationStore,
+        onTransportObservation = { observation ->
+            supportDiagnosticsRecorder?.recordTransportAttemptObserved(observation)
+            supportDiagnosticsRecorder?.recordRestrictionAssessed(restrictionAssessment())
+        },
     )
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
@@ -1021,6 +1036,21 @@ class MainViewModel(
      * never claiming support for an ABI/binary this checkout does not
      * actually package.
      */
+    /**
+     * B-WL-R6 - fail-closed eligibility for XRAY_REALITY_XHTTP on [endpointId]:
+     * a wired transport, this device's own provisioned REALITY profile for the
+     * endpoint (the credentials REALITY+XHTTP reuses), and a trusted signed
+     * binding of this exact kind whose XHTTP facts parse. No manifest in
+     * production carries such a binding today, so this is false in production.
+     */
+    private fun isRealityXhttpAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean {
+        if (realityXhttpTransport == null || !isXrayAvailableFor(endpointId)) return false
+        val binding = trustedTransportBindingFor(endpointId, TransportKind.XRAY_REALITY_XHTTP) ?: return false
+        val profile = binding.signedTransportProfile(endpointId)
+        return profile is net.pocvpn.client.reachability.SignedTransportProfileReadResult.Parsed &&
+            profile.profile is net.pocvpn.client.reachability.SignedTransportProfile.RealityXhttp
+    }
+
     private fun isShadowsocksAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean {
         if (!shadowsocksBinaryEligibility.isEligible) return false
         if (endpointId !in shadowsocksAvailableEndpoints.value) return false
@@ -1223,6 +1253,19 @@ class MainViewModel(
         // A NOT_IMPLEMENTED (no shadowsocksTransport wired at all) or
         // ineligible device/endpoint never gets a factory - fails closed
         // exactly like every other not-yet-eligible kind in this function.
+        // B-WL-R6 - AVAILABLE only when isRealityXhttpAvailableFor(endpointId):
+        // this device holds the endpoint's REALITY profile AND the trusted
+        // manifest carries a valid signed XRAY_REALITY_XHTTP binding for it.
+        val realityXhttp = realityXhttpTransport
+        if (realityXhttp != null) {
+            val available = isRealityXhttpAvailableFor(endpointId)
+            descriptors += TransportDescriptor(
+                kind = TransportKind.XRAY_REALITY_XHTTP,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) realityXhttp.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ realityXhttp }) else null,
+            )
+        }
         val shadowsocks = shadowsocksTransport
         if (shadowsocks != null) {
             val available = isShadowsocksAvailableFor(endpointId)
@@ -1346,7 +1389,13 @@ class MainViewModel(
      * [stabilizedRestrictionClass] for the SEPARATE, hysteresis-smoothed
      * value the actual DIRECT-vs-RELAY decision authority reads.
      */
-    fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(
+    fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(restrictionEvidence(), nowEpochMillis = nowProvider())
+
+    /** B-WL-R2 - the B40 assessment (class + qualitative confidence + reasons + behavior pattern) over the SAME evidence [restrictionClass] classifies. */
+    fun restrictionAssessment(): net.pocvpn.client.smartconnect.RestrictionAssessment =
+        RestrictionClassifier.assess(restrictionEvidence(), nowEpochMillis = nowProvider())
+
+    private fun restrictionEvidence(): RestrictionEvidence =
         RestrictionEvidence(
             networkProfile = networkProfile.value,
             transportState = transportState.value,
@@ -1355,9 +1404,11 @@ class MainViewModel(
             diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
             gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
             diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
-        ),
-        nowEpochMillis = nowProvider(),
-    )
+            // B-WL-R2 - real attempt behavior on THIS network (empty unless a store is wired).
+            transportObservations = controller.recentTransportObservations(),
+            referenceReachable = restrictionMonitor?.lastReferenceReachabilityResult?.value,
+            referenceProbeEpochMillis = restrictionMonitor?.lastReferenceReachabilityEpochMillis?.value,
+        )
 
     /** B28 review fix (blocker 2) - see [stabilizedRestrictionClass]'s own docs; the ONLY mutable field this stabilization mechanism needs. */
     private var restrictionStabilizerState: net.pocvpn.client.smartconnect.RestrictionStabilizer.State? = null
@@ -1689,6 +1740,9 @@ class MainViewModel(
 
     val transportState: StateFlow<TransportState> = controller.state
 
+    /** B-WL-R3 - post-connect traffic-progress verdict of the current session (observational; see VpnController.trafficProgress). */
+    val trafficProgress: StateFlow<net.pocvpn.client.smartconnect.TrafficProgressVerdict?> = controller.trafficProgress
+
     // B25 (task B) - the real Protected-gating authority UI code should
     // read for status text/visuals going forward (see [VpnSessionHealth]'s
     // own docs) - for every Direct/manual/private-gateway attempt this is
@@ -1864,6 +1918,10 @@ class MainViewModel(
     init {
         viewModelScope.launch {
             _publicKey.value = clientKeyRepository.getPublicKey()
+        }
+        // B-WL-R3 - each distinct traffic-progress verdict lands in the open diagnostics session (no-op when none is open).
+        viewModelScope.launch {
+            controller.trafficProgress.collect { verdict -> verdict?.let { supportDiagnosticsRecorder?.recordTrafficProgress(it) } }
         }
         restorePersistedProfile()
         // B8I7 - one-time startup check: does a real Xray profile already
@@ -2879,6 +2937,7 @@ class MainViewModel(
             xrayAvailableFor = ::isXrayAvailableFor,
             xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
             shadowsocksAvailableFor = ::isShadowsocksAvailableFor,
+            realityXhttpAvailableFor = ::isRealityXhttpAvailableFor,
             reachabilityFor = { endpointId, kind ->
                 val gateway = gatewaysById.getValue(endpointId)
                 val endpoint = net.pocvpn.client.smartconnect.ProductionGatewayEndpoints.descriptorFor(
@@ -3102,6 +3161,7 @@ class MainViewModel(
             xrayAvailableFor = ::isXrayAvailableFor,
             xrayTlsAvailableFor = ::isXrayTlsAvailableFor,
             shadowsocksAvailableFor = ::isShadowsocksAvailableFor,
+            realityXhttpAvailableFor = ::isRealityXhttpAvailableFor,
             cdnRuntimeCapabilities = cdnRuntimeCapabilities,
             reachabilityFor = { endpointId, kind ->
                 // B24 - relay endpoint ids (an INGRESS/EXIT the manifest
@@ -3192,9 +3252,14 @@ class MainViewModel(
         supportDiagnosticsRecorder?.startSession(
             buildDiagnosticStartContext(rawRestrictionClass = restrictionClass(), stabilizedRestrictionClass = snapshot.restrictionClass),
         )
+        // One trusted-state read for both manifest events.
+        val trustedManifest = manifestRepository?.trustedState() as? net.pocvpn.client.reachability.TrustedManifestState.Trusted
         supportDiagnosticsRecorder?.recordManifestSourceSelected(
-            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(manifestRepository?.trustedSource()),
+            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(trustedManifest?.source),
         )
+        trustedManifest?.tolerance?.takeIf { it.ignoredUnknownBindings > 0 }?.let {
+            supportDiagnosticsRecorder?.recordManifestUnknownTransportIgnored(it.ignoredUnknownBindings, it.droppedEndpoints)
+        }
         supportDiagnosticsRecorder?.recordCandidateRanked(attempts.size)
         if (attempts.isEmpty()) {
             // B28 review fix (blocker 1) - report TRUTHFULLY when this
@@ -4104,6 +4169,10 @@ class MainViewModel(
                 gatewaySelectionModeStore = gatewaySelectionModeStore,
                 privateGatewayStore = privateGatewayStore,
                 privateGatewayKeyRepository = privateGatewayKeyRepository,
+                // B-WL-R1 - production records real attempt observations (in memory, network-scoped).
+                transportObservationStore = net.pocvpn.client.smartconnect.TransportObservationStore(),
+                // B-WL-R6 - registered, but only ever AVAILABLE for an endpoint with a signed binding (none today).
+                realityXhttpTransport = net.pocvpn.client.vpn.VlessRealityXhttpTransport(context),
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 routingModeStore = routingModeStore,

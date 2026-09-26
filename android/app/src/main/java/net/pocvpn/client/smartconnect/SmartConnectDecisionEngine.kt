@@ -33,6 +33,10 @@ object SmartConnectDecisionEngine {
         // unavailable (or the user pins it via Manual), same as this list's
         // existing ordering discipline never reorders an earlier entry.
         TransportKind.SHADOWSOCKS_2022,
+        // B-WL-R6 - appended, never inserted: on a NORMAL network the
+        // existing order is untouched and this kind only ever wins by real
+        // evidence (restriction tier, health, history), never by position.
+        TransportKind.XRAY_REALITY_XHTTP,
     )
 
     fun decide(

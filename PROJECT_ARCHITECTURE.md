@@ -1620,6 +1620,11 @@ exists.
   `AMNEZIA_WG` via the pre-existing `HEALTH_TIER`
   (`TransportHealthCalculator`); a second protocol-specific branch here
   would be exactly the redundant nested if/else the task asked not to add.
+  **Amended by B-WL5 (2026-09-25):** "nonzero ONLY for POSSIBLE_HARD_WHITELIST"
+  no longer holds - the behavior-derived `POSSIBLE_EARLY_DROP` and
+  `POSSIBLE_UDP_FILTERING` classes also contribute (rank still in [-1, 1]; see
+  "Adaptive network layer (B-WL)" below). `POSSIBLE_UDP_OR_AWG_FILTERING` still
+  gets no branch, exactly as stated here.
 - **Eligibility is untouched (requirement 4)**: `PathScorer.isEligible`/
   `ineligibilityReason` gained ZERO new logic. Restriction only affects
   SCORE among already-eligible candidates - a relay candidate that is
@@ -2385,6 +2390,47 @@ against a real, independently-provisioned isolated peer on the Stockholm
 gateway (real handshake, real bidirectional data plane, distinct exit IP,
 DNS/IPv6 invariants held, managed identity/state completely unaffected - see
 `docs/ROADMAP.md`'s B22 row for the full evidence).
+
+## Adaptive network layer (B-WL, 2026-09-25) - invariants
+
+- `RestrictionClassifier` stays the single classification authority. Transport
+  behavior enters only via optional `RestrictionEvidence.transportObservations`
+  (`TransportAttemptObservation`: field-closed, opaque `destinationKey`, no
+  host/IP/UUID/key). Empty list = previous behavior exactly.
+- `TransportBehaviorAnalyzer` never uses a byte threshold; early drop is
+  connect + handshake + payload + stall-while-sending + no RST. New classes are
+  `POSSIBLE_EARLY_DROP`, `POSSIBLE_UDP_FILTERING` and `POSSIBLE_FULL_SHUTDOWN`
+  (always `POSSIBLE_`), all behavior-derived only. Early drop never maps to
+  `POSSIBLE_HARD_WHITELIST` (no allowed-reference contrast). Confidence is B40's
+  qualitative `RestrictionEvidenceQuality`, not a number.
+- `PathScorer` restriction tier keeps rank in [-1, 1]; transport preferences
+  react only to behavior-derived classes and are derived only from registry
+  `TransportCapabilities` (`usesUdp`/`usesTcp`/`suitableForRestrictiveNetworks`),
+  never from a `TransportKind` list. The probe-derived
+  `POSSIBLE_UDP_OR_AWG_FILTERING` (not UDP-specific: last outcome of ANY
+  transport) keeps rank 0. History/cooldown still outrank the tier.
+- Runtime (B-WL-R1..R4): `VpnController` records observations into a
+  network-scoped in-memory `TransportObservationStore`; `MainViewModel` feeds
+  them to the classifier. Xray outbound counters feed `TrafficProgressMonitor`
+  inside the EXISTING B33 watchdog; a stall only triggers the Xray-native
+  confirmation round trip, teardown still needs two failed round trips.
+- `XRAY_REALITY_XHTTP` (B-WL-R6) is registered but fail-closed: AVAILABLE only
+  with the device's REALITY profile AND a trusted signed binding carrying valid
+  XHTTP path/mode. No published or bootstrap manifest carries it.
+- `TransportKind.wireId` (stable, explicit, frozen: 0-5 = historical ordinals,
+  6 = XRAY_REALITY_XHTTP) is the ONLY value ever signed or persisted
+  (manifest codec incl. binding sort order, PathHistoryStore,
+  ConnectionOutcomeStore) - never `ordinal`. In schema 1 an unknown id still
+  rejects the whole manifest; a new kind must never be published in the
+  schema-1 manifest (see docs/B_WL_R6_MANIFEST_TRANSPORT_KIND_ROLLOUT.md).
+- Signed manifest schema is the first canonical int; `SignedManifestCodec`
+  dispatches 1 -> `ManifestCanonicalizer` (strict, unchanged), 2 ->
+  `ManifestSchema2Codec` (client-side only, nothing publishes it), else reject.
+  Schema 2 ignores structurally valid unknown-id bindings. Its
+  `SignedManifest.signedCanonicalBytes` are the exact received bytes: the
+  verifier checks the signature over them, then trusts the manifest only if it
+  equals the interpretation re-derived from them; LKG persists them verbatim.
+  A filtered manifest is never re-serialized for verification.
 
 ## Production vs debug boundary
 

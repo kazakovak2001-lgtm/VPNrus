@@ -32,15 +32,33 @@ data class EndpointManifest(
     }
 }
 
-/** A manifest plus the raw signature bytes over its canonical encoding - see ManifestCanonicalizer. */
-data class SignedManifest(val manifest: EndpointManifest, val signature: ByteArray) {
+/**
+ * A manifest plus the raw signature bytes over its canonical encoding - see
+ * ManifestCanonicalizer (schema 1) and ManifestSchema2Codec (schema 2).
+ *
+ * [signedCanonicalBytes] is null for schema 1, whose signed bytes are
+ * reproduced exactly by re-canonicalizing [manifest]. For schema 2 it holds
+ * the exact received canonical bytes: [manifest] may omit ignored bindings,
+ * so it can never be re-serialized into what was signed. Verification and
+ * persistence (SignedManifestCodec.encode) both use these bytes verbatim.
+ * Never mutated after decode (any mutation fails re-verification, which is fail-closed).
+ * [tolerance] says what the schema-2 interpretation left out (diagnostics only).
+ */
+data class SignedManifest(
+    val manifest: EndpointManifest,
+    val signature: ByteArray,
+    val signedCanonicalBytes: ByteArray? = null,
+    val tolerance: ManifestTolerance = ManifestTolerance.NONE,
+) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is SignedManifest) return false
-        return manifest == other.manifest && signature.contentEquals(other.signature)
+        return manifest == other.manifest && signature.contentEquals(other.signature) &&
+            signedCanonicalBytes.contentEquals(other.signedCanonicalBytes) && tolerance == other.tolerance
     }
 
-    override fun hashCode(): Int = 31 * manifest.hashCode() + signature.contentHashCode()
+    override fun hashCode(): Int =
+        ((31 * manifest.hashCode() + signature.contentHashCode()) * 31 + signedCanonicalBytes.contentHashCode()) * 31 + tolerance.hashCode()
 }
 
 /**
@@ -99,7 +117,8 @@ object ManifestCanonicalizer {
         writeString(d, e.provider)
         d.writeBoolean(e.asn != null)
         d.writeInt(e.asn ?: 0)
-        val transportsSorted = e.transports.sortedBy { it.kind.ordinal }
+        // Sorted by the STABLE wire id (identical to the historical ordinal order for ids 0-6).
+        val transportsSorted = e.transports.sortedBy { it.kind.wireId }
         d.writeInt(transportsSorted.size)
         transportsSorted.forEach { writeBinding(d, it) }
         d.writeBoolean(e.relayTo != null)
@@ -144,7 +163,7 @@ object ManifestCanonicalizer {
     }
 
     private fun writeBinding(d: java.io.DataOutputStream, b: EndpointTransportBinding) {
-        d.writeInt(b.kind.ordinal)
+        d.writeInt(b.kind.wireId)
         writeString(d, b.host)
         d.writeInt(b.port)
         val metadataSorted = b.metadata.entries.sortedBy { it.key }
@@ -154,8 +173,11 @@ object ManifestCanonicalizer {
 
     private fun readBinding(d: java.io.DataInputStream): EndpointTransportBinding {
         val kindOrdinal = d.readInt()
-        val kind = net.pocvpn.client.transport.TransportKind.entries.getOrNull(kindOrdinal)
-            ?: throw IllegalArgumentException("unknown TransportKind ordinal $kindOrdinal")
+        // B-WL-R6 - explicit stable wire id; an id this build does not know
+        // still rejects the WHOLE manifest (fail closed) - see
+        // docs/B_WL_R6_MANIFEST_TRANSPORT_KIND_ROLLOUT.md.
+        val kind = net.pocvpn.client.transport.TransportKind.fromWireId(kindOrdinal)
+            ?: throw IllegalArgumentException("unknown TransportKind wire id $kindOrdinal")
         val host = readString(d)
         val port = d.readInt()
         val metadataCount = d.readInt()

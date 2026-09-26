@@ -52,7 +52,7 @@ enum class EndpointOperationalState { ACTIVE, DISABLED, RETIRED }
 
 /** B23 - the reserved [EndpointTransportBinding.metadata] key [ingressKind]/[withIngressKind] read/write - never touched directly by callers. */
 private const val INGRESS_KIND_METADATA_KEY = "ingressKind"
-private const val OPERATIONAL_STATE_METADATA_KEY = "endpointOperationalState"
+internal const val OPERATIONAL_STATE_METADATA_KEY = "endpointOperationalState"
 private const val FAILURE_DOMAIN_OPERATOR_KEY = "failureDomain.operator"
 private const val FAILURE_DOMAIN_NETWORK_KEY = "failureDomain.network"
 private const val FAILURE_DOMAIN_REGION_KEY = "failureDomain.region"

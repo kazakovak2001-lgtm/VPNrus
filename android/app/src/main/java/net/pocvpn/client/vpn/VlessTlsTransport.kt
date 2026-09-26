@@ -15,6 +15,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
+import net.pocvpn.client.smartconnect.TrafficProgressSnapshot
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
@@ -79,6 +80,7 @@ class VlessTlsTransport(
         }
 
         val sessionId = nextSessionId.incrementAndGet()
+        currentSessionId = sessionId
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -118,6 +120,12 @@ class VlessTlsTransport(
             state.value = TransportState.Error(t.message ?: "disconnect failed", t)
         }
     }
+
+    // B-WL-R3 - the session this transport most recently started; only that
+    // session's traffic-progress reports are ever surfaced.
+    @Volatile private var currentSessionId: Long? = null
+
+    override fun observeTrafficProgress(): Flow<TrafficProgressSnapshot> = xrayTrafficProgressFor { currentSessionId }
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 

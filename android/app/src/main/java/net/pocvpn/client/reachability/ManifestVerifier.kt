@@ -67,13 +67,33 @@ class Ed25519ManifestVerifier(
             return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.EXPIRED, "manifest has expired")
         }
 
-        val canonical = ManifestCanonicalizer.canonicalBytes(manifest)
+        // Schema 2 (B-WL-R6): the exact received canonical bytes. Schema 1:
+        // the re-canonicalization, which its strict decoder guarantees is
+        // byte-identical to what was received.
+        val signedBytes = signed.signedCanonicalBytes
+        val canonical = signedBytes ?: ManifestCanonicalizer.canonicalBytes(manifest)
         val signatureValid = try {
             verifyEd25519(publicKeyBytes, canonical, signed.signature)
         } catch (e: IllegalArgumentException) {
             false
         }
         if (!signatureValid) return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.INVALID_SIGNATURE, "signature verification failed")
+
+        // Only now, over bytes whose signature just verified, is the schema-2
+        // interpretation (re)derived; the candidate [manifest] is trusted only
+        // if it is exactly that interpretation.
+        if (signedBytes != null) {
+            val interpreted = try {
+                ManifestSchema2Codec.decode(signedBytes)
+            } catch (e: IllegalArgumentException) {
+                null
+            } catch (e: java.io.IOException) {
+                null
+            }
+            if (interpreted == null || interpreted.manifest != manifest || interpreted.tolerance != signed.tolerance) {
+                return ManifestVerificationResult.Invalid(ManifestVerificationFailureKind.INVALID_SIGNATURE, "manifest does not match its signed schema-2 bytes")
+            }
+        }
 
         return ManifestVerificationResult.Valid
     }

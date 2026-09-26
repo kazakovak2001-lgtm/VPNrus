@@ -11,6 +11,8 @@ import net.pocvpn.client.reachability.PathCandidateBuilder
 import net.pocvpn.client.reachability.PathDiversity
 import net.pocvpn.client.reachability.PathHistoryEntry
 import net.pocvpn.client.reachability.PathScorer
+import net.pocvpn.client.reachability.RealityXhttpBindingReadResult
+import net.pocvpn.client.reachability.realityXhttpProfile
 import net.pocvpn.client.reachability.ReachabilityState
 import net.pocvpn.client.reachability.CdnClientCompatibility
 import net.pocvpn.client.reachability.CdnClientRuntimeCapabilities
@@ -151,6 +153,12 @@ object AutoGatewaySelector {
         // Defaults to `{ false }` - fail closed for any caller that never
         // wires Shadowsocks.
         shadowsocksAvailableFor: (EndpointId) -> Boolean = { false },
+        // B-WL-R6 - same device-eligibility gate shape as xrayAvailableFor
+        // (REALITY+XHTTP reuses the device's provisioned REALITY profile);
+        // the binding itself must ALSO carry valid signed XHTTP facts (see
+        // realityXhttpProfile()). Defaults to { false } - fail closed for every
+        // caller that never opts in; appended last for positional safety.
+        realityXhttpAvailableFor: (EndpointId) -> Boolean = { false },
     ): List<GatewayAttemptCandidate> {
         val eligible = manifestEndpoints.mapNotNull { manifestEndpoint ->
             val gateway = gatewayFactsFor(manifestEndpoint.id) ?: return@mapNotNull null
@@ -192,6 +200,8 @@ object AutoGatewaySelector {
                     // B45B-4 - same per-endpoint device-eligibility gate shape as
                     // XRAY_REALITY/TLS_TCP above.
                     TransportKind.SHADOWSOCKS_2022 -> shadowsocksAvailableFor(manifestEndpoint.id)
+                    TransportKind.XRAY_REALITY_XHTTP -> realityXhttpAvailableFor(manifestEndpoint.id) &&
+                        binding.realityXhttpProfile() is RealityXhttpBindingReadResult.Parsed
                     else -> false
                 }
             }
@@ -602,11 +612,13 @@ object AutoGatewaySelector {
         // at the end for the same "every pre-existing positional call site
         // unaffected" reason.
         shadowsocksAvailableFor: (EndpointId) -> Boolean = { false },
+        // B-WL-R6 - see buildCandidates's own docs for this parameter.
+        realityXhttpAvailableFor: (EndpointId) -> Boolean = { false },
     ): List<AutoConnectAttempt> {
         val direct = buildCandidates(
             manifestEndpoints, gatewayFactsFor, provisioned, clientTunnelIp, registryFor,
             xrayAvailableFor, xrayTlsAvailableFor, reachabilityFor, transportHealthFor, historyFor,
-            preference, nowEpochMillis, shadowsocksAvailableFor,
+            preference, nowEpochMillis, shadowsocksAvailableFor, realityXhttpAvailableFor,
         )
         val relayed = buildRelayedCandidates(
             manifestEndpoints, registryFor, reachabilityFor, transportHealthFor, historyFor,

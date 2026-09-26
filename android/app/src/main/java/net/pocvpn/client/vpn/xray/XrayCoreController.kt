@@ -11,6 +11,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.smartconnect.TrafficProgressMonitor
+import net.pocvpn.client.smartconnect.TrafficProgressPolicy
+import net.pocvpn.client.smartconnect.TrafficProgressSample
+import net.pocvpn.client.smartconnect.TrafficProgressSnapshot
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.policy.RoutingMode
 
@@ -243,6 +247,7 @@ class XrayCoreController(
     // failure branch clearing itself.
     @Volatile private var relayHealthWatchdogJob: Job? = null
 
+
     suspend fun requestStart(
         kind: TransportKind = TransportKind.XRAY_REALITY,
         routingMode: RoutingMode = RoutingMode.FULL_VPN,
@@ -262,6 +267,8 @@ class XrayCoreController(
         // .Relayed] already established.
         onRelayHealthLost: suspend () -> Unit = {},
         xhttpConfig: XrayVlessXhttpConfig? = null,
+        onTrafficProgress: (TrafficProgressSnapshot) -> Unit = {},
+        realityXhttpConfig: XrayVlessRealityXhttpConfig? = null,
     ): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
@@ -304,6 +311,23 @@ class XrayCoreController(
                             )
                     }
                 }
+                // B-WL-R6 - re-validated here (defense in depth: the store is
+                // process-local, but this is the last point before the core
+                // starts) - REALITY validator + XHTTP path + no Vision flow.
+                TransportKind.XRAY_REALITY_XHTTP -> {
+                    val config = realityXhttpConfig
+                        ?: return XrayCoreStartOutcome.Rejected("REALITY+XHTTP runtime config not supplied")
+                    when (val validated = validateXrayVlessRealityXhttpConfig(config)) {
+                        is XrayRealityXhttpConfigValidationResult.Invalid ->
+                            return XrayCoreStartOutcome.Rejected("REALITY+XHTTP runtime config invalid")
+                        is XrayRealityXhttpConfigValidationResult.Valid ->
+                            ReadyToStart(
+                                buildXrayVpnPlan(validated.config.reality, novaPackageId, routingMode),
+                                XrayConfigRenderer.render(validated.config),
+                                validated.config.reality.server,
+                            )
+                    }
+                }
                 TransportKind.XRAY_REALITY -> {
                     when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                         is XrayRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
@@ -331,13 +355,26 @@ class XrayCoreController(
                 if (confirmRemoteConnectivity(ready.serverHost, confirmationContext)) {
                     success = true
                     // B33 relay follow-up (round 3) - a genuine Connected
-                    // relayed session gets ongoing health monitoring; a
-                    // Direct one does not (no ownerless-relay-tun class of
-                    // bug exists for Direct - see [startRelayHealthWatchdog]'s
-                    // own docs for exactly why only [RemoteConfirmationContext
-                    // .Relayed] qualifies).
-                    if (confirmationContext is RemoteConfirmationContext.Relayed) {
-                        startRelayHealthWatchdog(confirmationContext.exitProbeHost, onRelayHealthLost)
+                    // relayed session gets ongoing periodic EXIT probing
+                    // (unchanged). B-WL-R3 - the SAME watchdog now also runs
+                    // for a Direct session, but WITHOUT the periodic probe:
+                    // it only samples Xray's outbound counters, and a real
+                    // stall can at most trigger an extra confirmation round
+                    // trip (see [startRelayHealthWatchdog]'s own docs).
+                    // The first counter read also tells whether this runtime
+                    // HAS a counter channel at all (null = none). A Direct
+                    // session without one gets no watchdog - nothing for it
+                    // to do - exactly the pre-B-WL-R3 behavior.
+                    val relayed = confirmationContext is RemoteConfirmationContext.Relayed
+                    val initialCounters = runCatching { coreRuntime.queryOutboundTrafficStats() }.getOrNull()
+                    if (relayed || initialCounters != null) {
+                        startRelayHealthWatchdog(
+                            probeUrl = confirmationUrl(ready.serverHost, confirmationContext),
+                            periodicProbe = relayed,
+                            onUnhealthy = onRelayHealthLost,
+                            onTrafficProgress = onTrafficProgress,
+                            initialCounters = initialCounters,
+                        )
                     }
                     XrayCoreStartOutcome.Started
                 } else {
@@ -454,8 +491,12 @@ class XrayCoreController(
      * just as much an ordinary blocking-native call running on [probeScope]
      * here, abandoned exactly the same way on timeout.
      */
-    private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
-        val url = when (context) {
+    private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean =
+        boundedMeasureDelay(confirmationUrl(serverHost, context))
+
+    /** The one Xray-native confirmation target per context - shared by [confirmRemoteConnectivity] and the session watchdog. */
+    private fun confirmationUrl(serverHost: String, context: RemoteConfirmationContext): String =
+        when (context) {
             is RemoteConfirmationContext.Direct -> "https://$serverHost/v1/manifest"
             // B33 relay follow-up (round 2) - the EXIT's own host,
             // never [serverHost] (that is the client's dial target -
@@ -469,8 +510,6 @@ class XrayCoreController(
             // empirical proof this target is safe.
             is RemoteConfirmationContext.Relayed -> "https://${context.exitProbeHost}/v1/manifest"
         }
-        return boundedMeasureDelay(url)
-    }
 
     /**
      * B33 relay follow-up (round 3) - the SAME bounded-abandonable
@@ -567,28 +606,74 @@ class XrayCoreController(
      * at a time, so a stale watchdog cannot outlive into - or act on - a
      * later, different session, by construction (never keyed on a
      * separately-tracked session id that could drift).
+     *
+     * B-WL-R3 amendment - this is now the session health watchdog for EVERY
+     * confirmed session, not only Relayed ones. [periodicProbe] keeps the
+     * Relayed-only periodic probe above exactly as it was; for every session
+     * it additionally reads Xray's own outbound counters every
+     * [TRAFFIC_SAMPLE_INTERVAL_MS] and publishes a [TrafficProgressMonitor]
+     * verdict. An unhealthy verdict (peer silent while we keep sending) only
+     * TRIGGERS an extra [boundedMeasureDelay] round trip against the same
+     * confirmation target; teardown still requires
+     * [RELAY_HEALTH_FAILURE_THRESHOLD] consecutive FAILED round trips, the
+     * same B33 rule. A runtime without counters changes nothing.
      */
-    private fun startRelayHealthWatchdog(exitProbeHost: String, onUnhealthy: suspend () -> Unit) {
-        val url = "https://$exitProbeHost/v1/manifest"
+    private fun startRelayHealthWatchdog(
+        probeUrl: String,
+        periodicProbe: Boolean,
+        onUnhealthy: suspend () -> Unit,
+        onTrafficProgress: (TrafficProgressSnapshot) -> Unit,
+        initialCounters: String? = null,
+    ) {
         relayHealthWatchdogJob = probeScope.launch {
+            // B-WL-R3 - traffic progress from Xray's own outbound counters.
+            // A null runtime result means "no counter channel": nothing is
+            // published and nothing is triggered - exactly the B33 behavior.
+            val accumulator = XrayOutboundTrafficAccumulator()
+            val samples = ArrayDeque<TrafficProgressSample>()
+            // The start-time read reset the core's counters; keep its deltas
+            // (the confirmation round trip) as the session's baseline.
+            if (accumulator.add(initialCounters)) samples.addLast(TrafficProgressSample(0L, accumulator.downlinkBytes, accumulator.uplinkBytes))
+            var elapsedMillis = 0L
+            var sinceProbeMillis = 0L
             var consecutiveFailures = 0
             while (isActive) {
-                delay(RELAY_HEALTH_PROBE_INTERVAL_MS)
+                delay(TRAFFIC_SAMPLE_INTERVAL_MS)
                 if (!isActive) return@launch
-                val healthy = boundedMeasureDelay(url)
-                if (healthy) {
+                elapsedMillis += TRAFFIC_SAMPLE_INTERVAL_MS
+                sinceProbeMillis += TRAFFIC_SAMPLE_INTERVAL_MS
+
+                var probeNow = periodicProbe && sinceProbeMillis >= RELAY_HEALTH_PROBE_INTERVAL_MS
+                var progressTriggered = false
+                val raw = runCatching { coreRuntime.queryOutboundTrafficStats() }.getOrNull()
+                if (accumulator.add(raw)) {
+                    samples.addLast(TrafficProgressSample(elapsedMillis, accumulator.downlinkBytes, accumulator.uplinkBytes))
+                    while (samples.isNotEmpty() && elapsedMillis - samples.first().elapsedMillis > TRAFFIC_SAMPLE_RETENTION_MS) samples.removeFirst()
+                    val verdict = TrafficProgressMonitor.evaluate(samples.toList(), TRAFFIC_PROGRESS_POLICY)
+                    runCatching { onTrafficProgress(TrafficProgressSnapshot(verdict, accumulator.downlinkBytes, accumulator.uplinkBytes)) }
+                    // A stall is a TRIGGER for the real Xray-native round
+                    // trip, never a teardown on its own: counters can stall
+                    // for application reasons, a failed round trip cannot.
+                    if (TrafficProgressMonitor.isUnhealthy(verdict)) {
+                        probeNow = true
+                        progressTriggered = true
+                    }
+                }
+                if (!probeNow) continue
+                sinceProbeMillis = 0L
+                if (boundedMeasureDelay(probeUrl)) {
                     consecutiveFailures = 0
+                    // The data plane just answered: restart the progress
+                    // window from the current totals so the same stall is
+                    // not re-reported until it genuinely re-develops.
+                    if (progressTriggered) {
+                        samples.clear()
+                        samples.addLast(TrafficProgressSample(elapsedMillis, accumulator.downlinkBytes, accumulator.uplinkBytes))
+                    }
                     continue
                 }
                 consecutiveFailures++
                 if (consecutiveFailures >= RELAY_HEALTH_FAILURE_THRESHOLD) {
-                    // Cleared BEFORE requestStop() - requestStop() itself
-                    // also cancels relayHealthWatchdogJob (see that
-                    // function's own docs), and this coroutine IS that job:
-                    // clearing the field first makes that a safe no-op on
-                    // null, rather than this coroutine cancelling itself and
-                    // risking onUnhealthy() below never running (cancellation
-                    // is cooperative, but there is no reason to court it).
                     relayHealthWatchdogJob = null
                     requestStop()
                     onUnhealthy()
@@ -635,6 +720,19 @@ class XrayCoreController(
          * miss must never be terminal.
          */
         const val RELAY_HEALTH_FAILURE_THRESHOLD = 2
+
+        /**
+         * B-WL-R3 - cheap LOCAL counter read cadence (an in-process call, no
+         * network I/O). RELAY_HEALTH_PROBE_INTERVAL_MS is an exact multiple,
+         * so the Relayed periodic probe keeps its B33 cadence.
+         */
+        const val TRAFFIC_SAMPLE_INTERVAL_MS = 5_000L
+
+        /** Samples older than this are dropped; comfortably above the stall window so a stall is always fully visible. */
+        const val TRAFFIC_SAMPLE_RETENTION_MS = 60_000L
+
+        /** TrafficProgressMonitor's defaults (10 s verification, 20 s stall window) - windows, never a byte threshold. */
+        val TRAFFIC_PROGRESS_POLICY = TrafficProgressPolicy()
     }
 
     fun requestStop(): XrayCoreStopOutcome {

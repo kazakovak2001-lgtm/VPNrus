@@ -95,6 +95,8 @@ class SmartConnectDecisionEngineTest {
                 TransportKind.XRAY_XHTTP,
                 TransportKind.TLS_TCP,
                 TransportKind.SHADOWSOCKS_2022,
+                // B-WL-R6 - appended after SHADOWSOCKS_2022; nothing earlier moved.
+                TransportKind.XRAY_REALITY_XHTTP,
             ),
             SmartConnectDecisionEngine.PREFERRED_ORDER,
         )
