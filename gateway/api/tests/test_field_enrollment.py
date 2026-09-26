@@ -15,7 +15,9 @@ corruption behavior.
 """
 import base64
 import json
+import multiprocessing
 import os
+import secrets
 import sys
 import threading
 import time
@@ -31,6 +33,34 @@ for _path in (_GATEWAY_DIR, _THIS_DIR):
 from api import activations as activations_module
 from api import field_enrollment as field_enrollment_module
 from _fixtures import make_field_enrollment_wrap_key_file, make_public_key, set_plan, write_fake_provision_script
+
+
+def _make_random_public_key():
+    """A genuinely distinct, valid AmneziaWG/WireGuard public key each
+    call - unlike `make_public_key`'s own fixed 256-value space (one
+    repeated byte), this is needed for the bounded-lock-footprint test
+    below, which must exercise far more than 256 distinct public keys."""
+    return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+# --- module-level helpers for MultiProcessKeyLockTests - must be
+# top-level (never a nested closure) so they can be handed to a genuinely
+# separate OS process, not merely a thread in this same process. ---
+
+def _mp_hold_key_lock(index_path, public_key, ready_event, release_event, order_queue, tag):
+    from api import field_enrollment as fe  # re-import in the child process
+    with fe.field_enrollment_key_lock(index_path, public_key):
+        order_queue.put(("acquired", tag))
+        ready_event.set()
+        release_event.wait(timeout=5)
+        order_queue.put(("released", tag))
+
+
+def _mp_acquire_and_release_key_lock(index_path, public_key, order_queue, tag):
+    from api import field_enrollment as fe
+    with fe.field_enrollment_key_lock(index_path, public_key):
+        order_queue.put(("acquired", tag))
+    order_queue.put(("released", tag))
 
 
 class FieldEnrollmentTestBase(unittest.TestCase):
@@ -862,6 +892,289 @@ class IndexSchemaValidationTests(FieldEnrollmentTestBase):
 
         with self.assertRaises(field_enrollment_module.FieldEnrollmentIndexError):
             self._enroll(key)
+
+
+class BoundedKeyLockFootprintTests(FieldEnrollmentTestBase):
+    """B67.4 second corrective-pass fix, MAJOR BUG #1 (unbounded lock-file
+    growth) - item A: real filesystem-footprint proof, not merely "the
+    request got rejected". Exercises far more distinct public keys than
+    the fixed shard-pool size and inspects the actual lock directory."""
+
+    def test_lock_file_count_never_exceeds_the_fixed_shard_pool_regardless_of_request_volume(self):
+        num_requests = 5000
+        for _ in range(num_requests):
+            key = _make_random_public_key()
+            with field_enrollment_module.field_enrollment_key_lock(self.index_path, key):
+                pass
+
+        lock_dir = field_enrollment_module._key_lock_dir(self.index_path)
+        lock_files = os.listdir(lock_dir)
+
+        self.assertGreater(
+            num_requests, len(lock_files) * 10,
+            "sanity check: far more requests than persistent lock artifacts",
+        )
+        self.assertGreater(len(lock_files), 0)
+        self.assertLessEqual(
+            len(lock_files), field_enrollment_module._KEY_LOCK_SHARD_COUNT,
+            "the persistent lock-file footprint must never exceed the fixed shard pool size, "
+            "no matter how many distinct public keys are ever presented",
+        )
+
+    def test_repeating_the_same_small_set_of_keys_never_grows_the_footprint_further(self):
+        keys = [_make_random_public_key() for _ in range(10)]
+        for _ in range(500):
+            for key in keys:
+                with field_enrollment_module.field_enrollment_key_lock(self.index_path, key):
+                    pass
+
+        lock_dir = field_enrollment_module._key_lock_dir(self.index_path)
+        lock_files = os.listdir(lock_dir)
+        self.assertLessEqual(len(lock_files), field_enrollment_module._KEY_LOCK_SHARD_COUNT)
+        self.assertLessEqual(len(lock_files), len(keys))
+
+
+class KeyLockDirectSerializationTests(FieldEnrollmentTestBase):
+    """B67.4 second corrective-pass fix - item B: the raw lock primitive
+    itself is mutually exclusive for the SAME public key, independent of
+    the full enroll_device flow (see SameKeyRollbackRaceRegressionTests
+    for the full-flow proof that the ENTIRE reserve->register->provision
+    ->rollback critical section is covered)."""
+
+    def test_same_public_key_lock_is_mutually_exclusive(self):
+        key = make_public_key(0xEB)
+        acquired = threading.Event()
+        release = threading.Event()
+        second_acquired = threading.Event()
+
+        def holder():
+            with field_enrollment_module.field_enrollment_key_lock(self.index_path, key):
+                acquired.set()
+                release.wait(timeout=5)
+
+        def contender():
+            self.assertTrue(acquired.wait(timeout=5))
+            with field_enrollment_module.field_enrollment_key_lock(self.index_path, key):
+                second_acquired.set()
+
+        t1 = threading.Thread(target=holder)
+        t2 = threading.Thread(target=contender)
+        t1.start()
+        self.assertTrue(acquired.wait(timeout=5))
+        t2.start()
+        time.sleep(0.2)
+        self.assertFalse(second_acquired.is_set(), "the same public key's lock must be mutually exclusive")
+        release.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        self.assertTrue(second_acquired.is_set())
+
+
+class ShardCollisionBehaviorTests(FieldEnrollmentTestBase):
+    """B67.4 second corrective-pass fix - item C: the fixed shard pool is
+    NOT accidentally one single global lock, and a deliberate shard
+    collision between two DIFFERENT keys only ever costs them concurrency
+    with each other, never correctness. Shard membership is computed
+    directly from the real, shipped hash function (never randomly
+    assumed), so this can never be flaky."""
+
+    def _keys_by_shard(self):
+        keys_by_shard = {}
+        for seed in range(256):
+            key = make_public_key(seed)
+            shard = field_enrollment_module._key_lock_shard_index(key)
+            keys_by_shard.setdefault(shard, []).append(key)
+        return keys_by_shard
+
+    def test_keys_on_different_shards_remain_concurrent(self):
+        keys_by_shard = self._keys_by_shard()
+        distinct_shard_keys = [keys[0] for keys in keys_by_shard.values()]
+        self.assertGreaterEqual(len(distinct_shard_keys), 2, "need at least two distinct shards among 256 test keys")
+        key_a, key_b = distinct_shard_keys[0], distinct_shard_keys[1]
+
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold_a():
+            with field_enrollment_module.field_enrollment_key_lock(self.index_path, key_a):
+                holding.set()
+                release.wait(timeout=5)
+
+        t_a = threading.Thread(target=hold_a)
+        t_a.start()
+        self.assertTrue(holding.wait(timeout=5))
+
+        acquired_b = threading.Event()
+
+        def try_b():
+            with field_enrollment_module.field_enrollment_key_lock(self.index_path, key_b):
+                acquired_b.set()
+
+        t_b = threading.Thread(target=try_b)
+        t_b.start()
+        t_b.join(timeout=2)
+        self.assertTrue(
+            acquired_b.is_set(), "a different shard's lock must never be blocked by an unrelated shard's holder",
+        )
+
+        release.set()
+        t_a.join(timeout=5)
+
+    def test_keys_sharing_a_shard_serialize_but_never_corrupt_each_others_enrollment(self):
+        keys_by_shard = self._keys_by_shard()
+        colliding_pair = next((keys for keys in keys_by_shard.values() if len(keys) >= 2), None)
+        self.assertIsNotNone(colliding_pair, "need at least one shard with >=2 of the 256 test keys colliding")
+        key_a, key_b = colliding_pair[0], colliding_pair[1]
+
+        result_a = self._enroll(key_a, cap=5)
+        result_b = self._enroll(key_b, cap=5)
+        self.assertEqual(result_a.outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(result_b.outcome, field_enrollment_module.ENROLLED)
+        self.assertNotEqual(result_a.credential, result_b.credential)
+
+        entry_a = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key_a)
+        entry_b = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key_b)
+        self.assertNotEqual(entry_a["activation_id"], entry_b["activation_id"])
+        self.assertEqual(entry_a["credential_digest"], activations_module.credential_digest(result_a.credential))
+        self.assertEqual(entry_b["credential_digest"], activations_module.credential_digest(result_b.credential))
+
+
+class MultiProcessKeyLockTests(FieldEnrollmentTestBase):
+    """B67.4 second corrective-pass fix - item D: genuine SEPARATE OS
+    processes (multiprocessing, `fork` context - this whole suite is
+    already POSIX-only, matching every other flock-based test here),
+    never merely threads inside one process, proving the shard lock is a
+    real cross-process primitive."""
+
+    def test_same_key_lock_serializes_across_separate_processes(self):
+        ctx = multiprocessing.get_context("fork")
+        key = make_public_key(0xEE)
+        ready_a = ctx.Event()
+        release_a = ctx.Event()
+        order_queue = ctx.Queue()
+
+        proc_a = ctx.Process(
+            target=_mp_hold_key_lock,
+            args=(self.index_path, key, ready_a, release_a, order_queue, "a"),
+        )
+        proc_a.start()
+        self.assertTrue(ready_a.wait(timeout=5))
+
+        proc_b = ctx.Process(
+            target=_mp_acquire_and_release_key_lock,
+            args=(self.index_path, key, order_queue, "b"),
+        )
+        proc_b.start()
+        proc_b.join(timeout=2)
+        self.assertTrue(
+            proc_b.is_alive(), "a SEPARATE process must genuinely block on the same shard's lock, not merely a thread",
+        )
+
+        release_a.set()
+        proc_a.join(timeout=5)
+        proc_b.join(timeout=5)
+        self.assertFalse(proc_a.is_alive())
+        self.assertFalse(proc_b.is_alive())
+
+        events = []
+        while not order_queue.empty():
+            events.append(order_queue.get())
+
+        self.assertEqual(events[0], ("acquired", "a"))
+        self.assertIn(("released", "a"), events)
+        self.assertIn(("acquired", "b"), events)
+        index_released_a = events.index(("released", "a"))
+        index_acquired_b = events.index(("acquired", "b"))
+        self.assertLess(
+            index_released_a, index_acquired_b,
+            "process B must only acquire the lock AFTER process A released it",
+        )
+
+
+class ActivationIdConsistencyTests(FieldEnrollmentTestBase):
+    """B67.4 second corrective-pass fix, MAJOR BUG #2 - `enroll_device`
+    must fail closed, never provision, never report success, and never
+    silently repair the index, whenever the activation store's own
+    record for a credential digest disagrees with what the index names
+    for that public key."""
+
+    def test_mismatched_activation_id_between_index_and_store_fails_closed(self):
+        key = make_public_key(0xEC)
+        first = self._enroll(key)
+        digest = activations_module.credential_digest(first.credential)
+
+        # Directly corrupt the activation store's OWN record for this
+        # exact credential digest to carry a DIFFERENT activation_id than
+        # the one the index believes it minted - simulates a prior
+        # corruption/manual edit/bug elsewhere; never reachable through
+        # this module's own normal call sequence.
+        with open(self.store_path, "r", encoding="utf-8") as handle:
+            store_data = json.load(handle)
+        divergent_activation_id = "b" * 32
+        store_data[digest]["activation_id"] = divergent_activation_id
+        with open(self.store_path, "w", encoding="utf-8") as handle:
+            json.dump(store_data, handle)
+
+        with self.assertRaises(field_enrollment_module.FieldEnrollmentIndexError):
+            self._enroll(key)
+
+        # The store's own (divergent) record must survive completely
+        # untouched - this attempt never owned it, so it must never be
+        # revoked, deleted, or rewritten.
+        record = activations_module.find_by_credential_digest(self.store_path, self.lock_path, digest)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["activation_id"], divergent_activation_id)
+        self.assertEqual(record["status"], activations_module.ACTIVE)
+        self.assertEqual(len(record["bound_devices"]), 1, "the store's own pre-existing record must be left byte-for-byte untouched")
+
+        # The index must never have been silently rewritten to agree with
+        # the store either.
+        entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        self.assertIsNotNone(entry)
+        self.assertNotEqual(entry["activation_id"], divergent_activation_id)
+
+    def test_normal_successful_enrollment_has_matching_activation_ids_throughout(self):
+        key = make_public_key(0xED)
+        wrap_key_bytes = field_enrollment_module._load_wrap_key(self.wrap_key_file)
+        reservation = field_enrollment_module._reserve_locked(
+            self.index_path, self.index_lock_path, wrap_key_bytes, key, global_cap=5,
+        )
+        register_result = activations_module.register_credential(
+            self.store_path, self.lock_path, reservation.credential, reservation.activation_id, max_devices=1,
+        )
+        self.assertEqual(register_result.activation_id, reservation.activation_id)
+
+        result = self._enroll(key)
+        self.assertEqual(result.outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(result.credential, reservation.credential)
+
+    def test_existing_credential_idempotent_registration_keeps_matching_activation_ids(self):
+        key = make_public_key(0xEE + 1)
+        first = self._enroll(key)
+        second = self._enroll(key)
+        self.assertEqual(first.credential, second.credential)
+
+        entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        record = activations_module.find_by_credential_digest(
+            self.store_path, self.lock_path, activations_module.credential_digest(first.credential),
+        )
+        self.assertEqual(entry["activation_id"], record["activation_id"])
+
+    def test_cli_revoke_revokes_exactly_the_enrolled_activation_with_no_orphan_authorization(self):
+        key = make_public_key(0xEE + 2)
+        self._enroll(key)
+        entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        activation_id = entry["activation_id"]
+
+        revoke_result = field_enrollment_module.revoke_and_remove_if_owned(
+            self.index_path, self.index_lock_path, self.store_path, self.lock_path, key,
+        )
+        self.assertTrue(revoke_result.changed)
+        self.assertEqual(revoke_result.activation_id, activation_id)
+
+        record = activations_module.find_by_activation_id(self.store_path, self.lock_path, activation_id)
+        self.assertEqual(record["status"], activations_module.REVOKED)
+        self.assertIsNone(field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key))
 
 
 if __name__ == "__main__":

@@ -83,23 +83,69 @@ equivalent check and could still delete the concurrent request's live
 index entry). Fixed with an explicit, OS-level, per-public-key lock -
 [field_enrollment_key_lock] - that now wraps `enroll_device`'s entire
 body: same public key => fully serialized end to end; different public
-keys => still fully concurrent (a different lock file each). See that
-function's own docstring for the fixed lock order this introduces
-(this key lock is always the OUTERMOST lock - acquired before, and
-released after, every lock already inside `enroll_device`'s call graph -
-`_index_lock`, `activations.per_activation_lock`, and
-`activations._exclusive_lock` - never the reverse, and nothing INSIDE any
-of those inner critical sections ever attempts to acquire this key lock,
-so this ordering cannot deadlock). Independently of the lock,
-[remove_reservation_if_owned] replaces the old rollback's blind
-`remove_from_index(public_key)` call with an ownership-checked removal
-(matches on `activation_id`, exactly mirroring
+keys => independently concurrent unless they happen to collide on the
+same fixed shard (see below). See that function's own docstring for the
+fixed lock order this introduces (this key lock is always the OUTERMOST
+lock - acquired before, and released after, every lock already inside
+`enroll_device`'s call graph - `_index_lock`, `activations
+.per_activation_lock`, and `activations._exclusive_lock` - never the
+reverse, and nothing INSIDE any of those inner critical sections ever
+attempts to acquire this key lock, so this ordering cannot deadlock).
+Independently of the lock, [remove_reservation_if_owned] replaces the old
+rollback's blind `remove_from_index(public_key)` call with an
+ownership-checked removal (matches on `activation_id`, exactly mirroring
 `activations.remove_credential_if_unbound`'s own discipline) - defense in
 depth even though the key lock alone already makes the original race
 unreachable, and the SAME primitive the operator CLI's own revoke flow
 now reuses (see field_enrollment_admin.py and [revoke_and_remove_if_owned]
 below) rather than that tool's own prior TOCTOU-prone
 find-then-blind-remove sequence.
+
+(1b) Second corrective-pass fix (independent post-fix audit, same day) -
+[field_enrollment_key_lock]'s FIRST version keyed its lock filename
+directly by a digest of the public key, which meant the number of
+persistent lock files grew without bound as new, distinct, individually
+valid public keys were presented - a cheap unbounded-filesystem-growth
+vector, in tension with this whole mechanism's own "bounded" design goal
+(`FieldEnrollmentIndex` itself, by contrast, is already capped at
+`global_device_cap` entries). Fixed by mapping every public key onto one
+of a FIXED-SIZE pool of `_KEY_LOCK_SHARD_COUNT` lock files
+(SHA-256(public_key) % N, never one file per key) - see
+`_key_lock_shard_index`/`_key_lock_file_path`'s own docs for the sizing
+rationale and `field_enrollment_key_lock`'s own docs for why a shard
+collision between two DIFFERENT keys only ever costs them concurrency
+with each other, never correctness (every read/write inside the locked
+section is still keyed by the real public_key/credential digest), and
+for why this shard-file scheme cannot be bypassed via an inode-
+replacement race (a shard's lock file, once created, is never unlinked
+or replaced for the life of the deployment).
+
+(1c) Second corrective-pass fix (activation_id consistency, MAJOR BUG #2
+of that same audit) - `enroll_device` used to proceed straight into
+provisioning using `reservation.activation_id` without ever confirming
+that `activations.register_credential`'s own returned `activation_id`
+(the ACTUAL id the durable activation-store record now carries for this
+exact credential digest) still matched it. In the ordinary path these
+are always equal (the same value flows: `_reserve_locked` mints it,
+`register_credential` is called with exactly that value, and either
+writes a fresh record under it or finds an EXISTING record for this
+credential digest whose OWN `activation_id` must, by `register_credential`'s
+own defensive check, already equal it - see that function's own
+"activation_id collides with a DIFFERENT existing record" guard).  But a
+prior process crash/corruption/manual edit could, in principle, leave the
+index and the activation store disagreeing about which activation_id a
+given credential digest belongs to - and `enroll_device` had no explicit
+check that would ever catch that instead of silently provisioning
+against whichever id the STORE actually used. `enroll_device` now checks
+`register_result.activation_id == activation_id` immediately after
+`register_credential` returns and, on a mismatch, fails closed
+(`FieldEnrollmentIndexError`, mapped to 503) WITHOUT provisioning,
+WITHOUT reporting success, and WITHOUT silently "fixing" the index to
+agree with the store - see that check's own comment for its exact
+rollback semantics (never revoking/removing the store's OWN,
+already-durable `register_result.activation_id` record, which this
+attempt does not own merely by virtue of having presented a matching
+credential digest).
 
 (2) `activations.register_credential`'s own durable write
 (`_atomic_write_store`) can raise AFTER its `os.replace()` has already
@@ -318,15 +364,64 @@ def _key_lock_dir(index_path):
     return os.path.join(os.path.dirname(os.path.abspath(index_path)) or ".", ".field-enrollment-key-locks")
 
 
+# B67.4 second corrective-pass fix (MAJOR BUG #1, unbounded lock-file
+# growth) - a FIXED-SIZE pool of lock files, never one file per distinct
+# public key ever presented. A public key deterministically maps to
+# exactly one of these `_KEY_LOCK_SHARD_COUNT` slots
+# (`_key_lock_shard_index`, below) - so the persistent filesystem
+# footprint this module's own locking ever creates is bounded by this
+# constant, REGARDLESS of how many distinct public keys are ever
+# submitted (including an attacker minting an unbounded stream of freshly
+# generated, individually-valid public keys that never enroll
+# successfully - see this constant's own sizing rationale below).
+#
+# 64 is chosen, not merely "some fixed number", for a concrete reason:
+# this mechanism exists ONLY for a small, capped field-test cohort
+# (`AppConfig.field_enrollment_max_devices` - a handful of real devices,
+# e.g. 5, per this module's own docs) - 64 slots keeps the odds of two
+# DISTINCT, LEGITIMATELY enrolling devices ever landing in the same shard
+# implausible at that real scale (a shard collision only ever costs those
+# two keys their concurrency with EACH OTHER - see the module's own
+# correctness argument below - never correctness), while still being a
+# small, fixed, easily-audited constant, not a large table sized as if
+# this served the whole production device base the way
+# `activations.per_activation_lock`'s own per-CREDENTIAL-digest scheme
+# does (that mechanism is intentionally NOT bounded the same way - see
+# its own docstring - because every activation record it locks is already
+# itself a bounded, operator-issued/durably-tracked resource; a
+# not-yet-issued, possibly-never-issued public key is not).
+_KEY_LOCK_SHARD_COUNT = 64
+
+
+def _key_lock_shard_index(public_key):
+    """Deterministic public_key -> shard mapping: the same public key
+    ALWAYS maps to the same shard (SHA-256 is a pure function of the
+    input bytes - no randomness, no process-local state), so two
+    requests for the SAME public key - even from two entirely SEPARATE
+    processes that have never communicated - always contend for the
+    SAME lock file. Different public keys MAY map to the same shard (a
+    collision merely serializes those two keys' attempts against each
+    other for the duration of one attempt each - see this module's own
+    correctness argument: shard collision only ever REDUCES concurrency
+    between unrelated keys, it can never merge or confuse their actual
+    index/activation-store state, since every read/write inside the
+    locked section is still keyed by the real `public_key`/credential
+    digest, never by the shard index itself)."""
+    digest_bytes = hashlib.sha256(public_key.encode("utf-8")).digest()
+    # First 8 bytes as a big-endian integer - any fixed-width slice of a
+    # cryptographic hash's output is itself uniformly distributed, so this
+    # is exactly as good a sharding input as hashing the whole digest and
+    # is one line simpler.
+    shard_seed = int.from_bytes(digest_bytes[:8], "big")
+    return shard_seed % _KEY_LOCK_SHARD_COUNT
+
+
 def _key_lock_file_path(index_path, public_key):
-    # SHA-256 of the public key, never the raw value, as the lock
-    # filename - the public key is not secret (see module docstring), but
-    # there is no reason to use it verbatim as a filename either (avoids
-    # any filesystem-charset surprise and keeps every lock filename a
-    # fixed, predictable shape, matching activations.per_activation_lock's
-    # own "digest, never raw value, as the lock filename" convention).
-    digest = hashlib.sha256(public_key.encode("utf-8")).hexdigest()
-    return os.path.join(_key_lock_dir(index_path), f"{digest}.lock")
+    # A FIXED filename per shard (never per public key - see
+    # _KEY_LOCK_SHARD_COUNT's own docs) - "shard-NNN.lock", zero-padded to
+    # a constant width purely for tidy `ls` output, never parsed back.
+    shard = _key_lock_shard_index(public_key)
+    return os.path.join(_key_lock_dir(index_path), f"shard-{shard:03d}.lock")
 
 
 @contextlib.contextmanager
@@ -339,9 +434,26 @@ def field_enrollment_key_lock(index_path, public_key):
     `public_key`, before touching anything else. Same public key => fully
     serialized (a second attempt for that key - whether a concurrent HTTP
     retry or a concurrent operator revoke - blocks until the first's
-    entire attempt has committed or rolled back); different public keys
-    => a different lock file each, so unrelated devices remain fully
-    concurrent.
+    entire attempt has committed or rolled back). Different public keys
+    => independently concurrent UNLESS they happen to land in the same
+    fixed shard (see `_KEY_LOCK_SHARD_COUNT`'s own docs) - a shard
+    collision only ever costs those two keys their concurrency with each
+    other for the duration of one attempt, never correctness: every
+    operation inside the locked section still reads/writes by the real
+    `public_key`/credential digest, never by the shard index.
+
+    B67.4 second corrective-pass fix (MAJOR BUG #1, unbounded lock-file
+    growth) - this used to open one lock file NAMED BY a digest of the
+    public key itself, so the number of persistent lock files grew
+    without bound as new DISTINCT, individually-valid public keys were
+    presented - including ones that never successfully enrolled (rejected
+    by the device cap, a provisioning failure, or simply never retried) -
+    a cheap, unbounded filesystem-growth vector for anyone who can mint
+    fresh public keys. Now backed by a FIXED-SIZE shard pool
+    (`_key_lock_file_path`) - the persistent footprint this function ever
+    creates is bounded by `_KEY_LOCK_SHARD_COUNT`, full stop, regardless
+    of request volume or the number of distinct public keys ever
+    presented.
 
     A real OS-level `flock`, NOT a `threading.Lock` - deliberately, since
     this API's own worker model (ThreadingHTTPServer today, but nothing
@@ -350,14 +462,24 @@ def field_enrollment_key_lock(index_path, public_key):
     not guaranteed to land in the same process, let alone the same
     thread - only a real file lock is safe across that boundary, exactly
     the same reasoning `activations.per_activation_lock` already applies.
-    Crash-safe: the OS releases this lock automatically the instant the
-    holding process exits, for any reason - nothing here depends on
-    cooperative cleanup. The lock FILE itself carries no sensitive
-    content (0600, empty, named only by a SHA-256 digest of the public
-    key - never the raw value, though the value is not secret either) and
-    never grows (one file per DISTINCT public key ever field-enrolled or
-    revoked, no larger than the corresponding index-entry count in
-    practice).
+    This is also why sharding is safe against a lock-bypass-via-inode-
+    replacement race: THIS function never calls `os.unlink()` on a shard
+    lock file (unlike `_atomic_write_index`'s temp-file dance, which
+    unlinks its OWN never-yet-visible temp file, never a lock file another
+    process might be holding open) - a shard's lock file is opened once,
+    ever, the first time that shard number is used, and is never removed
+    or replaced for the lifetime of the deployment; every subsequent
+    `os.open(lock_file_path, os.O_CREAT | os.O_RDWR, ...)` for that same
+    shard resolves to that SAME, still-existing inode (`O_CREAT` is a
+    no-op once the path exists), so two processes locking the same shard
+    always `flock()` the same underlying file - there is no window in
+    which a second process could create a fresh inode at that path and
+    silently acquire an independent, non-conflicting lock. Crash-safe:
+    the OS releases a held flock automatically the instant the holding
+    process exits, for any reason - nothing here depends on cooperative
+    cleanup. Each shard's lock file carries no sensitive content (0600,
+    empty, a fixed predictable name - never derived from or containing
+    any public key or credential material).
 
     LOCK ORDER (fixed, always in this direction, never the reverse): this
     key lock is always the OUTERMOST lock in this module's call graph -
@@ -381,7 +503,14 @@ def field_enrollment_key_lock(index_path, public_key):
     own file) - so this fixed order introduces no cycle and is
     deadlock-free without needing any lock-acquisition timeout, the exact
     same reasoning `activations.per_activation_lock`'s own docstring
-    already applies one level down."""
+    already applies one level down. Every acquisition of this key lock in
+    this codebase (both call sites: `enroll_device` and
+    `revoke_and_remove_if_owned`) acquires it FIRST, before any of the
+    inner locks - there is no code path anywhere that acquires an inner
+    lock (index/per-activation/global-store) and THEN attempts to acquire
+    this key lock, so the reverse ordering this docstring warns against
+    (KEY -> ACTIVATION in one process, ACTIVATION -> KEY in another) does
+    not occur."""
     lock_dir = _key_lock_dir(index_path)
     os.makedirs(lock_dir, exist_ok=True)
     lock_file_path = _key_lock_file_path(index_path, public_key)
@@ -712,6 +841,53 @@ def enroll_device(
                         f"field-enrollment index rollback failed after a registration failure: {cleanup_exc}"
                     ) from exc
             raise
+
+        # B67.4 second corrective-pass fix (MAJOR BUG #2, activation_id
+        # consistency) - register_credential's own idempotent-insert
+        # contract only ever returns created=False when a record for THIS
+        # EXACT credential digest already exists; that existing record's
+        # OWN activation_id is an independent fact from whatever THIS
+        # module's own index currently names for this public key. In the
+        # ordinary path these are always equal (the same reservation.
+        # activation_id flows into register_credential, which either
+        # writes a fresh record under it or - for a genuine replay -
+        # finds the SAME record it or an earlier attempt already wrote
+        # under it). A mismatch here means the index and the activation
+        # store have DIVERGED for this exact credential digest (e.g. a
+        # prior corruption, a manual edit, or a bug elsewhere) - this is
+        # an integrity violation, never ordinary idempotence, and must
+        # never be silently "resolved" by proceeding with whichever id
+        # happens to be in the store, or by rewriting the index to agree
+        # with it.
+        if register_result.activation_id != activation_id:
+            if reservation.is_new_index_entry:
+                # This call's OWN, just-created reservation is what is
+                # inconsistent with the store (its freshly minted
+                # credential's digest already resolves to a DIFFERENT
+                # activation_id than the one this call just reserved for
+                # it) - safe to remove, since this call unambiguously
+                # owns it. The store's own record under
+                # register_result.activation_id is NEVER touched here -
+                # this attempt has no ownership claim over it.
+                try:
+                    remove_reservation_if_owned(index_path, index_lock_path, public_key, activation_id)
+                except Exception as cleanup_exc:
+                    raise FieldEnrollmentIndexError(
+                        "field-enrollment index rollback failed after an activation_id mismatch: "
+                        f"{cleanup_exc}"
+                    ) from cleanup_exc
+            # Fail closed - no provisioning, no success response, no
+            # further side effects. If this was a PRE-EXISTING index entry
+            # (not this call's own reservation), it is deliberately left
+            # completely untouched - never blindly repaired/rewritten,
+            # since this call cannot tell which of the two disagreeing
+            # records (if either) is the one actually in legitimate use.
+            raise FieldEnrollmentIndexError(
+                "field-enrollment index/activation-store integrity violation: the index names "
+                f"activation_id={activation_id!r} for this public key, but the activation store's "
+                f"own record for this exact credential digest carries activation_id="
+                f"{register_result.activation_id!r} - refusing to provision or report success"
+            )
 
         # Reuse the EXACT SAME orchestration POST /v1/activate uses - decide_and_bind
         # -> run_provision_peer -> finalize/rollback, one per-activation lock.

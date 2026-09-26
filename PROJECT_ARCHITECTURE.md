@@ -937,6 +937,57 @@ nonce+GCM-tag-length bytes) - a corrupted entry of any kind fails closed
 with `FieldEnrollmentIndexError` (mapped to 503 by handler.py) at read
 time, never at decrypt time only.
 
+**Second corrective pass (same day, independent re-audit of the first
+corrective pass's own exact HEAD)** - two further MAJOR findings:
+
+1. **Unbounded per-public-key lock-file growth.** `field_enrollment_key_lock`'s
+   first version named its lock file directly by a digest of the public
+   key, so the number of persistent lock files grew without bound as new,
+   distinct, individually-valid public keys were presented - including
+   ones that never successfully enrolled (rejected by the cap, a
+   provisioning failure, or simply abandoned) - a cheap, unbounded
+   filesystem-growth vector, in tension with this whole mechanism's own
+   "bounded" design goal. Fixed with a FIXED-SIZE shard pool: every
+   public key maps onto one of `_KEY_LOCK_SHARD_COUNT` (64) lock files via
+   `SHA-256(public_key) % 64` (`_key_lock_shard_index`) - the persistent
+   footprint this locking mechanism can ever create is bounded by that
+   constant, full stop, regardless of request volume. 64 was chosen
+   because this mechanism serves only a small, capped field-test cohort
+   (`field_enrollment_max_devices`, e.g. 5) - large enough that two
+   legitimately-enrolling real devices colliding on the same shard is
+   implausible at that scale, small enough to stay a trivial, easily-
+   audited constant. A shard collision between two DIFFERENT keys only
+   ever serializes their attempts against each other - every read/write
+   inside the locked section is still keyed by the real public key/
+   credential digest, never by the shard index, so correctness is
+   unaffected. No inode-replacement bypass is possible: a shard's lock
+   file, once created, is never `unlink()`-ed or replaced for the life of
+   the deployment - every subsequent open of that same shard resolves to
+   the SAME inode, so two processes locking the same shard always
+   `flock()` the same underlying file.
+2. **`reservation.activation_id` vs. `register_result.activation_id`
+   divergence.** `enroll_device` proceeded straight into provisioning
+   using the index's own `reservation.activation_id` without ever
+   confirming it matched `activations.register_credential`'s own
+   returned `activation_id` (the id the durable activation-store record
+   actually carries for that exact credential digest). These are always
+   equal on every reachable code path today, but nothing enforced it -
+   a prior corruption/manual edit/bug elsewhere could leave the index and
+   the store disagreeing about which activation_id a credential digest
+   belongs to, and `enroll_device` would silently provision and report
+   success against whichever id the store happened to hold.
+   `enroll_device` now checks `register_result.activation_id ==
+   reservation.activation_id` immediately after registration and, on a
+   mismatch, fails closed (`FieldEnrollmentIndexError`, mapped to 503)
+   with NO provisioning, NO success response, and NO side effects beyond
+   removing this attempt's OWN just-created index reservation (only if
+   `reservation.is_new_index_entry`) - the store's own, already-durable
+   record under the DIFFERENT `register_result.activation_id` is never
+   touched, since this attempt has no ownership claim over it; a
+   pre-existing (not newly reserved) index entry that turns out to
+   disagree with the store is likewise left completely untouched, never
+   silently rewritten to agree with the store.
+
 **Cross-host topology**: Germany/Stockholm-the-gateway and the Stockholm
 ingress ROLE are SEPARATE `pocvpn-api` processes with their OWN,
 independent activation stores even when co-located on the same physical
