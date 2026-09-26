@@ -988,6 +988,35 @@ corrective pass's own exact HEAD)** - two further MAJOR findings:
    disagree with the store is likewise left completely untouched, never
    silently rewritten to agree with the store.
 
+**Third corrective pass (same day, independent re-audit of the second
+corrective pass's own exact HEAD)** - one further MAJOR finding, closing
+the LAST persistence-uncertainty gap in `activations._atomic_write_store`:
+the second pass correctly classified a post-`os.replace()` directory
+`fsync()` failure as `StoreCommitUncertainError`, but left two adjacent
+failure points on the SAME side of the `os.replace()` boundary still able
+to escape as a plain, unclassified `OSError` - the `os.open(directory,
+...)` call that obtains the directory fd (unwrapped entirely) and
+`os.close(dir_fd)` (called from a bare `finally`, so a close-time failure
+after a successful fsync would propagate as its own uncaught error
+instead of the fsync's already-correct classification). Either gap could
+have reintroduced the same index-exists/activation-record-status
+ambiguity the second pass otherwise closed. Fixed with an explicit local
+flag, `replace_completed` (set `True` immediately after `os.replace()`
+succeeds, never inferred from exception type or call position) and a
+single `try/except OSError` wrapping the ENTIRE post-replace directory
+sequence - open, fsync, AND close - that maps any failure among the three
+to `StoreCommitUncertainError`. The resulting invariant, stated exactly:
+before `os.replace()`, any failure is `DEFINITELY NOT COMMITTED` (store
+byte-for-byte untouched, an ordinary `ActivationStoreError`); after
+`os.replace()` succeeds, the outcome is always either `COMMITTED` (no
+exception) or `COMMIT UNCERTAIN` (`StoreCommitUncertainError` /
+`ActivationCommitUncertainError`) - never again `DEFINITELY NOT
+COMMITTED`. `field_enrollment.enroll_device`'s existing commit-uncertain
+handling (catch `ActivationCommitUncertainError` first, never roll back
+the index reservation, re-raise unchanged) required no further change -
+it already treats the whole exception type as one thing, regardless of
+which of the three post-replace operations actually failed.
+
 **Cross-host topology**: Germany/Stockholm-the-gateway and the Stockholm
 ingress ROLE are SEPARATE `pocvpn-api` processes with their OWN,
 independent activation stores even when co-located on the same physical

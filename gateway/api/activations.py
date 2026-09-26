@@ -311,13 +311,43 @@ def _atomic_write_store(store_path, data):
     file on failure - a failure THERE means the prior store is still
     byte-for-byte untouched, "nothing happened" is still an honest
     description, and an ordinary OSError/StoreWriteError is still exactly
-    right. The directory `fsync()` AFTER `os.replace()` is different in
-    kind: at that point the new content is already filesystem-visible
-    (any subsequent open() of `store_path` sees it) - a failure here is
-    raised as the distinct `StoreCommitUncertainError` instead of a plain
-    OSError, specifically so `_atomic_write_store_or_raise` (and, through
-    it, every caller) can tell "definitely did not happen" apart from
-    "may already have happened, durability merely unconfirmed"."""
+    right.
+
+    B67.4 THIRD corrective-pass fix (persistence-uncertainty gap in the
+    post-`os.replace()` window itself) - the SECOND pass already
+    classified a directory-`fsync()` failure as commit-uncertain, but left
+    two adjacent failure points on the SAME side of the `os.replace()`
+    boundary still able to escape as a plain, unclassified `OSError`: the
+    `os.open(directory, ...)` call that obtains `dir_fd` (if THAT fails,
+    nothing at all had wrapped it) and `os.close(dir_fd)` (called from a
+    bare `finally`, so a close-time failure - after a SUCCESSFUL fsync -
+    would propagate as its own uncaught, unclassified `OSError` instead of
+    the fsync's already-correctly-classified one). Both are the same kind
+    of failure as the directory fsync itself: they happen only AFTER
+    `os.replace()` has already made the new content filesystem-visible, so
+    a failure there can NEVER mean "nothing happened" either.
+
+    The fix makes the "before vs. after `os.replace()`" boundary explicit
+    with a plain local flag, `replace_completed` (never inferred from
+    exception type or call position), and puts EVERY filesystem operation
+    that happens once that flag is `True` - opening the directory,
+    `fsync()`ing it, and closing it - inside ONE `try/except OSError` that
+    maps ANY failure among the three to `StoreCommitUncertainError`. This
+    reads exactly as three explicit states:
+
+        replace_completed == False, any exception  -> ordinary failure
+            (still definitely nothing durable happened - the existing
+            `except BaseException: unlink tmp_path; raise` above is
+            UNCHANGED for this case)
+        replace_completed == True,  no exception    -> COMMITTED
+        replace_completed == True,  any exception    -> COMMIT UNCERTAIN
+            (`StoreCommitUncertainError`, regardless of whether the
+            failure was the directory open, its fsync, or its close -
+            os.replace() already succeeded, so "nothing happened" is
+            never again an honest description for any of the three)
+
+    There is deliberately no `DEFINITELY NOT COMMITTED` outcome once
+    `replace_completed` is `True` - that is the whole point of this fix."""
     directory = os.path.dirname(os.path.abspath(store_path)) or "."
     prior_mode = None
     prior_uid = None
@@ -331,6 +361,7 @@ def _atomic_write_store(store_path, data):
     except FileNotFoundError:
         pass
 
+    replace_completed = False
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".activations.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -346,29 +377,37 @@ def _atomic_write_store(store_path, data):
             os.chmod(tmp_path, 0o600)
 
         os.replace(tmp_path, store_path)
+        replace_completed = True
     except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if not replace_completed:
+            # os.replace() itself never ran, or never completed - the
+            # prior store is still byte-for-byte untouched, so cleaning up
+            # the never-published temp file and re-raising as an ordinary
+            # failure is still exactly right.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
 
-    # Past this point `tmp_path` no longer exists and `store_path` already
-    # holds the new content - VISIBLE regardless of whether the fsync below
-    # succeeds. A failure here must never be reported the same way as a
-    # failure above (see this function's own docstring and
-    # StoreCommitUncertainError's).
-    dir_fd = os.open(directory, os.O_RDONLY)
+    # Past this point `store_path` already holds the new content - VISIBLE
+    # regardless of what happens below. Opening the containing directory,
+    # fsync()ing it, and closing it are ALL, uniformly, "durability of an
+    # already-visible write" concerns from here on - a failure in ANY of
+    # the three is commit-uncertain, never an ordinary failure (see this
+    # function's own docstring).
     try:
-        os.fsync(dir_fd)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except OSError as exc:
         raise StoreCommitUncertainError(
             f"activation store content for {store_path} is now filesystem-visible via os.replace(), "
-            f"but fsync()ing its containing directory failed - durability of that directory entry "
-            f"across an immediate crash is unconfirmed: {exc}"
+            f"but durably confirming its containing directory entry failed (open/fsync/close of the "
+            f"directory itself) - durability across an immediate crash is unconfirmed: {exc}"
         ) from exc
-    finally:
-        os.close(dir_fd)
 
 
 def _atomic_write_store_or_raise(store_path, data):

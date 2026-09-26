@@ -397,6 +397,100 @@ class CommitUncertainFaultInjectionTests(ActivationTestBase):
         )
         self.assertIsNone(record, "nothing durable happened before os.replace() - the store must be completely untouched")
 
+    def test_directory_open_failure_after_a_successful_replace_is_commit_uncertain(self):
+        """B67.4 THIRD corrective-pass fix - the os.open(directory, ...)
+        call itself, not merely its later fsync, is now inside the
+        post-replace commit-uncertain boundary. Patches os.open itself
+        (never register_credential/_atomic_write_store wholesale), and
+        only for the EXACT (directory, O_RDONLY) call _atomic_write_store
+        makes - every other os.open call in this same code path (mkstemp's
+        own O_CREAT|O_RDWR temp-file open, the lock file's own open) must
+        keep working normally, or the write could never reach os.replace()
+        in the first place."""
+        credential = "open-failure-boundary-test-credential-1"
+        activation_id = "9" * 32
+        directory = os.path.dirname(os.path.abspath(self.store_path)) or "."
+        real_open = os.open
+
+        def flaky_open(path, flags, *args, **kwargs):
+            if path == directory and flags == os.O_RDONLY:
+                raise OSError("simulated containing-directory open failure, after a successful os.replace()")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=flaky_open):
+            with self.assertRaises(activations_module.ActivationCommitUncertainError):
+                activations_module.register_credential(
+                    self.store_path, self.lock_path, credential, activation_id, max_devices=1,
+                )
+
+        record = activations_module.find_by_credential_digest(
+            self.store_path, self.lock_path, activations_module.credential_digest(credential),
+        )
+        self.assertIsNotNone(
+            record, "os.replace() already succeeded before the directory-open failure - the record must be visible",
+        )
+        self.assertEqual(record["activation_id"], activation_id)
+
+        # Retry with the real os.open restored - must reconcile cleanly,
+        # never mint a duplicate.
+        result = activations_module.register_credential(
+            self.store_path, self.lock_path, credential, activation_id, max_devices=1,
+        )
+        self.assertFalse(result.created)
+        self.assertEqual(result.activation_id, activation_id)
+        data = activations_module.read_store_shared(self.store_path, self.lock_path)
+        self.assertEqual(len(data), 1)
+
+    def test_directory_close_failure_after_a_successful_fsync_is_commit_uncertain(self):
+        """B67.4 THIRD corrective-pass fix - a close()-time failure on the
+        directory fd, occurring AFTER its own fsync() already succeeded,
+        must be classified identically to an open or fsync failure -
+        never left to escape as a plain, unclassified OSError from a bare
+        `finally: os.close(dir_fd)`. Simulates the realistic case where
+        close() itself still releases the fd (as it does on Linux) but
+        also reports a failure via its return/errno."""
+        credential = "close-failure-boundary-test-credential-1"
+        activation_id = "8" * 32
+        directory = os.path.dirname(os.path.abspath(self.store_path)) or "."
+        real_open = os.open
+        real_close = os.close
+        captured_dir_fd = {}
+
+        def instrumented_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if path == directory and flags == os.O_RDONLY:
+                captured_dir_fd["fd"] = fd
+            return fd
+
+        def flaky_close(fd):
+            if fd == captured_dir_fd.get("fd"):
+                captured_dir_fd.pop("fd", None)
+                real_close(fd)  # the fd IS actually released, same as a real close() that still reports failure
+                raise OSError("simulated containing-directory close failure, after a successful fsync")
+            return real_close(fd)
+
+        with mock.patch("os.open", side_effect=instrumented_open), mock.patch("os.close", side_effect=flaky_close):
+            with self.assertRaises(activations_module.ActivationCommitUncertainError):
+                activations_module.register_credential(
+                    self.store_path, self.lock_path, credential, activation_id, max_devices=1,
+                )
+
+        record = activations_module.find_by_credential_digest(
+            self.store_path, self.lock_path, activations_module.credential_digest(credential),
+        )
+        self.assertIsNotNone(
+            record, "os.replace() and the directory fsync already succeeded - the record must be visible",
+        )
+        self.assertEqual(record["activation_id"], activation_id)
+
+        result = activations_module.register_credential(
+            self.store_path, self.lock_path, credential, activation_id, max_devices=1,
+        )
+        self.assertFalse(result.created)
+        self.assertEqual(result.activation_id, activation_id)
+        data = activations_module.read_store_shared(self.store_path, self.lock_path)
+        self.assertEqual(len(data), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

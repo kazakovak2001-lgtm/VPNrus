@@ -839,6 +839,61 @@ class CommitUncertainRollbackTests(FieldEnrollmentTestBase):
         data = activations_module.read_store_shared(self.store_path, self.lock_path)
         self.assertEqual(len(data), 1, "a retry after commit-uncertain must never mint a duplicate activation record")
 
+    def test_real_directory_fault_during_a_live_enrollment_is_reconcilable_on_retry(self):
+        """B67.4 THIRD corrective-pass fix - item E: proves the full,
+        real B67.4 recovery model actually works end to end for a GENUINE
+        persistence-boundary fault reached through the real
+        enroll_device() call sequence - never a coarse mock of
+        register_credential itself (see the two tests above for that
+        already-covered case). Patches os.open itself, targeted at the
+        SECOND directory-O_RDONLY-open in this flow specifically (the
+        first is field_enrollment's OWN index write inside
+        _reserve_locked, which must succeed normally; the second is
+        activations.register_credential's own post-replace directory
+        open) - proving the exact real boundary this bug lives at, inside
+        a live end-to-end enrollment attempt."""
+        key = make_public_key(0xFB)
+        shared_directory = os.path.dirname(os.path.abspath(self.store_path)) or "."
+        real_open = os.open
+        call_count = {"n": 0}
+
+        def flaky_open(path, flags, *args, **kwargs):
+            if path == shared_directory and flags == os.O_RDONLY:
+                call_count["n"] += 1
+                if call_count["n"] == 2:
+                    raise OSError("simulated containing-directory open failure during activation-store commit")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=flaky_open):
+            with self.assertRaises(activations_module.ActivationCommitUncertainError):
+                self._enroll(key)
+        self.assertEqual(call_count["n"], 2, "the fault must have been reached via the real call sequence, not skipped")
+
+        # 6: index reservation zůstává (never rolled back on commit-uncertain).
+        entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        self.assertIsNotNone(entry)
+
+        # The activation record IS already durable - os.replace() already
+        # succeeded before the simulated directory-open failure.
+        record = activations_module.find_by_activation_id(self.store_path, self.lock_path, entry["activation_id"])
+        self.assertIsNotNone(record)
+        self.assertEqual(record["bound_devices"], [], "provisioning never ran - the exception propagated before it")
+
+        # 7-11: retry, with the real os.open restored, must find the
+        # existing credential (created=False), the SAME activation_id,
+        # and complete provisioning cleanly.
+        result = self._enroll(key)
+        self.assertEqual(result.outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(
+            activations_module.credential_digest(result.credential), entry["credential_digest"],
+        )
+        data = activations_module.read_store_shared(self.store_path, self.lock_path)
+        self.assertEqual(len(data), 1, "no duplicate activation record must ever be created")
+        final_record = next(iter(data.values()))
+        self.assertEqual(final_record["activation_id"], entry["activation_id"])
+        self.assertEqual(len(final_record["bound_devices"]), 1)
+        self.assertEqual(final_record["bound_devices"][0]["state"], activations_module.CONFIRMED)
+
 
 class IndexSchemaValidationTests(FieldEnrollmentTestBase):
     """B67.4 corrective-pass fix, index integrity audit (item 17) - exact
