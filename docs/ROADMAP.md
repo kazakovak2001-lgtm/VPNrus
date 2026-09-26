@@ -272,7 +272,7 @@ Binding principles:
 | B49 Censorship / Chaos Simulation Framework | PLANNED | Reproduce bounded DNS/TLS/transport/ingress/relay/exit faults and verify typed failover, proof, and fail-closed behavior; simulation is not field proof. |
 | B50 Provider/ASN Survivability Score | PLANNED | Score measured path diversity and reliability without provider-name allowlists or claims of universal reachability. |
 | B51 Owned/authorized Non-Datacenter Endpoint Research | RESEARCH | Evaluate legal, operator-authorized endpoint diversity only; no unauthorized residential infrastructure. |
-| B52 Offline / Outage Mode research | RESEARCH | Define safe last-known-good, explicit unavailable states, and outage UX without bypassing manifest trust. |
+| B52 Offline / Outage Mode research | RESEARCH COMPLETE | State model selected: independent trust, network, control-plane, provisioning, and data-plane dimensions; safe reuse, fail-closed boundaries, UX, diagnostics, recovery policy, and staged implementation documented in `B52_OFFLINE_OUTAGE_MODE_RESEARCH.md`. Production implementation remains pending. |
 | B53 Android Device Exposure Hardening | PLANNED | Audit Android VPN lifecycle, local secret boundaries, logs, and support export against device-side exposure. |
 | B54 Restricted-Network Field Validation Matrix | PLANNED | Record real operator/network/device/time evidence, including Russia/hard-whitelist cases; publish only measured end-to-end outcomes, never infer bypass from reachability. |
 | B55 Continuous Anti-Censorship Intelligence Loop | PLANNED | Feed authorized field findings and typed diagnostics back into bounded tests, scoring, and signed rotation decisions with reviewable evidence. |
