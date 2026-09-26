@@ -423,6 +423,14 @@ class MainViewModel(
     // [cdnRuntimeCapabilities], which governs the SEPARATE CDN/relay XHTTP
     // path (CdnXhttpRuntimeConfigResolver) and is left untouched.
     private val xrayXhttpProfileRepositories: Map<net.pocvpn.client.reachability.EndpointId, XrayXhttpProfileRepository> = emptyMap(),
+    // B64 - the ONE place a real EXIT XHTTP profile is actually fetched/
+    // persisted: one XrayXhttpProfileProvisioner per endpoint, same
+    // catalog-driven map shape as [xrayXhttpProfileRepositories] above
+    // (never a single country/provider-fixed field). An empty map (the
+    // default) means provisioning is not wired at all - activateDevice()
+    // simply skips this step, exactly like every other optional
+    // provisioner in this class when unset.
+    private val xrayXhttpProfileProvisioners: Map<net.pocvpn.client.reachability.EndpointId, net.pocvpn.client.provisioning.XrayXhttpProfileProvisioner> = emptyMap(),
     // B45B-4 - additive, defaults to null (same "no wiring, no behavior"
     // seam every other optional transport instance above already uses). The
     // SAME real ShadowsocksTransport instance registered here (Smart Connect
@@ -2483,6 +2491,29 @@ class MainViewModel(
                                 }
                             }
                         }
+                        // B64 - the Direct/EXIT XHTTP counterpart of the TLS
+                        // block above: same "run only after AWG success,
+                        // reuse the SAME key/credential, never touch AWG's
+                        // own outcome either way, re-derive from the SAME
+                        // authoritative resolveXhttp() check the startup
+                        // path/B62 registry use - a wire-level Saved outcome
+                        // alone never marks the endpoint available; only a
+                        // fresh Ready resolution does" discipline. Looked up
+                        // by [targetEndpointId] directly (the catalog-driven
+                        // Map<EndpointId, ...> shape - never a per-gateway
+                        // `when`), so Stockholm needs no special-cased code
+                        // path here either.
+                        xrayXhttpProfileProvisioners[targetEndpointId]?.let { provisioner ->
+                            val xhttpOutcome = withContext(ioDispatcher) {
+                                provisioner.provision(key, trimmedCredential)
+                            }
+                            if (xhttpOutcome == XrayProfileProvisioningOutcome.Saved) {
+                                val repository = xrayXhttpProfileRepositories[targetEndpointId]
+                                if (repository != null && XrayRuntimeResolver.resolveXhttp(repository) is XrayXhttpRuntimeResolution.Ready) {
+                                    xrayXhttpAvailableEndpoints.update { it + targetEndpointId }
+                                }
+                            }
+                        }
                         ProvisioningUiState.Success(result)
                     }
                 }
@@ -4155,6 +4186,24 @@ class MainViewModel(
                 net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(
                     clientVersionCode = BuildConfig.VERSION_CODE.toLong(),
                 )
+            // B64 - one endpoint-scoped XrayXhttpProfileRepository per
+            // CATALOG gateway (same mechanism shadowsocksCredentialRepositories
+            // already uses below - never a single country/provider literal),
+            // and, built directly from it, one XrayXhttpProfileProvisioner
+            // per gateway - no special Stockholm-only code path, the SAME
+            // catalog-driven map covers both. Reuses gateway.id/gateway.endpointId
+            // straight from ProductionGatewayCatalog.all, never a second,
+            // independently-maintained endpoint mapping.
+            val xrayXhttpProfileRepositories = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                gateway.endpointId to XrayXhttpProfileRepositoryFactory.create(context, gateway.endpointId)
+            }
+            val xrayXhttpProfileProvisioners = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                gateway.endpointId to net.pocvpn.client.provisioning.XrayXhttpProfileProvisioner(
+                    xrayXhttpProfileRepositories.getValue(gateway.endpointId),
+                    gatewayId = gateway.id,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
+                )
+            }
             val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
             val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore, supportDiagnosticsRecorder)
 
@@ -4245,23 +4294,16 @@ class MainViewModel(
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
                 xrayXhttpTransport = net.pocvpn.client.vpn.VlessXhttpTransport(context),
-                // B62 - the SAME catalog-enumeration mechanism
-                // shadowsocksCredentialRepositories below already uses: one
-                // endpoint-scoped XrayXhttpProfileRepository per CATALOG
-                // gateway (never a single country/provider literal), so
-                // isXrayXhttpAvailableFor/the registry's Direct EXIT
-                // XRAY_XHTTP descriptor can see a real per-endpoint profile
-                // whenever one exists on disk. No provisioner writes to
-                // these repositories yet (that remains a separate, future
-                // follow-up - see B61's own disclosed-blocker note), so this
-                // wiring alone changes nothing observable today: every
-                // repository's getProfileOrNull() still returns null in
-                // production, and Direct EXIT XHTTP stays NOT_IMPLEMENTED
-                // exactly as before, until a real profile is actually
-                // provisioned for a given endpoint.
-                xrayXhttpProfileRepositories = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
-                    gateway.endpointId to XrayXhttpProfileRepositoryFactory.create(context, gateway.endpointId)
-                },
+                // B62 - one endpoint-scoped XrayXhttpProfileRepository per
+                // CATALOG gateway, so isXrayXhttpAvailableFor/the registry's
+                // Direct EXIT XRAY_XHTTP descriptor can see a real
+                // per-endpoint profile whenever one exists on disk.
+                // B64 - xrayXhttpProfileProvisioners (built above from this
+                // SAME map) is what actually WRITES a real profile into
+                // these repositories, from activateDevice() - see that
+                // constructor param's own docs.
+                xrayXhttpProfileRepositories = xrayXhttpProfileRepositories,
+                xrayXhttpProfileProvisioners = xrayXhttpProfileProvisioners,
                 // B45B-4 (review fix) - the SAME real ShadowsocksTransport
                 // instance registered for BOTH Smart Connect selection
                 // (buildTransportRegistry) and execution (VpnController) -

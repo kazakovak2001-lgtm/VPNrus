@@ -135,6 +135,22 @@ object ProvisioningClient {
         executeXrayTlsProfile(buildXrayTlsProfileRequest(publicKey, bearerToken, endpointHost))
 
     /**
+     * B64 - POST /v1/xray-profile with `{"transport": "xhttp"}`: same
+     * endpoint/credential/public-key shape as [fetchXrayProfile]/
+     * [fetchXrayTlsProfile] above, a THIRD transport option on the SAME
+     * identity (see gateway/api/handler.py's own B60 "xhttp" branch) -
+     * never a second endpoint, never a second credential. Targets Germany's
+     * own edge - see the 3-arg overload below for a live, per-endpoint
+     * request.
+     */
+    fun fetchXrayXhttpProfile(publicKey: String, bearerToken: String): XrayXhttpProfileResult =
+        fetchXrayXhttpProfile(publicKey, bearerToken, GERMANY_HOST)
+
+    /** B64 - same reasoning as the 3-arg [activate] overload above, for the Direct/EXIT XHTTP profile fetch. */
+    fun fetchXrayXhttpProfile(publicKey: String, bearerToken: String, endpointHost: String): XrayXhttpProfileResult =
+        executeXrayXhttpProfile(buildXrayXhttpProfileRequest(publicKey, bearerToken, endpointHost))
+
+    /**
      * B26 (task D) - POST /v1/ingress-profile: the SAME request shape as
      * [fetchXrayProfile]/[fetchXrayTlsProfile] (existing activation
      * credential + existing device public key, optional `transport`
@@ -371,6 +387,16 @@ object ProvisioningClient {
             body = buildXrayTlsRequestBody(publicKey),
         )
 
+    internal fun buildXrayXhttpProfileRequest(publicKey: String, bearerToken: String): OutgoingRequest =
+        buildXrayXhttpProfileRequest(publicKey, bearerToken, GERMANY_HOST)
+
+    internal fun buildXrayXhttpProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
+        OutgoingRequest(
+            url = "https://$endpointHost/v1/xray-profile",
+            headers = authHeaders(bearerToken),
+            body = buildXrayXhttpRequestBody(publicKey),
+        )
+
     private fun authHeaders(credential: String): Map<String, String> = mapOf(
         "Content-Type" to "application/json",
         "Authorization" to "Bearer $credential",
@@ -384,6 +410,9 @@ object ProvisioningClient {
 
     private fun executeXrayTlsProfile(request: OutgoingRequest): XrayTlsProfileResult =
         executeGeneric(request, XrayTlsProfileResult::NetworkError, ::mapXrayTlsProfileResponse)
+
+    private fun executeXrayXhttpProfile(request: OutgoingRequest): XrayXhttpProfileResult =
+        executeGeneric(request, XrayXhttpProfileResult::NetworkError, ::mapXrayXhttpProfileResponse)
 
     private fun <T> executeGeneric(
         request: OutgoingRequest,
@@ -447,6 +476,10 @@ object ProvisioningClient {
     /** B8O2 - same shape as [buildRequestBody] plus the explicit `"transport": "tls"` field the gateway's optional-field parsing accepts. */
     internal fun buildXrayTlsRequestBody(publicKey: String): String =
         JSONObject().put("public_key", publicKey).put("transport", "tls").toString()
+
+    /** B64 - same shape as [buildXrayTlsRequestBody], for the third allowed `"transport": "xhttp"` value. */
+    internal fun buildXrayXhttpRequestBody(publicKey: String): String =
+        JSONObject().put("public_key", publicKey).put("transport", "xhttp").toString()
 
     /**
      * Pure status-code + body -> ProvisioningResult mapping, with no
@@ -551,6 +584,94 @@ object ProvisioningClient {
             serverPort = serverPort,
             uuid = uuid,
             serverName = serverName,
+            fingerprint = fingerprint,
+        )
+    }
+
+    /**
+     * B64 - POST /v1/xray-profile?transport=xhttp response mapping - mirrors
+     * [mapXrayTlsProfileResponse]'s own shape, plus
+     * "xray_xhttp_not_configured" mapping to [XrayXhttpProfileResult.ServiceUnavailable]
+     * (same as any other 503).
+     */
+    internal fun mapXrayXhttpProfileResponse(status: Int, rawBody: String): XrayXhttpProfileResult = when (status) {
+        200, 201 -> parseXrayXhttpProfileSuccessBody(rawBody)
+        401 -> XrayXhttpProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> XrayXhttpProfileResult.Revoked
+            "device_not_bound" -> XrayXhttpProfileResult.DeviceNotBound
+            else -> XrayXhttpProfileResult.Unauthorized
+        }
+        503 -> XrayXhttpProfileResult.ServiceUnavailable
+        else -> XrayXhttpProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * B64 - never logs [raw]: on any rejection only a short, non-secret
+     * reason string is returned (field name + "missing"/"blank"/"not a
+     * well-formed UUID"/"not a recognized value"), never the raw JSON body
+     * and never the value itself - the uuid field in particular is checked
+     * only for well-formedness, its value is never interpolated into a
+     * rejection reason.
+     */
+    private fun parseXrayXhttpProfileSuccessBody(raw: String): XrayXhttpProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return XrayXhttpProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val uuid = json.optString("uuid", "")
+        val xhttpHost = json.optString("xhttp_host", "")
+        val xhttpPath = json.optString("xhttp_path", "")
+        val mode = json.optString("mode", "")
+        val uplinkHttpMethod = json.optString("uplink_http_method", "")
+        val fingerprint = json.optString("fingerprint", "")
+
+        if (serverAddress.isBlank()) {
+            return XrayXhttpProfileResult.MalformedResponse("server_address missing or blank")
+        }
+        if (serverPort !in 1..65535) {
+            return XrayXhttpProfileResult.MalformedResponse("server_port missing or out of range")
+        }
+        if (!UUID_REGEX.matches(uuid)) {
+            return XrayXhttpProfileResult.MalformedResponse("uuid missing or not a well-formed UUID")
+        }
+        if (xhttpHost.isBlank()) {
+            return XrayXhttpProfileResult.MalformedResponse("xhttp_host missing or blank")
+        }
+        if (xhttpPath.isBlank()) {
+            return XrayXhttpProfileResult.MalformedResponse("xhttp_path missing or blank")
+        }
+        // B64 - checked against the SAME closed wire-value sets
+        // XrayProfileMapper.toXrayVlessXhttpConfig itself resolves against
+        // (XrayXhttpMode/XrayXhttpUplinkHttpMethod) - never a second,
+        // independently-maintained list that could silently drift out of
+        // sync with what the mapper actually accepts. Rejecting an
+        // unrecognized value here, before it is ever persisted, is stricter
+        // than merely deferring to the mapper's own fail-closed null return
+        // at connect time - the SAME correct-set semantics, just enforced
+        // one step earlier.
+        if (net.pocvpn.client.vpn.xray.XrayXhttpMode.entries.none { it.wireValue == mode }) {
+            return XrayXhttpProfileResult.MalformedResponse("mode is not a recognized value")
+        }
+        if (net.pocvpn.client.vpn.xray.XrayXhttpUplinkHttpMethod.entries.none { it.wireValue == uplinkHttpMethod }) {
+            return XrayXhttpProfileResult.MalformedResponse("uplink_http_method is not a recognized value")
+        }
+        if (fingerprint.isBlank()) {
+            return XrayXhttpProfileResult.MalformedResponse("fingerprint missing or blank")
+        }
+
+        return XrayXhttpProfileResult.Success(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            uuid = uuid,
+            xhttpHost = xhttpHost,
+            xhttpPath = xhttpPath,
+            mode = mode,
+            uplinkHttpMethod = uplinkHttpMethod,
             fingerprint = fingerprint,
         )
     }
