@@ -87,6 +87,7 @@ fun AppRoot(
     // second, possibly-diverging copy of transportState for Direct sessions.
     val sessionHealth by viewModel.sessionHealth.collectAsStateWithLifecycle()
     val provisioningState by viewModel.provisioningState.collectAsStateWithLifecycle()
+    val activationPackageState by viewModel.activationPackageState.collectAsStateWithLifecycle()
     val publicKey by viewModel.publicKey.collectAsStateWithLifecycle()
     val diagnosticsSnapshot by viewModel.diagnostics.collectAsStateWithLifecycle()
     val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
@@ -210,17 +211,31 @@ fun AppRoot(
                 activatingGatewayId != null -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
-                    onActivateClick = { viewModel.activateDevice(credential, activatingGatewayId!!) },
-                    errorText = provisioningState.toActivationErrorText(),
-                    isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
+                    // B56-5 - a `nova-activation:1:` package is verified locally
+                    // first; anything else stays the unchanged raw-credential path.
+                    onActivateClick = {
+                        if (net.pocvpn.client.activation.ActivationPackageParser.looksLikePackageText(credential)) {
+                            viewModel.importActivationPackage(credential, activatingGatewayId!!)
+                        } else {
+                            viewModel.activateDevice(credential, activatingGatewayId!!)
+                        }
+                    },
+                    errorText = activationErrorText(credential, activationPackageState, provisioningState),
+                    isSubmitting = provisioningState is ProvisioningUiState.Provisioning || activationPackageState.isInProgress(),
                     onCancel = { activatingGatewayId = null; credential = "" },
                 )
                 screenFor(profileSource) == AppScreen.ACTIVATION -> ActivationScreen(
                     credential = credential,
                     onCredentialChange = { credential = it },
-                    onActivateClick = { viewModel.activateDevice(credential) },
-                    errorText = provisioningState.toActivationErrorText(),
-                    isSubmitting = provisioningState is ProvisioningUiState.Provisioning,
+                    onActivateClick = {
+                        if (net.pocvpn.client.activation.ActivationPackageParser.looksLikePackageText(credential)) {
+                            viewModel.importActivationPackage(credential)
+                        } else {
+                            viewModel.activateDevice(credential)
+                        }
+                    },
+                    errorText = activationErrorText(credential, activationPackageState, provisioningState),
+                    isSubmitting = provisioningState is ProvisioningUiState.Provisioning || activationPackageState.isInProgress(),
                 )
                 // B8H - "Select apps" screen, reached only from Settings.
                 settingsRoute == SettingsRoute.AppSelector -> AppSelectorScreen(
