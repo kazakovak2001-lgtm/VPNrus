@@ -2670,3 +2670,103 @@ activation store was never touched - see
 `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md` for the full ceremony record
 (including the abandoned candidate), offline-backup status, and rotation
 policy.)
+
+## B67/B63 recovery boundary (2026-09-26, ROADMAP-only re-scoping, no code change)
+
+- **B67 (Resilient Activation & Enrollment) is a recovery/re-scoping label, not
+  a new architecture.** It groups the ALREADY-DOCUMENTED B56 ActivationEnvelope
+  work (see "Resilient Activation & Control-Plane Access" and B56 sections
+  above - schema/verifier/issuer-tooling/production-key ceremony are real; the
+  runtime composition into `MainViewModel`/`ActivationScreen`/bootstrap
+  networking is B56-5, still not done) together with PR #58's still-unmerged
+  zero-touch field-enrollment service (`gateway/api/field_enrollment.py`,
+  `gateway/tools/field_enrollment_admin.py`, Android `FieldCredentialStore.kt`)
+  under one ROADMAP number, so neither loses tracking. See `docs/ROADMAP.md`'s
+  B67 rows for the DONE/PARTIAL/PLANNED breakdown per sub-slice.
+- **The legacy `ProvisioningClient.activate(publicKey, activationCredential:
+  String)` model is still the only LIVE activation path.** `ActivationEnvelope`
+  exists at the type/crypto/tooling layer only and has no runtime call site
+  yet - the two are not "old vs. replaced," they are "live" vs.
+  "built-but-unwired." Do not assume `ActivationEnvelope` supersedes the
+  credential model in any live code path until B56-5 actually wires it.
+- **Multi-path CONTROL-PLANE/activation discovery across DIRECT/CHAIN_DIRECT/
+  CHAIN_CDN does not exist.** The existing `PathScorer`/`AutoGatewaySelector`
+  multi-path ranking is a DATA-PLANE (VPN transport/gateway) authority only
+  (see the Reachability/Smart Connect pipeline section at the top of this
+  file). `ControlPlaneOriginSetBuilder`/`TrustedOriginRequestExecutor` (B30)
+  only iterate origins WITHIN one already-known gateway's catalog entry - they
+  do not select among DIRECT/relay/CDN paths for reaching the control plane
+  itself. B67.2 is genuinely unimplemented, not a rename of existing code.
+- **B63 (In-App Support & Diagnostics) reuses the existing B29 diagnostics
+  stack** (`SupportDiagnosticsRecorder`/`DiagnosticSession`/`SupportBundle`/
+  `DiagnosticSanitizer`/`DiagnosticsDialog`, all present at HEAD) - no support
+  chat, ticket history, or support backend of any kind exists yet. B63 extends
+  this existing plumbing; it does not introduce a second, parallel report/
+  diagnostics system.
+- **Milestone-number correction (2026-09-26, same pass)**: this section
+  originally labeled the activation/enrollment recovery milestone "B62" -
+  this collided with a REAL, already-merged slice on this branch's own commit
+  history (`625d50a "B62: surface direct EXIT XHTTP in transport registry"`,
+  part of the B59-B66.18 Direct-EXIT-XHTTP work). Renamed to **B67**
+  throughout this file and `docs/ROADMAP.md` before any commit - `B62` was
+  never free. The highest `B<n>` used anywhere in this repository's commit
+  history at the time of this correction was `B66` (`B66.18`); `B67` is the
+  next unused number in that sequence (`B63`, used for the separate In-App
+  Support milestone, was independently confirmed free).
+
+## B-WL (Whitelist / Restricted-Network Adaptation) recovery boundary (2026-09-26)
+
+- **B-WL is a distinct concern from B67, and both are distinct from B8/B8I
+  and B54.** B67 governs bootstrap/activation/enrollment/entitlement -
+  "is this device authorized and does it have a profile." B-WL governs
+  network-restriction classification and DATA-PLANE candidate transport/
+  front/ingress ranking - "given this network's observed behavior, which
+  transport/path should be tried, in what order." Neither replaces B8/B8I's
+  existing preflight/transport-resolution/per-attempt-ownership/failover
+  pipeline (unchanged, only extended) or B54's restricted-network field
+  validation matrix (B-WL6 IS that matrix, not a second one).
+- **`RestrictionClassifier.RestrictionClass`** (`smartconnect/RestrictionClassifier.kt`)
+  already carries `POSSIBLE_HARD_WHITELIST`/`POSSIBLE_UDP_OR_AWG_FILTERING`,
+  named `POSSIBLE` by design (B8M/B18 discipline - never a confirmed claim),
+  fed by a genuine multi-signal, nullable `RestrictionEvidence` model
+  (`awgHandshakeFresh`/`gatewayHttpsReachable`/B8M's strict-majority
+  `diverseInternetReachable`). B-WL1 extends this evidence model with finer
+  signals (early stall, timeout-without-RST, TLS-handshake-then-stall,
+  low-byte-count, cross-transport/endpoint pattern repetition, independent
+  UDP reachability) - it does NOT introduce a second classifier or a
+  second enum; existing naming is preserved and extended, per instruction.
+- **`TransportKind.XRAY_XHTTP`** (VLESS+REALITY+XHTTP/TCP-443) is a real,
+  live, EXIT-role-capable transport (B35 CDN-relay origin work, plus this
+  branch's own B59-B66.18 Direct-EXIT-XHTTP plumbing/failover, confirmed
+  wired into `MainViewModel.buildTransportRegistry` and AWG->Direct-EXIT-XHTTP
+  failover). B-WL2 does not build XHTTP - it gives `PathScorer` a scoring
+  adjustment that favors an already-reachable XRAY_XHTTP candidate under
+  B-WL1's UDP-filtering/possible-whitelist evidence, never a hardcoded
+  "restricted implies XHTTP" branch and never XHTTP as the sole candidate.
+- **`CdnProviderCapabilityProfile`/`CdnProviderProfileMetadata`** (B35,
+  `reachability/` package) already model a provider-agnostic front/CDN
+  capability set (provider identity is a data field, never a hardcoded
+  branch) - this is the `FrontProvider { A, B, C }` abstraction B-WL3 asks
+  for; it already exists and is already separate from activation authority
+  and VPN exit identity (`EndpointRole`/`EndpointDescriptor`/`EndpointManifest`,
+  B11, see the per-device-identity invariant above). B-WL3 extends B27's
+  typed `IngressKind` (`DIRECT_IP`/`CDN_FRONTED`) with whitelist/front
+  semantics; it does not create a new ingress abstraction.
+- **The CLIENT -> INGRESS -> EXIT relay architecture (B24-B34) already
+  separates ingress availability, exit availability, routing, health, and
+  failover** - see the B33/B34 sections above (`RelayIngressResolver`,
+  `IngressProfileStore`, `PathScorer`'s relay-fairness logic,
+  `HttpRelayEndToEndProbe`, the post-Connected relay-health watchdog). The
+  physical Stockholm(ingress)->Frankfurt(exit) test cited there proves the
+  two-hop DATA PLANE works end-to-end on an UNRESTRICTED network - it is
+  **not** whitelist/restricted-network evidence, and B-WL may never cite it
+  as such (this file's own B33 section already states this; B-WL4 exists
+  only to make the distinction explicit at the roadmap level too).
+- **The "successful handshake never proves a working tunnel" principle is
+  already a hard invariant**, not a B-WL proposal - see this file's own
+  "Xray/TLS Connected confirmation (hard invariant, B33)" section
+  (`confirmRemoteConnectivity`, the relay-health watchdog). B-WL5's real,
+  bounded scope is threading B-WL1's richer restriction evidence into the
+  ONE existing `PathCandidateBuilder`/`PathScorer` (never a second scorer,
+  never a per-classification hardcoded if/else chain - roadmap architecture
+  principle 6 already forbids this).
