@@ -2342,12 +2342,15 @@ B30) and `TrustedChainControlPlaneOriginCatalog.chainDirect`/`chainCdn`
 (CHAIN_DIRECT/CHAIN_CDN) - **both return `emptyList()` today: no trusted
 HTTP-capable relay/CDN front for the control plane is deployed or audited;
 the one real B25/B31 Stockholm ingress relays DATA-PLANE VLESS traffic and
-is never reused as a control-plane front.** A separate `internal`
-(module-visible-only) `forGatewayFromOrigins` overload exists purely as a
-deterministic-test seam (`ActivationPathCandidateTest` is its only caller
-anywhere in the codebase) - it is never called by `MainViewModel` or any
-other production code path, so no caller-supplied host reaches the
-production composition through it. Fixed DIRECT->CHAIN_DIRECT->CHAIN_CDN
+is never reused as a control-plane front.** `forGateway` delegates to a
+separate, `internal` (module-visible-only - a compile-time/Kotlin-visibility
+mechanism, not a runtime security boundary) `forGatewayFromOrigins`
+composition seam, but ONLY ever with origins it already resolved itself from
+those trusted production catalogs; `ActivationPathCandidateTest` calls that
+same internal seam directly, with synthetic test origins, to exercise the
+composition mechanism deterministically. No PRODUCTION caller (i.e.
+`forGateway`, the only one that exists) supplies a raw caller-supplied host
+to it - MainViewModel only ever calls `forGateway`. Fixed DIRECT->CHAIN_DIRECT->CHAIN_CDN
 declaration order, deliberately not a score (no per-gateway `Long` weight,
 no `PathScorer` tiering reused) - there is no control-plane-specific
 evidence to rank against, so this is the "no useful evidence -> stable

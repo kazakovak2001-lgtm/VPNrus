@@ -89,11 +89,17 @@ class ActivationPathCandidateTest {
         // calls, and its sole parameter is a closed ProductionGatewayId enum
         // - there is no origin/host/URL argument to pass through it at all.
         // The overload that DOES accept origin lists (forGatewayFromOrigins)
-        // is `internal` - invisible outside this Gradle module, and this
-        // test class is its only caller anywhere in the codebase (verified
-        // by inspection, not merely asserted) - so no external/user/network
-        // input can reach it. This test proves the production call shape,
-        // not an unprovable universal absence of any injection seam.
+        // is `internal` - a compile-time/Kotlin-visibility mechanism, not a
+        // runtime security boundary; invisible from outside this Gradle
+        // module. forGateway() itself calls it, but only ever with origins
+        // forGateway() already resolved from the trusted production
+        // catalogs (ControlPlaneOriginSetBuilder/
+        // TrustedChainControlPlaneOriginCatalog) - this test class calls it
+        // directly only with synthetic test origins, to exercise the
+        // composition mechanism deterministically. No production caller
+        // supplies a raw external/user/network-supplied host to it. This
+        // test proves the production call shape, not an unprovable
+        // universal absence of any injection seam.
         val candidates = ActivationPathCandidateBuilder.forGateway(gateway)
         candidates.flatMap { it.origins }.forEach { assertEquals(gateway, it.gatewayId) }
     }
