@@ -14,6 +14,13 @@ for _path in (_GATEWAY_DIR, _THIS_DIR):
 from api import config as config_module
 
 
+def _write_wrap_key_file(directory, content=b"\x03" * 32):
+    path = os.path.join(directory, "field-enrollment-wrap-key.bin")
+    with open(path, "wb") as handle:
+        handle.write(content)
+    return path
+
+
 def _valid_key():
     return base64.b64encode(b"\x02" * 32).decode("ascii")
 
@@ -509,6 +516,7 @@ class ManifestConfigTests(unittest.TestCase):
         env["POCVPN_API_FIELD_ENROLLMENT_MAX_DEVICES"] = "5"
         index_path = os.path.join(self._tmp.name, "does-not-exist-yet", "field-enrollment-index.json")
         env["POCVPN_API_FIELD_ENROLLMENT_INDEX_PATH"] = index_path
+        env["POCVPN_API_FIELD_ENROLLMENT_WRAP_KEY_FILE"] = _write_wrap_key_file(self._tmp.name)
         cfg = config_module.load_config(env=env)
         self.assertEqual(cfg.field_enrollment_index_path, index_path)
 
@@ -518,10 +526,52 @@ class ManifestConfigTests(unittest.TestCase):
         env["POCVPN_API_FIELD_ENROLLMENT_ENABLED"] = "true"
         env["POCVPN_API_FIELD_ENROLLMENT_MAX_DEVICES"] = "5"
         env["POCVPN_API_FIELD_ENROLLMENT_INDEX_PATH"] = os.path.join(self._tmp.name, "field-enrollment-index.json")
+        env["POCVPN_API_FIELD_ENROLLMENT_WRAP_KEY_FILE"] = _write_wrap_key_file(self._tmp.name)
         cfg = config_module.load_config(env=env)
         self.assertTrue(cfg.field_enrollment_enabled)
         self.assertEqual(cfg.field_enrollment_max_devices, 5)
         self.assertTrue(cfg.field_enrollment_index_lock_path.endswith(".lock"))
+
+    # --- FIELD_ENROLLMENT_WRAP_KEY_FILE (round-3 review fix) ---
+
+    def _valid_field_enrollment_env(self):
+        env = dict(self._valid_env())
+        env["POCVPN_API_ACTIVATION_STORE_PATH"] = os.path.join(self._tmp.name, "activations.json")
+        env["POCVPN_API_FIELD_ENROLLMENT_ENABLED"] = "true"
+        env["POCVPN_API_FIELD_ENROLLMENT_MAX_DEVICES"] = "5"
+        env["POCVPN_API_FIELD_ENROLLMENT_INDEX_PATH"] = os.path.join(self._tmp.name, "field-enrollment-index.json")
+        return env
+
+    def test_field_enrollment_enabled_requires_wrap_key_file(self):
+        env = self._valid_field_enrollment_env()
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_field_enrollment_wrap_key_file_must_be_absolute(self):
+        env = self._valid_field_enrollment_env()
+        key_path = _write_wrap_key_file(self._tmp.name)
+        env["POCVPN_API_FIELD_ENROLLMENT_WRAP_KEY_FILE"] = os.path.relpath(key_path, self._tmp.name)
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_field_enrollment_wrap_key_file_must_exist(self):
+        env = self._valid_field_enrollment_env()
+        env["POCVPN_API_FIELD_ENROLLMENT_WRAP_KEY_FILE"] = os.path.join(self._tmp.name, "does-not-exist.bin")
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_field_enrollment_wrap_key_file_must_be_exactly_32_bytes(self):
+        env = self._valid_field_enrollment_env()
+        env["POCVPN_API_FIELD_ENROLLMENT_WRAP_KEY_FILE"] = _write_wrap_key_file(self._tmp.name, content=b"\x03" * 16)
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
+    def test_field_enrollment_wrap_key_file_loads_when_valid(self):
+        env = self._valid_field_enrollment_env()
+        key_path = _write_wrap_key_file(self._tmp.name)
+        env["POCVPN_API_FIELD_ENROLLMENT_WRAP_KEY_FILE"] = key_path
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.field_enrollment_wrap_key_file, key_path)
 
 
 if __name__ == "__main__":

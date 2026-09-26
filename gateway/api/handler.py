@@ -850,7 +850,12 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         mere existence.
         """
         cfg = self.server.config
-        if not (cfg.field_enrollment_enabled and cfg.activation_store_path and cfg.field_enrollment_index_path):
+        if not (
+            cfg.field_enrollment_enabled
+            and cfg.activation_store_path
+            and cfg.field_enrollment_index_path
+            and cfg.field_enrollment_wrap_key_file
+        ):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "field_enrollment_not_configured")
 
         if not self.server.global_limiter.allow("global"):
@@ -901,6 +906,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 cfg.activation_store_path, cfg.activation_lock_path,
                 cfg.provision_script_path, cfg.subprocess_timeout_seconds,
                 cfg.field_enrollment_max_devices,
+                cfg.field_enrollment_wrap_key_file,
                 sudo_path=cfg.sudo_path or None,
             )
         except (activations.ActivationStoreError, field_enrollment.FieldEnrollmentIndexError):

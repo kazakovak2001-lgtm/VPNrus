@@ -180,10 +180,27 @@ class AppConfig:
     field_enrollment_max_devices: int = 0
     # Round-2 review fix: field_enrollment.py no longer derives credentials
     # from a server secret (see that module's own docs for why) - these
-    # name its own small, self-initializing, non-secret index file (public
-    # key -> already-issued credential/activation_id), never a secret file.
+    # name its own small, self-initializing index file (public key ->
+    # already-issued activation_id/credential digest/WRAPPED credential -
+    # never a raw/plaintext credential, see the wrap-key field below and
+    # field_enrollment.py's own docs on why the index is not itself secret
+    # even though one of its fields is now encrypted).
     field_enrollment_index_path: str = ""
     field_enrollment_index_lock_path: str = ""
+    # Round-3 review fix (plaintext-credential-at-rest finding) - a FILE
+    # PATH to exactly 32 raw bytes (AES-256-GCM key), read transiently by
+    # this process to wrap/unwrap ONLY the field-enrollment index's own
+    # per-device credential field - never logged, never returned, never
+    # embedded in the Android APK (the client never sees or needs this
+    # key: it only ever receives the plaintext credential once, in the
+    # POST /v1/field-enroll response itself, exactly as before). A
+    # SEPARATE key/trust domain from relay_probe_hmac_secret_file/
+    # xray_tls_key_file above - compromising this key discloses only the
+    # (at most field_enrollment_max_devices) credentials already wrapped
+    # in this ONE index file, nothing about the manifest, activation-issuer,
+    # or TLS/Xray key material. Required whenever field_enrollment_enabled
+    # is set - see load_config's own validation group below.
+    field_enrollment_wrap_key_file: str = ""
 
 
 def _get(env, key):
@@ -614,6 +631,7 @@ def load_config(env=None):
     field_enrollment_index_lock_path = _get(env, "FIELD_ENROLLMENT_INDEX_LOCK_PATH") or (
         field_enrollment_index_path + ".lock" if field_enrollment_index_path else ""
     )
+    field_enrollment_wrap_key_file = _get(env, "FIELD_ENROLLMENT_WRAP_KEY_FILE")
     field_enrollment_max_devices = 0
     if field_enrollment_max_devices_raw:
         try:
@@ -641,6 +659,26 @@ def load_config(env=None):
             )
         if not os.path.isabs(field_enrollment_index_path):
             raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_INDEX_PATH must be an absolute path: {field_enrollment_index_path!r}")
+        # Round-3 review fix - see AppConfig.field_enrollment_wrap_key_file's
+        # own docs. Validated eagerly (path + exact byte length) at startup,
+        # same fail-fast discipline as every other file-path config group
+        # above, rather than only discovering a misconfigured/truncated key
+        # the first time a real request tries to wrap/unwrap a credential.
+        if not field_enrollment_wrap_key_file:
+            raise ConfigError(
+                f"{_ENV_PREFIX}FIELD_ENROLLMENT_WRAP_KEY_FILE is required when field enrollment is enabled"
+            )
+        if not os.path.isabs(field_enrollment_wrap_key_file):
+            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_WRAP_KEY_FILE must be an absolute path: {field_enrollment_wrap_key_file!r}")
+        if not os.path.isfile(field_enrollment_wrap_key_file):
+            raise ConfigError(f"{_ENV_PREFIX}FIELD_ENROLLMENT_WRAP_KEY_FILE does not exist: {field_enrollment_wrap_key_file!r}")
+        with open(field_enrollment_wrap_key_file, "rb") as _wrap_key_handle:
+            _wrap_key_bytes = _wrap_key_handle.read()
+        if len(_wrap_key_bytes) != 32:
+            raise ConfigError(
+                f"{_ENV_PREFIX}FIELD_ENROLLMENT_WRAP_KEY_FILE must contain exactly 32 raw bytes (AES-256 key), "
+                f"got {len(_wrap_key_bytes)}"
+            )
 
     return AppConfig(
         endpoint_host=endpoint_host,
@@ -686,4 +724,5 @@ def load_config(env=None):
         field_enrollment_max_devices=field_enrollment_max_devices,
         field_enrollment_index_path=field_enrollment_index_path,
         field_enrollment_index_lock_path=field_enrollment_index_lock_path,
+        field_enrollment_wrap_key_file=field_enrollment_wrap_key_file,
     )

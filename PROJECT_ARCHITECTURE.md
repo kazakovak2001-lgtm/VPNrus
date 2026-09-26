@@ -793,26 +793,68 @@ credential this mints IS the same live legacy `ActivationCredential`
 server-side authorization artifact, minted a different way. Server: `POST
 /v1/field-enroll` (`gateway/api/field_enrollment.py`), disabled by default
 (`AppConfig.field_enrollment_enabled`, requires an explicit env-var opt-in
-plus a `FIELD_ENROLLMENT_INDEX_PATH`). Given only a fresh device's public
-key (no credential - none exists yet), it mints a genuinely RANDOM
-per-device credential (`secrets.token_urlsafe`, 256 bits of entropy, same
-as `activations.issue_activation`'s own operator-issued credentials -
-never HMAC-derived from any server secret, so compromising the mechanism
+plus `FIELD_ENROLLMENT_INDEX_PATH`/`FIELD_ENROLLMENT_WRAP_KEY_FILE` - see
+below). Given only a fresh device's public key (no credential - none
+exists yet), it mints a genuinely RANDOM per-device credential
+(`secrets.token_urlsafe`, 256 bits of entropy, same as
+`activations.issue_activation`'s own operator-issued credentials - never
+HMAC-derived from any server secret, so compromising the mechanism
 discloses only the handful of credentials it has already issued, never a
 skeleton key over every device) and registers it via
 `activations.register_credential` -> the SAME `provision_with_activation`
 `/v1/activate` already uses. A random (non-derivable) credential needs ONE
-piece of durable, non-secret bookkeeping to stay race-free/idempotent under
+piece of durable bookkeeping to stay race-free/idempotent under
 concurrency: `FieldEnrollmentIndex` (`field_enrollment.py`'s own small,
 self-initializing, capped index file, keyed by public key - never secret,
 already sent in cleartext on every request) is the single atomic operation
 making "same public key -> idempotent replay" and "global device cap" (now
 scoped to THIS index, never to the shared `activations.json`'s own total
 record count, which may also hold unrelated operator-issued multi-device
-activations) race-free together. A failed provisioning attempt releases
-its index reservation so a retry claims a fresh slot rather than being
-stuck behind a permanently-broken one that still counts against the cap.
-Two independent rate limiters gate the endpoint (`server.py`): a
+activations) race-free together.
+
+**Credential-at-rest (round-3 review fix)**: the index does NOT store the
+raw credential in plaintext - it stores `credential_digest` (the SAME
+SHA-256 digest `activations.py` already uses everywhere) plus
+`wrapped_credential` (AES-256-GCM ciphertext, base64, via `cryptography
+.hazmat.primitives.ciphers.aead.AESGCM` - the same library this repo's own
+manifest/envelope signing tooling already depends on, never a hand-rolled
+cipher), with the device's own public key bound in as authenticated-
+encryption associated data so one entry's wrapped blob can never decrypt
+under a different public key. The wrapping key
+(`AppConfig.field_enrollment_wrap_key_file` - 32 raw bytes, read
+transiently per request, never logged/returned/embedded in the APK) is a
+server-only secret in its own trust domain, disjoint from every other
+key/secret in this codebase; an index-file leak alone (without that
+separate key file) discloses nothing usable, and a corrupted/tampered
+wrapped entry fails closed at decrypt time (GCM's own authentication tag)
+rather than silently producing wrong bytes.
+
+**Transactional integrity (round-3 review fix)**: `enroll_device` is an
+explicit reserve -> register -> provision -> commit-or-rollback state
+machine with an unambiguous ownership model - `activations
+.RegisterCredentialResult.created` and `_Reservation.is_new_index_entry`
+mark whether THIS call, specifically, created the activation record/index
+entry (never inferred from exception-message text). If
+`activations.register_credential` itself raises (a simulated storage
+failure), the index reservation is rolled back (only if this call created
+it) and the original exception re-raised - never a dangling reservation,
+never a stuck device cap. If provisioning subsequently fails, the EXISTING
+`unbind_reservation` mechanism (inside `provision_with_activation` itself)
+already removes any PENDING device bind; this module additionally removes
+the activation RECORD `register_credential` created via a new,
+ownership-and-state-checked primitive, `activations
+.remove_credential_if_unbound` (never a blind delete-by-activation_id -
+it verifies the record's own `activation_id` matches and that
+`bound_devices` is empty before removing anything, mirroring
+`unbind_reservation`'s own "only remove what this call is certain it
+owns" discipline, and reusing the module's existing fixed lock order -
+per-activation lock, then the global store lock - rather than inventing a
+new one), then the index reservation. `register_credential` is now
+ALWAYS attempted, even on an idempotent replay - this closes a real
+crash-recovery gap: a process that reserved an index entry but died
+before ever registering the activation record no longer gets stuck
+returning `DISABLED` forever; a retry self-heals. Two independent rate
+limiters gate the endpoint (`server.py`): a
 per-public-key one (`field_enrollment_limiter`) and a global one
 (`field_enrollment_global_limiter`, keyed by a single constant) sized near
 the device cap itself - the per-key limiter cannot help against an

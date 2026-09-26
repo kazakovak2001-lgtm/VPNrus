@@ -17,6 +17,7 @@ from api import activations as activations_module
 from _fixtures import (
     RunningServer,
     make_app_config,
+    make_field_enrollment_wrap_key_file,
     make_public_key,
     set_plan,
     write_fake_provision_script,
@@ -40,6 +41,7 @@ class FieldEnrollEndpointTests(unittest.TestCase):
 
         self.index_path = os.path.join(self._tmp.name, "field-enrollment-index.json")
         self.index_lock_path = os.path.join(self._tmp.name, ".field-enrollment-index.lock")
+        self.wrap_key_file = make_field_enrollment_wrap_key_file(self._tmp.name)
 
     def _server(self, enabled=True, max_devices=5):
         app_config = make_app_config(
@@ -50,6 +52,7 @@ class FieldEnrollEndpointTests(unittest.TestCase):
             field_enrollment_max_devices=max_devices,
             field_enrollment_index_path=self.index_path if enabled else "",
             field_enrollment_index_lock_path=self.index_lock_path if enabled else "",
+            field_enrollment_wrap_key_file=self.wrap_key_file if enabled else "",
         )
         server = RunningServer(app_config)
         self.addCleanup(server.close)
