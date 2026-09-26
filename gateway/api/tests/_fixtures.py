@@ -107,6 +107,8 @@ def make_app_config(
     xray_dest="",
     xray_tls_server_port=0, xray_tls_server_name="", xray_tls_fingerprint="",
     xray_tls_cert_file="", xray_tls_key_file="",
+    xray_xhttp_server_port=0, xray_xhttp_path="",
+    xray_xhttp_client_host="", xray_xhttp_client_port=0,
     manifest_path="",
     relay_probe_hmac_secret_file="",
 ):
@@ -145,6 +147,10 @@ def make_app_config(
         xray_tls_fingerprint=xray_tls_fingerprint,
         xray_tls_cert_file=xray_tls_cert_file,
         xray_tls_key_file=xray_tls_key_file,
+        xray_xhttp_server_port=xray_xhttp_server_port,
+        xray_xhttp_path=xray_xhttp_path,
+        xray_xhttp_client_host=xray_xhttp_client_host,
+        xray_xhttp_client_port=xray_xhttp_client_port,
         manifest_path=manifest_path,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
     )
@@ -280,6 +286,25 @@ def make_xray_tls_app_config(tmp_dir, provision_script_path, activation_store_pa
         xray_tls_fingerprint=kwargs.pop("xray_tls_fingerprint", "chrome"),
         xray_tls_cert_file=kwargs.pop("xray_tls_cert_file", cert_file),
         xray_tls_key_file=kwargs.pop("xray_tls_key_file", key_file),
+        **kwargs,
+    )
+
+
+def make_xray_xhttp_app_config(tmp_dir, provision_script_path, activation_store_path, activation_lock_path, **kwargs):
+    """B60 - convenience wrapper: a full app config with REALITY (via
+    make_xray_app_config) AND XHTTP both configured - representative,
+    non-secret test values throughout, mirroring make_xray_tls_app_config's
+    own shape. xray_xhttp_server_port is the loopback-only Xray inbound
+    port; xray_xhttp_client_host/_port are the separate PUBLIC,
+    Cloudflare-facing coordinates POST /v1/xray-profile reports (B60) -
+    see AppConfig.xray_xhttp_client_host's own docs for why these are two
+    distinct fields."""
+    return make_xray_app_config(
+        tmp_dir, provision_script_path, activation_store_path, activation_lock_path,
+        xray_xhttp_server_port=kwargs.pop("xray_xhttp_server_port", 2099),
+        xray_xhttp_path=kwargs.pop("xray_xhttp_path", "/nova-xhttp/"),
+        xray_xhttp_client_host=kwargs.pop("xray_xhttp_client_host", "edge.aknova.pp.ua"),
+        xray_xhttp_client_port=kwargs.pop("xray_xhttp_client_port", 443),
         **kwargs,
     )
 

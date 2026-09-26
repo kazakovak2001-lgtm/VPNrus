@@ -8,6 +8,7 @@
 !gateway/edge/nginx-pocvpn-bootstrap.conf
 !gateway/edge/nginx-pocvpn.conf
 !gateway/edge/nginx-pocvpn-stockholm.conf
+!gateway/edge/nginx-pocvpn-cdn-origin-frankfurt.conf
 .env
 .env.*
 !.env.example

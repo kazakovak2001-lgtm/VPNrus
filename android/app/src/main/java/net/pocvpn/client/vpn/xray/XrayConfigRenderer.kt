@@ -185,13 +185,26 @@ object XrayConfigRenderer {
                     }
                 })
 
-        // Always explicit. v26.7.28 treats omitted/zero xPaddingBytes as
-        // its own 100..1000 default, so omission could never mean "NONE".
-        xhttpSettings
-            .put("xPaddingBytes", renderXhttpRange(config.paddingMinBytes, config.paddingMaxBytes))
-            .put("xPaddingObfsMode", true)
-            .put("xPaddingPlacement", config.paddingPlacement.wireValue)
-            .put("xPaddingMethod", "repeat-x")
+        // B61.4 - only emitted when explicit padding was actually requested
+        // (all three non-null, enforced by validateXrayVlessXhttpConfig's
+        // own consistency check). When null, these keys are OMITTED
+        // entirely - never a synthetic HEADER/QUERY guess - so pinned
+        // v26.7.28's own real, source-verified default applies naturally
+        // (transport/internet/splithttp/config.go's FillPacketRequest:
+        // xPaddingObfsMode absent -> a fixed PlacementQueryInHeader
+        // placement, key "x_padding", header "Referer" - a placement this
+        // app's own XrayXhttpPaddingPlacement enum has no member for and
+        // must never approximate).
+        val paddingMinBytes = config.paddingMinBytes
+        val paddingMaxBytes = config.paddingMaxBytes
+        val paddingPlacement = config.paddingPlacement
+        if (paddingMinBytes != null && paddingMaxBytes != null && paddingPlacement != null) {
+            xhttpSettings
+                .put("xPaddingBytes", renderXhttpRange(paddingMinBytes, paddingMaxBytes))
+                .put("xPaddingObfsMode", true)
+                .put("xPaddingPlacement", paddingPlacement.wireValue)
+                .put("xPaddingMethod", "repeat-x")
+        }
 
         val streamSettings = JSONObject()
             .put("network", "xhttp")

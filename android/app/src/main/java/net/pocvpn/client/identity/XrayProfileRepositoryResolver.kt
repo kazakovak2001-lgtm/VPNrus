@@ -39,3 +39,19 @@ class MapXrayProfileRepositoryResolver(private val repositories: Map<EndpointId,
 class MapXrayTlsProfileRepositoryResolver(private val repositories: Map<EndpointId, XrayTlsProfileRepository>) : XrayTlsProfileRepositoryResolver {
     override fun resolve(endpointId: EndpointId): XrayTlsProfileRepository? = repositories[endpointId]
 }
+
+/**
+ * B61 - the EXIT-role XHTTP counterpart of [XrayProfileRepositoryResolver],
+ * same contract, same fail-closed discipline. Deliberately independent of
+ * any ingress/relay resolver (see [net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver]'s
+ * own docs) - this resolves the repository for a DIRECT, non-relayed EXIT
+ * XHTTP profile only.
+ */
+fun interface XrayXhttpProfileRepositoryResolver {
+    fun resolve(endpointId: EndpointId): XrayXhttpProfileRepository?
+}
+
+/** The XHTTP counterpart of [MapXrayProfileRepositoryResolver]. */
+class MapXrayXhttpProfileRepositoryResolver(private val repositories: Map<EndpointId, XrayXhttpProfileRepository>) : XrayXhttpProfileRepositoryResolver {
+    override fun resolve(endpointId: EndpointId): XrayXhttpProfileRepository? = repositories[endpointId]
+}

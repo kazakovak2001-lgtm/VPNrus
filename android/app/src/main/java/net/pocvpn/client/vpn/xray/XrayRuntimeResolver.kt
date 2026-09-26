@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn.xray
 
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
+import net.pocvpn.client.identity.XrayXhttpProfileRepository
 
 /**
  * What [XrayRuntimeResolver.resolve] decided about the currently stored
@@ -19,6 +20,15 @@ sealed class XrayRuntimeResolution {
 sealed class XrayTlsRuntimeResolution {
     data class Ready(val config: XrayVlessTlsConfig, val renderedConfig: String) : XrayTlsRuntimeResolution()
     data class Rejected(val reason: String) : XrayTlsRuntimeResolution()
+}
+
+/**
+ * B61/B61.4 - the EXIT-role XHTTP counterpart of [XrayRuntimeResolution].
+ * Never carries the uuid in [Rejected]'s reason.
+ */
+sealed class XrayXhttpRuntimeResolution {
+    data class Ready(val config: XrayVlessXhttpConfig, val renderedConfig: String) : XrayXhttpRuntimeResolution()
+    data class Rejected(val reason: String) : XrayXhttpRuntimeResolution()
 }
 
 /**
@@ -66,6 +76,35 @@ object XrayRuntimeResolver {
                 XrayTlsRuntimeResolution.Rejected("stored Xray TLS profile failed validation: ${validation.errors.size} error(s)")
             is XrayTlsConfigValidationResult.Valid ->
                 XrayTlsRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
+        }
+    }
+
+    /**
+     * B61/B61.4 - the EXIT-role (Frankfurt, B60) XHTTP counterpart of
+     * [resolve]/[resolveTls], same load -> fail-closed -> map -> validate
+     * -> render chain. [XrayXhttpProfile.toXrayVlessXhttpConfig] fills
+     * minimumTlsVersion/alpn/maxEachPostBytes with the evidence-backed EXIT
+     * constants established in B61.3/B61.4 (see that function's own docs
+     * for the exact pinned-source citations) and leaves the padding fields
+     * null (omitted) - never an invented HEADER/QUERY placement.
+     */
+    suspend fun resolveXhttp(repository: XrayXhttpProfileRepository): XrayXhttpRuntimeResolution {
+        val profile = try {
+            repository.getProfileOrNull()
+        } catch (t: Throwable) {
+            return XrayXhttpRuntimeResolution.Rejected("failed to load Xray XHTTP profile: ${t.javaClass.simpleName}")
+        } ?: return XrayXhttpRuntimeResolution.Rejected("no Xray XHTTP profile configured")
+
+        val config = profile.toXrayVlessXhttpConfig()
+            ?: return XrayXhttpRuntimeResolution.Rejected(
+                "stored Xray XHTTP profile's mode/uplinkHttpMethod did not match a known wire value",
+            )
+
+        return when (val validation = validateXrayVlessXhttpConfig(config)) {
+            is XrayXhttpConfigValidationResult.Invalid ->
+                XrayXhttpRuntimeResolution.Rejected("stored Xray XHTTP profile failed validation: ${validation.errors.size} error(s)")
+            is XrayXhttpConfigValidationResult.Valid ->
+                XrayXhttpRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
         }
     }
 }

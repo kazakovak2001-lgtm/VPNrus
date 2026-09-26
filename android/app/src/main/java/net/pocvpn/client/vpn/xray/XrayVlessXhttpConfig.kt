@@ -23,9 +23,18 @@ data class XrayVlessXhttpConfig(
     val mode: XrayXhttpMode,
     val uplinkHttpMethod: XrayXhttpUplinkHttpMethod,
     val maxEachPostBytes: Int,
-    val paddingPlacement: XrayXhttpPaddingPlacement,
-    val paddingMinBytes: Int,
-    val paddingMaxBytes: Int,
+    // B61.4 - nullable, defaulting to null (never a synthetic HEADER/QUERY
+    // guess): the pinned Xray-core v26.7.28 source
+    // (transport/internet/splithttp/config.go's FillPacketRequest) proves
+    // that omitting these entirely is real, defined behavior - Xray-core
+    // applies its OWN internal default (a fixed PlacementQueryInHeader
+    // placement, key "x_padding", header "Referer") - which this enum
+    // cannot represent and must never approximate. All three fields are
+    // omitted together, never independently - see
+    // validateXrayVlessXhttpConfig's own consistency check.
+    val paddingPlacement: XrayXhttpPaddingPlacement? = null,
+    val paddingMinBytes: Int? = null,
+    val paddingMaxBytes: Int? = null,
     val mtu: Int = XrayVlessRealityConfig.DEFAULT_MTU,
     val dnsServers: List<String> = XrayVlessRealityConfig.DEFAULT_DNS_SERVERS,
     val tunLocalAddressIpv4: String = XrayVlessRealityConfig.DEFAULT_TUN_LOCAL_ADDRESS_IPV4,
@@ -83,6 +92,8 @@ enum class XrayXhttpConfigValidationError {
     INVALID_MODE_METHOD_COMBINATION,
     INVALID_POST_LIMIT,
     INVALID_PADDING_RANGE,
+    /** B61.4 - exactly one of paddingPlacement/paddingMinBytes/paddingMaxBytes is null while another is not. */
+    INCONSISTENT_PADDING_FIELDS,
     INVALID_MTU,
     INVALID_TUN_LOCAL_ADDRESS,
 }
@@ -128,13 +139,24 @@ fun validateXrayVlessXhttpConfig(config: XrayVlessXhttpConfig): XrayXhttpConfigV
     }
     if (config.maxEachPostBytes <= 0) errors += XrayXhttpConfigValidationError.INVALID_POST_LIMIT
 
-    // Pinned v26.7.28 has no "padding disabled" representation:
-    // absent/zero xPaddingBytes normalizes to 100..1000. This executable
-    // type therefore represents only explicit positive padding.
-    val validPadding =
-        config.paddingMinBytes in 1..65536 &&
-            config.paddingMaxBytes in config.paddingMinBytes..65536
-    if (!validPadding) errors += XrayXhttpConfigValidationError.INVALID_PADDING_RANGE
+    // B61.4 - all three padding fields are omitted together (null) or
+    // supplied together (non-null) - never a partial mix, since the
+    // renderer's own "omit means omit" contract (XrayConfigRenderer) has
+    // no way to represent "placement set but range unset" or vice versa.
+    // When explicit padding IS supplied, the SAME range check B35
+    // originally established still applies (pinned v26.7.28 rejects a
+    // non-positive/out-of-range xPaddingBytes range).
+    val placementIsNull = config.paddingPlacement == null
+    val minIsNull = config.paddingMinBytes == null
+    val maxIsNull = config.paddingMaxBytes == null
+    if (placementIsNull != minIsNull || placementIsNull != maxIsNull) {
+        errors += XrayXhttpConfigValidationError.INCONSISTENT_PADDING_FIELDS
+    } else if (!placementIsNull) {
+        val min = config.paddingMinBytes!!
+        val max = config.paddingMaxBytes!!
+        val validPadding = min in 1..65536 && max in min..65536
+        if (!validPadding) errors += XrayXhttpConfigValidationError.INVALID_PADDING_RANGE
+    }
     if (config.mtu !in 1280..65535) errors += XrayXhttpConfigValidationError.INVALID_MTU
     if (!XHTTP_IPV4_REGEX.matches(config.tunLocalAddressIpv4)) {
         errors += XrayXhttpConfigValidationError.INVALID_TUN_LOCAL_ADDRESS

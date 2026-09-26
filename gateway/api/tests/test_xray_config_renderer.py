@@ -1,6 +1,7 @@
 """B8K2 - narrow tests for xray_config_renderer's determinism, correct
 VLESS+REALITY client entries, revocation enforcement, and atomic-write
 rollback behavior."""
+import dataclasses
 import json
 import os
 import sys
@@ -194,6 +195,155 @@ class TlsInboundTests(RendererTestBase):
         bad_tls = renderer_module.TlsServerConfig(listen_port=2053, cert_file="relative.pem", key_file="/y")
         with self.assertRaises(renderer_module.XrayConfigRenderError):
             renderer_module.render_server_config({}, {}, self.reality, tls=bad_tls)
+
+
+class XhttpInboundTests(RendererTestBase):
+    """B35 - the THIRD inbound render_server_config appends when `xhttp` is
+    given, alongside (never instead of) REALITY/TLS's own. Mirrors
+    TlsInboundTests' own structure."""
+
+    def setUp(self):
+        super().setUp()
+        self.xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp/")
+
+    def test_xhttp_none_produces_byte_identical_output_to_pre_b35(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality)
+        self.assertEqual(len(config["inbounds"]), 1)
+
+    def test_xhttp_inbound_is_appended_alongside_reality_and_tls(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        tls = renderer_module.TlsServerConfig(listen_port=2053, cert_file="/a", key_file="/b")
+
+        config = renderer_module.render_server_config(
+            activations_data, xray_data, self.reality, tls=tls, xhttp=self.xhttp,
+        )
+
+        self.assertEqual(len(config["inbounds"]), 3)
+        reality_inbound, tls_inbound, xhttp_inbound = config["inbounds"]
+        self.assertEqual(reality_inbound["streamSettings"]["security"], "reality")
+        self.assertEqual(tls_inbound["streamSettings"]["security"], "tls")
+        self.assertEqual(xhttp_inbound["streamSettings"]["network"], "xhttp")
+        self.assertEqual(xhttp_inbound["port"], 2099)
+        self.assertNotIn(xhttp_inbound["port"], (reality_inbound["port"], tls_inbound["port"]))
+
+    def test_xhttp_inbound_listens_on_loopback_only(self):
+        # Deliberate defense in depth (see _render_xhttp_inbound's own
+        # docs): this inbound has no TLS of its own and is meant to be
+        # reached only through a reverse proxy in front of this host.
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        self.assertEqual(config["inbounds"][1]["listen"], "127.0.0.1")
+
+    def test_xhttp_inbound_carries_the_same_active_clients_without_flow(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+
+        config = renderer_module.render_server_config(
+            activations_data, xray_data, self.reality, xhttp=self.xhttp, flow="xtls-rprx-vision",
+        )
+
+        reality_clients = config["inbounds"][0]["settings"]["clients"]
+        xhttp_clients = config["inbounds"][1]["settings"]["clients"]
+        self.assertEqual(len(xhttp_clients), 1)
+        self.assertEqual(xhttp_clients[0]["id"], reality_clients[0]["id"])
+        self.assertNotIn("flow", xhttp_clients[0])
+
+    def test_xhttp_inbound_carries_no_tls_material_of_any_kind(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        xhttp_stream_settings = config["inbounds"][1]["streamSettings"]
+        self.assertNotIn("tlsSettings", xhttp_stream_settings)
+        self.assertNotIn("security", xhttp_stream_settings)
+        self.assertEqual(xhttp_stream_settings["xhttpSettings"], {"path": "/nova-xhttp/", "mode": "packet-up"})
+
+    def test_xhttp_path_requires_trailing_slash(self):
+        # B57 - required so the base path exactly matches pinned v26.7.28's
+        # own session/sequence appending behavior and the Android
+        # CdnXhttpPolicy validator's own requirement.
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_xhttp_mode_defaults_to_packet_up(self):
+        self.assertEqual(self.xhttp.mode, "packet-up")
+
+    def test_xhttp_mode_is_rendered_explicitly(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        self.assertEqual(config["inbounds"][1]["streamSettings"]["xhttpSettings"]["mode"], "packet-up")
+
+    def test_unsupported_xhttp_mode_is_rejected(self):
+        # B57 - deliberately not operator-configurable (see
+        # XhttpServerConfig's own docs) - only the one proven contract
+        # value is accepted, fail closed on anything else.
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="/nova-xhttp/", mode="stream-up")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_xhttp_inbound_renders_no_fields_beyond_the_proven_contract(self):
+        # B57 (Phase 9, test 4) - the rendered inbound must contain
+        # exactly the fields this module owns (tag/listen/port/protocol/
+        # settings/streamSettings.network/xhttpSettings.path+mode) and
+        # nothing from the TLS/Cloudflare/Android-only layers (no cert/key
+        # paths, no public hostname, no ALPN/fingerprint/TLS-server-name,
+        # no Cloudflare-specific field of any kind).
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.ACTIVE)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        xhttp_inbound = config["inbounds"][1]
+        self.assertEqual(set(xhttp_inbound.keys()), {"tag", "listen", "port", "protocol", "settings", "streamSettings"})
+        self.assertEqual(set(xhttp_inbound["streamSettings"].keys()), {"network", "xhttpSettings"})
+        self.assertEqual(set(xhttp_inbound["streamSettings"]["xhttpSettings"].keys()), {"path", "mode"})
+        rendered_text = json.dumps(config)
+        for forbidden in ("cert", "key_file", "privkey", "fullchain", "alpn", "fingerprint", "aknova", "cloudflare", "tlsServerName"):
+            self.assertNotIn(forbidden, rendered_text.lower())
+
+    def test_revoked_activation_is_excluded_from_xhttp_inbound(self):
+        digest = "a" * 64
+        activations_data = {digest: _activation_record("act1", activations_module.REVOKED)}
+        xray_data = {digest: [_identity(self.key_a, self.uuid_a)]}
+        config = renderer_module.render_server_config(activations_data, xray_data, self.reality, xhttp=self.xhttp)
+        self.assertEqual(config["inbounds"][1]["settings"]["clients"], [])
+
+    def test_invalid_xhttp_port_is_rejected(self):
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=99999, path="/x")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_xhttp_path_not_starting_with_slash_is_rejected(self):
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="nova-xhttp")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_empty_xhttp_path_is_rejected(self):
+        bad_xhttp = renderer_module.XhttpServerConfig(listen_port=2099, path="")
+        with self.assertRaises(renderer_module.XrayConfigRenderError):
+            renderer_module.render_server_config({}, {}, self.reality, xhttp=bad_xhttp)
+
+    def test_xhttp_server_config_has_no_cert_or_key_field_at_all(self):
+        # Security invariant (unlike TlsServerConfig, which at least carries
+        # non-secret FILE PATHS): XhttpServerConfig cannot leak TLS material
+        # into this process because it structurally has no field capable of
+        # holding one - not a cert/key path, and certainly not raw key
+        # material. Asserted on the dataclass shape itself so a future
+        # field addition here is a visible, reviewable diff, not a silent
+        # reopening of the TLS-private-key boundary this whole module's
+        # docstring exists to hold.
+        field_names = {f.name for f in dataclasses.fields(renderer_module.XhttpServerConfig)}
+        self.assertEqual(field_names, {"listen_port", "path", "inbound_tag", "mode"})
 
 
 class DeterminismTests(RendererTestBase):

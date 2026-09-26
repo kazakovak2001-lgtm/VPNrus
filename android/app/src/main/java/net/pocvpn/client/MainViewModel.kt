@@ -29,6 +29,8 @@ import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
+import net.pocvpn.client.identity.XrayXhttpProfileRepository
+import net.pocvpn.client.identity.XrayXhttpProfileRepositoryFactory
 import net.pocvpn.client.network.NetworkProfile
 import net.pocvpn.client.network.NetworkProfiler
 import net.pocvpn.client.provisioning.ProvisioningClient
@@ -85,6 +87,7 @@ import net.pocvpn.client.vpn.config.ProfileSource
 import net.pocvpn.client.vpn.config.ProfileStore
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
 import net.pocvpn.client.vpn.xray.XrayTlsRuntimeResolution
+import net.pocvpn.client.vpn.xray.XrayXhttpRuntimeResolution
 import net.pocvpn.client.vpn.policy.AndroidInstalledPackageChecker
 import net.pocvpn.client.vpn.policy.AppRoutingPolicy
 import net.pocvpn.client.vpn.policy.AppRoutingPolicyStore
@@ -410,6 +413,24 @@ class MainViewModel(
     private val xrayTlsProfileProvisioner: XrayTlsProfileProvisioner? = null,
     private val xrayTlsTransport: VpnTransport? = null,
     private val xrayXhttpTransport: VpnTransport? = null,
+    // B62 - the EXIT-role counterpart of [shadowsocksCredentialRepositories]
+    // below: endpoint-scoped XHTTP profile repositories, keyed by the SAME
+    // EndpointId every other per-endpoint collaborator in this class uses -
+    // never a single country/provider-fixed field. An empty map (the
+    // default) means no EXIT XHTTP profile source is wired at all -
+    // isXrayXhttpAvailableFor stays false for every endpoint, never a
+    // fabricated availability. This is completely independent of
+    // [cdnRuntimeCapabilities], which governs the SEPARATE CDN/relay XHTTP
+    // path (CdnXhttpRuntimeConfigResolver) and is left untouched.
+    private val xrayXhttpProfileRepositories: Map<net.pocvpn.client.reachability.EndpointId, XrayXhttpProfileRepository> = emptyMap(),
+    // B64 - the ONE place a real EXIT XHTTP profile is actually fetched/
+    // persisted: one XrayXhttpProfileProvisioner per endpoint, same
+    // catalog-driven map shape as [xrayXhttpProfileRepositories] above
+    // (never a single country/provider-fixed field). An empty map (the
+    // default) means provisioning is not wired at all - activateDevice()
+    // simply skips this step, exactly like every other optional
+    // provisioner in this class when unset.
+    private val xrayXhttpProfileProvisioners: Map<net.pocvpn.client.reachability.EndpointId, net.pocvpn.client.provisioning.XrayXhttpProfileProvisioner> = emptyMap(),
     // B45B-4 - additive, defaults to null (same "no wiring, no behavior"
     // seam every other optional transport instance above already uses). The
     // SAME real ShadowsocksTransport instance registered here (Smart Connect
@@ -929,6 +950,15 @@ class MainViewModel(
         shadowsocksCredentialRepositories.takeIf { it.isNotEmpty() }
             ?.let { net.pocvpn.client.identity.MapShadowsocks2022CredentialRepositoryResolver(it) }
 
+    // B62 - same shape/reasoning as xrayProfileRepositoryResolver/
+    // xrayTlsProfileRepositoryResolver above, built from
+    // [xrayXhttpProfileRepositories] directly: the ONE authoritative
+    // endpoint -> repository lookup VpnController.buildTransportConfig's
+    // Direct EXIT XRAY_XHTTP branch actually resolves through.
+    private val xrayXhttpProfileRepositoryResolver: net.pocvpn.client.identity.XrayXhttpProfileRepositoryResolver? =
+        xrayXhttpProfileRepositories.takeIf { it.isNotEmpty() }
+            ?.let { net.pocvpn.client.identity.MapXrayXhttpProfileRepositoryResolver(it) }
+
     private val controller = VpnController(
         transport = transport,
         clientKeyRepository = clientKeyRepository,
@@ -943,6 +973,7 @@ class MainViewModel(
         xrayTlsProfileRepository = xrayTlsProfileRepository,
         xrayProfileRepositoryResolver = xrayProfileRepositoryResolver,
         xrayTlsProfileRepositoryResolver = xrayTlsProfileRepositoryResolver,
+        xrayXhttpProfileRepositoryResolver = xrayXhttpProfileRepositoryResolver,
         relayXrayProfileRepositoryResolver = relayXrayProfileRepositoryResolver,
         relayXrayTlsProfileRepositoryResolver = relayXrayTlsProfileRepositoryResolver,
         cdnRuntimeCapabilities = cdnRuntimeCapabilities,
@@ -997,6 +1028,17 @@ class MainViewModel(
 
     private fun isXrayTlsAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
         endpointId in xrayTlsAvailableEndpoints.value
+
+    // B62 - the Direct/EXIT XHTTP counterpart of [xrayAvailableEndpoints]/
+    // [xrayTlsAvailableEndpoints] above, same per-endpoint Set<EndpointId>
+    // shape/reasoning. Deliberately separate from cdnRuntimeCapabilities
+    // (the CDN/relay XHTTP capability flag, untouched by B62) - this tracks
+    // ONLY whether XrayRuntimeResolver.resolveXhttp has produced a real
+    // Ready EXIT configuration for a given endpoint.
+    private val xrayXhttpAvailableEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
+
+    private fun isXrayXhttpAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
+        endpointId in xrayXhttpAvailableEndpoints.value
 
     // B45B-4 - same per-endpoint Set<EndpointId> shape/reasoning as
     // [xrayAvailableEndpoints]/[xrayTlsAvailableEndpoints] above - a
@@ -1205,10 +1247,49 @@ class MainViewModel(
                 factory = if (available) ({ xrayTls }) else null,
             )
         }
+        // B62 - XRAY_XHTTP has TWO structurally distinct roles that must
+        // never be merged into one generic capability flag: for a KNOWN
+        // CDN/relay ingress endpoint (isKnownIngressEndpoint - today, only
+        // ProductionIngressEndpoints.STOCKHOLM), availability is exactly the
+        // pre-B62 CDN/relay capability check
+        // (cdnRuntimeCapabilities.isPinnedXhttpExecutable(),
+        // CdnXhttpRuntimeConfigResolver's own gate downstream) - completely
+        // unchanged. For any OTHER endpoint (a real Direct/EXIT gateway,
+        // e.g. Frankfurt/Germany), that CDN flag describes a different
+        // capability entirely and must not be consulted - availability is
+        // now the genuine Direct/EXIT readiness signal
+        // (isXrayXhttpAvailableFor, backed by
+        // XrayRuntimeResolver.resolveXhttp's own Ready/Rejected result for
+        // THIS endpoint - see its startup check above), mirroring EXACTLY
+        // how XRAY_REALITY/TLS_TCP already split ingress-vs-gateway
+        // availability above.
+        //
+        // B62 Smart Connect safety check (verified, not assumed):
+        // registering this AVAILABLE does NOT introduce a new automatic
+        // pick. SmartConnectDecisionEngine.decideAuto's
+        // PREFERRED_ORDER.firstOrNull{it in availableKinds} always resolves
+        // to AMNEZIA_WG regardless of XRAY_XHTTP's status, because
+        // AMNEZIA_WG's own descriptor above is unconditionally AVAILABLE
+        // and is PREFERRED_ORDER's first entry - unaffected by this change.
+        // AwgXrayFailoverPolicy's caller hardcodes TransportKind.XRAY_REALITY
+        // as the only fallback target (see MainViewModel's own
+        // maybeFailoverToXray call sites) - it never reads XRAY_XHTTP's
+        // availability at all. AutoGatewaySelector's own per-transport
+        // eligibility `when` (automatic GATEWAY-mode candidate generation)
+        // has no XRAY_XHTTP branch and falls through to `else -> false` -
+        // it was NOT extended in B62 and stays out of scope, so Direct EXIT
+        // XHTTP is not synthesized as an automatic-mode candidate there
+        // either. XRAY_XHTTP therefore only becomes selectable via an
+        // explicit UserTransportPreference.Manual(XRAY_XHTTP) - this slice
+        // does not touch PREFERRED_ORDER, AwgXrayFailoverPolicy, or
+        // AutoGatewaySelector.
         val xhttp = xrayXhttpTransport
         if (xhttp != null) {
-            val available = cdnRuntimeCapabilities.isPinnedXhttpExecutable() &&
-                xhttp.kind == TransportKind.XRAY_XHTTP
+            val available = if (isKnownIngressEndpoint) {
+                cdnRuntimeCapabilities.isPinnedXhttpExecutable()
+            } else {
+                isXrayXhttpAvailableFor(endpointId)
+            }
             descriptors += TransportDescriptor(
                 kind = TransportKind.XRAY_XHTTP,
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
@@ -1346,16 +1427,32 @@ class MainViewModel(
      * [stabilizedRestrictionClass] for the SEPARATE, hysteresis-smoothed
      * value the actual DIRECT-vs-RELAY decision authority reads.
      */
+    private fun currentRestrictionEvidence(): net.pocvpn.client.smartconnect.RestrictionEvidence = RestrictionEvidence(
+        networkProfile = networkProfile.value,
+        transportState = transportState.value,
+        awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
+        gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
+        diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
+        gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
+        diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
+    )
+
     fun restrictionClass(): RestrictionClass = RestrictionClassifier.classify(
-        RestrictionEvidence(
-            networkProfile = networkProfile.value,
-            transportState = transportState.value,
-            awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
-            gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
-            diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
-            gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
-            diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
-        ),
+        currentRestrictionEvidence(),
+        nowEpochMillis = nowProvider(),
+    )
+
+    /**
+     * B66.18 - the quality-graded counterpart of [restrictionClass], built
+     * from the SAME [currentRestrictionEvidence] (never a second,
+     * independently-assembled evidence snapshot that could disagree with
+     * it). Used ONLY by the AWG -> Xray failover target selection
+     * ([AwgXrayFailoverPolicy.selectXrayFailoverTarget]) - every existing
+     * consumer of [restrictionClass]/[stabilizedRestrictionClass] is
+     * completely unaffected by this addition.
+     */
+    private fun restrictionAssessment(): net.pocvpn.client.smartconnect.RestrictionAssessment = RestrictionClassifier.assess(
+        currentRestrictionEvidence(),
         nowEpochMillis = nowProvider(),
     )
 
@@ -1906,6 +2003,19 @@ class MainViewModel(
                 if (ready) xrayTlsAvailableEndpoints.update { it + endpointId }
             }
         }
+        // B62 - the Direct/EXIT XHTTP counterpart of the TLS/TCP block
+        // above: same one-time-at-startup, per-endpoint-independent shape,
+        // reusing the SAME authoritative check
+        // (XrayRuntimeResolver.resolveXhttp) VpnController.buildTransportConfig
+        // itself runs at connect time - never a looser/duplicated "profile
+        // exists" heuristic that could disagree with what connect() will
+        // actually accept.
+        xrayXhttpProfileRepositories.forEach { (endpointId, repository) ->
+            viewModelScope.launch {
+                val ready = XrayRuntimeResolver.resolveXhttp(repository) is XrayXhttpRuntimeResolution.Ready
+                if (ready) xrayXhttpAvailableEndpoints.update { it + endpointId }
+            }
+        }
         // B45B-4 (review fix) - same startup-check shape as the Xray/TLS
         // blocks above, generalized over EVERY wired endpoint (never a
         // single fixed one): checked ONCE at init per repository (never
@@ -2394,6 +2504,29 @@ class MainViewModel(
                                 val repository = targetXrayTlsRepository
                                 if (repository != null && XrayRuntimeResolver.resolveTls(repository) is XrayTlsRuntimeResolution.Ready) {
                                     xrayTlsAvailableEndpoints.update { it + targetEndpointId }
+                                }
+                            }
+                        }
+                        // B64 - the Direct/EXIT XHTTP counterpart of the TLS
+                        // block above: same "run only after AWG success,
+                        // reuse the SAME key/credential, never touch AWG's
+                        // own outcome either way, re-derive from the SAME
+                        // authoritative resolveXhttp() check the startup
+                        // path/B62 registry use - a wire-level Saved outcome
+                        // alone never marks the endpoint available; only a
+                        // fresh Ready resolution does" discipline. Looked up
+                        // by [targetEndpointId] directly (the catalog-driven
+                        // Map<EndpointId, ...> shape - never a per-gateway
+                        // `when`), so Stockholm needs no special-cased code
+                        // path here either.
+                        xrayXhttpProfileProvisioners[targetEndpointId]?.let { provisioner ->
+                            val xhttpOutcome = withContext(ioDispatcher) {
+                                provisioner.provision(key, trimmedCredential)
+                            }
+                            if (xhttpOutcome == XrayProfileProvisioningOutcome.Saved) {
+                                val repository = xrayXhttpProfileRepositories[targetEndpointId]
+                                if (repository != null && XrayRuntimeResolver.resolveXhttp(repository) is XrayXhttpRuntimeResolution.Ready) {
+                                    xrayXhttpAvailableEndpoints.update { it + targetEndpointId }
                                 }
                             }
                         }
@@ -3541,7 +3674,22 @@ class MainViewModel(
      * exactly one place per connect() request (armFailoverWatch()'s own
      * collector, which acts at most once per attempt - see its own docs) -
      * a failed Xray fallback surfaces its own truthful terminal state and
-     * nothing more (no retry, no bounce back to AWG).
+     * nothing more (no retry, no bounce back to AWG, and - B66.18 - no
+     * bounce between XHTTP and REALITY either: this function is still
+     * called from exactly the same one collector site, at most once per
+     * AWG attempt, and does not itself re-arm [armFailoverWatch] for the
+     * Xray attempt it starts, so a SUBSEQUENT failure of that Xray attempt
+     * surfaces its own terminal state with no further automatic hop - the
+     * SAME one-shot property this function already had before B66.18, now
+     * just reused for two possible targets instead of one).
+     *
+     * B66.18 - [targetKind] is [TransportKind.XRAY_REALITY] or
+     * [TransportKind.XRAY_XHTTP] (never anything else - see
+     * [AwgXrayFailoverPolicy.selectXrayFailoverTarget], the ONE place that
+     * decides it), threaded through from the SAME eligibility evaluation
+     * the caller already performed - this function never re-derives the
+     * target itself, it only defensively re-confirms (see below) that the
+     * registry it was handed genuinely has that exact kind AVAILABLE.
      */
     private suspend fun maybeFailoverToXray(
         initialKind: TransportKind,
@@ -3549,17 +3697,18 @@ class MainViewModel(
         registry: TransportRegistry,
         orchestrator: TransportOrchestrator,
         endpointId: net.pocvpn.client.reachability.EndpointId,
+        targetKind: TransportKind,
     ) {
         val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
             initialKind = initialKind,
             preference = preference,
             awgState = controller.state.value,
             awgError = diagnosticsStore.snapshot.value.lastError,
-            xrayAvailable = registry.descriptorFor(TransportKind.XRAY_REALITY)?.status == TransportStatus.AVAILABLE,
+            xrayAvailable = registry.descriptorFor(targetKind)?.status == TransportStatus.AVAILABLE,
         )
         if (!eligible) return
 
-        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY), endpointId)) {
+        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(targetKind), endpointId)) {
             is TransportOrchestrator.Resolution.Resolved -> {
                 supportDiagnosticsRecorder?.recordAttemptFailed()
                 controller.disconnect()
@@ -3570,7 +3719,7 @@ class MainViewModel(
                 controller.connect(xrayResolution)
             }
             // Defensive only: xrayAvailable already guarantees the registry
-            // has a real, resolvable XRAY_REALITY descriptor at this point.
+            // has a real, resolvable descriptor for targetKind at this point.
             is TransportOrchestrator.Resolution.NotSelectable -> Unit
         }
     }
@@ -3834,12 +3983,61 @@ class MainViewModel(
                     attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
                     return@collect
                 }
+                // B66.18 - decide WHICH Xray kind to fail over to BEFORE
+                // gating eligibility on it, so a genuinely UDP/AWG-filtered
+                // network with a real Direct EXIT XHTTP profile (and no
+                // usable REALITY profile) can still fail over - see
+                // AwgXrayFailoverPolicy.selectXrayFailoverTarget's own docs
+                // for exactly why `registry.descriptorFor(...)` (never
+                // MainViewModel's own isXrayXhttpAvailableFor directly) is
+                // the correct, already-endpoint-scoped signal to read here.
+                //
+                // Only for a genuine terminal-failure state (the SAME
+                // HandshakeFailed/Error check isEligibleForXrayFallback
+                // itself applies below) AND only when a Direct EXIT XHTTP
+                // candidate genuinely exists for this endpoint's registry
+                // (a cheap, already-computed, synchronous check - never a
+                // probe) is a fresh probe even considered. This collector
+                // runs for EVERY state emission of a manual/direct attempt
+                // (Connecting, Disconnected, etc, not just a final failure),
+                // and probeNow() performs a real network reachability check -
+                // it must never fire on a non-terminal transition, and must
+                // never fire at all when there is no XHTTP candidate this
+                // decision could possibly change (the overwhelming majority
+                // of connect attempts, where XHTTP is not even wired) - or
+                // every AWG failure would incur an extra, pointless network
+                // probe on top of RestrictionMonitor's own existing reactive
+                // one. For anything else the target stays the pre-existing
+                // XRAY_REALITY default and no probe runs, byte-for-byte the
+                // original (pre-B66.18) cost for the common case.
+                val directXhttpCandidateExists = attempt.registry.descriptorFor(TransportKind.XRAY_XHTTP)?.status == TransportStatus.AVAILABLE
+                val xrayTarget = if (directXhttpCandidateExists && (state is TransportState.HandshakeFailed || state is TransportState.Error)) {
+                    // probeNow() first - RestrictionMonitor's own reactive
+                    // probe (triggerProbe(), fired from the SAME AWG-failure
+                    // state transition via a SEPARATE Flow collector) has no
+                    // ordering guarantee relative to THIS collector's own
+                    // reaction to the exact same transition, so
+                    // restrictionAssessment() below could otherwise read
+                    // stale/absent probe evidence. This never duplicates
+                    // RestrictionClassifier's own logic - it only ensures the
+                    // SAME evidence-gathering probe has genuinely completed
+                    // before that evidence is read.
+                    restrictionMonitor?.probeNow()
+                    val restriction = restrictionAssessment()
+                    AwgXrayFailoverPolicy.selectXrayFailoverTarget(
+                        restrictionClass = restriction.classification,
+                        restrictionEvidenceQuality = restriction.evidenceQuality,
+                        directXhttpAvailable = true,
+                    )
+                } else {
+                    TransportKind.XRAY_REALITY
+                }
                 val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
                     initialKind = attempt.initialKind,
                     preference = attempt.preference,
                     awgState = state,
                     awgError = diagnosticsStore.snapshot.value.lastError,
-                    xrayAvailable = attempt.registry.descriptorFor(TransportKind.XRAY_REALITY)?.status == TransportStatus.AVAILABLE,
+                    xrayAvailable = attempt.registry.descriptorFor(xrayTarget)?.status == TransportStatus.AVAILABLE,
                 )
                 if (!eligible) return@collect
                 pendingFailoverAttempt = null
@@ -3849,6 +4047,7 @@ class MainViewModel(
                     registry = attempt.registry,
                     orchestrator = attempt.orchestrator,
                     endpointId = attempt.endpointId,
+                    targetKind = xrayTarget,
                 )
                 failoverObserverJob?.cancel()
                 failoverObserverJob = null
@@ -4069,6 +4268,24 @@ class MainViewModel(
                 net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(
                     clientVersionCode = BuildConfig.VERSION_CODE.toLong(),
                 )
+            // B64 - one endpoint-scoped XrayXhttpProfileRepository per
+            // CATALOG gateway (same mechanism shadowsocksCredentialRepositories
+            // already uses below - never a single country/provider literal),
+            // and, built directly from it, one XrayXhttpProfileProvisioner
+            // per gateway - no special Stockholm-only code path, the SAME
+            // catalog-driven map covers both. Reuses gateway.id/gateway.endpointId
+            // straight from ProductionGatewayCatalog.all, never a second,
+            // independently-maintained endpoint mapping.
+            val xrayXhttpProfileRepositories = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                gateway.endpointId to XrayXhttpProfileRepositoryFactory.create(context, gateway.endpointId)
+            }
+            val xrayXhttpProfileProvisioners = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                gateway.endpointId to net.pocvpn.client.provisioning.XrayXhttpProfileProvisioner(
+                    xrayXhttpProfileRepositories.getValue(gateway.endpointId),
+                    gatewayId = gateway.id,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
+                )
+            }
             val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
             val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore, supportDiagnosticsRecorder)
 
@@ -4159,6 +4376,16 @@ class MainViewModel(
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 ),
                 xrayXhttpTransport = net.pocvpn.client.vpn.VlessXhttpTransport(context),
+                // B62 - one endpoint-scoped XrayXhttpProfileRepository per
+                // CATALOG gateway, so isXrayXhttpAvailableFor/the registry's
+                // Direct EXIT XRAY_XHTTP descriptor can see a real
+                // per-endpoint profile whenever one exists on disk.
+                // B64 - xrayXhttpProfileProvisioners (built above from this
+                // SAME map) is what actually WRITES a real profile into
+                // these repositories, from activateDevice() - see that
+                // constructor param's own docs.
+                xrayXhttpProfileRepositories = xrayXhttpProfileRepositories,
+                xrayXhttpProfileProvisioners = xrayXhttpProfileProvisioners,
                 // B45B-4 (review fix) - the SAME real ShadowsocksTransport
                 // instance registered for BOTH Smart Connect selection
                 // (buildTransportRegistry) and execution (VpnController) -

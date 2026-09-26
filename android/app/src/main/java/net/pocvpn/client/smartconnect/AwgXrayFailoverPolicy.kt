@@ -80,4 +80,58 @@ object AwgXrayFailoverPolicy {
             else -> false
         }
     }
+
+    /**
+     * B66.18 - given that AWG failover is ALREADY eligible (see
+     * [isEligibleForXrayFallback], unchanged, still the one gate that
+     * decides WHETHER to fail over at all), decides WHICH Xray transport to
+     * fail over to. Pure/deterministic, same "no I/O, no second-guessing"
+     * discipline as this object's existing function.
+     *
+     * Prefers the Direct EXIT [TransportKind.XRAY_XHTTP] path B64 already
+     * implemented ONLY when the CURRENT restriction evidence specifically
+     * points at UDP/AWG-SPECIFIC filtering - never a general internet/
+     * gateway problem, which [RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING]
+     * already exists precisely to distinguish (see RestrictionClassifier's
+     * own priority-ordered docs) - with at least [RestrictionEvidenceQuality
+     * .MEDIUM] confidence (never [RestrictionEvidenceQuality.LOW]/
+     * [RestrictionEvidenceQuality.INSUFFICIENT], which mean the evidence
+     * itself is stale/contradictory/incomplete), AND a real Direct EXIT
+     * XHTTP profile is available for THIS endpoint. [directXhttpAvailable]
+     * is deliberately a plain Boolean, not re-derived here from
+     * [net.pocvpn.client.reachability.EndpointId] or any registry - the
+     * caller passes `registry.descriptorFor(TransportKind.XRAY_XHTTP)
+     * ?.status == TransportStatus.AVAILABLE` for the SAME per-endpoint
+     * [net.pocvpn.client.transport.TransportRegistry] instance
+     * [isEligibleForXrayFallback] itself was already evaluated against -
+     * for a real (non-ingress) gateway endpoint that registry entry's
+     * AVAILABLE status is ITSELF backed by MainViewModel's
+     * `isXrayXhttpAvailableFor(endpointId)` (see
+     * MainViewModel.buildTransportRegistry's B62 docs), never the separate
+     * CDN/relay `cdnRuntimeCapabilities.isPinnedXhttpExecutable()` flag - so
+     * this function never needs to know about that distinction itself, it
+     * only ever sees the already-correctly-gated per-endpoint result.
+     *
+     * Every other case (wrong/insufficient restriction evidence, or no
+     * Direct XHTTP profile for this endpoint) returns the pre-existing
+     * [TransportKind.XRAY_REALITY] target, byte-for-byte the same choice
+     * this policy always made before this function existed.
+     */
+    fun selectXrayFailoverTarget(
+        restrictionClass: RestrictionClass,
+        restrictionEvidenceQuality: RestrictionEvidenceQuality,
+        directXhttpAvailable: Boolean,
+    ): TransportKind {
+        val filteringEvidenceSufficient =
+            restrictionClass == RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING &&
+                (
+                    restrictionEvidenceQuality == RestrictionEvidenceQuality.HIGH ||
+                        restrictionEvidenceQuality == RestrictionEvidenceQuality.MEDIUM
+                    )
+        return if (filteringEvidenceSufficient && directXhttpAvailable) {
+            TransportKind.XRAY_XHTTP
+        } else {
+            TransportKind.XRAY_REALITY
+        }
+    }
 }
