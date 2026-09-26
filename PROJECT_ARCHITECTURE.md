@@ -2320,7 +2320,13 @@ UNVERIFIED.
   redirect-classified failure is never treated as success); this does NOT
   prove Russia hard-whitelist bypass, which remains UNVERIFIED.
 
-### Multi-Path Activation Discovery (B67.2) - extends B30, no new engine
+### Multi-Path Activation Discovery (B67.2) - FOUNDATION/PARTIAL, extends B30, no new engine
+
+**SOFTWARE COMPOSITION: DONE. PRODUCTION CHAIN PATH AVAILABILITY: NOT
+IMPLEMENTED (no trusted CHAIN_DIRECT/CHAIN_CDN control-plane origin is
+deployed or audited). REAL PRODUCTION ACTIVATION: DIRECT-ONLY TODAY.** This
+section describes a composition MECHANISM, not a deployed three-path
+system - see the callouts below for exactly where the line sits.
 
 `ActivationPathKind` (`DIRECT`/`CHAIN_DIRECT`/`CHAIN_CDN`,
 `controlplane/ActivationPathCandidate.kt`) is the ACTIVATION/CONTROL-PLANE
@@ -2328,14 +2334,20 @@ path-shape vocabulary - never conflated with the DATA-PLANE
 `PathCandidate.Direct`/`PathCandidate.Relayed` (`reachability/PathCandidate.kt`)
 `PathScorer`/`AutoGatewaySelector` already rank; the two answer different
 questions ("how does the client reach `/v1/activate`" vs "how does traffic
-reach the Internet") and share no type. `ActivationPathCandidateBuilder`
-composes an ordered `List<ActivationPathCandidate>` per gateway from
-`ControlPlaneOriginSetBuilder` (DIRECT, unchanged B30) and
-`TrustedChainControlPlaneOriginCatalog.chainDirect`/`chainCdn`
-(CHAIN_DIRECT/CHAIN_CDN) - both return `emptyList()` today (no trusted
-HTTP-capable relay/CDN front for the control plane is deployed; the one
-real B25/B31 Stockholm ingress relays DATA-PLANE VLESS traffic and is never
-reused as a control-plane front). Fixed DIRECT->CHAIN_DIRECT->CHAIN_CDN
+reach the Internet") and share no type. `ActivationPathCandidateBuilder`'s
+PRODUCTION entry point, `forGateway(gatewayId)`, takes no origin/host
+parameter at all - it composes an ordered `List<ActivationPathCandidate>`
+per gateway purely from `ControlPlaneOriginSetBuilder` (DIRECT, unchanged
+B30) and `TrustedChainControlPlaneOriginCatalog.chainDirect`/`chainCdn`
+(CHAIN_DIRECT/CHAIN_CDN) - **both return `emptyList()` today: no trusted
+HTTP-capable relay/CDN front for the control plane is deployed or audited;
+the one real B25/B31 Stockholm ingress relays DATA-PLANE VLESS traffic and
+is never reused as a control-plane front.** A separate `internal`
+(module-visible-only) `forGatewayFromOrigins` overload exists purely as a
+deterministic-test seam (`ActivationPathCandidateTest` is its only caller
+anywhere in the codebase) - it is never called by `MainViewModel` or any
+other production code path, so no caller-supplied host reaches the
+production composition through it. Fixed DIRECT->CHAIN_DIRECT->CHAIN_CDN
 declaration order, deliberately not a score (no per-gateway `Long` weight,
 no `PathScorer` tiering reused) - there is no control-plane-specific
 evidence to rank against, so this is the "no useful evidence -> stable
@@ -2350,12 +2362,18 @@ accepted - the ONE integration seam (`MainViewModel`'s existing
 completely unmodified: the flat multi-path origin list already gives
 per-origin-once bounded execution in path order, with
 `AUTHORIZATION_REJECTED` on any origin (any path shape) terminal for the
-whole call - the B30 invariant, unchanged. Since both chain catalogs are
-empty in production, `ActivationPathOriginSetBuilder.forGateway` is
-byte-for-byte `ControlPlaneOriginSetBuilder.forGateway` today; real
-activation traffic remains DIRECT-only until ops deploys and audits a
-trusted CHAIN_DIRECT/CHAIN_CDN control-plane origin. See `docs/ROADMAP.md`'s
-B67.2 row for the full test list.
+whole call - the B30 invariant, unchanged (this part of the mechanism is
+real and tested; it is simply exercised today with exactly one trusted
+origin, since that is all that exists in production). Since both chain
+catalogs are empty in production, `ActivationPathOriginSetBuilder.forGateway`
+is byte-for-byte `ControlPlaneOriginSetBuilder.forGateway` today; **real
+activation traffic remains DIRECT-only** until ops deploys and audits a
+trusted CHAIN_DIRECT/CHAIN_CDN control-plane origin - that deployment/audit
+work is explicitly NOT part of this slice. `ActivationPathCandidateTest`'s
+15 deterministic tests (synthetic trusted origins via the internal test
+seam) prove the composition/fallback mechanism works correctly once such
+origins exist; they are not evidence that any do. See `docs/ROADMAP.md`'s
+B67.2 row for the full test list and status wording.
 
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 

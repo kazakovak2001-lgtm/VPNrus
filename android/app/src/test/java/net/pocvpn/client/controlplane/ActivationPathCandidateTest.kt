@@ -15,6 +15,15 @@ import org.junit.Test
  * races, no concurrency, no live network. Fake origins are distinguished by
  * host string so a test can assert exactly which trusted origin was actually
  * dialed, without relying on call count alone (task requirement 6).
+ *
+ * These tests prove the DIRECT/CHAIN_DIRECT/CHAIN_CDN composition/fallback
+ * MECHANISM - they do NOT prove real production CHAIN_DIRECT/CHAIN_CDN
+ * reachability, since [TrustedChainControlPlaneOriginCatalog] deploys neither
+ * today (see that object's own docs). Synthetic multi-path origins here come
+ * ONLY from [ActivationPathCandidateBuilder.forGatewayFromOrigins], an
+ * `internal` (module-visible-only) test seam this test class is the sole
+ * caller of - the production entry point, [ActivationPathCandidateBuilder
+ * .forGateway], takes no origin/host parameter at all.
  */
 class ActivationPathCandidateTest {
 
@@ -35,7 +44,7 @@ class ActivationPathCandidateTest {
 
     @Test
     fun `candidate builder composes DIRECT, CHAIN_DIRECT, CHAIN_CDN in that fixed order when all are trusted`() {
-        val candidates = ActivationPathCandidateBuilder.forGateway(
+        val candidates = ActivationPathCandidateBuilder.forGatewayFromOrigins(
             gateway,
             directOrigins = listOf(direct),
             chainDirectOrigins = listOf(chainDirect),
@@ -49,7 +58,7 @@ class ActivationPathCandidateTest {
 
     @Test
     fun `an ineligible untrusted path shape contributes no candidate - never an empty-origin placeholder`() {
-        val candidates = ActivationPathCandidateBuilder.forGateway(
+        val candidates = ActivationPathCandidateBuilder.forGatewayFromOrigins(
             gateway,
             directOrigins = listOf(direct),
             chainDirectOrigins = emptyList(),
@@ -74,20 +83,38 @@ class ActivationPathCandidateTest {
     }
 
     @Test
-    fun `untrusted arbitrary origin injection is structurally impossible - no caller-supplied host reaches a candidate`() {
-        // ActivationPathCandidateBuilder/TrustedChainControlPlaneOriginCatalog
-        // expose no parameter through which a raw URL/host string could be
-        // supplied - every origin traces back to a compiled catalog
-        // (ControlPlaneOriginSetBuilder / TrustedChainControlPlaneOriginCatalog).
+    fun `the production entry point takes no origin-host parameter - only the internal test seam does`() {
+        // ActivationPathCandidateBuilder.forGateway(gatewayId) is the ONLY
+        // function MainViewModel (via ActivationPathOriginSetBuilder) ever
+        // calls, and its sole parameter is a closed ProductionGatewayId enum
+        // - there is no origin/host/URL argument to pass through it at all.
+        // The overload that DOES accept origin lists (forGatewayFromOrigins)
+        // is `internal` - invisible outside this Gradle module, and this
+        // test class is its only caller anywhere in the codebase (verified
+        // by inspection, not merely asserted) - so no external/user/network
+        // input can reach it. This test proves the production call shape,
+        // not an unprovable universal absence of any injection seam.
         val candidates = ActivationPathCandidateBuilder.forGateway(gateway)
         candidates.flatMap { it.origins }.forEach { assertEquals(gateway, it.gatewayId) }
+    }
+
+    @Test
+    fun `today's real production catalog is DIRECT-only - CHAIN_DIRECT and CHAIN_CDN are not yet deployed`() {
+        // TrustedChainControlPlaneOriginCatalog.chainDirect/chainCdn both
+        // return emptyList() today (no trusted relay/CDN control-plane
+        // origin has been deployed or audited yet) - so real production
+        // activation traffic is DIRECT-only, not a genuine three-path
+        // system, regardless of the composition mechanism proven below.
         assertTrue(TrustedChainControlPlaneOriginCatalog.chainDirect(gateway).isEmpty())
         assertTrue(TrustedChainControlPlaneOriginCatalog.chainCdn(gateway).isEmpty())
+        assertEquals(listOf(ActivationPathKind.DIRECT), ActivationPathCandidateBuilder.forGateway(gateway).map { it.kind })
     }
 
     // --- End-to-end through the existing, unmodified ActivationResilienceCoordinator ---
+    // (synthetic trusted origins via the internal forGatewayFromOrigins test seam -
+    // proves the composition/fallback MECHANISM, not production reachability)
 
-    private fun flattenedOrigins() = ActivationPathCandidateBuilder.forGateway(
+    private fun flattenedOrigins() = ActivationPathCandidateBuilder.forGatewayFromOrigins(
         gateway,
         directOrigins = listOf(direct),
         chainDirectOrigins = listOf(chainDirect),
@@ -223,7 +250,7 @@ class ActivationPathCandidateTest {
     @Test
     fun `nested boundedness - a multi-origin CHAIN_DIRECT path never multiplies into unbounded retries`() {
         val chainDirectSecondary = ControlPlaneOrigin(gateway, "chain-direct-origin-2")
-        val origins = ActivationPathCandidateBuilder.forGateway(
+        val origins = ActivationPathCandidateBuilder.forGatewayFromOrigins(
             gateway,
             directOrigins = listOf(direct),
             chainDirectOrigins = listOf(chainDirect, chainDirectSecondary),

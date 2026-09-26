@@ -78,20 +78,42 @@ data class ActivationPathCandidate(val kind: ActivationPathKind, val origins: Li
  * pre-B67.2 (task requirement 8/"existing single-path behavior unchanged"),
  * once flattened by [ActivationPathOriginSetBuilder].
  *
- * Never accepts a caller-supplied host/URL, exactly like
- * [ControlPlaneOriginSetBuilder] itself - every origin here is traced back to
- * a compiled, trusted catalog. This is the ONLY new composition this slice
- * adds; scoring/ranking stays fixed-order (no second scorer), and bounded
- * per-origin execution stays [TrustedOriginRequestExecutor]'s (no second
- * retry engine) - see [ActivationPathOriginSetBuilder]'s own docs for how
- * this feeds the existing [ActivationResilienceCoordinator] unchanged.
+ * [forGateway] - the ONLY production entry point - takes no origin/host
+ * parameter of any kind: there is structurally no argument through which a
+ * caller could pass a raw host/URL, exactly like
+ * [ControlPlaneOriginSetBuilder] itself - every origin it produces is traced
+ * back to a compiled, trusted catalog. This is the ONLY new composition this
+ * slice adds; scoring/ranking stays fixed-order (no second scorer), and
+ * bounded per-origin execution stays [TrustedOriginRequestExecutor]'s (no
+ * second retry engine) - see [ActivationPathOriginSetBuilder]'s own docs for
+ * how this feeds the existing [ActivationResilienceCoordinator] unchanged.
+ *
+ * [forGatewayFromOrigins] is a SEPARATE, `internal` (module-visible only,
+ * never reachable from outside this Gradle module, never called by
+ * [forGateway] itself or by any production call site such as
+ * `MainViewModel`) test seam - it exists ONLY so a deterministic unit test
+ * can prove the DIRECT/CHAIN_DIRECT/CHAIN_CDN composition/fallback
+ * MECHANISM against synthetic, test-authored [ControlPlaneOrigin] values,
+ * the same established pattern [ActivationResilienceCoordinator.activate]'s
+ * own `origins` parameter and `MainViewModel`'s own
+ * `controlPlaneOriginsForActivation` constructor seam already use elsewhere
+ * in this codebase. It is never given a caller-/user-/network-supplied host
+ * in this codebase - the one and only caller of it is this module's own test
+ * source set.
  */
 object ActivationPathCandidateBuilder {
-    fun forGateway(
+    fun forGateway(gatewayId: ProductionGatewayId): List<ActivationPathCandidate> = forGatewayFromOrigins(
+        gatewayId,
+        directOrigins = ControlPlaneOriginSetBuilder.forGateway(gatewayId),
+        chainDirectOrigins = TrustedChainControlPlaneOriginCatalog.chainDirect(gatewayId),
+        chainCdnOrigins = TrustedChainControlPlaneOriginCatalog.chainCdn(gatewayId),
+    )
+
+    internal fun forGatewayFromOrigins(
         gatewayId: ProductionGatewayId,
-        directOrigins: List<ControlPlaneOrigin> = ControlPlaneOriginSetBuilder.forGateway(gatewayId),
-        chainDirectOrigins: List<ControlPlaneOrigin> = TrustedChainControlPlaneOriginCatalog.chainDirect(gatewayId),
-        chainCdnOrigins: List<ControlPlaneOrigin> = TrustedChainControlPlaneOriginCatalog.chainCdn(gatewayId),
+        directOrigins: List<ControlPlaneOrigin>,
+        chainDirectOrigins: List<ControlPlaneOrigin>,
+        chainCdnOrigins: List<ControlPlaneOrigin>,
     ): List<ActivationPathCandidate> = listOfNotNull(
         directOrigins.takeIf { it.isNotEmpty() }?.let { ActivationPathCandidate(ActivationPathKind.DIRECT, it) },
         chainDirectOrigins.takeIf { it.isNotEmpty() }?.let { ActivationPathCandidate(ActivationPathKind.CHAIN_DIRECT, it) },
