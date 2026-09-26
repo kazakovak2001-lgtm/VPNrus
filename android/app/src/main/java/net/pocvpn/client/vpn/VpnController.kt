@@ -218,6 +218,15 @@ class VpnController(
     // independent lookup.
     private val relayXrayProfileRepositoryResolver: XrayProfileRepositoryResolver? = null,
     private val relayXrayTlsProfileRepositoryResolver: XrayTlsProfileRepositoryResolver? = null,
+    // B61 - the EXIT-role (Frankfurt, B60) DIRECT (never relayed) XHTTP
+    // counterpart of [xrayProfileRepositoryResolver]/[xrayTlsProfileRepositoryResolver]
+    // above - a SEPARATE resolver from the relay-only [net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver]
+    // path buildTransportConfig's XRAY_XHTTP branch already has (see that
+    // branch's own docs). Defaults to null: with no repository wired, a
+    // Direct XRAY_XHTTP attempt fails closed with
+    // [XrayProfileNotReadyException], never silently falling through to the
+    // relay-only path.
+    private val xrayXhttpProfileRepositoryResolver: net.pocvpn.client.identity.XrayXhttpProfileRepositoryResolver? = null,
     // B35 Android execution - one authoritative local runtime capability
     // snapshot shared with candidate eligibility. Conservative default keeps
     // every legacy/test caller fail-closed for CDN-fronted XHTTP.
@@ -285,7 +294,11 @@ class VpnController(
         // [relayXrayProfileRepositoryResolver]/[relayXrayTlsProfileRepositoryResolver].
         if (xrayProfileRepository != null || xrayProfileRepositoryResolver != null || relayXrayProfileRepositoryResolver != null) add(TransportKind.XRAY_REALITY)
         if (xrayTlsProfileRepository != null || xrayTlsProfileRepositoryResolver != null || relayXrayTlsProfileRepositoryResolver != null) add(TransportKind.TLS_TCP)
-        if (cdnRuntimeCapabilities.isPinnedXhttpExecutable()) add(TransportKind.XRAY_XHTTP)
+        // B61 - also true whenever the EXIT-role Direct resolver was wired,
+        // independent of cdnRuntimeCapabilities (that gate covers ONLY the
+        // relay/CDN-ingress path - see buildTransportConfig's own XRAY_XHTTP
+        // docs for why the two are separate).
+        if (cdnRuntimeCapabilities.isPinnedXhttpExecutable() || xrayXhttpProfileRepositoryResolver != null) add(TransportKind.XRAY_XHTTP)
         // B45B-4 - same shape as the others: this controller can only ever
         // build a TransportConfig.Shadowsocks (see buildTransportConfig's own
         // `when`) when a real ShadowsocksTransport was actually wired.
@@ -1220,32 +1233,63 @@ class VpnController(
                 }
             }
             TransportKind.XRAY_XHTTP -> {
-                val context = pendingAttemptContext as? VpnAttemptContext.Relayed
-                    ?: throw XrayProfileNotReadyException(
-                        "XHTTP requires a relayed attempt context",
-                    )
+                val relayedContext = pendingAttemptContext as? VpnAttemptContext.Relayed
+                if (relayedContext != null) {
+                    // B35/CdnXhttpRuntimeConfigResolver - the Stockholm/B35
+                    // CDN-fronted INGRESS relay path, completely unchanged
+                    // by B61. Never consulted for a Direct attempt (see the
+                    // else branch below) - see that resolver's own docs for
+                    // why its signed-provider-profile semantics must stay
+                    // separate from the EXIT-role path.
+                    when (
+                        val resolution =
+                            net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver.resolve(
+                                ingressProfile = relayedContext.profile,
+                                exitEndpointId = relayedContext.plan.exitEndpointId,
+                                runtime = cdnRuntimeCapabilities,
+                            )
+                    ) {
+                        is net.pocvpn.client.vpn.xray.CdnXhttpRuntimeResolution.Rejected ->
+                            throw XrayProfileNotReadyException(
+                                "XHTTP runtime rejected: ${resolution.reason}",
+                            )
 
-                when (
-                    val resolution =
-                        net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver.resolve(
-                            ingressProfile = context.profile,
-                            exitEndpointId = context.plan.exitEndpointId,
-                            runtime = cdnRuntimeCapabilities,
-                        )
-                ) {
-                    is net.pocvpn.client.vpn.xray.CdnXhttpRuntimeResolution.Rejected ->
-                        throw XrayProfileNotReadyException(
-                            "XHTTP runtime rejected: ${resolution.reason}",
-                        )
+                        is net.pocvpn.client.vpn.xray.CdnXhttpRuntimeResolution.Ready ->
+                            TransportConfig.XrayXhttp(
+                                config = resolution.config,
+                                endpointId = pendingConnectEndpointId,
+                                routingMode = routingMode,
+                                isRelayed = true,
+                                relayExitProbeHost = relayedContext.plan.exitBinding.host,
+                            )
+                    }
+                } else {
+                    // B61 - the EXIT-role (Frankfurt, B60) DIRECT counterpart
+                    // of the Relayed branch above - a SEPARATE, narrow
+                    // resolver (XrayRuntimeResolver.resolveXhttp), never
+                    // CdnXhttpRuntimeConfigResolver (see this branch's own
+                    // docs above for why mixing the two would be wrong).
+                    // Unreachable unless xrayXhttpProfileRepositoryResolver
+                    // != null.
+                    val resolver = xrayXhttpProfileRepositoryResolver
+                        ?: throw XrayProfileNotReadyException("Xray XHTTP profile repository not wired")
+                    val repository = resolver.resolve(pendingConnectEndpointId)
+                        ?: throw XrayProfileNotReadyException("no Xray XHTTP profile repository configured for endpoint ${pendingConnectEndpointId.value}")
+                    when (
+                        val resolution = net.pocvpn.client.vpn.xray.XrayRuntimeResolver.resolveXhttp(repository)
+                    ) {
+                        is net.pocvpn.client.vpn.xray.XrayXhttpRuntimeResolution.Rejected ->
+                            throw XrayProfileNotReadyException(resolution.reason)
 
-                    is net.pocvpn.client.vpn.xray.CdnXhttpRuntimeResolution.Ready ->
-                        TransportConfig.XrayXhttp(
-                            config = resolution.config,
-                            endpointId = pendingConnectEndpointId,
-                            routingMode = routingMode,
-                            isRelayed = true,
-                            relayExitProbeHost = context.plan.exitBinding.host,
-                        )
+                        is net.pocvpn.client.vpn.xray.XrayXhttpRuntimeResolution.Ready ->
+                            TransportConfig.XrayXhttp(
+                                config = resolution.config,
+                                endpointId = pendingConnectEndpointId,
+                                routingMode = routingMode,
+                                isRelayed = false,
+                                relayExitProbeHost = null,
+                            )
+                    }
                 }
             }
 

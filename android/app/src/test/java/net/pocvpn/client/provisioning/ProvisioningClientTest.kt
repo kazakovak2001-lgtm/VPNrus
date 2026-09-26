@@ -292,4 +292,157 @@ class ProvisioningClientTest {
                 is IngressProfileResult.MalformedResponse,
         )
     }
+
+    // --- B64: Direct/EXIT XHTTP profile fetch (POST /v1/xray-profile, transport=xhttp) ---
+
+    private val validXhttpKey = validKey
+    private val validXhttpSuccessBody = JSONObject()
+        .put("server_address", "edge.aknova.pp.ua")
+        .put("server_port", 443)
+        .put("uuid", "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f")
+        .put("xhttp_host", "edge.aknova.pp.ua")
+        .put("xhttp_path", "/nova-xhttp/")
+        .put("mode", "packet-up")
+        .put("uplink_http_method", "POST")
+        .put("fingerprint", "chrome")
+        .toString()
+
+    @Test
+    fun `the 3-arg xray-xhttp-profile request targets the given endpoint host and carries the xhttp transport field`() {
+        val request = ProvisioningClient.buildXrayXhttpProfileRequest(validXhttpKey, "cred", "16.170.208.231")
+        assertEquals("https://16.170.208.231/v1/xray-profile", request.url)
+        assertEquals("xhttp", JSONObject(request.body).getString("transport"))
+    }
+
+    @Test
+    fun `the 2-arg xray-xhttp-profile request still targets Germany's own edge`() {
+        val request = ProvisioningClient.buildXrayXhttpProfileRequest(validXhttpKey, "cred")
+        assertEquals("https://152.70.43.1/v1/xray-profile", request.url)
+    }
+
+    @Test
+    fun `valid XHTTP success body parses into Success with all eight fields`() {
+        val result = ProvisioningClient.mapXrayXhttpProfileResponse(200, validXhttpSuccessBody)
+        assertTrue(result is XrayXhttpProfileResult.Success)
+        val success = result as XrayXhttpProfileResult.Success
+        assertEquals("edge.aknova.pp.ua", success.serverAddress)
+        assertEquals(443, success.serverPort)
+        assertEquals("3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f", success.uuid)
+        assertEquals("edge.aknova.pp.ua", success.xhttpHost)
+        assertEquals("/nova-xhttp/", success.xhttpPath)
+        assertEquals("packet-up", success.mode)
+        assertEquals("POST", success.uplinkHttpMethod)
+        assertEquals("chrome", success.fingerprint)
+    }
+
+    @Test
+    fun `Success maps strictly into XrayXhttpProfile via toXrayXhttpProfile`() {
+        val success = ProvisioningClient.mapXrayXhttpProfileResponse(200, validXhttpSuccessBody) as XrayXhttpProfileResult.Success
+        val profile = success.toXrayXhttpProfile()
+        assertEquals("edge.aknova.pp.ua", profile.server)
+        assertEquals(443, profile.serverPort)
+        assertEquals("3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f", profile.uuid)
+        assertEquals("edge.aknova.pp.ua", profile.xhttpHost)
+        assertEquals("/nova-xhttp/", profile.xhttpPath)
+        assertEquals("packet-up", profile.mode)
+        assertEquals("POST", profile.uplinkHttpMethod)
+        assertEquals("chrome", profile.fingerprint)
+    }
+
+    @Test
+    fun `XHTTP response missing a required field is MalformedResponse`() {
+        val missingXhttpPath = JSONObject(validXhttpSuccessBody).apply { remove("xhttp_path") }.toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, missingXhttpPath) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with a blank uuid is rejected`() {
+        val blankUuid = JSONObject(validXhttpSuccessBody).put("uuid", "").toString()
+        val result = ProvisioningClient.mapXrayXhttpProfileResponse(200, blankUuid)
+        assertTrue(result is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with a malformed (non-UUID) uuid is rejected`() {
+        val badUuid = JSONObject(validXhttpSuccessBody).put("uuid", "not-a-uuid").toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, badUuid) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with an out-of-range server_port is rejected`() {
+        val badPort = JSONObject(validXhttpSuccessBody).put("server_port", 70000).toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, badPort) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with a missing server_port is rejected`() {
+        val missingPort = JSONObject(validXhttpSuccessBody).apply { remove("server_port") }.toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, missingPort) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with a blank xhttp_host is rejected`() {
+        val blankHost = JSONObject(validXhttpSuccessBody).put("xhttp_host", "").toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, blankHost) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with a blank xhttp_path is rejected`() {
+        val blankPath = JSONObject(validXhttpSuccessBody).put("xhttp_path", "").toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, blankPath) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with an unrecognized mode value is rejected`() {
+        val badMode = JSONObject(validXhttpSuccessBody).put("mode", "not-a-real-mode").toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, badMode) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with an unrecognized uplink_http_method value is rejected`() {
+        val badMethod = JSONObject(validXhttpSuccessBody).put("uplink_http_method", "DELETE").toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, badMethod) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response with a blank fingerprint is rejected`() {
+        val blankFingerprint = JSONObject(validXhttpSuccessBody).put("fingerprint", "").toString()
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(200, blankFingerprint) is XrayXhttpProfileResult.MalformedResponse)
+    }
+
+    @Test
+    fun `XHTTP response body that is not valid JSON is MalformedResponse, never a raw-body leak`() {
+        val result = ProvisioningClient.mapXrayXhttpProfileResponse(200, "not json") as XrayXhttpProfileResult.MalformedResponse
+        assertTrue(!result.reason.contains("not json"))
+    }
+
+    @Test
+    fun `XHTTP 401 maps to Unauthorized`() {
+        assertEquals(XrayXhttpProfileResult.Unauthorized, ProvisioningClient.mapXrayXhttpProfileResponse(401, ""))
+    }
+
+    @Test
+    fun `XHTTP 403 revoked maps to Revoked`() {
+        assertEquals(XrayXhttpProfileResult.Revoked, ProvisioningClient.mapXrayXhttpProfileResponse(403, """{"error":"revoked"}"""))
+    }
+
+    @Test
+    fun `XHTTP 403 device_not_bound maps to DeviceNotBound`() {
+        assertEquals(XrayXhttpProfileResult.DeviceNotBound, ProvisioningClient.mapXrayXhttpProfileResponse(403, """{"error":"device_not_bound"}"""))
+    }
+
+    @Test
+    fun `XHTTP 403 with unrecognized or missing error code falls back to Unauthorized`() {
+        assertEquals(XrayXhttpProfileResult.Unauthorized, ProvisioningClient.mapXrayXhttpProfileResponse(403, """{"error":"something_new"}"""))
+    }
+
+    @Test
+    fun `XHTTP 503 (including xray_xhttp_not_configured) maps to ServiceUnavailable`() {
+        assertEquals(XrayXhttpProfileResult.ServiceUnavailable, ProvisioningClient.mapXrayXhttpProfileResponse(503, """{"error":"xray_xhttp_not_configured"}"""))
+    }
+
+    @Test
+    fun `XHTTP unexpected status maps to NetworkError, never treated as success`() {
+        assertTrue(ProvisioningClient.mapXrayXhttpProfileResponse(500, "") is XrayXhttpProfileResult.NetworkError)
+    }
 }

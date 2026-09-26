@@ -2737,9 +2737,15 @@ policy.)
   second enum; existing naming is preserved and extended, per instruction.
 - **`TransportKind.XRAY_XHTTP`** (VLESS+REALITY+XHTTP/TCP-443) is a real,
   live, EXIT-role-capable transport (B35 CDN-relay origin work, plus this
-  branch's own B59-B66.18 Direct-EXIT-XHTTP plumbing/failover, confirmed
-  wired into `MainViewModel.buildTransportRegistry` and AWG->Direct-EXIT-XHTTP
-  failover). B-WL2 does not build XHTTP - it gives `PathScorer` a scoring
+  branch's own B59-B64 Direct-EXIT-XHTTP plumbing, confirmed wired into
+  `MainViewModel.buildTransportRegistry`'s transport registry surfacing and
+  client-side provisioning). **Correction (2026-09-26 baseline
+  reconciliation)**: B66.18's conditional AWG->Direct-EXIT-XHTTP failover
+  policy (`AwgXrayFailoverPolicy`, commit `a2e4a77`) is NOT part of this
+  baseline - it exists only on a separate, not-yet-reconciled branch
+  (`b66-18-awg-xhttp-failover`) and is out of scope for this reconciliation
+  pass; do not assume it is wired here. B-WL2 does not build XHTTP - it
+  gives `PathScorer` a scoring
   adjustment that favors an already-reachable XRAY_XHTTP candidate under
   B-WL1's UDP-filtering/possible-whitelist evidence, never a hardcoded
   "restricted implies XHTTP" branch and never XHTTP as the sole candidate.

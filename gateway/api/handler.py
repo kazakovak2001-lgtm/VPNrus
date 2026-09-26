@@ -431,12 +431,21 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # identity, the client never sends one (see xray_provisioning.py's
         # own eligibility gate) - the SAME identity is reused for either
         # transport, never a second one.
-        public_key, transport = self._parse_and_validate_xray_profile_body(raw_body)
+        # B60 - "xhttp" joins "reality"/"tls" as a third allowed transport
+        # value, same optional/defaulted body shape, no new parsing
+        # mechanism.
+        public_key, transport = self._parse_and_validate_xray_profile_body(
+            raw_body, allowed_transports=("reality", "tls", "xhttp"),
+        )
         self._log_fields["pubkey_prefix"] = public_key[:8]
         self._log_fields["xray_transport"] = transport
 
         if transport == "tls" and not cfg.xray_tls_server_port:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_tls_not_configured")
+        if transport == "xhttp" and not (
+            cfg.xray_xhttp_server_port and cfg.xray_xhttp_client_host and cfg.xray_xhttp_client_port
+        ):
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_xhttp_not_configured")
 
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
@@ -497,7 +506,54 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # server-internal config, never the activation digest, never any
         # other user's/device's identity. Snake_case keys, matching the
         # existing /v1/activate and /v1/peers response convention.
-        if transport == "tls":
+        if transport == "xhttp":
+            # B60 - server_address/server_port are the PUBLIC Cloudflare-
+            # facing coordinates (cfg.xray_xhttp_client_host/_port), never
+            # cfg.xray_xhttp_server_port (127.0.0.1-only, this process's own
+            # loopback Xray inbound - see AppConfig.xray_xhttp_client_host's
+            # own docs for why the two are separate fields, and
+            # nginx-pocvpn-cdn-origin-frankfurt.conf's own comment for why
+            # 127.0.0.1:<port> must never reach a client response).
+            # xhttp_host mirrors server_address (same Cloudflare-fronted
+            # hostname acts as both the public endpoint and the origin Host
+            # header this deployment's nginx expects - see B58/B59's own
+            # "fixed operator-controlled Host" invariant) - modeled as its
+            # own field because XrayVlessXhttpConfig.kt's own docs treat
+            # xhttpHost as conceptually distinct from server, even though
+            # they carry the same value in this single-hostname deployment.
+            # fingerprint reuses the SAME operator-configured value TLS/TCP
+            # already sends (cfg.xray_tls_fingerprint) - XHTTP introduces no
+            # separate fingerprint knob/mechanism (B60 scope: "never
+            # introduce a new fingerprint/TLS-minimum/ALPN mechanism"; no
+            # per-transport fingerprint config exists anywhere in this
+            # codebase, so reusing the one real, already-audited operator
+            # knob is the non-invented choice). mode/uplink_http_method are
+            # the SAME fixed protocol invariants B57 already fixed at the
+            # Xray-render layer (XhttpServerConfig.mode, never operator-
+            # configurable) - sent explicitly so the client does not have to
+            # independently assume them either, matching B57's own stated
+            # reasoning for fixing them server-side in the first place.
+            # Deliberately NOT sent: minimumTlsVersion/alpn/queryParameters/
+            # headers/maxEachPostBytes/padding* - none of these has an
+            # existing project config value or Xray-rendered invariant on
+            # the EXIT role (unlike the ingress role's own separate
+            # scMaxEachPostBytes/padding knobs - see
+            # xray_ingress_config_renderer.py) to source them from; B57
+            # separately proved packet-up needs no explicit padding values
+            # at all. Inventing values for these here would violate B60's
+            # own "never invent a value just to satisfy a schema" rule -
+            # left as client-side defaults/an explicit B61 gap instead.
+            payload = {
+                "server_address": cfg.xray_xhttp_client_host,
+                "server_port": cfg.xray_xhttp_client_port,
+                "uuid": identity_outcome.vless_uuid,
+                "xhttp_host": cfg.xray_xhttp_client_host,
+                "xhttp_path": cfg.xray_xhttp_path,
+                "mode": "packet-up",
+                "uplink_http_method": "POST",
+                "fingerprint": cfg.xray_tls_fingerprint,
+            }
+        elif transport == "tls":
             # B8O2 - TLS needs materially fewer fields than REALITY (no
             # flow/reality_public_key/short_id - see
             # docs/B8O0_TLS_TCP_FALLBACK_AUDIT.md's own "simpler credential

@@ -66,8 +66,23 @@ def build_reality_config(app_config):
     module-level/long-lived variable, never logged."""
     if not app_config.xray_reality_private_key_file:
         raise XrayActivationNotConfigured("xray_reality_private_key_file is not configured")
-    with open(app_config.xray_reality_private_key_file, "r", encoding="utf-8") as handle:
-        private_key = handle.read().strip()
+    # Fail-closed defense-in-depth: this is the one place in the whole
+    # /v1/xray-profile request pipeline that opens an externally-permissioned
+    # secret file (every other open() in this pipeline is one of this
+    # process's own pocvpn-api-owned durable stores). A permission/ownership
+    # problem on that file (misconfiguration, deployment drift, a key
+    # rotation race) must surface as the SAME typed, already-handled
+    # XrayConfigRenderError activate_if_needed's caller already maps to a
+    # clean 503 "xray_activation_failed" - never as a raw uncaught
+    # PermissionError/OSError reaching the HTTP dispatcher's generic
+    # catch-all and returning an undifferentiated 500.
+    try:
+        with open(app_config.xray_reality_private_key_file, "r", encoding="utf-8") as handle:
+            private_key = handle.read().strip()
+    except OSError as exc:
+        raise xray_config_renderer.XrayConfigRenderError(
+            f"could not read REALITY private key file: {exc.__class__.__name__}"
+        ) from exc
 
     return xray_config_renderer.RealityServerConfig(
         listen_port=app_config.xray_server_port,
@@ -91,6 +106,22 @@ def build_tls_config(app_config):
         listen_port=app_config.xray_tls_server_port,
         cert_file=app_config.xray_tls_cert_file,
         key_file=app_config.xray_tls_key_file,
+    )
+
+
+def build_xhttp_config(app_config):
+    """B35 - the XHTTP/CDN counterpart of [build_reality_config]/
+    [build_tls_config]. Reads no secret and no file path at all - unlike
+    TLS, this inbound holds no cert/key reference of any kind (see
+    [xray_config_renderer.XhttpServerConfig]'s own docs: TLS termination
+    happens entirely in front of this host). Returns None (not an error)
+    when XHTTP is not configured - matching REALITY/TLS's own
+    optional-group convention."""
+    if not app_config.xray_xhttp_server_port:
+        return None
+    return xray_config_renderer.XhttpServerConfig(
+        listen_port=app_config.xray_xhttp_server_port,
+        path=app_config.xray_xhttp_path,
     )
 
 
@@ -127,6 +158,7 @@ def _render_candidate(app_config):
     canonical_json_text, sha256_hex)."""
     reality = build_reality_config(app_config)
     tls = build_tls_config(app_config)
+    xhttp = build_xhttp_config(app_config)
     activations_data = activations.read_store_shared(app_config.activation_store_path, app_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(app_config.xray_store_path, app_config.xray_lock_path)
     # B26 (task G) - a genuinely separate trust domain from activations_data
@@ -134,7 +166,8 @@ def _render_candidate(app_config):
     # cross-referenced against per-user activation/revocation state.
     static_clients = relay_identity_store.load_static_clients(app_config.static_relay_clients_file)
     config_dict = xray_config_renderer.render_server_config(
-        activations_data, xray_data, reality, tls=tls, flow=app_config.xray_flow, static_clients=static_clients,
+        activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=app_config.xray_flow,
+        static_clients=static_clients,
     )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
