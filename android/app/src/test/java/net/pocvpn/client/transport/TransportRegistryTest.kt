@@ -92,6 +92,6 @@ class TransportRegistryTest {
     fun `all() lists every registered kind regardless of status`() {
         val registry = TransportRegistry.defaults { FakeVpnTransport() }
         assertEquals(TransportKind.entries.toSet(), registry.all().map { it.kind }.toSet())
-        assertTrue(registry.all().size == 6)
+        assertTrue(registry.all().size == 7)
     }
 }
