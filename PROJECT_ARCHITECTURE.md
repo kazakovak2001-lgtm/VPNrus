@@ -2766,19 +2766,41 @@ not implemented here.)
 - **B67 (Resilient Activation & Enrollment) is a recovery/re-scoping label, not
   a new architecture.** It groups the ALREADY-DOCUMENTED B56 ActivationEnvelope
   work (see "Resilient Activation & Control-Plane Access" and B56 sections
-  above - schema/verifier/issuer-tooling/production-key ceremony are real; the
-  runtime composition into `MainViewModel`/`ActivationScreen`/bootstrap
-  networking is B56-5, still not done) together with PR #58's still-unmerged
+  above - schema/verifier/issuer-tooling/production-key ceremony, AND, as of
+  B56-5, the runtime composition into `MainViewModel`/`ActivationScreen`/
+  bootstrap networking, are all real and present at HEAD - see the "Last
+  updated" note just above this section) together with PR #58's still-unmerged
   zero-touch field-enrollment service (`gateway/api/field_enrollment.py`,
   `gateway/tools/field_enrollment_admin.py`, Android `FieldCredentialStore.kt`)
   under one ROADMAP number, so neither loses tracking. See `docs/ROADMAP.md`'s
   B67 rows for the DONE/PARTIAL/PLANNED breakdown per sub-slice.
-- **The legacy `ProvisioningClient.activate(publicKey, activationCredential:
-  String)` model is still the only LIVE activation path.** `ActivationEnvelope`
-  exists at the type/crypto/tooling layer only and has no runtime call site
-  yet - the two are not "old vs. replaced," they are "live" vs.
-  "built-but-unwired." Do not assume `ActivationEnvelope` supersedes the
-  credential model in any live code path until B56-5 actually wires it.
+- **B67.3 (2026-09-26 audit) determined the `ActivationEnvelope` <-> legacy
+  credential CONTRACT from the actual code, not by architectural preference:
+  `ActivationEnvelope.credential` (`activation/ActivationEnvelope.kt`) IS an
+  `ActivationCredential` - the SAME bearer token
+  `gateway/tools/activation_tokens.py` always issued. `ActivationPackageRedeemer`
+  extracts it and calls the SAME `MainViewModel.activateDevice()` a typed
+  credential uses - no second activation/provisioning system, confirmed.
+  `gateway/api/activations.py` has ZERO awareness of `ActivationEnvelope` or
+  issuer keys - it authorizes purely via that legacy credential's own store
+  record (`max_devices`/`expires_at`/`status`/`decide_and_bind`), unchanged.
+  **The legacy credential is therefore the ONE live, unconditional,
+  never-deprecated server-side authorization artifact; `ActivationEnvelope` is
+  a CLIENT-SIDE-ONLY signed integrity/entitlement wrapper around distributing
+  that SAME credential offline - never a second authorization mechanism, and
+  never itself checked server-side.** Whether/when the legacy raw-credential
+  manual-entry UI path is ever deprecated, and whether a future server-side
+  envelope-verification path is ever built, are genuine, UNDECIDED product
+  questions - not implemented, not assumed, not blocking this contract
+  statement. Server-side rejection of the credential (revoked/expired/
+  device-limit) is authoritative over a locally-valid envelope and was
+  already provably terminal via B30's existing `AUTHORIZATION_REJECTED`
+  taxonomy; B67.3 added the one test that had been missing - proving this
+  through the REAL `MainViewModel.activateDevice()` mapping for the package
+  flow specifically, not a stand-in (`MainViewModelActivationPackageAuthorityTest`).
+  `bootstrapEndpointHints` remains a signed schema field with ZERO runtime
+  consumer anywhere in the codebase (confirmed by search) - inert today, not
+  an oversight to silently assume is wired.
 - **Multi-path CONTROL-PLANE/activation discovery across DIRECT/CHAIN_DIRECT/
   CHAIN_CDN does not exist.** The existing `PathScorer`/`AutoGatewaySelector`
   multi-path ranking is a DATA-PLANE (VPN transport/gateway) authority only
