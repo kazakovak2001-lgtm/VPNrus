@@ -111,6 +111,10 @@ def make_app_config(
     xray_xhttp_client_host="", xray_xhttp_client_port=0,
     manifest_path="",
     relay_probe_hmac_secret_file="",
+    field_enrollment_enabled=False,
+    field_enrollment_max_devices=0,
+    field_enrollment_index_path="",
+    field_enrollment_index_lock_path="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -153,6 +157,10 @@ def make_app_config(
         xray_xhttp_client_port=xray_xhttp_client_port,
         manifest_path=manifest_path,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
+        field_enrollment_enabled=field_enrollment_enabled,
+        field_enrollment_max_devices=field_enrollment_max_devices,
+        field_enrollment_index_path=field_enrollment_index_path,
+        field_enrollment_index_lock_path=field_enrollment_index_lock_path,
     )
 
 

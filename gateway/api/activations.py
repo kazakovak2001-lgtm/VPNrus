@@ -721,6 +721,81 @@ def issue_activation(store_path, lock_path, max_devices, expires_in_days=None):
     return activation_id, credential
 
 
+# --- field-enrollment support (Russia field test - see gateway/api/field_enrollment.py) --
+
+def register_credential(store_path, lock_path, credential, activation_id, max_devices=1, expires_in_days=None, now=None):
+    """Field-enrollment variant of issue_activation(): the caller has
+    already generated BOTH `credential` (a genuinely random, per-device
+    value, never derived from anything) AND `activation_id` (see
+    field_enrollment.py's own FieldEnrollmentIndex, which must record the
+    SAME activation_id this call durably assigns - passing it in, rather
+    than generating a second, independent one here, is what keeps the
+    index and this store from ever disagreeing about a device's
+    activation_id) and has ALREADY made its own admission/cap decision
+    (field_enrollment.py's index owns that - never this store's own total
+    record count, which may also hold unrelated operator-issued
+    multi-device activations). This is the atomic, race-free "create a new
+    single-device activation record for this exact credential, unless one
+    already exists" primitive, under the SAME _exclusive_lock(lock_path)
+    issue_activation itself uses. Unlike the earlier
+    issue_activation_if_under_cap this replaces, this function enforces NO
+    cap of its own - it is a pure idempotent insert.
+
+    Idempotent: if a record for this exact credential's digest ALREADY
+    exists (a benign race, or a genuine retry), returns that existing
+    record's activation_id UNCHANGED (which the caller already knows,
+    since it derives from the SAME durable index entry) - never
+    double-writes.
+
+    Raises ActivationStoreError if `activation_id` collides with a
+    DIFFERENT existing record's own id - should be unreachable (both id
+    spaces are 128-bit random hex), kept as a defensive, explicit failure
+    rather than silently overwriting an unrelated record.
+
+    Returns the activation_id (new or already-existing).
+    """
+    if not isinstance(max_devices, int) or max_devices < 1:
+        raise ValueError("max_devices must be a positive integer")
+    if not _ACTIVATION_ID_RE.match(activation_id):
+        raise ValueError("activation_id must be 32 lowercase hex characters")
+
+    digest = credential_digest(credential)
+    with _exclusive_lock(lock_path, create=False):
+        data = _read_and_validate_under_lock(store_path)
+
+        existing = data.get(digest)
+        if existing is not None:
+            return existing["activation_id"]
+
+        for record in data.values():
+            if record["activation_id"] == activation_id:
+                raise ActivationStoreError(f"activation_id {activation_id} already used by a different credential")
+
+        expires_at = None
+        if expires_in_days is not None:
+            from datetime import timedelta
+            expires_at = ((now or datetime.now(timezone.utc)) + timedelta(days=expires_in_days)).isoformat()
+
+        data[digest] = {
+            "activation_id": activation_id,
+            "status": ACTIVE,
+            "max_devices": max_devices,
+            "created_at": _utc_now_iso(),
+            "expires_at": expires_at,
+            "bound_devices": [],
+        }
+        _atomic_write_store_or_raise(store_path, data)
+        return activation_id
+
+
+def find_by_credential_digest(store_path, lock_path, digest):
+    """Read-only (LOCK_SH) lookup by an ALREADY-COMPUTED credential digest -
+    never takes a raw credential, matching every other read path's own
+    no-raw-credential discipline. Returns the record dict, or None."""
+    data = read_store_shared(store_path, lock_path)
+    return data.get(digest)
+
+
 def revoke_activation(store_path, lock_path, activation_id):
     """B8C1C: revoke must serialize with any in-flight provisioning for the
     SAME activation - otherwise a revoke could complete without a
