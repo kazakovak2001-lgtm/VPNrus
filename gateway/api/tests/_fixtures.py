@@ -111,6 +111,11 @@ def make_app_config(
     xray_xhttp_client_host="", xray_xhttp_client_port=0,
     manifest_path="",
     relay_probe_hmac_secret_file="",
+    field_enrollment_enabled=False,
+    field_enrollment_max_devices=0,
+    field_enrollment_index_path="",
+    field_enrollment_index_lock_path="",
+    field_enrollment_wrap_key_file="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -153,12 +158,29 @@ def make_app_config(
         xray_xhttp_client_port=xray_xhttp_client_port,
         manifest_path=manifest_path,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,
+        field_enrollment_enabled=field_enrollment_enabled,
+        field_enrollment_max_devices=field_enrollment_max_devices,
+        field_enrollment_index_path=field_enrollment_index_path,
+        field_enrollment_index_lock_path=field_enrollment_index_lock_path,
+        field_enrollment_wrap_key_file=field_enrollment_wrap_key_file,
     )
 
 
 def make_relay_probe_hmac_secret_file(tmp_dir, name="relay-probe-hmac-secret.bin", content=None):
     """B26 - a throwaway 32-byte shared secret, written with the same
     0600/never-in-repo discipline as every other test secret file."""
+    path = os.path.join(tmp_dir, name)
+    with open(path, "wb") as handle:
+        handle.write(content if content is not None else secrets.token_bytes(32))
+    os.chmod(path, 0o600)
+    return path
+
+
+def make_field_enrollment_wrap_key_file(tmp_dir, name="field-enrollment-wrap-key.bin", content=None):
+    """Round-3 review fix - a throwaway 32-byte AES-256-GCM key for
+    wrapping the field-enrollment index's own per-device credential field,
+    same disposable-test-secret discipline as make_relay_probe_hmac_secret_file
+    above (never a real production key)."""
     path = os.path.join(tmp_dir, name)
     with open(path, "wb") as handle:
         handle.write(content if content is not None else secrets.token_bytes(32))

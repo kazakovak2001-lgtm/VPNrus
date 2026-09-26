@@ -127,10 +127,51 @@ class ActivationStoreError(Exception):
     error instead."""
 
 
+class ActivationCommitUncertainError(ActivationStoreError):
+    """B67.4 corrective-pass fix (MAJOR BUG #2) - the public-facing wrapper
+    around `StoreCommitUncertainError` (see that class's own docs):
+    `register_credential`'s own `os.replace()` already succeeded before
+    this was raised, so the activation record it was writing MAY already
+    durably exist, even though this exact call cannot confirm the
+    directory-entry durability step completed. A subclass of
+    `ActivationStoreError` on purpose - handler.py's existing
+    `except activations.ActivationStoreError: -> 503` mapping already
+    covers it correctly with no code change there - but callers that
+    perform their OWN compensating rollback on a registration failure
+    (field_enrollment.py's `enroll_device`) MUST catch this specific type
+    FIRST and never treat it like an ordinary registration failure: it
+    must re-raise without removing any reservation/index entry, so a
+    retry of the same public key can find and reconcile with whatever
+    this call actually left durable (`register_credential`'s own
+    idempotent-insert semantics: found-existing digest -> `created=False`,
+    genuinely absent -> a clean fresh `created=True` write - either way
+    never a duplicate credential/activation_id for the same device)."""
+
+
 class StoreWriteError(Exception):
     """A durable-write precondition or step failed - caller must abort,
     leave the prior store byte-for-byte untouched, and report a clean
     error, never claim success for a write that didn't durably happen."""
+
+
+class StoreCommitUncertainError(StoreWriteError):
+    """B67.4 corrective-pass fix - raised ONLY when `os.replace()` has
+    ALREADY succeeded (the new store content is filesystem-VISIBLE to any
+    subsequent reader, including this same process's own next read under
+    the same lock) but the following containing-directory `fsync()` then
+    failed. This is deliberately NOT the same case as every other
+    `StoreWriteError`/`OSError` this module raises: those all happen
+    strictly BEFORE `os.replace()`, when the prior store is still
+    byte-for-byte untouched and "nothing happened" is the correct,
+    honest description. Past `os.replace()`, "nothing happened" would be
+    a LIE - the new bytes are already live - so a caller must never treat
+    this the same as an ordinary write failure: never re-derive "did this
+    write happen?" from this exception's mere existence, never delete/
+    roll back a record this call MAY have just durably created (see
+    `ActivationCommitUncertainError`/`register_credential`'s own docs for
+    the specific caller-facing contract this maps to). Durability
+    (surviving an immediate crash/power-loss) is what is actually in
+    doubt here - visibility is not."""
 
 
 @dataclass(frozen=True)
@@ -262,7 +303,51 @@ def _atomic_write_store(store_path, data):
     mkstemp (always mode 0600) in the same directory, write+fsync, restore
     the PRIOR file's exact mode/ownership (or a restrictive 0600 default
     for a brand-new store), os.replace, then fsync the containing
-    directory. Never a partial/best-effort write."""
+    directory. Never a partial/best-effort write.
+
+    B67.4 corrective-pass fix (MAJOR BUG #2) - VISIBILITY vs DURABILITY are
+    no longer conflated: everything up to and including `os.replace()`
+    stays inside the existing try/except that unlinks the leftover temp
+    file on failure - a failure THERE means the prior store is still
+    byte-for-byte untouched, "nothing happened" is still an honest
+    description, and an ordinary OSError/StoreWriteError is still exactly
+    right.
+
+    B67.4 THIRD corrective-pass fix (persistence-uncertainty gap in the
+    post-`os.replace()` window itself) - the SECOND pass already
+    classified a directory-`fsync()` failure as commit-uncertain, but left
+    two adjacent failure points on the SAME side of the `os.replace()`
+    boundary still able to escape as a plain, unclassified `OSError`: the
+    `os.open(directory, ...)` call that obtains `dir_fd` (if THAT fails,
+    nothing at all had wrapped it) and `os.close(dir_fd)` (called from a
+    bare `finally`, so a close-time failure - after a SUCCESSFUL fsync -
+    would propagate as its own uncaught, unclassified `OSError` instead of
+    the fsync's already-correctly-classified one). Both are the same kind
+    of failure as the directory fsync itself: they happen only AFTER
+    `os.replace()` has already made the new content filesystem-visible, so
+    a failure there can NEVER mean "nothing happened" either.
+
+    The fix makes the "before vs. after `os.replace()`" boundary explicit
+    with a plain local flag, `replace_completed` (never inferred from
+    exception type or call position), and puts EVERY filesystem operation
+    that happens once that flag is `True` - opening the directory,
+    `fsync()`ing it, and closing it - inside ONE `try/except OSError` that
+    maps ANY failure among the three to `StoreCommitUncertainError`. This
+    reads exactly as three explicit states:
+
+        replace_completed == False, any exception  -> ordinary failure
+            (still definitely nothing durable happened - the existing
+            `except BaseException: unlink tmp_path; raise` above is
+            UNCHANGED for this case)
+        replace_completed == True,  no exception    -> COMMITTED
+        replace_completed == True,  any exception    -> COMMIT UNCERTAIN
+            (`StoreCommitUncertainError`, regardless of whether the
+            failure was the directory open, its fsync, or its close -
+            os.replace() already succeeded, so "nothing happened" is
+            never again an honest description for any of the three)
+
+    There is deliberately no `DEFINITELY NOT COMMITTED` outcome once
+    `replace_completed` is `True` - that is the whole point of this fix."""
     directory = os.path.dirname(os.path.abspath(store_path)) or "."
     prior_mode = None
     prior_uid = None
@@ -276,6 +361,7 @@ def _atomic_write_store(store_path, data):
     except FileNotFoundError:
         pass
 
+    replace_completed = False
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".activations.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -291,23 +377,50 @@ def _atomic_write_store(store_path, data):
             os.chmod(tmp_path, 0o600)
 
         os.replace(tmp_path, store_path)
+        replace_completed = True
     except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if not replace_completed:
+            # os.replace() itself never ran, or never completed - the
+            # prior store is still byte-for-byte untouched, so cleaning up
+            # the never-published temp file and re-raising as an ordinary
+            # failure is still exactly right.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
 
-    dir_fd = os.open(directory, os.O_RDONLY)
+    # Past this point `store_path` already holds the new content - VISIBLE
+    # regardless of what happens below. Opening the containing directory,
+    # fsync()ing it, and closing it are ALL, uniformly, "durability of an
+    # already-visible write" concerns from here on - a failure in ANY of
+    # the three is commit-uncertain, never an ordinary failure (see this
+    # function's own docstring).
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        raise StoreCommitUncertainError(
+            f"activation store content for {store_path} is now filesystem-visible via os.replace(), "
+            f"but durably confirming its containing directory entry failed (open/fsync/close of the "
+            f"directory itself) - durability across an immediate crash is unconfirmed: {exc}"
+        ) from exc
 
 
 def _atomic_write_store_or_raise(store_path, data):
     try:
         _atomic_write_store(store_path, data)
+    except StoreCommitUncertainError as exc:
+        # Must be checked before the plainer (OSError, StoreWriteError)
+        # branch below - StoreCommitUncertainError IS a StoreWriteError,
+        # and conflating the two here would erase exactly the distinction
+        # this fix exists to preserve.
+        raise ActivationCommitUncertainError(
+            f"activation store write for {store_path} may have already committed - durability unconfirmed: {exc}"
+        ) from exc
     except (OSError, StoreWriteError) as exc:
         raise ActivationStoreError(f"failed to durably write the activation store: {exc}") from exc
 
@@ -719,6 +832,163 @@ def issue_activation(store_path, lock_path, max_devices, expires_in_days=None):
         _atomic_write_store_or_raise(store_path, data)
 
     return activation_id, credential
+
+
+# --- field-enrollment support (Russia field test - see gateway/api/field_enrollment.py) --
+
+@dataclass(frozen=True)
+class RegisterCredentialResult:
+    """Round-3 review fix - `activation_id` alone could not tell a caller
+    whether THIS call created the record or merely found an existing one
+    (an idempotent replay) - a real ownership question field_enrollment.py
+    needs to answer safely before it may ever delete a record on rollback
+    (see `remove_credential_if_unbound`'s own docs: never delete a record
+    this exact call did not itself create). `created=True` means this call
+    durably wrote a brand-new record; `created=False` means a record for
+    this exact credential digest already existed and was left untouched."""
+
+    activation_id: str
+    created: bool
+
+
+def register_credential(store_path, lock_path, credential, activation_id, max_devices=1, expires_in_days=None, now=None):
+    """Field-enrollment variant of issue_activation(): the caller has
+    already generated BOTH `credential` (a genuinely random, per-device
+    value, never derived from anything) AND `activation_id` (see
+    field_enrollment.py's own FieldEnrollmentIndex, which must record the
+    SAME activation_id this call durably assigns - passing it in, rather
+    than generating a second, independent one here, is what keeps the
+    index and this store from ever disagreeing about a device's
+    activation_id) and has ALREADY made its own admission/cap decision
+    (field_enrollment.py's index owns that - never this store's own total
+    record count, which may also hold unrelated operator-issued
+    multi-device activations). This is the atomic, race-free "create a new
+    single-device activation record for this exact credential, unless one
+    already exists" primitive, under the SAME _exclusive_lock(lock_path)
+    issue_activation itself uses. Unlike the earlier
+    issue_activation_if_under_cap this replaces, this function enforces NO
+    cap of its own - it is a pure idempotent insert.
+
+    Idempotent: if a record for this exact credential's digest ALREADY
+    exists (a benign race, or a genuine retry), returns that existing
+    record's activation_id UNCHANGED (which the caller already knows,
+    since it derives from the SAME durable index entry) - never
+    double-writes. Safe, and INTENDED, to call on every field-enrollment
+    attempt for a given public key, not only the first - this is what lets
+    a device recover cleanly if a PREVIOUS attempt reserved an index entry
+    but crashed/failed before this call ever ran (see field_enrollment.py's
+    own docs on why it no longer skips this call for an idempotent replay).
+
+    Raises ActivationStoreError if `activation_id` collides with a
+    DIFFERENT existing record's own id - should be unreachable (both id
+    spaces are 128-bit random hex), kept as a defensive, explicit failure
+    rather than silently overwriting an unrelated record.
+
+    Returns a [RegisterCredentialResult] - see its own docs for why
+    `created` exists.
+    """
+    if not isinstance(max_devices, int) or max_devices < 1:
+        raise ValueError("max_devices must be a positive integer")
+    if not _ACTIVATION_ID_RE.match(activation_id):
+        raise ValueError("activation_id must be 32 lowercase hex characters")
+
+    digest = credential_digest(credential)
+    with _exclusive_lock(lock_path, create=False):
+        data = _read_and_validate_under_lock(store_path)
+
+        existing = data.get(digest)
+        if existing is not None:
+            return RegisterCredentialResult(existing["activation_id"], created=False)
+
+        for record in data.values():
+            if record["activation_id"] == activation_id:
+                raise ActivationStoreError(f"activation_id {activation_id} already used by a different credential")
+
+        expires_at = None
+        if expires_in_days is not None:
+            from datetime import timedelta
+            expires_at = ((now or datetime.now(timezone.utc)) + timedelta(days=expires_in_days)).isoformat()
+
+        data[digest] = {
+            "activation_id": activation_id,
+            "status": ACTIVE,
+            "max_devices": max_devices,
+            "created_at": _utc_now_iso(),
+            "expires_at": expires_at,
+            "bound_devices": [],
+        }
+        _atomic_write_store_or_raise(store_path, data)
+        return RegisterCredentialResult(activation_id, created=True)
+
+
+def remove_credential_if_unbound(store_path, lock_path, credential, activation_id):
+    """Round-3 review fix (orphan-activation rollback) - compensating
+    rollback for `register_credential`'s OWN record when the field-
+    enrollment attempt that just created it definitively fails (register
+    itself raised, or the subsequent `provision_with_activation` call
+    failed and `unbind_reservation` already removed any PENDING device
+    bind - see field_enrollment.py's own call site). There is no existing
+    "delete a whole activation record" primitive in this module
+    (`revoke_activation` marks REVOKED, it never deletes - correct for an
+    operator-issued, possibly still-useful activation, but wrong here: a
+    field-enrollment record that never became a working device should
+    leave no trace at all, not a permanently-revoked orphan).
+
+    Ownership + state check, mirroring `unbind_reservation`'s own
+    "only remove what THIS call is certain it owns" discipline - NEVER a
+    blind delete-by-activation_id:
+      - the record must still exist;
+      - its `activation_id` must match exactly (defensive - the digest
+        alone already identifies it uniquely in practice, since both
+        `credential` and `activation_id` are independently 128+ bits of
+        randomness, but this costs nothing and removes any doubt);
+      - `bound_devices` must be EMPTY. A record with any bound device
+        (even a PENDING one) was, or still is, in active use by SOME
+        request - possibly a concurrent one this rollback knows nothing
+        about - and must never be deleted out from under it. In the
+        specific field-enrollment call sequence this exists for, any
+        PENDING bind from THIS SAME failed attempt is already gone by the
+        time this runs (provision_with_activation's own unbind_reservation
+        already ran) - so an empty bound_devices list here means "this
+        record was created by register_credential moments ago and nothing
+        has touched it since," never "some other request's bind happened
+        to finish first."
+
+    Uses the SAME fixed lock order every other whole-activation mutation
+    in this module uses (per_activation_lock(digest) THEN the global
+    _exclusive_lock, never the reverse) - safe to call from
+    field_enrollment.py AFTER `provision_with_activation` has already
+    returned (that call's own per_activation_lock critical section has
+    fully exited by then, so this acquires a fresh one, never a nested
+    re-entrant one - re-entrant flock() on the same fd-less file from the
+    same process would otherwise self-deadlock).
+
+    Returns True if a record was actually removed, False if the ownership/
+    state check did not match (a safe no-op, not an error - the caller
+    should not treat False as a failure).
+    """
+    digest = credential_digest(credential)
+    with per_activation_lock(store_path, digest):
+        with _exclusive_lock(lock_path, create=False):
+            data = _read_and_validate_under_lock(store_path)
+            record = data.get(digest)
+            if record is None:
+                return False
+            if record["activation_id"] != activation_id:
+                return False
+            if record["bound_devices"]:
+                return False
+            del data[digest]
+            _atomic_write_store_or_raise(store_path, data)
+            return True
+
+
+def find_by_credential_digest(store_path, lock_path, digest):
+    """Read-only (LOCK_SH) lookup by an ALREADY-COMPUTED credential digest -
+    never takes a raw credential, matching every other read path's own
+    no-raw-credential discipline. Returns the record dict, or None."""
+    data = read_store_shared(store_path, lock_path)
+    return data.get(digest)
 
 
 def revoke_activation(store_path, lock_path, activation_id):

@@ -35,6 +35,7 @@ class MainActivity : AppCompatActivity() {
                     viewModel = viewModel,
                     isDebugBuild = BuildConfig.DEBUG,
                     onRequestVpnPermission = { intent: Intent -> vpnPermissionLauncher.launch(intent) },
+                    isZeroTouchEnrollmentBuild = BuildConfig.FIELD_ENROLLMENT_ENABLED,
                 )
             }
         }

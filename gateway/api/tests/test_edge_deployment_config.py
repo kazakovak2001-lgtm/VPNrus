@@ -84,6 +84,28 @@ class GermanyNginxExposesRelayHealthTests(unittest.TestCase):
         self.assertIsNone(_SUSPICIOUS_SECRET_REGEX.search(self.conf))
 
 
+class GermanyNginxExposesFieldEnrollTests(unittest.TestCase):
+    """PR #58 round-2: /v1/field-enroll was added to handler.py but never
+    to this tracked edge template - this class guards against that gap
+    reappearing. Germany runs only the EXIT/gateway role, so field-enroll
+    proxies to the SAME loopback port every other route here uses (8443)."""
+
+    def setUp(self):
+        self.conf = _read(_NGINX_GERMANY)
+
+    def test_exact_field_enroll_location_present(self):
+        self.assertIn("location = /v1/field-enroll {", self.conf)
+
+    def test_field_enroll_is_post_only(self):
+        block = self.conf.split("location = /v1/field-enroll {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("limit_except POST", block)
+        self.assertNotIn("limit_except GET", block)
+
+    def test_field_enroll_proxies_to_loopback_8443_never_publicly(self):
+        block = self.conf.split("location = /v1/field-enroll {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("proxy_pass http://127.0.0.1:8443;", block)
+
+
 class StockholmNginxExposesIngressProfileTests(unittest.TestCase):
     def setUp(self):
         self.conf = _read(_NGINX_STOCKHOLM)
@@ -132,6 +154,34 @@ class StockholmNginxExposesIngressProfileTests(unittest.TestCase):
 
     def test_no_secret_shaped_value_in_tracked_template(self):
         self.assertIsNone(_SUSPICIOUS_SECRET_REGEX.search(self.conf))
+
+
+class StockholmNginxExposesFieldEnrollOnIngressPortTests(unittest.TestCase):
+    """PR #58 round-2: same gap as GermanyNginxExposesFieldEnrollTests, plus
+    the exact bug test_ingress_profile_proxies_to_ITS_OWN_loopback_8444_...
+    already guards against - Stockholm runs BOTH an EXIT-role
+    pocvpn-api.service (8443, the pre-existing /v1/peers /v1/activate /v1/
+    xray-profile /v1/manifest /v1/relay-health routes) AND a SEPARATE
+    INGRESS-role pocvpn-api-ingress.service (8444). Field-enroll for the
+    ingress role's own credential must proxy to 8444, never 8443, exactly
+    like /v1/ingress-profile above - a device's ingress credential and its
+    Germany/EXIT credential are separate stores on separate processes."""
+
+    def setUp(self):
+        self.conf = _read(_NGINX_STOCKHOLM)
+
+    def test_exact_field_enroll_location_present(self):
+        self.assertIn("location = /v1/field-enroll {", self.conf)
+
+    def test_field_enroll_is_post_only(self):
+        block = self.conf.split("location = /v1/field-enroll {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("limit_except POST", block)
+        self.assertNotIn("limit_except GET", block)
+
+    def test_field_enroll_proxies_to_ITS_OWN_loopback_8444_never_the_exit_roles_8443(self):
+        block = self.conf.split("location = /v1/field-enroll {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("proxy_pass http://127.0.0.1:8444;", block)
+        self.assertNotIn("127.0.0.1:8443", block)
 
 
 class IngressEnvExampleTests(unittest.TestCase):
