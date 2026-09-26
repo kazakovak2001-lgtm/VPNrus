@@ -68,12 +68,58 @@ Round-3 review fix (transactional integrity findings). `enroll_device`'s
 own docstring below covers the full reserve -> register -> provision ->
 commit-or-rollback state machine and its explicit ownership model - see
 that function and `activations.remove_credential_if_unbound`'s own docs.
+
+B67.4 corrective-pass fix (independent post-round-3 audit, two MAJOR
+findings). (1) The round-3 transactional design above still had a live
+same-public-key race: nothing serialized the WHOLE reserve -> register ->
+provision -> commit-or-rollback lifecycle for one public key against a
+CONCURRENT attempt for that SAME key, so a request whose OWN provisioning
+failed could roll back an index entry a concurrent request for the same
+key had, by then, already turned into a real confirmed device (the
+rollback's own ownership check on the ACTIVATION record - `activation_id`
+match + empty `bound_devices` - correctly refused to delete the
+activation record itself, but the INDEX removal that followed had no
+equivalent check and could still delete the concurrent request's live
+index entry). Fixed with an explicit, OS-level, per-public-key lock -
+[field_enrollment_key_lock] - that now wraps `enroll_device`'s entire
+body: same public key => fully serialized end to end; different public
+keys => still fully concurrent (a different lock file each). See that
+function's own docstring for the fixed lock order this introduces
+(this key lock is always the OUTERMOST lock - acquired before, and
+released after, every lock already inside `enroll_device`'s call graph -
+`_index_lock`, `activations.per_activation_lock`, and
+`activations._exclusive_lock` - never the reverse, and nothing INSIDE any
+of those inner critical sections ever attempts to acquire this key lock,
+so this ordering cannot deadlock). Independently of the lock,
+[remove_reservation_if_owned] replaces the old rollback's blind
+`remove_from_index(public_key)` call with an ownership-checked removal
+(matches on `activation_id`, exactly mirroring
+`activations.remove_credential_if_unbound`'s own discipline) - defense in
+depth even though the key lock alone already makes the original race
+unreachable, and the SAME primitive the operator CLI's own revoke flow
+now reuses (see field_enrollment_admin.py and [revoke_and_remove_if_owned]
+below) rather than that tool's own prior TOCTOU-prone
+find-then-blind-remove sequence.
+
+(2) `activations.register_credential`'s own durable write
+(`_atomic_write_store`) can raise AFTER its `os.replace()` has already
+succeeded - visible-but-durability-uncertain, an outcome
+`activations.ActivationCommitUncertainError` now names explicitly (see
+that class's own docs). `enroll_device`'s registration-failure handler
+below now catches that type FIRST and re-raises without touching the
+index reservation at all - a same-key retry finds the same reservation
+and reconciles with whatever `register_credential` actually left durable
+via its own idempotent-insert semantics, never risking a
+index-entry-exists/activation-record-exists split-brain by guessing
+"nothing happened" for an outcome that cannot honestly be called that.
 """
 import base64
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
+import re
 import secrets
 import tempfile
 from datetime import datetime, timezone
@@ -88,6 +134,19 @@ _CREDENTIAL_BYTES = 32  # secrets.token_urlsafe(32) -> 256 bits, same entropy as
 _WRAP_KEY_BYTES = 32  # AES-256
 _WRAP_NONCE_BYTES = 12  # AES-GCM standard nonce length
 _INDEX_REQUIRED_FIELDS = frozenset({"activation_id", "credential_digest", "wrapped_credential", "created_at"})
+
+# B67.4 corrective-pass fix (index integrity audit, item 17) - exact shape
+# checks, not merely "is a non-empty string": activation_id mirrors
+# activations.py's own 32-lowercase-hex convention (secrets.token_hex(16)),
+# credential_digest is always a SHA-256 hex digest (64 lowercase hex - see
+# activations.credential_digest), and wrapped_credential is always
+# base64(12-byte nonce || AES-GCM ciphertext-with-16-byte-tag) - a decoded
+# length below nonce+tag (28 bytes) can never be a real wrapped credential
+# and must fail closed here, at read time, rather than only at decrypt
+# time deeper in _unwrap_credential.
+_ACTIVATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CREDENTIAL_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_WRAPPED_CREDENTIAL_MIN_DECODED_BYTES = _WRAP_NONCE_BYTES + 16  # nonce + GCM's own 16-byte auth tag, empty plaintext
 
 # enroll_device() outcomes.
 ENROLLED = "enrolled"
@@ -195,10 +254,23 @@ def _read_index(index_path):
             raise FieldEnrollmentIndexError("field-enrollment index contains a malformed public key")
         if not isinstance(entry, dict) or set(entry.keys()) != _INDEX_REQUIRED_FIELDS:
             raise FieldEnrollmentIndexError("field-enrollment index entry does not have exactly the required fields")
-        if not isinstance(entry["credential_digest"], str) or not entry["credential_digest"]:
+        activation_id = entry["activation_id"]
+        if not isinstance(activation_id, str) or not _ACTIVATION_ID_RE.match(activation_id):
+            raise FieldEnrollmentIndexError("field-enrollment index entry has an invalid activation_id")
+        credential_digest_value = entry["credential_digest"]
+        if not isinstance(credential_digest_value, str) or not _CREDENTIAL_DIGEST_RE.match(credential_digest_value):
             raise FieldEnrollmentIndexError("field-enrollment index entry has an invalid credential_digest")
-        if not isinstance(entry["wrapped_credential"], str) or not entry["wrapped_credential"]:
+        wrapped_credential = entry["wrapped_credential"]
+        if not isinstance(wrapped_credential, str) or not wrapped_credential:
             raise FieldEnrollmentIndexError("field-enrollment index entry has an invalid wrapped_credential")
+        try:
+            decoded_wrapped = base64.b64decode(wrapped_credential, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise FieldEnrollmentIndexError(f"field-enrollment index entry has a malformed wrapped_credential: {exc}") from exc
+        if len(decoded_wrapped) < _WRAPPED_CREDENTIAL_MIN_DECODED_BYTES:
+            raise FieldEnrollmentIndexError("field-enrollment index entry has an implausibly short wrapped_credential")
+        if not isinstance(entry["created_at"], str) or not entry["created_at"]:
+            raise FieldEnrollmentIndexError("field-enrollment index entry has an invalid created_at")
     return data
 
 
@@ -242,6 +314,88 @@ def _index_lock(lock_path):
         os.close(fd)
 
 
+def _key_lock_dir(index_path):
+    return os.path.join(os.path.dirname(os.path.abspath(index_path)) or ".", ".field-enrollment-key-locks")
+
+
+def _key_lock_file_path(index_path, public_key):
+    # SHA-256 of the public key, never the raw value, as the lock
+    # filename - the public key is not secret (see module docstring), but
+    # there is no reason to use it verbatim as a filename either (avoids
+    # any filesystem-charset surprise and keeps every lock filename a
+    # fixed, predictable shape, matching activations.per_activation_lock's
+    # own "digest, never raw value, as the lock filename" convention).
+    digest = hashlib.sha256(public_key.encode("utf-8")).hexdigest()
+    return os.path.join(_key_lock_dir(index_path), f"{digest}.lock")
+
+
+@contextlib.contextmanager
+def field_enrollment_key_lock(index_path, public_key):
+    """B67.4 corrective-pass fix (MAJOR BUG #1) - the ONE lock that
+    serializes a public key's ENTIRE field-enrollment lifecycle end to
+    end: reserve -> register -> provision -> commit-or-rollback
+    (`enroll_device`) and the operator CLI's own revoke/cleanup flow
+    (`revoke_and_remove_if_owned`) both acquire this SAME lock, keyed by
+    `public_key`, before touching anything else. Same public key => fully
+    serialized (a second attempt for that key - whether a concurrent HTTP
+    retry or a concurrent operator revoke - blocks until the first's
+    entire attempt has committed or rolled back); different public keys
+    => a different lock file each, so unrelated devices remain fully
+    concurrent.
+
+    A real OS-level `flock`, NOT a `threading.Lock` - deliberately, since
+    this API's own worker model (ThreadingHTTPServer today, but nothing
+    architecturally rules out a future multi-process/gunicorn-style
+    deployment) means two concurrent requests for the same public key are
+    not guaranteed to land in the same process, let alone the same
+    thread - only a real file lock is safe across that boundary, exactly
+    the same reasoning `activations.per_activation_lock` already applies.
+    Crash-safe: the OS releases this lock automatically the instant the
+    holding process exits, for any reason - nothing here depends on
+    cooperative cleanup. The lock FILE itself carries no sensitive
+    content (0600, empty, named only by a SHA-256 digest of the public
+    key - never the raw value, though the value is not secret either) and
+    never grows (one file per DISTINCT public key ever field-enrolled or
+    revoked, no larger than the corresponding index-entry count in
+    practice).
+
+    LOCK ORDER (fixed, always in this direction, never the reverse): this
+    key lock is always the OUTERMOST lock in this module's call graph -
+    acquired BEFORE, and released AFTER, every other lock `enroll_device`
+    or `revoke_and_remove_if_owned` may take beneath it:
+
+        FIELD-ENROLLMENT KEY LOCK (this function)
+          -> FieldEnrollmentIndex lock (`_index_lock`, via `_reserve_locked`/
+             `find_in_index`/`remove_reservation_if_owned`/etc.)
+          -> activations.py's per-activation lock (`per_activation_lock`,
+             via `register_credential`/`provision_with_activation`/
+             `remove_credential_if_unbound`/`revoke_activation`)
+             -> activations.py's own global store lock (`_exclusive_lock`,
+                already nested INSIDE the per-activation lock by
+                activations.py's own existing, unchanged fixed order)
+
+    Nothing INSIDE any of those three inner critical sections ever
+    attempts to acquire THIS key lock (this module's own index-lock and
+    activations.py's own per-activation/global-store locks are each
+    self-contained, short critical sections that only ever touch their
+    own file) - so this fixed order introduces no cycle and is
+    deadlock-free without needing any lock-acquisition timeout, the exact
+    same reasoning `activations.per_activation_lock`'s own docstring
+    already applies one level down."""
+    lock_dir = _key_lock_dir(index_path)
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_file_path = _key_lock_file_path(index_path, public_key)
+    fd = os.open(lock_file_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def find_in_index(index_path, index_lock_path, public_key):
     """Read-only lookup - used by the operator CLI (field_enrollment_admin.py)
     to find a device's activation_id/credential_digest from its (non-secret)
@@ -258,13 +412,19 @@ def list_index(index_path, index_lock_path):
 
 
 def remove_from_index(index_path, index_lock_path, public_key):
-    """Removes a device's index entry (e.g. an operator cleanup after
-    revoking its activations.json record, or this module's OWN rollback on
-    a definitive enrollment failure - see `enroll_device`'s own docs) so a
-    LATER enrollment attempt for the SAME public key is treated as
-    genuinely fresh - a new random credential and a new activation record -
-    rather than replaying a now-dead reservation forever. Safe no-op if no
-    entry exists."""
+    """Unconditional, NOT ownership-checked removal of a device's index
+    entry, keyed by public key alone. B67.4 corrective-pass fix: this is
+    now a plain, general-purpose primitive ONLY - `enroll_device`'s own
+    rollback and the operator CLI's own revoke flow no longer call this
+    (see [remove_reservation_if_owned]/[revoke_and_remove_if_owned]
+    instead, which check the entry still belongs to the exact attempt
+    doing the removing before deleting anything). Safe to keep using for
+    a genuinely unconditional, caller-already-certain-of-ownership
+    removal (e.g. a test fixture standing in for direct operator/database
+    surgery), but never for a rollback/cleanup path that must not delete a
+    LIVE concurrent reservation out from under it - those callers MUST
+    hold [field_enrollment_key_lock] for this exact public key AND use the
+    ownership-checked primitive below. Safe no-op if no entry exists."""
     with _index_lock(index_lock_path):
         data = _read_index(index_path)
         if public_key not in data:
@@ -272,6 +432,101 @@ def remove_from_index(index_path, index_lock_path, public_key):
         del data[public_key]
         _atomic_write_index(index_path, data)
         return True
+
+
+def remove_reservation_if_owned(index_path, index_lock_path, public_key, expected_activation_id):
+    """B67.4 corrective-pass fix (MAJOR BUG #1 cleanup) - the
+    ownership-checked replacement for a blind `remove_from_index` call in
+    every TRANSACTIONAL rollback/cleanup path (`enroll_device`'s own
+    registration/provisioning-failure rollback, and the operator CLI's
+    `revoke_and_remove_if_owned` below). Removes the entry for
+    `public_key` ONLY if it still exists AND its `activation_id` still
+    matches `expected_activation_id` exactly - i.e. only if this is still
+    genuinely the SAME reservation the caller believes it owns, never
+    whatever entry happens to be there NOW (a concurrent attempt may have
+    already replaced it with an unrelated one, or already committed a
+    real device against it). Mirrors
+    `activations.remove_credential_if_unbound`'s own "only remove what
+    this call is certain it owns" discipline on the index side of the
+    same transaction.
+
+    Idempotent and a safe no-op (returns False, never raises) whenever
+    the ownership check does not match - a concurrent attempt already
+    won this public key's slot, or a previous call already removed this
+    exact entry. Callers performing a genuine rollback MUST call this
+    while still holding [field_enrollment_key_lock] for this exact
+    `public_key` (every caller in this module already does - the lock
+    already makes the race this check defends against unreachable in
+    practice, but the check itself costs nothing and removes any doubt,
+    exactly like `remove_credential_if_unbound`'s own defensive
+    activation_id-match reasoning)."""
+    with _index_lock(index_lock_path):
+        data = _read_index(index_path)
+        entry = data.get(public_key)
+        if entry is None:
+            return False
+        if entry["activation_id"] != expected_activation_id:
+            return False
+        del data[public_key]
+        _atomic_write_index(index_path, data)
+        return True
+
+
+class RevokeResult:
+    """One outcome of [revoke_and_remove_if_owned]."""
+
+    __slots__ = ("activation_id", "changed")
+
+    def __init__(self, activation_id, changed):
+        self.activation_id = activation_id
+        self.changed = changed
+
+
+def revoke_and_remove_if_owned(index_path, index_lock_path, store_path, store_lock_path, public_key):
+    """B67.4 corrective-pass fix (operator-CLI TOCTOU, item 15) - the ONE
+    transactional operation `gateway/tools/field_enrollment_admin.py`'s
+    `revoke` subcommand now calls, replacing its former
+    find-then-revoke-then-blind-remove sequence (three independent,
+    unsynchronized operations - a concurrent enrollment attempt for the
+    SAME public key could revoke/remove a stale entry the CLI read, then
+    have its OWN fresh entry deleted out from under it by that same CLI
+    call's final `remove_from_index`). Entirely inside
+    [field_enrollment_key_lock] for this exact `public_key`, so a
+    concurrent `enroll_device` attempt for the SAME key cannot interleave
+    with ANY part of this sequence - it either runs entirely before this
+    call acquires the lock (this call then revokes/removes exactly the
+    fresh entry that attempt created) or entirely after this call
+    releases it (that attempt then sees a genuinely empty slot and
+    enrolls the public key fresh, never a half-revoked leftover).
+
+    Returns `None` if no index entry exists for this public key (nothing
+    to revoke - the caller should report that, not attempt a revoke
+    against a name that resolves to nothing). Otherwise returns a
+    [RevokeResult] - `changed` mirrors `activations.revoke_activation`'s
+    own return (True if this call actually flipped ACTIVE -> REVOKED,
+    False if it was already revoked) - and the index entry naming that
+    activation_id is removed via the SAME ownership-checked
+    [remove_reservation_if_owned] primitive `enroll_device`'s own
+    rollback uses, never a blind delete. If the activation record itself
+    is already gone by the time this runs (e.g. a concurrent provisioning
+    failure's own rollback already removed it via
+    `remove_credential_if_unbound` - see that function's own docs), the
+    revoke step is treated as `changed=False` (nothing left to revoke)
+    and the stale index entry naming it is still cleaned up - a
+    field-enrollment index entry must never outlive the activation record
+    it names.
+    """
+    with field_enrollment_key_lock(index_path, public_key):
+        entry = find_in_index(index_path, index_lock_path, public_key)
+        if entry is None:
+            return None
+        activation_id = entry["activation_id"]
+        try:
+            changed = activations.revoke_activation(store_path, store_lock_path, activation_id)
+        except KeyError:
+            changed = False
+        remove_reservation_if_owned(index_path, index_lock_path, public_key, activation_id)
+        return RevokeResult(activation_id, changed)
 
 
 class _Reservation:
@@ -397,92 +652,126 @@ def enroll_device(
     step 2's own idempotency). Either way, every raised exception is still
     caught by handler.py's existing except clause (or its outer generic
     handler) and mapped to a closed HTTP response - never left unhandled.
+
+    B67.4 corrective-pass fix - this entire sequence (steps 1-4, including
+    every rollback path) now runs inside [field_enrollment_key_lock] for
+    THIS exact `public_key` - see that function's own docstring for why
+    this closes the same-public-key rollback race a prior version of this
+    function had (a failed attempt's own rollback could delete a
+    concurrent, successful attempt's live index entry) and for the fixed
+    lock order this introduces. Rollback removals below additionally use
+    [remove_reservation_if_owned] (ownership-checked - matches on
+    `activation_id`) rather than a blind `remove_from_index`, as defense
+    in depth on top of the lock itself. A registration failure that is
+    specifically `activations.ActivationCommitUncertainError` (its own
+    `os.replace()` already succeeded, durability merely unconfirmed - see
+    that class's own docs) is re-raised WITHOUT any index rollback at
+    all, even if this call made a new reservation - the activation record
+    it was writing may already durably exist, and deleting the index
+    reservation naming it would strand that record with no way back to
+    its public key on a same-key retry.
     """
     if not is_valid_wg_public_key(public_key):
         return FieldEnrollmentResult(INVALID_PUBLIC_KEY)
 
-    wrap_key_bytes = _load_wrap_key(wrap_key_file)
+    with field_enrollment_key_lock(index_path, public_key):
+        wrap_key_bytes = _load_wrap_key(wrap_key_file)
 
-    reservation = _reserve_locked(index_path, index_lock_path, wrap_key_bytes, public_key, global_device_cap)
-    if reservation is None:
-        return FieldEnrollmentResult(DEVICE_CAP_REACHED)
-    credential, activation_id = reservation.credential, reservation.activation_id
+        reservation = _reserve_locked(index_path, index_lock_path, wrap_key_bytes, public_key, global_device_cap)
+        if reservation is None:
+            return FieldEnrollmentResult(DEVICE_CAP_REACHED)
+        credential, activation_id = reservation.credential, reservation.activation_id
 
-    # Step 2: REGISTER. Always attempted (see docstring above) - never
-    # gated on is_new_index_entry.
-    try:
-        register_result = activations.register_credential(
-            activation_store_path, activation_lock_path, credential, activation_id, max_devices=1,
+        # Step 2: REGISTER. Always attempted (see docstring above) - never
+        # gated on is_new_index_entry.
+        try:
+            register_result = activations.register_credential(
+                activation_store_path, activation_lock_path, credential, activation_id, max_devices=1,
+            )
+        except activations.ActivationCommitUncertainError:
+            # See this function's own docstring and
+            # ActivationCommitUncertainError's own docs: os.replace()
+            # already succeeded - the activation record MAY already
+            # durably exist - so this NEVER rolls back the index
+            # reservation, even if this call created it. Re-raised
+            # unchanged; handler.py's existing
+            # ActivationStoreError/FieldEnrollmentIndexError catch (this
+            # IS an ActivationStoreError) still maps it to a closed 503.
+            # A retry of this SAME public key re-enters this same
+            # reserve -> register sequence, finds this SAME index entry
+            # (is_new_index_entry=False on that replay), and
+            # register_credential's own idempotent-insert semantics
+            # reconcile with whatever this attempt actually left durable.
+            raise
+        except Exception as exc:
+            if reservation.is_new_index_entry:
+                try:
+                    remove_reservation_if_owned(index_path, index_lock_path, public_key, activation_id)
+                except Exception as cleanup_exc:
+                    raise FieldEnrollmentIndexError(
+                        f"field-enrollment index rollback failed after a registration failure: {cleanup_exc}"
+                    ) from exc
+            raise
+
+        # Reuse the EXACT SAME orchestration POST /v1/activate uses - decide_and_bind
+        # -> run_provision_peer -> finalize/rollback, one per-activation lock.
+        # For an idempotent replay this is ALSO exactly right: it re-confirms
+        # the same device against the same credential, covering the case where
+        # the device's ORIGINAL request actually succeeded but its response
+        # never reached the client.
+        result = activations.provision_with_activation(
+            credential, public_key,
+            activation_store_path, activation_lock_path,
+            provision_script_path, subprocess_timeout_seconds, sudo_path=sudo_path,
+            now=now,
         )
-    except Exception as exc:
-        if reservation.is_new_index_entry:
-            try:
-                remove_from_index(index_path, index_lock_path, public_key)
-            except Exception as cleanup_exc:
-                raise FieldEnrollmentIndexError(
-                    f"field-enrollment index rollback failed after a registration failure: {cleanup_exc}"
-                ) from exc
-        raise
+        decision = result.decision
+        if decision.outcome == activations.INVALID:
+            # Unreachable in practice for a fresh registration (register_credential
+            # just created/confirmed this exact digest under its own lock); reachable
+            # for a replay only if activations.json was somehow separately wiped -
+            # never silently swallowed either way.
+            return FieldEnrollmentResult(DISABLED)
+        if decision.outcome == activations.REVOKED_OUTCOME:
+            return FieldEnrollmentResult(REVOKED)
+        if decision.outcome == activations.EXPIRED:
+            return FieldEnrollmentResult(EXPIRED)
+        if decision.outcome == activations.DEVICE_LIMIT:
+            # This credential's own max_devices=1 already reached by a
+            # DIFFERENT public key - structurally shouldn't happen (this
+            # credential is 1:1 with this exact public key via the index), but
+            # fails closed rather than reporting success either way.
+            return FieldEnrollmentResult(DEVICE_CAP_REACHED)
 
-    # Reuse the EXACT SAME orchestration POST /v1/activate uses - decide_and_bind
-    # -> run_provision_peer -> finalize/rollback, one per-activation lock.
-    # For an idempotent replay this is ALSO exactly right: it re-confirms
-    # the same device against the same credential, covering the case where
-    # the device's ORIGINAL request actually succeeded but its response
-    # never reached the client.
-    result = activations.provision_with_activation(
-        credential, public_key,
-        activation_store_path, activation_lock_path,
-        provision_script_path, subprocess_timeout_seconds, sudo_path=sudo_path,
-        now=now,
-    )
-    decision = result.decision
-    if decision.outcome == activations.INVALID:
-        # Unreachable in practice for a fresh registration (register_credential
-        # just created/confirmed this exact digest under its own lock); reachable
-        # for a replay only if activations.json was somehow separately wiped -
-        # never silently swallowed either way.
-        return FieldEnrollmentResult(DISABLED)
-    if decision.outcome == activations.REVOKED_OUTCOME:
-        return FieldEnrollmentResult(REVOKED)
-    if decision.outcome == activations.EXPIRED:
-        return FieldEnrollmentResult(EXPIRED)
-    if decision.outcome == activations.DEVICE_LIMIT:
-        # This credential's own max_devices=1 already reached by a
-        # DIFFERENT public key - structurally shouldn't happen (this
-        # credential is 1:1 with this exact public key via the index), but
-        # fails closed rather than reporting success either way.
-        return FieldEnrollmentResult(DEVICE_CAP_REACHED)
+        if result.provision_error is not None:
+            # Step 3 failure: unbind_reservation has already run internally
+            # (provision_with_activation's own rollback for a fresh
+            # BOUND_NEW device bind). This module's own additional cleanup:
+            # remove the activation record itself (only if THIS call created
+            # it) THEN the index reservation (only if THIS call created it) -
+            # never orphaning either, never touching a record/entry this call
+            # does not own. Deliberately sequential, never a nested best-effort
+            # "try the other one anyway" on failure: if the activation-record
+            # removal itself fails, that failure is raised immediately and
+            # loudly (never swallowed) and the index entry is deliberately
+            # LEFT IN PLACE rather than independently cleaned up - a later
+            # retry of the same public key finds that same index entry,
+            # re-runs register_credential (idempotent - finds the still-present
+            # record, created=False) and re-attempts provisioning, so the
+            # system self-heals rather than risking a second silent failure
+            # compounding the first.
+            if register_result.created:
+                activations.remove_credential_if_unbound(activation_store_path, activation_lock_path, credential, activation_id)
+            if reservation.is_new_index_entry:
+                remove_reservation_if_owned(index_path, index_lock_path, public_key, activation_id)
+            return FieldEnrollmentResult(PROVISION_FAILED, provision_error=result.provision_error)
 
-    if result.provision_error is not None:
-        # Step 3 failure: unbind_reservation has already run internally
-        # (provision_with_activation's own rollback for a fresh
-        # BOUND_NEW device bind). This module's own additional cleanup:
-        # remove the activation record itself (only if THIS call created
-        # it) THEN the index reservation (only if THIS call created it) -
-        # never orphaning either, never touching a record/entry this call
-        # does not own. Deliberately sequential, never a nested best-effort
-        # "try the other one anyway" on failure: if the activation-record
-        # removal itself fails, that failure is raised immediately and
-        # loudly (never swallowed) and the index entry is deliberately
-        # LEFT IN PLACE rather than independently cleaned up - a later
-        # retry of the same public key finds that same index entry,
-        # re-runs register_credential (idempotent - finds the still-present
-        # record, created=False) and re-attempts provisioning, so the
-        # system self-heals rather than risking a second silent failure
-        # compounding the first.
-        if register_result.created:
-            activations.remove_credential_if_unbound(activation_store_path, activation_lock_path, credential, activation_id)
-        if reservation.is_new_index_entry:
-            remove_from_index(index_path, index_lock_path, public_key)
-        return FieldEnrollmentResult(PROVISION_FAILED, provision_error=result.provision_error)
+        finalize_result = result.finalize_result
+        if not finalize_result.confirmed:
+            return FieldEnrollmentResult(DEVICE_CAP_REACHED)
+        if finalize_result.status != activations.ACTIVE:
+            return FieldEnrollmentResult(REVOKED)
 
-    finalize_result = result.finalize_result
-    if not finalize_result.confirmed:
-        return FieldEnrollmentResult(DEVICE_CAP_REACHED)
-    if finalize_result.status != activations.ACTIVE:
-        return FieldEnrollmentResult(REVOKED)
-
-    return FieldEnrollmentResult(
-        ENROLLED, credential=credential, client_tunnel_ip=result.provision_outcome.ip,
-    )
+        return FieldEnrollmentResult(
+            ENROLLED, credential=credential, client_tunnel_ip=result.provision_outcome.ip,
+        )

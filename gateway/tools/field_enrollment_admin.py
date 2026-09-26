@@ -62,16 +62,24 @@ def cmd_find(args):
 
 
 def cmd_revoke(args):
-    entry = field_enrollment_module.find_in_index(args.index, _index_lock_path(args), args.public_key)
-    if entry is None:
+    # B67.4 corrective-pass fix (TOCTOU, item 15) - this used to be three
+    # independent, unsynchronized steps (find, revoke, blind
+    # remove-by-public-key), which a concurrent enrollment attempt for the
+    # SAME public key could interleave with: this call could revoke/remove
+    # a STALE entry it read, then delete a FRESH entry that concurrent
+    # attempt had, by then, already created. Now a single call, entirely
+    # under this public key's own field_enrollment_key_lock - see
+    # revoke_and_remove_if_owned's own docs.
+    result = field_enrollment_module.revoke_and_remove_if_owned(
+        args.index, _index_lock_path(args), args.store, _store_lock_path(args), args.public_key,
+    )
+    if result is None:
         print(f"error: no field-enrollment record found for public key {args.public_key}", file=sys.stderr)
         return 1
-    changed = activations_module.revoke_activation(args.store, _store_lock_path(args), entry["activation_id"])
-    field_enrollment_module.remove_from_index(args.index, _index_lock_path(args), args.public_key)
-    if changed:
-        print(f"revoked {entry['activation_id']} (public key {args.public_key}) and cleared its field-enrollment index entry")
+    if result.changed:
+        print(f"revoked {result.activation_id} (public key {args.public_key}) and cleared its field-enrollment index entry")
     else:
-        print(f"{entry['activation_id']} was already revoked - field-enrollment index entry cleared")
+        print(f"{result.activation_id} was already revoked - field-enrollment index entry cleared")
     return 0
 
 

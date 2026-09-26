@@ -864,6 +864,79 @@ Sybil-resistance guarantee - a cap this small has no stronger guarantee
 available without the kind of identity proof, e.g. IP allowlisting or a
 manually-typed credential, this field test's own constraints rule out).
 
+**Corrective pass, two MAJOR findings from an independent post-round-3
+audit (same day)**:
+
+1. **Same-public-key rollback race.** The round-3 design above still had
+   no lock serializing one public key's WHOLE lifecycle against a
+   CONCURRENT attempt for that SAME key - a failed attempt's own index
+   cleanup could delete a concurrent, successful attempt's live index
+   entry (the activation-record side of the rollback already had a
+   correct ownership check via `remove_credential_if_unbound`; the index
+   side did not). Fixed with `field_enrollment_key_lock` - a real
+   OS-level `flock` (never `threading.Lock`, since this API's worker
+   model does not guarantee two concurrent requests for the same key
+   land in the same process), keyed by SHA-256(public_key), that now
+   wraps `enroll_device`'s ENTIRE body: same public key => fully
+   serialized end to end (reserve -> register -> provision ->
+   commit-or-rollback); different public keys => still fully concurrent.
+   Fixed lock order, always in this direction: this key lock (outermost)
+   -> `FieldEnrollmentIndex`'s own lock -> `activations.py`'s
+   per-activation lock -> `activations.py`'s own global store lock
+   (already nested inside the per-activation lock by `activations.py`'s
+   own unchanged order) - nothing inside any inner critical section ever
+   acquires the key lock, so this introduces no cycle. Independently, the
+   index-side rollback itself is now ownership-checked -
+   `remove_reservation_if_owned` (matches on `activation_id`, mirroring
+   `remove_credential_if_unbound`'s own discipline) replaces a blind
+   `remove_from_index(public_key)` call in both `enroll_device`'s own
+   rollback and the operator CLI's revoke flow - defense in depth on top
+   of the lock itself.
+2. **Post-`os.replace()` commit uncertainty.** `activations
+   ._atomic_write_store` can raise AFTER its own `os.replace()` already
+   succeeded (the new content is filesystem-visible) if the FOLLOWING
+   containing-directory `fsync()` then fails - a real durability edge
+   case a caller must never conflate with "nothing happened."
+   `activations.StoreCommitUncertainError` (internal) /
+   `ActivationCommitUncertainError` (public, a subclass of the existing
+   `ActivationStoreError` - handler.py's existing 503 mapping is
+   unchanged) now name this outcome explicitly.
+   `field_enrollment.enroll_device`'s registration-failure handler
+   catches this SPECIFIC type first and re-raises WITHOUT touching the
+   index reservation, even if this call made a new one - the activation
+   record it was writing may already durably exist; a same-key retry
+   finds the same reservation and reconciles via
+   `register_credential`'s own idempotent-insert semantics
+   (found-existing-digest -> `created=False`, genuinely absent -> a
+   clean `created=True`), never minting a duplicate credential/
+   activation_id for the same device.
+
+**Operator CLI (`field_enrollment_admin.py`) TOCTOU fix**: the `revoke`
+subcommand's prior find -> revoke -> blind-remove-by-public-key sequence
+was three independent, unsynchronized operations - a concurrent
+enrollment attempt for the SAME public key could interleave with any part
+of it (revoke/remove a STALE entry the CLI read, then have its OWN fresh
+entry deleted by that same call's final blind remove). It now calls a
+single transactional primitive, `field_enrollment
+.revoke_and_remove_if_owned`, entirely inside the SAME
+`field_enrollment_key_lock` `enroll_device` itself uses - a concurrent
+enrollment for that key either completes entirely before this call
+acquires the lock, or entirely after it releases, never interleaved.
+Read-only lookups (`find_in_index`/`list_index`) remain a separate,
+un-lock-required API surface from transactional/ownership-sensitive
+mutation (`_reserve_locked`/`remove_reservation_if_owned`
+/`revoke_and_remove_if_owned`) - the CLI's `find`/`list` subcommands use
+only the former.
+
+**Index integrity**: `_read_index` now validates each entry's EXACT
+shape, not merely field presence - `activation_id` (32 lowercase hex, the
+same convention `activations.py` itself uses),
+`credential_digest` (64 lowercase hex - a SHA-256 hex digest), and
+`wrapped_credential` (valid base64, decoding to at least
+nonce+GCM-tag-length bytes) - a corrupted entry of any kind fails closed
+with `FieldEnrollmentIndexError` (mapped to 503 by handler.py) at read
+time, never at decrypt time only.
+
 **Cross-host topology**: Germany/Stockholm-the-gateway and the Stockholm
 ingress ROLE are SEPARATE `pocvpn-api` processes with their OWN,
 independent activation stores even when co-located on the same physical

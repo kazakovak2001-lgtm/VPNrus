@@ -127,10 +127,51 @@ class ActivationStoreError(Exception):
     error instead."""
 
 
+class ActivationCommitUncertainError(ActivationStoreError):
+    """B67.4 corrective-pass fix (MAJOR BUG #2) - the public-facing wrapper
+    around `StoreCommitUncertainError` (see that class's own docs):
+    `register_credential`'s own `os.replace()` already succeeded before
+    this was raised, so the activation record it was writing MAY already
+    durably exist, even though this exact call cannot confirm the
+    directory-entry durability step completed. A subclass of
+    `ActivationStoreError` on purpose - handler.py's existing
+    `except activations.ActivationStoreError: -> 503` mapping already
+    covers it correctly with no code change there - but callers that
+    perform their OWN compensating rollback on a registration failure
+    (field_enrollment.py's `enroll_device`) MUST catch this specific type
+    FIRST and never treat it like an ordinary registration failure: it
+    must re-raise without removing any reservation/index entry, so a
+    retry of the same public key can find and reconcile with whatever
+    this call actually left durable (`register_credential`'s own
+    idempotent-insert semantics: found-existing digest -> `created=False`,
+    genuinely absent -> a clean fresh `created=True` write - either way
+    never a duplicate credential/activation_id for the same device)."""
+
+
 class StoreWriteError(Exception):
     """A durable-write precondition or step failed - caller must abort,
     leave the prior store byte-for-byte untouched, and report a clean
     error, never claim success for a write that didn't durably happen."""
+
+
+class StoreCommitUncertainError(StoreWriteError):
+    """B67.4 corrective-pass fix - raised ONLY when `os.replace()` has
+    ALREADY succeeded (the new store content is filesystem-VISIBLE to any
+    subsequent reader, including this same process's own next read under
+    the same lock) but the following containing-directory `fsync()` then
+    failed. This is deliberately NOT the same case as every other
+    `StoreWriteError`/`OSError` this module raises: those all happen
+    strictly BEFORE `os.replace()`, when the prior store is still
+    byte-for-byte untouched and "nothing happened" is the correct,
+    honest description. Past `os.replace()`, "nothing happened" would be
+    a LIE - the new bytes are already live - so a caller must never treat
+    this the same as an ordinary write failure: never re-derive "did this
+    write happen?" from this exception's mere existence, never delete/
+    roll back a record this call MAY have just durably created (see
+    `ActivationCommitUncertainError`/`register_credential`'s own docs for
+    the specific caller-facing contract this maps to). Durability
+    (surviving an immediate crash/power-loss) is what is actually in
+    doubt here - visibility is not."""
 
 
 @dataclass(frozen=True)
@@ -262,7 +303,21 @@ def _atomic_write_store(store_path, data):
     mkstemp (always mode 0600) in the same directory, write+fsync, restore
     the PRIOR file's exact mode/ownership (or a restrictive 0600 default
     for a brand-new store), os.replace, then fsync the containing
-    directory. Never a partial/best-effort write."""
+    directory. Never a partial/best-effort write.
+
+    B67.4 corrective-pass fix (MAJOR BUG #2) - VISIBILITY vs DURABILITY are
+    no longer conflated: everything up to and including `os.replace()`
+    stays inside the existing try/except that unlinks the leftover temp
+    file on failure - a failure THERE means the prior store is still
+    byte-for-byte untouched, "nothing happened" is still an honest
+    description, and an ordinary OSError/StoreWriteError is still exactly
+    right. The directory `fsync()` AFTER `os.replace()` is different in
+    kind: at that point the new content is already filesystem-visible
+    (any subsequent open() of `store_path` sees it) - a failure here is
+    raised as the distinct `StoreCommitUncertainError` instead of a plain
+    OSError, specifically so `_atomic_write_store_or_raise` (and, through
+    it, every caller) can tell "definitely did not happen" apart from
+    "may already have happened, durability merely unconfirmed"."""
     directory = os.path.dirname(os.path.abspath(store_path)) or "."
     prior_mode = None
     prior_uid = None
@@ -298,9 +353,20 @@ def _atomic_write_store(store_path, data):
             pass
         raise
 
+    # Past this point `tmp_path` no longer exists and `store_path` already
+    # holds the new content - VISIBLE regardless of whether the fsync below
+    # succeeds. A failure here must never be reported the same way as a
+    # failure above (see this function's own docstring and
+    # StoreCommitUncertainError's).
     dir_fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(dir_fd)
+    except OSError as exc:
+        raise StoreCommitUncertainError(
+            f"activation store content for {store_path} is now filesystem-visible via os.replace(), "
+            f"but fsync()ing its containing directory failed - durability of that directory entry "
+            f"across an immediate crash is unconfirmed: {exc}"
+        ) from exc
     finally:
         os.close(dir_fd)
 
@@ -308,6 +374,14 @@ def _atomic_write_store(store_path, data):
 def _atomic_write_store_or_raise(store_path, data):
     try:
         _atomic_write_store(store_path, data)
+    except StoreCommitUncertainError as exc:
+        # Must be checked before the plainer (OSError, StoreWriteError)
+        # branch below - StoreCommitUncertainError IS a StoreWriteError,
+        # and conflating the two here would erase exactly the distinction
+        # this fix exists to preserve.
+        raise ActivationCommitUncertainError(
+            f"activation store write for {store_path} may have already committed - durability unconfirmed: {exc}"
+        ) from exc
     except (OSError, StoreWriteError) as exc:
         raise ActivationStoreError(f"failed to durably write the activation store: {exc}") from exc
 

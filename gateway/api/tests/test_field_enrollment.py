@@ -13,10 +13,12 @@ failure, (D) that rollback never deletes an activation it does not own,
 plus explicit concurrency (same-key and cap-boundary) and restart/
 corruption behavior.
 """
+import base64
 import json
 import os
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -535,6 +537,331 @@ class RestartRecoveryTests(FieldEnrollmentTestBase):
         )
         self.assertIsNotNone(record)
         self.assertEqual(record["activation_id"], entry_activation_id)
+
+
+class SameKeyRollbackRaceRegressionTests(FieldEnrollmentTestBase):
+    """B67.4 corrective-pass fix, MAJOR BUG #1 - deterministic (not merely
+    many-random-threads) proof that a failed attempt's own rollback can
+    never destroy a concurrent, successful attempt's live state for the
+    SAME public key. Coordinates two real threads with threading.Event so
+    the exact interleaving the original bug allowed - A reserves/
+    registers/blocks in provisioning, B attempts the SAME key, A's
+    provisioning fails and its rollback runs, only THEN does B proceed -
+    is actually exercised, not merely hoped for by launching 8 threads
+    and hoping the scheduler produces it.
+    """
+
+    def test_failed_attempt_cannot_delete_a_concurrent_successful_attempts_state(self):
+        key = make_public_key(0xD5)
+        provisioning_call_started = threading.Event()
+        allow_first_provisioning_to_proceed = threading.Event()
+        call_count = {"n": 0}
+        count_lock = threading.Lock()
+        real_provision_with_activation = activations_module.provision_with_activation
+
+        def instrumented_provision_with_activation(*args, **kwargs):
+            with count_lock:
+                call_count["n"] += 1
+                this_call = call_count["n"]
+            if this_call == 1:
+                # This is request A's own provisioning attempt - signal
+                # that it has started (so B knows it is safe to attempt
+                # the SAME key) and block until the test explicitly lets
+                # it proceed, so B's attempt is guaranteed to be issued
+                # while A is still fully in-flight, still holding its own
+                # field_enrollment_key_lock.
+                provisioning_call_started.set()
+                allow_first_provisioning_to_proceed.wait(timeout=5)
+                set_plan(self.plan_path, "EXIT", "1")
+            else:
+                # This is request B's own provisioning attempt - reachable
+                # ONLY after A's entire attempt (including its rollback)
+                # has released the key lock, since B's own enroll_device
+                # call blocks on that same lock until then.
+                set_plan(self.plan_path, "CREATED", "10.77.0.30")
+            return real_provision_with_activation(*args, **kwargs)
+
+        results = {}
+        errors = []
+
+        def worker_a():
+            try:
+                results["a"] = self._enroll(key)
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                errors.append(exc)
+
+        def worker_b():
+            self.assertTrue(provisioning_call_started.wait(timeout=5))
+            try:
+                results["b"] = self._enroll(key)
+            except Exception as exc:  # pragma: no cover - surfaced via errors list
+                errors.append(exc)
+
+        with mock.patch.object(
+            activations_module, "provision_with_activation", side_effect=instrumented_provision_with_activation,
+        ):
+            thread_a = threading.Thread(target=worker_a)
+            thread_b = threading.Thread(target=worker_b)
+            thread_a.start()
+            self.assertTrue(provisioning_call_started.wait(timeout=5))
+            thread_b.start()
+            # B must genuinely BLOCK here (on A's still-held
+            # field_enrollment_key_lock) rather than interleave with A's
+            # in-flight attempt - give the scheduler a real window to prove
+            # that, then confirm B has not yet produced a result.
+            time.sleep(0.2)
+            self.assertNotIn("b", results, "B must not proceed while A still holds the per-key lock")
+            allow_first_provisioning_to_proceed.set()
+            thread_a.join(timeout=5)
+            thread_b.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results["a"].outcome, field_enrollment_module.PROVISION_FAILED)
+        self.assertEqual(results["b"].outcome, field_enrollment_module.ENROLLED)
+
+        # A's failure/rollback must never have touched B's live state:
+        # exactly one index entry, one activation record, one confirmed
+        # bound device, using B's credential.
+        index_entries = field_enrollment_module.list_index(self.index_path, self.index_lock_path)
+        self.assertEqual(len(index_entries), 1)
+        entry = index_entries[key]
+        data = activations_module.read_store_shared(self.store_path, self.lock_path)
+        self.assertEqual(len(data), 1)
+        record = next(iter(data.values()))
+        self.assertEqual(record["activation_id"], entry["activation_id"])
+        self.assertEqual(record["status"], activations_module.ACTIVE)
+        self.assertEqual(len(record["bound_devices"]), 1)
+        self.assertEqual(record["bound_devices"][0]["state"], activations_module.CONFIRMED)
+        self.assertEqual(
+            activations_module.credential_digest(results["b"].credential), entry["credential_digest"],
+        )
+
+
+class OwnershipAwareIndexRollbackTests(FieldEnrollmentTestBase):
+    """B67.4 corrective-pass fix, MAJOR BUG #1 cleanup - direct unit proof
+    of [remove_reservation_if_owned] itself: it must never delete an index
+    entry that does not match the exact activation_id the caller believes
+    it owns, independent of the key lock (defense in depth)."""
+
+    def test_never_removes_an_entry_whose_activation_id_has_since_changed(self):
+        key = make_public_key(0xD6)
+        first = self._enroll(key)
+        original_entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        original_activation_id = original_entry["activation_id"]
+
+        # Simulate a legitimate concurrent replacement of this public
+        # key's slot (e.g. an operator revoke followed by a fresh
+        # enrollment) that happened between when a caller captured
+        # `original_activation_id` and when its own (now-stale) rollback
+        # runs.
+        field_enrollment_module.remove_from_index(self.index_path, self.index_lock_path, key)
+        second = self._enroll(key)
+        self.assertNotEqual(first.credential, second.credential)
+
+        removed = field_enrollment_module.remove_reservation_if_owned(
+            self.index_path, self.index_lock_path, key, original_activation_id,
+        )
+        self.assertFalse(removed, "a rollback must never delete a reservation it does not own")
+
+        still_there = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        self.assertIsNotNone(still_there)
+        self.assertNotEqual(still_there["activation_id"], original_activation_id)
+
+    def test_removes_an_entry_only_when_the_activation_id_matches_exactly(self):
+        key = make_public_key(0xD7)
+        result = self._enroll(key)
+        entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+
+        removed = field_enrollment_module.remove_reservation_if_owned(
+            self.index_path, self.index_lock_path, key, entry["activation_id"],
+        )
+        self.assertTrue(removed)
+        self.assertIsNone(field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key))
+
+    def test_safe_no_op_when_no_entry_exists_at_all(self):
+        key = make_public_key(0xD8)
+        removed = field_enrollment_module.remove_reservation_if_owned(
+            self.index_path, self.index_lock_path, key, "a" * 32,
+        )
+        self.assertFalse(removed)
+
+
+class CliRevokeRaceRegressionTests(FieldEnrollmentTestBase):
+    """B67.4 corrective-pass fix, operator CLI TOCTOU (item 15) -
+    deterministic proof that [revoke_and_remove_if_owned] (the primitive
+    gateway/tools/field_enrollment_admin.py's `revoke` subcommand now
+    calls) is fully serialized, via the SAME per-public-key lock, against
+    a concurrent enrollment attempt for that exact public key - so an
+    operator's revoke can never race a device's own concurrent retry into
+    either a resurrected credential or a dangling index entry."""
+
+    def test_revoke_is_serialized_against_a_concurrent_enrollment_for_the_same_key(self):
+        key = make_public_key(0xE5)
+        first = self._enroll(key)
+        original_entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        original_activation_id = original_entry["activation_id"]
+
+        revoke_started = threading.Event()
+        allow_revoke_to_finish = threading.Event()
+        real_revoke_activation = activations_module.revoke_activation
+
+        def blocking_revoke_activation(*args, **kwargs):
+            revoke_started.set()
+            allow_revoke_to_finish.wait(timeout=5)
+            return real_revoke_activation(*args, **kwargs)
+
+        results = {}
+        errors = []
+
+        def revoke_worker():
+            try:
+                results["revoke"] = field_enrollment_module.revoke_and_remove_if_owned(
+                    self.index_path, self.index_lock_path, self.store_path, self.lock_path, key,
+                )
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def enroll_worker():
+            self.assertTrue(revoke_started.wait(timeout=5))
+            # The CLI revoke has started but is deliberately still holding
+            # the per-key lock (blocked on allow_revoke_to_finish) - this
+            # concurrent enrollment attempt for the SAME key must block
+            # until it releases, never interleave with it.
+            time.sleep(0.2)
+            self.assertNotIn("enroll", results)
+            try:
+                results["enroll"] = self._enroll(key)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with mock.patch.object(activations_module, "revoke_activation", side_effect=blocking_revoke_activation):
+            t_revoke = threading.Thread(target=revoke_worker)
+            t_enroll = threading.Thread(target=enroll_worker)
+            t_revoke.start()
+            self.assertTrue(revoke_started.wait(timeout=5))
+            t_enroll.start()
+            time.sleep(0.2)
+            allow_revoke_to_finish.set()
+            t_revoke.join(timeout=5)
+            t_enroll.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(results["revoke"].changed)
+        self.assertEqual(results["revoke"].activation_id, original_activation_id)
+        self.assertEqual(results["enroll"].outcome, field_enrollment_module.ENROLLED)
+        self.assertNotEqual(results["enroll"].credential, first.credential)
+
+        entry_after = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        self.assertIsNotNone(entry_after, "the concurrent fresh enrollment's own entry must survive the revoke")
+        self.assertNotEqual(entry_after["activation_id"], original_activation_id)
+        revoked_record = activations_module.find_by_activation_id(self.store_path, self.lock_path, original_activation_id)
+        self.assertEqual(revoked_record["status"], activations_module.REVOKED)
+
+
+class CommitUncertainRollbackTests(FieldEnrollmentTestBase):
+    """B67.4 corrective-pass fix, MAJOR BUG #2 - a registration failure
+    that is SPECIFICALLY activations.ActivationCommitUncertainError (its
+    own os.replace() already succeeded - durability merely unconfirmed)
+    must never roll back the index reservation, and a same-key retry must
+    reconcile cleanly with whatever the interrupted attempt actually left
+    durable."""
+
+    def test_commit_uncertain_registration_failure_does_not_remove_the_index_reservation(self):
+        key = make_public_key(0xF5)
+        with mock.patch.object(
+            activations_module, "register_credential",
+            side_effect=activations_module.ActivationCommitUncertainError("simulated commit-uncertain failure"),
+        ):
+            with self.assertRaises(activations_module.ActivationCommitUncertainError):
+                self._enroll(key)
+
+        entry = field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key)
+        self.assertIsNotNone(entry, "a commit-uncertain registration failure must never roll back the index reservation")
+
+    def test_retry_after_commit_uncertain_reconciles_with_whatever_was_actually_left_durable(self):
+        """Simulates the real boundary this bug lives at: the interrupted
+        attempt's own register_credential call actually durably wrote the
+        record (its own os.replace() succeeded) even though IT observed
+        commit-uncertain - proven here by calling the real
+        register_credential directly first, then having a mocked
+        enroll_device call raise commit-uncertain on top of that
+        already-durable state, exactly as a real directory-fsync failure
+        would leave things."""
+        key = make_public_key(0xF6)
+        wrap_key_bytes = field_enrollment_module._load_wrap_key(self.wrap_key_file)
+        reservation = field_enrollment_module._reserve_locked(
+            self.index_path, self.index_lock_path, wrap_key_bytes, key, global_cap=5,
+        )
+        activations_module.register_credential(
+            self.store_path, self.lock_path, reservation.credential, reservation.activation_id, max_devices=1,
+        )
+
+        with mock.patch.object(
+            activations_module, "register_credential",
+            side_effect=activations_module.ActivationCommitUncertainError("simulated commit-uncertain failure"),
+        ):
+            with self.assertRaises(activations_module.ActivationCommitUncertainError):
+                self._enroll(key)
+
+        result = self._enroll(key)
+        self.assertEqual(result.outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(result.credential, reservation.credential)
+        data = activations_module.read_store_shared(self.store_path, self.lock_path)
+        self.assertEqual(len(data), 1, "a retry after commit-uncertain must never mint a duplicate activation record")
+
+
+class IndexSchemaValidationTests(FieldEnrollmentTestBase):
+    """B67.4 corrective-pass fix, index integrity audit (item 17) - exact
+    shape checks on every index entry field, not merely presence/
+    non-emptiness, so a corrupted entry fails closed at read time."""
+
+    def test_malformed_activation_id_fails_closed(self):
+        key = make_public_key(0xF7)
+        self._enroll(key)
+        with open(self.index_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data[key]["activation_id"] = "not-32-lowercase-hex-chars"
+        with open(self.index_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+        with self.assertRaises(field_enrollment_module.FieldEnrollmentIndexError):
+            self._enroll(key)
+
+    def test_malformed_credential_digest_fails_closed(self):
+        key = make_public_key(0xF8)
+        self._enroll(key)
+        with open(self.index_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data[key]["credential_digest"] = "too-short"
+        with open(self.index_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+        with self.assertRaises(field_enrollment_module.FieldEnrollmentIndexError):
+            self._enroll(key)
+
+    def test_implausibly_short_wrapped_credential_fails_closed(self):
+        key = make_public_key(0xF9)
+        self._enroll(key)
+        with open(self.index_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data[key]["wrapped_credential"] = base64.b64encode(b"short").decode("ascii")
+        with open(self.index_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+        with self.assertRaises(field_enrollment_module.FieldEnrollmentIndexError):
+            self._enroll(key)
+
+    def test_non_base64_wrapped_credential_fails_closed(self):
+        key = make_public_key(0xFA)
+        self._enroll(key)
+        with open(self.index_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data[key]["wrapped_credential"] = "not valid base64!!!"
+        with open(self.index_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+        with self.assertRaises(field_enrollment_module.FieldEnrollmentIndexError):
+            self._enroll(key)
 
 
 if __name__ == "__main__":
