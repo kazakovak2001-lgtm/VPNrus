@@ -171,14 +171,13 @@ class XrayTlsRuntimeResolverTest {
 }
 
 /**
- * B61 - the EXIT-role (Frankfurt, B60) XHTTP counterpart of
+ * B61/B61.4 - the EXIT-role (Frankfurt, B60) XHTTP counterpart of
  * [XrayRuntimeResolverTest]/[XrayTlsRuntimeResolverTest]. Proves the real
- * load -> map -> validate -> render machinery works end to end (the "Ready"
- * tests below supply literal, TEST-ONLY values for minimumTlsVersion/alpn/
- * maxEachPostBytes/paddingPlacement - never production values, since B61
- * found no real source of truth for them - see resolveXhttp's own docs),
- * and separately proves the PRODUCTION default (no values supplied) always
- * fails closed with the exact, itemized blocker reason.
+ * load -> map -> validate -> render machinery reaches Ready using the
+ * evidence-backed EXIT constants established in B61.3/B61.4 (never the
+ * Stockholm ingress profile's own values), and that padding is genuinely
+ * omitted from the rendered config rather than a synthesized HEADER/QUERY
+ * guess.
  */
 class XrayXhttpRuntimeResolverTest {
 
@@ -197,17 +196,11 @@ class XrayXhttpRuntimeResolverTest {
         SecureXrayXhttpProfileRepository(FileXrayXhttpProfileStore(dir), FakeAesGcmKeyEncryptor())
 
     @Test
-    fun `a valid stored XHTTP profile plus real owner-decided values resolves to Ready`() = runBlocking {
+    fun `a valid stored XHTTP profile resolves to Ready using the evidence-backed EXIT constants`() = runBlocking {
         val repository = newXhttpRepository()
         repository.saveProfile(validXhttpProfile)
 
-        val resolution = XrayRuntimeResolver.resolveXhttp(
-            repository,
-            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
-            alpn = "h2",
-            maxEachPostBytes = 524_288,
-            paddingPlacement = XrayXhttpPaddingPlacement.HEADER,
-        )
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository)
 
         assertTrue(resolution is XrayXhttpRuntimeResolution.Ready)
         val ready = resolution as XrayXhttpRuntimeResolution.Ready
@@ -219,43 +212,31 @@ class XrayXhttpRuntimeResolverTest {
         assertEquals(XrayXhttpMode.PACKET_UP, ready.config.mode)
         assertEquals(XrayXhttpUplinkHttpMethod.POST, ready.config.uplinkHttpMethod)
         assertEquals("chrome", ready.config.fingerprint)
-        assertEquals(100, ready.config.paddingMinBytes)
-        assertEquals(1000, ready.config.paddingMaxBytes)
+        // B61.3/B61.4 evidence-backed EXIT constants (see XrayProfileMapper's own docs).
+        assertEquals(XrayXhttpMinimumTlsVersion.TLS_1_3, ready.config.minimumTlsVersion)
+        assertEquals("h2", ready.config.alpn)
+        assertEquals(1_000_000, ready.config.maxEachPostBytes)
+        // Padding is genuinely omitted, never a synthesized placement.
+        assertEquals(null, ready.config.paddingPlacement)
+        assertEquals(null, ready.config.paddingMinBytes)
+        assertEquals(null, ready.config.paddingMaxBytes)
         assertEquals(XrayConfigRenderer.render(ready.config), ready.renderedConfig)
     }
 
     @Test
-    fun `production default (no owner-decided values supplied) always fails closed with the itemized blocker reason`() = runBlocking {
+    fun `rendered config never contains an explicit padding placement`() = runBlocking {
         val repository = newXhttpRepository()
         repository.saveProfile(validXhttpProfile)
 
-        val resolution = XrayRuntimeResolver.resolveXhttp(repository)
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository) as XrayXhttpRuntimeResolution.Ready
 
-        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
-        val reason = (resolution as XrayXhttpRuntimeResolution.Rejected).reason
-        assertTrue(reason.contains("minimumTlsVersion"))
-        assertTrue(reason.contains("alpn"))
-        assertTrue(reason.contains("maxEachPostBytes"))
-        assertTrue(reason.contains("paddingPlacement"))
-    }
-
-    @Test
-    fun `partially-supplied values still name only the still-missing ones`() = runBlocking {
-        val repository = newXhttpRepository()
-        repository.saveProfile(validXhttpProfile)
-
-        val resolution = XrayRuntimeResolver.resolveXhttp(
-            repository,
-            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
-            alpn = "h2",
-        )
-
-        assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
-        val reason = (resolution as XrayXhttpRuntimeResolution.Rejected).reason
-        assertFalse(reason.contains("minimumTlsVersion"))
-        assertFalse(reason.contains("alpn"))
-        assertTrue(reason.contains("maxEachPostBytes"))
-        assertTrue(reason.contains("paddingPlacement"))
+        assertFalse(resolution.renderedConfig.contains("xPaddingPlacement"))
+        assertFalse(resolution.renderedConfig.contains("xPaddingBytes"))
+        assertFalse(resolution.renderedConfig.contains("xPaddingObfsMode"))
+        // Never a synthesized HEADER/QUERY wire value standing in for Xray's
+        // own real (unrepresentable) PlacementQueryInHeader default.
+        assertFalse(resolution.renderedConfig.contains("\"header\""))
+        assertFalse(resolution.renderedConfig.contains("\"query\""))
     }
 
     @Test
@@ -284,13 +265,7 @@ class XrayXhttpRuntimeResolverTest {
         val repository = newXhttpRepository()
         repository.saveProfile(validXhttpProfile.copy(mode = "stream-up"))
 
-        val resolution = XrayRuntimeResolver.resolveXhttp(
-            repository,
-            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
-            alpn = "h2",
-            maxEachPostBytes = 524_288,
-            paddingPlacement = XrayXhttpPaddingPlacement.HEADER,
-        )
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository)
 
         assertTrue(resolution is XrayXhttpRuntimeResolution.Rejected)
     }
@@ -300,13 +275,7 @@ class XrayXhttpRuntimeResolverTest {
         val repository = newXhttpRepository()
         repository.saveProfile(validXhttpProfile)
 
-        val resolution = XrayRuntimeResolver.resolveXhttp(
-            repository,
-            minimumTlsVersion = XrayXhttpMinimumTlsVersion.TLS_1_3,
-            alpn = "h2",
-            maxEachPostBytes = 524_288,
-            paddingPlacement = XrayXhttpPaddingPlacement.HEADER,
-        ) as XrayXhttpRuntimeResolution.Ready
+        val resolution = XrayRuntimeResolver.resolveXhttp(repository) as XrayXhttpRuntimeResolution.Ready
 
         assertFalse(resolution.config.server.contains("127.0.0.1"))
         assertFalse(resolution.renderedConfig.contains("127.0.0.1"))

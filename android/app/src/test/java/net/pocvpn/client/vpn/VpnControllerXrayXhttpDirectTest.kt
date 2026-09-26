@@ -12,18 +12,21 @@ import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
+import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.xray.toXrayVlessXhttpConfig
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * B61 - proves the EXIT-role (Frankfurt, B60) DIRECT XRAY_XHTTP path
+ * B61/B61.4 - proves the EXIT-role (Frankfurt, B60) DIRECT XRAY_XHTTP path
  * through VpnController is real plumbing, NOT the old, unconditional
- * "XHTTP requires a relayed attempt context" refusal - and separately
- * proves it honestly fails closed (never a fabricated connection) while
- * minimumTlsVersion/alpn/maxEachPostBytes/paddingPlacement remain
- * undecided (see XrayRuntimeResolver.resolveXhttp's own docs). Mirrors
- * VpnControllerXrayEndpointResolverTest's own shape for REALITY/TLS.
+ * "XHTTP requires a relayed attempt context" refusal, and that a real
+ * stored profile now genuinely reaches a connected transport using the
+ * evidence-backed EXIT constants (B61.3/B61.4) - never the Stockholm
+ * ingress profile's own values, never a fabricated padding placement.
+ * Mirrors VpnControllerXrayEndpointResolverTest's own shape for REALITY/TLS.
  */
 private fun configuredGateway() = GatewayConfiguration.Configured(
     endpointHost = "203.0.113.10",
@@ -67,7 +70,7 @@ class VpnControllerXrayXhttpDirectTest {
     }
 
     @Test
-    fun `a wired resolver with a real stored profile still fails closed - never fabricates a connection`() = runTest {
+    fun `a wired resolver with a real stored profile now genuinely connects using the evidence-backed EXIT constants`() = runTest {
         val xhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
         val resolver = MapXrayXhttpProfileRepositoryResolver(
             mapOf(frankfurt to FakeXrayXhttpProfileRepository(frankfurtXhttpProfile)),
@@ -82,22 +85,20 @@ class VpnControllerXrayXhttpDirectTest {
         controller.connect(TransportOrchestrator.Resolution.Resolved(xhttpTransport, TransportKind.XRAY_XHTTP, frankfurt))
         runCurrent()
 
-        // Real plumbing genuinely ran (this is NOT the old unconditional
-        // "requires a relayed attempt context" refusal - a stored profile
-        // for this exact endpoint really was loaded and mapped by
-        // XrayRuntimeResolver.resolveXhttp, proven directly by
-        // XrayXhttpRuntimeResolverTest), but the resolver honestly refuses
-        // to invent minimumTlsVersion/alpn/maxEachPostBytes/paddingPlacement,
-        // so no connection is faked. VpnController's own catch site
-        // (buildTransportConfig's caller) deliberately discards the
-        // specific exception message into the generic, non-secret
-        // "Failed to build tunnel configuration" TransportState.Error - see
-        // that catch site's own docs - so this test asserts the type/
-        // never-connected outcome, not message content (the itemized
-        // blocker reason itself is proven directly by
-        // XrayXhttpRuntimeResolverTest instead).
-        assertEquals(0, xhttpTransport.connectCallCount)
-        assertTrue(controller.state.value is TransportState.Error)
+        // B61.4 - this is NOT the old unconditional "requires a relayed
+        // attempt context" refusal, and no longer the B61 "always rejects,
+        // no source of truth" outcome either: a stored profile for this
+        // exact endpoint is genuinely loaded, mapped through
+        // XrayRuntimeResolver.resolveXhttp using the evidence-backed EXIT
+        // constants (B61.3), and reaches the transport.
+        assertEquals(1, xhttpTransport.connectCallCount)
+        val sent = xhttpTransport.lastConfig as TransportConfig.XrayXhttp
+        assertEquals(frankfurtXhttpProfile.toXrayVlessXhttpConfig(), sent.config)
+        assertEquals(frankfurt, sent.endpointId)
+        assertFalse(sent.isRelayed)
+        assertEquals(null, sent.relayExitProbeHost)
+        // Never a synthesized padding placement.
+        assertEquals(null, sent.config.paddingPlacement)
     }
 
     @Test

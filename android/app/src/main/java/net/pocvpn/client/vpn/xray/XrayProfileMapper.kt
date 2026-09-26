@@ -26,57 +26,62 @@ fun XrayTlsProfile.toXrayVlessTlsConfig(): XrayVlessTlsConfig = XrayVlessTlsConf
 )
 
 /**
- * B61 - xray-core v26.7.28's own documented internal default for omitted
- * `xPaddingBytes` (see [XhttpServerConfig]'s own docstring, gateway-side,
- * and this exact figure's cross-reference to this Kotlin file). A real,
- * cited project fact - never an invented number - but see
- * [XrayXhttpProfile.toXrayVlessXhttpConfig]'s own docs for why
- * [paddingPlacement] still has NO equivalent source of truth.
+ * B61.4 - the EXIT-role's fixed `minimumTlsVersion`/`alpn`/`maxEachPostBytes`
+ * values, each backed by evidence read directly from the pinned Xray-core
+ * v26.7.28 source (commit `5ca6f4b`, see B61.3's audit) - never copied from
+ * the Stockholm/B35 CDN-ingress signed provider profile
+ * ([net.pocvpn.client.reachability.CdnClientCapabilityPolicy.pinnedXhttp]),
+ * which is a different, provider-negotiated trust surface.
+ *
+ * - [EXIT_XHTTP_MINIMUM_TLS_VERSION] = TLS_1_3: `transport/internet/tls/tls.go`'s
+ *   `copyConfig()` never copies `MinVersion`/`MaxVersion` into the uTLS
+ *   config the SplitHTTP dialer actually uses whenever `fingerprint` is set
+ *   (`transport/internet/splithttp/dialer.go` - this EXIT config always
+ *   sets `fingerprint`) - this field is proven inert on the real dial path,
+ *   so any valid value is safe; TLS_1_3 is used for label consistency.
+ * - [EXIT_XHTTP_ALPN] = "h2": `infra/conf/transport_security.go`'s
+ *   `TLSConfig.Build()` defaults `NextProtos` to `["h2", "http/1.1"]` when
+ *   unset, and that value DOES reach the real uTLS ClientHello (`copyConfig`
+ *   copies `NextProtos`, unlike MinVersion) - "h2" is Xray's own
+ *   first-preference default, not an invented value.
+ * - [EXIT_XHTTP_MAX_EACH_POST_BYTES] = 1000000: `transport/internet/splithttp/config.go`'s
+ *   `GetNormalizedScMaxEachPostBytes()` returns exactly `{From: 1000000, To:
+ *   1000000}` when the field is omitted - Xray-core's own real, general
+ *   default (never the Stockholm ingress profile's own `524288`).
+ *
+ * `paddingPlacement`/`paddingMinBytes`/`paddingMaxBytes` are deliberately
+ * NOT set here (left null - see [XrayVlessXhttpConfig]'s own docs): the
+ * SAME pinned source (`splithttp/config.go`'s `FillPacketRequest`) proves
+ * omitting them is real, defined behavior (Xray-core's own
+ * `PlacementQueryInHeader` default), and that placement has no equivalent
+ * member in [XrayXhttpPaddingPlacement] - never approximated as HEADER or
+ * QUERY.
  */
-const val XRAY_CORE_DEFAULT_PADDING_MIN_BYTES = 100
-const val XRAY_CORE_DEFAULT_PADDING_MAX_BYTES = 1000
+val EXIT_XHTTP_MINIMUM_TLS_VERSION = XrayXhttpMinimumTlsVersion.TLS_1_3
+const val EXIT_XHTTP_ALPN = "h2"
+const val EXIT_XHTTP_MAX_EACH_POST_BYTES = 1_000_000
 
 /**
- * B61 - the EXIT-role (Frankfurt, B60) counterpart of [toXrayVlessRealityConfig]/
- * [toXrayVlessTlsConfig]. Deliberately NOT [net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver] -
- * that resolver belongs to the Stockholm/B35 CDN-fronted INGRESS relay flow
- * (a signed [net.pocvpn.client.reachability.CdnProviderCapabilityProfile]
- * negotiation), a genuinely different trust/config surface from this EXIT's
- * own fixed B58/B59/B60 identity - see docs/B58/B59/B60 for why Frankfurt's
- * own values are NOT provider-negotiated.
+ * B61/B61.4 - the EXIT-role (Frankfurt, B60) counterpart of
+ * [toXrayVlessRealityConfig]/[toXrayVlessTlsConfig]. Deliberately NOT
+ * [net.pocvpn.client.vpn.xray.CdnXhttpRuntimeConfigResolver] - that
+ * resolver belongs to the Stockholm/B35 CDN-fronted INGRESS relay flow (a
+ * signed [net.pocvpn.client.reachability.CdnProviderCapabilityProfile]
+ * negotiation), a genuinely different trust/config surface from this
+ * EXIT's own fixed B58/B59/B60 identity.
  *
- * Maps ONLY the fields B60's wire response actually supplies
+ * Maps the fields B60's wire response actually supplies
  * ([server]/[serverPort]/[uuid]/[xhttpHost]/[xhttpPath]/[mode]/
- * [uplinkHttpMethod]/[fingerprint]) plus [tlsServerName] (B60/B61 §2.5:
- * the SAME public hostname as [server] - Cloudflare's single-hostname front
- * for this deployment, never a second, independently-invented value) and
- * [queryParameters]/[headers] (empty - B57 proved packet-up needs neither).
- *
- * [minimumTlsVersion]/[alpn]/[maxEachPostBytes]/[paddingPlacement] have NO
- * existing project source of truth for the EXIT role (unlike the CDN
- * ingress flow's own [net.pocvpn.client.reachability.CdnClientCapabilityPolicy.pinnedXhttp],
- * which is a DIFFERENT, provider-negotiated surface this function
- * deliberately does not read from - see this function's own docs above).
- * `docs/ROADMAP.md`'s own XHTTP Traffic-Shape row is explicit that this
- * class of value requires real per-deployment validation, "never a copied
- * community claim." B61 therefore takes these as explicit, nullable
- * parameters with NO default and NO fallback: this function returns null
- * (never a fabricated config) whenever any of them is null - callers MUST
- * supply real, owner-decided values before this can ever produce a
- * connectable config. [paddingMinBytes]/[paddingMaxBytes] are the ONE
- * exception: xray-core's own documented default (100..1000, see
- * [XRAY_CORE_DEFAULT_PADDING_MIN_BYTES]) is a real, cited fact, not an
- * invention.
+ * [uplinkHttpMethod]/[fingerprint]) plus [tlsServerName] (B60/B61 §2.5: the
+ * SAME public hostname as [server]) and [queryParameters]/[headers] (empty
+ * - B57 proved packet-up needs neither), and fills
+ * [minimumTlsVersion]/[alpn]/[maxEachPostBytes] with the evidence-backed
+ * EXIT constants above (B61.4 - see B61.3's audit for the source). Padding
+ * fields are left null (omitted) - see [XrayVlessXhttpConfig]'s own docs.
  */
-fun XrayXhttpProfile.toXrayVlessXhttpConfig(
-    minimumTlsVersion: XrayXhttpMinimumTlsVersion?,
-    alpn: String?,
-    maxEachPostBytes: Int?,
-    paddingPlacement: XrayXhttpPaddingPlacement?,
-): XrayVlessXhttpConfig? {
+fun XrayXhttpProfile.toXrayVlessXhttpConfig(): XrayVlessXhttpConfig? {
     val resolvedMode = XrayXhttpMode.entries.firstOrNull { it.wireValue == mode } ?: return null
     val resolvedUplinkHttpMethod = XrayXhttpUplinkHttpMethod.entries.firstOrNull { it.wireValue == uplinkHttpMethod } ?: return null
-    if (minimumTlsVersion == null || alpn == null || maxEachPostBytes == null || paddingPlacement == null) return null
 
     return XrayVlessXhttpConfig(
         server = server,
@@ -84,17 +89,17 @@ fun XrayXhttpProfile.toXrayVlessXhttpConfig(
         uuid = uuid,
         tlsServerName = server,
         fingerprint = fingerprint,
-        minimumTlsVersion = minimumTlsVersion,
-        alpn = alpn,
+        minimumTlsVersion = EXIT_XHTTP_MINIMUM_TLS_VERSION,
+        alpn = EXIT_XHTTP_ALPN,
         xhttpHost = xhttpHost,
         xhttpPath = xhttpPath,
         queryParameters = emptyMap(),
         headers = emptyMap(),
         mode = resolvedMode,
         uplinkHttpMethod = resolvedUplinkHttpMethod,
-        maxEachPostBytes = maxEachPostBytes,
-        paddingPlacement = paddingPlacement,
-        paddingMinBytes = XRAY_CORE_DEFAULT_PADDING_MIN_BYTES,
-        paddingMaxBytes = XRAY_CORE_DEFAULT_PADDING_MAX_BYTES,
+        maxEachPostBytes = EXIT_XHTTP_MAX_EACH_POST_BYTES,
+        paddingPlacement = null,
+        paddingMinBytes = null,
+        paddingMaxBytes = null,
     )
 }

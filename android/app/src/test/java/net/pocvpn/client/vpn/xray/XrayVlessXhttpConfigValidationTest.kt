@@ -94,4 +94,43 @@ class XrayVlessXhttpConfigValidationTest {
         assertTrue(result is XrayXhttpConfigValidationResult.Invalid)
         assertFalse((result as XrayXhttpConfigValidationResult.Invalid).errors.isEmpty())
     }
+
+    // --- B61.4: padding fields are omittable (null) ---
+
+    @Test
+    fun `all three padding fields null together is valid - Xray's own default applies`() {
+        val config = validConfig().copy(paddingPlacement = null, paddingMinBytes = null, paddingMaxBytes = null)
+        val result = validateXrayVlessXhttpConfig(config)
+        assertTrue(result is XrayXhttpConfigValidationResult.Valid)
+    }
+
+    @Test
+    fun `placement null but range non-null is rejected as inconsistent`() {
+        val config = validConfig().copy(paddingPlacement = null)
+        val result = validateXrayVlessXhttpConfig(config)
+        assertTrue(result is XrayXhttpConfigValidationResult.Invalid)
+        assertTrue(
+            XrayXhttpConfigValidationError.INCONSISTENT_PADDING_FIELDS in (result as XrayXhttpConfigValidationResult.Invalid).errors,
+        )
+    }
+
+    @Test
+    fun `placement non-null but range null is rejected as inconsistent`() {
+        val config = validConfig().copy(paddingMinBytes = null, paddingMaxBytes = null)
+        val result = validateXrayVlessXhttpConfig(config)
+        assertTrue(result is XrayXhttpConfigValidationResult.Invalid)
+        assertTrue(
+            XrayXhttpConfigValidationError.INCONSISTENT_PADDING_FIELDS in (result as XrayXhttpConfigValidationResult.Invalid).errors,
+        )
+    }
+
+    @Test
+    fun `explicit non-null padding still enforces the existing range check`() {
+        val config = validConfig().copy(paddingMinBytes = 0, paddingMaxBytes = 0)
+        val result = validateXrayVlessXhttpConfig(config)
+        assertTrue(result is XrayXhttpConfigValidationResult.Invalid)
+        assertTrue(
+            XrayXhttpConfigValidationError.INVALID_PADDING_RANGE in (result as XrayXhttpConfigValidationResult.Invalid).errors,
+        )
+    }
 }
