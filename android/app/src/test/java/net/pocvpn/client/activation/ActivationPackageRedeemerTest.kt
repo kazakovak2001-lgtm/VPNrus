@@ -1,6 +1,8 @@
 package net.pocvpn.client.activation
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -121,6 +123,77 @@ class ActivationPackageRedeemerTest {
     @Test fun `retry with nothing pending does nothing`() {
         assertFalse(runBlocking { redeemer().retry({ states += it }, activateWith(ActivationAttemptOutcome.SUCCEEDED)) })
         assertTrue(activated.isEmpty() && states.isEmpty())
+    }
+
+    /**
+     * Regression for the `retry()` race where `pending` was read BEFORE
+     * `busy.tryLock()`: a `retry()` that captured a stale `pending` snapshot
+     * while `busy` was held by a concurrent `redeem()` could, once that
+     * `redeem()` released the lock, go on to activate the now-superseded
+     * package instead of the current one.
+     *
+     * Deterministic by construction, no sleeps/thread races: each
+     * `redeem()`'s [activate] lambda signals a `readyX` [CompletableDeferred]
+     * IMMEDIATELY BEFORE it suspends on its own `outcomeX` deferred, and the
+     * test coroutine `await()`s that signal - a real suspension point, not a
+     * scheduling assumption - before attempting a concurrent `retry()`. That
+     * guarantees `redeem()` is suspended inside [activate] - i.e. still
+     * holding `busy` (unlocked only in `redeem()`'s `finally`, which runs
+     * after [activate] returns) - at the moment `retry()` is attempted.
+     */
+    @Test fun `retry never activates a package captured before it acquired the lock`() {
+        val credB = "Zbc_def-123GHIjklMNOpqrSTUvwxYZ0123456789ab"
+        val r = redeemer()
+        val readyA = CompletableDeferred<Unit>()
+        val outcomeA = CompletableDeferred<ActivationAttemptOutcome>()
+        val readyB = CompletableDeferred<Unit>()
+        val outcomeB = CompletableDeferred<ActivationAttemptOutcome>()
+
+        runBlocking {
+            // --- Package A becomes pending, then redeem() suspends mid-
+            // activation - busy is still held (activatePending() runs
+            // before the finally-block unlock). ---
+            val jobA = launch {
+                r.redeem(
+                    ActivationPackageInput.Text(f.packageText(f.envelope(nonceSeed = 1))),
+                    { states += it },
+                ) { credential -> activated += credential; readyA.complete(Unit); outcomeA.await() }
+            }
+            readyA.await()
+            // A concurrent retry() here must refuse outright (busy held) -
+            // it must never read `pending` before establishing that busy is
+            // free, which is exactly the bug: reading `pending` first would
+            // have captured A regardless of what happens next.
+            assertFalse(r.retry({ states += it }, activateWith(ActivationAttemptOutcome.SUCCEEDED)))
+            outcomeA.complete(ActivationAttemptOutcome.NETWORK_UNAVAILABLE)
+            jobA.join()
+            assertTrue(r.hasPending) // A is now the pending package (NetworkRequired)
+
+            // --- Package B replaces A as `pending`, again suspending
+            // redeem() mid-activation while busy is held. ---
+            val jobB = launch {
+                r.redeem(
+                    ActivationPackageInput.Text(f.packageText(f.envelope(nonceSeed = 2, credential = credB))),
+                    { states += it },
+                ) { credential -> activated += credential; readyB.complete(Unit); outcomeB.await() }
+            }
+            readyB.await()
+            // Same refusal, now with a DIFFERENT package superseding the
+            // first: the buggy implementation would have captured `pending`
+            // as A again before even checking the lock.
+            assertFalse(r.retry({ states += it }, activateWith(ActivationAttemptOutcome.SUCCEEDED)))
+            outcomeB.complete(ActivationAttemptOutcome.NETWORK_UNAVAILABLE)
+            jobB.join()
+            assertTrue(r.hasPending) // B has replaced A as the pending package
+
+            activated.clear()
+            // busy is free now: retry() must act on the CURRENT pending
+            // package (B) - never a stale snapshot of A captured earlier.
+            assertTrue(r.retry({ states += it }, activateWith(ActivationAttemptOutcome.SUCCEEDED)))
+            assertEquals(listOf(credB), activated)
+            assertEquals(ActivationPackageUiState.Succeeded(BootstrapStagingStatus.NOT_INCLUDED), states.last())
+            assertFalse(r.hasPending)
+        }
     }
 
     @Test fun `offline parse and verification need no network at all`() {
