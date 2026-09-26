@@ -510,6 +510,11 @@ class MainViewModel(
     // unaffected - see ReachabilityDiagnosticsSnapshot's own "observational
     // only" docs for that boundary, unchanged by B17).
     private val manifestRepository: net.pocvpn.client.reachability.EndpointManifestRepository? = null,
+    // B56-5 - verifies a NovaActivationPackage (activation-issuer trust
+    // anchors + the SAME manifestRepository above for its bootstrap bundle)
+    // before its credential is handed to activateDevice(). Null = package
+    // import unavailable (fails closed, never parsed as a raw credential).
+    private val activationPackageImporter: net.pocvpn.client.activation.ActivationPackageImporter? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
     // B24 review fix (PR #38, round 3) - the real client<->ingress
@@ -2260,15 +2265,21 @@ class MainViewModel(
     fun activateDevice(
         activationCredential: String,
         targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value,
+        // B56-5 - optional completion signal for the activation-package flow
+        // (importActivationPackage). Every pre-B56-5 call site passes nothing
+        // and is byte-for-byte unaffected.
+        onFinished: ((net.pocvpn.client.activation.ActivationAttemptOutcome) -> Unit)? = null,
     ) {
         val trimmedCredential = activationCredential.trim()
         if (trimmedCredential.isEmpty()) {
             _provisioningState.value = ProvisioningUiState.Error("activation credential is empty")
+            onFinished?.invoke(net.pocvpn.client.activation.ActivationAttemptOutcome.FAILED)
             return
         }
         val key = _publicKey.value
         if (key == null) {
             _provisioningState.value = ProvisioningUiState.Error("device public key not loaded yet")
+            onFinished?.invoke(net.pocvpn.client.activation.ActivationAttemptOutcome.FAILED)
             return
         }
 
@@ -2542,8 +2553,71 @@ class MainViewModel(
             if (result is ProvisioningResult.Success && _provisioningState.value !is ProvisioningUiState.Success) {
                 supportDiagnosticsRecorder?.recordActivationFailed(net.pocvpn.client.controlplane.ControlPlaneFailureReason.TRUST_VALIDATION_REJECTED)
             }
+            onFinished?.invoke(
+                when {
+                    _provisioningState.value is ProvisioningUiState.Success -> net.pocvpn.client.activation.ActivationAttemptOutcome.SUCCEEDED
+                    result is ProvisioningResult.NetworkError -> net.pocvpn.client.activation.ActivationAttemptOutcome.NETWORK_UNAVAILABLE
+                    else -> net.pocvpn.client.activation.ActivationAttemptOutcome.FAILED
+                },
+            )
         }
     }
+
+    // --- B56-5: NovaActivationPackage -> EXISTING activateDevice() ---
+    //
+    // Local verification (issuer signature, validity window, local replay
+    // guard, bundle binding + staging through manifestRepository) happens in
+    // ActivationPackageImporter; ActivationPackageRedeemer then calls the
+    // SAME activateDevice() a typed credential uses - no second activation
+    // or provisioning path.
+    private val activationPackageRedeemer = activationPackageImporter?.let {
+        net.pocvpn.client.activation.ActivationPackageRedeemer(it, nowProvider, ioDispatcher)
+    }
+    private val _activationPackageState =
+        MutableStateFlow<net.pocvpn.client.activation.ActivationPackageUiState>(net.pocvpn.client.activation.ActivationPackageUiState.Idle)
+    val activationPackageState: StateFlow<net.pocvpn.client.activation.ActivationPackageUiState> = _activationPackageState.asStateFlow()
+
+    /** QR / deep link / clipboard / manual entry all arrive here as text; the source confers no trust. */
+    fun importActivationPackage(
+        packageText: String,
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value,
+    ) {
+        val redeemer = activationPackageRedeemer
+        if (redeemer == null) {
+            _activationPackageState.value = net.pocvpn.client.activation.ActivationPackageUiState.Unavailable
+            return
+        }
+        viewModelScope.launch {
+            redeemer.redeem(
+                net.pocvpn.client.activation.ActivationPackageInput.Text(packageText),
+                onState = { _activationPackageState.value = it },
+                activate = { credential -> activateDeviceAwaiting(credential, targetGatewayId) },
+            )
+        }
+    }
+
+    /** Finishes a locally-verified package once the network is back (state NetworkRequired). */
+    fun retryPendingActivationPackage(
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value,
+    ) {
+        val redeemer = activationPackageRedeemer ?: return
+        viewModelScope.launch {
+            redeemer.retry(
+                onState = { _activationPackageState.value = it },
+                activate = { credential -> activateDeviceAwaiting(credential, targetGatewayId) },
+            )
+        }
+    }
+
+    private suspend fun activateDeviceAwaiting(
+        credential: String,
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    ): net.pocvpn.client.activation.ActivationAttemptOutcome =
+        kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            activateDevice(credential, targetGatewayId) { outcome ->
+                if (continuation.isActive) continuation.resumeWith(Result.success(outcome))
+            }
+        }
 
     private val _ingressActivationState = MutableStateFlow<net.pocvpn.client.relay.IngressActivationOutcome?>(null)
     val ingressActivationState: StateFlow<net.pocvpn.client.relay.IngressActivationOutcome?> = _ingressActivationState.asStateFlow()
@@ -4366,6 +4440,14 @@ class MainViewModel(
                 // reachabilityDiagnostics()'s own docs for why this cannot
                 // change automatic selection in this slice.
                 manifestRepository = manifestRepository,
+                // B56-5 - production activation-issuer PUBLIC anchor only
+                // (prod-activation-issuer-2026-09-20-r2); bundles go through
+                // the SAME manifestRepository instance above.
+                activationPackageImporter = net.pocvpn.client.activation.ActivationPackageImporter(
+                    trustAnchors = net.pocvpn.client.activation.ProductionActivationIssuerTrustAnchors.trustAnchors(),
+                    bundleImporter = net.pocvpn.client.reachability.SignedBootstrapBundleImporter(manifestRepository),
+                    replayGuard = net.pocvpn.client.activation.FileActivationReplayGuard(context.noBackupFilesDir),
+                ),
                 pathHistoryStore = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createPathHistoryStore(context),
                 fingerprintKeyProvider = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createFingerprintKeyProvider(context),
                 manifestDistributionClient = manifestDistributionClient,

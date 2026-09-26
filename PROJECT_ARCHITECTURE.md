@@ -2671,6 +2671,38 @@ activation store was never touched - see
 (including the abandoned candidate), offline-backup status, and rotation
 policy.)
 
+---
+Last updated: 2026-09-26 (B56-5 - Android runtime wired the B56-1..4B1
+pieces together, adding no new trust root. `NovaActivationPackage`
+(`nova-activation:1:` / `NOVA_ACTIVATION_PACKAGE_V1`) is a TRANSPORT
+container only: the existing `SignedActivationEnvelope` bytes plus an
+OPTIONAL exact-byte `SignedBootstrapBundle` (= `SignedManifest`) plus a
+reserved, must-be-empty V1 Level-2 section (non-empty is rejected, never
+silently ignored - the B56-6 extension point). `ActivationPackageImporter`
+verifies the envelope via the EXISTING `Ed25519ActivationEnvelopeVerifier`/
+`ProductionActivationIssuerTrustAnchors`, checks a local
+`ActivationReplayGuard` (file-backed hash of issuerKeyId+activationId+nonce,
+survives restart, never the credential/nonce/envelope itself - server-side
+`max_devices`/binding/expiry/revocation remain the real replay bound), and
+stages any bundle through the EXISTING `SignedBootstrapBundleImporter` ->
+`EndpointManifestRepository.offer()` - no second manifest verifier or
+repository. `ActivationPackageRedeemer` then calls the SAME
+`MainViewModel.activateDevice()` a typed credential uses (a new optional
+`onFinished` callback, every pre-B56-5 call site unaffected) - there is no
+second activation/provisioning system. Offline is truthful: a locally
+verified package with no network reachable reports `NetworkRequired`
+(STAGED if its bundle was adopted, else NOT_INCLUDED) and is held
+IN-MEMORY ONLY for retry; an app restart requires re-import, and a pending
+package that expires while waiting is rejected on retry, never activated.
+`bootstrapEndpointHints`/`bootstrapCapabilityHint` remain non-authoritative
+hints, never a network-configuration authority. UI: `ActivationScreen` is
+unchanged; `AppRoot` routes text starting with `nova-activation:1:` to
+`importActivationPackage`, everything else to the existing raw-credential
+`activateDevice` - one screen, one entry point, fixed non-secret copy per
+rejection category. See `docs/B56_5_ANDROID_ACTIVATION_PACKAGE_RUNTIME.md`
+and ROADMAP's B56 row. Next slice: B67.2 multi-path activation discovery -
+not implemented here.)
+
 ## B67/B63 recovery boundary (2026-09-26, ROADMAP-only re-scoping, no code change)
 
 - **B67 (Resilient Activation & Enrollment) is a recovery/re-scoping label, not
