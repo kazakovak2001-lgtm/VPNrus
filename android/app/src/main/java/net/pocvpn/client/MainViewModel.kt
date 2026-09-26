@@ -302,8 +302,13 @@ class MainViewModel(
     // synthetic multi-origin list to prove the fallback MECHANISM works
     // through the REAL activateDevice() code path, without this class ever
     // inventing a fake production host itself.
+    // B67.2 - repointed from ControlPlaneOriginSetBuilder::forGateway to
+    // ActivationPathOriginSetBuilder::forGateway, which composes the SAME
+    // DIRECT origin(s) plus any trusted CHAIN_DIRECT/CHAIN_CDN origins (see
+    // that object's own docs) - today's real production catalog has none of
+    // the latter, so this is byte-for-byte the same list as before.
     private val controlPlaneOriginsForActivation: (net.pocvpn.client.vpn.config.ProductionGatewayId) -> List<net.pocvpn.client.controlplane.ControlPlaneOrigin> =
-        net.pocvpn.client.controlplane.ControlPlaneOriginSetBuilder::forGateway,
+        net.pocvpn.client.controlplane.ActivationPathOriginSetBuilder::forGateway,
     // B8C2A - additive, defaults to Dispatchers.IO (byte-for-byte unchanged
     // production behavior). Lets tests run activateDevice()'s coroutine on
     // the SAME (virtual-time) test dispatcher as the rest of the test instead

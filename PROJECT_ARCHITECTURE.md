@@ -2320,6 +2320,43 @@ UNVERIFIED.
   redirect-classified failure is never treated as success); this does NOT
   prove Russia hard-whitelist bypass, which remains UNVERIFIED.
 
+### Multi-Path Activation Discovery (B67.2) - extends B30, no new engine
+
+`ActivationPathKind` (`DIRECT`/`CHAIN_DIRECT`/`CHAIN_CDN`,
+`controlplane/ActivationPathCandidate.kt`) is the ACTIVATION/CONTROL-PLANE
+path-shape vocabulary - never conflated with the DATA-PLANE
+`PathCandidate.Direct`/`PathCandidate.Relayed` (`reachability/PathCandidate.kt`)
+`PathScorer`/`AutoGatewaySelector` already rank; the two answer different
+questions ("how does the client reach `/v1/activate`" vs "how does traffic
+reach the Internet") and share no type. `ActivationPathCandidateBuilder`
+composes an ordered `List<ActivationPathCandidate>` per gateway from
+`ControlPlaneOriginSetBuilder` (DIRECT, unchanged B30) and
+`TrustedChainControlPlaneOriginCatalog.chainDirect`/`chainCdn`
+(CHAIN_DIRECT/CHAIN_CDN) - both return `emptyList()` today (no trusted
+HTTP-capable relay/CDN front for the control plane is deployed; the one
+real B25/B31 Stockholm ingress relays DATA-PLANE VLESS traffic and is never
+reused as a control-plane front). Fixed DIRECT->CHAIN_DIRECT->CHAIN_CDN
+declaration order, deliberately not a score (no per-gateway `Long` weight,
+no `PathScorer` tiering reused) - there is no control-plane-specific
+evidence to rank against, so this is the "no useful evidence -> stable
+deterministic order" the architecture calls for, not an invented
+preference. A path shape with zero trusted origins contributes no
+candidate. `ActivationPathOriginSetBuilder.forGateway` flattens those
+candidates into the same `List<ControlPlaneOrigin>` shape
+`ActivationResilienceCoordinator.activate`'s `origins` parameter already
+accepted - the ONE integration seam (`MainViewModel`'s existing
+`controlPlaneOriginsForActivation` constructor seam is repointed to it).
+`TrustedOriginRequestExecutor`/`ActivationResilienceCoordinator` are
+completely unmodified: the flat multi-path origin list already gives
+per-origin-once bounded execution in path order, with
+`AUTHORIZATION_REJECTED` on any origin (any path shape) terminal for the
+whole call - the B30 invariant, unchanged. Since both chain catalogs are
+empty in production, `ActivationPathOriginSetBuilder.forGateway` is
+byte-for-byte `ControlPlaneOriginSetBuilder.forGateway` today; real
+activation traffic remains DIRECT-only until ops deploys and audits a
+trusted CHAIN_DIRECT/CHAIN_CDN control-plane origin. See `docs/ROADMAP.md`'s
+B67.2 row for the full test list.
+
 ## Private Gateway Mode (B22) - a third, explicit gateway-selection authority
 
 Architecture principle 9: a user may connect through the managed gateway
