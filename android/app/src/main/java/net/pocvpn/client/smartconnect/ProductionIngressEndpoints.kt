@@ -52,13 +52,13 @@ import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
  * descriptor - callers must resolve Germany's descriptor via
  * [ProductionGatewayEndpoints.descriptorFor], never a second/independent one.
  *
- * **Not yet consumed by the live connect path** - same deliberate deferral
- * [AutoGatewaySelector.buildRelayedCandidates] itself already documents.
- * This object only makes the real ingress topology DATA available to that
- * already-generic pipeline; promoting it into `MainViewModel.connectAuto()`/
- * `VpnController` execution is a separate decision (now that real
- * infrastructure and a real end-to-end server-side proof exist, unlike when
- * that deferral was first written) - out of scope for this narrow change.
+ * **Consumed by the live connect path since B32** (`MainViewModel.
+ * mergedIngressAwareEndpoints`/`buildCombinedAutoRankingSnapshot`, wired
+ * into `connectAuto()` - see `MainViewModelIngressWiringTest` for proof).
+ * This paragraph previously said "not yet consumed" - that was true when
+ * this object was first written but went stale once B32 landed; corrected
+ * during the PR #58 field-test audit so this doc no longer contradicts the
+ * actual wiring.
  *
  * Carries only public routing/topology facts - no activation credential, no
  * VLESS client UUID, no private key, no per-device tunnel identity, no relay

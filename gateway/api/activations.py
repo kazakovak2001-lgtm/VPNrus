@@ -721,6 +721,163 @@ def issue_activation(store_path, lock_path, max_devices, expires_in_days=None):
     return activation_id, credential
 
 
+# --- field-enrollment support (Russia field test - see gateway/api/field_enrollment.py) --
+
+@dataclass(frozen=True)
+class RegisterCredentialResult:
+    """Round-3 review fix - `activation_id` alone could not tell a caller
+    whether THIS call created the record or merely found an existing one
+    (an idempotent replay) - a real ownership question field_enrollment.py
+    needs to answer safely before it may ever delete a record on rollback
+    (see `remove_credential_if_unbound`'s own docs: never delete a record
+    this exact call did not itself create). `created=True` means this call
+    durably wrote a brand-new record; `created=False` means a record for
+    this exact credential digest already existed and was left untouched."""
+
+    activation_id: str
+    created: bool
+
+
+def register_credential(store_path, lock_path, credential, activation_id, max_devices=1, expires_in_days=None, now=None):
+    """Field-enrollment variant of issue_activation(): the caller has
+    already generated BOTH `credential` (a genuinely random, per-device
+    value, never derived from anything) AND `activation_id` (see
+    field_enrollment.py's own FieldEnrollmentIndex, which must record the
+    SAME activation_id this call durably assigns - passing it in, rather
+    than generating a second, independent one here, is what keeps the
+    index and this store from ever disagreeing about a device's
+    activation_id) and has ALREADY made its own admission/cap decision
+    (field_enrollment.py's index owns that - never this store's own total
+    record count, which may also hold unrelated operator-issued
+    multi-device activations). This is the atomic, race-free "create a new
+    single-device activation record for this exact credential, unless one
+    already exists" primitive, under the SAME _exclusive_lock(lock_path)
+    issue_activation itself uses. Unlike the earlier
+    issue_activation_if_under_cap this replaces, this function enforces NO
+    cap of its own - it is a pure idempotent insert.
+
+    Idempotent: if a record for this exact credential's digest ALREADY
+    exists (a benign race, or a genuine retry), returns that existing
+    record's activation_id UNCHANGED (which the caller already knows,
+    since it derives from the SAME durable index entry) - never
+    double-writes. Safe, and INTENDED, to call on every field-enrollment
+    attempt for a given public key, not only the first - this is what lets
+    a device recover cleanly if a PREVIOUS attempt reserved an index entry
+    but crashed/failed before this call ever ran (see field_enrollment.py's
+    own docs on why it no longer skips this call for an idempotent replay).
+
+    Raises ActivationStoreError if `activation_id` collides with a
+    DIFFERENT existing record's own id - should be unreachable (both id
+    spaces are 128-bit random hex), kept as a defensive, explicit failure
+    rather than silently overwriting an unrelated record.
+
+    Returns a [RegisterCredentialResult] - see its own docs for why
+    `created` exists.
+    """
+    if not isinstance(max_devices, int) or max_devices < 1:
+        raise ValueError("max_devices must be a positive integer")
+    if not _ACTIVATION_ID_RE.match(activation_id):
+        raise ValueError("activation_id must be 32 lowercase hex characters")
+
+    digest = credential_digest(credential)
+    with _exclusive_lock(lock_path, create=False):
+        data = _read_and_validate_under_lock(store_path)
+
+        existing = data.get(digest)
+        if existing is not None:
+            return RegisterCredentialResult(existing["activation_id"], created=False)
+
+        for record in data.values():
+            if record["activation_id"] == activation_id:
+                raise ActivationStoreError(f"activation_id {activation_id} already used by a different credential")
+
+        expires_at = None
+        if expires_in_days is not None:
+            from datetime import timedelta
+            expires_at = ((now or datetime.now(timezone.utc)) + timedelta(days=expires_in_days)).isoformat()
+
+        data[digest] = {
+            "activation_id": activation_id,
+            "status": ACTIVE,
+            "max_devices": max_devices,
+            "created_at": _utc_now_iso(),
+            "expires_at": expires_at,
+            "bound_devices": [],
+        }
+        _atomic_write_store_or_raise(store_path, data)
+        return RegisterCredentialResult(activation_id, created=True)
+
+
+def remove_credential_if_unbound(store_path, lock_path, credential, activation_id):
+    """Round-3 review fix (orphan-activation rollback) - compensating
+    rollback for `register_credential`'s OWN record when the field-
+    enrollment attempt that just created it definitively fails (register
+    itself raised, or the subsequent `provision_with_activation` call
+    failed and `unbind_reservation` already removed any PENDING device
+    bind - see field_enrollment.py's own call site). There is no existing
+    "delete a whole activation record" primitive in this module
+    (`revoke_activation` marks REVOKED, it never deletes - correct for an
+    operator-issued, possibly still-useful activation, but wrong here: a
+    field-enrollment record that never became a working device should
+    leave no trace at all, not a permanently-revoked orphan).
+
+    Ownership + state check, mirroring `unbind_reservation`'s own
+    "only remove what THIS call is certain it owns" discipline - NEVER a
+    blind delete-by-activation_id:
+      - the record must still exist;
+      - its `activation_id` must match exactly (defensive - the digest
+        alone already identifies it uniquely in practice, since both
+        `credential` and `activation_id` are independently 128+ bits of
+        randomness, but this costs nothing and removes any doubt);
+      - `bound_devices` must be EMPTY. A record with any bound device
+        (even a PENDING one) was, or still is, in active use by SOME
+        request - possibly a concurrent one this rollback knows nothing
+        about - and must never be deleted out from under it. In the
+        specific field-enrollment call sequence this exists for, any
+        PENDING bind from THIS SAME failed attempt is already gone by the
+        time this runs (provision_with_activation's own unbind_reservation
+        already ran) - so an empty bound_devices list here means "this
+        record was created by register_credential moments ago and nothing
+        has touched it since," never "some other request's bind happened
+        to finish first."
+
+    Uses the SAME fixed lock order every other whole-activation mutation
+    in this module uses (per_activation_lock(digest) THEN the global
+    _exclusive_lock, never the reverse) - safe to call from
+    field_enrollment.py AFTER `provision_with_activation` has already
+    returned (that call's own per_activation_lock critical section has
+    fully exited by then, so this acquires a fresh one, never a nested
+    re-entrant one - re-entrant flock() on the same fd-less file from the
+    same process would otherwise self-deadlock).
+
+    Returns True if a record was actually removed, False if the ownership/
+    state check did not match (a safe no-op, not an error - the caller
+    should not treat False as a failure).
+    """
+    digest = credential_digest(credential)
+    with per_activation_lock(store_path, digest):
+        with _exclusive_lock(lock_path, create=False):
+            data = _read_and_validate_under_lock(store_path)
+            record = data.get(digest)
+            if record is None:
+                return False
+            if record["activation_id"] != activation_id:
+                return False
+            if record["bound_devices"]:
+                return False
+            del data[digest]
+            _atomic_write_store_or_raise(store_path, data)
+            return True
+
+
+def find_by_credential_digest(store_path, lock_path, digest):
+    """Read-only (LOCK_SH) lookup by an ALREADY-COMPUTED credential digest -
+    never takes a raw credential, matching every other read path's own
+    no-raw-credential discipline. Returns the record dict, or None."""
+    data = read_store_shared(store_path, lock_path)
+    return data.get(digest)
+
+
 def revoke_activation(store_path, lock_path, activation_id):
     """B8C1C: revoke must serialize with any in-flight provisioning for the
     SAME activation - otherwise a revoke could complete without a

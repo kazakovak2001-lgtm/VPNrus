@@ -37,6 +37,28 @@ class ProductFlowPresentationTest {
         assertEquals(AppScreen.HOME, screenFor(ProfileSource.PROVISIONED_LIVE))
     }
 
+    // Russia field-test zero-touch enrollment - ActivationScreen must never
+    // be reachable via screenFor when the build flag is set, regardless of
+    // profileSource (test #14: "ActivationScreen is not shown in release
+    // field flow").
+    @Test
+    fun `zero-touch build routes DEV_FALLBACK to HOME, never ACTIVATION`() {
+        assertEquals(AppScreen.HOME, screenFor(ProfileSource.DEV_FALLBACK, zeroTouchEnrollmentEnabled = true))
+    }
+
+    @Test
+    fun `zero-touch build still routes RESTORED_PERSISTED and PROVISIONED_LIVE to HOME`() {
+        assertEquals(AppScreen.HOME, screenFor(ProfileSource.RESTORED_PERSISTED, zeroTouchEnrollmentEnabled = true))
+        assertEquals(AppScreen.HOME, screenFor(ProfileSource.PROVISIONED_LIVE, zeroTouchEnrollmentEnabled = true))
+    }
+
+    @Test
+    fun `zero-touch disabled reproduces the ordinary screenFor decision byte-for-byte`() {
+        for (source in ProfileSource.entries) {
+            assertEquals(screenFor(source), screenFor(source, zeroTouchEnrollmentEnabled = false))
+        }
+    }
+
     // 4: activation credential cleared after success
     @Test
     fun `credential input is cleared only on Success, never on Idle, Provisioning, or an error`() {
