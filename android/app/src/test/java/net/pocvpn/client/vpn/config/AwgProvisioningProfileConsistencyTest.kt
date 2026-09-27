@@ -10,9 +10,11 @@ import java.io.File
  * (`gateway/config/awg-profile.env`, rendered into a NEW gateway's awg0.conf
  * by `gateway/provision.sh`) must carry the same AmneziaWG S1-S4/H1-H4 as the
  * profile the app ships ([ProductionGatewayCatalog], [PocAwgProfile]).
- * B8B3B found a mismatch in these fields to be a real handshake blocker; the
- * repo file had silently kept its original B5 values while both live
- * gateways and the app use the values below (read-only verified 2026-09-27).
+ * The repo file had kept its original B5 values while the current app and
+ * both live gateways use the values it now carries (read-only verified
+ * 2026-09-27). Historical project evidence (B8B3B, see [PocAwgProfile])
+ * indicates such a mismatch has caused AWG compatibility problems; no live
+ * handshake regression test was run for this check.
  *
  * Deliberately NOT compared here: Jc/Jmin/Jmax/RandomTrailers/DisableCookies
  * - live Frankfurt differs from the repo/app/Stockholm on those
