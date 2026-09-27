@@ -213,6 +213,12 @@ class AppConfig:
     hysteria2_lock_path: str = ""
     hysteria2_server_port: int = 0
     hysteria2_sni: str = ""
+    # B46-4P.2 - TCP port of the loopback-only auth backend
+    # (hysteria_auth_server.py; bind host is hard-coded 127.0.0.1 there, never
+    # configurable). 0 (the default) = disabled: the auth backend refuses to
+    # start. Optional and independent of the /v1/hysteria-profile group above,
+    # but when set it requires that whole group and must differ from api_port.
+    hysteria2_auth_backend_port: int = 0
 
 
 def _get(env, key):
@@ -734,6 +740,29 @@ def load_config(env=None):
         if any(ch.isspace() for ch in hysteria2_sni) or len(hysteria2_sni) > 253:
             raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SNI is not a plausible hostname: {hysteria2_sni!r}")
 
+    # B46-4P.2 - see AppConfig.hysteria2_auth_backend_port's own docs.
+    hysteria2_auth_backend_port_raw = _get(env, "HYSTERIA2_AUTH_BACKEND_PORT")
+    hysteria2_auth_backend_port = 0
+    if hysteria2_auth_backend_port_raw:
+        try:
+            hysteria2_auth_backend_port = int(hysteria2_auth_backend_port_raw)
+        except ValueError:
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT is not an integer: {hysteria2_auth_backend_port_raw!r}"
+            )
+        if not (1 <= hysteria2_auth_backend_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT out of range: {hysteria2_auth_backend_port}")
+        if not hysteria2_store_path:
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT is set but the Hysteria2 group "
+                f"({_ENV_PREFIX}HYSTERIA2_STORE_PATH etc.) is not configured"
+            )
+        if hysteria2_auth_backend_port == api_port:
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT must differ from {_ENV_PREFIX}API_PORT "
+                "- the auth backend is a separate loopback-only listener"
+            )
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -783,4 +812,5 @@ def load_config(env=None):
         hysteria2_lock_path=hysteria2_lock_path,
         hysteria2_server_port=hysteria2_server_port,
         hysteria2_sni=hysteria2_sni,
+        hysteria2_auth_backend_port=hysteria2_auth_backend_port,
     )

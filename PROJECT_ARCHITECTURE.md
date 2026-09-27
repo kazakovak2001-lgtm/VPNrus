@@ -3503,10 +3503,15 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 - Per-device wire secret: fresh 256-bit value per call (rotation), only a
   salted hash at rest (`hysteria_store.py`), returned once in the response,
   never logged. `verify_hysteria_auth` re-checks LIVE activation state and is
-  the future auth-backend's only authority; it has no running caller yet.
+  the auth backend's only authority.
+- Auth backend (B46-4P.2): `hysteria_auth_server.py` serves `POST /auth` on
+  the hard-coded `127.0.0.1` only (no host setting), port
+  `POCVPN_API_HYSTERIA2_AUTH_BACKEND_PORT` (0 = refuses to start; must differ
+  from `API_PORT`). Every failure path denies with the same body; logs never
+  carry the secret. Source only - no unit or process starts it.
 - Fail-closed: `503 hysteria_not_configured` unless the all-or-nothing
   `POCVPN_API_HYSTERIA2_{STORE_PATH,LOCK_PATH,SERVER_PORT,SNI}` group is set
   (blank by default). Not publicly reachable: no edge nginx location routes it.
-- Not deployed: no Hysteria2 server, auth listener, systemd unit, firewall
+- Not deployed: no Hysteria2 server, running auth listener, systemd unit, firewall
   rule, or signed `HYSTERIA2` binding exists; the Android client is unmerged
   (PR #111).
