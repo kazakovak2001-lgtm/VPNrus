@@ -784,7 +784,7 @@ force-stopped.
   (`xrayAvailableEndpoints`/`xrayTlsAvailableEndpoints`, `Set<EndpointId>`) - one
   endpoint's profile can never make a different endpoint appear available.
 
-## Field-test zero-touch enrollment (B67.4, Russia field test) - bounded, opt-in, FOUNDATION/PARTIAL until physically validated
+## Field-test zero-touch enrollment (B67.4) - bounded, opt-in, IMPLEMENTED (merged via PR #123) - PHYSICAL VALIDATION NOT CONFIRMED
 
 A separate, additive enrollment PATH onto the SAME `/v1/activate`
 entitlement model - never a second authorization system, and never a
@@ -1063,8 +1063,9 @@ unrelated, never-yet-dialed ingress candidate's own eligibility) exists in
 the field-test history this recovery is based on, with an additive,
 default-preserving fix already drafted - deliberately NOT ported here,
 since fixing Smart Connect eligibility is a separate concern from minting
-enrollment credentials and belongs with B67.7 (Smart Connect Integration,
-still PLANNED) rather than being folded into this slice.
+enrollment credentials and belongs with B67.7 (Smart Connect Integration -
+since IMPLEMENTED, see `docs/ROADMAP.md`'s B67.7 row and this file's B67.7
+section) rather than being folded into this slice.
 
 Not yet physically exercised end to end against a real field-test
 deployment (in particular, the ingress role's own
@@ -3092,13 +3093,18 @@ not implemented here.)
   consumer anywhere in the codebase (confirmed by search) - inert today, not
   an oversight to silently assume is wired.
 - **Multi-path CONTROL-PLANE/activation discovery across DIRECT/CHAIN_DIRECT/
-  CHAIN_CDN does not exist.** The existing `PathScorer`/`AutoGatewaySelector`
-  multi-path ranking is a DATA-PLANE (VPN transport/gateway) authority only
-  (see the Reachability/Smart Connect pipeline section at the top of this
-  file). `ControlPlaneOriginSetBuilder`/`TrustedOriginRequestExecutor` (B30)
-  only iterate origins WITHIN one already-known gateway's catalog entry - they
-  do not select among DIRECT/relay/CDN paths for reaching the control plane
-  itself. B67.2 is genuinely unimplemented, not a rename of existing code.
+  CHAIN_CDN (B67.2) is now a real, merged composition layer - see the "Multi-Path
+  Activation Discovery (B67.2)" section below for the full mechanism.** At the
+  time this bullet was first written (2026-09-26), it was genuinely
+  unimplemented; as of the B67.2 slice it is FOUNDATION/PARTIAL: the
+  `ActivationPathCandidateBuilder`/`ActivationPathOriginSetBuilder` composition
+  mechanism is real and tested, but no trusted CHAIN_DIRECT/CHAIN_CDN
+  control-plane origin is deployed, so real production activation traffic
+  stays DIRECT-only today. The existing `PathScorer`/`AutoGatewaySelector`
+  multi-path ranking remains a separate, DATA-PLANE (VPN transport/gateway)
+  authority (see the Reachability/Smart Connect pipeline section at the top of
+  this file) and shares no type with the activation/control-plane path
+  vocabulary.
 - **B63 (In-App Support & Diagnostics) reuses the existing B29 diagnostics
   stack** (`SupportDiagnosticsRecorder`/`DiagnosticSession`/`SupportBundle`/
   `DiagnosticSanitizer`/`DiagnosticsDialog`, all present at HEAD) - no support
