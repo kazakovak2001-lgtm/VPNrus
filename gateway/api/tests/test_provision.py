@@ -90,6 +90,19 @@ class ProvisionSubprocessTests(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz012345", ctx.exception.stderr)
         self.assertIn("Bearer [REDACTED]", ctx.exception.stderr)
 
+    def test_non_zero_exit_stderr_preserves_filesystem_paths(self):
+        # Regression test: an absolute path is long and contains '/', but is
+        # NOT a secret - it must survive sanitization intact, in full,
+        # exactly as lib/peer_mutations.sh's own die() messages emit it
+        # (e.g. find_existing_peer/mutate_add_peer's "gateway config not
+        # found at $config_path" - see gateway/lib/peer_mutations.sh).
+        message = "gateway config not found at /etc/amnezia/amneziawg/awg0.conf - run provision.sh first"
+        set_plan(self.plan_path, "EXIT_STDERR", message)
+        with self.assertRaises(provision_module.ProvisionError) as ctx:
+            provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)
+        self.assertIn("/etc/amnezia/amneziawg/awg0.conf", ctx.exception.stderr)
+        self.assertNotIn("[REDACTED]", ctx.exception.stderr)
+
     def test_success_and_timeout_do_not_populate_exit_code_or_stderr(self):
         set_plan(self.plan_path, "CREATED", "10.77.0.5")
         provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)  # no raise - nothing to assert on the outcome

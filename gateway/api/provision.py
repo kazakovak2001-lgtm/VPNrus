@@ -52,17 +52,32 @@ _STDOUT_LINE_RE = re.compile(r"^(created|existing)\t(\d{1,3}\.\d{1,3}\.\d{1,3}\.
 _SUDO_NONINTERACTIVE_FLAG = "-n"
 
 # Diagnostic-only stderr sanitization (observability boundary - see
-# ProvisionError.stderr's own docs). Matches anything shaped like a secret
-# this process must never log: an activation credential
-# (secrets.token_urlsafe(32) -> 43 URL-safe-base64 chars), a WireGuard/
-# AmneziaWG public or private key (32 raw bytes, standard base64 -> 44
-# chars incl. trailing '='), or any other long base64-ish run that could be
-# a bearer/token value provision-peer.sh's own stderr was never meant to
-# carry but a future change or an unexpected upstream tool might emit
-# anyway - fail closed by redacting the shape, not by trying to enumerate
-# every exact secret type. 20 chars is comfortably below the shortest real
-# secret here (43) while still not catching ordinary short words/paths.
-_SENSITIVE_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_-]{20,}={0,2}")
+# ProvisionError.stderr's own docs). Two DISTINCT patterns, not one
+# open-ended "long run" heuristic - the original single-regex version
+# (`[A-Za-z0-9+/_-]{20,}={0,2}`) allowed '/' in its character class, which
+# made it swallow an entire filesystem path (e.g.
+# "/etc/amnezia/amneziawg/awg0.conf", every character of which except '.'
+# is in that class) as one giant "token", destroying exactly the
+# diagnostic value this field exists for. Fixed by anchoring the two REAL
+# secret shapes this process can ever produce to their EXACT lengths
+# (never "20+"), and keeping '/' ONLY in the one pattern that genuinely
+# needs it for real base64 key data:
+#
+#   - WireGuard/AmneziaWG public or private key: 32 raw bytes, standard
+#     base64 -> EXACTLY 44 chars, always ending in exactly one '=' pad
+#     character. A real filesystem path essentially never ends in a bare
+#     '=' immediately followed by a non-base64 character, so anchoring to
+#     this exact shape is what makes it safe to allow '/' here at all.
+#   - Any other genuinely token/key-like value (activation credentials -
+#     secrets.token_urlsafe(32) -> EXACTLY 43 URL-safe-base64 chars, never
+#     containing '/' or '.' - and any future similarly-shaped secret this
+#     process was never meant to log). This pattern deliberately EXCLUDES
+#     '/' and '.' from its character class: a filesystem path is
+#     fundamentally '/'-and-'.'-structured, so a charset that can never
+#     contain either can never absorb one, no matter how long the path is.
+#     This is what fixes the awg0.conf false positive above.
+_WG_KEY_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{43}=(?![A-Za-z0-9+/=])")
+_GENERIC_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])")
 _BEARER_HEADER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 
 _MAX_DIAGNOSTIC_STDERR_CHARS = 2000
@@ -78,7 +93,8 @@ def _sanitize_diagnostic_stderr(stderr):
     if not stderr:
         return ""
     sanitized = _BEARER_HEADER_RE.sub("Bearer [REDACTED]", stderr)
-    sanitized = _SENSITIVE_TOKEN_RE.sub("[REDACTED]", sanitized)
+    sanitized = _WG_KEY_RE.sub("[REDACTED]", sanitized)
+    sanitized = _GENERIC_TOKEN_RE.sub("[REDACTED]", sanitized)
     sanitized = " ".join(sanitized.split())
     if len(sanitized) > _MAX_DIAGNOSTIC_STDERR_CHARS:
         sanitized = sanitized[:_MAX_DIAGNOSTIC_STDERR_CHARS] + "...[truncated]"
