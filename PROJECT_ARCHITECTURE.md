@@ -3523,10 +3523,12 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   `gateway/api/exit_target_policy.py` (IPv4 + IPv6 CIDRs). Never add
   `::ffff:0:0/96` (Go treats it as 0.0.0.0/0); IPv4-mapped space is judged
   by the IPv4 list.
-- Xray exit: `xray_config_renderer.render_server_config` renders the policy
-  as explicit `freedom.settings.finalRules` (single `block` rule, all
-  networks/ports). Enforcement is at dial time on the RESOLVED IP (hostname
-  destinations included). Xray ingress configs have no freedom outbound.
+- Xray exit: `xray_config_renderer.render_server_config` enforces it twice:
+  a routing field rule (`domainStrategy: AsIs` - never resolves public
+  domains) sends literal blocked IPs to the `exit-acl-block` blackhole
+  outbound, and `freedom.settings.finalRules` blocks at dial time on the
+  RESOLVED IP (hostname destinations included). `direct` stays the first
+  (default) outbound. Xray ingress configs have no freedom outbound.
 - AWG exit: `gateway/nftables/pocvpn.nft.template` sets `exit_blocked_v4/v6`
   must equal the Python policy (test-enforced); forward chain order is
   `ct established,related accept` -> tunnel-ingress reject to the sets ->

@@ -143,43 +143,87 @@ class XrayRenderingTests(unittest.TestCase):
             private_key="A" * 43, short_ids=("ab12cd34",),
         )
 
-    def _outbounds(self, **kwargs):
-        return renderer.render_server_config({}, {}, self.reality, **kwargs)["outbounds"]
+    def _config(self, **kwargs):
+        return renderer.render_server_config({}, {}, self.reality, **kwargs)
 
-    def test_single_freedom_outbound_carries_the_policy_as_one_block_rule(self):
-        outbounds = self._outbounds()
-        self.assertEqual(len(outbounds), 1)
-        direct = outbounds[0]
-        self.assertEqual((direct["tag"], direct["protocol"]), ("direct", "freedom"))
-        rules = direct["settings"]["finalRules"]
+    def _blocked_by_rendered_config(self, address):
+        """Evaluates the RENDERED config (not the policy module): is [address]
+        inside the routing->blackhole rule's CIDRs AND the freedom finalRules
+        block CIDRs? (IPv4-mapped judged by its IPv4, as xray-core does.)"""
+        config = self._config()
+        ip = ipaddress.ip_address(address)
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+
+        def inside(cidrs):
+            return any(ip in n for n in map(ipaddress.ip_network, cidrs) if n.version == ip.version)
+
+        routing = [r for r in config["routing"]["rules"] if r["outboundTag"] == policy.XRAY_BLOCK_OUTBOUND_TAG]
+        final = config["outbounds"][0]["settings"]["finalRules"]
+        return inside(routing[0]["ip"]), inside(final[0]["ip"])
+
+    def test_required_targets_blocked_at_routing_and_at_dial(self):
+        for address in ("127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+                        "100.64.0.1", "::1", "fc00::1", "fe80::1", "::ffff:169.254.169.254"):
+            self.assertEqual(self._blocked_by_rendered_config(address), (True, True), address)
+
+    def test_public_targets_allowed_at_both_layers(self):
+        for address in ("1.1.1.1", "8.8.8.8", "16.170.208.231", "2606:4700::1111",
+                        "2001:4860:4860::8888", "::ffff:1.1.1.1"):
+            self.assertEqual(self._blocked_by_rendered_config(address), (False, False), address)
+
+    def test_ipv4_mapped_rule_cannot_swallow_ipv4(self):
+        config = json.dumps(self._config())
+        self.assertNotIn("::ffff:", config)
+        for cidr in self._config()["routing"]["rules"][0]["ip"]:
+            net = ipaddress.ip_network(cidr)
+            self.assertFalse(net.version == 6 and net.overlaps(ipaddress.ip_network("::ffff:0:0/96")), cidr)
+
+    def test_direct_stays_first_default_outbound_and_blackhole_is_second(self):
+        outbounds = self._config()["outbounds"]
+        self.assertEqual([(o["tag"], o["protocol"]) for o in outbounds],
+                         [("direct", "freedom"), (policy.XRAY_BLOCK_OUTBOUND_TAG, "blackhole")])
+        self.assertEqual(set(outbounds[1]), {"tag", "protocol"})
+
+    def test_routing_is_only_the_acl_rule_and_does_not_resolve_domains(self):
+        routing = self._config()["routing"]
+        self.assertEqual(routing["domainStrategy"], "AsIs")
+        self.assertEqual(routing["rules"], [{
+            "type": "field",
+            "ip": list(policy.BLOCKED_IPV4_CIDRS + policy.BLOCKED_IPV6_CIDRS),
+            "outboundTag": policy.XRAY_BLOCK_OUTBOUND_TAG,
+        }])
+        for key in ("domain", "port", "network", "inboundTag", "protocol", "user"):
+            self.assertNotIn(key, routing["rules"][0])
+
+    def test_freedom_final_rule_is_one_block_for_every_network_and_port(self):
+        rules = self._config()["outbounds"][0]["settings"]["finalRules"]
         self.assertEqual(rules, [{"action": "block", "ip": list(policy.BLOCKED_IPV4_CIDRS + policy.BLOCKED_IPV6_CIDRS)}])
+        for key in ("network", "port", "blockDelay"):
+            self.assertNotIn(key, rules[0])
 
-    def test_rule_applies_to_every_network_and_port(self):
-        rule = self._outbounds()[0]["settings"]["finalRules"][0]
-        self.assertNotIn("network", rule)
-        self.assertNotIn("port", rule)
-        self.assertNotIn("blockDelay", rule)
-
-    def test_no_allow_rule_precedes_or_follows_the_block(self):
-        actions = [r["action"] for r in self._outbounds()[0]["settings"]["finalRules"]]
-        self.assertEqual(actions, ["block"])
-
-    def test_same_policy_with_tls_and_xhttp_inbounds(self):
+    def test_same_acl_with_tls_and_xhttp_inbounds(self):
         tls = renderer.TlsServerConfig(listen_port=2083, cert_file="/etc/x/c.pem", key_file="/etc/x/k.pem")
-        self.assertEqual(self._outbounds(tls=tls), self._outbounds())
+        with_tls = self._config(tls=tls)
+        base = self._config()
+        self.assertEqual(with_tls["outbounds"], base["outbounds"])
+        self.assertEqual(with_tls["routing"], base["routing"])
 
-    def test_transport_behaviour_untouched(self):
-        outbound = self._outbounds()[0]
-        self.assertEqual(set(outbound), {"tag", "protocol", "settings"})
-        self.assertEqual(set(outbound["settings"]), {"finalRules"})
+    def test_transport_and_logging_untouched(self):
+        config = self._config()
+        self.assertEqual(config["log"], {"loglevel": "warning"})
+        self.assertEqual(set(config), {"log", "inbounds", "outbounds", "routing"})
+        freedom = config["outbounds"][0]
+        self.assertEqual(set(freedom["settings"]), {"finalRules"})
         for key in ("domainStrategy", "targetStrategy", "redirect", "fragment", "noises", "ipsBlocked"):
-            self.assertNotIn(key, outbound["settings"])
+            self.assertNotIn(key, freedom["settings"])
+        for inbound in config["inbounds"]:
+            self.assertNotIn("sniffing", inbound)
 
     def test_deterministic_and_json_serializable(self):
-        a = json.dumps(renderer.render_server_config({}, {}, self.reality), sort_keys=True)
-        b = json.dumps(renderer.render_server_config({}, {}, self.reality), sort_keys=True)
+        a = json.dumps(self._config(), sort_keys=True)
+        b = json.dumps(self._config(), sort_keys=True)
         self.assertEqual(a, b)
-        self.assertNotIn("::ffff:", a)
 
 
 class NftablesTemplateTests(unittest.TestCase):

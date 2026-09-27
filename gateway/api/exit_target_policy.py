@@ -66,6 +66,19 @@ def is_blocked(address):
     return any(ip in net for net in BLOCKED_NETWORKS if net.version == ip.version)
 
 
+XRAY_BLOCK_OUTBOUND_TAG = "exit-acl-block"
+
+
+def xray_routing_block_rule():
+    """Xray-core routing field rule: literal blocked-IP destinations -> the
+    blackhole outbound (infra/conf/router.go `ip` CIDR list)."""
+    return {
+        "type": "field",
+        "ip": list(BLOCKED_IPV4_CIDRS + BLOCKED_IPV6_CIDRS),
+        "outboundTag": XRAY_BLOCK_OUTBOUND_TAG,
+    }
+
+
 def xray_freedom_final_rules():
     """Xray-core `freedom.settings.finalRules` (pinned v26.7.28,
     infra/conf/freedom.go FreedomFinalRuleConfig): one block rule, every
