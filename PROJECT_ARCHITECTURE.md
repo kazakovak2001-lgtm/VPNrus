@@ -3305,11 +3305,14 @@ or moved, and no commercial/billing/subscription concept of any kind.
   policy (`AwgXrayFailoverPolicy`, commit `a2e4a77`) is NOT part of this
   baseline - it exists only on a separate, not-yet-reconciled branch
   (`b66-18-awg-xhttp-failover`) and is out of scope for this reconciliation
-  pass; do not assume it is wired here. B-WL2 does not build XHTTP - it
-  gives `PathScorer` a scoring
-  adjustment that favors an already-reachable XRAY_XHTTP candidate under
-  B-WL1's UDP-filtering/possible-whitelist evidence, never a hardcoded
-  "restricted implies XHTTP" branch and never XHTTP as the sole candidate.
+  pass; do not assume it is wired here. B-WL2 does not build XHTTP; its
+  ranking role is B-WL5's `PathScorer.restrictionPreference` (in source):
+  under `POSSIBLE_UDP_FILTERING` the only profile declaring
+  `suitableForRestrictiveNetworks` (`XRAY_XHTTP`) gets +1 and UDP-only -1,
+  never a hardcoded "restricted implies XHTTP" branch, never XHTTP as the
+  sole candidate, never above health/reachability/history - pinned by
+  `XhttpRestrictedNetworkPreferenceTest`. `POSSIBLE_HARD_WHITELIST` stays
+  relay-vs-direct only (B28). Field effect UNVERIFIED.
 - **`CdnProviderCapabilityProfile`/`CdnProviderProfileMetadata`** (B35,
   `reachability/` package) already model a provider-agnostic front/CDN
   capability set (provider identity is a data field, never a hardcoded
