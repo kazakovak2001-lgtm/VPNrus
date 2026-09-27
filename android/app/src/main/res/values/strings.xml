@@ -116,6 +116,13 @@
          (see ActivationScreen's onCancel param); the mandatory first-run
          activation path never passes onCancel, so never shows this. -->
     <string name="activation_cancel_button">Cancel</string>
+    <!-- B-ACT-IMPORT - primary, no-Base64-handling import entry points; the
+         text field above becomes the fallback/admin/recovery path once
+         these are shown (see ActivationScreen's own docs). -->
+    <string name="activation_scan_qr_button">Scan QR code</string>
+    <string name="activation_choose_file_button">Choose activation file</string>
+    <string name="activation_paste_fallback_label">Or paste it manually</string>
+    <string name="activation_qr_not_available">QR scanning is not available in this build yet.</string>
 
     <!-- Diagnostics dialog (debug builds only) -->
     <string name="diagnostics_title">Diagnostics</string>

@@ -3463,3 +3463,32 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Gradle/JVM test run was performed in this pass - see `docs/ROADMAP.md`'s
   B-WL row for why (pre-existing environment limitation, reproduces
   identically on unmodified `main`).
+
+## Activation Import Layer (2026-09-27, source-adapter boundary, no new trust root)
+
+- **`ActivationInput`/`ActivationInputResolution`/`ActivationInputResolver`**
+  (`net.pocvpn.client.activation.ActivationInput.kt`) is a pure-JVM,
+  zero-crypto normalization layer sitting IN FRONT OF the existing
+  `ActivationPackageImporter`/`ActivationPackageRedeemer` pipeline
+  (unchanged) - it turns a raw source (pasted text, a SAF-picked file's UTF-8
+  content, a scanned QR payload, an incoming HTTPS App Link) into either a
+  `Ready(ActivationPackageInput.Text)` (which `MainViewModel.submitActivationInput`
+  forwards to the SAME `importActivationPackage()` the paste path already
+  calls), a `NeedsHandoff(token)` (an App Link/QR-URL resolved to a
+  well-formed one-time token, but no backend endpoint exists yet to exchange
+  it for a package - surfaced as "not yet supported", NEVER treated as
+  trusted), or a `Rejected(reason)` (the raw input's own shape was unusable -
+  before the crypto pipeline is ever reached).
+- **No new trust root, no new verifier, no duplicated signature/issuer/
+  expiry/replay/eligibility logic** - every adapter's only job ends at
+  producing plain text for the EXISTING `ActivationPackageInput.Text`.
+- **File import** (`ACTION_OPEN_DOCUMENT`, `MainActivity`) and **App Link**
+  plumbing (`AndroidManifest.xml`'s `MainActivity` intent-filter,
+  `android:autoVerify="true"`, exact host+pathPrefix literals - never a
+  wildcard) are real and wired. **QR camera capture and the one-time
+  handoff backend endpoint are NOT implemented** - see
+  `docs/ACTIVATION_HANDOFF_CONTRACT.md` for the full design contract, exact
+  host TODO, and `assetlinks.json` template. `ActivationScreen`'s manual
+  paste field remains the fallback/admin/recovery path, unchanged in
+  behavior; the relayed-ingress `ActivationScreen` reuse (a different bearer
+  credential, never a `NovaActivationPackage`) is untouched.

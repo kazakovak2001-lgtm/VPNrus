@@ -48,6 +48,17 @@ fun ActivationScreen(
     isSubmitting: Boolean,
     modifier: Modifier = Modifier,
     onCancel: (() -> Unit)? = null,
+    // B-ACT-IMPORT - the manual paste field above stays the fallback/admin/
+    // recovery path (see ActivationInputResolver's own module docs); these
+    // two are the primary, no-Base64-handling entry points for an ordinary
+    // user. Both null by default so every pre-existing call site (the
+    // relayed-ingress ActivationScreen reuse, which activates a DIFFERENT
+    // bearer credential and never handles a NovaActivationPackage at all) is
+    // byte-for-byte unaffected. Neither performs any validation itself -
+    // both only ever end up calling the SAME onActivateClick-adjacent
+    // MainViewModel entry point the paste path already uses.
+    onChooseFileClick: (() -> Unit)? = null,
+    onScanQrClick: (() -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -75,6 +86,43 @@ fun ActivationScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(modifier = Modifier.height(28.dp))
+
+        if (onScanQrClick != null || onChooseFileClick != null) {
+            if (onScanQrClick != null) {
+                Button(
+                    onClick = onScanQrClick,
+                    enabled = !isSubmitting,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                    ),
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                ) {
+                    Text(stringResource(R.string.activation_scan_qr_button))
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+            if (onChooseFileClick != null) {
+                Button(
+                    onClick = onChooseFileClick,
+                    enabled = !isSubmitting,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary,
+                        contentColor = MaterialTheme.colorScheme.onSecondary,
+                    ),
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                ) {
+                    Text(stringResource(R.string.activation_choose_file_button))
+                }
+            }
+            Spacer(modifier = Modifier.height(20.dp))
+            Text(
+                text = stringResource(R.string.activation_paste_fallback_label),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         OutlinedTextField(
             value = credential,

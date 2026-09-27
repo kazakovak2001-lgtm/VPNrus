@@ -124,7 +124,25 @@ fun mapRestrictionClassToFailureReason(restrictionClass: RestrictionClass): Diag
     RestrictionClass.NETWORK_RECOVERING,
     RestrictionClass.NO_RESTRICTION_OBSERVED,
     RestrictionClass.UNKNOWN,
+    // B-WL1 - all three are behavior-derived (only ever produced from real
+    // RestrictionEvidence.transportObservations AFTER at least one transport
+    // attempt has already run - see RestrictionClassifier's own docs for
+    // each), so they are structurally unreachable via THIS mapper's own
+    // documented scope above ("a session that never even reached the point
+    // of building combined attempts"). Grouped with the other
+    // not-applicable-here classes above rather than guessed at with an
+    // invented DiagnosticFailureReason severity this mapper's callers never
+    // established.
+    RestrictionClass.POSSIBLE_EARLY_DROP,
+    RestrictionClass.POSSIBLE_FULL_SHUTDOWN,
     -> null
+    // POSSIBLE_UDP_FILTERING is an explicit UDP-specific REFINEMENT of the
+    // existing POSSIBLE_UDP_OR_AWG_FILTERING rule (see RestrictionClassifier's
+    // own priority-order docs: "checked before the existing rule 8
+    // (POSSIBLE_UDP_OR_AWG_FILTERING), which it refines") - reuses that
+    // rule's own already-established DiagnosticFailureReason, never a new,
+    // independently-guessed one.
+    RestrictionClass.POSSIBLE_UDP_FILTERING -> DiagnosticFailureReason.PROTOCOL_OR_TRANSPORT_BLOCKED
 }
 
 /**

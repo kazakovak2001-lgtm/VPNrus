@@ -2669,6 +2669,61 @@ class MainViewModel(
      */
     private var currentEntitlementEligibleGatewayIds: Set<net.pocvpn.client.vpn.config.ProductionGatewayId>? = null
 
+    // B-ACT-IMPORT - adapter-level UI state (file/QR/App Link input shape),
+    // deliberately SEPARATE from [_activationPackageState] above - see
+    // ActivationInputAdapterUiState's own docs for why this must never be
+    // confused with a crypto/trust verdict.
+    private val _activationInputAdapterState = MutableStateFlow<net.pocvpn.client.activation.ActivationInputAdapterUiState>(
+        net.pocvpn.client.activation.ActivationInputAdapterUiState.Idle,
+    )
+    val activationInputAdapterState: StateFlow<net.pocvpn.client.activation.ActivationInputAdapterUiState> = _activationInputAdapterState.asStateFlow()
+
+    /**
+     * B-ACT-IMPORT - the ONE entry point every non-paste adapter (file, QR,
+     * App Link - see MainActivity/AppRoot's own wiring) calls. [resolution]
+     * was already produced by [net.pocvpn.client.activation.ActivationInputResolver]
+     * (pure shape-checking only, zero crypto) - this function does exactly
+     * ONE of three things:
+     *
+     * - [net.pocvpn.client.activation.ActivationInputResolution.Ready] -
+     *   forwards the SAME [net.pocvpn.client.activation.ActivationPackageInput.Text]
+     *   the existing paste path already builds into [importActivationPackage]
+     *   below - the EXISTING signature/issuer/expiry/replay/eligibility
+     *   pipeline runs completely unchanged from this point on.
+     * - [net.pocvpn.client.activation.ActivationInputResolution.NeedsHandoff] -
+     *   surfaces "not yet supported" (see docs/ACTIVATION_HANDOFF_CONTRACT.md)
+     *   - NEVER makes up a network call, NEVER treats the token as a package.
+     * - [net.pocvpn.client.activation.ActivationInputResolution.Rejected] -
+     *   surfaces the adapter-level reason - never reaches the crypto pipeline
+     *   at all.
+     */
+    fun submitActivationInput(
+        resolution: net.pocvpn.client.activation.ActivationInputResolution,
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId = selectedGateway.value,
+    ) {
+        when (resolution) {
+            is net.pocvpn.client.activation.ActivationInputResolution.Ready -> {
+                _activationInputAdapterState.value = net.pocvpn.client.activation.ActivationInputAdapterUiState.Idle
+                when (val pkgInput = resolution.input) {
+                    is net.pocvpn.client.activation.ActivationPackageInput.Text -> importActivationPackage(pkgInput.text, targetGatewayId)
+                    is net.pocvpn.client.activation.ActivationPackageInput.Bytes -> {
+                        // No adapter produces Bytes today (File/QR/AppLink all
+                        // resolve to Text) - kept exhaustive as a structural
+                        // safeguard against a future adapter silently bypassing
+                        // this state update, never reached in practice.
+                        _activationInputAdapterState.value = net.pocvpn.client.activation.ActivationInputAdapterUiState.Rejected(
+                            net.pocvpn.client.activation.ActivationInputRejectionReason.FILE_UNREADABLE,
+                        )
+                    }
+                }
+            }
+            is net.pocvpn.client.activation.ActivationInputResolution.NeedsHandoff ->
+                _activationInputAdapterState.value = net.pocvpn.client.activation.ActivationInputAdapterUiState.HandoffNotSupported(resolution.token)
+            is net.pocvpn.client.activation.ActivationInputResolution.Rejected ->
+                _activationInputAdapterState.value = net.pocvpn.client.activation.ActivationInputAdapterUiState.Rejected(resolution.reason)
+        }
+    }
+
     /** QR / deep link / clipboard / manual entry all arrive here as text; the source confers no trust. */
     fun importActivationPackage(
         packageText: String,

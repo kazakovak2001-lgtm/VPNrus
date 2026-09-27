@@ -30,6 +30,32 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- B-ACT-IMPORT - Android App Link for activation handoff. HTTPS
+                 ONLY (never a custom URI scheme as the production mechanism -
+                 see ActivationInputResolver's own docs), one explicit
+                 production host, one explicit path prefix - never a
+                 wildcard host/path. android:autoVerify requires a matching
+                 assetlinks.json served from this exact host at
+                 /.well-known/assetlinks.json (see
+                 docs/ACTIVATION_HANDOFF_CONTRACT.md) - until that is
+                 published, Android silently falls back to showing a disambig
+                 chooser instead of auto-opening this app, which is a safe,
+                 non-broken degraded state, never a security issue.
+                 ActivationInputResolver.resolveAppLinkUrl re-validates this
+                 SAME host/path at runtime - the manifest filter and the
+                 resolver are deliberately kept in sync by both existing as
+                 explicit literals, never a wildcard either side could drift
+                 out of matching. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="activate.aknova.pp.ua"
+                    android:pathPrefix="/a/" />
+            </intent-filter>
         </activity>
 
         <service
