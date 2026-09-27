@@ -61,10 +61,11 @@ class VpnControllerLiveProgressObservationTest {
         transport: FakeVpnTransport,
         store: TransportObservationStore?,
         scope: kotlinx.coroutines.CoroutineScope,
+        reconnectManager: FakeReconnectManager = FakeReconnectManager(),
     ) = VpnController(
         transport, FakeClientKeyRepository(),
         FakeGatewayConfigurationRepository(configuredGateway()),
-        FakeReconnectManager(), DiagnosticsStore(), scope,
+        reconnectManager, DiagnosticsStore(), scope,
         transportObservationStore = store,
         fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
         networkProfileProvider = { fakeUsableNetworkProfile },
@@ -192,5 +193,36 @@ class VpnControllerLiveProgressObservationTest {
         // Exactly one observation for the SECOND attempt - the first
         // sampler's job was cancelled, never raced a second write in.
         assertEquals(1, store.recent(fingerprint()).size)
+    }
+
+    @Test
+    fun `an automatic network-loss reconnect cancels the still-running sampler - no stale evidence from the outage`() = runTest {
+        val transport = FakeVpnTransport() // flat (0, 0) - sampler would otherwise reach IDLE at 20s
+        val store = TransportObservationStore()
+        val reconnectManager = FakeReconnectManager()
+        val controller = newController(transport, store, backgroundScope, reconnectManager)
+
+        controller.connect()
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Connected)
+        advanceTimeBy(1_000) // sampler is running, well before its 20s decisive point
+        runCurrent()
+
+        // B-WL7 review fix - handleNetworkLost() -> startReconnect() must
+        // cancel the STILL-RUNNING sampler from the attempt just superseded,
+        // exactly like disconnect()/a new connect() already do.
+        reconnectManager.triggerNetworkLost()
+        runCurrent()
+
+        // Network never comes back in this test, so reconnectLoop just backs
+        // off (never reaches awaitFreshHandshake/records its own outcome) -
+        // well past the 20s the ORIGINAL sampler needed to conclude IDLE and
+        // write, but nothing is ever recorded, because that sampler was
+        // cancelled instead of running to completion against a transport
+        // that is no longer part of a valid session.
+        advanceTimeBy(30_001)
+        runCurrent()
+
+        assertTrue(store.recent(fingerprint()).isEmpty())
     }
 }

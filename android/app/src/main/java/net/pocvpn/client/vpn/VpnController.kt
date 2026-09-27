@@ -1709,6 +1709,18 @@ class VpnController(
     private fun startReconnect(restartImmediately: Boolean) {
         synchronized(reconnectOwnershipLock) {
             reconnectJob?.cancel()
+            // B-WL7 review fix - an automatic recovery cycle (handleNetworkLost/
+            // handleUnderlyingNetworkChanged) supersedes the PREVIOUS attempt's
+            // live-progress sampler exactly like every other "this attempt is
+            // over" point already does (cancelReconnectLocked/
+            // cancelReconnectForExplicitConnect/shutdown) - AmneziaWG's
+            // in-place recovery never disconnects activeTransport, so without
+            // this a stale sampler would otherwise keep polling the SAME
+            // instance through the outage and could write a real handshake's
+            // evidence using counters captured during a DIFFERENT (recovering)
+            // session.
+            progressObservationJob?.cancel()
+            progressObservationJob = null
             val generation = ++reconnectGeneration
             reconnectJob = scope.launch { reconnectLoop(generation, restartImmediately) }
         }
