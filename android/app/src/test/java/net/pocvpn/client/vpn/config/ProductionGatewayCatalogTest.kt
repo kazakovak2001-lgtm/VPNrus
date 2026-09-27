@@ -1,5 +1,6 @@
 package net.pocvpn.client.vpn.config
 
+import net.pocvpn.client.reachability.EndpointId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -101,5 +102,18 @@ class ProductionGatewayCatalogTest {
         // will (correctly) start failing and must be revisited, not
         // silently left green.
         assertEquals(ProductionGatewayId.GERMANY, id)
+    }
+
+    // --- B67.6: EndpointId -> ProductionGatewayId reverse lookup (local/product policy input) ---
+
+    @Test
+    fun `byEndpointId resolves each real gateway's own endpointId`() {
+        assertEquals(ProductionGatewayId.GERMANY, ProductionGatewayCatalog.byEndpointId(ProductionGatewayCatalog.GERMANY.endpointId))
+        assertEquals(ProductionGatewayId.STOCKHOLM, ProductionGatewayCatalog.byEndpointId(ProductionGatewayCatalog.STOCKHOLM.endpointId))
+    }
+
+    @Test
+    fun `byEndpointId returns null for an EndpointId this catalog does not carry - never guessed`() {
+        assertNull(ProductionGatewayCatalog.byEndpointId(EndpointId("stockholm-ingress-1")))
     }
 }

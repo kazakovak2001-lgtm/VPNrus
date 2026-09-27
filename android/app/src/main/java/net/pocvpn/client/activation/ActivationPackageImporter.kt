@@ -19,6 +19,17 @@ enum class ActivationPackageRejectionKind {
     ALREADY_REDEEMED,
     BOOTSTRAP_BUNDLE_MISMATCH,
     BOOTSTRAP_BUNDLE_INVALID,
+
+    /**
+     * B67.6 - the envelope's signed [ActivationEnvelope.bootstrapEndpointHints]
+     * named no gateway this device can currently use: either nothing is
+     * trusted right now (no manifest), none of the hinted endpoints appear
+     * in the currently trusted manifest, or none of the trusted hints map to
+     * a product-supported gateway. Never reached for an envelope with no
+     * hints at all (see [EntitlementScope.Unscoped]) - only for one that
+     * carries a scope this device cannot currently satisfy.
+     */
+    GATEWAY_NOT_ELIGIBLE,
 }
 
 /** What happened to the package's network facts - reported explicitly, never implied. */

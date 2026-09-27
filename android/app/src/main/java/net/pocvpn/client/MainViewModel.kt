@@ -2609,6 +2609,38 @@ class MainViewModel(
         MutableStateFlow<net.pocvpn.client.activation.ActivationPackageUiState>(net.pocvpn.client.activation.ActivationPackageUiState.Idle)
     val activationPackageState: StateFlow<net.pocvpn.client.activation.ActivationPackageUiState> = _activationPackageState.asStateFlow()
 
+    /**
+     * B67.7 - the most recently resolved B67.6 eligibility constraint,
+     * applied as an additional narrowing filter on top of Smart Connect's
+     * own trusted-manifest/provisioned gating (see
+     * [currentEligibilityFilteredManifestEndpoints]) - never a replacement
+     * for either. IN-MEMORY ONLY, never persisted: a process restart
+     * always restores `null` (no constraint), exactly mirroring
+     * [net.pocvpn.client.activation.ActivationPackageRedeemer]'s own
+     * "pending state is never persisted, restart requires re-import"
+     * discipline - a stale restriction can never survive a restart.
+     * `null` means [net.pocvpn.client.activation.EntitlementScope.Unscoped]
+     * (or "no package with a resolved hint has SUCCEEDED this process
+     * yet") - the pre-B67.7 candidate list, byte for byte. Set ONLY after
+     * [activateDeviceAwaiting] genuinely reports
+     * [net.pocvpn.client.activation.ActivationAttemptOutcome.SUCCEEDED] for
+     * a [net.pocvpn.client.activation.EntitlementScope.Hinted] redemption -
+     * deliberately NOT at eligibility-resolution time. Resolving eligible
+     * does not itself prove entitlement: a locally-valid envelope can still
+     * be rejected server-side (revoked/expired/device-limit -
+     * `ActivationResilienceCoordinator`'s existing AUTHORIZATION_REJECTED
+     * taxonomy, unchanged), and a rejected/network-failed attempt must
+     * never narrow Smart Connect for gateways this device is genuinely
+     * already provisioned for from an earlier, real activation - the exact
+     * regression a resolution-time write would silently introduce. An
+     * [net.pocvpn.client.activation.EntitlementScope.Unscoped] redemption
+     * (legacy credential, B67.4's own field-enrolled credential) never
+     * touches this field at all, at any outcome, so it can never
+     * accidentally narrow Smart Connect to whatever gateway it happened to
+     * explicitly target.
+     */
+    private var currentEntitlementEligibleGatewayIds: Set<net.pocvpn.client.vpn.config.ProductionGatewayId>? = null
+
     /** QR / deep link / clipboard / manual entry all arrive here as text; the source confers no trust. */
     fun importActivationPackage(
         packageText: String,
@@ -2620,10 +2652,15 @@ class MainViewModel(
             return
         }
         viewModelScope.launch {
+            var resolvedScope: net.pocvpn.client.activation.EntitlementScope = net.pocvpn.client.activation.EntitlementScope.Unscoped
             redeemer.redeem(
                 net.pocvpn.client.activation.ActivationPackageInput.Text(packageText),
                 onState = { _activationPackageState.value = it },
-                activate = { credential -> activateDeviceAwaiting(credential, targetGatewayId) },
+                resolveEligibility = { scope -> resolvedScope = scope; resolveEntitlementGatewayEligibility(scope, targetGatewayId) },
+                activate = { credential, eligibleGatewayIds ->
+                    activateDeviceAwaiting(credential, chooseEligibleGateway(targetGatewayId, eligibleGatewayIds))
+                        .also { outcome -> recordEntitlementEligibilityOnSuccess(resolvedScope, eligibleGatewayIds, outcome) }
+                },
             )
         }
     }
@@ -2634,12 +2671,103 @@ class MainViewModel(
     ) {
         val redeemer = activationPackageRedeemer ?: return
         viewModelScope.launch {
+            var resolvedScope: net.pocvpn.client.activation.EntitlementScope = net.pocvpn.client.activation.EntitlementScope.Unscoped
             redeemer.retry(
                 onState = { _activationPackageState.value = it },
-                activate = { credential -> activateDeviceAwaiting(credential, targetGatewayId) },
+                resolveEligibility = { scope -> resolvedScope = scope; resolveEntitlementGatewayEligibility(scope, targetGatewayId) },
+                activate = { credential, eligibleGatewayIds ->
+                    activateDeviceAwaiting(credential, chooseEligibleGateway(targetGatewayId, eligibleGatewayIds))
+                        .also { outcome -> recordEntitlementEligibilityOnSuccess(resolvedScope, eligibleGatewayIds, outcome) }
+                },
             )
         }
     }
+
+    /**
+     * B67.6 - entitlement (the envelope's signed [net.pocvpn.client.activation.EntitlementScope])
+     * + trusted manifest + local/product policy (`ProductionGatewayCatalog`
+     * membership, applied inside [net.pocvpn.client.activation.EntitlementGatewayEligibility])
+     * -> eligible gateway set. [manifestRepository]'s CURRENT trusted state
+     * is read fresh on every call (never cached here), so a manifest
+     * rollback/expiry between import and retry is always reflected - see
+     * that repository's own docs for why `trusted()` is always the live
+     * answer. Pure query - see [recordEntitlementEligibilityOnSuccess] for
+     * the (separate, outcome-gated) B67.7 side effect.
+     */
+    private fun resolveEntitlementGatewayEligibility(
+        scope: net.pocvpn.client.activation.EntitlementScope,
+        requestedGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    ): net.pocvpn.client.activation.GatewayEligibilityResult {
+        val trustedEndpointIds = manifestRepository?.trusted()?.endpoints?.map { it.id }?.toSet().orEmpty()
+        return net.pocvpn.client.activation.EntitlementGatewayEligibility.resolve(
+            scope = scope,
+            trustedManifestEndpointIds = trustedEndpointIds,
+            explicitRequestedGatewayId = requestedGatewayId,
+        )
+    }
+
+    /**
+     * B67.7 - see [currentEntitlementEligibleGatewayIds]'s own docs for why
+     * this only ever fires for a [net.pocvpn.client.activation.EntitlementScope.Hinted]
+     * redemption that [activateDeviceAwaiting] reports genuinely
+     * [net.pocvpn.client.activation.ActivationAttemptOutcome.SUCCEEDED] -
+     * never on [net.pocvpn.client.activation.ActivationAttemptOutcome.FAILED]/
+     * [net.pocvpn.client.activation.ActivationAttemptOutcome.NETWORK_UNAVAILABLE],
+     * and never for [net.pocvpn.client.activation.EntitlementScope.Unscoped].
+     */
+    private fun recordEntitlementEligibilityOnSuccess(
+        scope: net.pocvpn.client.activation.EntitlementScope,
+        eligibleGatewayIds: List<net.pocvpn.client.vpn.config.ProductionGatewayId>,
+        outcome: net.pocvpn.client.activation.ActivationAttemptOutcome,
+    ) {
+        if (scope is net.pocvpn.client.activation.EntitlementScope.Hinted && outcome == net.pocvpn.client.activation.ActivationAttemptOutcome.SUCCEEDED) {
+            currentEntitlementEligibleGatewayIds = eligibleGatewayIds.toSet()
+        }
+    }
+
+    /**
+     * B67.7 - THE one place trusted-manifest endpoints are narrowed by the
+     * current B67.6 eligibility constraint before either
+     * [buildAutoGatewayCandidates] (observational) or
+     * [buildCombinedAutoRankingSnapshot] (the REAL [connectAuto] input)
+     * build candidates from them - both call this instead of reading
+     * [manifestRepository]'s trusted endpoints directly, so the constraint
+     * applies identically to whichever pipeline is actually driving a
+     * connection attempt. [manifestRepository]'s trusted state is read
+     * fresh here (never cached) - the exact same "always the live answer"
+     * discipline every other manifest-endpoint read in this class already
+     * follows - so a manifest rollback/expiry is reflected immediately,
+     * completely independent of [currentEntitlementEligibleGatewayIds]'s
+     * own (session-scoped, restart-cleared) lifetime. See
+     * [net.pocvpn.client.activation.EntitlementGatewayEligibility.filterEligibleEndpoints]
+     * for why a non-gateway (ingress/exit-only) manifest entry is never
+     * touched by this constraint.
+     */
+    private fun currentEligibilityFilteredManifestEndpoints(): List<net.pocvpn.client.reachability.EndpointDescriptor> {
+        val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
+        return net.pocvpn.client.activation.EntitlementGatewayEligibility.filterEligibleEndpoints(
+            manifestEndpoints,
+            currentEntitlementEligibleGatewayIds,
+        )
+    }
+
+    /**
+     * B67.6 - the ONE explicit `activateDevice()` call this slice still
+     * makes (unchanged fail-closed per-gateway validation - see that
+     * function's own docs) needs one concrete target. Prefers the caller's
+     * own explicit/UI-selected gateway when it is itself eligible (least
+     * behavior change for the common single-eligible-gateway case);
+     * otherwise deterministically picks the first eligible id in the signed
+     * hint order - never a re-ranking, never a second Smart Connect. A
+     * plural eligible set existing at all is the exact input B67.7's Smart
+     * Connect integration is meant to consume; this slice does not attempt
+     * that ranking.
+     */
+    private fun chooseEligibleGateway(
+        requestedGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+        eligibleGatewayIds: List<net.pocvpn.client.vpn.config.ProductionGatewayId>,
+    ): net.pocvpn.client.vpn.config.ProductionGatewayId =
+        if (requestedGatewayId in eligibleGatewayIds) requestedGatewayId else eligibleGatewayIds.first()
 
     private suspend fun activateDeviceAwaiting(
         credential: String,
@@ -3201,7 +3329,7 @@ class MainViewModel(
             )
         }
         val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
-        val manifestEndpoints = manifestRepository?.trusted()?.endpoints.orEmpty()
+        val manifestEndpoints = currentEligibilityFilteredManifestEndpoints()
         return net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCandidates(
             manifestEndpoints = manifestEndpoints,
             gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
@@ -3357,10 +3485,13 @@ class MainViewModel(
      * instead of `buildCandidates` alone (task requirement 4 - "build ONE
      * combined executable attempt plan... do not maintain separate ranking/
      * execution loops that can disagree"). [buildAutoGatewayCandidates]
-     * itself is intentionally left untouched - every pre-B24 caller of it
-     * (and of [autoGatewayCandidates]/[AutoGatewayDiagnostics], which stay
-     * Direct-only - see [connectAuto]'s own docs) is byte-for-byte
-     * unaffected.
+     * itself is intentionally left untouched by THIS (B24) change - every
+     * pre-B24 caller of it (and of [autoGatewayCandidates]/
+     * [AutoGatewayDiagnostics], which stay Direct-only - see [connectAuto]'s
+     * own docs) is byte-for-byte unaffected. (B67.7 later gave both
+     * functions one small, intentionally-shared dependency - see
+     * [currentEligibilityFilteredManifestEndpoints] - without touching
+     * anything else either builds.)
      *
      * B28 review fix (final blocker) - renamed from `buildCombinedAutoAttempts`
      * and now returns a [CombinedAutoRankingSnapshot] (restriction class +
@@ -3422,9 +3553,16 @@ class MainViewModel(
         val gatewaysById = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associateBy { it.endpointId }
         // B32 - [mergedIngressAwareEndpoints] is the ONLY difference from
         // pre-B32: every other accessor below is byte-for-byte identical to
-        // [buildAutoGatewayCandidates] (which stays Direct-only and
-        // intentionally untouched - see that function's own docs).
-        val manifestEndpoints = mergedIngressAwareEndpoints(manifestRepository?.trusted()?.endpoints.orEmpty())
+        // [buildAutoGatewayCandidates] (which stays Direct-only). B67.7 -
+        // both this function and [buildAutoGatewayCandidates] now read
+        // trusted manifest endpoints through the SAME
+        // [currentEligibilityFilteredManifestEndpoints] (never independently
+        // re-implemented), so a B67.6 eligibility constraint applies
+        // identically to whichever pipeline [connectAuto] is actually
+        // using; [mergedIngressAwareEndpoints] itself only ever adds
+        // non-gateway ingress fallback entries, which that filter already
+        // never touches - see its own docs.
+        val manifestEndpoints = mergedIngressAwareEndpoints(currentEligibilityFilteredManifestEndpoints())
         val attempts = net.pocvpn.client.smartconnect.AutoGatewaySelector.buildCombinedAttempts(
             manifestEndpoints = manifestEndpoints,
             gatewayFactsFor = { endpointId -> gatewaysById[endpointId] },
