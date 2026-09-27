@@ -51,17 +51,62 @@ _STDOUT_LINE_RE = re.compile(r"^(created|existing)\t(\d{1,3}\.\d{1,3}\.\d{1,3}\.
 
 _SUDO_NONINTERACTIVE_FLAG = "-n"
 
+# Diagnostic-only stderr sanitization (observability boundary - see
+# ProvisionError.stderr's own docs). Matches anything shaped like a secret
+# this process must never log: an activation credential
+# (secrets.token_urlsafe(32) -> 43 URL-safe-base64 chars), a WireGuard/
+# AmneziaWG public or private key (32 raw bytes, standard base64 -> 44
+# chars incl. trailing '='), or any other long base64-ish run that could be
+# a bearer/token value provision-peer.sh's own stderr was never meant to
+# carry but a future change or an unexpected upstream tool might emit
+# anyway - fail closed by redacting the shape, not by trying to enumerate
+# every exact secret type. 20 chars is comfortably below the shortest real
+# secret here (43) while still not catching ordinary short words/paths.
+_SENSITIVE_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_-]{20,}={0,2}")
+_BEARER_HEADER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
+
+_MAX_DIAGNOSTIC_STDERR_CHARS = 2000
+
+
+def _sanitize_diagnostic_stderr(stderr):
+    """Best-effort redaction of a provisioning subprocess's stderr before it
+    is ever attached to a ProvisionError for logging - see the module-level
+    regexes' own docs for exactly what shape is redacted. Never raises;
+    empty/None input yields "". Output is single-line (embedded newlines
+    collapsed) and length-bounded, since this is a log field, not a
+    diagnostic dump."""
+    if not stderr:
+        return ""
+    sanitized = _BEARER_HEADER_RE.sub("Bearer [REDACTED]", stderr)
+    sanitized = _SENSITIVE_TOKEN_RE.sub("[REDACTED]", sanitized)
+    sanitized = " ".join(sanitized.split())
+    if len(sanitized) > _MAX_DIAGNOSTIC_STDERR_CHARS:
+        sanitized = sanitized[:_MAX_DIAGNOSTIC_STDERR_CHARS] + "...[truncated]"
+    return sanitized
+
 
 class ProvisionError(Exception):
     """kind is one of "exhausted" / "timeout" / "internal" - the only
     three outcomes handler.py needs to distinguish for its HTTP status
     mapping (503 / 504 / 500 respectively). The human-readable message is
     for server-side logs only and must never be echoed to the HTTP
-    client."""
+    client.
 
-    def __init__(self, kind, message):
+    exit_code/stderr are diagnostic-only, populated ONLY for the
+    non-zero-exit-code branch of run_provision_peer (the only case where a
+    real subprocess actually ran and produced its own diagnostics) - both
+    default to None/"" for every other raise site (OSError, timeout,
+    malformed stdout, path validation), where there is nothing meaningful
+    to attach. `stderr` has already been through
+    _sanitize_diagnostic_stderr by the time it reaches here - this class
+    never re-sanitizes, so any new raise site that wants to attach stderr
+    MUST sanitize it first."""
+
+    def __init__(self, kind, message, exit_code=None, stderr=""):
         super().__init__(message)
         self.kind = kind
+        self.exit_code = exit_code
+        self.stderr = stderr
 
 
 class ProvisionOutcome:
@@ -137,6 +182,12 @@ def run_provision_peer(script_path, public_key, timeout_seconds, sudo_path=None)
     if proc.returncode == _EXIT_SUBNET_EXHAUSTED:
         raise ProvisionError("exhausted", "subnet exhausted")
     if proc.returncode != _EXIT_SUCCESS:
-        raise ProvisionError("internal", f"provisioning helper exited with code {proc.returncode}")
+        sanitized_stderr = _sanitize_diagnostic_stderr(proc.stderr)
+        raise ProvisionError(
+            "internal",
+            f"provisioning helper exited with code {proc.returncode}",
+            exit_code=proc.returncode,
+            stderr=sanitized_stderr,
+        )
 
     return _parse_stdout(proc.stdout)

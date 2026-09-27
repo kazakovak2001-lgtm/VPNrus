@@ -61,6 +61,31 @@ class ActivateEndpointTests(unittest.TestCase):
         status2, _headers2, _body2 = post_activate(self.server.port, credential=credential, body_obj={"public_key": self.key_a})
         self.assertEqual(status2, 200)
 
+    def test_provisioning_failure_logs_exit_code_and_sanitized_stderr(self):
+        """Observability-only: a non-zero provisioning exit must surface its
+        exit code and sanitized stderr in the server log, without ever
+        logging the activation credential or the device's public key as a
+        separate field - see provision.ProvisionError/handler._log_provision_error."""
+        _activation_id, credential = activations_module.issue_activation(
+            self.activation_store_path, self.activation_lock_path, max_devices=1,
+        )
+        set_plan(self.plan_path, "EXIT_STDERR", "durable peer state for this public key is malformed or ambiguous")
+
+        with self.assertLogs("pocvpn.api", level="ERROR") as log_ctx:
+            status, _headers, _body = post_activate(
+                self.server.port, credential=credential, body_obj={"public_key": self.key_a},
+            )
+        self.assertEqual(status, 500)
+
+        provision_error_lines = [line for line in log_ctx.output if "provision_error" in line]
+        self.assertEqual(len(provision_error_lines), 1)
+        line = provision_error_lines[0]
+        self.assertIn("kind=internal", line)
+        self.assertIn("exit_code=1", line)
+        self.assertIn("malformed or ambiguous", line)
+        self.assertNotIn(credential, line)
+        self.assertNotIn(self.key_a, line)
+
     def test_revoke_completed_before_finalize_is_reported_as_revoked_not_success(self):
         """item 6 - the activation is revoked WHILE this request's
         provisioning subprocess is in flight (simulated here by revoking

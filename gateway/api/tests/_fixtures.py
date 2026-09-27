@@ -43,6 +43,7 @@ case "$cmd" in
     MALFORMED) printf 'not-the-right-format\\n'; exit 0 ;;
     EXTRA) printf 'created\\t10.77.0.2\\nextra-line\\n'; exit 0 ;;
     BADIP) printf 'created\\t999.999.999.999\\n'; exit 0 ;;
+    EXIT_STDERR) printf '%s\\n' "$arg1" >&2; exit 1 ;;
     *) exit 99 ;;
 esac
 """

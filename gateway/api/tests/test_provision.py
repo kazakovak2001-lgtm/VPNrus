@@ -65,6 +65,42 @@ class ProvisionSubprocessTests(unittest.TestCase):
             provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)
         self.assertEqual(ctx.exception.kind, "internal")
 
+    def test_non_zero_exit_captures_exit_code_and_stderr(self):
+        set_plan(self.plan_path, "EXIT_STDERR", "durable peer state for this public key is malformed or ambiguous")
+        with self.assertRaises(provision_module.ProvisionError) as ctx:
+            provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)
+        self.assertEqual(ctx.exception.kind, "internal")
+        self.assertEqual(ctx.exception.exit_code, 1)
+        self.assertIn("malformed or ambiguous", ctx.exception.stderr)
+
+    def test_non_zero_exit_stderr_redacts_key_like_token(self):
+        # 44-char base64-with-padding shape, exactly like a WireGuard public
+        # or private key - must never survive into the diagnostic field.
+        fake_key = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0NTY="
+        set_plan(self.plan_path, "EXIT_STDERR", f"peer with public key {fake_key} already exists")
+        with self.assertRaises(provision_module.ProvisionError) as ctx:
+            provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)
+        self.assertNotIn(fake_key, ctx.exception.stderr)
+        self.assertIn("[REDACTED]", ctx.exception.stderr)
+
+    def test_non_zero_exit_stderr_redacts_bearer_header(self):
+        set_plan(self.plan_path, "EXIT_STDERR", "unexpected Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345 header")
+        with self.assertRaises(provision_module.ProvisionError) as ctx:
+            provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz012345", ctx.exception.stderr)
+        self.assertIn("Bearer [REDACTED]", ctx.exception.stderr)
+
+    def test_success_and_timeout_do_not_populate_exit_code_or_stderr(self):
+        set_plan(self.plan_path, "CREATED", "10.77.0.5")
+        provision_module.run_provision_peer(self.script_path, "pubkey", 5.0)  # no raise - nothing to assert on the outcome
+
+        set_plan(self.plan_path, "SLEEP", "5")
+        with self.assertRaises(provision_module.ProvisionError) as ctx:
+            provision_module.run_provision_peer(self.script_path, "pubkey", 0.2)
+        self.assertEqual(ctx.exception.kind, "timeout")
+        self.assertIsNone(ctx.exception.exit_code)
+        self.assertEqual(ctx.exception.stderr, "")
+
     def test_timeout(self):
         set_plan(self.plan_path, "SLEEP", "5")
         with self.assertRaises(provision_module.ProvisionError) as ctx:
