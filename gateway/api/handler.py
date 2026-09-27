@@ -39,6 +39,21 @@ from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
 
+
+def _log_provision_error(exc):
+    """Shared log call for every ProvisionError raise site in this file -
+    see provision.ProvisionError's own docs for why exit_code/stderr are
+    only ever populated for the non-zero-exit-code branch (every other
+    kind, e.g. timeout/OSError/malformed stdout, has nothing to attach).
+    stderr has already been sanitized by provision.py before it ever
+    reaches here - this call never re-inspects or re-logs the raw value,
+    and never logs the credential/public key as a separate field."""
+    if exc.exit_code is not None:
+        logger.error("provision_error kind=%s exit_code=%s stderr=%r", exc.kind, exc.exit_code, exc.stderr)
+    else:
+        logger.error("provision_error kind=%s", exc.kind)
+
+
 _PATH_PEERS = "/v1/peers"
 _PATH_ACTIVATE = "/v1/activate"
 _PATH_XRAY_PROFILE = "/v1/xray-profile"
@@ -254,7 +269,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 sudo_path=self.server.config.sudo_path or None,
             )
         except provision.ProvisionError as exc:
-            logger.error("provision_error kind=%s", exc.kind)
+            _log_provision_error(exc)
             if exc.kind == "exhausted":
                 raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "subnet_exhausted")
             if exc.kind == "timeout":
@@ -356,7 +371,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # ever reimplemented here.
         if result.provision_error is not None:
             exc = result.provision_error
-            logger.error("provision_error kind=%s", exc.kind)
+            _log_provision_error(exc)
             # Rollback (if this request owned a reservation) already
             # happened inside provision_with_activation, still under the
             # per-activation lock - see its own docstring.

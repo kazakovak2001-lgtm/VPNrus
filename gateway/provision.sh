@@ -75,6 +75,26 @@ render_template "$SCRIPT_DIR/nftables/pocvpn.nft.template" \
 chmod 644 /etc/nftables.pocvpn.conf
 nft -f /etc/nftables.pocvpn.conf
 
+# Persist across reboot: /etc/nftables.pocvpn.conf above was only applied
+# live - nothing previously reloaded it at boot, so a reboot silently lost
+# the whole table (forward + MASQUERADE) while awg-poc.service came back
+# up fine on its own, masking the loss (handshakes still worked, only the
+# data plane was broken). Fix: make the distro's own nftables.service
+# (already installed by the apt-get step above, not a new mechanism) load
+# this SAME rendered file on every boot, via one idempotent `include` line
+# in the stock /etc/nftables.conf - never a second/parallel ruleset, and
+# never touching awg-poc.service. The include is appended only if not
+# already present (grep -qxF guard), so re-running provision.sh never
+# duplicates it. `systemctl enable --now nftables` is itself idempotent
+# (README's existing "systemd" idempotence guarantee) and, since
+# /etc/nftables.conf's own `flush ruleset` runs first, re-running this
+# (or a future reboot) always converges to exactly one copy of our table -
+# never additive drift.
+NFT_INCLUDE_LINE='include "/etc/nftables.pocvpn.conf";'
+grep -qxF "$NFT_INCLUDE_LINE" /etc/nftables.conf 2>/dev/null \
+    || echo "$NFT_INCLUDE_LINE" >> /etc/nftables.conf
+systemctl enable --now nftables
+
 log "step 6/6: systemd service"
 install -m 0644 "$SCRIPT_DIR/systemd/awg-poc.service" /etc/systemd/system/awg-poc.service
 systemctl daemon-reload
