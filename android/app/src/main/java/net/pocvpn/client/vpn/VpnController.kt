@@ -33,6 +33,8 @@ import net.pocvpn.client.reachability.NetworkFingerprinter
 import net.pocvpn.client.reachability.PathHistoryStore
 import net.pocvpn.client.relay.RelayReadinessStage
 import net.pocvpn.client.relay.VpnAttemptContext
+import net.pocvpn.client.smartconnect.AttemptStageOutcome
+import net.pocvpn.client.smartconnect.AttemptTermination
 import net.pocvpn.client.smartconnect.ConnectionErrorCategory
 import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
@@ -40,6 +42,10 @@ import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
+import net.pocvpn.client.smartconnect.TrafficProgressOutcome
+import net.pocvpn.client.smartconnect.TransportAttemptObservation
+import net.pocvpn.client.smartconnect.TransportAttemptProtocol
+import net.pocvpn.client.smartconnect.TransportObservationStore
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportStats
@@ -250,6 +256,14 @@ class VpnController(
     // (same "read fresh, never cached" discipline gatewayConfigurationRepository.get()
     // already uses elsewhere in this class).
     private val networkProfileProvider: (() -> NetworkProfile)? = null,
+    // B-WL1 - additive, defaults to null (same reasoning as pathHistoryStore
+    // above): with no store (or without fingerprintKeyProvider/
+    // networkProfileProvider also wired), recordTransportBehaviorObservation
+    // below is simply a no-op. In-memory only, process-local, bounded (see
+    // TransportObservationStore's own docs) - never a second on-disk history
+    // format alongside PathHistoryStore/ConnectionOutcomeStore. Recording
+    // never changes control flow, exactly like connectionOutcomeStore.
+    private val transportObservationStore: TransportObservationStore? = null,
     // R2: optional, diagnostic-only observation of the exact pinned endpoint's
     // transport call. Invoked after permission/config validation, immediately
     // before connect(); failure in an observer cannot alter execution.
@@ -1019,6 +1033,7 @@ class VpnController(
                             if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
                                 recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
                                 recordPathHistory(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                                recordTransportBehaviorObservation(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                             }
                             true
                         } else {
@@ -1031,6 +1046,7 @@ class VpnController(
                             if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
                                 recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.HANDSHAKE_TIMEOUT, attemptStartEpochMillis)
                                 recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                                recordTransportBehaviorObservation(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                             }
                             false
                         }
@@ -1085,6 +1101,7 @@ class VpnController(
                     if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
                         recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.BACKEND_START_FAILURE, attemptStartEpochMillis)
                         recordPathHistory(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                        recordTransportBehaviorObservation(success = false, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                     }
                     false
                 }
@@ -1460,6 +1477,58 @@ class VpnController(
     }
 
     /**
+     * B-WL1 - the FIRST real writer into [TransportObservationStore], called
+     * from the SAME authoritative-outcome sites [recordPathHistory] already
+     * uses, reusing its exact fingerprint computation (never a second
+     * network-identity system). Deliberately coarse today: this call site's
+     * only real evidence is connect-level success/failure (the SAME
+     * evidence [recordConnectionOutcome] already records), so
+     * [TransportAttemptObservation.progress]/[TransportAttemptObservation
+     * .termination] are honestly [TrafficProgressOutcome.NOT_OBSERVED]/
+     * [AttemptTermination.NONE_OBSERVED] (never fabricated payload/stall
+     * evidence this call site cannot see - see TransportBehaviorAnalyzer's
+     * own docs on why payload-level fields require a real, separately-wired
+     * traffic-progress source, not yet connected here). [endpointId] is the
+     * SAME opaque technical identifier used elsewhere (never a raw
+     * host/IP). A transport with `usesUdp` in its own capabilities is
+     * recorded as [TransportAttemptProtocol.UDP] so POSSIBLE_UDP_FILTERING
+     * evidence can ever be produced from real observations; every other
+     * transport is TCP.
+     */
+    private fun recordTransportBehaviorObservation(success: Boolean, kind: TransportKind, endpointId: EndpointId, nowEpochMillis: Long) {
+        val store = transportObservationStore ?: return
+        val keyProvider = fingerprintKeyProvider ?: return
+        val profileProvider = networkProfileProvider ?: return
+        val profile = profileProvider()
+        val fingerprint = NetworkFingerprinter.fingerprint(
+            CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+            keyProvider.keyBytes(),
+        )
+        val protocol = if (kind == TransportKind.AMNEZIA_WG) TransportAttemptProtocol.UDP else TransportAttemptProtocol.TCP
+        // Honest per real evidence: this call site can only confirm/deny a
+        // FRESH HANDSHAKE (see awaitFreshHandshake), never the lower-level
+        // socket-connect step in isolation - so a failure is recorded as
+        // "handshake failed", not "connect failed" (never claims evidence
+        // about a connect stage this app cannot separately observe).
+        val connectOutcome = if (success) AttemptStageOutcome.SUCCEEDED else AttemptStageOutcome.NOT_OBSERVED
+        val handshakeOutcome = if (success) AttemptStageOutcome.SUCCEEDED else AttemptStageOutcome.FAILED
+        store.record(
+            fingerprint,
+            TransportAttemptObservation(
+                destinationKey = endpointId.value,
+                protocol = protocol,
+                connect = connectOutcome,
+                handshake = handshakeOutcome,
+                bytesSent = 0L,
+                bytesReceived = 0L,
+                progress = TrafficProgressOutcome.NOT_OBSERVED,
+                termination = AttemptTermination.NONE_OBSERVED,
+                observedAtEpochMillis = nowEpochMillis,
+            ),
+        )
+    }
+
+    /**
      * B8I5/B8I6 - triggers whenever `_state.value is Connected` when the
      * real underlying network is lost - NOT AWG-specific: `_state` reaches
      * Connected for TLS_TCP/XRAY_REALITY too, via [switchActiveTransport]'s
@@ -1571,6 +1640,7 @@ class VpnController(
                 if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
                     recordConnectionOutcome(ConnectionOutcomeResult.FAILURE, ConnectionErrorCategory.RECONNECT_EXHAUSTED, reconnectionThresholdEpochMillis)
                     recordPathHistory(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                    recordTransportBehaviorObservation(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                 }
                 runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Failed(generation)) }
                 return

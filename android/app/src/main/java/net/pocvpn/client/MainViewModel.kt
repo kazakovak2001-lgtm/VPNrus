@@ -523,6 +523,13 @@ class MainViewModel(
     private val activationPackageImporter: net.pocvpn.client.activation.ActivationPackageImporter? = null,
     private val pathHistoryStore: net.pocvpn.client.reachability.PathHistoryStore? = null,
     private val fingerprintKeyProvider: net.pocvpn.client.reachability.NetworkFingerprintKeyProvider? = null,
+    // B-WL1 - the SAME instance VpnController's live-connect-path writer
+    // (recordTransportBehaviorObservation) and restrictionClass() below both
+    // read/write - never a second, independently-constructed store. In-memory
+    // only (see TransportObservationStore's own docs); defaults to null so
+    // every existing call site is byte-for-byte unaffected (restrictionClass()
+    // simply supplies an empty observation list, its pre-B-WL1 behavior).
+    private val transportObservationStore: net.pocvpn.client.smartconnect.TransportObservationStore? = null,
     // B24 review fix (PR #38, round 3) - the real client<->ingress
     // PREPARATION boundary a relayed Auto winner is handed to (see
     // RelayIngressResolver's own docs). A Resolved result is fed into the
@@ -1024,6 +1031,10 @@ class MainViewModel(
         // writer, that remains the read-only observer.
         pathHistoryStore = pathHistoryStore,
         fingerprintKeyProvider = fingerprintKeyProvider,
+        // B-WL1 - the SAME instance restrictionClass() below reads (never a
+        // second, independently-constructed store) - this is the live-connect
+        // -path writer, restrictionClass() remains the read-only observer.
+        transportObservationStore = transportObservationStore,
         networkProfileProvider = { networkProfile.value },
         routingModeStore = routingModeStore ?: RoutingModeStore.fullVpn(),
         // B18 - RestrictionClassifier wired into RoutingDecisionEngine
@@ -1473,9 +1484,26 @@ class MainViewModel(
             diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
             gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,
             diverseProbeEpochMillis = restrictionMonitor?.lastDiverseReachabilityEpochMillis?.value,
+            // B-WL1 - the SAME network-scoped recent behavior observations
+            // VpnController's live-connect-path writer recorded (see that
+            // class's own recordTransportBehaviorObservation docs) - empty
+            // when unwired or when fingerprintKeyProvider can't compute a
+            // fingerprint, which RestrictionClassifier already treats as "no
+            // behavior evidence supplied", its byte-for-byte pre-B-WL1 self.
+            transportObservations = currentNetworkFingerprint()?.let { transportObservationStore?.recent(it) } ?: emptyList(),
         ),
         nowEpochMillis = nowProvider(),
     )
+
+    /** B-WL1 - the SAME network-fingerprint computation VpnController.recordPathHistory/recordTransportBehaviorObservation already use, reused here rather than a second identity system. Null when fingerprintKeyProvider isn't wired. */
+    private fun currentNetworkFingerprint(): String? {
+        val keyProvider = fingerprintKeyProvider ?: return null
+        val profile = networkProfile.value
+        return net.pocvpn.client.reachability.NetworkFingerprinter.fingerprint(
+            net.pocvpn.client.reachability.CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+            keyProvider.keyBytes(),
+        )
+    }
 
     /** B28 review fix (blocker 2) - see [stabilizedRestrictionClass]'s own docs; the ONLY mutable field this stabilization mechanism needs. */
     private var restrictionStabilizerState: net.pocvpn.client.smartconnect.RestrictionStabilizer.State? = null
@@ -4783,6 +4811,11 @@ class MainViewModel(
                 ),
                 pathHistoryStore = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createPathHistoryStore(context),
                 fingerprintKeyProvider = net.pocvpn.client.reachability.EndpointManifestRepositoryFactory.createFingerprintKeyProvider(context),
+                // B-WL1 - in-memory only, process-local (see
+                // TransportObservationStore's own docs) - no factory helper
+                // needed, unlike pathHistoryStore/fingerprintKeyProvider
+                // above, since this store does no file I/O.
+                transportObservationStore = net.pocvpn.client.smartconnect.TransportObservationStore(),
                 manifestDistributionClient = manifestDistributionClient,
                 // B26 (task A) - the real relay/ingress composition wired
                 // above: this is what supersedes NotProvisionedRelayIngressResolver/
