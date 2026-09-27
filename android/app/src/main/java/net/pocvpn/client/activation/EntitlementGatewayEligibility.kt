@@ -1,5 +1,6 @@
 package net.pocvpn.client.activation
 
+import net.pocvpn.client.reachability.EndpointDescriptor
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 
@@ -95,6 +96,44 @@ object EntitlementGatewayEligibility {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * B67.7 - the "existing trusted candidates + B67.6 eligibility
+     * constraint -> eligible trusted candidates" step, applied to the
+     * SAME manifest-derived [EndpointDescriptor] list
+     * `AutoGatewaySelector.buildCandidates`/`buildCombinedAttempts` already
+     * consume - never a second candidate source. This is a pure filter,
+     * not a resolver: [eligibleGatewayIds] is whatever a PRIOR call to
+     * [resolve] already decided (`null` for [EntitlementScope.Unscoped] or
+     * "no active constraint" - see the caller's own docs for exactly when
+     * that applies), so this function only narrows, never re-derives
+     * eligibility from a hint.
+     *
+     * A `null` [eligibleGatewayIds] returns [endpoints] unchanged - the
+     * pre-B67.7 candidate list, byte for byte. A non-null set keeps only
+     * the entries that map to one of [eligibleGatewayIds] via
+     * [net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byEndpointId]
+     * (the SAME local/product-policy lookup [resolve] itself uses) -
+     * **an endpoint that does not map to any product gateway at all (an
+     * ingress/exit-only manifest entry - B67.6 eligibility has no defined
+     * meaning for a non-gateway role) is left UNTOUCHED, never excluded by
+     * a gateway-scoped constraint it was never about.** This keeps the
+     * relayed/ingress candidate space (`MainViewModel.mergedIngressAwareEndpoints`)
+     * completely outside this slice's scope, exactly as intended - B67.6
+     * only ever produces a set of [ProductionGatewayId]s, and this filter
+     * only ever acts on entries the catalog itself recognizes as one.
+     */
+    fun filterEligibleEndpoints(
+        endpoints: List<EndpointDescriptor>,
+        eligibleGatewayIds: Set<ProductionGatewayId>?,
+        gatewayIdForEndpointId: (EndpointId) -> ProductionGatewayId? = { net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byEndpointId(it) },
+    ): List<EndpointDescriptor> {
+        if (eligibleGatewayIds == null) return endpoints
+        return endpoints.filter { endpoint ->
+            val gatewayId = gatewayIdForEndpointId(endpoint.id)
+            gatewayId == null || gatewayId in eligibleGatewayIds
         }
     }
 }

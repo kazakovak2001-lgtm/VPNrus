@@ -100,4 +100,52 @@ class EntitlementGatewayEligibilityTest {
         assertEquals(EntitlementScope.Unscoped, EntitlementScope.fromEnvelopeHints(emptyList()))
         assertEquals(EntitlementScope.Hinted(listOf(frankfurt)), EntitlementScope.fromEnvelopeHints(listOf(frankfurt)))
     }
+
+    // --- B67.7: filterEligibleEndpoints (the trusted-candidates + eligibility -> eligible-candidates step) ---
+
+    private fun endpoint(id: EndpointId, roles: Set<net.pocvpn.client.reachability.EndpointRole> = setOf(net.pocvpn.client.reachability.EndpointRole.GATEWAY)) =
+        net.pocvpn.client.reachability.EndpointDescriptor(
+            id = id,
+            roles = roles,
+            region = "eu",
+            provider = "acme",
+            transports = listOf(net.pocvpn.client.reachability.EndpointTransportBinding(net.pocvpn.client.transport.TransportKind.AMNEZIA_WG, "203.0.113.1", 51820)),
+        )
+
+    @Test fun `null eligibleGatewayIds returns the endpoint list unchanged - the pre-B67_7 candidate list`() {
+        val endpoints = listOf(endpoint(frankfurt), endpoint(stockholm))
+        val result = EntitlementGatewayEligibility.filterEligibleEndpoints(endpoints, null, catalogLookup)
+        assertEquals(endpoints, result)
+    }
+
+    @Test fun `a non-null eligible set keeps only endpoints mapping to it - ineligible gateway is filtered out`() {
+        val endpoints = listOf(endpoint(frankfurt), endpoint(stockholm))
+        val result = EntitlementGatewayEligibility.filterEligibleEndpoints(endpoints, setOf(ProductionGatewayId.STOCKHOLM), catalogLookup)
+        assertEquals(listOf(endpoint(stockholm)), result)
+    }
+
+    @Test fun `a plural eligible set keeps every matching endpoint - Smart Connect still sees more than one candidate`() {
+        val endpoints = listOf(endpoint(frankfurt), endpoint(stockholm))
+        val result = EntitlementGatewayEligibility.filterEligibleEndpoints(
+            endpoints,
+            setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
+            catalogLookup,
+        )
+        assertEquals(endpoints, result)
+    }
+
+    @Test fun `an endpoint the catalog does not recognize as any gateway is never touched by the constraint`() {
+        // e.g. a manifest-listed ingress/exit entry - B67.6 eligibility has no defined meaning for a non-gateway role.
+        val ingressOnly = endpoint(unknown, roles = setOf(net.pocvpn.client.reachability.EndpointRole.INGRESS))
+        val result = EntitlementGatewayEligibility.filterEligibleEndpoints(
+            listOf(ingressOnly, endpoint(frankfurt)),
+            setOf(ProductionGatewayId.STOCKHOLM), // frankfurt is NOT eligible; ingressOnly is not a gateway at all
+            catalogLookup,
+        )
+        assertEquals(listOf(ingressOnly), result)
+    }
+
+    @Test fun `an empty candidate list stays empty regardless of the eligible set`() {
+        assertEquals(emptyList<net.pocvpn.client.reachability.EndpointDescriptor>(), EntitlementGatewayEligibility.filterEligibleEndpoints(emptyList(), setOf(ProductionGatewayId.GERMANY), catalogLookup))
+    }
 }
