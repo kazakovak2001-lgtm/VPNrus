@@ -32,6 +32,7 @@ import tempfile
 from dataclasses import dataclass, field
 
 from . import activations
+from . import exit_target_policy
 from . import xray_provisioning
 
 # Same shape Android's XrayVlessRealityConfig validator requires (see
@@ -360,11 +361,22 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
     if xhttp is not None:
         inbounds.append(_render_xhttp_inbound(clients, xhttp))
 
+    # Exit Target ACL: explicit, not left to xray-core's own implicit
+    # per-inbound-protocol default (which older binaries lack). freedom
+    # resolves a domain destination itself, checks the RESOLVED IP against
+    # finalRules and dials that same IP (proxy/freedom/freedom.go, pinned
+    # v26.7.28), so neither a literal IP nor a hostname resolving to a
+    # blocked address (DNS rebinding included) gets through; UDP packets are
+    # checked per packet. See exit_target_policy.py.
     return {
         "log": {"loglevel": "warning"},
         "inbounds": inbounds,
         "outbounds": [
-            {"tag": "direct", "protocol": "freedom"},
+            {
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": exit_target_policy.xray_freedom_final_rules()},
+            },
         ],
     }
 
