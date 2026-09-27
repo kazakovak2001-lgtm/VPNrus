@@ -1,0 +1,54 @@
+# B46-4P.3 - runs the B46-4P.2 Hysteria2 auth backend
+# (gateway/api/hysteria_auth_server.py, POST /auth). Its bind host is the
+# literal 127.0.0.1 in code; POCVPN_API_HYSTERIA2_AUTH_BACKEND_PORT (8446 on
+# Stockholm) is the only setting. It must NEVER be reachable from outside
+# this host: no nginx location, no firewall/security-group rule, and the
+# IPAddressDeny/Allow pair below drops any non-loopback packet at the cgroup
+# level even if the bind ever changed.
+#
+# Runs as pocvpn-api because the activation and Hysteria2 stores (and their
+# lock files, opened O_RDWR for flock) are that user's. Unlike
+# pocvpn-api.service it never calls sudo, so NoNewPrivileges and an empty
+# capability bounding set are safe here.
+[Unit]
+Description=pocvpn Hysteria2 auth backend (loopback-only, non-root)
+After=network.target
+
+[Service]
+Type=simple
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+EnvironmentFile=/etc/pocvpn/api.env
+ExecStart=/usr/bin/python3 -m api.hysteria_auth_server
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+ProtectSystem=strict
+# Store + lock files only (the lock files are opened read-write).
+ReadWritePaths=/var/lib/pocvpn-provision
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

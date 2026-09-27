@@ -3512,9 +3512,17 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 - Fail-closed: `503 hysteria_not_configured` unless the all-or-nothing
   `POCVPN_API_HYSTERIA2_{STORE_PATH,LOCK_PATH,SERVER_PORT,SNI}` group is set
   (blank by default). Not publicly reachable: no edge nginx location routes it.
-- Not deployed: no Hysteria2 server, running auth listener, systemd unit, firewall
-  rule, or signed `HYSTERIA2` binding exists; the Android client is unmerged
-  (PR #111).
+- Deployment artifacts (B46-4P.3, repo only): Stockholm topology is public
+  UDP 443 -> `nova-hysteria.service` (non-root, `CAP_NET_BIND_SERVICE` only)
+  -> `http://127.0.0.1:8446/auth` -> `pocvpn-hysteria-auth.service`. Server
+  config is rendered from the same `POCVPN_API_HYSTERIA2_*` values the API
+  advertises (`hysteria_server_config.py`); its ACL rejects loopback/private/
+  link-local destinations. SNI `origin-sthlm.aknova.pp.ua` (DNS-only, never a
+  Cloudflare-proxied name). nginx is not in the data path and must never add
+  a QUIC listener on 443. 8446 is never public.
+- Not deployed: no Hysteria2 server or auth listener runs on any host, no
+  firewall/security-group rule, no signed `HYSTERIA2` binding exists; the
+  Android client is unmerged (PR #111).
 
 ## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27, repo only - not deployed)
 
