@@ -30,9 +30,24 @@ class RestrictionClassifierTest {
         diverseInternetReachable: Boolean? = null,
         gatewayProbeEpochMillis: Long? = null,
         diverseProbeEpochMillis: Long? = null,
+        transportObservations: List<TransportAttemptObservation> = emptyList(),
     ) = RestrictionEvidence(
         networkProfile, transportState, awgHandshakeFresh, gatewayHttpsReachable, diverseInternetReachable,
-        gatewayProbeEpochMillis, diverseProbeEpochMillis,
+        gatewayProbeEpochMillis, diverseProbeEpochMillis, transportObservations,
+    )
+
+    private fun observation(
+        destinationKey: String = "ep1",
+        protocol: TransportAttemptProtocol = TransportAttemptProtocol.TCP,
+        connect: AttemptStageOutcome = AttemptStageOutcome.SUCCEEDED,
+        handshake: AttemptStageOutcome = AttemptStageOutcome.SUCCEEDED,
+        bytesReceived: Long = 0L,
+        progress: TrafficProgressOutcome = TrafficProgressOutcome.NOT_OBSERVED,
+        termination: AttemptTermination = AttemptTermination.NONE_OBSERVED,
+        observedAtEpochMillis: Long = 0L,
+    ) = TransportAttemptObservation(
+        destinationKey, protocol, connect, handshake, bytesSent = 0L, bytesReceived = bytesReceived,
+        progress = progress, termination = termination, observedAtEpochMillis = observedAtEpochMillis,
     )
 
     @Test
@@ -189,7 +204,7 @@ class RestrictionClassifierTest {
             .toSet()
         val expected = setOf(
             "networkProfile", "transportState", "awgHandshakeFresh", "gatewayHttpsReachable", "diverseInternetReachable",
-            "gatewayProbeEpochMillis", "diverseProbeEpochMillis",
+            "gatewayProbeEpochMillis", "diverseProbeEpochMillis", "transportObservations",
         )
         assertEquals(expected, fieldNames)
     }
@@ -222,5 +237,153 @@ class RestrictionClassifierTest {
         assertEquals(RestrictionClass.UNKNOWN, assessment.classification)
         assertEquals(RestrictionEvidenceQuality.INSUFFICIENT, assessment.evidenceQuality)
         assertTrue(RestrictionEvidenceReason.EVIDENCE_INCOMPLETE in assessment.reasons)
+    }
+
+    // --- B-WL1: behavior-derived classes ---
+
+    @Test
+    fun `empty transportObservations leaves classification byte-for-byte its pre-B-WL1 self`() {
+        val result = RestrictionClassifier.classify(evidence(gatewayHttpsReachable = true, awgHandshakeFresh = false))
+        assertEquals(RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, result)
+    }
+
+    @Test
+    fun `sustained progress yields NO_RESTRICTION_OBSERVED even with no probe evidence at all`() {
+        val result = RestrictionClassifier.classify(
+            evidence(transportObservations = listOf(observation(progress = TrafficProgressOutcome.SUSTAINED, bytesReceived = 500))),
+        )
+        assertEquals(RestrictionClass.NO_RESTRICTION_OBSERVED, result)
+    }
+
+    @Test
+    fun `a single early-drop observation alone yields POSSIBLE_EARLY_DROP`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                transportObservations = listOf(
+                    observation(bytesReceived = 100, progress = TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_EARLY_DROP, result)
+    }
+
+    @Test
+    fun `an early-drop stall reset by the peer (RST) is never POSSIBLE_EARLY_DROP - an explicit reset is a different signal`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                transportObservations = listOf(
+                    observation(bytesReceived = 100, progress = TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD, termination = AttemptTermination.RST),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.UNKNOWN, result)
+    }
+
+    @Test
+    fun `an early-drop stall on one destination while another sustains progress is INSUFFICIENT - never generalized to POSSIBLE_EARLY_DROP`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                transportObservations = listOf(
+                    observation(destinationKey = "ep1", bytesReceived = 100, progress = TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD),
+                    observation(destinationKey = "ep2", progress = TrafficProgressOutcome.SUSTAINED),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.UNKNOWN, result)
+    }
+
+    @Test
+    fun `UDP no-response while TCP works yields POSSIBLE_UDP_FILTERING, distinct from POSSIBLE_UDP_OR_AWG_FILTERING`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                transportObservations = listOf(
+                    observation(destinationKey = "awg1", protocol = TransportAttemptProtocol.UDP, connect = AttemptStageOutcome.FAILED, handshake = AttemptStageOutcome.FAILED),
+                    observation(destinationKey = "xray1", protocol = TransportAttemptProtocol.TCP, handshake = AttemptStageOutcome.SUCCEEDED),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_UDP_FILTERING, result)
+    }
+
+    @Test
+    fun `every attempt across two distinct destinations failing before payload, with unvalidated internet, yields POSSIBLE_FULL_SHUTDOWN`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                networkProfile = profile(validatedInternet = false, captivePortal = false),
+                transportObservations = listOf(
+                    observation(destinationKey = "ep1", connect = AttemptStageOutcome.FAILED),
+                    observation(destinationKey = "ep2", connect = AttemptStageOutcome.FAILED),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_FULL_SHUTDOWN, result)
+    }
+
+    @Test
+    fun `POSSIBLE_FULL_SHUTDOWN is never claimed from a single destination's own failure - one gateway unreachable is not a broad shutdown`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                networkProfile = profile(validatedInternet = false, captivePortal = false),
+                transportObservations = listOf(observation(destinationKey = "ep1", connect = AttemptStageOutcome.FAILED)),
+            ),
+        )
+        assertEquals(RestrictionClass.INTERNET_NOT_VALIDATED, result)
+    }
+
+    @Test
+    fun `all-connect-failed behavior plus diverse-majority failure still yields POSSIBLE_HARD_WHITELIST - the existing rule is never weakened, only reachable through an additional route`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                diverseInternetReachable = false,
+                transportObservations = listOf(
+                    observation(destinationKey = "ep1", connect = AttemptStageOutcome.FAILED),
+                    observation(destinationKey = "ep2", connect = AttemptStageOutcome.FAILED),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_HARD_WHITELIST, result)
+    }
+
+    @Test
+    fun `all-connect-failed behavior WITHOUT a diverse-failure contrast never claims POSSIBLE_HARD_WHITELIST from behavior alone`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                diverseInternetReachable = true,
+                transportObservations = listOf(
+                    observation(destinationKey = "ep1", connect = AttemptStageOutcome.FAILED),
+                    observation(destinationKey = "ep2", connect = AttemptStageOutcome.FAILED),
+                ),
+            ),
+        )
+        assertTrue(RestrictionClass.POSSIBLE_HARD_WHITELIST != result)
+    }
+
+    @Test
+    fun `stale transport observations decay to no behavior evidence, same staleness window as probe evidence`() {
+        val result = RestrictionClassifier.classify(
+            evidence(
+                transportObservations = listOf(
+                    observation(bytesReceived = 100, progress = TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD, observedAtEpochMillis = 0L),
+                ),
+            ),
+            nowEpochMillis = RestrictionClassifier.DEFAULT_STALE_AFTER_MILLIS + 1L,
+        )
+        assertEquals(RestrictionClass.UNKNOWN, result)
+    }
+
+    @Test
+    fun `a behavior-driven assessment carries the behavior's own qualitative confidence, not the probe-completeness rule`() {
+        val assessment = RestrictionClassifier.assess(
+            evidence(
+                transportObservations = listOf(
+                    observation(destinationKey = "ep1", bytesReceived = 100, progress = TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD, observedAtEpochMillis = 0L),
+                    observation(destinationKey = "ep1", bytesReceived = 200, progress = TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD, observedAtEpochMillis = 1L),
+                ),
+            ),
+        )
+        assertEquals(RestrictionClass.POSSIBLE_EARLY_DROP, assessment.classification)
+        assertEquals(RestrictionEvidenceQuality.HIGH, assessment.evidenceQuality)
+        assertTrue(RestrictionEvidenceReason.TRANSPORT_REPEATED_EARLY_DROP in assessment.reasons)
+        assertEquals(TransportBehaviorPattern.REPEATED_EARLY_DROP, assessment.transportBehavior?.pattern)
     }
 }

@@ -83,6 +83,12 @@ class PathScorerTest {
         ),
     )
 
+    private fun registryWithAvailable(vararg kinds: TransportKind): TransportRegistry = TransportRegistry.build(
+        kinds.map { kind ->
+            TransportDescriptor(kind = kind, status = TransportStatus.AVAILABLE, capabilities = TransportCapabilities.amneziaWg(), factory = { FakeVpnTransport() })
+        },
+    )
+
     @Test
     fun `unreachable never beats reachable, no matter the latency penalty`() {
         val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
@@ -589,5 +595,68 @@ class PathScorerTest {
         val directScoreWithHistory = PathScorer.score(direct, registry, TransportCapabilities.amneziaWg(), health, bestHistory, false)
         val relayedScoreNoHistory = PathScorer.score(relayed, registry, TransportCapabilities.amneziaWg(), health, null, false)
         assertTrue(directScoreWithHistory.score > relayedScoreNoHistory.score)
+    }
+
+    // --- B-WL5: capability-based restriction preference ---
+
+    @Test
+    fun `POSSIBLE_UDP_FILTERING penalizes a UDP-only transport relative to an equally-eligible TCP restrictive-network transport`() {
+        val registry = registryWithAvailable(TransportKind.AMNEZIA_WG, TransportKind.XRAY_XHTTP)
+        val udpOnly = directCandidate("gw1", TransportKind.AMNEZIA_WG, RestrictionClass.POSSIBLE_UDP_FILTERING)
+        val tcpRestrictive = directCandidate("gw2", TransportKind.XRAY_XHTTP, RestrictionClass.POSSIBLE_UDP_FILTERING)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val udpScore = PathScorer.score(udpOnly, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        val tcpScore = PathScorer.score(tcpRestrictive, registry, TransportCapabilities.xrayXhttpAdapterShell(), health, null, false)
+        assertTrue(tcpScore.score > udpScore.score)
+        assertTrue(PathScorer.Reason.RESTRICTION_PENALIZES_UDP_TRANSPORT.name in udpScore.reasons)
+        assertTrue(PathScorer.Reason.RESTRICTION_FAVORS_TCP_TRANSPORT.name in tcpScore.reasons)
+    }
+
+    @Test
+    fun `POSSIBLE_UDP_FILTERING leaves an ordinary (non-restrictive-network-declared) TCP transport at zero preference`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val plainTcp = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_UDP_FILTERING)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val result = PathScorer.score(plainTcp, registry, TransportCapabilities.xrayTlsAdapterShell(), health, null, false)
+        assertTrue(result.reasons.none { it.startsWith("restriction=") })
+    }
+
+    @Test
+    fun `POSSIBLE_EARLY_DROP prefers a relay over an equally-eligible plain direct TCP candidate`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val direct = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_EARLY_DROP)
+        val relayed = relayedCandidate("in1", "exit1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_EARLY_DROP)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val directScore = PathScorer.score(direct, registry, TransportCapabilities.xrayTlsAdapterShell(), health, null, false)
+        val relayedScore = PathScorer.score(relayed, registry, TransportCapabilities.xrayTlsAdapterShell(), health, null, false)
+        assertTrue(relayedScore.score > directScore.score)
+        assertTrue(PathScorer.Reason.RESTRICTION_PENALIZES_EARLY_DROP_PRONE.name in directScore.reasons)
+    }
+
+    @Test
+    fun `POSSIBLE_EARLY_DROP does not penalize a direct transport already declared suitable for restrictive networks`() {
+        val registry = registryWithAvailable(TransportKind.XRAY_XHTTP)
+        val direct = directCandidate("gw1", TransportKind.XRAY_XHTTP, RestrictionClass.POSSIBLE_EARLY_DROP)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val result = PathScorer.score(direct, registry, TransportCapabilities.xrayXhttpAdapterShell(), health, null, false)
+        assertTrue(result.reasons.none { it.startsWith("restriction=") })
+    }
+
+    @Test
+    fun `POSSIBLE_UDP_OR_AWG_FILTERING (probe-derived, not behavior-derived) contributes no restriction preference at all - unchanged since B28`() {
+        val registry = registryWith(TransportKind.AMNEZIA_WG, TransportStatus.AVAILABLE)
+        val candidate = directCandidate("gw1", TransportKind.AMNEZIA_WG, RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val result = PathScorer.score(candidate, registry, TransportCapabilities.amneziaWg(), health, null, false)
+        assertTrue(result.reasons.none { it.startsWith("restriction=") })
+    }
+
+    @Test
+    fun `POSSIBLE_FULL_SHUTDOWN contributes no restriction preference - no transport choice helps a network carrying nothing`() {
+        val registry = registryWith(TransportKind.TLS_TCP, TransportStatus.AVAILABLE)
+        val candidate = directCandidate("gw1", TransportKind.TLS_TCP, RestrictionClass.POSSIBLE_FULL_SHUTDOWN)
+        val health = TransportHealth(state = TransportHealthState.HEALTHY)
+        val result = PathScorer.score(candidate, registry, TransportCapabilities.xrayTlsAdapterShell(), health, null, false)
+        assertTrue(result.reasons.none { it.startsWith("restriction=") })
     }
 }
