@@ -202,6 +202,18 @@ class AppConfig:
     # is set - see load_config's own validation group below.
     field_enrollment_wrap_key_file: str = ""
 
+    # B46-4P.1 - POST /v1/hysteria-profile. One all-or-nothing completeness
+    # group, same convention as the Xray groups above: blank (the default)
+    # means the endpoint fails closed with 503 hysteria_not_configured.
+    # server_address handed to the client is ALWAYS endpoint_host (the host a
+    # signed HYSTERIA2 EndpointTransportBinding must pin) - there is
+    # deliberately no separate override field that could drift from the
+    # signed manifest.
+    hysteria2_store_path: str = ""
+    hysteria2_lock_path: str = ""
+    hysteria2_server_port: int = 0
+    hysteria2_sni: str = ""
+
 
 def _get(env, key):
     return env.get(_ENV_PREFIX + key, "").strip()
@@ -680,6 +692,48 @@ def load_config(env=None):
                 f"got {len(_wrap_key_bytes)}"
             )
 
+    # B46-4P.1 - see AppConfig.hysteria2_*'s own docs. All-or-nothing: a
+    # half-configured Hysteria2 group is a startup error, never a silently
+    # disabled or silently defaulted endpoint.
+    hysteria2_store_path = _get(env, "HYSTERIA2_STORE_PATH")
+    hysteria2_lock_path = _get(env, "HYSTERIA2_LOCK_PATH")
+    hysteria2_server_port_raw = _get(env, "HYSTERIA2_SERVER_PORT")
+    hysteria2_sni = _get(env, "HYSTERIA2_SNI")
+    hysteria2_server_port = 0
+    if hysteria2_server_port_raw:
+        try:
+            hysteria2_server_port = int(hysteria2_server_port_raw)
+        except ValueError:
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SERVER_PORT is not an integer: {hysteria2_server_port_raw!r}")
+        if not (1 <= hysteria2_server_port <= 65535):
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SERVER_PORT out of range: {hysteria2_server_port}")
+    hysteria2_values = (
+        ("HYSTERIA2_STORE_PATH", hysteria2_store_path),
+        ("HYSTERIA2_LOCK_PATH", hysteria2_lock_path),
+        ("HYSTERIA2_SERVER_PORT", hysteria2_server_port_raw),
+        ("HYSTERIA2_SNI", hysteria2_sni),
+    )
+    if any(value for _name, value in hysteria2_values):
+        hysteria2_missing = [name for name, value in hysteria2_values if not value]
+        if hysteria2_missing:
+            raise ConfigError(
+                "partial Hysteria2 configuration: "
+                + ", ".join(_ENV_PREFIX + k for k in hysteria2_missing)
+                + " must all be set once any Hysteria2 setting is set (or none of them, to leave Hysteria2 unconfigured)"
+            )
+        for name, path in (("HYSTERIA2_STORE_PATH", hysteria2_store_path), ("HYSTERIA2_LOCK_PATH", hysteria2_lock_path)):
+            if not os.path.isabs(path):
+                raise ConfigError(f"{_ENV_PREFIX}{name} must be an absolute path: {path!r}")
+        # Hysteria2 credentials are scoped to the EXISTING activation/device
+        # binding - there is no Hysteria2 entitlement without it.
+        if not (activation_store_path and activation_lock_path):
+            raise ConfigError(
+                "partial Hysteria2 configuration: the activation store "
+                f"({_ENV_PREFIX}ACTIVATION_STORE_PATH/{_ENV_PREFIX}ACTIVATION_LOCK_PATH) must be configured before Hysteria2 can be enabled"
+            )
+        if any(ch.isspace() for ch in hysteria2_sni) or len(hysteria2_sni) > 253:
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SNI is not a plausible hostname: {hysteria2_sni!r}")
+
     return AppConfig(
         endpoint_host=endpoint_host,
         endpoint_port=endpoint_port,
@@ -725,4 +779,8 @@ def load_config(env=None):
         field_enrollment_index_path=field_enrollment_index_path,
         field_enrollment_index_lock_path=field_enrollment_index_lock_path,
         field_enrollment_wrap_key_file=field_enrollment_wrap_key_file,
+        hysteria2_store_path=hysteria2_store_path,
+        hysteria2_lock_path=hysteria2_lock_path,
+        hysteria2_server_port=hysteria2_server_port,
+        hysteria2_sni=hysteria2_sni,
     )
