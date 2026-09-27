@@ -31,6 +31,7 @@ fun ActivationPackageUiState.toActivationPackageMessage(): String? = when (this)
         ActivationPackageRejectionKind.NOT_YET_VALID -> "Activation package is not valid yet."
         ActivationPackageRejectionKind.CLOCK_UNCERTAIN -> "Check your device date and time, then try again."
         ActivationPackageRejectionKind.ALREADY_REDEEMED -> "Activation package was already used."
+        ActivationPackageRejectionKind.GATEWAY_NOT_ELIGIBLE -> "This activation package is not valid for any currently available server."
     }
 }
 

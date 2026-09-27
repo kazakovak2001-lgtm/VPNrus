@@ -3,6 +3,7 @@ package net.pocvpn.client.activation
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
+import net.pocvpn.client.vpn.config.ProductionGatewayId
 
 /**
  * B56-5 - package -> EXISTING activation flow orchestration, kept out of
@@ -21,6 +22,22 @@ import kotlinx.coroutines.withContext
  *   [activate] reports success.
  * - One redemption at a time: a call while another is in flight is ignored
  *   (returns false) rather than racing two activations.
+ *
+ * B67.6 - entitlement-aware gateway eligibility, checked BEFORE [activate]
+ * is ever called (never after, and never merged with server-side
+ * rejection): [resolveEligibility] is handed the envelope's own signed
+ * [ActivationEnvelope.bootstrapEndpointHints] (via [EntitlementScope],
+ * derived here from data this class already legitimately owns - no second
+ * envelope verification), and decides whether ANY currently-eligible
+ * gateway exists for it. A [GatewayEligibilityResult.Denied] fails closed
+ * with [ActivationPackageRejectionKind.GATEWAY_NOT_ELIGIBLE] - clears
+ * [pending] and never reaches [activate] at all, so an envelope this device
+ * cannot currently satisfy never even attempts a network call. Mapping
+ * [EntitlementScope] to a concrete gateway set needs the trusted manifest
+ * and the product gateway catalog, neither of which this pure-JVM class
+ * depends on directly - [resolveEligibility] is the caller's own decision
+ * (production: MainViewModel, via [EntitlementGatewayEligibility]), keeping
+ * this class unit-testable exactly as before with a plain fake function.
  */
 class ActivationPackageRedeemer(
     private val importer: ActivationPackageImporter,
@@ -37,7 +54,8 @@ class ActivationPackageRedeemer(
     suspend fun redeem(
         input: ActivationPackageInput,
         onState: (ActivationPackageUiState) -> Unit,
-        activate: suspend (credential: String) -> ActivationAttemptOutcome,
+        resolveEligibility: (EntitlementScope) -> GatewayEligibilityResult,
+        activate: suspend (credential: String, eligibleGatewayIds: List<ProductionGatewayId>) -> ActivationAttemptOutcome,
     ): Boolean {
         if (!busy.tryLock()) return false
         try {
@@ -50,7 +68,7 @@ class ActivationPackageRedeemer(
                 }
                 is ActivationPackageImportResult.Verified -> {
                     pending = result
-                    onState(activatePending(result, onState, activate))
+                    onState(activatePending(result, onState, resolveEligibility, activate))
                 }
             }
             return true
@@ -61,12 +79,13 @@ class ActivationPackageRedeemer(
 
     suspend fun retry(
         onState: (ActivationPackageUiState) -> Unit,
-        activate: suspend (credential: String) -> ActivationAttemptOutcome,
+        resolveEligibility: (EntitlementScope) -> GatewayEligibilityResult,
+        activate: suspend (credential: String, eligibleGatewayIds: List<ProductionGatewayId>) -> ActivationAttemptOutcome,
     ): Boolean {
         val current = pending ?: return false
         if (!busy.tryLock()) return false
         try {
-            onState(activatePending(current, onState, activate))
+            onState(activatePending(current, onState, resolveEligibility, activate))
             return true
         } finally {
             busy.unlock()
@@ -76,15 +95,25 @@ class ActivationPackageRedeemer(
     private suspend fun activatePending(
         verified: ActivationPackageImportResult.Verified,
         onState: (ActivationPackageUiState) -> Unit,
-        activate: suspend (credential: String) -> ActivationAttemptOutcome,
+        resolveEligibility: (EntitlementScope) -> GatewayEligibilityResult,
+        activate: suspend (credential: String, eligibleGatewayIds: List<ProductionGatewayId>) -> ActivationAttemptOutcome,
     ): ActivationPackageUiState {
         // A package verified earlier can expire while waiting for network.
         if (nowEpochMillis() >= verified.envelope.expiresAtEpochMillis) {
             pending = null
             return ActivationPackageUiState.Rejected(ActivationPackageRejectionKind.EXPIRED)
         }
+        val scope = EntitlementScope.fromEnvelopeHints(verified.envelope.bootstrapEndpointHints)
+        val eligibility = resolveEligibility(scope)
+        val eligibleGatewayIds = when (eligibility) {
+            is GatewayEligibilityResult.Denied -> {
+                pending = null
+                return ActivationPackageUiState.Rejected(ActivationPackageRejectionKind.GATEWAY_NOT_ELIGIBLE)
+            }
+            is GatewayEligibilityResult.Eligible -> eligibility.gatewayIds
+        }
         onState(ActivationPackageUiState.Activating(verified.bootstrap))
-        return when (activate(verified.envelope.credential.value)) {
+        return when (activate(verified.envelope.credential.value, eligibleGatewayIds)) {
             ActivationAttemptOutcome.SUCCEEDED -> {
                 pending = null
                 // Activation already succeeded server-side; failing to record

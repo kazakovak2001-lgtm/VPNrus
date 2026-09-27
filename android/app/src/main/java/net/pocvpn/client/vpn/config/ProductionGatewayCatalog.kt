@@ -169,6 +169,18 @@ object ProductionGatewayCatalog {
     }
 
     /**
+     * B67.6 - reverse lookup for a trusted-manifest [EndpointId], used to
+     * decide whether a manifest-backed endpoint is a product-supported
+     * gateway at all (local/product policy), never to accept an
+     * [EndpointId] as authoritative over this catalog's own facts. Returns
+     * null for any id this catalog does not carry - an unknown endpoint id
+     * (an ingress/exit-only manifest entry, a future gateway not yet in
+     * this build) is never guessed at.
+     */
+    fun byEndpointId(endpointId: EndpointId): ProductionGatewayId? =
+        all.singleOrNull { it.endpointId == endpointId }?.id
+
+    /**
      * B13 consolidated review fix - the ONE place a validated control-plane
      * response (ProvisioningResult.Success) OR a legacy persisted profile
      * (PersistedProfile) is mapped to a [ProductionGatewayId]. Matches on

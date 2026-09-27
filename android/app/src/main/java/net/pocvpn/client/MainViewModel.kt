@@ -2623,7 +2623,8 @@ class MainViewModel(
             redeemer.redeem(
                 net.pocvpn.client.activation.ActivationPackageInput.Text(packageText),
                 onState = { _activationPackageState.value = it },
-                activate = { credential -> activateDeviceAwaiting(credential, targetGatewayId) },
+                resolveEligibility = { scope -> resolveEntitlementGatewayEligibility(scope, targetGatewayId) },
+                activate = { credential, eligibleGatewayIds -> activateDeviceAwaiting(credential, chooseEligibleGateway(targetGatewayId, eligibleGatewayIds)) },
             )
         }
     }
@@ -2636,10 +2637,51 @@ class MainViewModel(
         viewModelScope.launch {
             redeemer.retry(
                 onState = { _activationPackageState.value = it },
-                activate = { credential -> activateDeviceAwaiting(credential, targetGatewayId) },
+                resolveEligibility = { scope -> resolveEntitlementGatewayEligibility(scope, targetGatewayId) },
+                activate = { credential, eligibleGatewayIds -> activateDeviceAwaiting(credential, chooseEligibleGateway(targetGatewayId, eligibleGatewayIds)) },
             )
         }
     }
+
+    /**
+     * B67.6 - entitlement (the envelope's signed [net.pocvpn.client.activation.EntitlementScope])
+     * + trusted manifest + local/product policy (`ProductionGatewayCatalog`
+     * membership, applied inside [net.pocvpn.client.activation.EntitlementGatewayEligibility])
+     * -> eligible gateway set. [manifestRepository]'s CURRENT trusted state
+     * is read fresh on every call (never cached here), so a manifest
+     * rollback/expiry between import and retry is always reflected - see
+     * that repository's own docs for why `trusted()` is always the live
+     * answer.
+     */
+    private fun resolveEntitlementGatewayEligibility(
+        scope: net.pocvpn.client.activation.EntitlementScope,
+        requestedGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    ): net.pocvpn.client.activation.GatewayEligibilityResult {
+        val trustedEndpointIds = manifestRepository?.trusted()?.endpoints?.map { it.id }?.toSet().orEmpty()
+        return net.pocvpn.client.activation.EntitlementGatewayEligibility.resolve(
+            scope = scope,
+            trustedManifestEndpointIds = trustedEndpointIds,
+            explicitRequestedGatewayId = requestedGatewayId,
+        )
+    }
+
+    /**
+     * B67.6 - the ONE explicit `activateDevice()` call this slice still
+     * makes (unchanged fail-closed per-gateway validation - see that
+     * function's own docs) needs one concrete target. Prefers the caller's
+     * own explicit/UI-selected gateway when it is itself eligible (least
+     * behavior change for the common single-eligible-gateway case);
+     * otherwise deterministically picks the first eligible id in the signed
+     * hint order - never a re-ranking, never a second Smart Connect. A
+     * plural eligible set existing at all is the exact input B67.7's Smart
+     * Connect integration is meant to consume; this slice does not attempt
+     * that ranking.
+     */
+    private fun chooseEligibleGateway(
+        requestedGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+        eligibleGatewayIds: List<net.pocvpn.client.vpn.config.ProductionGatewayId>,
+    ): net.pocvpn.client.vpn.config.ProductionGatewayId =
+        if (requestedGatewayId in eligibleGatewayIds) requestedGatewayId else eligibleGatewayIds.first()
 
     private suspend fun activateDeviceAwaiting(
         credential: String,
