@@ -3515,3 +3515,26 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 - Not deployed: no Hysteria2 server, running auth listener, systemd unit, firewall
   rule, or signed `HYSTERIA2` binding exists; the Android client is unmerged
   (PR #111).
+
+## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27, repo only - not deployed)
+
+- A VPN exit is an Internet proxy, never a proxy into the gateway host, its
+  VPC, cloud metadata, or special-purpose space. ONE canonical list:
+  `gateway/api/exit_target_policy.py` (IPv4 + IPv6 CIDRs). Never add
+  `::ffff:0:0/96` (Go treats it as 0.0.0.0/0); IPv4-mapped space is judged
+  by the IPv4 list.
+- Xray exit: `xray_config_renderer.render_server_config` enforces it twice:
+  a routing field rule (`domainStrategy: AsIs` - never resolves public
+  domains) sends literal blocked IPs to the `exit-acl-block` blackhole
+  outbound, and `freedom.settings.finalRules` blocks at dial time on the
+  RESOLVED IP (hostname destinations included). `direct` stays the first
+  (default) outbound. Xray ingress configs have no freedom outbound.
+- AWG exit: `gateway/nftables/pocvpn.nft.template` sets `exit_blocked_v4/v6`
+  must equal the Python policy (test-enforced); forward chain order is
+  `ct established,related accept` -> tunnel-ingress reject to the sets ->
+  tunnel<->egress accept; masquerade (postrouting) unchanged and after it.
+  Match only `iifname <awg>` so return traffic and ICMP errors (PMTUD) pass.
+- Hysteria2 (B46-4P.3) keeps its own application-layer ACL for the same
+  classes. Defense in depth: application ACL -> host/network ACL; neither
+  replaces the other.
+- Not covered: tunnel -> gateway INPUT path (host's own listeners).

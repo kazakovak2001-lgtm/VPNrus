@@ -32,6 +32,7 @@ import tempfile
 from dataclasses import dataclass, field
 
 from . import activations
+from . import exit_target_policy
 from . import xray_provisioning
 
 # Same shape Android's XrayVlessRealityConfig validator requires (see
@@ -360,12 +361,32 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
     if xhttp is not None:
         inbounds.append(_render_xhttp_inbound(clients, xhttp))
 
+    # Exit Target ACL (exit_target_policy.py), two independent layers:
+    # 1. routing: literal-IP destinations in blocked space -> blackhole.
+    #    domainStrategy stays AsIs, so public domains are NOT resolved by the
+    #    router and the public path is unchanged ("direct" is still the
+    #    first/default outbound).
+    # 2. freedom.finalRules: freedom resolves a domain destination itself,
+    #    checks the RESOLVED IP and dials that same IP (proxy/freedom/
+    #    freedom.go, pinned v26.7.28) - this catches hostnames resolving to
+    #    blocked space (DNS rebinding included), which layer 1 cannot see;
+    #    UDP is checked per packet. Explicit, not left to xray-core's
+    #    implicit per-inbound default (older binaries lack it).
     return {
         "log": {"loglevel": "warning"},
         "inbounds": inbounds,
         "outbounds": [
-            {"tag": "direct", "protocol": "freedom"},
+            {
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": exit_target_policy.xray_freedom_final_rules()},
+            },
+            {"tag": exit_target_policy.XRAY_BLOCK_OUTBOUND_TAG, "protocol": "blackhole"},
         ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [exit_target_policy.xray_routing_block_rule()],
+        },
     }
 
 
