@@ -77,11 +77,11 @@ file, never held while acquiring an activations.py lock.
 
 WIRING (B46-4P.1): provisioning is reached via handler.py's POST
 /v1/hysteria-profile, which fails closed with 503 unless the complete
-hysteria2_* config group is set. verify_hysteria_auth has NO caller yet - the
-loopback-only auth listener that a Hysteria2 server would call is later
-B46-4P work, as are the systemd units, the nginx route (none exists, so the
-edge's catch-all 404 keeps this endpoint unreachable publicly), the firewall
-rule, and the production manifest binding.
+hysteria2_* config group is set. verify_hysteria_auth is called by the
+loopback-only auth listener hysteria_auth_server.py (B46-4P.2, source only,
+not deployed). The systemd units, the nginx route (none exists, so the
+edge's catch-all 404 keeps /v1/hysteria-profile unreachable publicly), the
+firewall rule, and the production manifest binding remain later B46-4P work.
 """
 import hashlib
 import os
