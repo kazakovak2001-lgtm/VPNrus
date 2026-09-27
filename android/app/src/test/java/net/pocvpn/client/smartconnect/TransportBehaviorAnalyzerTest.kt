@@ -57,6 +57,23 @@ class TransportBehaviorAnalyzerTest {
     }
 
     @Test
+    fun `the live writer's real TCP failure shape (connect NOT_OBSERVED, handshake FAILED) across two destinations is still classifier-compatible ALL_CONNECT_FAILED`() {
+        // B-WL7 - VpnController.recordTransportBehaviorObservation can only
+        // confirm/deny a FRESH HANDSHAKE, never the lower-level socket-connect
+        // step in isolation, so a real TCP failure is honestly recorded this
+        // way (never connect=FAILED) - this must still reach ALL_CONNECT_FAILED,
+        // not silently fall through to INSUFFICIENT.
+        val result = TransportBehaviorAnalyzer.assess(
+            listOf(
+                tcp(destinationKey = "ep1", connect = AttemptStageOutcome.NOT_OBSERVED, handshake = AttemptStageOutcome.FAILED),
+                tcp(destinationKey = "ep2", connect = AttemptStageOutcome.NOT_OBSERVED, handshake = AttemptStageOutcome.FAILED),
+            ),
+        )
+        assertEquals(TransportBehaviorPattern.ALL_CONNECT_FAILED, result.pattern)
+        assertTrue(TransportBehaviorSignal.MULTIPLE_DESTINATIONS in result.signals)
+    }
+
+    @Test
     fun `successful handshake plus sustained payload yields SUSTAINED_PROGRESS`() {
         val result = TransportBehaviorAnalyzer.assess(listOf(tcp(bytesReceived = 500, progress = TrafficProgressOutcome.SUSTAINED)))
         assertEquals(TransportBehaviorPattern.SUSTAINED_PROGRESS, result.pattern)

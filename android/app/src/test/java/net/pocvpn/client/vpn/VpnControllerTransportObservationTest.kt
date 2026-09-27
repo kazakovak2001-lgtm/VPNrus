@@ -78,6 +78,14 @@ class VpnControllerTransportObservationTest {
 
         controller.connect()
         runCurrent()
+        // B-WL7 - the observation is no longer written synchronously on
+        // Connected: it is now the OUTCOME of a bounded live traffic-progress
+        // sample (see VpnController.launchLiveProgressObservation's own
+        // docs). This fake transport reports flat (0, 0) counters forever, so
+        // the sampler needs its full bounded window (verification + stall)
+        // before it can conclude IDLE and write the one observation.
+        advanceTimeBy(30_001)
+        runCurrent()
 
         assertTrue(controller.state.value is TransportState.Connected)
         val fingerprint = fingerprintFor(fakeUsableNetworkProfile)

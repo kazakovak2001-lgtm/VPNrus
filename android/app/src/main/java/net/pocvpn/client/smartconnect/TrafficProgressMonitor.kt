@@ -69,13 +69,19 @@ enum class TrafficProgressVerdict {
  * inbound answer). No magic byte count appears anywhere - an early drop at
  * any size looks the same here.
  *
- * Not yet wired into VpnController's live session loop - that wiring needs
- * per-transport, real-time counter sampling this pass did not add (see
- * docs/ROADMAP.md's B-WL row for the exact remaining gate).
- * VpnController's existing handshake/remote-confirmation gates remain the
- * live connection-health authority; this object is a pure, already-tested
- * decision function ready for that future wiring, and is never itself a
- * second watchdog or a second reconnect trigger.
+ * Wired into VpnController's live session loop via
+ * `launchLiveProgressObservation` (called once, right after a real
+ * AmneziaWG handshake succeeds): a bounded, OBSERVATIONAL-ONLY coroutine
+ * samples the transport's real `stats()` at the same poll cadence
+ * `awaitFreshHandshake` already uses, feeds the samples to [evaluate], and
+ * writes exactly one [TransportAttemptObservation] once a decisive verdict
+ * (or the bounded window) is reached. VpnController's existing handshake/
+ * remote-confirmation gates remain the live connection-health authority;
+ * this object never triggers a reconnect, never touches `_state`, and is
+ * never itself a second watchdog. Every non-AmneziaWG transport's `stats()`
+ * still reports no real counters, so this call site honestly records
+ * NOT_OBSERVED for them (see [TrafficProgressSample.fromCounters]) rather
+ * than fabricating progress evidence.
  */
 object TrafficProgressMonitor {
 

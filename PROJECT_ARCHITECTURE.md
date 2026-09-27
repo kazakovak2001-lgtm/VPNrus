@@ -3340,8 +3340,10 @@ or moved, and no commercial/billing/subscription concept of any kind.
   per-classification hardcoded if/else chain (roadmap architecture
   principle 6), never a hardcoded `TransportKind` branch. **B-WL7 (traffic
   progress) is IMPLEMENTED as a pure decision function** (`TrafficProgressMonitor`)
-  but is NOT wired into `VpnController`'s live session loop - see the
-  section below for the exact boundary.
+  **and is now wired into `VpnController`'s live AmneziaWG session lifecycle**
+  (bounded, observational-only real-counter sampling; every other transport
+  kind stays connect/handshake-level only) - see the section below for the
+  exact boundary.
 
 ## B-WL1/B-WL5 behavior-evidence pipeline (2026-09-27, IMPLEMENTED)
 
@@ -3399,43 +3401,65 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 - **`VpnController` production wiring, precisely bounded** - a new optional
   `transportObservationStore` collaborator (additive, defaults to `null`,
   same seam as `pathHistoryStore`/`connectionOutcomeStore`) is written from
-  the SAME four authoritative connect-outcome call sites those two already
-  use (`recordTransportBehaviorObservation`, called immediately alongside
-  `recordPathHistory` - never a fifth, independently-timed writer). This
-  call site can only honestly confirm/deny a FRESH HANDSHAKE (the same
-  evidence `recordConnectionOutcome` already records) - so it records
-  `connect`/`handshake` stage outcomes only; `progress`/`termination` are
-  left at their honest `NOT_OBSERVED`/`NONE_OBSERVED` defaults, never
-  fabricated. `MainViewModel.restrictionClass()` reads this SAME store,
-  scoped by the SAME network fingerprint `recordPathHistory` computes, and
-  passes it into `RestrictionEvidence.transportObservations`.
+  the SAME authoritative connect-outcome call sites `recordPathHistory`
+  already uses - never an independently-timed writer. A FAILED attempt
+  (`recordTransportBehaviorObservation`) can only honestly confirm/deny a
+  FRESH HANDSHAKE, so `connect`/`handshake` stage outcomes are recorded as
+  `NOT_OBSERVED`/`FAILED` (never `connect=FAILED` - this app cannot separate
+  the socket-connect step from the handshake step); `TransportBehaviorAnalyzer
+  .failedBeforePayload()`'s TCP predicate accepts either shape as "failed
+  before payload," so this genuine evidence still reaches `ALL_CONNECT_FAILED`.
+  A SUCCESSFUL AmneziaWG attempt instead goes to `launchLiveProgressObservation`
+  (below), which can actually sample real progress before its own, richer
+  write. Protocol (`TransportAttemptProtocol.TCP`/`UDP`) is decided from the
+  active transport's real `TransportCapabilities.usesUdp`, never a hardcoded
+  `TransportKind` branch. `MainViewModel.restrictionClass()` reads this SAME
+  store, scoped by the SAME network fingerprint `recordPathHistory` computes,
+  and passes it into `RestrictionEvidence.transportObservations`.
 - **`smartconnect/TrafficProgressMonitor.kt`** - a pure `evaluate()` judging
   `VERIFIED`/`STALLED_AFTER_INITIAL_PAYLOAD`/`NO_PAYLOAD`/`IDLE`/
   `UNAVAILABLE`/`VERIFYING` from bounded time windows over the EXISTING
-  `TransportStats.Counters` type (no new stats type). **NOT wired into
-  `VpnController`'s live session loop in this pass** - real per-transport,
-  real-time counter sampling was not added; B33's existing post-Connected
-  confirmation (`confirmRemoteConnectivity`, the relay-health watchdog)
-  remains the sole live connection-health authority, unmodified, and this
-  object is never a second watchdog and never itself triggers a
-  reconnect/teardown.
-- **What this means for real production evidence, stated precisely**: since
-  only connect/handshake-level facts are wired, `POSSIBLE_FULL_SHUTDOWN`
-  (all-transports-connect-failed) and a connect-level `POSSIBLE_UDP_FILTERING`
-  (AWG handshake fails while another transport's handshake succeeds) ARE
-  reachable from real production evidence today. `POSSIBLE_EARLY_DROP` and a
-  payload-aware `POSSIBLE_UDP_FILTERING` require the still-unwired
-  `TrafficProgressMonitor` and are NOT reachable from production evidence
-  yet - they are proven only against synthetic observations in
-  `TransportBehaviorAnalyzerTest`/`RestrictionClassifierTest`/`PathScorerTest`.
+  `TransportStats.Counters` type (no new stats type). **Wired into
+  `VpnController`'s live session lifecycle via `launchLiveProgressObservation`**:
+  called once, right after a real fresh AmneziaWG handshake, it samples
+  `activeTransport.stats()` at the SAME poll cadence `awaitFreshHandshake`
+  already uses (no second polling cadence, no new coroutine framework),
+  feeding each sample to `evaluate()` and stopping the instant a decisive
+  verdict is reached or the bounded `verificationWindowMillis +
+  stallWindowMillis` window elapses - always terminates, never loops
+  indefinitely. It writes exactly ONE `TransportAttemptObservation` per
+  attempt (tracked in `progressObservationJob`, cancelled under the SAME
+  `reconnectOwnershipLock`/generation discipline `reconnectJob` already uses,
+  so a superseded attempt can never record stale evidence), and never calls
+  `disconnect()`/`startReconnect()`/`setState()` - purely a store write. A
+  transport whose `stats()` reports no real counters (every non-AmneziaWG
+  kind today) is recorded `NOT_OBSERVED` on the very first poll, never a
+  fabricated claim. B33's existing post-Connected confirmation
+  (`confirmRemoteConnectivity`, the relay-health watchdog) remains the sole
+  live connection-health/reconnect authority, unmodified - this object is
+  never a second watchdog and never itself triggers a reconnect/teardown.
+- **What this means for real production evidence, stated precisely**:
+  `POSSIBLE_FULL_SHUTDOWN` (all-transports-connect-failed) and a
+  connect-level `POSSIBLE_UDP_FILTERING` (AWG handshake fails while another
+  transport's handshake succeeds) ARE reachable from real production
+  evidence for every transport kind. `POSSIBLE_EARLY_DROP` and a
+  payload-aware `POSSIBLE_UDP_FILTERING` ARE now reachable from real
+  AmneziaWG production evidence (the live `TrafficProgressMonitor` wiring
+  above); every other transport kind's evidence stays connect/handshake-level
+  only until it exposes real `TransportStats.Counters`. No physical
+  restricted-network/Russia validation of any of this exists yet.
 - **Tests**: `TransportBehaviorAnalyzerTest`, `TransportObservationStoreTest`,
-  `TrafficProgressMonitorTest` (new), plus additions to
-  `RestrictionClassifierTest` (new classes, corroboration, staleness,
-  contradiction, the closed-field-set proof updated for the new field),
-  `PathScorerTest` (capability-based preference, no-preference cases for
-  unchanged classes), and `VpnControllerTransportObservationTest` (new -
-  proves the real wiring records exactly one observation per authoritative
-  outcome, network-scoped, and is a no-op when unwired). No Android
+  `TrafficProgressMonitorTest`, plus `RestrictionClassifierTest` (new
+  classes, corroboration, staleness, contradiction, the closed-field-set
+  proof updated for the new field), `PathScorerTest` (capability-based
+  preference, no-preference cases for unchanged classes),
+  `VpnControllerTransportObservationTest` (records exactly one observation
+  per authoritative outcome, network-scoped, no-op when unwired), and the
+  new `VpnControllerLiveProgressObservationTest` (real-counter sampling ->
+  `SUSTAINED`/`STALLED_AFTER_INITIAL_PAYLOAD`/`NOT_OBSERVED` verdicts,
+  no-counter transports short-circuit to `NOT_OBSERVED` without waiting out
+  the bounded window, capability-driven protocol mapping, and a superseded
+  attempt's sampler never records stale/duplicate evidence). No Android
   Gradle/JVM test run was performed in this pass - see `docs/ROADMAP.md`'s
   B-WL row for why (pre-existing environment limitation, reproduces
   identically on unmodified `main`).

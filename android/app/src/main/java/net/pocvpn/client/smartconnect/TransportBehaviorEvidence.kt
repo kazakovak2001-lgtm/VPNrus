@@ -91,16 +91,18 @@ data class TransportBehaviorAssessment(
  * [TransportBehaviorPattern.INSUFFICIENT] rather than a network-wide claim.
  *
  * This is a pure decision function only - it does not itself produce
- * [TransportAttemptObservation]s. Today's one real production source of
- * observations is [net.pocvpn.client.vpn.VpnController]'s existing
- * authoritative connect-outcome recording (connect/handshake success or
- * failure only - see that class's own recordTransportBehaviorObservation
- * docs); this is honestly coarser than the full connect/handshake/payload/
- * stall/termination model this type can represent; payload-level fields
- * (bytesReceived/progress/termination beyond NONE_OBSERVED/TIMEOUT) are only
- * populated once a caller has real evidence for them (e.g. via
- * [TrafficProgressMonitor], not yet wired into a live session loop - see
- * that object's own docs) - never fabricated to make a pattern match.
+ * [TransportAttemptObservation]s. [net.pocvpn.client.vpn.VpnController] is the
+ * one real production source: a FAILED attempt (handshake timeout/backend
+ * start failure/reconnect exhaustion) still only has connect/handshake-level
+ * evidence (see that class's own recordTransportBehaviorObservation docs) and
+ * reports payload-level fields as NOT_OBSERVED/NONE_OBSERVED. A SUCCESSFUL
+ * AmneziaWG attempt now also samples real [TransportStats.Counters] over a
+ * bounded post-connect window via [TrafficProgressMonitor]
+ * (VpnController.launchLiveProgressObservation - see that function's own
+ * docs), so bytesReceived/progress reflect genuine live evidence for that
+ * transport; every other transport's `stats()` still reports no counters at
+ * all, so its payload-level fields stay honestly NOT_OBSERVED/NONE_OBSERVED -
+ * never fabricated to make a pattern match.
  */
 object TransportBehaviorAnalyzer {
 
@@ -181,8 +183,20 @@ object TransportBehaviorAnalyzer {
             o.handshake != AttemptStageOutcome.SUCCEEDED &&
             (o.handshake == AttemptStageOutcome.FAILED || o.termination == AttemptTermination.TIMEOUT)
 
+    /**
+     * B-WL7 - the live writer (VpnController.recordTransportBehaviorObservation)
+     * can only confirm a FRESH HANDSHAKE, never the lower-level socket-connect
+     * step in isolation (see that function's own docs) - so a genuine TCP
+     * failure is honestly recorded as `connect=NOT_OBSERVED, handshake=FAILED`,
+     * not `connect=FAILED`. Treating ONLY `connect==FAILED` as evidence would
+     * make this predicate unreachable from real observations. Both shapes mean
+     * the same thing (this attempt failed before any payload arrived), so
+     * either one - together with the unconditional zero-payload check, which
+     * this call site never fabricates a nonzero value for - is accepted.
+     */
     private fun failedBeforePayload(o: TransportAttemptObservation): Boolean = when (o.protocol) {
-        TransportAttemptProtocol.TCP -> o.connect == AttemptStageOutcome.FAILED && o.bytesReceived == 0L
+        TransportAttemptProtocol.TCP ->
+            o.bytesReceived == 0L && (o.connect == AttemptStageOutcome.FAILED || o.handshake == AttemptStageOutcome.FAILED)
         TransportAttemptProtocol.UDP -> isUdpNoResponse(o)
     }
 

@@ -42,7 +42,11 @@ import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
+import net.pocvpn.client.smartconnect.TrafficProgressMonitor
 import net.pocvpn.client.smartconnect.TrafficProgressOutcome
+import net.pocvpn.client.smartconnect.TrafficProgressPolicy
+import net.pocvpn.client.smartconnect.TrafficProgressSample
+import net.pocvpn.client.smartconnect.TrafficProgressVerdict
 import net.pocvpn.client.smartconnect.TransportAttemptObservation
 import net.pocvpn.client.smartconnect.TransportAttemptProtocol
 import net.pocvpn.client.smartconnect.TransportObservationStore
@@ -426,6 +430,15 @@ class VpnController(
     private var reconnectJob: Job? = null
     private val reconnectOwnershipLock = Any()
     private var reconnectGeneration = 0L
+
+    // B-WL7 - the bounded, OBSERVATIONAL-ONLY live traffic-progress sampler
+    // for the CURRENT attempt (see launchLiveProgressObservation's own docs).
+    // Never read for connection-health/reconnect decisions - only cancelled,
+    // at the exact same "this attempt/recovery cycle is over" points
+    // reconnectJob already is (cancelReconnectLocked/
+    // cancelReconnectForExplicitConnect), so a stale sampler from an
+    // abandoned attempt can never record evidence for a NEWER one.
+    private var progressObservationJob: Job? = null
 
     // B8I4 - the kind of the resolution the CURRENT/most recent connect()
     // attempt validated (see connect() below) - defaults to this
@@ -1033,7 +1046,13 @@ class VpnController(
                             if (pendingAttemptContext !is VpnAttemptContext.Relayed) {
                                 recordConnectionOutcome(ConnectionOutcomeResult.SUCCESS, ConnectionErrorCategory.NONE, attemptStartEpochMillis)
                                 recordPathHistory(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
-                                recordTransportBehaviorObservation(success = true, kind = kind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
+                                // B-WL7 - a real success can actually sample
+                                // live traffic progress (see that function's
+                                // own docs for why this replaces an
+                                // immediate, evidence-free
+                                // recordTransportBehaviorObservation(success =
+                                // true, ...) write here).
+                                launchLiveProgressObservation(endpointId = pendingConnectEndpointId, transport = activeTransport)
                             }
                             true
                         } else {
@@ -1477,23 +1496,26 @@ class VpnController(
     }
 
     /**
-     * B-WL1 - the FIRST real writer into [TransportObservationStore], called
-     * from the SAME authoritative-outcome sites [recordPathHistory] already
-     * uses, reusing its exact fingerprint computation (never a second
-     * network-identity system). Deliberately coarse today: this call site's
-     * only real evidence is connect-level success/failure (the SAME
-     * evidence [recordConnectionOutcome] already records), so
+     * B-WL1/B-WL7 - the FIRST real writer into [TransportObservationStore],
+     * called from the SAME authoritative-outcome sites [recordPathHistory]
+     * already uses, reusing its exact fingerprint computation (never a
+     * second network-identity system). Handles only the FAILURE side of a
+     * connect/reconnect attempt today (handshake timeout, backend start
+     * failure, or reconnect exhaustion) - a real SUCCESS is instead handed to
+     * [launchLiveProgressObservation], which can actually sample real
+     * traffic progress before writing its own, richer observation (see that
+     * function's own docs for why success is not recorded here). This call
+     * site's only real evidence for a failure is connect/handshake-level
+     * (the SAME evidence [recordConnectionOutcome] already records), so
      * [TransportAttemptObservation.progress]/[TransportAttemptObservation
      * .termination] are honestly [TrafficProgressOutcome.NOT_OBSERVED]/
-     * [AttemptTermination.NONE_OBSERVED] (never fabricated payload/stall
-     * evidence this call site cannot see - see TransportBehaviorAnalyzer's
-     * own docs on why payload-level fields require a real, separately-wired
-     * traffic-progress source, not yet connected here). [endpointId] is the
-     * SAME opaque technical identifier used elsewhere (never a raw
-     * host/IP). A transport with `usesUdp` in its own capabilities is
-     * recorded as [TransportAttemptProtocol.UDP] so POSSIBLE_UDP_FILTERING
-     * evidence can ever be produced from real observations; every other
-     * transport is TCP.
+     * [AttemptTermination.NONE_OBSERVED] - never fabricated payload/stall
+     * evidence this call site cannot see. [endpointId] is the SAME opaque
+     * technical identifier used elsewhere (never a raw host/IP). The active
+     * transport's real [net.pocvpn.client.transport.TransportCapabilities
+     * .usesUdp] (never a hardcoded [TransportKind] branch) decides
+     * [TransportAttemptProtocol] so POSSIBLE_UDP_FILTERING evidence can ever
+     * be produced from real observations.
      */
     private fun recordTransportBehaviorObservation(success: Boolean, kind: TransportKind, endpointId: EndpointId, nowEpochMillis: Long) {
         val store = transportObservationStore ?: return
@@ -1504,7 +1526,7 @@ class VpnController(
             CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
             keyProvider.keyBytes(),
         )
-        val protocol = if (kind == TransportKind.AMNEZIA_WG) TransportAttemptProtocol.UDP else TransportAttemptProtocol.TCP
+        val protocol = if (activeTransport.capabilities.usesUdp) TransportAttemptProtocol.UDP else TransportAttemptProtocol.TCP
         // Honest per real evidence: this call site can only confirm/deny a
         // FRESH HANDSHAKE (see awaitFreshHandshake), never the lower-level
         // socket-connect step in isolation - so a failure is recorded as
@@ -1524,6 +1546,122 @@ class VpnController(
                 progress = TrafficProgressOutcome.NOT_OBSERVED,
                 termination = AttemptTermination.NONE_OBSERVED,
                 observedAtEpochMillis = nowEpochMillis,
+            ),
+        )
+    }
+
+    /**
+     * B-WL7 - launches the bounded, OBSERVATIONAL-ONLY live traffic-progress
+     * sample for the attempt that JUST reached a real, fresh handshake (the
+     * ONE production caller is doConnectAttempt's AmneziaWG success branch -
+     * see its own docs for why a reconnect-recovery success never calls this,
+     * same "one logical outcome per attempt" model
+     * [recordTransportBehaviorObservation] already follows). Runs in [scope]
+     * so it never blocks doConnectAttempt's own return or delays the
+     * Connected transition by even one poll interval - this is additive
+     * evidence collection, not a gate.
+     *
+     * Samples [transport]'s real `stats()` at the SAME
+     * [HANDSHAKE_POLL_INTERVAL_MS] cadence [awaitFreshHandshake] already
+     * polls at (no second polling cadence invented), converting each sample
+     * via [TrafficProgressSample.fromCounters] and feeding the accumulated
+     * list to [TrafficProgressMonitor.evaluate] after every sample. The loop
+     * stops the instant a decisive verdict is reached (anything other than
+     * [TrafficProgressVerdict.VERIFYING]) or after
+     * `verificationWindowMillis + stallWindowMillis` worth of polls, whichever
+     * comes first - so this always terminates in bounded time, never loops
+     * indefinitely, and is never itself a second watchdog. A transport whose
+     * `stats()` is [TransportStats.Unsupported]/[TransportStats.NotImplemented]
+     * (i.e. there is nothing to observe) breaks out on the FIRST poll rather
+     * than spending the whole window doing nothing - the resulting empty
+     * sample list evaluates to [TrafficProgressVerdict.VERIFYING], which
+     * [TrafficProgressMonitor.toProgressOutcome] correctly maps to
+     * [TrafficProgressOutcome.NOT_OBSERVED] - never a fabricated claim.
+     * [elapsedMillis] passed to each sample is `pollIndex *
+     * HANDSHAKE_POLL_INTERVAL_MS` - monotonic by construction, never
+     * wall-clock, and exactly as fast-forwardable under
+     * kotlinx-coroutines-test's virtual time as [awaitFreshHandshake]'s own
+     * poll loop already is.
+     *
+     * Writes exactly ONE [TransportAttemptObservation] via
+     * [recordLiveProgressObservation] once the loop ends - never one per
+     * poll, never a duplicate for the same attempt (superseded by a NEWER
+     * attempt's [progressObservationJob] via [cancelReconnectLocked]/
+     * [cancelReconnectForExplicitConnect], which cancel this exact job before
+     * it can race a fresher one). Never calls disconnect()/startReconnect()/
+     * setState() - purely a store write, so this can never itself trigger a
+     * reconnect or alter transport execution.
+     */
+    private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport) {
+        val store = transportObservationStore ?: return
+        // Same synchronized(reconnectOwnershipLock) discipline startReconnect()
+        // already uses for reconnectJob - never a bare, unsynchronized
+        // cross-coroutine write (cancelReconnectLocked/
+        // cancelReconnectForExplicitConnect read this same field under the
+        // SAME lock, from a call path that does not always hold connectMutex
+        // yet - see cancelReconnectForExplicitConnect's own call site).
+        synchronized(reconnectOwnershipLock) {
+            progressObservationJob?.cancel()
+            progressObservationJob = scope.launch {
+                val policy = TrafficProgressPolicy()
+                val maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
+                val samples = mutableListOf<TrafficProgressSample>()
+                var verdict = TrafficProgressVerdict.VERIFYING
+                for (pollIndex in 0..maxPolls) {
+                    val stats = transport.stats()
+                    if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) break
+                    TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
+                    verdict = TrafficProgressMonitor.evaluate(samples, policy)
+                    if (verdict != TrafficProgressVerdict.VERIFYING) break
+                    if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
+                }
+                recordLiveProgressObservation(store, endpointId, transport, samples, verdict)
+            }
+        }
+    }
+
+    /**
+     * B-WL7 - the actual [TransportObservationStore] write
+     * [launchLiveProgressObservation] performs once its bounded window ends.
+     * Reuses the exact SAME fingerprint computation
+     * [recordTransportBehaviorObservation] already uses (never a second
+     * network-identity system). Connect/handshake are always SUCCEEDED here
+     * - the only caller only reaches this after a real fresh handshake - and
+     * bytesSent/bytesReceived come from the LAST real sample this attempt
+     * collected (0 when the transport offered no counters at all, never
+     * fabricated). [TrafficProgressMonitor.toProgressOutcome] maps [verdict]
+     * onto the honest [TrafficProgressOutcome]; termination stays
+     * [AttemptTermination.NONE_OBSERVED] since this app cannot observe an
+     * RST/FIN at this layer.
+     */
+    private fun recordLiveProgressObservation(
+        store: TransportObservationStore,
+        endpointId: EndpointId,
+        transport: VpnTransport,
+        samples: List<TrafficProgressSample>,
+        verdict: TrafficProgressVerdict,
+    ) {
+        val keyProvider = fingerprintKeyProvider ?: return
+        val profileProvider = networkProfileProvider ?: return
+        val profile = profileProvider()
+        val fingerprint = NetworkFingerprinter.fingerprint(
+            CoarseNetworkSignals(profile.type, profile.dnsServerAddresses),
+            keyProvider.keyBytes(),
+        )
+        val protocol = if (transport.capabilities.usesUdp) TransportAttemptProtocol.UDP else TransportAttemptProtocol.TCP
+        val last = samples.lastOrNull()
+        store.record(
+            fingerprint,
+            TransportAttemptObservation(
+                destinationKey = endpointId.value,
+                protocol = protocol,
+                connect = AttemptStageOutcome.SUCCEEDED,
+                handshake = AttemptStageOutcome.SUCCEEDED,
+                bytesSent = last?.bytesSent ?: 0L,
+                bytesReceived = last?.bytesReceived ?: 0L,
+                progress = TrafficProgressMonitor.toProgressOutcome(verdict),
+                termination = AttemptTermination.NONE_OBSERVED,
+                observedAtEpochMillis = System.currentTimeMillis(),
             ),
         )
     }
@@ -1742,6 +1880,8 @@ class VpnController(
             reconnectGeneration++
             reconnectJob?.cancel()
             reconnectJob = null
+            progressObservationJob?.cancel()
+            progressObservationJob = null
             oldGeneration
         }
         if (cancelledGeneration != null) {
@@ -1757,6 +1897,8 @@ class VpnController(
             reconnectGeneration++
             reconnectJob?.cancel()
             reconnectJob = null
+            progressObservationJob?.cancel()
+            progressObservationJob = null
             oldGeneration
         }
         runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Disconnected(cancelledGeneration)) }
@@ -1773,6 +1915,7 @@ class VpnController(
     fun shutdown() {
         reconnectManager.stop()
         reconnectJob?.cancel()
+        synchronized(reconnectOwnershipLock) { progressObservationJob?.cancel() }
         activeObserverJob?.cancel()
     }
 }

@@ -28,9 +28,14 @@ class FakeVpnTransport(
     // ONLY available transport is something else (e.g. XRAY_REALITY), to
     // prove Smart Connect's AWG-only preflight blocks a non-AWG selection.
     override val kind: TransportKind = TransportKind.AMNEZIA_WG,
+    // B-WL7 - additive, defaults to null (kept byte-for-byte on the AWG
+    // shape every existing test relies on): lets a test prove protocol
+    // identification is driven by the transport's real capabilities, never
+    // by `kind`, without needing a genuinely different transport class.
+    capabilitiesOverride: TransportCapabilities? = null,
 ) : VpnTransport {
     override val name: String = "fake"
-    override val capabilities: TransportCapabilities = TransportCapabilities.amneziaWg()
+    override val capabilities: TransportCapabilities = capabilitiesOverride ?: TransportCapabilities.amneziaWg()
     override val underlyingNetworkRecovery: UnderlyingNetworkRecovery =
         if (kind == TransportKind.AMNEZIA_WG) UnderlyingNetworkRecovery.IN_PLACE else UnderlyingNetworkRecovery.RESTART_SESSION
 
@@ -52,6 +57,13 @@ class FakeVpnTransport(
     var handshakeAvailable = true
     var statsBytesReceived = 0L
     var statsBytesSent = 0L
+
+    // B-WL7 - additive, defaults to null (every existing test keeps reading
+    // the static statsBytesReceived/statsBytesSent fields above via the
+    // default stats() body below): lets a test simulate stats() CHANGING
+    // across repeated live-progress-sampler polls (e.g. real per-call
+    // counter growth) without needing a bespoke VpnTransport subclass.
+    var statsProvider: (() -> TransportStats)? = null
 
     override fun preparePermissionIntent(): Intent? = permission
 
@@ -80,7 +92,7 @@ class FakeVpnTransport(
         stateFlow.value = state
     }
 
-    override suspend fun stats(): TransportStats = TransportStats.Counters(
+    override suspend fun stats(): TransportStats = statsProvider?.invoke() ?: TransportStats.Counters(
         bytesReceived = statsBytesReceived,
         bytesSent = statsBytesSent,
         lastHandshakeEpochMillis = if (handshakeAvailable) System.currentTimeMillis() else null,
