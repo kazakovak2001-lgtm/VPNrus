@@ -59,6 +59,52 @@ class ActivationInputResolverFileTests {
     }
 }
 
+class ActivationInputResolverFileStreamTests {
+    @Test
+    fun `file limit is derived from the existing parser text limit`() {
+        assertEquals(ActivationPackageParser.MAX_TEXT_LENGTH, ActivationInputResolver.MAX_FILE_BYTES)
+    }
+
+    @Test
+    fun `file exactly at the limit is accepted`() {
+        val text = "nova-activation:1:" + "A".repeat(ActivationInputResolver.MAX_FILE_BYTES - "nova-activation:1:".length)
+        val result = ActivationInputResolver.resolveFileStream(java.io.ByteArrayInputStream(text.toByteArray(Charsets.UTF_8)))
+        assertReadyText(text, result)
+    }
+
+    @Test
+    fun `file one byte over the limit is rejected as too large`() {
+        val bytes = ByteArray(ActivationInputResolver.MAX_FILE_BYTES + 1) { 'A'.code.toByte() }
+        val result = ActivationInputResolver.resolveFileStream(java.io.ByteArrayInputStream(bytes))
+        assertEquals(ActivationInputResolution.Rejected(ActivationInputRejectionReason.FILE_TOO_LARGE), result)
+    }
+
+    @Test
+    fun `oversized stream is never read past limit plus one byte`() {
+        var bytesServed = 0L
+        val endless = object : java.io.InputStream() {
+            override fun read(): Int { bytesServed++; return 'A'.code }
+        }
+        val result = ActivationInputResolver.resolveFileStream(endless)
+        assertEquals(ActivationInputResolution.Rejected(ActivationInputRejectionReason.FILE_TOO_LARGE), result)
+        assertEquals((ActivationInputResolver.MAX_FILE_BYTES + 1).toLong(), bytesServed)
+    }
+
+    @Test
+    fun `empty stream is rejected as empty`() {
+        val result = ActivationInputResolver.resolveFileStream(java.io.ByteArrayInputStream(ByteArray(0)))
+        assertEquals(ActivationInputResolution.Rejected(ActivationInputRejectionReason.FILE_EMPTY), result)
+    }
+
+    @Test
+    fun `stream result matches string-based file resolution`() {
+        val text = "nova-activation:1:abcXYZ_-123\n"
+        val fromStream = ActivationInputResolver.resolveFileStream(java.io.ByteArrayInputStream(text.toByteArray(Charsets.UTF_8)))
+        assertReadyText(text, fromStream)
+        assertReadyText(text, ActivationInputResolver.resolveFile(text))
+    }
+}
+
 class ActivationInputResolverQrTests {
     @Test
     fun `valid HTTPS activation link is recognized and produces a handoff token`() {

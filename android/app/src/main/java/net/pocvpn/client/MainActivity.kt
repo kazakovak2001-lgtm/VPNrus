@@ -7,7 +7,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import net.pocvpn.client.activation.ActivationInput
+import net.pocvpn.client.activation.ActivationInputRejectionReason
+import net.pocvpn.client.activation.ActivationInputResolution
 import net.pocvpn.client.activation.ActivationInputResolver
 import net.pocvpn.client.ui.AppRoot
 import net.pocvpn.client.ui.theme.NovaVpnTheme
@@ -43,10 +49,11 @@ class MainActivity : AppCompatActivity() {
      * B-ACT-IMPORT - Storage Access Framework document picker. No MIME type
      * restriction is hardcoded here (SAF's own `ACTION_OPEN_DOCUMENT` contract) -
      * see [AppRoot]'s file-picker launch site for the preferred/fallback MIME
-     * types it actually requests. On pick, reads the file's exact UTF-8 text
-     * (no trim/normalization beyond what decoding bytes as a String already
-     * is) and hands it to [ActivationInputResolver.resolveFile] - the ONLY
-     * place that decides whether that text is usable at all. Deliberately
+     * types it actually requests. On pick, reads the file on Dispatchers.IO
+     * via [ActivationInputResolver.resolveFileStream] (bounded to
+     * [ActivationInputResolver.MAX_FILE_BYTES]; oversized files are rejected
+     * before any String is built) - the ONLY place that decides whether that
+     * content is usable at all. Deliberately
      * never calls `takePersistableUriPermission` - this Uri is read exactly
      * once, right here, so the one-time grant Android already provides for
      * the launching call is sufficient and nothing needs to be explicitly
@@ -55,19 +62,18 @@ class MainActivity : AppCompatActivity() {
     private val activationFileLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
             if (uri == null) return@registerForActivityResult
-            val content = try {
-                contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
-            } catch (e: java.io.IOException) {
-                null
-            } catch (e: SecurityException) {
-                null
+            lifecycleScope.launch {
+                val resolution = withContext(Dispatchers.IO) {
+                    try {
+                        contentResolver.openInputStream(uri)?.use { ActivationInputResolver.resolveFileStream(it) }
+                    } catch (e: java.io.IOException) {
+                        null
+                    } catch (e: SecurityException) {
+                        null
+                    } ?: ActivationInputResolution.Rejected(ActivationInputRejectionReason.FILE_UNREADABLE)
+                }
+                viewModel.submitActivationInput(resolution)
             }
-            val resolution = if (content == null) {
-                ActivationInputResolver.resolveFile("")
-            } else {
-                ActivationInputResolver.resolve(ActivationInput.File(content))
-            }
-            viewModel.submitActivationInput(resolution)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {

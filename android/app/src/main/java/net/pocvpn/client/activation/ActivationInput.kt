@@ -41,6 +41,7 @@ sealed class ActivationInput {
 enum class ActivationInputRejectionReason {
     FILE_EMPTY,
     FILE_UNREADABLE,
+    FILE_TOO_LARGE,
     QR_EMPTY,
     QR_UNRECOGNIZED,
     APPLINK_WRONG_SCHEME,
@@ -134,6 +135,27 @@ object ActivationInputResolver {
         return ActivationInputResolution.Ready(ActivationPackageInput.Text(content))
     }
 
+    // Package text is ASCII, so the parser's own char bound is also the byte bound; anything larger is already TooLarge there.
+    val MAX_FILE_BYTES: Int = ActivationPackageParser.MAX_TEXT_LENGTH
+
+    /**
+     * Blocking - call off the main thread. Reads at most [MAX_FILE_BYTES] + 1
+     * bytes so an oversized file is rejected before any large String exists.
+     */
+    fun resolveFileStream(stream: java.io.InputStream): ActivationInputResolution {
+        val buffer = ByteArray(MAX_FILE_BYTES + 1)
+        var total = 0
+        while (total < buffer.size) {
+            val read = stream.read(buffer, total, buffer.size - total)
+            if (read < 0) break
+            total += read
+        }
+        if (total > MAX_FILE_BYTES) {
+            return ActivationInputResolution.Rejected(ActivationInputRejectionReason.FILE_TOO_LARGE)
+        }
+        return resolve(ActivationInput.File(String(buffer, 0, total, Charsets.UTF_8)))
+    }
+
     /**
      * A QR payload is supported in exactly two shapes (never a third,
      * guessed one): an `https://` App Link URL (delegates to
@@ -215,6 +237,8 @@ fun ActivationInputAdapterUiState.toDisplayMessage(): String? = when (this) {
     is ActivationInputAdapterUiState.Rejected -> when (reason) {
         ActivationInputRejectionReason.FILE_EMPTY, ActivationInputRejectionReason.FILE_UNREADABLE ->
             "Couldn't read that file. Choose a valid activation package file."
+        ActivationInputRejectionReason.FILE_TOO_LARGE ->
+            "That file is too large to be an activation package."
         ActivationInputRejectionReason.QR_EMPTY, ActivationInputRejectionReason.QR_UNRECOGNIZED ->
             "That QR code isn't a recognized activation code."
         ActivationInputRejectionReason.APPLINK_WRONG_SCHEME,
