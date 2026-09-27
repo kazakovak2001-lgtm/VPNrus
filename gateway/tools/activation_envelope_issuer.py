@@ -63,6 +63,27 @@ That is B56-4B, after this tooling is reviewed.
 Requires the `cryptography` package (same existing dev-only dependency as
 manifest_signing.py - not a gateway API runtime dependency, never imported
 by gateway/api/*). Install with: pip install cryptography
+
+## `sign-existing` - the B56-4B production-issuance split (B67.8-support)
+
+`issue` above fuses TWO operations into one process: creating a new
+activation record (needs the live store, never the private key) and
+signing an envelope for it (needs the private key, never the store). That
+fusion is exactly why `issue` can never safely run anywhere the private
+key is also allowed to be - the ceremony's own hard invariant ("the
+private key never enters ... the VPS", see
+docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md) leaves no place `issue` could
+run for a REAL production activation.
+
+`sign-existing` splits this: it takes an activation_id/credential/
+expires_at that were already produced by the EXISTING, unmodified
+`activation_tokens.py issue`/`status` run on the gateway host (no code
+change there), and does ONLY the signing half - it has no `--store`/
+`--lock` argument at all, so it structurally cannot create, read, or
+mutate any activation record. It is meant to run on the SAME offline,
+operator-controlled machine that holds the private key, never on the
+gateway host. See `docs/B56_ACTIVATION_ISSUER_KEY_CEREMONY.md`'s
+"sign-existing operator workflow" section for the full two-step procedure.
 """
 from __future__ import annotations
 
@@ -400,6 +421,47 @@ def read_private_key_file(path: str) -> Ed25519PrivateKey:
         raise IssuerError(f"private key file {path!r} does not contain a valid Ed25519 private key") from None
     finally:
         raw = None  # best-effort - CPython bytes are immutable, but drop the reference promptly
+
+
+def read_credential_file(path: str) -> str:
+    """B67.8-support - reads an already-issued activation credential (the
+    exact plaintext `activation_tokens.py issue`/`issue_activation()`
+    already prints once to stdout - see that file's own docs) from a file,
+    for `sign-existing` below. Mirrors `read_private_key_file`'s own
+    read-time hygiene (regular file, POSIX owner-only mode) - a live
+    activation credential is exactly as sensitive as a private key file
+    for as long as this file exists, since anyone holding it can redeem
+    the activation it names. Never logged, printed, or included in any
+    exception message; content is validated against the SAME
+    `_CREDENTIAL_RE`/`MAX_CREDENTIAL_CHARS` bounds `ActivationEnvelope`
+    itself already enforces, so a malformed file fails here with a
+    generic message rather than deeper inside envelope construction."""
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise IssuerError(f"failed to stat credential file {path!r}: {exc.__class__.__name__}") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise IssuerError(f"credential file {path!r} is not a regular file")
+    if os.name != "nt":
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & _UNSAFE_PRIVATE_KEY_MODE_MASK:
+            raise IssuerError(
+                f"refusing to read credential file {path!r}: its POSIX mode {oct(mode)} is "
+                "group/other-accessible - `chmod 600` it (owner read/write only) before retrying"
+            )
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise IssuerError(f"failed to read credential file {path!r}: {exc.__class__.__name__}") from None
+    credential = raw.strip()
+    if not credential:
+        raise IssuerError(f"credential file {path!r} is empty")
+    if len(credential) > MAX_CREDENTIAL_CHARS:
+        raise IssuerError(f"credential file {path!r} exceeds max credential length ({MAX_CREDENTIAL_CHARS})")
+    if not _CREDENTIAL_RE.match(credential):
+        raise IssuerError(f"credential file {path!r} does not contain a URL-safe base64 (no padding) credential")
+    return credential
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1079,6 +1141,131 @@ def _revoke_or_report_critical(args, activation_id: str, original_exc: BaseExcep
     )
 
 
+def cmd_sign_existing(args) -> int:
+    """B67.8-support - closes the B56-4B production issuance gap: signs an
+    envelope for an activation record that ALREADY EXISTS in the live
+    store, WITHOUT this command ever opening, locking, or even knowing the
+    path of that store. This is the offline half of a two-step split:
+
+        1. an operator with ordinary shell access to the gateway host runs
+           the EXISTING, unmodified `activation_tokens.py issue` there
+           (creates exactly one record, prints activation_id/credential to
+           stdout exactly once, per that file's own long-standing
+           contract - no code in this file or that one changes for that
+           step) and, if a bound expiry matters, the EXISTING `status`
+           command to read back `expires_at`;
+        2. the operator carries those three plain values (activation_id,
+           credential, expires_at) to the SEPARATE, offline machine that
+           holds the production private key, and runs THIS command there.
+
+    This command has no `--store`/`--lock` argument at all - structurally,
+    not just by convention, it cannot read or write any activation store,
+    so it cannot create a second record, cannot duplicate the one step 1
+    already created, and cannot touch `bound_devices`/`status`/any other
+    field a live redemption depends on. The resulting envelope is
+    redeemable precisely because step 1 already inserted a record whose
+    credential digest matches - this command changes nothing about how
+    `gateway.api.activations.decide_and_bind` decides that (unchanged,
+    unimported by this function).
+
+    Unlike `cmd_issue`, there is no activation to roll back on failure -
+    none was created here - so any error simply fails closed with a
+    non-zero exit and no output file, exactly like a rejected `issue`
+    input validation failure (steps 1-4 of that command's own docs)."""
+    _require_finite_positive(args.envelope_valid_for_hours, "--envelope-valid-for-hours", _MAX_ENVELOPE_VALID_FOR_HOURS)
+    if not _ACTIVATION_ID_RE.match(args.activation_id):
+        raise IssuerError("--activation-id must be 32 lowercase hex characters")
+
+    private_key = read_private_key_file(args.private_key_file)
+    public_key = private_key.public_key()
+    derived_public_key_bytes = public_key.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+
+    identity = read_issuer_metadata_file(args.issuer_metadata_file)
+    if not hmac.compare_digest(identity.public_key_bytes, derived_public_key_bytes):
+        raise IssuerError(
+            "--private-key-file does not match the public key recorded in --issuer-metadata-file - "
+            "refusing to sign an envelope with issuerKeyId that no client could ever verify against this key"
+        )
+    issuer_key_id = identity.issuer_key_id
+
+    _refuse_if_exists(args.out)
+    _refuse_if_inside_git_repo(args.out)
+
+    hints = _validate_hints_order_preserving(args.endpoint_hint or [])
+
+    bundle_ref: Optional[BundleRef] = None
+    if args.bootstrap_bundle:
+        try:
+            manifest_version, content_hash = inspect_signed_manifest_bundle(args.bootstrap_bundle)
+        except BundleInspectionError as exc:
+            raise IssuerError(f"--bootstrap-bundle rejected: {exc}") from None
+        bundle_ref = BundleRef(manifest_version=manifest_version, content_hash=content_hash)
+
+    credential = read_credential_file(args.credential_file)
+    try:
+        issued_at = int(time.time() * 1000)
+        not_before = issued_at
+        requested_expires_at = issued_at + int(args.envelope_valid_for_hours * 3600 * 1000)
+
+        server_expires_at = None
+        if args.activation_record_expires_at:
+            from datetime import datetime
+
+            try:
+                server_expires_at = int(datetime.fromisoformat(args.activation_record_expires_at).timestamp() * 1000)
+            except ValueError:
+                raise IssuerError(
+                    f"--activation-record-expires-at {args.activation_record_expires_at!r} is not a valid "
+                    "ISO-8601 timestamp (paste it exactly as `activation_tokens.py status` printed it)"
+                ) from None
+
+        if server_expires_at is not None and requested_expires_at > server_expires_at:
+            raise IssuerError(
+                f"requested envelope lifetime (expiring at epoch millis {requested_expires_at}) would extend "
+                f"beyond this activation's own server-side expiry (epoch millis {server_expires_at}) - "
+                "reduce --envelope-valid-for-hours or pass a longer --activation-record-expires-at"
+            )
+        expires_at = requested_expires_at
+
+        envelope = ActivationEnvelope(
+            activation_id=args.activation_id,
+            credential=credential,
+            issued_at_epoch_millis=issued_at,
+            not_before_epoch_millis=not_before,
+            expires_at_epoch_millis=expires_at,
+            bootstrap_bundle_ref=bundle_ref,
+            bootstrap_endpoint_hints=hints,
+            bootstrap_capability_hint=None,
+            nonce=secrets.token_bytes(NONCE_LENGTH),
+            issuer_key_id=issuer_key_id,
+        )
+
+        canonical = canonical_bytes(envelope)
+        signature = private_key.sign(canonical)
+        artifact = pack_signed_envelope(canonical, signature)
+        artifact_sha256 = hashlib.sha256(artifact).hexdigest()
+        artifact_tmp_path = publish_secret_no_clobber(args.out, artifact)
+    finally:
+        credential = None  # best-effort - drop the local reference promptly
+
+    publication = confirm_post_publication(args.out, artifact_tmp_path)
+
+    print(f"activation_envelope_issuer: sign-existing activation_id={args.activation_id} issuerKeyId={issuer_key_id}")
+    print(f"activation_envelope_issuer: envelope issuedAt={issued_at} expiresAt={expires_at}")
+    print(f"activation_envelope_issuer: issuer public key fingerprint (sha256)={public_key_fingerprint_sha256_hex(public_key)}")
+    print(f"activation_envelope_issuer: envelope artifact written to {args.out} (sha256={artifact_sha256})")
+    if not publication.directory_sync_confirmed:
+        print(
+            "activation_envelope_issuer: NOTE - see the durability warning above: the envelope artifact is "
+            "successfully published and its file contents are fsynced, but directory-entry crash durability "
+            "could not be confirmed.",
+            file=sys.stderr,
+        )
+    if bundle_ref is not None:
+        print(f"activation_envelope_issuer: bootstrap bundle manifestVersion={bundle_ref.manifest_version} contentHash(sha256)={bundle_ref.content_hash.hex()}")
+    return 0
+
+
 # --- CLI wiring ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1105,6 +1292,25 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument("--bootstrap-bundle", default=None, help="optional path to an ALREADY-signed SignedManifestCodec artifact (from manifest_signing.py) to correlate by exact-byte SHA-256 + manifest version - never re-signed")
     issue.add_argument("--out", required=True, help="output path for the signed envelope artifact - SECRET (contains the plaintext activation credential); refuses to overwrite")
 
+    sign_existing = sub.add_parser(
+        "sign-existing",
+        help=(
+            "B67.8-support - sign an envelope for an activation record that was ALREADY created elsewhere "
+            "(e.g. via `activation_tokens.py issue` run directly on the gateway host) - never opens, locks, "
+            "or even takes a path to any activation store; run this ONLY on the offline machine holding the "
+            "production private key, never on the gateway host itself"
+        ),
+    )
+    sign_existing.add_argument("--activation-id", required=True, help="the activation_id `activation_tokens.py issue` printed (non-secret, 32 lowercase hex characters)")
+    sign_existing.add_argument("--credential-file", required=True, help="path to a file containing exactly the raw activation credential `activation_tokens.py issue` printed to stdout - NEVER pass the credential itself on the command line")
+    sign_existing.add_argument("--activation-record-expires-at", default=None, help="optional - the exact expires_at value `activation_tokens.py status <activation_id>` printed for this record (ISO-8601); omit if that record has no expiry")
+    sign_existing.add_argument("--issuer-metadata-file", required=True, help="the EXACT public-metadata JSON generate-key produced alongside --private-key-file - its issuerKeyId is used, and its public key MUST match the private key")
+    sign_existing.add_argument("--private-key-file", required=True, help="path to a raw 32-byte Ed25519 private key file - NEVER pass the key itself on the command line")
+    sign_existing.add_argument("--envelope-valid-for-hours", type=float, required=True, help="REQUIRED - how long the signed envelope itself remains valid, in hours (architecture guidance: roughly 24-72h, not mandated)")
+    sign_existing.add_argument("--endpoint-hint", action="append", default=[], help="optional, repeatable, non-authoritative EndpointId hint (order preserved, max 32, no duplicates)")
+    sign_existing.add_argument("--bootstrap-bundle", default=None, help="optional path to an ALREADY-signed SignedManifestCodec artifact (from manifest_signing.py) to correlate by exact-byte SHA-256 + manifest version - never re-signed")
+    sign_existing.add_argument("--out", required=True, help="output path for the signed envelope artifact - SECRET (contains the plaintext activation credential); refuses to overwrite")
+
     return parser
 
 
@@ -1117,6 +1323,8 @@ def main(argv=None) -> int:
             return cmd_generate_key(args)
         if args.command == "issue":
             return cmd_issue(args)
+        if args.command == "sign-existing":
+            return cmd_sign_existing(args)
     except IssuerError as exc:
         print(f"activation_envelope_issuer: error: {exc}", file=sys.stderr)
         return 1

@@ -1488,5 +1488,254 @@ class IssueCommandTests(unittest.TestCase):
         self.assertTrue(os.path.exists(args.out))
 
 
+def _write_credential_file(directory, credential, name="test-credential.txt"):
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(credential)
+    os.chmod(path, 0o600)
+    return path
+
+
+class SignExistingCommandTests(unittest.TestCase):
+    """B67.8-support - `sign-existing` must be structurally incapable of
+    touching any activation store, must never echo the raw credential, and
+    must fail closed on a mismatched key or malformed input - exactly like
+    `issue`'s own equivalent guarantees, minus the store."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.key_path = _write_test_key_file(self.tmp.name)
+        self.metadata_path = _write_metadata_file(self.tmp.name)
+        # A real store, used ONLY to obtain a genuine activation_id/credential
+        # the same way `activation_tokens.py issue` would on a real gateway -
+        # sign-existing itself is never given this store's path.
+        self.store = os.path.join(self.tmp.name, "activations.json")
+        self.lock = os.path.join(self.tmp.name, "activations.lock")
+        activations_module = issuer._activations_module()
+        activations_module.init_store(self.store, self.lock)
+        self.activations_module = activations_module
+        self.activation_id, self.credential = activations_module.issue_activation(
+            self.store, self.lock, max_devices=1,
+        )
+        self.credential_path = _write_credential_file(self.tmp.name, self.credential)
+
+    def _base_args(self, **overrides):
+        args = mock.Mock(
+            activation_id=self.activation_id,
+            credential_file=self.credential_path,
+            activation_record_expires_at=None,
+            issuer_metadata_file=self.metadata_path,
+            private_key_file=self.key_path,
+            envelope_valid_for_hours=48.0,
+            endpoint_hint=["frankfurt"],
+            bootstrap_bundle=None,
+            out=os.path.join(self.tmp.name, "envelope.bin"),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_produces_a_verifiable_envelope_for_the_given_activation_id_and_credential(self):
+        args = self._base_args()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = issuer.cmd_sign_existing(args)
+        self.assertEqual(0, rc)
+
+        with open(args.out, "rb") as handle:
+            artifact = handle.read()
+        canonical_len = struct.unpack_from(">i", artifact, 4)[0]
+        sig_len = struct.unpack_from(">i", artifact, 8 + canonical_len)[0]
+        self.assertEqual(64, sig_len)
+        priv = Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES)
+        canonical = artifact[8:8 + canonical_len]
+        signature = artifact[12 + canonical_len:12 + canonical_len + sig_len]
+        priv.public_key().verify(signature, canonical)  # raises if invalid
+
+    def test_command_never_creates_a_second_activation_record(self):
+        # (A) exactly one record exists before AND after - sign-existing
+        # is structurally incapable of creating one (no --store argument).
+        records_before = self.activations_module.list_all(self.store, self.lock)
+        self.assertEqual(1, len(records_before))
+        args = self._base_args()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            issuer.cmd_sign_existing(args)
+        records_after = self.activations_module.list_all(self.store, self.lock)
+        self.assertEqual(1, len(records_after))
+
+    def test_existing_activation_record_is_not_modified(self):
+        # (B) the record itself (status/bound_devices/expires_at/etc.) is
+        # byte-for-byte unchanged - sign-existing never opens the store file.
+        before = self.activations_module.find_by_activation_id(self.store, self.lock, self.activation_id)
+        args = self._base_args()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            issuer.cmd_sign_existing(args)
+        after = self.activations_module.find_by_activation_id(self.store, self.lock, self.activation_id)
+        self.assertEqual(before, after)
+
+    def test_store_file_bytes_are_untouched(self):
+        # (E) no lock/atomic-write activity of any kind - the store file's
+        # own bytes and mtime are completely unaffected by sign-existing.
+        with open(self.store, "rb") as handle:
+            before_bytes = handle.read()
+        before_mtime_ns = os.stat(self.store).st_mtime_ns
+        args = self._base_args()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            issuer.cmd_sign_existing(args)
+        with open(self.store, "rb") as handle:
+            after_bytes = handle.read()
+        self.assertEqual(before_bytes, after_bytes)
+        self.assertEqual(before_mtime_ns, os.stat(self.store).st_mtime_ns)
+
+    def test_has_no_store_or_lock_argument_at_all(self):
+        # Structural guarantee, not merely a convention: the CLI parser for
+        # sign-existing has no way to even name an activation store.
+        parser = issuer.build_parser()
+        sign_existing_action = next(
+            action for action in parser._subparsers._group_actions[0]._choices_actions
+            if action.dest == "sign-existing"
+        )
+        subparser = parser._subparsers._group_actions[0].choices["sign-existing"]
+        dests = {action.dest for action in subparser._actions}
+        self.assertNotIn("store", dests)
+        self.assertNotIn("lock", dests)
+        del sign_existing_action  # only used to assert the subparser exists via .choices above
+
+    def test_raw_credential_never_appears_in_stdout_or_stderr(self):
+        # (C) the credential is consumed only to embed it (signed) into the
+        # envelope artifact - never echoed back on any stream.
+        args = self._base_args()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = issuer.cmd_sign_existing(args)
+        self.assertEqual(0, rc)
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn(self.credential, combined)
+
+    def test_wrong_private_key_for_metadata_is_rejected_before_any_output(self):
+        # (F) "unauthorized invocation fails" - a key that does not match
+        # the issuer metadata is refused before anything is written.
+        other_key_path = _write_test_key_file(self.tmp.name, key_bytes=bytes(range(1, 33)), name="other-key.bin")
+        args = self._base_args(private_key_file=other_key_path)
+        with self.assertRaises(issuer.IssuerError):
+            issuer.cmd_sign_existing(args)
+        self.assertFalse(os.path.exists(args.out))
+
+    def test_credential_file_group_readable_is_rejected_on_posix(self):
+        if os.name == "nt":
+            self.skipTest("POSIX-only permission check")
+        os.chmod(self.credential_path, 0o640)
+        args = self._base_args()
+        with self.assertRaises(issuer.IssuerError):
+            issuer.cmd_sign_existing(args)
+        self.assertFalse(os.path.exists(args.out))
+
+    def test_envelope_expiry_never_extends_beyond_the_supplied_activation_record_expiry(self):
+        from datetime import datetime, timedelta, timezone
+        record_expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        args = self._base_args(activation_record_expires_at=record_expires_at, envelope_valid_for_hours=48.0)
+        with self.assertRaises(issuer.IssuerError):
+            issuer.cmd_sign_existing(args)
+        self.assertFalse(os.path.exists(args.out))
+
+    def test_missing_credential_file_fails_closed(self):
+        args = self._base_args(credential_file=os.path.join(self.tmp.name, "does-not-exist.txt"))
+        with self.assertRaises(issuer.IssuerError):
+            issuer.cmd_sign_existing(args)
+
+
+class SignExistingRedemptionTests(unittest.TestCase):
+    """(G)/(H) - the full split-issuance flow end to end, entirely local:
+    activation_tokens.py-equivalent record creation -> sign-existing ->
+    the SAME gateway.api.activations.decide_and_bind a real /v1/activate
+    request would call - never production, never a real key."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.key_path = _write_test_key_file(self.tmp.name)
+        self.metadata_path = _write_metadata_file(self.tmp.name)
+        self.store = os.path.join(self.tmp.name, "activations.json")
+        self.lock = os.path.join(self.tmp.name, "activations.lock")
+        self.activations_module = issuer._activations_module()
+        self.activations_module.init_store(self.store, self.lock)
+
+    def test_a_sign_existing_envelope_credential_is_accepted_by_decide_and_bind(self):
+        # Step 1 (gateway host, no private key involved) - exactly what
+        # `activation_tokens.py issue` already does, unmodified.
+        activation_id, credential = self.activations_module.issue_activation(
+            self.store, self.lock, max_devices=1,
+        )
+        credential_path = _write_credential_file(self.tmp.name, credential)
+
+        # Step 2 (offline machine, no store involved).
+        args = mock.Mock(
+            activation_id=activation_id,
+            credential_file=credential_path,
+            activation_record_expires_at=None,
+            issuer_metadata_file=self.metadata_path,
+            private_key_file=self.key_path,
+            envelope_valid_for_hours=48.0,
+            endpoint_hint=["frankfurt"],
+            bootstrap_bundle=None,
+            out=os.path.join(self.tmp.name, "envelope.bin"),
+        )
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = issuer.cmd_sign_existing(args)
+        self.assertEqual(0, rc)
+
+        # Decode+verify the artifact the way the Android client would,
+        # never trusting the local Python variables above without this
+        # check - this IS the client's own trust boundary.
+        with open(args.out, "rb") as handle:
+            artifact = handle.read()
+        canonical_len = struct.unpack_from(">i", artifact, 4)[0]
+        canonical = artifact[8:8 + canonical_len]
+        sig_len = struct.unpack_from(">i", artifact, 8 + canonical_len)[0]
+        signature = artifact[12 + canonical_len:12 + canonical_len + sig_len]
+        priv = Ed25519PrivateKey.from_private_bytes(_TEST_PRIVATE_KEY_BYTES)
+        priv.public_key().verify(signature, canonical)  # raises if invalid
+
+        # (G)/(H): redeem using the activation_id/credential the offline
+        # step was given - proving the store's pre-existing record
+        # (created in step 1, never touched by step 2) is exactly what
+        # makes this envelope's credential redeemable.
+        decision = self.activations_module.decide_and_bind(
+            credential, "test-wg-public-key-base64==", self.store, self.lock,
+        )
+        self.assertEqual(self.activations_module.BOUND_NEW, decision.outcome)
+        self.assertEqual(activation_id, decision.activation_id)
+
+    def test_a_wrong_credential_is_rejected_by_decide_and_bind(self):
+        # Negative control for the same flow - a credential that was NEVER
+        # issued into this store must never redeem, regardless of having a
+        # validly-signed envelope wrapper.
+        activation_id, _real_credential = self.activations_module.issue_activation(
+            self.store, self.lock, max_devices=1,
+        )
+        fabricated_credential = "FABRICATED_never_issued_credential_0123456789"
+        credential_path = _write_credential_file(self.tmp.name, fabricated_credential)
+        args = mock.Mock(
+            activation_id=activation_id,
+            credential_file=credential_path,
+            activation_record_expires_at=None,
+            issuer_metadata_file=self.metadata_path,
+            private_key_file=self.key_path,
+            envelope_valid_for_hours=48.0,
+            endpoint_hint=["frankfurt"],
+            bootstrap_bundle=None,
+            out=os.path.join(self.tmp.name, "envelope.bin"),
+        )
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = issuer.cmd_sign_existing(args)
+        self.assertEqual(0, rc)  # signing succeeds - it never validates against any store
+
+        decision = self.activations_module.decide_and_bind(
+            fabricated_credential, "test-wg-public-key-base64==", self.store, self.lock,
+        )
+        self.assertEqual(self.activations_module.INVALID, decision.outcome)
+
+
 if __name__ == "__main__":
     unittest.main()

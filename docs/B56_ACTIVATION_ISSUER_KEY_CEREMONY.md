@@ -507,6 +507,56 @@ signed envelope's own `expiresAtEpochMillis`. The rotation MECHANISM is the
 supports trusting an old and a new key simultaneously during a rotation
 window.
 
+## `sign-existing` operator workflow (closes the B56-4B2 issuance-split gap)
+
+`issue` (documented above) fuses activation-record creation (needs the
+live store) and envelope signing (needs the private key) into one call -
+which is exactly why it can never be run for a REAL production activation
+without violating "the private key never enters ... the VPS." This gap was
+identified by a B67.8 read-only audit and closed by a new, narrowly-scoped
+`sign-existing` subcommand (`gateway/tools/activation_envelope_issuer.py`)
+that has no `--store`/`--lock` argument at all - it structurally cannot
+touch any activation store. The two-step operator procedure:
+
+1. **On the gateway host** (`152.70.43.1`, ordinary existing SSH/shell
+   access - the SAME operator-trust boundary `activation_tokens.py`
+   already requires, nothing new): run the EXISTING, unmodified
+   `activation_tokens.py issue [--max-devices N] [--expires-in-days N]`.
+   It prints `activation_id`/`max_devices` to stderr and the raw
+   `credential` to stdout, exactly once, exactly as it always has. If the
+   activation has a bounded expiry, also run
+   `activation_tokens.py status <activation_id>` (read-only, non-mutating)
+   to read back `expires_at`.
+2. **On the separate, offline, operator-controlled machine holding the
+   production private key** (never the gateway host): run
+   `activation_envelope_issuer.py sign-existing --activation-id <id>
+   --credential-file <path> --activation-record-expires-at <expires_at, if
+   any> --issuer-metadata-file <path> --private-key-file <path>
+   --envelope-valid-for-hours <N> --endpoint-hint <hint> --out <path>`.
+   The credential is passed via a file (never argv), matching
+   `--private-key-file`'s own existing discipline; delete that file after
+   use. `sign-existing` verifies the private key matches the issuer
+   metadata (the same check `issue` already does) before signing anything,
+   so a wrong/unauthorized key fails closed with no output produced.
+
+The values `activation_id`/`credential`/`expires_at` travel between step 1
+and step 2 through whatever channel the operator already uses to reach the
+gateway host's own SSH session (e.g. reading them off that same terminal) -
+this workflow deliberately introduces no new transport, no new daemon, and
+no new HTTP endpoint for that step, per this ceremony's own existing
+constraints. The resulting envelope is redeemable by `/v1/activate`
+precisely because step 1 already inserted a record whose credential digest
+matches, in the exact same store `decide_and_bind` reads - `sign-existing`
+changes nothing about how that decision is made.
+
+This closes the ISSUANCE-INFRASTRUCTURE gap only. No production issuance
+has been performed using it - see `test_activation_envelope_issuer.py`'s
+`SignExistingCommandTests` for the offline-only proof, and
+`test_activation_envelope_issuer.py`'s `SignExistingRedemptionTests` for
+the local (non-production) end-to-end proof that a `sign-existing`-signed
+envelope's credential is accepted by the existing, unmodified
+`gateway.api.activations.decide_and_bind`.
+
 ## What B56-4B2+ still has to do
 
 B56-4B1 (this ceremony) completed steps 1-4 below for real. Remaining:

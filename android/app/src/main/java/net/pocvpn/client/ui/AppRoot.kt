@@ -13,11 +13,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.pocvpn.client.MainViewModel
+import net.pocvpn.client.activation.toDisplayMessage
 import net.pocvpn.client.apps.InstalledAppInfo
 import net.pocvpn.client.apps.InstalledAppRepository
 import net.pocvpn.client.apps.PackageManagerInstalledAppRepository
@@ -87,6 +89,13 @@ fun AppRoot(
     // and ingress provisioning silently, with no credential/key/server UI
     // ever shown to the field tester.
     isZeroTouchEnrollmentBuild: Boolean = false,
+    // B-ACT-IMPORT - launches the SAF ACTION_OPEN_DOCUMENT picker
+    // (MainActivity owns the actual ActivityResultLauncher/ContentResolver
+    // read - see that class's own docs); this is a plain function reference
+    // so AppRoot itself never touches Android framework file APIs. Defaults
+    // to a no-op so every pre-existing preview/test caller of AppRoot stays
+    // unaffected.
+    onLaunchActivationFilePicker: (Array<String>) -> Unit = {},
 ) {
     val profileSource by viewModel.profileSource.collectAsStateWithLifecycle()
     val transportState by viewModel.transportState.collectAsStateWithLifecycle()
@@ -96,6 +105,7 @@ fun AppRoot(
     val sessionHealth by viewModel.sessionHealth.collectAsStateWithLifecycle()
     val provisioningState by viewModel.provisioningState.collectAsStateWithLifecycle()
     val activationPackageState by viewModel.activationPackageState.collectAsStateWithLifecycle()
+    val activationInputAdapterState by viewModel.activationInputAdapterState.collectAsStateWithLifecycle()
     val publicKey by viewModel.publicKey.collectAsStateWithLifecycle()
     val diagnosticsSnapshot by viewModel.diagnostics.collectAsStateWithLifecycle()
     val alwaysOnState by AlwaysOnVpnState.state.collectAsStateWithLifecycle()
@@ -166,6 +176,13 @@ fun AppRoot(
     val installedAppRepository = remember(context) { PackageManagerInstalledAppRepository(context) }
     var installedApps by remember { mutableStateOf<List<InstalledAppInfo>?>(null) }
 
+    // B-ACT-IMPORT - purely a local UI notice (no camera/QR dependency wired
+    // yet - see ActivationScreen's onScanQrClick docs); never touches any
+    // activation/security state. Cleared whenever the credential field
+    // itself changes, so it never lingers over an unrelated later attempt.
+    var qrScanUnavailableNotice by remember { mutableStateOf(false) }
+    LaunchedEffect(credential) { qrScanUnavailableNotice = false }
+
     LaunchedEffect(provisioningState) {
         if (shouldClearCredentialInput(provisioningState)) {
             credential = ""
@@ -228,9 +245,15 @@ fun AppRoot(
                             viewModel.activateDevice(credential, activatingGatewayId!!)
                         }
                     },
-                    errorText = activationErrorText(credential, activationPackageState, provisioningState),
+                    errorText = if (qrScanUnavailableNotice) {
+                        stringResource(net.pocvpn.client.R.string.activation_qr_not_available)
+                    } else {
+                        activationInputAdapterState.toDisplayMessage() ?: activationErrorText(credential, activationPackageState, provisioningState)
+                    },
                     isSubmitting = provisioningState is ProvisioningUiState.Provisioning || activationPackageState.isInProgress(),
                     onCancel = { activatingGatewayId = null; credential = "" },
+                    onChooseFileClick = { onLaunchActivationFilePicker(arrayOf("application/vnd.nova.activation-package", "text/plain")) },
+                    onScanQrClick = { qrScanUnavailableNotice = true },
                 )
                 screenFor(profileSource, isZeroTouchEnrollmentBuild) == AppScreen.ACTIVATION -> ActivationScreen(
                     credential = credential,
@@ -242,7 +265,13 @@ fun AppRoot(
                             viewModel.activateDevice(credential)
                         }
                     },
-                    errorText = activationErrorText(credential, activationPackageState, provisioningState),
+                    onChooseFileClick = { onLaunchActivationFilePicker(arrayOf("application/vnd.nova.activation-package", "text/plain")) },
+                    onScanQrClick = { qrScanUnavailableNotice = true },
+                    errorText = if (qrScanUnavailableNotice) {
+                        stringResource(net.pocvpn.client.R.string.activation_qr_not_available)
+                    } else {
+                        activationInputAdapterState.toDisplayMessage() ?: activationErrorText(credential, activationPackageState, provisioningState)
+                    },
                     isSubmitting = provisioningState is ProvisioningUiState.Provisioning || activationPackageState.isInProgress(),
                 )
                 // B8H - "Select apps" screen, reached only from Settings.
