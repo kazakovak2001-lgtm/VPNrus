@@ -1,0 +1,63 @@
+# B46-4P.3 - Hysteria2 server (apernet/hysteria app/v2.12.3, see
+# gateway/hysteria/VERSION). The ONLY public listener it opens is UDP
+# :443 (QUIC); TCP 443 stays nginx's. Every client credential is checked by
+# the loopback-only auth backend (pocvpn-hysteria-auth.service,
+# 127.0.0.1:8446) - this unit holds no secret and reads no /etc/pocvpn file.
+# Config: rendered by `python3 -m api.hysteria_server_config` (see
+# gateway/DEPLOYMENT.md "Hysteria2 on Stockholm (B46-4P.3)").
+#
+# Deliberately Wants=, not Requires=, the auth backend: if the backend is
+# down Hysteria2 keeps running and its HTTP authenticator denies every
+# connection (fail closed), instead of systemd tearing this unit down.
+[Unit]
+Description=Nova Hysteria2 server (public UDP 443, loopback auth backend)
+After=network-online.target pocvpn-hysteria-auth.service
+Wants=network-online.target pocvpn-hysteria-auth.service
+
+[Service]
+Type=simple
+User=nova-hysteria
+Group=nova-hysteria
+StateDirectory=nova-hysteria
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/nova-hysteria
+# No outbound call to GitHub from a production gateway.
+Environment=HYSTERIA_DISABLE_UPDATE_CHECK=true
+ExecStart=/opt/pocvpn/hysteria/v2.12.3/hysteria server --config /etc/nova-hysteria/config.yaml --disable-update-check
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+# Binding UDP 443 (< 1024) as a non-root user is the only privilege needed.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+RestrictSUIDSGID=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# AF_NETLINK: Go's net package enumerates interfaces for the direct
+# outbound's dual-stack dialing.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

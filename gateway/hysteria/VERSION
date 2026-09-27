@@ -1,0 +1,22 @@
+# B46-4P.3 - pinned provenance for the SERVER-side Hysteria2 runtime.
+# Same apernet/hysteria tag/commit the B46 Android research client pinned
+# (research/b46-2p-android-physical/hysteria-minimal-client/README.md) - not
+# an independently chosen version. Do not float to "latest"; re-audit the
+# server config schema (gateway/api/hysteria_server_config.py) before bumping.
+
+HYSTERIA_REPO=https://github.com/apernet/hysteria.git
+HYSTERIA_TAG=app/v2.12.3
+HYSTERIA_VERSION=v2.12.3
+HYSTERIA_COMMIT=e1366b173ccf5706e1e4630fe8aa654a4b574085
+HYSTERIA_LICENSE=MIT
+
+# Official upstream release asset for the linux/amd64 Stockholm VPS (AWS
+# t3.micro, x86_64). Verified for real in B46-4P.3: downloaded, sha256sum'd
+# locally, cross-checked against the release's own published hashes.txt
+# ("build/hysteria-linux-amd64"), both matched exactly.
+HYSTERIA_RELEASE_ASSET=hysteria-linux-amd64
+HYSTERIA_RELEASE_ASSET_URL=https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.3/hysteria-linux-amd64
+HYSTERIA_RELEASE_ASSET_SHA256=8c7a68a906998b747a0db87586e364f995fbfddb95693ae6e2fdb68a6e920d3e
+
+# `hysteria version` of that exact binary: "Version: v2.12.3",
+# "BuildType: release", "CommitHash: e1366b173ccf5706e1e4630fe8aa654a4b574085".

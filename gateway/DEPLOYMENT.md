@@ -471,3 +471,102 @@ code otherwise remains behind this repo's HEAD** - a full, reviewed
 redeployment of `gateway/api/*.py` to Frankfurt (bringing it byte-for-byte
 current, not just the manifest route) is a distinct, separate future
 slice, not performed here.
+
+## Hysteria2 on Stockholm (B46-4P.3, 2026-09-27) - PREPARED, NOT DEPLOYED
+
+Repository artifacts only. Nothing below has been installed or started on
+Stockholm; server installation and the AWS security-group change are
+separate, explicitly approved steps.
+
+### Topology (from the 2026-09-27 read-only audit of 16.170.208.231)
+
+```
+Public:   UDP 443 -> Hysteria2 (nova-hysteria.service, user nova-hysteria)
+Private:  127.0.0.1:8446 (TCP) -> Hysteria2 auth backend
+          (pocvpn-hysteria-auth.service = python3 -m api.hysteria_auth_server)
+TLS/SNI:  origin-sthlm.aknova.pp.ua (DNS-only A record -> 16.170.208.231)
+Nginx:    not involved in the Hysteria2 data path (TCP 80/443 stay nginx's;
+          nginx has no QUIC listener - never add `listen 443 quic` while
+          Hysteria2 owns UDP 443)
+AWS:      UDP 443 must be explicitly allowed before public service startup
+```
+
+**Do NOT expose TCP/UDP 8446 publicly.** No nginx location, no nftables
+rule, no security-group rule may ever route to it; the auth unit also sets
+`IPAddressDeny=any` / `IPAddressAllow=localhost`.
+
+Audited facts it rests on: UDP in use = 51820 (AWG) + loopback-only 53/323;
+TCP public = 22, 80, 443 (nginx), 2053/2083 (nova-xray); loopback = 2100,
+8443-8445; 2093 reserved (nova-xray-ingress, disabled). OS firewall is
+ACCEPT everywhere (nftables `inet filter` policy accept), so the security
+group `launch-wizard-1` is the only inbound gate - its rules were NOT
+verifiable from the host (no IAM role) and are still unverified.
+`edge-sthlm.aknova.pp.ua` must not be used: it is Cloudflare-proxied and
+Cloudflare does not carry UDP/QUIC to the origin. The IP certificate is not
+usable either (an IP cannot be sent as SNI; `sniGuard: strict`).
+
+### Artifacts
+
+| Artifact | Purpose |
+|---|---|
+| `gateway/hysteria/VERSION` | pinned `app/v2.12.3`, commit `e1366b17...`, sha256 of `hysteria-linux-amd64` |
+| `gateway/hysteria/fetch-hysteria-server.sh` | download, sha256 + commit verify, install to `/opt/pocvpn/hysteria/v2.12.3/` |
+| `gateway/api/hysteria_server_config.py` | renders the server config from `POCVPN_API_HYSTERIA2_*` (fails closed) |
+| `gateway/hysteria/nova-hysteria-stockholm.yaml` | the exact rendered Stockholm config (test-enforced) |
+| `gateway/systemd/nova-hysteria.service` | Hysteria2, non-root, only `CAP_NET_BIND_SERVICE` |
+| `gateway/systemd/pocvpn-hysteria-auth.service` | B46-4P.2 auth backend, `pocvpn-api`, no capabilities |
+| `gateway/edge/nova-hysteria-cert-deploy-hook.sh` | runtime TLS copy for `nova-hysteria` only |
+
+The config contains no secret: every client credential is checked by the
+auth backend against the salted-hash store. Its ACL rejects loopback,
+link-local (incl. EC2 metadata), RFC1918/VPC, CGNAT and other non-public
+destinations, so a valid credential is never a proxy into this host's own
+loopback services. (Deliberately no `::ffff:0:0/96` rule: Go matches it
+against every IPv4 address.)
+
+TLS: Let's Encrypt keys are `root:root 0600`. The deploy hook runs only for
+the lineage `/etc/letsencrypt/live/$POCVPN_API_HYSTERIA2_SNI` (no-op for the
+~6-day IP cert and all others), validates hostname/expiry/key-match, then
+installs `/etc/nova-hysteria/tls/{privkey.pem 0400, fullchain.pem 0440}`
+owned by `nova-hysteria` in a `root:nova-hysteria 0750` directory via
+atomic renames. No restart: Hysteria2 v2.12.3 reloads cert/key on mtime
+change at the next handshake and keeps the old pair if the new one fails.
+
+### Server steps (each requires explicit owner approval - NOT performed)
+
+1. `sudo bash gateway/hysteria/fetch-hysteria-server.sh`
+2. `sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin nova-hysteria`
+3. Init the Hysteria2 store as `pocvpn-api` (see `api.env.example`), then set
+   in `/etc/pocvpn/api.env`: `POCVPN_API_HYSTERIA2_STORE_PATH`/`LOCK_PATH`,
+   `POCVPN_API_HYSTERIA2_SERVER_PORT=443`,
+   `POCVPN_API_HYSTERIA2_SNI=origin-sthlm.aknova.pp.ua`,
+   `POCVPN_API_HYSTERIA2_AUTH_BACKEND_PORT=8446`. (This also enables
+   `/v1/hysteria-profile` inside `pocvpn-api` after its restart; it stays
+   publicly unrouted - no nginx location.)
+4. `sudo install -d -o root -g nova-hysteria -m 0750 /etc/nova-hysteria`, then
+   render as `pocvpn-api`: `cd /opt/pocvpn/gateway && python3 -m api.hysteria_server_config`
+   and install it as `/etc/nova-hysteria/config.yaml` (`root:nova-hysteria 0640`);
+   `cmp` it against `gateway/hysteria/nova-hysteria-stockholm.yaml`.
+5. Install the hook as `/etc/letsencrypt/renewal-hooks/deploy/nova-hysteria-cert.sh`
+   (`root:root 0755`) and run it once with
+   `RENEWED_LINEAGE=/etc/letsencrypt/live/origin-sthlm.aknova.pp.ua`.
+6. Install both units, `systemctl daemon-reload`, start `pocvpn-hysteria-auth`
+   and verify `ss -tlnp` shows `127.0.0.1:8446` only.
+7. Firewall/AWS (separate approval): security group `launch-wizard-1`,
+   **inbound UDP 443, source 0.0.0.0/0, destination the Stockholm instance
+   (16.170.208.231), service Hysteria2.** Nothing for 8446. Verify the group's
+   current rules first - until then, starting `nova-hysteria` may already
+   expose UDP 443 if the group happens to allow it.
+8. Start `nova-hysteria` only after step 7 is decided.
+
+### Local validation (B46-4P.3, WSL systemd, never a real host)
+
+The real pinned binary, both real units, the hook and a real Hysteria2
+client were run end to end locally with a throwaway CA: fetch script
+(sha256 + commit), renderer == tracked file, hook no-op/refusal/install
+permissions, `systemd-analyze verify`, auth bound to `127.0.0.1:8446` only,
+Hysteria2 UDP 443 only (no TCP), `CapEff` = `CAP_NET_BIND_SERVICE` only
+(auth: none), valid secret -> public HTTPS 200, wrong secret denied, ACL
+rejects `127.0.0.1:8446` / `169.254.169.254` / `localhost`, no secret in the
+journal, renewed cert served without restart. `systemd-analyze security`:
+1.7 (nova-hysteria), 2.9 (auth). 35/35 checks passed.
