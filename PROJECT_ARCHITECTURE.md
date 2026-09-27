@@ -3492,3 +3492,21 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   paste field remains the fallback/admin/recovery path, unchanged in
   behavior; the relayed-ingress `ActivationScreen` reuse (a different bearer
   credential, never a `NovaActivationPackage`) is untouched.
+
+## Hysteria2 gateway profile route (B46-4P.1, 2026-09-27, in source only)
+
+- `POST /v1/hysteria-profile` (`gateway/api/handler.py` ->
+  `hysteria_provisioning.provision_hysteria_identity`) uses the SAME
+  activation credential + device binding as `/v1/xray-profile`
+  (`activations.py`, `per_activation_lock` outermost; the Hysteria store lock
+  is separate and inner). No second activation authority, no crypto of its own.
+- Per-device wire secret: fresh 256-bit value per call (rotation), only a
+  salted hash at rest (`hysteria_store.py`), returned once in the response,
+  never logged. `verify_hysteria_auth` re-checks LIVE activation state and is
+  the future auth-backend's only authority; it has no running caller yet.
+- Fail-closed: `503 hysteria_not_configured` unless the all-or-nothing
+  `POCVPN_API_HYSTERIA2_{STORE_PATH,LOCK_PATH,SERVER_PORT,SNI}` group is set
+  (blank by default). Not publicly reachable: no edge nginx location routes it.
+- Not deployed: no Hysteria2 server, auth listener, systemd unit, firewall
+  rule, or signed `HYSTERIA2` binding exists; the Android client is unmerged
+  (PR #111).
