@@ -156,6 +156,45 @@ manifest bytes, remove the nginx location + reload, blank the
 `POCVPN_API_HYSTERIA2_*` group + restart `pocvpn-api`. Android fails
 closed on every one of these (no binding -> HYSTERIA2 unavailable).
 
+### Deployment gate run (2026-09-28) - STOPPED AT G1, no production change
+
+G1 licensing - NOT APPROVED. No owner/legal decision is recorded anywhere
+(B46-4P legal review package: "LEGAL CONCLUSION: NOT DETERMINED - LEGAL
+REVIEW REQUIRED"). Component licences re-checked: `apernet/hysteria`,
+`apernet/quic-go`, `quic-go/quic-go`, `apernet/go-tproxy` MIT (GitHub
+licence API); `apernet/sing-tun`, `sagernet/sing` GPL-3.0-or-later (LICENSE
+text at the pinned commits, B46-4P review; GitHub API reports
+NOASSERTION). `gateway/hysteria/VERSION`'s `HYSTERIA_LICENSE=MIT` describes
+the upstream repo, not the complete compiled official binary. The GPL-free
+server-only build (`tools/hysteria-server-prototype`, B46-4A worktree, not
+on main) is a prototype only: fixed in-memory password, no `auth.type:
+http` integration, no ACL/cert wiring - not deployable as is.
+
+Stockholm read-only audit (16.170.208.231, Ubuntu 24.04.4, x86_64):
+- no Hysteria2 binary, config, `nova-hysteria` user or units installed;
+  UDP 443 free (UDP listeners: 51820 AWG, loopback 53/323 only); nothing on
+  8446.
+- nginx active, `nginx -t` OK, no hysteria/8446 reference in `/etc/nginx`.
+- `POCVPN_API_ENDPOINT_HOST=16.170.208.231` (= planned binding host); no
+  `POCVPN_API_HYSTERIA2_*` set.
+- certs: `origin-sthlm.aknova.pp.ua` valid to 2026-12-13; public DNS (1.1.1.1)
+  resolves it to 16.170.208.231 directly (not Cloudflare-proxied).
+- manifest `/etc/pocvpn/endpoint-manifest.bin` sha256 `304722f2...` (v4).
+- host firewall policy accept everywhere; instance SG `launch-wizard-1`;
+  no IAM role (IMDS 404) and no local AWS CLI, so SG rules could NOT be
+  read - UDP 443 status UNVERIFIED.
+- **new gate G4 - deployed gateway API is behind main**: `/opt/pocvpn/gateway`
+  (no git metadata) lacks `hysteria_*.py`, `exit_target_policy.py`,
+  `field_enrollment.py`; `activations.py`, `config.py`, `handler.py`,
+  `server.py`, `xray_config_renderer.py`, `xray_provisioning.py` all differ
+  from main 73ab24b (`handler.py` hand-edited 2026-09-27). Enabling
+  `/v1/hysteria-profile` therefore requires deploying current gateway code,
+  which also activates other merged-but-undeployed changes (B47 T1/T2
+  entitlement enforcement, exit-ACL Xray rendering). That is a separate
+  owner-approved gateway rollout, not part of the B46-4P.3 artefacts.
+
+Device: `adb devices` empty - H1-H7 BLOCKED.
+
 ### Physical validation plan (OPPO CPH2173, Android 14, arm64-v8a)
 
 Normal Nova UI, debug build with the pinned binaries: H1 activation ->
