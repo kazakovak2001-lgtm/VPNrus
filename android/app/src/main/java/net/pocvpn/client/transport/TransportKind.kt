@@ -30,4 +30,25 @@ enum class TransportKind {
      * NOT_IMPLEMENTED convention).
      */
     SHADOWSOCKS_2022,
+
+    /**
+     * B46-4A - process-isolated Hysteria2 (QUIC-substrate proxy protocol),
+     * physically proven feasible by B46-3A/B46-3B/B46-3C (see
+     * docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md's "research evidence
+     * inherited" section). APPENDED HERE, deliberately never inserted
+     * between existing constants: [net.pocvpn.client.reachability.EndpointManifest]'s
+     * ManifestCanonicalizer serializes a binding's [TransportKind] by
+     * `.ordinal` (`d.writeInt(b.kind.ordinal)` /
+     * `TransportKind.entries.getOrNull(kindOrdinal)`), so every
+     * already-signed production manifest's bytes stay valid only if every
+     * PRE-EXISTING constant keeps its exact ordinal - see
+     * `TransportKindOrdinalCompatibilityTest` for the regression proof. TYPES
+     * ONLY as of B46-4A: no `VpnTransport` is registered AVAILABLE in
+     * `TransportRegistry` for this kind until a real, currently-trusted
+     * signed [net.pocvpn.client.reachability.SignedTransportProfile.Hysteria2]
+     * binding AND a real endpoint-scoped
+     * [net.pocvpn.client.identity.Hysteria2Credential] AND arm64-v8a native
+     * child eligibility all hold (see `MainViewModel.isHysteria2AvailableFor`).
+     */
+    HYSTERIA2,
 }

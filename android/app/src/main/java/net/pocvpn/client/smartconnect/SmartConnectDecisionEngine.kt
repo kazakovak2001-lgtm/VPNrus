@@ -33,6 +33,17 @@ object SmartConnectDecisionEngine {
         // unavailable (or the user pins it via Manual), same as this list's
         // existing ordering discipline never reorders an earlier entry.
         TransportKind.SHADOWSOCKS_2022,
+        // B46-4A - same discipline, appended LAST: HYSTERIA2 stays
+        // NOT_IMPLEMENTED in TransportRegistry until a real trusted signed
+        // binding + credential + ABI/binary eligibility all hold (see
+        // MainViewModel.isHysteria2AvailableFor), so this entry has no
+        // practical effect yet - it exists only so PREFERRED_ORDER stays
+        // exhaustive over TransportKind.entries (see
+        // SmartConnectDecisionEngineTest's own invariant). Per task
+        // instruction, this is NOT a Smart Connect heuristic for
+        // HYSTERIA2 - lowest priority, never reorders an earlier entry,
+        // never makes HYSTERIA2 win merely by existing.
+        TransportKind.HYSTERIA2,
     )
 
     fun decide(

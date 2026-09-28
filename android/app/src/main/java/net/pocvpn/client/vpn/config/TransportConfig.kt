@@ -133,4 +133,31 @@ sealed class TransportConfig {
         val method: String,
         val routingMode: RoutingMode = RoutingMode.FULL_VPN,
     ) : TransportConfig()
+
+    /**
+     * B46-4A - PUBLIC attempt-pinned facts only (mirrors [Shadowsocks]'s own
+     * doc/discipline exactly). [sni]/[obfuscationMode] come from the
+     * trusted manifest's signed
+     * [net.pocvpn.client.reachability.SignedTransportProfile.Hysteria2]
+     * (see `VpnController.buildTransportConfig`'s own HYSTERIA2 branch for
+     * exactly how they are resolved and pinned - never a hardcoded
+     * Stockholm host/port). NO auth secret, NO obfuscation secret: the
+     * Hysteria auth/Salamander secrets are resolved from
+     * `Hysteria2CredentialRepository` inside `Hysteria2VpnService` itself,
+     * scoped to [endpointId], at connect() time - never carried through
+     * this config, never through the start Intent (see
+     * `Hysteria2Transport`'s own "no secret Intent extras" doc).
+     * [routingMode] must be [RoutingMode.FULL_VPN] for this slice - B46-4A
+     * fails closed (never silently downgrades) for any other value, since
+     * split routing for HYSTERIA2 is not implemented/tested yet (see
+     * `TransportCapabilities.hysteria2AdapterShell().supportsSplitRouting`).
+     */
+    data class Hysteria2(
+        val endpointId: EndpointId,
+        val host: String,
+        val port: Int,
+        val sni: String,
+        val obfuscationMode: String,
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+    ) : TransportConfig()
 }
