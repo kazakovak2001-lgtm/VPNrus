@@ -6,8 +6,8 @@
 |---|---|---|
 | SOURCE VERIFIED | **yes** | Android half of historical PR #111 ported onto `main` 73ab24b (branch `feature/b46-4a-hysteria2-production-completion`); gateway half already on `main` via B46-4P.1/.2/.3 |
 | BUILD VERIFIED | **yes** | `:app:compileDebugKotlin`, `:app:compileDebugUnitTestKotlin`, `:app:assembleDebug`, `:app:assembleRelease`, `:app:lintVitalRelease`, `:app:checkDebugDuplicateClasses` green; release APK inspected (below) |
-| DEPLOYED | **no** | Stockholm server install, AWS UDP 443, nginx route, signed manifest v5 all pending owner approval - see "Deployment plan" below |
-| PHYSICALLY VERIFIED (normal Nova UI) | **no** | blocked on deployment (no signed HYSTERIA2 binding exists, so the app correctly keeps HYSTERIA2 unavailable) |
+| DEPLOYED | **yes (2026-09-28)** | Stockholm server + gateway API + nginx route live (G3); signed manifest v6 (`prod-manifest-key-2026-09-14`) with the HYSTERIA2 binding live on BOTH gateways (G4) - see "Production rollout (2026-09-28)" below. Licence: official binary under owner decision A, **LEGAL REVIEW REQUIRED** (G1 open) |
+| PHYSICALLY VERIFIED (normal Nova UI) | **no** | next: G5 owner-issued production ActivationEnvelope, then G6 on OPPO |
 | PRODUCTION READY | **no** | |
 
 The rest of this document below "Status (historical, PR #111)" is the
@@ -194,6 +194,84 @@ Stockholm read-only audit (16.170.208.231, Ubuntu 24.04.4, x86_64):
   owner-approved gateway rollout, not part of the B46-4P.3 artefacts.
 
 Device: `adb devices` empty - H1-H7 BLOCKED.
+
+### Production rollout (2026-09-28) - G2 evidence, G3 and G4 done, owner-approved
+
+Owner decisions: G1 = option A (official pinned binary), recorded as
+**LEGAL REVIEW REQUIRED** - no legal conclusion made. G3 and G4 each
+explicitly approved.
+
+- **G2 (AWS UDP 443)**: still no AWS API access (no CLI, no IAM role;
+  instance `i-0a34c6a87e1dba4aa`, eu-north-1, SG `launch-wizard-1`). Wire
+  evidence instead: UDP probes from an outside residential IP captured on
+  `ens5` - UDP/443 5/5 arrived, control UDP/4433 0/5. Exact SG source CIDR
+  still unread.
+- **G3 (Stockholm)**: pre-change snapshot
+  `/var/backups/pocvpn-pre-b46-4a-20260928T155306Z/` (gateway, /etc/pocvpn,
+  nginx, systemd, LE hooks, nft ruleset, state, SHA256SUMS). Gateway code
+  replaced by `git archive e424dfb gateway` (LF; `config/` kept from the host;
+  old tree kept as `/opt/pocvpn/gateway.pre-b46-4a`) - the live tree had no
+  unique hotfix (every live-only line was an older form of refactored code).
+  Staged preflight with the new code against live env/stores: all 3 roles
+  load, B47-strict store parse OK, Xray renders pass `xray run -test` on
+  live Xray 26.3.27 (exit render includes `exit-acl-block`). Side effect,
+  intended B47 T2: activations that are ACTIVE but past `expires_at` (exit:
+  2, expired 2026-09-07) drop from the next Xray render. Then
+  `fetch-hysteria-server.sh` (sha256 `8c7a68a9...`, v2.12.3, commit
+  `e1366b17...`), user `nova-hysteria`, store init, `POCVPN_API_HYSTERIA2_*`
+  in `api.env`, rendered config `cmp`-equal to
+  `nova-hysteria-stockholm.yaml`, cert hook run, both units enabled.
+  Restarted: `pocvpn-api`, `pocvpn-api-ingress`, `pocvpn-api-xhttp-ingress`
+  only. nginx: the certbot-managed live vhost was NOT replaced by the repo
+  file; `location = /v1/hysteria-profile` was inserted additively after each
+  of its 3 `/v1/xray-profile` blocks, `nginx -t`, reload.
+  Verified: UDP `*:443` = hysteria only (no TCP), TCP 443 = nginx; auth
+  `127.0.0.1:8446` TCP only, unreachable externally, `CapEff` 0; hysteria
+  `CapEff` = `CAP_NET_BIND_SERVICE`; public `POST /v1/hysteria-profile` 401,
+  `GET` 403; nft ruleset byte-identical to the snapshot; 0 failed units.
+  Real external Hysteria2 client (official binary, strict cert verify,
+  invalid credential): QUIC+TLS OK for `origin-sthlm.aknova.pp.ua`, auth
+  rejected (backend logged `ok=False`); wrong SNI rejected by `sniGuard`.
+  The data path with a VALID credential is not yet verified (needs G5).
+- **G4 (manifest) - current live: v6**, `production_manifest_2026-09-28_v6.json` /
+  `endpoint-manifest-2026-09-28-v6.bin`, sha256
+  `304afa8ba435febba742a320b99d10e8bbb07853474a041f9b39b779257faebb`,
+  signed with the current production manifest key
+  `prod-manifest-key-2026-09-14` (the B35 rotation key that also signed v3
+  and v4; private key at the location documented in
+  `B45B4P_SHADOWSOCKS_SELECTION_PHYSICAL_VALIDATION.md`, derived public key
+  verified in memory against `B35_PUBLIC_KEY_BASE64`, never displayed).
+  Content = v5 byte-for-byte except `manifestVersion` 5 -> 6 and
+  `signingKeyId`; same window (2026-09-28T16:08:08Z .. 2027-03-27T16:08:08Z).
+  Relative to v4 the only content change is ONE added Stockholm binding
+  `{"kindOrdinal":6,"host":"16.170.208.231","port":443,"metadata":{"hysteria2Profile":"{\"version\":1,\"sni\":\"origin-sthlm.aknova.pp.ua\",\"obfuscationMode\":\"NONE\"}"}}`.
+  v4 source: live bytes `304722f2...a9ad`, identical on both gateways and in
+  git; v4 JSON byte-identical to the live canonical form.
+  Verified: independent decoder round trip, all 10 bindings unchanged,
+  signature valid, tampered signature/canonical bytes rejected, and the
+  app's own `SignedManifestCodec` + `Ed25519ManifestVerifier` +
+  `EmbeddedBootstrapManifest.trustAnchors()` + `hysteria2Profile()` accept
+  it and v6 > v5 (temporary unit test, not committed). Deployed with
+  `install -o root -g pocvpn-api -m 0640` to `/etc/pocvpn/endpoint-manifest.bin`
+  on Stockholm and Frankfurt; public `GET /v1/manifest` on `152.70.43.1`,
+  `16.170.208.231` and `origin-sthlm.aknova.pp.ua` returns exactly the v6
+  sha256.
+- **Superseded v5** (`endpoint-manifest-2026-09-28-v5.bin`, sha256
+  `794dc729...8d0d`, live 2026-09-28 16:10-16:25Z): identical content,
+  but signed with the older bootstrap key `prod-manifest-key-2026-09-01`
+  because the 09-14 key was wrongly reported unavailable (the first search
+  missed its documented location). Both keys are embedded trust anchors, so
+  v5 was valid, but signing with 09-01 reversed the B12 rotation that
+  B35 performed (steps 1-3 done; 09-01 not yet removed from the anchors).
+  v6 restores the rotation direction; it must be a higher version because
+  devices that adopted v5 would refuse an equal one.
+
+Rollback: manifest - reinstall `endpoint-manifest.bin.v5-backup-20260928`
+(or `.v4-backup-20260928`) on both hosts; devices that already adopted a
+newer version keep it as LKG until a higher version is published.
+G3 - `systemctl disable --now nova-hysteria pocvpn-hysteria-auth`, swap
+`/opt/pocvpn/gateway.pre-b46-4a` back, restore `api.env.pre-b46-4a` and the
+snapshot's nginx vhost, reload nginx, restart the 3 API services.
 
 ### Physical validation plan (OPPO CPH2173, Android 14, arm64-v8a)
 
