@@ -573,8 +573,12 @@ change at the next handshake and keeps the old pair if the new one fails.
    `POCVPN_API_HYSTERIA2_SERVER_PORT=443`,
    `POCVPN_API_HYSTERIA2_SNI=origin-sthlm.aknova.pp.ua`,
    `POCVPN_API_HYSTERIA2_AUTH_BACKEND_PORT=8446`. (This also enables
-   `/v1/hysteria-profile` inside `pocvpn-api` after its restart; it stays
-   publicly unrouted - no nginx location.)
+   `/v1/hysteria-profile` inside `pocvpn-api` after its restart. B46-4A
+   completion adds the Stockholm edge `location = /v1/hysteria-profile`
+   (POST-only -> 127.0.0.1:8443) in `edge/nginx-pocvpn-stockholm.conf`;
+   install it, `nginx -t`, reload - the Android client provisions through
+   it. `POCVPN_API_ENDPOINT_HOST` must be `16.170.208.231`, the signed
+   HYSTERIA2 binding host.)
 4. `sudo install -d -o root -g nova-hysteria -m 0750 /etc/nova-hysteria`, then
    render as `pocvpn-api`: `cd /opt/pocvpn/gateway && python3 -m api.hysteria_server_config`
    and install it as `/etc/nova-hysteria/config.yaml` (`root:nova-hysteria 0640`);

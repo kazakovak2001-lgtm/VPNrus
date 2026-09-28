@@ -3496,7 +3496,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   behavior; the relayed-ingress `ActivationScreen` reuse (a different bearer
   credential, never a `NovaActivationPackage`) is untouched.
 
-## Hysteria2 gateway profile route (B46-4P.1, 2026-09-27, in source only)
+## Hysteria2 gateway route + Android client (B46-4P.1-.3, B46-4A; in source only)
 
 - `POST /v1/hysteria-profile` (`gateway/api/handler.py` ->
   `hysteria_provisioning.provision_hysteria_identity`) uses the SAME
@@ -3523,9 +3523,19 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   link-local destinations. SNI `origin-sthlm.aknova.pp.ua` (DNS-only, never a
   Cloudflare-proxied name). nginx is not in the data path and must never add
   a QUIC listener on 443. 8446 is never public.
+- Android client (B46-4A completion, ported from #111): `vpn/hysteria/*`
+  keeps the three-process boundary (app/VpnService -> tun2socks child ->
+  Hysteria2 child, SCM_RIGHTS TUN handoff, protect bridge); no Go runtime
+  for Hysteria/tun2socks in the app process. Secrets only from the
+  endpoint-scoped `Hysteria2CredentialRepository`, never via Intent.
+  HYSTERIA2 (ordinal 6) is AVAILABLE only with a trusted signed
+  `hysteria2Profile` binding + stored credential + arm64-v8a binaries;
+  last in `PREFERRED_ORDER`; never offered by `AutoGatewaySelector`.
+  Provisioning goes through the Stockholm edge `location =
+  /v1/hysteria-profile` (POST -> 127.0.0.1:8443); the client rejects a
+  response whose server/port/SNI/obfuscation differ from the binding.
 - Not deployed: no Hysteria2 server or auth listener runs on any host, no
-  firewall/security-group rule, no signed `HYSTERIA2` binding exists; the
-  Android client is unmerged (PR #111).
+  firewall/security-group rule, no signed `HYSTERIA2` binding exists.
 
 ## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27, repo only - not deployed)
 
