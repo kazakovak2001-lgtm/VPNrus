@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import net.pocvpn.client.BuildConfig
 import net.pocvpn.client.identity.Hysteria2CredentialGetResult
 import net.pocvpn.client.identity.Hysteria2CredentialRepository
@@ -41,6 +43,10 @@ enum class Hysteria2RuntimePhase { STOPPED, STARTING, RUNNING, STOPPING, FAILED 
 /** Typed, non-secret failure reason - never a raw exception message that could echo secret-shaped input. */
 sealed interface Hysteria2RuntimeError {
     data object MissingEndpointId : Hysteria2RuntimeError
+    /** B46-4A completion - a required PUBLIC start fact (host/port/sni/obfuscationMode/routingMode) was missing or unparseable; never defaulted. */
+    data class InvalidStartRequest(val reason: String) : Hysteria2RuntimeError
+    /** B46-4A completion - START for a new session while another is still starting/running/stopping; the new session fails fast instead of waiting forever. */
+    data object SessionBusy : Hysteria2RuntimeError
     data class CredentialAbsent(val endpointId: String) : Hysteria2RuntimeError
     data class CredentialCorrupted(val reason: String) : Hysteria2RuntimeError
     data class UnsupportedAbi(val deviceAbis: List<String>) : Hysteria2RuntimeError
@@ -131,6 +137,13 @@ class Hysteria2VpnService : VpnService() {
     internal val lifecycleLock = Any()
     internal var lifecycle: Hysteria2ServiceLifecycle = Hysteria2ServiceLifecycle.Idle
 
+    // B46-4A completion - serializes ALL child/TUN mutation (startup work and
+    // teardown cleanup). The lifecycle state machine above decides WHO owns a
+    // transition; this mutex guarantees a stale startup coroutine can never
+    // touch the shared runtimes/TUN while a teardown or a newer session's
+    // startup is using them.
+    private val sessionWorkMutex = Mutex()
+
     /** Test seam - same contract as `ShadowsocksVpnService.credentialRepositoryFactory`. */
     internal var credentialRepositoryFactory: (Context, EndpointId) -> Hysteria2CredentialRepository = { context, endpointId ->
         Hysteria2CredentialRepositoryFactory.create(context, endpointId)
@@ -163,28 +176,36 @@ class Hysteria2VpnService : VpnService() {
                 if (endpointIdRaw.isNullOrBlank()) {
                     Log.e(TAG, "refusing to start: missing/blank endpoint id")
                     publish(sessionId, Hysteria2RuntimePhase.FAILED, Hysteria2RuntimeError.MissingEndpointId)
-                    stopSelf()
+                    stopSelfIfIdle()
                     return START_NOT_STICKY
                 }
                 val endpointId = EndpointId(endpointIdRaw)
                 val host = intent.getStringExtra(EXTRA_HOST)
                 val port = intent.getIntExtra(EXTRA_PORT, -1)
                 val sni = intent.getStringExtra(EXTRA_SNI)
-                val obfuscationMode = intent.getStringExtra(EXTRA_OBFUSCATION_MODE) ?: "NONE"
+                // B46-4A completion - no implicit defaults: a missing
+                // obfuscationMode/routingMode fails closed rather than being
+                // assumed NONE/FULL_VPN (Hysteria2Transport always sends both).
+                val obfuscationMode = intent.getStringExtra(EXTRA_OBFUSCATION_MODE)
                 val routingMode = intent.getStringExtra(EXTRA_ROUTING_MODE)
                     ?.let { runCatching { RoutingMode.valueOf(it) }.getOrNull() }
-                    ?: RoutingMode.FULL_VPN
+                if (obfuscationMode.isNullOrBlank() || routingMode == null) {
+                    Log.e(TAG, "refusing to start: missing/invalid obfuscationMode or routingMode")
+                    publish(sessionId, Hysteria2RuntimePhase.FAILED, Hysteria2RuntimeError.InvalidStartRequest("missing obfuscationMode or routingMode"))
+                    stopSelfIfIdle()
+                    return START_NOT_STICKY
+                }
 
                 if (host.isNullOrBlank() || port !in 1..65535 || sni.isNullOrBlank()) {
                     Log.e(TAG, "refusing to start: missing/invalid host, port, or sni")
-                    publish(sessionId, Hysteria2RuntimePhase.FAILED)
-                    stopSelf()
+                    publish(sessionId, Hysteria2RuntimePhase.FAILED, Hysteria2RuntimeError.InvalidStartRequest("missing/invalid host, port, or sni"))
+                    stopSelfIfIdle()
                     return START_NOT_STICKY
                 }
                 if (routingMode != RoutingMode.FULL_VPN) {
                     Log.e(TAG, "refusing to start: unsupported routing mode $routingMode (HYSTERIA2 is FULL_VPN only this slice)")
                     publish(sessionId, Hysteria2RuntimePhase.FAILED, Hysteria2RuntimeError.UnsupportedRoutingMode(routingMode.name))
-                    stopSelf()
+                    stopSelfIfIdle()
                     return START_NOT_STICKY
                 }
                 startIfNotAlreadyRunning(sessionId, endpointId, host, port, sni, obfuscationMode)
@@ -264,24 +285,36 @@ class Hysteria2VpnService : VpnService() {
     ) {
         if (!tryBeginStarting(sessionId)) {
             Log.w(TAG, "refusing duplicate/concurrent start - a session is already starting, running, or stopping")
+            // Fail THIS (new) session fast; the existing session's observer
+            // filters by its own sessionId and is unaffected.
+            publish(sessionId, Hysteria2RuntimePhase.FAILED, Hysteria2RuntimeError.SessionBusy)
             return
         }
         publish(sessionId, Hysteria2RuntimePhase.STARTING)
         // Bounded, once-per-attempt, PUBLIC facts only - never the secret.
         Log.i(TAG, "starting: endpointId=${endpointId.value} host=$host port=$port sni=$sni obfuscationMode=$obfuscationMode")
 
-        serviceScope.launch(workDispatcher) {
-            // B46-4A review fix (Finding 6) - any failure branch below calls
-            // this instead of touching lifecycle directly: it claims the
-            // terminal transition for EXACTLY this sessionId (a no-op if a
-            // concurrent STOP/unexpected-exit already claimed it - never a
-            // double teardown), publishes FAILED, and returns ownership to
-            // Idle so a later fresh session can start.
+        serviceScope.launch(workDispatcher) { sessionWorkMutex.withLock {
+            // B46-4A completion - only the owner of the terminal transition
+            // may reset the lifecycle / stop the service. If a STOP or a
+            // child-death event already claimed this session, that claimer
+            // finishes the teardown; resetting Idle/stopSelf() here could
+            // clobber a NEWER session that has since started.
             fun failStartup(error: Hysteria2RuntimeError?) {
-                tryClaimTerminal(sessionId)
+                if (!concludeFailedStartup(sessionId)) return
                 publish(sessionId, Hysteria2RuntimePhase.FAILED, error)
-                synchronized(lifecycleLock) { lifecycle = Hysteria2ServiceLifecycle.Idle }
                 stopSelf()
+            }
+            // Undoes this coroutine's own startup work when the session was
+            // stopped mid-startup. Safe to touch the shared runtimes because
+            // sessionWorkMutex is held.
+            fun abandonedIfNotStarting(): Boolean {
+                if (isStarting(sessionId)) return false
+                Log.w(TAG, "session $sessionId stopped during startup - abandoning")
+                tun2socksRuntime.stop()
+                hysteriaRuntime.stop()
+                closeTunFd()
+                return true
             }
 
             val abiEligibility = Hysteria2AdapterEligibilityChecker.check(
@@ -321,6 +354,7 @@ class Hysteria2VpnService : VpnService() {
                 }
                 is Hysteria2CredentialGetResult.Present -> result.credential
             }
+            if (abandonedIfNotStarting()) return@launch
 
             // B46-4A review fix (Finding 3) - the SIGNED public
             // obfuscationMode is authoritative; it is never inferred from
@@ -346,6 +380,7 @@ class Hysteria2VpnService : VpnService() {
                 return@launch
             }
 
+            if (abandonedIfNotStarting()) return@launch
             val established = establishInterface()
             if (established == null) {
                 Log.e(TAG, "refusing to start: VpnService.Builder.establish() returned null")
@@ -375,6 +410,7 @@ class Hysteria2VpnService : VpnService() {
                 return@launch
             }
 
+            if (abandonedIfNotStarting()) return@launch
             val dupFd = ParcelFileDescriptor.dup(established.fileDescriptor).detachFd()
             val controlSocketPath = File(filesDir, TUN2SOCKS_CONTROL_SOCKET_FILENAME)
             val tun2socksResult = tun2socksRuntime.start(dupFd, MTU, LOCAL_SOCKS_ADDR, tun2socksBinaryPath, controlSocketPath)
@@ -404,7 +440,7 @@ class Hysteria2VpnService : VpnService() {
                     failStartup(Hysteria2RuntimeError.Tun2SocksChildFailed(tun2socksResult.reason))
                 }
             }
-        }
+        } }
     }
 
     @SuppressLint("VpnServicePolicy")
@@ -462,12 +498,36 @@ class Hysteria2VpnService : VpnService() {
             return
         }
         publish(claimedSessionId, Hysteria2RuntimePhase.STOPPING)
-        tun2socksRuntime.stop()
-        hysteriaRuntime.stop()
-        closeTunFd()
-        publish(claimedSessionId, Hysteria2RuntimePhase.STOPPED)
-        synchronized(lifecycleLock) { lifecycle = Hysteria2ServiceLifecycle.Idle }
-        stopSelf()
+        sessionWorkMutex.withLock {
+            tun2socksRuntime.stop()
+            hysteriaRuntime.stop()
+            closeTunFd()
+            publish(claimedSessionId, Hysteria2RuntimePhase.STOPPED)
+            synchronized(lifecycleLock) { lifecycle = Hysteria2ServiceLifecycle.Idle }
+            stopSelf()
+        }
+    }
+
+    internal fun isStarting(sessionId: Long): Boolean = synchronized(lifecycleLock) {
+        lifecycle == Hysteria2ServiceLifecycle.Starting(sessionId)
+    }
+
+    /**
+     * B46-4A completion - a startup failure for [sessionId] owns the terminal
+     * transition only while that session is still STARTING. Returns true (and
+     * resets to Idle) when it does; false when a STOP/child-death already
+     * claimed it or a newer session now owns the lifecycle - the caller must
+     * then neither publish nor stopSelf().
+     */
+    internal fun concludeFailedStartup(sessionId: Long): Boolean = synchronized(lifecycleLock) {
+        if (lifecycle != Hysteria2ServiceLifecycle.Starting(sessionId)) return@synchronized false
+        lifecycle = Hysteria2ServiceLifecycle.Idle
+        true
+    }
+
+    /** A rejected START must never stop a service that is running another session. */
+    private fun stopSelfIfIdle() {
+        if (synchronized(lifecycleLock) { lifecycle == Hysteria2ServiceLifecycle.Idle }) stopSelf()
     }
 
     private fun closeTunFd() {

@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.hysteria
 
 import android.util.Log
+import net.pocvpn.client.BuildConfig
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -104,7 +105,11 @@ private class RealHysteria2Hysteria2Tun2SocksChildProcess(
                     // Non-secret operational log lines only (B46_3B_CHILD_*
                     // prefixes, MTU, socks address, pid) - never config/secret
                     // material, matching the Go child's own logging discipline.
-                    Log.d(TAG, "[$label] $line")
+                    // B46-4A completion - verbatim child output (which can
+                    // carry destination addresses) reaches logcat in debug
+                    // builds only; listeners (readiness detection) always
+                    // receive it.
+                    if (BuildConfig.DEBUG) Log.d(TAG, "[$label] $line")
                 }
             } catch (_: java.io.IOException) {
                 // Stream closed because the process exited - expected, not an error.

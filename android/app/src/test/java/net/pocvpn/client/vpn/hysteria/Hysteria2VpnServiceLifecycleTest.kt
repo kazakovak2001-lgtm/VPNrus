@@ -168,4 +168,90 @@ class Hysteria2VpnServiceLifecycleTest {
         assertEquals(0, factoryCalls)
         assertEquals(Hysteria2RuntimeError.MissingEndpointId, Hysteria2VpnService.status.value?.error)
     }
+
+    // --- B46-4A completion: stale-startup ownership + no implicit defaults ---
+
+    @Test
+    fun `a stale startup failure never clobbers a newer session`() {
+        val service = newService()
+        assertTrue(service.tryBeginStarting(1L))
+        // STOP claims session 1 during STARTING; its teardown finishes -> Idle.
+        assertEquals(1L, service.tryClaimTerminal())
+        synchronized(service.lifecycleLock) { service.lifecycle = Hysteria2ServiceLifecycle.Idle }
+        // A new session starts before session 1's startup coroutine noticed.
+        assertTrue(service.tryBeginStarting(2L))
+
+        assertFalse("session 1 no longer owns the lifecycle", service.concludeFailedStartup(1L))
+        assertEquals(Hysteria2ServiceLifecycle.Starting(2L), service.lifecycle)
+        assertFalse(service.isStarting(1L))
+        assertTrue(service.isStarting(2L))
+    }
+
+    @Test
+    fun `a startup failure for the session still STARTING returns ownership to Idle`() {
+        val service = newService()
+        service.tryBeginStarting(1L)
+
+        assertTrue(service.concludeFailedStartup(1L))
+        assertEquals(Hysteria2ServiceLifecycle.Idle, service.lifecycle)
+    }
+
+    @Test
+    fun `a startup failure after STOP already claimed the session is a no-op`() {
+        val service = newService()
+        service.tryBeginStarting(1L)
+        service.tryClaimTerminal()
+
+        assertFalse(service.concludeFailedStartup(1L))
+        assertEquals(Hysteria2ServiceLifecycle.Stopping(1L), service.lifecycle)
+    }
+
+    @Test
+    fun `a rejected concurrent START publishes FAILED SessionBusy for the new session only`() {
+        val service = newService()
+        assertTrue(service.tryBeginStarting(1L))
+        service.credentialRepositoryFactory = { _, _ -> throw AssertionError("must never be called") }
+
+        service.onStartCommand(validStart(sessionId = 2L), 0, 1)
+
+        val status = Hysteria2VpnService.status.value
+        assertEquals(2L, status?.sessionId)
+        assertEquals(Hysteria2RuntimePhase.FAILED, status?.phase)
+        assertEquals(Hysteria2RuntimeError.SessionBusy, status?.error)
+        assertEquals(Hysteria2ServiceLifecycle.Starting(1L), service.lifecycle)
+    }
+
+    @Test
+    fun `missing obfuscation mode fails closed instead of defaulting to NONE`() {
+        val service = newService()
+        service.credentialRepositoryFactory = { _, _ -> throw AssertionError("must never be called") }
+
+        service.onStartCommand(validStart(sessionId = 3L).apply { removeExtra(Hysteria2VpnService.EXTRA_OBFUSCATION_MODE) }, 0, 1)
+
+        assertTrue(Hysteria2VpnService.status.value?.error is Hysteria2RuntimeError.InvalidStartRequest)
+        assertEquals(Hysteria2ServiceLifecycle.Idle, service.lifecycle)
+    }
+
+    @Test
+    fun `missing or unknown routing mode fails closed instead of defaulting to FULL_VPN`() {
+        val service = newService()
+        service.credentialRepositoryFactory = { _, _ -> throw AssertionError("must never be called") }
+
+        service.onStartCommand(validStart(sessionId = 4L).apply { removeExtra(Hysteria2VpnService.EXTRA_ROUTING_MODE) }, 0, 1)
+        assertTrue(Hysteria2VpnService.status.value?.error is Hysteria2RuntimeError.InvalidStartRequest)
+
+        service.onStartCommand(validStart(sessionId = 5L).putExtra(Hysteria2VpnService.EXTRA_ROUTING_MODE, "NOT_A_MODE"), 0, 1)
+        assertEquals(5L, Hysteria2VpnService.status.value?.sessionId)
+        assertTrue(Hysteria2VpnService.status.value?.error is Hysteria2RuntimeError.InvalidStartRequest)
+        assertEquals(Hysteria2ServiceLifecycle.Idle, service.lifecycle)
+    }
+
+    private fun validStart(sessionId: Long) = android.content.Intent(Hysteria2VpnService.ACTION_START)
+        .putExtra(Hysteria2VpnService.EXTRA_SESSION_ID, sessionId)
+        .putExtra(Hysteria2VpnService.EXTRA_ENDPOINT_ID, "stockholm")
+        .putExtra(Hysteria2VpnService.EXTRA_HOST, "host.example")
+        .putExtra(Hysteria2VpnService.EXTRA_PORT, 443)
+        .putExtra(Hysteria2VpnService.EXTRA_SNI, "sni.example.com")
+        .putExtra(Hysteria2VpnService.EXTRA_OBFUSCATION_MODE, "NONE")
+        .putExtra(Hysteria2VpnService.EXTRA_ROUTING_MODE, "FULL_VPN")
 }

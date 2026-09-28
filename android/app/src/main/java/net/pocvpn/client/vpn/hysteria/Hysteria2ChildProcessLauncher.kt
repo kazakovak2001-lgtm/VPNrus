@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.hysteria
 
 import android.util.Log
+import net.pocvpn.client.BuildConfig
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
@@ -103,7 +104,11 @@ private class RealHysteria2ChildProcess(
                 stream.bufferedReader().forEachLine { line ->
                     // The Go child's own log lines never carry --auth (see
                     // its own --config-file doc) - only operational status.
-                    Log.d(TAG, "[$label] $line")
+                    // B46-4A completion - verbatim child output (which can
+                    // carry destination addresses) reaches logcat in debug
+                    // builds only; listeners (readiness detection) always
+                    // receive it.
+                    if (BuildConfig.DEBUG) Log.d(TAG, "[$label] $line")
                     notifyLogListeners(line)
                 }
             } catch (_: java.io.IOException) {
