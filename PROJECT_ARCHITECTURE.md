@@ -3496,7 +3496,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   behavior; the relayed-ingress `ActivationScreen` reuse (a different bearer
   credential, never a `NovaActivationPackage`) is untouched.
 
-## Hysteria2 gateway route + Android client (B46-4P.1-.3, B46-4A; in source only)
+## Hysteria2 gateway route + Android client (B46-4P.1-.3, B46-4A; live on Stockholm since 2026-09-28)
 
 - `POST /v1/hysteria-profile` (`gateway/api/handler.py` ->
   `hysteria_provisioning.provision_hysteria_identity`) uses the SAME
@@ -3511,11 +3511,11 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   the hard-coded `127.0.0.1` only (no host setting), port
   `POCVPN_API_HYSTERIA2_AUTH_BACKEND_PORT` (0 = refuses to start; must differ
   from `API_PORT`). Every failure path denies with the same body; logs never
-  carry the secret. Source only - no unit or process starts it.
+  carry the secret. Runs as `pocvpn-hysteria-auth.service` on Stockholm.
 - Fail-closed: `503 hysteria_not_configured` unless the all-or-nothing
   `POCVPN_API_HYSTERIA2_{STORE_PATH,LOCK_PATH,SERVER_PORT,SNI}` group is set
-  (blank by default). Not publicly reachable: no edge nginx location routes it.
-- Deployment artifacts (B46-4P.3, repo only): Stockholm topology is public
+  (blank by default). Public only through the Stockholm edge location below.
+- Deployment (B46-4P.3 artifacts, live on Stockholm): topology is public
   UDP 443 -> `nova-hysteria.service` (non-root, `CAP_NET_BIND_SERVICE` only)
   -> `http://127.0.0.1:8446/auth` -> `pocvpn-hysteria-auth.service`. Server
   config is rendered from the same `POCVPN_API_HYSTERIA2_*` values the API
@@ -3534,10 +3534,14 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Provisioning goes through the Stockholm edge `location =
   /v1/hysteria-profile` (POST -> 127.0.0.1:8443); the client rejects a
   response whose server/port/SNI/obfuscation differ from the binding.
-- Not deployed: no Hysteria2 server or auth listener runs on any host, no
-  firewall/security-group rule, no signed `HYSTERIA2` binding exists.
+- Live (2026-09-28): Stockholm runs both units (official pinned v2.12.3);
+  manifest v6 (`prod-manifest-key-2026-09-14`) carries the only HYSTERIA2
+  binding, `16.170.208.231:443`, SNI `origin-sthlm.aknova.pp.ua`, `NONE`;
+  physically verified on a device (B46-4A G5/G6). The official server binary
+  statically links GPL-3.0-or-later `sing`/`sing-tun` - licence decision
+  open (legal review). Record: `docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md`.
 
-## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27, repo only - not deployed)
+## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27; Xray exit layer live on Stockholm since 2026-09-28, Frankfurt Xray and AWG nftables layer not deployed)
 
 - A VPN exit is an Internet proxy, never a proxy into the gateway host, its
   VPC, cloud metadata, or special-purpose space. ONE canonical list:
@@ -3560,7 +3564,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   replaces the other.
 - Not covered: tunnel -> gateway INPUT path (host's own listeners).
 
-## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2, repo only - not deployed)
+## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28, reconcile timers and Frankfurt not deployed)
 
 - ONE predicate: `gateway/api/activations.py` `entitlement_state(record, now)`
   -> ACTIVE / REVOKED / EXPIRED (`status != ACTIVE` -> REVOKED; `expires_at`
