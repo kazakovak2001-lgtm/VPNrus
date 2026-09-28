@@ -184,6 +184,13 @@ fun DiagnosticsDialog(
                     TextButton(onClick = { onSetTransportForce(TransportKind.SHADOWSOCKS_2022) }, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_force_shadowsocks))
                     }
+                    // B46-4A completion - same debug-only physical-validation
+                    // entry point as SHADOWSOCKS_2022 above: no bypass - the
+                    // registry still reports HYSTERIA2 unavailable unless the
+                    // trusted signed binding + credential + ABI/binary gate holds.
+                    TextButton(onClick = { onSetTransportForce(TransportKind.HYSTERIA2) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_hysteria2))
+                    }
                     TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_simulate_awg_failure))
                     }

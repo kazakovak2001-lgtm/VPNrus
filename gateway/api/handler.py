@@ -636,8 +636,8 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         Every successful call ROTATES the device's Hysteria2 wire secret
         (retry-safe rotation, not idempotence): the per-token limiter below
         bounds that churn. The response is the ONLY place the raw
-        auth_secret ever leaves this process; it is never logged. Not
-        publicly reachable: no edge nginx location routes this path."""
+        auth_secret ever leaves this process; it is never logged. Routed
+        only by the Stockholm edge (nginx-pocvpn-stockholm.conf, POST-only)."""
         cfg = self.server.config
         if not (cfg.activation_store_path and cfg.hysteria2_store_path and cfg.hysteria2_server_port):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "hysteria_not_configured")

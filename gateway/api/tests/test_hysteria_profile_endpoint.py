@@ -10,6 +10,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -345,9 +346,10 @@ class HysteriaConfigTests(unittest.TestCase):
                 config_module.load_config(env={**self.env, **self.hy, "POCVPN_API_HYSTERIA2_SNI": bad})
 
 
-class HysteriaNotPubliclyExposedTests(unittest.TestCase):
-    """B46-4P.1 is git-only: no edge config may route the new path, so the
-    existing catch-all keeps it unreachable from the internet."""
+class HysteriaEdgeExposureTests(unittest.TestCase):
+    """B46-4P.1 kept the path unrouted; B46-4A completion routes it on the
+    Stockholm edge only (the Android client provisions through it). The
+    catch-all 404 and the never-routed auth backend port stay enforced."""
 
     _EDGE = os.path.join(_GATEWAY_DIR, "edge")
 
@@ -355,11 +357,30 @@ class HysteriaNotPubliclyExposedTests(unittest.TestCase):
         with open(os.path.join(self._EDGE, name), encoding="utf-8") as handle:
             return handle.read()
 
-    def test_no_edge_config_routes_hysteria_profile(self):
+    # B46-4A completion - the route is now deliberately exposed on Stockholm
+    # only (the one host with a Hysteria2 listener), POST-only, to the EXIT
+    # API. Every other edge config still never mentions it, and no edge
+    # config may ever reference the loopback auth backend port.
+    def test_only_stockholm_routes_hysteria_profile(self):
+        for name in os.listdir(self._EDGE):
+            if name.endswith(".conf") and name != "nginx-pocvpn-stockholm.conf":
+                with self.subTest(conf=name):
+                    self.assertNotIn("hysteria", self._read(name).lower())
+
+    def test_stockholm_hysteria_profile_is_post_only_to_exit_api(self):
+        text = self._read("nginx-pocvpn-stockholm.conf")
+        match = re.search(r"location = /v1/hysteria-profile \{(.*?)\n    \}", text, re.S)
+        self.assertIsNotNone(match)
+        block = match.group(1)
+        self.assertRegex(block, r"limit_except POST \{\s*deny all;\s*\}")
+        self.assertIn("proxy_pass http://127.0.0.1:8443;", block)
+        self.assertEqual(1, text.count("location = /v1/hysteria-profile"))
+
+    def test_no_edge_config_references_the_auth_backend_port(self):
         for name in os.listdir(self._EDGE):
             if name.endswith(".conf"):
                 with self.subTest(conf=name):
-                    self.assertNotIn("hysteria", self._read(name).lower())
+                    self.assertNotIn("8446", self._read(name))
 
     def test_stockholm_catch_all_still_returns_404(self):
         text = self._read("nginx-pocvpn-stockholm.conf")

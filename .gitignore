@@ -95,6 +95,13 @@ android/app/b45a-dataplane.properties
 # pinned upstream source/commit/hash).
 android/app/src/main/jniLibs/arm64-v8a/libsslocal.so
 
+# B46-4A completion - Hysteria2 production child executables (same
+# gitignored, rebuild-from-pinned-source convention as libsslocal.so above).
+# Provenance: docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md "Native binary
+# packaging" (B46-3B tun2socks-child / B46-3C Hysteria2 child, SHA-256 pinned).
+android/app/src/main/jniLibs/arm64-v8a/libnovatun2sockschild.so
+android/app/src/main/jniLibs/arm64-v8a/libnovahysteriachild.so
+
 # B46-2P - separate debug/research-only harness module (see
 # docs/B46_2P_HYSTERIA2_ANDROID_PHYSICAL_VALIDATION.md). Locally-built
 # artifacts only, all reproducible from pinned source under

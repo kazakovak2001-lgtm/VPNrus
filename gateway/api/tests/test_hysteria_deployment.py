@@ -310,6 +310,11 @@ class DeploymentBoundaryTests(unittest.TestCase):
             if name.endswith(".conf") or name.endswith(".example"):
                 text = _read(os.path.join(_EDGE_DIR, name))
                 self.assertNotIn("8446", text, name)
+                # B46-4A completion - Stockholm's edge routes ONLY the
+                # client provisioning path; nothing else Hysteria-related.
+                if name == "nginx-pocvpn-stockholm.conf":
+                    text = text.replace("/v1/hysteria-profile", "")
+                    text = re.sub(r"(?m)^\s*#.*$", "", text)
                 self.assertNotIn("hysteria", text.lower(), name)
 
     def test_env_template_documents_stockholm_values_but_ships_blank(self):
