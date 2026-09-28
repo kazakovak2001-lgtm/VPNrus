@@ -36,6 +36,12 @@ make_fixture() {
     cp "$REPO_GATEWAY_DIR/scripts/remove-peer.sh" "$root/scripts/remove-peer.sh"
     cp "$REPO_GATEWAY_DIR/scripts/allocate-and-add-peer.sh" "$root/scripts/allocate-and-add-peer.sh"
     cp "$REPO_GATEWAY_DIR/scripts/provision-peer.sh" "$root/scripts/provision-peer.sh"
+    cp "$REPO_GATEWAY_DIR/scripts/reconcile-peers.sh" "$root/scripts/reconcile-peers.sh"
+    # B47 T1 - reconcile-peers.sh runs the real read-only planner, which
+    # imports the real api package (stdlib-only modules) from the fixture root.
+    mkdir -p "$root/tools"
+    cp "$REPO_GATEWAY_DIR/tools/awg_reconcile.py" "$root/tools/awg_reconcile.py"
+    cp -r "$REPO_GATEWAY_DIR/api" "$root/api"
     chmod +x "$root/scripts/"*.sh
 
     # Fake systemctl/awg so converge_live_state's behavior is deterministic
@@ -1120,6 +1126,262 @@ test_provision_subnet_exhaustion_dedicated_exit_code
 test_provision_stdout_contract_created_and_existing
 test_provision_usage_requires_exactly_one_arg
 test_allocate_and_add_peer_usage_and_duplicate_unchanged
+
+# --- B47 T1: idempotent removal + AWG entitlement desired-state reconcile ---
+
+# The reconcile planner validates keys with the API's STRICT canonical-base64
+# check (api/wgkey.py), unlike this harness's regex-only KEY2-KEY4 fixtures -
+# so these tests use canonical fixture keys (last base64 char has zero
+# padding bits). Still NOT real keys.
+RKEY1="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+RKEY2="EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE="
+RKEY3="IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII="
+RKEY4="MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM="
+RGWKEY="ggggggggggggggggggggggggggggggggggggggggggg="
+
+# remove_if_present_only <root> <key> -> prints mutate_remove_peer_if_present's rc
+remove_if_present_only() {
+    local root=$1 key=$2
+    PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" bash -c '
+        set -euo pipefail
+        source "'"$root"'/lib/common.sh"
+        source "'"$root"'/lib/peer_mutations.sh"
+        load_config
+        exec 9>"$CONFIG_DIR/.provision.lock"
+        flock -x 9
+        rc=0
+        mutate_remove_peer_if_present "$1" || rc=$?
+        echo "$rc"
+    ' _ "$key" 2>/dev/null
+}
+
+# write_entitlement_stores <root> <spec...> - each spec is
+# "<KEY>:<ACTIVE|REVOKED>:<none|past|future>" bound (confirmed) to its own
+# activation; a matching env file for the planner goes to $root/etc/api.env.
+write_entitlement_stores() {
+    local root=$1; shift
+    python3 - "$root/etc" "$@" <<'PY'
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+etc = sys.argv[1]
+now = datetime.now(timezone.utc)
+store = {}
+for i, spec in enumerate(sys.argv[2:]):
+    key, status, when = spec.split(":")
+    expires = {"none": None, "past": (now - timedelta(days=1)).isoformat(), "future": (now + timedelta(days=1)).isoformat()}[when]
+    store["%064x" % (i + 1)] = {
+        "activation_id": "%032x" % (i + 1), "status": status, "max_devices": 1,
+        "created_at": now.isoformat(), "expires_at": expires,
+        "bound_devices": [{"public_key": key, "reservation_id": "", "state": "confirmed"}],
+    }
+with open(os.path.join(etc, "activations.json"), "w") as h:
+    json.dump(store, h)
+with open(os.path.join(etc, "tokens.json"), "w") as h:
+    json.dump({}, h)
+for lock in ("activations.json.lock", "tokens.json.lock"):
+    open(os.path.join(etc, lock), "a").close()
+PY
+    cat > "$root/etc/api.env" <<ENV
+POCVPN_API_ENDPOINT_HOST=203.0.113.1
+POCVPN_API_ENDPOINT_PORT=51820
+POCVPN_API_GATEWAY_PUBLIC_KEY=$RGWKEY
+POCVPN_API_GATEWAY_TUNNEL_IP=10.77.0.1
+POCVPN_API_TOKEN_STORE_PATH=$root/etc/tokens.json
+POCVPN_API_PROVISION_SCRIPT_PATH=$root/scripts/provision-peer.sh
+POCVPN_API_SUBPROCESS_TIMEOUT_SECONDS=5
+POCVPN_API_API_PORT=8443
+POCVPN_API_ACTIVATION_STORE_PATH=$root/etc/activations.json
+ENV
+}
+
+reconcile() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/reconcile-peers.sh" --env-file "$root/etc/api.env" "$@" 2>/dev/null; }
+reconcile_stderr() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/reconcile-peers.sh" --env-file "$root/etc/api.env" "$@" 2>&1 >/dev/null; }
+export -f reconcile
+
+test_remove_if_present_absent_is_noop() {
+    local root; root=$(make_fixture "10.151.30.0/29" "10.151.30.1" 29)
+    provision "$root" "$KEY1" >/dev/null
+    local before rc; before=$(cat "$root/etc/awg0.conf")
+    rc=$(remove_if_present_only "$root" "$KEY2")
+    if [ "$rc" = "0" ] && [ "$(cat "$root/etc/awg0.conf")" = "$before" ]; then
+        pass "mutate_remove_peer_if_present: absent peer is a successful no-op, config untouched"
+    else
+        fail "mutate_remove_peer_if_present absent: rc=$rc, config changed=$([ "$(cat "$root/etc/awg0.conf")" = "$before" ] && echo no || echo yes)"
+    fi
+    rm -rf "$root"
+}
+
+test_remove_if_present_removes_and_verifies() {
+    local root; root=$(make_fixture "10.151.31.0/29" "10.151.31.1" 29)
+    provision "$root" "$KEY1" >/dev/null; provision "$root" "$KEY2" >/dev/null
+    local rc; rc=$(remove_if_present_only "$root" "$KEY1")
+    if [ "$rc" = "0" ] && ! has_peer "$root" "$KEY1" && has_peer "$root" "$KEY2"; then
+        pass "mutate_remove_peer_if_present: present peer removed, others untouched"
+    else
+        fail "mutate_remove_peer_if_present present: rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_remove_if_present_malformed_is_refused() {
+    local root; root=$(make_fixture "10.151.32.0/29" "10.151.32.1" 29)
+    provision "$root" "$KEY1" >/dev/null
+    corrupt_add_duplicate_key_peer "$root" "$KEY1"
+    local before rc; before=$(cat "$root/etc/awg0.conf")
+    rc=$(remove_if_present_only "$root" "$KEY1")
+    if [ "$rc" = "2" ] && [ "$(cat "$root/etc/awg0.conf")" = "$before" ]; then
+        pass "mutate_remove_peer_if_present: ambiguous durable entry refused (rc 2), config untouched"
+    else
+        fail "mutate_remove_peer_if_present malformed: rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_removes_only_revoked_and_expired() {
+    local root; root=$(make_fixture "10.151.33.0/28" "10.151.33.1" 28)
+    set_service_active "$root"; set_reload_converges "$root"
+    provision "$root" "$RKEY1" >/dev/null; provision "$root" "$RKEY2" >/dev/null; provision "$root" "$RKEY3" >/dev/null
+    add_manual "$root" "$RKEY4" "10.151.33.9" "manual-operator-peer" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:ACTIVE:future" "$RKEY2:REVOKED:none" "$RKEY3:ACTIVE:past"
+    local rc=0; reconcile "$root" >/dev/null || rc=$?
+    if [ "$rc" = "0" ] && has_peer "$root" "$RKEY1" && ! has_peer "$root" "$RKEY2" && ! has_peer "$root" "$RKEY3" \
+        && has_peer "$root" "$RKEY4" && ! live_peers_of "$root" | grep -qxF "$RKEY2" && ! live_peers_of "$root" | grep -qxF "$RKEY3"; then
+        pass "reconcile: revoked + expired peers removed (durable and live), active kept, unknown/manual peer NOT removed"
+    else
+        fail "reconcile removal set wrong: rc=$rc K1=$(has_peer "$root" "$RKEY1" && echo y) K2=$(has_peer "$root" "$RKEY2" && echo y) K3=$(has_peer "$root" "$RKEY3" && echo y) K4=$(has_peer "$root" "$RKEY4" && echo y)"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_is_idempotent() {
+    local root; root=$(make_fixture "10.151.34.0/29" "10.151.34.1" 29)
+    set_service_active "$root"; set_reload_converges "$root"
+    provision "$root" "$RKEY1" >/dev/null; provision "$root" "$RKEY2" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:ACTIVE:none" "$RKEY2:REVOKED:none"
+    reconcile "$root" >/dev/null
+    local before reloads rc=0; before=$(cat "$root/etc/awg0.conf"); reloads=$(reload_count "$root")
+    reconcile "$root" >/dev/null || rc=$?
+    if [ "$rc" = "0" ] && [ "$(cat "$root/etc/awg0.conf")" = "$before" ] && [ "$(reload_count "$root")" = "$reloads" ]; then
+        pass "reconcile: second run is a no-op (no mutation, no reload)"
+    else
+        fail "reconcile not idempotent: rc=$rc reloads $reloads -> $(reload_count "$root")"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_corrupt_store_fails_closed() {
+    local root; root=$(make_fixture "10.151.35.0/29" "10.151.35.1" 29)
+    set_service_active "$root"; set_reload_converges "$root"
+    provision "$root" "$RKEY1" >/dev/null; provision "$root" "$RKEY2" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none" "$RKEY2:REVOKED:none"
+    printf '{not json' > "$root/etc/activations.json"
+    local before reloads rc=0; before=$(cat "$root/etc/awg0.conf"); reloads=$(reload_count "$root")
+    local err; err=$(reconcile_stderr "$root") || rc=$?
+    if [ "$rc" = "3" ] && echo "$err" | grep -q "store unavailable.*FAIL CLOSED" && [ "$(cat "$root/etc/awg0.conf")" = "$before" ] && [ "$(reload_count "$root")" = "$reloads" ]; then
+        pass "reconcile: corrupt activation store -> exit 3, NO peer removed, no reload (fail closed)"
+    else
+        fail "reconcile corrupt store: rc=$rc (want 3), config changed=$([ "$(cat "$root/etc/awg0.conf")" = "$before" ] && echo no || echo yes)"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_missing_store_fails_closed() {
+    local root; root=$(make_fixture "10.151.36.0/29" "10.151.36.1" 29)
+    provision "$root" "$RKEY1" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none"
+    rm -f "$root/etc/activations.json"
+    local before rc=0; before=$(cat "$root/etc/awg0.conf")
+    local err; err=$(reconcile_stderr "$root") || rc=$?
+    if [ "$rc" = "3" ] && echo "$err" | grep -q "store unavailable.*FAIL CLOSED" && [ "$(cat "$root/etc/awg0.conf")" = "$before" ]; then
+        pass "reconcile: missing activation store -> exit 3, NO peer removed"
+    else
+        fail "reconcile missing store: rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_naive_expiry_fails_closed() {
+    local root; root=$(make_fixture "10.151.37.0/29" "10.151.37.1" 29)
+    provision "$root" "$RKEY1" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none"
+    sed -i 's/"expires_at": null/"expires_at": "2000-01-01T00:00:00"/' "$root/etc/activations.json"
+    local before rc=0; before=$(cat "$root/etc/awg0.conf")
+    local err; err=$(reconcile_stderr "$root") || rc=$?
+    if [ "$rc" = "3" ] && echo "$err" | grep -q "store unavailable.*FAIL CLOSED" && [ "$(cat "$root/etc/awg0.conf")" = "$before" ]; then
+        pass "reconcile: naive expires_at -> exit 3, NO peer removed"
+    else
+        fail "reconcile naive expiry: rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_dry_run_changes_nothing() {
+    local root; root=$(make_fixture "10.151.38.0/29" "10.151.38.1" 29)
+    provision "$root" "$RKEY1" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none"
+    local before err rc=0; before=$(cat "$root/etc/awg0.conf")
+    err=$(reconcile_stderr "$root" --dry-run) || rc=$?
+    if [ "$rc" = "0" ] && [ "$(cat "$root/etc/awg0.conf")" = "$before" ] && echo "$err" | grep -q "dry-run: would remove"; then
+        pass "reconcile --dry-run reports the planned removal and changes nothing"
+    else
+        fail "reconcile dry-run: rc=$rc err='$err'"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_serializes_behind_provision_lock() {
+    local root; root=$(make_fixture "10.151.39.0/29" "10.151.39.1" 29)
+    provision "$root" "$RKEY1" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none"
+    # Model an in-flight provision-peer.sh transaction holding the lock.
+    ( exec 8>"$root/etc/.provision.lock"; flock -x 8; sleep 2 ) &
+    local holder=$!
+    sleep 0.3
+    timeout 15 bash -c 'reconcile "$@"' _ "$root" >/dev/null 2>&1 &
+    local rec=$!
+    sleep 1
+    local still_present=0; has_peer "$root" "$RKEY1" && still_present=1
+    wait "$holder"; wait "$rec"; local rc=$?
+    if [ "$still_present" = "1" ] && [ "$rc" = "0" ] && ! has_peer "$root" "$RKEY1"; then
+        pass "reconcile waits for .provision.lock (no mutation while another transaction holds it), then converges"
+    else
+        fail "reconcile lock serialization: present-while-locked=$still_present rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_concurrent_with_provision_of_entitled_key() {
+    local root; root=$(make_fixture "10.151.40.0/28" "10.151.40.1" 28)
+    provision "$root" "$RKEY2" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:ACTIVE:none" "$RKEY2:REVOKED:none"
+    timeout 15 bash -c 'provision "$@"' _ "$root" "$RKEY1" >/dev/null 2>&1 &
+    local p1=$!
+    timeout 15 bash -c 'reconcile "$@"' _ "$root" >/dev/null 2>&1 &
+    local r1=$!
+    wait "$p1"; local prc=$?
+    wait "$r1"; local rrc=$?
+    # Second reconcile covers the order where it ran before provisioning.
+    reconcile "$root" >/dev/null
+    if [ "$prc" = "0" ] && [ "$rrc" = "0" ] && has_peer "$root" "$RKEY1" && ! has_peer "$root" "$RKEY2" \
+        && [ "$(grep -cF "PublicKey = $RKEY1" "$root/etc/awg0.conf")" = "1" ]; then
+        pass "concurrent provision (entitled key) + reconcile: entitled peer kept exactly once, revoked peer removed"
+    else
+        fail "provision/reconcile race: prc=$prc rrc=$rrc"
+    fi
+    rm -rf "$root"
+}
+
+test_remove_if_present_absent_is_noop
+test_remove_if_present_removes_and_verifies
+test_remove_if_present_malformed_is_refused
+test_reconcile_removes_only_revoked_and_expired
+test_reconcile_is_idempotent
+test_reconcile_corrupt_store_fails_closed
+test_reconcile_missing_store_fails_closed
+test_reconcile_naive_expiry_fails_closed
+test_reconcile_dry_run_changes_nothing
+test_reconcile_serializes_behind_provision_lock
+test_reconcile_concurrent_with_provision_of_entitled_key
 
 echo
 echo "== results: $PASSES passed, $FAILURES failed =="

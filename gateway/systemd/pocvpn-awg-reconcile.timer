@@ -1,0 +1,14 @@
+# B47 T1 - periodic safety net for pocvpn-awg-reconcile.service: bounds how
+# long a revoked or expired entitlement's AWG peer can outlive its
+# entitlement (~5 minutes), and converges any drift after boot, a missed
+# revoke trigger, or an expiry that no request ever observed.
+[Unit]
+Description=Run pocvpn AWG entitlement reconcile every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

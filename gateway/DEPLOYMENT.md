@@ -393,6 +393,35 @@ any script in this slice.
   1, and run `gateway/tools/enrollment_tokens.py init` - none of which is
   automated by this slice.
 
+## Entitlement reconcile units (B47 T1/T2) - PREPARED, NOT DEPLOYED
+
+Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
+step needs explicit owner approval.
+
+- `pocvpn-awg-reconcile.service` + `.timer` (root): removes AWG peers whose
+  activation/legacy token is revoked or expired - see
+  `gateway/scripts/reconcile-peers.sh`. Unknown/manual peers are reported
+  only; a missing/corrupt store or a naive `expires_at` aborts with exit 3
+  and changes nothing. No sudoers change.
+- `nova-xray-reconcile.service` + `.timer` (pocvpn-api): runs the existing
+  `tools/xray_reconcile.py`, so an expired activation's Xray identity is
+  dropped within ~5 minutes via the existing render/hash/reload path.
+- `nova-xray-ingress-reconcile@<env>.service` + `.timer` (pocvpn-api): the
+  same for each ingress env file (`@ingress`, `@ingress-xhttp`).
+
+Rollout order (per host):
+1. Read-only pre-check: every `expires_at` in each activations store carries
+   a UTC offset (`parse_store` now rejects naive values - the API would
+   answer 503 and the reconcile would refuse to run).
+2. Install the updated `gateway/` code (api, lib, scripts, tools).
+3. `reconcile-peers.sh --env-file /etc/pocvpn/api.env --dry-run` and review
+   the planned removals: the first real run removes EVERY peer of an
+   already revoked/expired activation, which is a user-visible change.
+4. Install and enable the timers (commands in each unit's header).
+5. Verify: revoke a test activation -> its peer and Xray UUID disappear;
+   an activation issued with a short `--expires-in-days` disappears after
+   expiry without any API request.
+
 ## Deploying a second gateway (e.g. Stockholm)
 
 B14 (2026-08-31) - this entire codebase (`gateway/api/*.py`) is already

@@ -1,0 +1,35 @@
+# B47 T2 - periodic Xray entitlement convergence for the gateway/EXIT role.
+# Runs the EXISTING gateway/tools/xray_reconcile.py -> xray_activation
+# .reconcile() path unchanged in mechanism: render (entitlement = status AND
+# expiry at `now`) -> hash compare -> only on change: stage + the already
+# sudoers-permitted nova-xray-reload wrapper. Once an activation's
+# expires_at passes, the render drops its identities, the hash differs and
+# the existing reload publishes it. No new reload mechanism, no new sudo
+# rule. A missing/malformed store fails closed (no staging write, no
+# reload - the running config is left untouched, never emptied).
+#
+# Same user and sandbox as pocvpn-api.service, whose paths it shares.
+# Install (owner-approved rollout only):
+#   install -o root -g root -m 0644 gateway/systemd/nova-xray-reconcile.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now nova-xray-reconcile.timer
+[Unit]
+Description=Nova Xray entitlement reconcile (drop revoked/expired identities)
+After=nova-xray.service
+ConditionPathExists=/etc/pocvpn/api.env
+
+[Service]
+Type=oneshot
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+ExecStart=/usr/bin/python3 /opt/pocvpn/gateway/tools/xray_reconcile.py --env-file /etc/pocvpn/api.env
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pocvpn-provision /etc/nova-xray

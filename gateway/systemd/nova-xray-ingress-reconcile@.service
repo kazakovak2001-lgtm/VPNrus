@@ -1,0 +1,31 @@
+# B47 T2 - ingress-role counterpart of nova-xray-reconcile.service, one
+# instance per ingress env file: %i is the env file's basename under
+# /etc/pocvpn/ (e.g. nova-xray-ingress-reconcile@ingress.service for
+# /etc/pocvpn/ingress.env, @ingress-xhttp for /etc/pocvpn/ingress-xhttp.env).
+# Runs the EXISTING gateway/tools/ingress_reconcile.py -> ingress_activation
+# .reconcile() render/hash/reload path - same fail-closed rules.
+# Install (owner-approved rollout only):
+#   install -o root -g root -m 0644 gateway/systemd/nova-xray-ingress-reconcile@.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now nova-xray-ingress-reconcile@ingress.timer
+[Unit]
+Description=Nova Xray ingress entitlement reconcile (%i)
+ConditionPathExists=/etc/pocvpn/%i.env
+
+[Service]
+Type=oneshot
+User=pocvpn-api
+Group=pocvpn-api
+WorkingDirectory=/opt/pocvpn/gateway
+ExecStart=/usr/bin/python3 /opt/pocvpn/gateway/tools/ingress_reconcile.py --env-file /etc/pocvpn/%i.env
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectSystem=strict
+# Union of both ingress roles' write paths (pocvpn-api-ingress.service /
+# pocvpn-api-xhttp-ingress.service); '-' = ignore a path absent on this host.
+ReadWritePaths=-/var/lib/pocvpn-provision-ingress -/var/lib/pocvpn-provision-xhttp-ingress -/etc/nova-xray-ingress -/etc/nova-xray-xhttp-ingress

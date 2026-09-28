@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 
 from . import activations, xray_provisioning, xray_reload
 from . import xray_ingress_config_renderer as ingress_renderer
@@ -130,7 +131,7 @@ def _write_last_activated_hash(path, sha256_hex):
         raise
 
 
-def _render_candidate(ingress_config):
+def _render_candidate(ingress_config, now):
     reality = build_reality_config(ingress_config)
     tls = build_tls_config(ingress_config)
     xhttp = build_xhttp_config(ingress_config)
@@ -145,22 +146,25 @@ def _render_candidate(ingress_config):
         tls=tls,
         flow=ingress_config.ingress_flow,
         xhttp=xhttp,
+        now=now,
     )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
     return config_dict, sha256_hex
 
 
-def activate_if_needed(ingress_config):
+def activate_if_needed(ingress_config, now=None):
     """Mirrors xray_activation.activate_if_needed's own lock-ordering and
     skip-when-unchanged optimization exactly - see that function's own
-    docstring for the full rationale, reused verbatim here."""
+    docstring for the full rationale, reused verbatim here (including B47
+    T2's explicit `now`)."""
     if not ingress_config.ingress_activation_wrapper_path:
         raise IngressActivationNotConfigured("ingress activation boundary is not configured")
 
+    now = now or datetime.now(timezone.utc)
     with xray_provisioning.global_lock(ingress_config.ingress_activation_lock_path, create=False):
         try:
-            config_dict, sha256_hex = _render_candidate(ingress_config)
+            config_dict, sha256_hex = _render_candidate(ingress_config, now)
         except ingress_renderer.IngressConfigRenderError as exc:
             return ActivationResult(activated=False, error=exc)
 
@@ -199,13 +203,13 @@ def provision_and_activate(credential, public_key, ingress_config, now=None):
         credential, public_key,
         ingress_config.activation_store_path, ingress_config.activation_lock_path,
         ingress_config.xray_store_path, ingress_config.xray_lock_path,
-        activate_fn=lambda: activate_if_needed(ingress_config),
+        activate_fn=lambda: activate_if_needed(ingress_config, now=now),
         now=now,
     )
 
 
-def reconcile(ingress_config):
+def reconcile(ingress_config, now=None):
     """Idempotent recovery/startup-convergence entry point - mirrors
     xray_activation.reconcile exactly (task I's own "reload/restart
-    semantics")."""
-    return activate_if_needed(ingress_config)
+    semantics"), including B47 T2's periodic expiry enforcement."""
+    return activate_if_needed(ingress_config, now=now)

@@ -1,0 +1,13 @@
+# B47 T2 - schedules nova-xray-reconcile.service: bounds how long an expired
+# activation's Xray identity can stay in the running config (~5 minutes)
+# when no API request happens to trigger a render.
+[Unit]
+Description=Run Nova Xray entitlement reconcile every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

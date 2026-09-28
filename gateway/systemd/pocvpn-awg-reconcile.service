@@ -1,0 +1,38 @@
+# B47 T1 - AWG entitlement desired-state reconcile (see
+# gateway/scripts/reconcile-peers.sh and gateway/tools/awg_reconcile.py).
+# Removes ONLY peers whose activation/legacy token is revoked or expired;
+# peers unknown to every store are reported, never removed; any store
+# problem aborts before any change (fail closed, unit ends `failed`,
+# visible via `systemctl --failed` / `journalctl -u pocvpn-awg-reconcile`).
+#
+# Runs as root directly under systemd - deliberately NOT through
+# pocvpn-api's sudoers: the API process gains no peer-removal privilege.
+# Started by pocvpn-awg-reconcile.timer and, best-effort, by
+# `activation_tokens.py revoke` (systemctl start --no-block).
+#
+# Install (owner-approved rollout only, never automatic):
+#   install -o root -g root -m 0644 gateway/systemd/pocvpn-awg-reconcile.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   /opt/pocvpn/gateway/scripts/reconcile-peers.sh --env-file /etc/pocvpn/api.env --dry-run   # review first
+#   systemctl enable --now pocvpn-awg-reconcile.timer
+[Unit]
+Description=pocvpn AWG entitlement reconcile (remove revoked/expired peers)
+After=awg-poc.service
+ConditionPathExists=/etc/pocvpn/api.env
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/pocvpn/gateway
+ExecStart=/opt/pocvpn/gateway/scripts/reconcile-peers.sh --env-file /etc/pocvpn/api.env
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+ProtectSystem=strict
+# awg0.conf, its atomic-replace temp files and .provision.lock only. The
+# activation/token stores are only READ (shared locks on existing lock
+# files) - never written by this unit.
+ReadWritePaths=/etc/amnezia/amneziawg

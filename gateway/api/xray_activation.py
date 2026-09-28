@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 
 from . import activations, relay_identity_store, xray_config_renderer, xray_provisioning, xray_reload
 
@@ -152,9 +153,11 @@ def _write_last_activated_hash(path, sha256_hex):
         raise
 
 
-def _render_candidate(app_config):
+def _render_candidate(app_config, now):
     """Reads BOTH durable stores fresh (short, released locks - never this
-    module's own long-held lock) and renders. Returns (config_dict,
+    module's own long-held lock) and renders at `now` (B47 T2 - client
+    entitlement includes expiry, so the render, and therefore its hash,
+    changes once an activation expires). Returns (config_dict,
     canonical_json_text, sha256_hex)."""
     reality = build_reality_config(app_config)
     tls = build_tls_config(app_config)
@@ -167,14 +170,14 @@ def _render_candidate(app_config):
     static_clients = relay_identity_store.load_static_clients(app_config.static_relay_clients_file)
     config_dict = xray_config_renderer.render_server_config(
         activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=app_config.xray_flow,
-        static_clients=static_clients,
+        static_clients=static_clients, now=now,
     )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
     return config_dict, sha256_hex
 
 
-def activate_if_needed(app_config):
+def activate_if_needed(app_config, now=None):
     """The one function callers (provision_and_activate, the revoke CLI,
     and the recovery/reconcile path) all use. Must be called while holding
     whatever OUTER lock the caller already needs for its own correctness
@@ -203,9 +206,10 @@ def activate_if_needed(app_config):
     if not app_config.xray_activation_wrapper_path:
         raise XrayActivationNotConfigured("Xray activation boundary is not configured")
 
+    now = now or datetime.now(timezone.utc)
     with xray_provisioning.global_lock(app_config.xray_activation_lock_path, create=False):
         try:
-            config_dict, sha256_hex = _render_candidate(app_config)
+            config_dict, sha256_hex = _render_candidate(app_config, now)
         except xray_config_renderer.XrayConfigRenderError as exc:
             return ActivationResult(activated=False, error=exc)
 
@@ -241,18 +245,19 @@ def provision_and_activate(credential, public_key, app_config, now=None):
         credential, public_key,
         app_config.activation_store_path, app_config.activation_lock_path,
         app_config.xray_store_path, app_config.xray_lock_path,
-        activate_fn=lambda: activate_if_needed(app_config),
+        activate_fn=lambda: activate_if_needed(app_config, now=now),
         now=now,
     )
 
 
-def reconcile(app_config):
+def reconcile(app_config, now=None):
     """Idempotent recovery/startup-convergence entry point (B8K2A step 7) -
     safe to call after a process crash, host reboot, a failed prior
     reload, or a durable revoke whose reload attempt failed. Does exactly
     what activate_if_needed always does: render current canonical state,
-    skip if already activated, otherwise validate/publish/reload. Not
-    wired to run automatically on every request or on a timer in this
-    slice - see gateway/tools/xray_reconcile.py, the explicit operator
-    entry point."""
-    return activate_if_needed(app_config)
+    skip if already activated, otherwise validate/publish/reload. B47 T2 -
+    also the periodic expiry-enforcement path: gateway/tools/xray_reconcile.py
+    is run by nova-xray-reconcile.timer, and a render after an activation's
+    expires_at drops its identities, so the hash differs and the existing
+    reload path publishes the change. No new reload mechanism."""
+    return activate_if_needed(app_config, now=now)

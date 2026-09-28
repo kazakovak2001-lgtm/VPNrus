@@ -3549,3 +3549,35 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   classes. Defense in depth: application ACL -> host/network ACL; neither
   replaces the other.
 - Not covered: tunnel -> gateway INPUT path (host's own listeners).
+
+## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2, repo only - not deployed)
+
+- ONE predicate: `gateway/api/activations.py` `entitlement_state(record, now)`
+  -> ACTIVE / REVOKED / EXPIRED (`status != ACTIVE` -> REVOKED; `expires_at`
+  None -> no expiry; `now >= expires_at` -> EXPIRED). `now` must be tz-aware;
+  a naive/unparseable `expires_at` is store corruption (`parse_store` rejects
+  it) - never an active entitlement. Never decide on `status == ACTIVE` alone.
+- Users: `decide_and_bind` (activate / field enroll / ingress self-bind),
+  Xray eligibility (`xray_provisioning`), Xray rendering
+  (`xray_config_renderer._active_clients`, shared by the ingress renderer,
+  evaluated at an explicit `now`), and the AWG reconcile planner.
+  Hysteria (`hysteria_provisioning.py`) still has its own copy - follow-up.
+- AWG: `awg0.conf` is reconciled to the stores by
+  `gateway/scripts/reconcile-peers.sh` (root, `pocvpn-awg-reconcile.service`
+  + `.timer` ~5 min, plus a best-effort `systemctl start --no-block` from
+  `activation_tokens.py revoke`). It holds `.provision.lock` across planning
+  (`gateway/tools/awg_reconcile.py`, read-only) AND mutation
+  (`mutate_remove_peer_if_present`). Removes only keys bound exclusively to
+  revoked/expired activations or REVOKED legacy tokens; peers unknown to every
+  store are reported, never removed; any store problem aborts before any
+  mutation. The API gains NO removal privilege (sudoers unchanged).
+  Lock order: `.provision.lock` -> store shared locks; the reconcile never
+  takes a per-activation lock (the API holds per-activation -> waits on
+  `.provision.lock`), so no cycle.
+- Xray: the existing render -> hash compare -> `nova-xray-reload` path, run
+  periodically by `nova-xray-reconcile.timer` /
+  `nova-xray-ingress-reconcile@<env>.timer`; expiry changes the render, so
+  the hash changes and the existing reload drops the client. A store error
+  leaves the running config untouched (no staging write, no reload).
+- Relay `static_clients` (ingress -> exit infra identity) are NOT user
+  entitlements and are never filtered by this predicate.

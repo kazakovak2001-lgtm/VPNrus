@@ -24,6 +24,8 @@ if _GATEWAY_DIR not in sys.path:
 
 from api import config as config_module  # noqa: E402
 from api import xray_activation as xray_activation_module  # noqa: E402
+from api import activations as activations_module  # noqa: E402
+from api import xray_provisioning as xray_provisioning_module  # noqa: E402
 
 
 def _fail(message):
@@ -66,7 +68,15 @@ def main(argv=None):
         _fail("Xray activation boundary is not configured in this env file")
         return
 
-    result = xray_activation_module.reconcile(app_config)
+    # B47 T2 - also run periodically (nova-xray-reconcile.timer) to drop
+    # expired identities. An unreadable/malformed store must never be
+    # rendered around: fail closed with NO staging write and NO reload, so
+    # the running config stays exactly as it was (never a mass removal).
+    try:
+        result = xray_activation_module.reconcile(app_config)
+    except (activations_module.ActivationStoreError, xray_provisioning_module.XrayStoreError, OSError) as exc:
+        _fail(f"store unavailable or invalid ({exc.__class__.__name__}) - FAIL CLOSED, running Xray config left unchanged")
+        return
     if result.activated:
         if result.skipped:
             print("xray_reconcile: already converged - no change needed")
