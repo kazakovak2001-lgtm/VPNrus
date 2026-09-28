@@ -7,8 +7,8 @@
 | SOURCE VERIFIED | **yes** | Android half of historical PR #111 ported onto `main` 73ab24b (branch `feature/b46-4a-hysteria2-production-completion`); gateway half already on `main` via B46-4P.1/.2/.3 |
 | BUILD VERIFIED | **yes** | `:app:compileDebugKotlin`, `:app:compileDebugUnitTestKotlin`, `:app:assembleDebug`, `:app:assembleRelease`, `:app:lintVitalRelease`, `:app:checkDebugDuplicateClasses` green; release APK inspected (below) |
 | DEPLOYED | **yes (2026-09-28)** | Stockholm server + gateway API + nginx route live (G3); signed manifest v6 (`prod-manifest-key-2026-09-14`) with the HYSTERIA2 binding live on BOTH gateways (G4) - see "Production rollout (2026-09-28)" below. Licence: official binary under owner decision A, **LEGAL REVIEW REQUIRED** (G1 open) |
-| PHYSICALLY VERIFIED (normal Nova UI) | **no** | next: G5 owner-issued production ActivationEnvelope, then G6 on OPPO |
-| PRODUCTION READY | **no** | |
+| PHYSICALLY VERIFIED (normal Nova UI) | **yes (2026-09-28, OPPO CPH2173)** | G5 production activation -> Hysteria2 credential, G6 real Hysteria2 data plane via Diagnostics "Force HYSTERIA2" (debug build) - see "G5/G6 physical validation (2026-09-28)" below |
+| PRODUCTION READY | **no - TECHNICALLY READY / LEGAL REVIEW REQUIRED** | G1 licence decision open; HYSTERIA2 reachable only by manual/forced selection (not Smart Connect default); open findings below |
 
 The rest of this document below "Status (historical, PR #111)" is the
 original #111 design record, kept because the ported code cites its
@@ -272,6 +272,86 @@ newer version keep it as LKG until a higher version is published.
 G3 - `systemctl disable --now nova-hysteria pocvpn-hysteria-auth`, swap
 `/opt/pocvpn/gateway.pre-b46-4a` back, restore `api.env.pre-b46-4a` and the
 snapshot's nginx vhost, reload nginx, restart the 3 API services.
+
+### G5/G6 physical validation (2026-09-28) - PASS
+
+Issuer backup gate: `PRODUCTION_ISSUER_OFFLINE_BACKUP_PENDING` closed by
+**owner attestation** (2026-09-28: 2 encrypted copies, 2 separate
+locations, `verify-key` OK on both, restore drill OK) - media not
+independently inspected. Primary key and the extra plaintext copies in the
+operator's `nova-issuer-work` folder re-verified with `verify-key`
+(`88ccf819...e840`); those plaintext copies are still an open custody item.
+
+**G5 (activation -> Hysteria2 credential)**, first production envelope:
+
+- Stockholm `activation_tokens.py issue --max-devices 1 --expires-in-days 30`
+  -> `activation_id=bbe6beafacc1c0ad31102eb69238d206`, expires
+  2026-10-28T16:32:05Z; credential piped over SSH straight into a `0600`
+  file on the offline machine, never displayed.
+- Offline, inside `unshare --net` (loopback DOWN, no routes):
+  `activation_envelope_issuer.py sign-existing` with
+  `prod-activation-issuer-2026-09-20-r2`, `--envelope-valid-for-hours 24`,
+  `--endpoint-hint stockholm`, `--bootstrap-bundle` = manifest v6 ->
+  envelope sha256 `ef2b468a...ca06`; `activation_package_wrapper.py` ->
+  `nova-activation:1:` package (the wrapper never attaches the bundle, so
+  the package carries the v6 REFERENCE only; Android stages it as
+  `REFERENCED_BUT_NOT_INCLUDED` and gets v6 from `/v1/manifest`).
+- App-side pre-check (temporary unit test, not committed): envelope `Valid`
+  under `ProductionActivationIssuerTrustAnchors`, bundleRef = v6 sha256 and
+  version, B67.6 eligibility `Eligible([STOCKHOLM])`.
+- OPPO: debug APK `519c5b33...` (ships both pinned children), LKG manifest
+  on the device = v6 byte-for-byte. Package imported through the normal
+  "Choose activation file" UI. Server: `/v1/activate` 200 -> `devices_bound=1`;
+  `/v1/hysteria-profile` 200 `hysteria_outcome=issued`; the Hysteria2 store
+  holds 1 salted-hash identity whose device key equals the activation's
+  bound device; the app stored `hysteria2_credential_stockholm-*.bin`.
+- Secret material (credential, envelope, package) shredded on the offline
+  machine and removed from the phone afterwards.
+
+**G6 (data plane)**, Wi-Fi `Vodafone-7914`, baseline IPv4 `86.49.237.32`,
+real global IPv6 present. Stockholm selected explicitly, Diagnostics
+"Force HYSTERIA2", connect:
+
+- Transport proof: app process spawned `libnovahysteriachild.so` +
+  `libnovatun2sockschild.so`; `tun0` `10.206.49.1/24` (the Hysteria2 TUN,
+  not AWG's `10.77.0.4`); child log `server=16.170.208.231:443
+  sni=origin-sthlm.aknova.pp.ua insecure=false`, `protect()` succeeded,
+  `connected: udpEnabled=true`; server `nova-hysteria` logged
+  `client connected {"addr":"86.49.237.32:17002","id":"1beca650:czbrGTix"}`,
+  auth backend `ok=True`; server capture: UDP `86.49.237.32:17002 <->
+  172.31.36.199:443` only.
+- Exit IPv4 `16.170.208.231`; a phone request to Frankfurt's `/v1/manifest`
+  was logged by Frankfurt nginx from `16.170.208.231` (no direct IPv4);
+  IPv6 blocked fail-closed (hostname and IPv6 literal both refused); 10 MB
+  download at ~12.6 MB/s; VPN DNS `1.1.1.1/1.0.0.1` - with Private DNS
+  `opportunistic`, a unique lookup produced DoT from Stockholm to
+  `1.0.0.1:853` during the probe.
+- Disconnect: `tun0` and both children gone, `127.0.0.1:41080` closed,
+  direct IPv4/IPv6 back, last client packet 1 s after the tap; server
+  logged `client disconnected` at the 30 s idle timeout (no explicit QUIC
+  close observed server-side).
+- Reconnect with the same stored credential: new children, same identity
+  id, auth `ok=True`, new flow `:17020`, exit `16.170.208.231`, IPv6 still
+  blocked, 10 MB at ~11.5 MB/s, Frankfurt again saw `16.170.208.231`.
+- Credential leakage: logcat 0 hits for bearer/secret/password/credential/
+  auth and 0 long tokens in Nova/child lines; `pocvpn-api`,
+  `nova-hysteria`, `pocvpn-hysteria-auth` journals and nginx access log
+  0 hits.
+
+Findings (separate, not fixed here):
+
+- "Force HYSTERIA2 on next connect" is one-shot - a plain reconnect picked
+  AWG (HYSTERIA2 is last in Smart Connect's order and not offered by
+  `AutoGatewaySelector`).
+- The child config `files/hysteria2/hysteria2-child-config.json` (app
+  private, `0600`) holds the plaintext `auth` value for the session
+  lifetime; it is deleted on disconnect.
+- Unauthenticated SOCKS5 `127.0.0.1:41080` confirmed live on the device
+  during the session (already listed below).
+- Importing an envelope hinted to `stockholm` from the generic activation
+  screen activated Stockholm but left the selected gateway as GERMANY.
+- `/v1/xray-profile` 503 seen once during G5 on Stockholm - not Hysteria2,
+  not investigated here.
 
 ### Physical validation plan (OPPO CPH2173, Android 14, arm64-v8a)
 
