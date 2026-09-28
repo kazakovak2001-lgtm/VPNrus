@@ -292,6 +292,75 @@ def parse_conf(lines):
     return interface_fields, peers, first_peer_line, last_content_line
 
 
+def parse_marked_conf(lines):
+    """B47 T1 - strict structural parse of an ALREADY-MARKED awg0.conf (the
+    production shape lib/peer_mutations.sh reads and writes), for callers
+    that must not act on a file they cannot interpret unambiguously - the
+    AWG entitlement reconcile (tools/awg_reconcile.py). Raises ConfigError;
+    never repairs anything. Returns the same (interface_fields, peers)
+    parse_conf produces for the file with its two marker lines removed.
+
+    Field/section validation is parse_conf's own, unchanged (exactly one
+    [Interface] before any [Peer], only known fields, no duplicate field in
+    one block, PublicKey + AllowedIPs on every peer, no content outside a
+    section). On top of that it requires the marker/boundary structure the
+    mutation tooling depends on:
+
+      - exactly one BEGIN and one END marker line, BEGIN before END
+        (lib/peer_mutations.sh's own _validate_peer_markers rule);
+      - every [Peer] section lies between BEGIN and END, and nothing but
+        blank/comment lines follows END (mutate_add_peer only ever inserts
+        immediately before END);
+      - peer block boundaries mean the same thing to parse_conf and to
+        mutate_remove_peer's awk (a block runs from "[Peer]" to the first
+        blank line): a key = value line after that blank line (which
+        parse_conf would still attribute to the peer, but the awk would
+        not), or a block that reaches END without a terminating blank line
+        (which the awk would delete TOGETHER WITH the END marker), is
+        rejected as ambiguous.
+    """
+    begin_idxs = [i for i, raw in enumerate(lines) if raw.strip().startswith(_BEGIN_PREFIX)]
+    end_idxs = [i for i, raw in enumerate(lines) if raw.strip().startswith(_END_PREFIX)]
+    if len(begin_idxs) != 1:
+        raise ConfigError(f"expected exactly one '{_BEGIN_PREFIX}' marker line, found {len(begin_idxs)}")
+    if len(end_idxs) != 1:
+        raise ConfigError(f"expected exactly one '{_END_PREFIX}' marker line, found {len(end_idxs)}")
+    begin_idx, end_idx = begin_idxs[0], end_idxs[0]
+    if begin_idx >= end_idx:
+        raise ConfigError(f"'{_BEGIN_PREFIX}' must occur before '{_END_PREFIX}'")
+
+    for idx, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if stripped == _PEER_HEADER and not begin_idx < idx < end_idx:
+            raise ConfigError(f"line {idx + 1}: [Peer] section outside the PEERS BEGIN/END markers")
+        if idx > end_idx and stripped and not stripped.startswith("#"):
+            raise ConfigError(f"line {idx + 1}: content after the '{_END_PREFIX}' marker")
+
+    in_block = False
+    for idx in range(begin_idx + 1, end_idx):
+        stripped = lines[idx].strip()
+        if stripped == _PEER_HEADER:
+            in_block = True
+        elif not stripped:
+            in_block = False
+        elif stripped.startswith("#"):
+            continue
+        elif not in_block:
+            raise ConfigError(
+                f"line {idx + 1}: {stripped.split('=', 1)[0].strip()!r} line outside any [Peer] block "
+                "(after its terminating blank line) - ambiguous peer boundaries"
+            )
+    if in_block:
+        raise ConfigError(
+            f"line {end_idx}: last [Peer] block has no terminating blank line before "
+            f"'{_END_PREFIX}' - ambiguous peer boundaries"
+        )
+
+    unmarked = [line for i, line in enumerate(lines) if i not in (begin_idx, end_idx)]
+    interface_fields, peers, _first_peer_line, _last_content_line = parse_conf(unmarked)
+    return interface_fields, peers
+
+
 def _validate_peer(peer, end_idx):
     missing = [f for f in _PEER_REQUIRED_FIELDS if f not in peer]
     if missing:

@@ -10,8 +10,12 @@ authority), and calls this planner WHILE holding .provision.lock, so the
 plan can never be computed from a store snapshot older than the lock.
 
     reconcile-peers.sh (root, holds .provision.lock)
-        grep PublicKey awg0.conf | awg_reconcile.py --env-file /etc/pocvpn/api.env
+        awg_reconcile.py --env-file /etc/pocvpn/api.env < awg0.conf
         -> stdout: one public key per line = peers to remove
+
+The planner receives the WHOLE awg0.conf on stdin (it never opens the file
+itself) and validates its structure before anything else - see
+parse_awg_config(). A file it cannot interpret unambiguously yields no plan.
 
 Desired-state rules (activations.entitlement_state is the ONLY entitlement
 predicate - status AND expiry, never status alone):
@@ -32,29 +36,33 @@ even if another entitlement binding it was revoked. Pending bindings count
 as DESIRED so an in-flight /v1/activate is never undercut.
 
 Fail closed: if any configured store is missing, unreadable, malformed, or
-holds a naive/unparseable expires_at, or stdin contains anything that is
-not a well-formed public key, NO plan is printed and the exit code is
+holds a naive/unparseable expires_at, or awg0.conf fails structural
+validation (parse_awg_config), NO plan is printed and the exit code is
 non-zero - reconcile-peers.sh then makes no change at all. An incomplete
-view of entitlement must never drive deletions.
+or ambiguous view of entitlement or of the peer set must never drive
+deletions.
 
 Exit codes: 0 = plan printed (possibly empty); 2 = usage/config error;
 3 = store or input unavailable/invalid (nothing planned).
 """
 import argparse
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _GATEWAY_DIR = os.path.abspath(os.path.join(_THIS_DIR, ".."))
-if _GATEWAY_DIR not in sys.path:
-    sys.path.insert(0, _GATEWAY_DIR)
+for _path in (_GATEWAY_DIR, _THIS_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from api import activations as activations_module  # noqa: E402
 from api import config as config_module  # noqa: E402
 from api import tokens as tokens_module  # noqa: E402
 from api.wgkey import is_valid_wg_public_key  # noqa: E402
+import migrate_peer_markers  # noqa: E402  (the existing strict awg0.conf parser)
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -62,7 +70,7 @@ EXIT_STORE = 3
 
 
 class PlanInputError(Exception):
-    """A store or the peer list could not be trusted - never plan from it."""
+    """A store or awg0.conf could not be trusted - never plan from it."""
 
 
 @dataclass(frozen=True)
@@ -100,20 +108,38 @@ def plan_peer_removals(activations_data, token_data, current_peers, now):
     return ReconcilePlan(remove=tuple(remove), unknown=tuple(unknown), desired_present=len(peers & desired))
 
 
-def parse_peer_list(lines):
-    """One public key per line (blank lines ignored). Anything else means
-    reconcile-peers.sh's view of awg0.conf is not what it should be - fail
-    closed rather than guess."""
+_LINE_NO_RE = re.compile(r"^line (\d+)")
+
+
+def parse_awg_config(text):
+    """B47 T1 - the peer set a removal plan may be computed from.
+
+    Delegates ALL structural validation to
+    migrate_peer_markers.parse_marked_conf (markers, section order, known
+    fields only, one PublicKey + AllowedIPs per [Peer], no duplicate field
+    in a block, peer block boundaries identical to mutate_remove_peer's),
+    then additionally requires every PublicKey to be a canonical
+    AmneziaWG/WireGuard key (api.wgkey, the API's own definition) and
+    unique across peers. Returns the list of peer public keys.
+
+    Any failure raises PlanInputError carrying at most a line number -
+    never line content, which could include [Interface] PrivateKey or a
+    PresharedKey."""
+    if not isinstance(text, str):
+        raise PlanInputError("awg0.conf content unavailable")
+    try:
+        _interface, peers = migrate_peer_markers.parse_marked_conf(text.splitlines())
+    except migrate_peer_markers.ConfigError as exc:
+        match = _LINE_NO_RE.match(str(exc))
+        where = f" near line {match.group(1)}" if match else ""
+        raise PlanInputError(f"awg0.conf failed structural validation{where} (details withheld)") from None
     keys = []
-    for line in lines:
-        key = line.strip()
-        if not key:
-            continue
-        if not is_valid_wg_public_key(key):
-            raise PlanInputError("peer list contains a line that is not a well-formed public key")
-        keys.append(key)
+    for position, peer in enumerate(peers, start=1):
+        if not is_valid_wg_public_key(peer["PublicKey"]):
+            raise PlanInputError(f"awg0.conf peer #{position} has a non-canonical PublicKey")
+        keys.append(peer["PublicKey"])
     if len(keys) != len(set(keys)):
-        raise PlanInputError("peer list contains a duplicate public key (ambiguous awg0.conf)")
+        raise PlanInputError("awg0.conf contains a duplicate PublicKey (ambiguous peer set)")
     return keys
 
 
@@ -185,7 +211,11 @@ def main(argv=None, stdin=None, stdout=None):
         return EXIT_CONFIG
 
     try:
-        peers = parse_peer_list(stdin)
+        try:
+            config_text = stdin.read()
+        except (OSError, UnicodeDecodeError):
+            raise PlanInputError("awg0.conf content unreadable") from None
+        peers = parse_awg_config(config_text)
         activations_data, token_data = load_stores(app_config)
         plan = plan_peer_removals(activations_data, token_data, peers, now)
     except PlanInputError as exc:

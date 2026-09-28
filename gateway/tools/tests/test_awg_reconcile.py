@@ -39,6 +39,41 @@ def _key(byte):
 KEY_A, KEY_B, KEY_C, KEY_D, KEY_M = _key(1), _key(2), _key(3), _key(4), _key(9)
 
 
+_INTERFACE = """# rendered by provision.sh from gateway/config/awg0.conf.example
+[Interface]
+PrivateKey = test-fixture-not-a-real-private-key
+Address = 10.77.0.1/24
+ListenPort = 51820
+Jc = 6
+Jmin = 40
+Jmax = 100
+S1 = 113
+S2 = 159
+S3 = 0
+S4 = 0
+H1 = 1106684696
+H2 = 3677857287
+H3 = 353316806
+H4 = 2068198996
+RandomTrailers = off
+DisableCookies = off
+
+# --- PEERS BEGIN --- (managed by scripts/add-peer.sh / remove-peer.sh; do not hand-edit below this line)
+"""
+_END = "# --- PEERS END ---\n"
+
+
+def _peer_block(key, ip, label="provision-peer-1789000000"):
+    """Exactly the block lib/peer_mutations.sh mutate_add_peer writes."""
+    return f"[Peer]\n# label: {label}\nPublicKey = {key}\nAllowedIPs = {ip}/32\n\n"
+
+
+def _awg_conf(keys):
+    """A production-shaped awg0.conf holding one peer per key."""
+    blocks = "".join(_peer_block(k, f"10.77.0.{i + 2}") for i, k in enumerate(keys))
+    return _INTERFACE + blocks + _END
+
+
 def _activation(status="ACTIVE", expires_at=None, keys=(), activation_id="a" * 32, state="confirmed"):
     return {
         "activation_id": activation_id,
@@ -133,12 +168,102 @@ class PlannerDesiredStateTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(awg_reconcile.PlanInputError):
                 _plan({"1" * 64: _activation(expires_at=bad, keys=(KEY_A,))}, {}, [KEY_A])
 
-    def test_peer_list_rejects_non_keys_and_duplicates(self):
-        self.assertEqual(awg_reconcile.parse_peer_list([KEY_A + "\n", "\n", KEY_B]), [KEY_A, KEY_B])
-        with self.assertRaises(awg_reconcile.PlanInputError):
-            awg_reconcile.parse_peer_list(["not-a-key\n"])
-        with self.assertRaises(awg_reconcile.PlanInputError):
-            awg_reconcile.parse_peer_list([KEY_A, KEY_A])
+
+
+class AwgConfigStructureTests(unittest.TestCase):
+    """parse_awg_config: the peer set is only trusted when awg0.conf can be
+    interpreted unambiguously, in the exact shape lib/peer_mutations.sh
+    writes; otherwise PlanInputError (-> no plan, no mutation, no reload)."""
+
+    def _fails_closed(self, text):
+        with self.assertRaises(awg_reconcile.PlanInputError) as ctx:
+            awg_reconcile.parse_awg_config(text)
+        # Never echo file content (PrivateKey/PresharedKey) into the journal.
+        self.assertNotIn("test-fixture-not-a-real-private-key", str(ctx.exception))
+        self.assertNotIn("sec" + "ret-psk", str(ctx.exception))
+
+    # --- PASS ---
+    def test_valid_single_peer(self):
+        self.assertEqual(awg_reconcile.parse_awg_config(_awg_conf([KEY_A])), [KEY_A])
+
+    def test_valid_multiple_peers(self):
+        self.assertEqual(awg_reconcile.parse_awg_config(_awg_conf([KEY_A, KEY_B, KEY_C])), [KEY_A, KEY_B, KEY_C])
+
+    def test_valid_with_manual_peer_and_preshared_key(self):
+        manual = f"[Peer]\n# label: operator-manual\nPublicKey = {KEY_M}\nAllowedIPs = 10.77.0.9/32\nPresharedKey = secret-psk\n\n"
+        text = _INTERFACE + _peer_block(KEY_A, "10.77.0.2") + manual + _END
+        self.assertEqual(awg_reconcile.parse_awg_config(text), [KEY_A, KEY_M])
+
+    def test_valid_zero_peers_matches_the_template_shape(self):
+        self.assertEqual(awg_reconcile.parse_awg_config(_INTERFACE + _END), [])
+
+    def test_interface_is_never_read_as_a_peer(self):
+        # [Interface] has no PublicKey; its keys never reach the peer set.
+        self.assertEqual(awg_reconcile.parse_awg_config(_awg_conf([KEY_A])), [KEY_A])
+
+    # --- FAIL CLOSED ---
+    def test_peer_without_public_key(self):
+        self._fails_closed(_INTERFACE + "[Peer]\n# label: x\nAllowedIPs = 10.77.0.2/32\n\n" + _END)
+
+    def test_peer_with_invalid_public_key(self):
+        for bad in ("not-a-key", "B" * 43 + "=", KEY_A[:-2] + "=="):
+            with self.subTest(bad=bad):
+                self._fails_closed(_awg_conf([bad]))
+
+    def test_duplicate_public_key_inside_one_peer(self):
+        self._fails_closed(_INTERFACE + f"[Peer]\nPublicKey = {KEY_A}\nPublicKey = {KEY_B}\nAllowedIPs = 10.77.0.2/32\n\n" + _END)
+
+    def test_duplicate_public_key_across_peers(self):
+        self._fails_closed(_INTERFACE + _peer_block(KEY_A, "10.77.0.2") + _peer_block(KEY_A, "10.77.0.3") + _END)
+
+    def test_key_line_after_block_terminator_is_ambiguous(self):
+        # parse_conf would attribute this line to the peer; mutate_remove_peer's awk would not.
+        text = _INTERFACE + f"[Peer]\nPublicKey = {KEY_A}\n\nAllowedIPs = 10.77.0.2/32\n\n" + _END
+        self._fails_closed(text)
+
+    def test_last_peer_without_terminating_blank_line(self):
+        # The awk removal would swallow the END marker together with this block.
+        self._fails_closed(_INTERFACE + f"[Peer]\nPublicKey = {KEY_A}\nAllowedIPs = 10.77.0.2/32\n" + _END)
+
+    def test_missing_or_duplicated_or_reversed_markers(self):
+        body = _peer_block(KEY_A, "10.77.0.2")
+        begin = "# --- PEERS BEGIN --- (managed by scripts/add-peer.sh / remove-peer.sh; do not hand-edit below this line)\n"
+        no_begin = _INTERFACE.replace(begin, "") + body + _END
+        no_end = _INTERFACE + body
+        two_end = _INTERFACE + body + _END + _END
+        reversed_ = _INTERFACE.replace(begin, _END) + body + begin
+        for name, text in (("no_begin", no_begin), ("no_end", no_end), ("two_end", two_end), ("reversed", reversed_)):
+            with self.subTest(name):
+                self._fails_closed(text)
+
+    def test_peer_outside_markers(self):
+        self._fails_closed(_INTERFACE + _END + _peer_block(KEY_A, "10.77.0.2"))
+
+    def test_malformed_peer_sections(self):
+        cases = {
+            "unknown_field": f"[Peer]\nPublicKey = {KEY_A}\nAllowedIPs = 10.77.0.2/32\nEndpoint = 1.2.3.4:5\n\n",
+            "missing_allowed_ips": f"[Peer]\nPublicKey = {KEY_A}\n\n",
+            "non_kv_line": f"[Peer]\nPublicKey = {KEY_A}\nAllowedIPs 10.77.0.2/32\n\n",
+            "misspelled_header": f"[Peer ]\nPublicKey = {KEY_A}\nAllowedIPs = 10.77.0.2/32\n\n",
+            "unknown_section": f"[Peers]\nPublicKey = {KEY_A}\nAllowedIPs = 10.77.0.2/32\n\n",
+        }
+        for name, block in cases.items():
+            with self.subTest(name):
+                self._fails_closed(_INTERFACE + block + _END)
+
+    def test_other_structural_errors(self):
+        cases = {
+            "second_interface": _INTERFACE.replace("# --- PEERS BEGIN", "[Interface]\nPrivateKey = x\n\n# --- PEERS BEGIN") + _END,
+            "no_interface": "# --- PEERS BEGIN ---\n" + _peer_block(KEY_A, "10.77.0.2") + _END,
+            "interface_between_markers": _INTERFACE + "[Interface]\nPrivateKey = x\n\n" + _END,
+            "content_after_end": _awg_conf([KEY_A]) + "AllowedIPs = 10.77.0.9/32\n",
+            "loose_kv_between_peers": _INTERFACE + _peer_block(KEY_A, "10.77.0.2") + "PublicKey = " + KEY_B + "\n" + _END,
+            "secret_in_error_path": "PrivateKey = test-fixture-not-a-real-private-key\n" + _awg_conf([KEY_A]),
+            "empty_input": "",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self._fails_closed(text)
 
 
 class PlannerCliTests(unittest.TestCase):
@@ -183,7 +308,7 @@ class PlannerCliTests(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             rc = awg_reconcile.main(
                 ["--env-file", self.env_file, "--now", now.isoformat()],
-                stdin=io.StringIO("".join(k + "\n" for k in peers)), stdout=out,
+                stdin=io.StringIO(peers if isinstance(peers, str) else _awg_conf(peers)), stdout=out,
             )
         return rc, out.getvalue().split(), err.getvalue()
 
@@ -228,10 +353,12 @@ class PlannerCliTests(unittest.TestCase):
         rc, removed, _err = self._run([KEY_B])
         self.assertEqual((rc, removed), (awg_reconcile.EXIT_STORE, []))
 
-    def test_garbage_peer_list_fails_closed(self):
+    def test_malformed_awg_config_fails_closed_even_with_a_revoked_key(self):
         self._write(self.activation_store, {"2" * 64: _activation(status="REVOKED", keys=(KEY_B,))})
-        rc, removed, _err = self._run(["garbage"])
+        ambiguous = _INTERFACE + f"[Peer]\nPublicKey = {KEY_B}\nAllowedIPs = 10.77.0.2/32\n" + _END
+        rc, removed, err = self._run(ambiguous)
         self.assertEqual((rc, removed), (awg_reconcile.EXIT_STORE, []))
+        self.assertIn("structural validation", err)
 
     def test_bad_env_file_is_a_config_error(self):
         out = io.StringIO()

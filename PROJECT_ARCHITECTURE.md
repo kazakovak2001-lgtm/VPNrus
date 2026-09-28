@@ -3569,8 +3569,11 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   (`gateway/tools/awg_reconcile.py`, read-only) AND mutation
   (`mutate_remove_peer_if_present`). Removes only keys bound exclusively to
   revoked/expired activations or REVOKED legacy tokens; peers unknown to every
-  store are reported, never removed; any store problem aborts before any
-  mutation. The API gains NO removal privilege (sudoers unchanged).
+  store are reported, never removed; any store problem, or an `awg0.conf`
+  that fails structural validation (`migrate_peer_markers.parse_marked_conf`:
+  markers, sections, one canonical PublicKey per `[Peer]`, peer boundaries
+  identical to `mutate_remove_peer`'s), aborts with exit 3 before any
+  mutation or reload. The API gains NO removal privilege (sudoers unchanged).
   Lock order: `.provision.lock` -> store shared locks; the reconcile never
   takes a per-activation lock (the API holds per-activation -> waits on
   `.provision.lock`), so no cycle.

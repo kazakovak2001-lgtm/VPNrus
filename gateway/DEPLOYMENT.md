@@ -401,8 +401,11 @@ step needs explicit owner approval.
 - `pocvpn-awg-reconcile.service` + `.timer` (root): removes AWG peers whose
   activation/legacy token is revoked or expired - see
   `gateway/scripts/reconcile-peers.sh`. Unknown/manual peers are reported
-  only; a missing/corrupt store or a naive `expires_at` aborts with exit 3
-  and changes nothing. No sudoers change.
+  only; a missing/corrupt store, a naive `expires_at`, or an `awg0.conf`
+  that cannot be parsed unambiguously (bad/missing markers, a `[Peer]`
+  without exactly one canonical PublicKey, an unknown field, ambiguous peer
+  boundaries) aborts with exit 3 and changes nothing - no repair is ever
+  attempted; fix the file by hand, then re-run `--dry-run`. No sudoers change.
 - `nova-xray-reconcile.service` + `.timer` (pocvpn-api): runs the existing
   `tools/xray_reconcile.py`, so an expired activation's Xray identity is
   dropped within ~5 minutes via the existing render/hash/reload path.

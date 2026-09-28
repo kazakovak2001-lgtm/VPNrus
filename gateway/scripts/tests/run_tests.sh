@@ -41,6 +41,7 @@ make_fixture() {
     # imports the real api package (stdlib-only modules) from the fixture root.
     mkdir -p "$root/tools"
     cp "$REPO_GATEWAY_DIR/tools/awg_reconcile.py" "$root/tools/awg_reconcile.py"
+    cp "$REPO_GATEWAY_DIR/tools/migrate_peer_markers.py" "$root/tools/migrate_peer_markers.py"
     cp -r "$REPO_GATEWAY_DIR/api" "$root/api"
     chmod +x "$root/scripts/"*.sh
 
@@ -1382,6 +1383,79 @@ test_reconcile_naive_expiry_fails_closed
 test_reconcile_dry_run_changes_nothing
 test_reconcile_serializes_behind_provision_lock
 test_reconcile_concurrent_with_provision_of_entitled_key
+
+# --- B47 T1 follow-up: awg0.conf structural validation before any plan ---
+# Each case starts from a valid, provisioned config whose RKEY1 entitlement is
+# REVOKED (so a plan WOULD remove it), then damages awg0.conf. Required
+# outcome: exit 3, awg0.conf byte-identical, no peer mutation, no reload.
+
+corrupt_peer_without_public_key() { insert_before_end_marker "$1" "$(printf '[Peer]\n# label: nokey\nAllowedIPs = 10.151.50.6/32')"; }
+corrupt_peer_non_canonical_key() { insert_before_end_marker "$1" "$(printf '[Peer]\n# label: badkey\nPublicKey = %s\nAllowedIPs = 10.151.50.6/32' "$KEY2")"; }
+corrupt_peer_two_public_keys() { insert_before_end_marker "$1" "$(printf '[Peer]\n# label: twokeys\nPublicKey = %s\nPublicKey = %s\nAllowedIPs = 10.151.50.6/32' "$RKEY3" "$RKEY4")"; }
+corrupt_peer_misspelled_header() { insert_before_end_marker "$1" "$(printf '[Peer ]\nPublicKey = %s\nAllowedIPs = 10.151.50.6/32' "$RKEY3")"; }
+corrupt_last_peer_unterminated() { python3 - "$1/etc/awg0.conf" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+assert "\n\n# --- PEERS END ---" in text
+open(path, "w").write(text.replace("\n\n# --- PEERS END ---", "\n# --- PEERS END ---", 1))
+PY
+}
+corrupt_key_line_after_block_end() { python3 - "$1/etc/awg0.conf" "$RKEY3" <<'PY'
+import sys
+path, key = sys.argv[1], sys.argv[2]
+text = open(path).read()
+open(path, "w").write(text.replace("# --- PEERS END ---", "PublicKey = %s\n# --- PEERS END ---" % key, 1))
+PY
+}
+
+corrupt_add_duplicate_key_peer_rkey1() { corrupt_add_peer_with_ip "$1" "$RKEY1" "10.151.50.9"; }
+
+reconcile_structural_case() {
+    local label=$1 corrupt_fn=$2
+    local root; root=$(make_fixture "10.151.50.0/28" "10.151.50.1" 28)
+    set_service_active "$root"; set_reload_converges "$root"
+    provision "$root" "$RKEY1" >/dev/null; provision "$root" "$RKEY2" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none" "$RKEY2:ACTIVE:none"
+    "$corrupt_fn" "$root"
+    local before reloads err rc=0
+    before=$(sha256sum "$root/etc/awg0.conf"); reloads=$(reload_count "$root")
+    err=$(reconcile_stderr "$root") || rc=$?
+    if [ "$rc" = "3" ] && [ "$(sha256sum "$root/etc/awg0.conf")" = "$before" ] \
+        && [ "$(reload_count "$root")" = "$reloads" ] && has_peer "$root" "$RKEY1" \
+        && echo "$err" | grep -q "error: awg0.conf.*FAIL CLOSED" \
+        && ! echo "$err" | grep -q "test-fixture-not-a-real-key"; then
+        pass "reconcile fail-closed on malformed awg0.conf ($label): exit 3, file unchanged, no mutation, no reload"
+    else
+        fail "reconcile structural case '$label': rc=$rc (want 3) unchanged=$([ "$(sha256sum "$root/etc/awg0.conf")" = "$before" ] && echo y || echo n) reloads $reloads -> $(reload_count "$root") err='$err'"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_valid_single_peer_still_removed() {
+    local root; root=$(make_fixture "10.151.51.0/29" "10.151.51.1" 29)
+    set_service_active "$root"; set_reload_converges "$root"
+    provision "$root" "$RKEY1" >/dev/null
+    write_entitlement_stores "$root" "$RKEY1:REVOKED:none"
+    local rc=0; reconcile "$root" >/dev/null || rc=$?
+    if [ "$rc" = "0" ] && ! has_peer "$root" "$RKEY1" && grep -q '^# --- PEERS END ---' "$root/etc/awg0.conf"; then
+        pass "reconcile on a valid single-peer config behaves as before (revoked peer removed, markers intact)"
+    else
+        fail "reconcile valid single peer: rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_reconcile_valid_single_peer_still_removed
+reconcile_structural_case "peer without PublicKey" corrupt_peer_without_public_key
+reconcile_structural_case "non-canonical PublicKey" corrupt_peer_non_canonical_key
+reconcile_structural_case "two PublicKeys in one peer" corrupt_peer_two_public_keys
+reconcile_structural_case "duplicate PublicKey across peers" corrupt_add_duplicate_key_peer_rkey1
+reconcile_structural_case "misspelled [Peer] header" corrupt_peer_misspelled_header
+reconcile_structural_case "last peer block unterminated before END" corrupt_last_peer_unterminated
+reconcile_structural_case "key line outside a peer block" corrupt_key_line_after_block_end
+reconcile_structural_case "missing END marker" corrupt_remove_end_marker
+reconcile_structural_case "duplicated BEGIN marker" corrupt_duplicate_begin_marker
 
 echo
 echo "== results: $PASSES passed, $FAILURES failed =="

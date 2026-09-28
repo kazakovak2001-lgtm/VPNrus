@@ -9,8 +9,9 @@
 # Sequence (entirely under ONE exclusive .provision.lock acquisition, the
 # same single serialization authority provision-peer.sh/add-peer.sh/
 # remove-peer.sh use):
-#   1. list the peers currently in awg0.conf
-#   2. ask tools/awg_reconcile.py (read-only planner) which of them belong
+#   1. hand awg0.conf to tools/awg_reconcile.py (read-only planner), which
+#      validates its structure and extracts the current peer set
+#   2. the planner decides which of those peers belong
 #      to a revoked/expired entitlement - the planner reads the stores
 #      WHILE this lock is held, so a concurrent /v1/activate either bound
 #      its key before the snapshot (-> kept) or its provision-peer.sh is
@@ -19,8 +20,9 @@
 #
 # Safety rules:
 #   - the planner failing for ANY reason (store missing/unreadable/malformed,
-#     naive expiry, odd awg0.conf) aborts BEFORE any mutation - an
-#     incomplete view of entitlement never drives deletions
+#     naive expiry, awg0.conf failing structural validation) aborts BEFORE
+#     any mutation or reload - an incomplete or ambiguous view of
+#     entitlement or of the peer set never drives deletions
 #   - peers unknown to every store are reported by the planner, never removed
 #   - a malformed durable entry for a planned key is skipped (reported,
 #     non-zero exit), never "repaired" by deletion
@@ -64,14 +66,19 @@ LOCK_FILE="$CONFIG_DIR/.provision.lock"
 exec 9>"$LOCK_FILE"
 flock -x 9
 
-[ -f "$CONFIG_PATH" ] || die "gateway config not found at $CONFIG_PATH - nothing reconciled"
+if [ ! -f "$CONFIG_PATH" ]; then
+    log "reconcile aborted: gateway config not found at $CONFIG_PATH - FAIL CLOSED, nothing reconciled"
+    exit 3
+fi
 
 # Everything below runs with the exclusive lock held.
 planner_rc=0
-# awk (not grep): zero peers is a normal, successful empty list, while an
-# unreadable file is still a hard error under pipefail.
-PLAN=$(awk '/^PublicKey = / { sub(/^PublicKey = /, ""); print }' "$CONFIG_PATH" \
-    | "$PYTHON_BIN" "$PLANNER" --env-file "$ENV_FILE" ${POCVPN_RECONCILE_NOW:+--now "$POCVPN_RECONCILE_NOW"}) || planner_rc=$?
+# The planner gets the WHOLE awg0.conf on stdin and validates its structure
+# (markers, sections, one canonical PublicKey per [Peer], unambiguous peer
+# boundaries) before planning anything - a file it cannot interpret
+# unambiguously means no plan, no mutation, no reload (exit 3 below).
+PLAN=$("$PYTHON_BIN" "$PLANNER" --env-file "$ENV_FILE" ${POCVPN_RECONCILE_NOW:+--now "$POCVPN_RECONCILE_NOW"} \
+    < "$CONFIG_PATH") || planner_rc=$?
 if [ "$planner_rc" -ne 0 ]; then
     log "reconcile aborted: planner refused (rc=$planner_rc) - FAIL CLOSED, no peer removed"
     exit 3
