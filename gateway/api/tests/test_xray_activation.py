@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _GATEWAY_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
@@ -301,6 +302,73 @@ class ConcurrencyTests(XrayActivationTestBase):
         with open(self.app_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
             staged = json.load(handle)  # must parse cleanly - never a torn/partial write
         self.assertIsInstance(staged["inbounds"][0]["settings"]["clients"], list)
+
+
+class ExpiryConvergenceTests(XrayActivationTestBase):
+    """B47 T2 - an activation's expires_at alone (no revoke, no API request)
+    must drop its identity through the EXISTING render -> hash compare ->
+    reload path, driven by the periodic reconcile with an explicit `now`."""
+
+    def _issue_bind_confirm_expiring(self, expires_in_days):
+        activation_id, credential = activations_module.issue_activation(
+            self.activation_store_path, self.activation_lock_path, max_devices=1, expires_in_days=expires_in_days,
+        )
+        activations_module.decide_and_bind(credential, self.key_a, self.activation_store_path, self.activation_lock_path)
+        activations_module.finalize_reservation(credential, self.key_a, self.activation_store_path, self.activation_lock_path)
+        result = xray_provisioning_module.provision_and_activate_identity(
+            credential, self.key_a,
+            self.activation_store_path, self.activation_lock_path,
+            self.app_config.xray_store_path, self.app_config.xray_lock_path,
+            activate_fn=lambda: xray_activation_module.activate_if_needed(self.app_config),
+        )
+        self.assertTrue(result.activated)
+        record = activations_module.find_by_activation_id(self.activation_store_path, self.activation_lock_path, activation_id)
+        return activations_module.parse_expires_at(record["expires_at"])
+
+    def _staged_clients(self):
+        with open(self.app_config.xray_staging_config_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)["inbounds"][0]["settings"]["clients"]
+
+    def test_reconcile_before_expiry_is_a_no_op(self):
+        expires_at = self._issue_bind_confirm_expiring(1)
+        result = xray_activation_module.reconcile(self.app_config, now=expires_at - timedelta(seconds=1))
+        self.assertTrue(result.activated)
+        self.assertTrue(result.skipped)
+        self.assertEqual(len(self._staged_clients()), 1)
+
+    def test_reconcile_after_expiry_reloads_without_the_expired_identity(self):
+        expires_at = self._issue_bind_confirm_expiring(1)
+        result = xray_activation_module.reconcile(self.app_config, now=expires_at)
+        self.assertTrue(result.activated)
+        self.assertFalse(result.skipped)  # hash changed -> the existing reload path ran
+        self.assertEqual(self._staged_clients(), [])
+        # Converged: the next run at the same instant has nothing to do.
+        again = xray_activation_module.reconcile(self.app_config, now=expires_at + timedelta(minutes=5))
+        self.assertTrue(again.skipped)
+
+    def test_expired_activation_cannot_obtain_a_new_identity(self):
+        _activation_id, credential = activations_module.issue_activation(
+            self.activation_store_path, self.activation_lock_path, max_devices=1, expires_in_days=1,
+        )
+        activations_module.decide_and_bind(credential, self.key_a, self.activation_store_path, self.activation_lock_path)
+        activations_module.finalize_reservation(credential, self.key_a, self.activation_store_path, self.activation_lock_path)
+        result = xray_provisioning_module.provision_and_activate_identity(
+            credential, self.key_a,
+            self.activation_store_path, self.activation_lock_path,
+            self.app_config.xray_store_path, self.app_config.xray_lock_path,
+            activate_fn=lambda: xray_activation_module.activate_if_needed(self.app_config),
+            now=datetime.now(timezone.utc) + timedelta(days=2),
+        )
+        self.assertEqual(result.identity_outcome.outcome, xray_provisioning_module.NOT_ELIGIBLE_EXPIRED)
+
+    def test_corrupt_activation_store_fails_closed_without_touching_staged_config(self):
+        self._issue_bind_confirm_expiring(1)
+        staged_before = self._staged_clients()
+        with open(self.activation_store_path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        with self.assertRaises(activations_module.ActivationStoreError):
+            xray_activation_module.reconcile(self.app_config)
+        self.assertEqual(self._staged_clients(), staged_before)
 
 
 if __name__ == "__main__":

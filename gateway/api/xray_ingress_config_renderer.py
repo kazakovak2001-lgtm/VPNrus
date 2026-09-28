@@ -259,7 +259,7 @@ def _render_xhttp_origin_inbound(clients, xhttp):
     }
 
 
-def render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=None, flow="", xhttp=None):
+def render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=None, flow="", xhttp=None, now=None):
     """B24 - the real ingress relay config: the SAME client-facing
     inbound(s) `xray_config_renderer.render_server_config` already produces
     (identity/authorization reuse - task requirement 7/8, never a second/
@@ -278,7 +278,12 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
     at all, so even a routing-rule bug could never fall through to one -
     task requirement L's own "cannot generate an unauthenticated/open
     relay").
+
+    B47 T2 - [now] is the instant client entitlement (status AND expiry)
+    is evaluated at, via the SAME base._active_clients the EXIT renderer
+    uses; omitted means "current UTC time", resolved once here.
     """
+    now = base._resolve_now(now)
     if reality is not None:
         base._validate_reality_server_config(reality)
     if tls is not None:
@@ -289,7 +294,7 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
         raise IngressConfigRenderError("at least one client-facing inbound is required")
     _validate_upstream(upstream)
 
-    clients = base._active_clients(activations_data, xray_data)
+    clients = base._active_clients(activations_data, xray_data, now)
 
     inbounds = []
     inbound_tags = []
@@ -316,7 +321,7 @@ def render_ingress_server_config(activations_data, xray_data, reality, upstream,
     }
 
 
-def render_ingress_server_config_redacted(activations_data, xray_data, reality, upstream, tls=None, flow="", xhttp=None):
+def render_ingress_server_config_redacted(activations_data, xray_data, reality, upstream, tls=None, flow="", xhttp=None, now=None):
     """Same as [render_ingress_server_config] but with every secret value
     replaced by a fixed placeholder - the ONLY form of the rendered config
     that may ever be logged, diffed in an error message, or otherwise
@@ -328,7 +333,7 @@ def render_ingress_server_config_redacted(activations_data, xray_data, reality, 
     this module introduces) - REALITY's own `publicKey`/`shortId` for the
     upstream are NOT secrets (a public key and a non-secret short id, by
     design of the REALITY protocol itself) and are left as-is."""
-    full = render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=tls, flow=flow, xhttp=xhttp)
+    full = render_ingress_server_config(activations_data, xray_data, reality, upstream, tls=tls, flow=flow, xhttp=xhttp, now=now)
     if reality is not None:
         full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     for user in full["outbounds"][0]["settings"]["vnext"][0]["users"]:

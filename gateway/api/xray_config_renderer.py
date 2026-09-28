@@ -11,7 +11,13 @@ own docstring for why that stays a distinct, explicit action.
 
 Revocation is realized ENTIRELY here, not in xray_provisioning.py: an
 identity is included in the rendered client list if and only if its
-owning activation is currently ACTIVE and unexpired in activations.json.
+owning activation is currently ACTIVE and unexpired in activations.json -
+decided by activations.entitlement_state() at an explicit `now` (B47 T2:
+before that fix only `status` was checked here, so an expired activation's
+identities stayed rendered forever). Because the render depends on `now`,
+the activation hash (xray_activation.activate_if_needed) changes the first
+time a render runs after an activation's expires_at, which is what lets
+the existing render -> hash compare -> reload path drop expired clients.
 Renaming this "the config renderer skips revoked/expired identities" is
 deliberate - there is exactly one source of truth for "is this
 entitlement still valid" (activations.json), never a second copy of that
@@ -30,6 +36,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from . import activations
 from . import exit_target_policy
@@ -168,17 +175,32 @@ def _validate_reality_server_config(reality):
             raise XrayConfigRenderError(f"malformed short id: {short_id!r}")
 
 
-def _active_clients(activations_data, xray_data):
-    """Pure. Deterministic ordering: sorted by activation digest, then by
-    device_public_key - so two renders of the same input are byte-for-byte
-    identical (see this module's own determinism test)."""
+def _resolve_now(now):
+    """The ONE place a public render entry point turns an omitted `now`
+    into the current UTC time; `_active_clients` itself never reads the
+    clock. Production callers (xray_activation/ingress_activation) always
+    pass an explicit value."""
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("render `now` must be a timezone-aware datetime")
+    return now
+
+
+def _active_clients(activations_data, xray_data, now):
+    """Pure given `now`. Deterministic ordering: sorted by activation
+    digest, then by device_public_key - so two renders of the same input at
+    the same `now` are byte-for-byte identical (see this module's own
+    determinism test). An identity is rendered only if its owning
+    activation is entitled at `now` (activations.entitlement_state -
+    never a bare status check, B47 T2)."""
     clients = []
     for digest in sorted(xray_data.keys()):
         activation_record = activations_data.get(digest)
         if activation_record is None:
             continue  # identity store outlived its activation record - never render an orphan
-        if activation_record["status"] != activations.ACTIVE:
-            continue  # revoked - the one enforcement point for Xray-side revocation
+        if not activations.is_entitled(activation_record, now):
+            continue  # revoked or expired - the one enforcement point for Xray-side entitlement
 
         identities = sorted(xray_data[digest], key=lambda entry: entry["device_public_key"])
         for identity in identities:
@@ -320,7 +342,7 @@ def _validate_static_clients(static_clients):
             raise XrayConfigRenderError(f"static client has a malformed vless_uuid: {client.vless_uuid!r}")
 
 
-def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=()):
+def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=(), now=None):
     """Pure function: (parsed activations store, parsed xray identity
     store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
     server config dict, ready for json.dumps. Deterministic - same inputs
@@ -345,7 +367,12 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
     tracks - so it is deliberately never revoked by a USER'S activation
     expiring/being revoked. Every pre-B25 caller passes nothing here and
     is byte-for-byte unaffected (empty tuple -> no static clients appended,
-    identical output to before this parameter existed)."""
+    identical output to before this parameter existed).
+
+    B47 T2 - [now] is the instant entitlement is evaluated at (see
+    [_active_clients]); omitted means "current UTC time", resolved once
+    here."""
+    now = _resolve_now(now)
     _validate_reality_server_config(reality)
     if tls is not None:
         _validate_tls_server_config(tls)
@@ -353,7 +380,7 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
         _validate_xhttp_server_config(xhttp)
     _validate_static_clients(static_clients)
 
-    clients = _active_clients(activations_data, xray_data) + list(static_clients)
+    clients = _active_clients(activations_data, xray_data, now) + list(static_clients)
 
     inbounds = [_render_reality_inbound(clients, reality, flow)]
     if tls is not None:
@@ -390,7 +417,7 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=()):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=(), now=None):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
@@ -404,7 +431,7 @@ def render_server_config_redacted(activations_data, xray_data, reality, tls=None
     secret as an ordinary device's vless uuid - never distinguishable in a
     log/diagnostic dump)."""
     full = render_server_config(
-        activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=flow, static_clients=static_clients,
+        activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=flow, static_clients=static_clients, now=now,
     )
     full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
     static_uuids = {client.vless_uuid for client in static_clients}
@@ -449,7 +476,7 @@ def regenerate_and_write_config(
     activation_store_path, activation_lock_path,
     xray_store_path, xray_lock_path,
     config_path, reality, tls=None, flow="",
-    validate_config_fn=None,
+    validate_config_fn=None, now=None,
 ):
     """The full pipeline this module's docstring describes, minus reload:
     read both durable stores (short, released locks - read_store_shared/
@@ -466,7 +493,7 @@ def regenerate_and_write_config(
     activations_data = activations.read_store_shared(activation_store_path, activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(xray_store_path, xray_lock_path)
 
-    config_dict = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow)
+    config_dict = render_server_config(activations_data, xray_data, reality, tls=tls, flow=flow, now=now)
     atomic_write_config(config_path, config_dict)
 
     if validate_config_fn is not None:

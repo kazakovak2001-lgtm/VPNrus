@@ -201,6 +201,69 @@ def _parse_iso(value):
     return datetime.fromisoformat(value)
 
 
+# --- entitlement predicate (B47 T1/T2) -----------------------------------
+#
+# The ONE definition of "is this activation still entitled right now". Every
+# decision that grants or keeps data-plane access - API authorization
+# (decide_and_bind, xray_provisioning's eligibility check), Xray config
+# rendering (xray_config_renderer._active_clients, shared by the ingress
+# renderer) and AWG peer reconciliation (gateway/tools/awg_reconcile.py) -
+# goes through entitlement_state(); never a bare `status == ACTIVE` check.
+
+ENTITLEMENT_ACTIVE = "ACTIVE"
+ENTITLEMENT_REVOKED = "REVOKED"
+ENTITLEMENT_EXPIRED = "EXPIRED"
+
+
+def parse_expires_at(value):
+    """Parses a store `expires_at` value into a timezone-aware datetime.
+
+    Raises ActivationStoreError for anything that is not a string holding
+    an ISO 8601 timestamp WITH an explicit UTC offset - a naive timestamp
+    has no well-defined instant, so it is treated as corrupt state (fail
+    closed), never guessed as local time or UTC. Callers handle `None`
+    (a non-expiring activation) themselves."""
+    if not isinstance(value, str):
+        raise ActivationStoreError("activation store entry has an invalid expires_at")
+    try:
+        parsed = _parse_iso(value)
+    except ValueError:
+        raise ActivationStoreError("activation store entry has an unparseable expires_at")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ActivationStoreError("activation store entry has a naive (timezone-less) expires_at")
+    return parsed
+
+
+def entitlement_state(record, now):
+    """ENTITLEMENT_ACTIVE / ENTITLEMENT_REVOKED / ENTITLEMENT_EXPIRED for one
+    parsed store record at `now`.
+
+    - status != ACTIVE           -> REVOKED
+    - expires_at is None         -> ACTIVE (a non-expiring activation)
+    - now >= expires_at          -> EXPIRED (same boundary the API always used)
+    - otherwise                  -> ACTIVE
+
+    `now` must be timezone-aware (ValueError otherwise - comparing against
+    a naive clock reading would silently depend on the host's local time
+    zone). A malformed/naive `expires_at` raises ActivationStoreError: it is
+    never interpreted as an active entitlement."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("entitlement_state requires a timezone-aware `now`")
+    if record["status"] != ACTIVE:
+        return ENTITLEMENT_REVOKED
+    expires_at = record["expires_at"]
+    if expires_at is None:
+        return ENTITLEMENT_ACTIVE
+    if now >= parse_expires_at(expires_at):
+        return ENTITLEMENT_EXPIRED
+    return ENTITLEMENT_ACTIVE
+
+
+def is_entitled(record, now):
+    """True only for ENTITLEMENT_ACTIVE - see entitlement_state()."""
+    return entitlement_state(record, now) == ENTITLEMENT_ACTIVE
+
+
 def parse_store(raw):
     """Parse and fully validate raw JSON store text - raises
     ActivationStoreError on ANY schema violation. Mirrors
@@ -251,12 +314,9 @@ def parse_store(raw):
 
         expires_at = record.get("expires_at")
         if expires_at is not None:
-            if not isinstance(expires_at, str):
-                raise ActivationStoreError("activation store entry has an invalid expires_at")
-            try:
-                _parse_iso(expires_at)
-            except ValueError:
-                raise ActivationStoreError("activation store entry has an unparseable expires_at")
+            # B47 T2 - must also carry an explicit UTC offset: a naive
+            # expiry is corrupt state, never an active entitlement.
+            parse_expires_at(expires_at)
 
         bound_devices = record.get("bound_devices")
         if not isinstance(bound_devices, list):
@@ -563,11 +623,10 @@ def decide_and_bind(credential, public_key, store_path, lock_path, now=None):
 
         activation_id = record["activation_id"]
 
-        if record["status"] != ACTIVE:
+        state = entitlement_state(record, now)
+        if state == ENTITLEMENT_REVOKED:
             return ActivationDecision(REVOKED_OUTCOME, activation_id)
-
-        expires_at = record["expires_at"]
-        if expires_at is not None and now >= _parse_iso(expires_at):
+        if state == ENTITLEMENT_EXPIRED:
             return ActivationDecision(EXPIRED, activation_id)
 
         bound_devices = record["bound_devices"]

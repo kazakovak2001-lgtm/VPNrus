@@ -9,7 +9,7 @@ the raw value).
 
     activation_tokens.py --store PATH [--lock PATH] init
     activation_tokens.py --store PATH [--lock PATH] issue [--max-devices N] [--expires-in-days N]
-    activation_tokens.py --store PATH [--lock PATH] revoke <ACTIVATION_ID>
+    activation_tokens.py --store PATH [--lock PATH] revoke <ACTIVATION_ID> [--no-awg-reconcile]
     activation_tokens.py --store PATH [--lock PATH] status <ACTIVATION_ID>
     activation_tokens.py --store PATH [--lock PATH] list
 
@@ -24,6 +24,7 @@ filesystem lock, never by in-process state alone.
 """
 import argparse
 import os
+import subprocess
 import sys
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +85,43 @@ def _attempt_xray_convergence(args):
               "separately (see gateway/tools/xray_reconcile.py)", file=sys.stderr)
 
 
+AWG_RECONCILE_UNIT = "pocvpn-awg-reconcile.service"
+_AWG_RECONCILE_START_TIMEOUT_SECONDS = 10
+
+
+def _trigger_awg_reconcile(runner=subprocess.run):
+    """B47 T1 - after a durable revoke, ask systemd to START (never wait for)
+    the root-run AWG desired-state reconcile, so the revoked activation's
+    AWG peers are removed promptly instead of at the next timer tick.
+
+    Strictly best-effort and never part of the revoke's own atomicity: the
+    revocation is already durably recorded before this runs, `--no-block`
+    means this never waits for the reconcile itself, and any failure
+    (systemctl missing, not root, unit not installed, timeout) is reported
+    on stderr and otherwise ignored - pocvpn-awg-reconcile.timer remains
+    the safety net that converges within its interval regardless. Returns
+    True only when systemctl accepted the start request."""
+    command = ["systemctl", "start", "--no-block", AWG_RECONCILE_UNIT]
+    try:
+        completed = runner(
+            command, capture_output=True, text=True, timeout=_AWG_RECONCILE_START_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"activation_tokens: WARNING - could not start {AWG_RECONCILE_UNIT} "
+              f"({exc.__class__.__name__}); revocation is durably recorded, AWG peer removal "
+              "will happen on the next pocvpn-awg-reconcile.timer run", file=sys.stderr)
+        return False
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        print(f"activation_tokens: WARNING - `systemctl start {AWG_RECONCILE_UNIT}` failed "
+              f"(rc={completed.returncode}{': ' + detail[-1] if detail else ''}); revocation is durably "
+              "recorded, AWG peer removal will happen on the next pocvpn-awg-reconcile.timer run",
+              file=sys.stderr)
+        return False
+    print(f"activation_tokens: AWG reconcile requested ({AWG_RECONCILE_UNIT})")
+    return True
+
+
 def _fail(message):
     print(f"activation_tokens: error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -131,6 +169,11 @@ def cmd_revoke(args):
     # the RUNNING Xray process reflect it sooner, never undo it. See
     # _attempt_xray_convergence's own docs.
     _attempt_xray_convergence(args)
+    # B47 T1 - same "sooner, never undo" contract for the AWG data plane.
+    # Triggered for an already-revoked activation too: a peer left behind
+    # by an earlier revoke must still converge.
+    if not args.no_awg_reconcile:
+        _trigger_awg_reconcile()
 
 
 def _print_record(record):
@@ -182,6 +225,12 @@ def build_parser():
              "if given, attempts to synchronously converge the running Xray process to reflect "
              "this revocation (see gateway/api/xray_activation.py). Omitted entirely by default - "
              "existing pure-AWG usage of this command is completely unaffected.",
+    )
+    p_revoke.add_argument(
+        "--no-awg-reconcile", action="store_true",
+        help="B47 T1 - do not request an immediate `systemctl start --no-block "
+             f"{AWG_RECONCILE_UNIT}` after revoking (e.g. on a host with no AWG "
+             "interface); pocvpn-awg-reconcile.timer still converges on its own schedule.",
     )
 
     p_status = sub.add_parser("status", help="show one activation's non-secret status by activation_id")

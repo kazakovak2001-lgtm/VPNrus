@@ -293,10 +293,10 @@ def _check_device_eligibility(credential, public_key, activation_store_path, act
     record = data.get(digest)
     if record is None:
         return NOT_ELIGIBLE_UNKNOWN
-    if record["status"] != activations.ACTIVE:
+    state = activations.entitlement_state(record, now)
+    if state == activations.ENTITLEMENT_REVOKED:
         return NOT_ELIGIBLE_REVOKED
-    expires_at = record["expires_at"]
-    if expires_at is not None and now >= _parse_iso(expires_at):
+    if state == activations.ENTITLEMENT_EXPIRED:
         return NOT_ELIGIBLE_EXPIRED
 
     for device in record["bound_devices"]:

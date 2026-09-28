@@ -169,6 +169,36 @@ mutate_remove_peer() {
     log "peer removed"
 }
 
+# mutate_remove_peer_if_present <PUBLIC_KEY>
+# B47 T1 - idempotent removal for the desired-state reconcile
+# (scripts/reconcile-peers.sh). Unlocked, like every mutate_* here - the
+# caller must already hold .provision.lock.
+#
+# Uses find_existing_peer's three-valued lookup, so "absent" and "present
+# but malformed" never collapse into one signal:
+#   find rc 1 (absent)    -> no-op, return 0 (already in the desired state)
+#   find rc 0 (present)   -> mutate_remove_peer (atomic write + its own
+#                            postcondition re-read), return 0
+#   find rc 2 (malformed) -> return 2 WITHOUT touching the file - an
+#                            ambiguous/broken durable entry is never
+#                            "repaired" by deleting whatever matches
+# Any other failure (missing config, write failure, postcondition failure)
+# still goes through die(), exactly like mutate_remove_peer - a real error
+# is never silently ignored.
+# Live convergence is the caller's job (converge_live_state absent), same
+# split as every other mutate_* function.
+mutate_remove_peer_if_present() {
+    local public_key=$1
+    local find_rc=0
+    find_existing_peer "$public_key" >/dev/null || find_rc=$?
+    case "$find_rc" in
+        1) return 0 ;;
+        0) mutate_remove_peer "$public_key"; return 0 ;;
+        2) log "refusing to remove peer: durable entry for this public key is malformed or ambiguous"; return 2 ;;
+        *) die "mutate_remove_peer_if_present: unexpected lookup result $find_rc" ;;
+    esac
+}
+
 # _live_peer_state_matches <present|absent> <PUBLIC_KEY>
 # `awg show <iface> peers` lists only peer PUBLIC keys, one per line -
 # never the interface's own private key (same invariant status.sh already

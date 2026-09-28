@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _GATEWAY_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
@@ -46,7 +47,10 @@ class XhttpOriginRendererTests(unittest.TestCase):
         self.digest = "a" * 64
         self.uuid = "11111111-1111-1111-1111-111111111111"
         self.activations = {
-            self.digest: {"activation_id": "act1", "status": activations_module.ACTIVE},
+            # Store-shaped record: expires_at is always present in a real
+            # parsed activations store (None = non-expiring) - B47 T2's
+            # entitlement predicate never treats a missing field as "no expiry".
+            self.digest: {"activation_id": "act1", "status": activations_module.ACTIVE, "expires_at": None},
         }
         self.identities = {
             self.digest: [{"device_public_key": "device-public-key", "vless_uuid": self.uuid}],
@@ -84,7 +88,7 @@ class XhttpOriginRendererTests(unittest.TestCase):
 
     def test_reuses_activation_authority_and_revocation(self):
         expected = base._vless_clients(
-            base._active_clients(self.activations, self.identities),
+            base._active_clients(self.activations, self.identities, datetime.now(timezone.utc)),
             flow=None,
         )
         inbound = next(i for i in self.render()["inbounds"] if i["tag"] == self.xhttp.inbound_tag)
