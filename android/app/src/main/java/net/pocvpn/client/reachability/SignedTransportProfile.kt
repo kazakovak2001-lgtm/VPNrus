@@ -37,6 +37,22 @@ sealed interface SignedTransportProfile {
     ) : SignedTransportProfile {
         override val transportKind: TransportKind = TransportKind.SHADOWSOCKS_2022
     }
+
+    /**
+     * B46-4A - PUBLIC/SIGNED Hysteria2 facts only (see [Hysteria2Profile]'s
+     * own doc for the public/secret split). TYPES ONLY as of B46-4A in the
+     * sense that constructing this value alone never activates a real
+     * connection: a binding must also pass
+     * [net.pocvpn.client.MainViewModel.isHysteria2AvailableFor]'s full
+     * eligibility (trusted binding + credential + ABI/binary) before
+     * `TransportRegistry` ever reports HYSTERIA2 AVAILABLE.
+     */
+    data class Hysteria2(
+        override val endpointId: EndpointId,
+        val profile: Hysteria2Profile,
+    ) : SignedTransportProfile {
+        override val transportKind: TransportKind = TransportKind.HYSTERIA2
+    }
 }
 
 sealed interface SignedTransportProfileReadResult {
@@ -81,6 +97,19 @@ fun EndpointTransportBinding.signedTransportProfile(endpointId: EndpointId): Sig
             Shadowsocks2022ProfileReadResult.Invalid -> SignedTransportProfileReadResult.Invalid
             is Shadowsocks2022ProfileReadResult.Parsed -> SignedTransportProfileReadResult.Parsed(
                 SignedTransportProfile.Shadowsocks2022(endpointId, ss.profile),
+            )
+        }
+    }
+
+    if (kind == TransportKind.HYSTERIA2) {
+        return when (val hy = hysteria2Profile()) {
+            Hysteria2ProfileReadResult.Missing -> SignedTransportProfileReadResult.Parsed(
+                SignedTransportProfile.Legacy(endpointId, kind),
+            )
+            Hysteria2ProfileReadResult.UnsupportedVersion -> SignedTransportProfileReadResult.Unsupported
+            Hysteria2ProfileReadResult.Invalid -> SignedTransportProfileReadResult.Invalid
+            is Hysteria2ProfileReadResult.Parsed -> SignedTransportProfileReadResult.Parsed(
+                SignedTransportProfile.Hysteria2(endpointId, hy.profile),
             )
         }
     }

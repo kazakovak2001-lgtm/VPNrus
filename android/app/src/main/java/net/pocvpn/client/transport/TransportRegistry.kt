@@ -75,6 +75,20 @@ class TransportRegistry private constructor(
                     status = TransportStatus.NOT_IMPLEMENTED,
                     capabilities = TransportCapabilities.notImplemented(),
                 ),
+                // B46-4A - types + credential/binding wiring only (see
+                // docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md). NOT_IMPLEMENTED/
+                // notImplemented(), no factory here - the real per-endpoint
+                // eligibility gate lives in
+                // MainViewModel.buildTransportRegistry(endpointId)/
+                // isHysteria2AvailableFor, the same shape SHADOWSOCKS_2022 above
+                // already uses. Never selectable/executable via THIS default
+                // registry until a real adapter shell registers it AVAILABLE
+                // with a real factory and real capabilities.
+                TransportDescriptor(
+                    kind = TransportKind.HYSTERIA2,
+                    status = TransportStatus.NOT_IMPLEMENTED,
+                    capabilities = TransportCapabilities.notImplemented(),
+                ),
             ),
         )
     }
