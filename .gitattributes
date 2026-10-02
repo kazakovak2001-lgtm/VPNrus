@@ -1,0 +1,4 @@
+# B46-4A: the native child sources must keep LF endings in every checkout -
+# CRLF sources produce a different ELF (see third_party/*-child/README.md).
+third_party/hysteria2-child/** text eol=lf
+third_party/tun2socks-child/** text eol=lf

@@ -45,7 +45,7 @@ private class FakeHysteria2ChildProcess : Hysteria2ChildProcess, LogLineObservab
 
 private class FakeHysteria2ChildProcessLauncher(
     private val process: FakeHysteria2ChildProcess = FakeHysteria2ChildProcess(),
-    private val readyLineOnLaunch: String? = "SOCKS5_LISTENING addr=127.0.0.1:41080",
+    private val readyLineOnLaunch: String? = "SOCKS5_LISTENING addr=127.0.0.1:41080 auth=required",
 ) : Hysteria2ChildProcessLauncher {
     var launchCalls = 0
     override fun launch(binaryPath: String, args: List<String>): Hysteria2ChildProcess {
@@ -70,7 +70,7 @@ class Hysteria2ChildRuntimeTest {
     // insecure = false - see Hysteria2ChildConfig.insecure's own hard
     // production gate: this runtime refuses to launch a child at all when
     // insecure is true (see the dedicated test below).
-    private val config = Hysteria2ChildConfig(server = "127.0.0.1:34443", auth = "test-auth", sni = "test.local", insecure = false, socksListen = "127.0.0.1:41080")
+    private val config = Hysteria2ChildConfig(server = "127.0.0.1:34443", auth = "test-auth", sni = "test.local", insecure = false, socksListen = LOCAL_SOCKS_LISTEN, socksUsername = "test-socks-user", socksPassword = "test-socks-pass")
 
     @Test
     fun `valid start succeeds once the child reports SOCKS5_LISTENING`() {
@@ -208,5 +208,117 @@ class Hysteria2ChildRuntimeTest {
         assertEquals(0, launcher.launchCalls)
         assertEquals(0, protect.startCalls)
         assertFalse(runtime.isRunning())
+    }
+
+    // --- B46-4A: local SOCKS hardening ---------------------------------------
+
+    @Test
+    fun `B46-4A the actually bound ephemeral socks address is parsed - no fixed port assumed`() {
+        val launcher = FakeHysteria2ChildProcessLauncher(readyLineOnLaunch = "2026/10/02 12:00:00 SOCKS5_LISTENING addr=127.0.0.1:43999 auth=required")
+        val runtime = Hysteria2ChildRuntime(launcher, FakeHysteria2ProtectBridge(), readyTimeoutMillis = 2_000)
+
+        val result = runtime.start(config, "/fake/bin", tempFolder.newFolder("work")) { true }
+
+        assertTrue(result is Hysteria2ChildResult.Ok)
+        assertEquals("127.0.0.1:43999", runtime.boundSocksAddress)
+    }
+
+    @Test
+    fun `B46-4A an invalid SOCKS5_LISTENING address fails closed and cleans up`() {
+        for (line in listOf("SOCKS5_LISTENING addr=0.0.0.0:43999 auth=required", "SOCKS5_LISTENING addr=127.0.0.1:0 auth=required", "SOCKS5_LISTENING addr=[::1]:43999 auth=required", "SOCKS5_LISTENING auth=required")) {
+            val process = FakeHysteria2ChildProcess()
+            val protect = FakeHysteria2ProtectBridge()
+            val runtime = Hysteria2ChildRuntime(FakeHysteria2ChildProcessLauncher(process, line), protect, readyTimeoutMillis = 2_000)
+            val workDir = tempFolder.newFolder()
+
+            val result = runtime.start(config, "/fake/bin", workDir) { true }
+
+            assertTrue(line, result is Hysteria2ChildResult.Failed)
+            assertFalse(line, runtime.isRunning())
+            assertTrue(line, process.requestStopCalls > 0 || !process.alive)
+            assertEquals(line, 1, protect.stopCalls)
+            assertEquals(line, null, runtime.boundSocksAddress)
+            assertFalse(line, File(workDir, "hysteria2-child-config.json").exists())
+        }
+    }
+
+    @Test
+    fun `B46-4A a pre-hardening child without the auth=required marker is refused`() {
+        val process = FakeHysteria2ChildProcess()
+        val protect = FakeHysteria2ProtectBridge()
+        val runtime = Hysteria2ChildRuntime(FakeHysteria2ChildProcessLauncher(process, "SOCKS5_LISTENING addr=127.0.0.1:41080"), protect, readyTimeoutMillis = 2_000)
+        val workDir = tempFolder.newFolder()
+
+        val result = runtime.start(config, "/fake/bin", workDir) { true }
+
+        assertTrue(result is Hysteria2ChildResult.Failed)
+        assertFalse(runtime.isRunning())
+        assertEquals(1, protect.stopCalls)
+        assertFalse(File(workDir, "hysteria2-child-config.json").exists())
+    }
+
+    @Test
+    fun `B46-4A missing local socks credentials fail closed before launch`() {
+        for (bad in listOf(config.copy(socksUsername = ""), config.copy(socksPassword = ""))) {
+            val launcher = FakeHysteria2ChildProcessLauncher()
+            val protect = FakeHysteria2ProtectBridge()
+            val runtime = Hysteria2ChildRuntime(launcher, protect, readyTimeoutMillis = 2_000)
+
+            val result = runtime.start(bad, "/fake/bin", tempFolder.newFolder()) { true }
+
+            assertTrue(result is Hysteria2ChildResult.Failed)
+            assertEquals(0, launcher.launchCalls)
+            assertEquals(0, protect.startCalls)
+        }
+    }
+
+    @Test
+    fun `B46-4A a non-loopback socks listen address fails closed before launch`() {
+        for (listen in listOf("0.0.0.0:0", "0.0.0.0:41080", "192.168.1.5:0", "[::1]:0", "localhost:0", "127.0.0.1:99999")) {
+            val launcher = FakeHysteria2ChildProcessLauncher()
+            val runtime = Hysteria2ChildRuntime(launcher, FakeHysteria2ProtectBridge(), readyTimeoutMillis = 2_000)
+
+            val result = runtime.start(config.copy(socksListen = listen), "/fake/bin", tempFolder.newFolder()) { true }
+
+            assertTrue(listen, result is Hysteria2ChildResult.Failed)
+            assertEquals(listen, 0, launcher.launchCalls)
+        }
+    }
+
+    @Test
+    fun `B46-4A config carries the per-session credentials only while running`() {
+        val runtime = Hysteria2ChildRuntime(FakeHysteria2ChildProcessLauncher(), FakeHysteria2ProtectBridge(), readyTimeoutMillis = 2_000)
+        val workDir = tempFolder.newFolder("work")
+        runtime.start(config, "/fake/bin", workDir) { true }
+        val configFile = File(workDir, "hysteria2-child-config.json")
+
+        val json = org.json.JSONObject(configFile.readText())
+        assertEquals("test-socks-user", json.getString("socksUsername"))
+        assertEquals("test-socks-pass", json.getString("socksPassword"))
+        assertEquals("127.0.0.1:0", json.getString("socksListen"))
+
+        runtime.stop()
+        assertFalse(configFile.exists())
+        assertEquals(null, runtime.boundSocksAddress)
+    }
+
+    @Test
+    fun `B46-4A child death clears the bound socks address`() {
+        val process = FakeHysteria2ChildProcess()
+        val runtime = Hysteria2ChildRuntime(FakeHysteria2ChildProcessLauncher(process), FakeHysteria2ProtectBridge(), readyTimeoutMillis = 2_000)
+        runtime.start(config, "/fake/bin", tempFolder.newFolder("work")) { true }
+        assertEquals("127.0.0.1:41080", runtime.boundSocksAddress)
+
+        process.simulateUnexpectedExit(1)
+
+        assertEquals(null, runtime.boundSocksAddress)
+    }
+
+    @Test
+    fun `B46-4A config toString never contains secrets`() {
+        val text = config.toString()
+        for (secret in listOf("test-auth", "test-socks-user", "test-socks-pass")) {
+            assertFalse(secret, text.contains(secret))
+        }
     }
 }

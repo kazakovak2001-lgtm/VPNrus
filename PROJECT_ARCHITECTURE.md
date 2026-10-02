@@ -3528,7 +3528,13 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 - Android client (B46-4A completion, ported from #111): `vpn/hysteria/*`
   keeps the three-process boundary (app/VpnService -> tun2socks child ->
   Hysteria2 child, SCM_RIGHTS TUN handoff, protect bridge); no Go runtime
-  for Hysteria/tun2socks in the app process. Secrets only from the
+  for Hysteria/tun2socks in the app process. The tun2socks -> Hysteria2 hop
+  is a local SOCKS5 on an ephemeral `127.0.0.1` port with per-session
+  credentials, and every UDP association is pinned to the client's declared
+  loopback address on both sides; the two child ELFs ship only as a pair
+  (sources/build records `third_party/{hysteria2,tun2socks}-child/`;
+  physically verified on device 2026-10-02; not released, not production
+  deployed). Secrets only from the
   endpoint-scoped `Hysteria2CredentialRepository`, never via Intent.
   HYSTERIA2 (ordinal 6) is AVAILABLE only with a trusted signed
   `hysteria2Profile` binding + stored credential + arm64-v8a binaries;

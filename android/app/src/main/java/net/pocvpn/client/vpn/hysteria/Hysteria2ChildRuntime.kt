@@ -48,6 +48,11 @@ private const val DEFAULT_FORCE_STOP_WAIT_MILLIS = 1_000L
  * disposable local server may construct this with `insecure = true`, and it
  * must do so directly against [writeConfigFile]-adjacent test doubles, never
  * through the production [Hysteria2ChildRuntime].
+ *
+ * B46-4A: [socksListen] must be a 127.0.0.1 address (normally
+ * [LOCAL_SOCKS_LISTEN], port 0) and [socksUsername]/[socksPassword] are the
+ * per-session local SOCKS credentials - all enforced by
+ * [Hysteria2ChildRuntime.start]. [toString] never prints any secret.
  */
 data class Hysteria2ChildConfig(
     val server: String,
@@ -56,7 +61,12 @@ data class Hysteria2ChildConfig(
     val insecure: Boolean,
     val obfsSalamander: String = "",
     val socksListen: String,
-)
+    val socksUsername: String,
+    val socksPassword: String,
+) {
+    override fun toString(): String =
+        "Hysteria2ChildConfig(server=$server, sni=$sni, insecure=$insecure, socksListen=$socksListen, <secrets redacted>)"
+}
 
 sealed interface Hysteria2ChildResult {
     object Ok : Hysteria2ChildResult
@@ -93,6 +103,14 @@ class Hysteria2ChildRuntime(
     @Volatile var socksReady: Boolean = false
         private set
 
+    /**
+     * B46-4A - the `127.0.0.1:<port>` the child actually bound, parsed from its
+     * `SOCKS5_LISTENING` line. Non-null only while a started child is running;
+     * cleared on stop, failure and unexpected exit.
+     */
+    @Volatile var boundSocksAddress: String? = null
+        private set
+
     /** Set true the instant the child's own `connected: udpEnabled=...` log line is observed (real QUIC handshake success) - diagnostic only. */
     @Volatile var quicConnected: Boolean = false
         private set
@@ -108,6 +126,13 @@ class Hysteria2ChildRuntime(
         // this runtime can accidentally bypass it.
         if (config.insecure) {
             return Hysteria2ChildResult.Failed("insecure TLS is not permitted for a production Hysteria2 child")
+        }
+        // B46-4A - never launch an anonymous or non-loopback local SOCKS listener.
+        if (config.socksListen != LOCAL_SOCKS_LISTEN && parseLoopbackSocksAddress(config.socksListen) == null) {
+            return Hysteria2ChildResult.Failed("socksListen must be a 127.0.0.1 address")
+        }
+        if (config.socksUsername.isEmpty() || config.socksPassword.isEmpty()) {
+            return Hysteria2ChildResult.Failed("missing local socks credentials")
         }
         synchronized(stateLock) {
             if (process != null) return Hysteria2ChildResult.Failed("child already running")
@@ -133,6 +158,7 @@ class Hysteria2ChildRuntime(
 
         socksReady = false
         quicConnected = false
+        boundSocksAddress = null
         val launched = try {
             launcher.launch(binaryPath, listOf("--config-file", configPath.absolutePath))
         } catch (t: Throwable) {
@@ -142,8 +168,12 @@ class Hysteria2ChildRuntime(
         }
 
         val readyLatch = java.util.concurrent.CountDownLatch(1)
+        // B46-4A - the readiness line must carry the real bound 127.0.0.1:<port>;
+        // a missing or invalid address fails startup closed below.
+        var reportedSocksAddress: String? = null
         launched.attachLogWatcher { line ->
-            if (line.contains("SOCKS5_LISTENING")) {
+            if (line.contains("SOCKS5_LISTENING") && readyLatch.count > 0) {
+                reportedSocksAddress = parseSocksListeningLine(line)
                 socksReady = true
                 readyLatch.countDown()
             }
@@ -159,6 +189,15 @@ class Hysteria2ChildRuntime(
             configPath.delete()
             return Hysteria2ChildResult.Failed("child did not report SOCKS5_LISTENING within ${readyTimeoutMillis}ms")
         }
+        val bound = reportedSocksAddress
+        if (bound == null) {
+            stopLaunchedProcess(launched)
+            protectBridge.stop()
+            configPath.delete()
+            socksReady = false
+            return Hysteria2ChildResult.Failed("child reported SOCKS5_LISTENING without a valid 127.0.0.1 address")
+        }
+        boundSocksAddress = bound
 
         synchronized(stateLock) {
             process = launched
@@ -209,6 +248,7 @@ class Hysteria2ChildRuntime(
         protectSocketFile = null
         socksReady = false
         quicConnected = false
+        boundSocksAddress = null
     }
 
     private fun stopLaunchedProcess(launched: Hysteria2ChildProcess) {
@@ -231,6 +271,8 @@ class Hysteria2ChildRuntime(
             put("obfsSalamander", config.obfsSalamander)
             put("socksListen", config.socksListen)
             put("protectPath", protectSocketPath.absolutePath)
+            put("socksUsername", config.socksUsername)
+            put("socksPassword", config.socksPassword)
         }
         path.writeText(json.toString())
         path.setReadable(false, false)

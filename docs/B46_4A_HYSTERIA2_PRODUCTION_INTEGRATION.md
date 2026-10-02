@@ -80,10 +80,21 @@ gateway route, that is superseded by B46-4P.1 (route) and this completion
 
 ### Native binary packaging (done locally, never committed)
 
-| File (`android/app/src/main/jniLibs/arm64-v8a/`) | Pinned SHA-256 (pre-build, = B46-3B/3C record) | Shipped in release APK (post AGP strip) |
+Current pair - rebuilt together by the local SOCKS5 hardening (2026-10-02),
+sources and build scripts in `third_party/hysteria2-child/` and
+`third_party/tun2socks-child/` (see their READMEs for the full record):
+
+| File (`android/app/src/main/jniLibs/arm64-v8a/`) | SHA-256 (reproducible build) | In APK (post AGP strip) |
 |---|---|---|
-| `libnovatun2sockschild.so` | `3ee51b0bbfec55f3b1f05c7b55057110fda1d9b64187822b6efeb9621349621f` | `8bfc684b2adbb174571f92d363bdfee50ee62ce501c5a3a0cefb6296078536b1` |
-| `libnovahysteriachild.so` | `ed3d020aa193f8cf9f097d9e7996636f772bb1e2450460a23b4d5eb740e3048b` | `be92dc13e627d773a06e34c666423aeba92fdb1bb59953106121060c81a76344` |
+| `libnovatun2sockschild.so` | `15f95403a415035cba5226c297bf3818d99baadff40197d4ef83c478c8e2c381` | `bac1d93c8fa703635cf6ee8020d20ce24437707283c70b1f7d5f83a3b5448dc2` |
+| `libnovahysteriachild.so` | `6af33046f5518b30e35c49dc34ce370492622c3eb914235e4079d071552e26d5` | `1f4cf0ed04f96388aa4c59bac9f186e4b7226121ca6d4651811e7821dfeda7d9` |
+
+Superseded pre-hardening pair (B46-3B/3C record, deployed in the G3-G6 run):
+tun2socks `3ee51b0b...` (APK `8bfc684b...`), hysteria `ed3d020a...` (APK
+`be92dc13...`). The current app is built to refuse that pair at startup
+(missing capability markers) - covered by automated tests, not physically
+reproduced with the old binaries - so the two children must always ship
+together.
 
 Both gitignored (`.gitignore` B46-4A entries). A build without them still
 compiles; `Hysteria2AdapterEligibilityChecker` then reports
@@ -373,6 +384,10 @@ deployment above and a USB-attached device (none attached 2026-09-28).
 - Hysteria2 child exposes an unauthenticated SOCKS5 listener on fixed
   `127.0.0.1:41080` for the session lifetime (any local app can reach it;
   localhost-port VPN detection). Belongs to the post-B57 hardening phase.
+  **Fixed in repo and physically verified on an OPPO CPH2173 (2026-10-02);
+  NOT DEPLOYED** - see "Local SOCKS5 hardening" and "Physical verification -
+  2026-10-02" below.
+
 - `AutoGatewaySelector` never offers HYSTERIA2 (manual gateway mode only)
   - a deliberate policy decision to revisit after field evidence.
 - **C6-R2 (security, separate)**: VPN UID coverage `0-10755, 10757-20755,
@@ -381,6 +396,59 @@ deployment above and a USB-attached device (none attached 2026-09-28).
   the others, excludes only Nova's own package and inherits the same
   per-user coverage. Hysteria2 does not need a change to it, so it is not
   fixed here.
+
+### Local SOCKS5 hardening (repo only, NOT DEPLOYED)
+
+- Per-session random SOCKS credentials (`Hysteria2LocalSocksCredentials`,
+  `SecureRandom`, 128-bit user / 256-bit password), held in memory, in the
+  mode-600 child config (deleted on stop/failure/child death) and in the
+  tun2socks control header over the app-private Unix socket; never logged.
+- Ephemeral port: the Hysteria2 child binds `127.0.0.1:0`; the app parses the
+  real port from `SOCKS5_LISTENING addr=... auth=required` and hands it to
+  tun2socks. The fixed `41080` is gone.
+- Hysteria2 child: mandatory SOCKS5 auth; UDP ASSOCIATE must declare
+  `127.0.0.1:<non-zero>`; the UDP relay is pinned to that declared address
+  (no "first sender wins").
+- tun2socks child (`novasocks5`): UDP socket bound to `127.0.0.1:0` before
+  UDP ASSOCIATE and declared in it; only datagrams from the negotiated relay
+  are accepted; credentials never in the proxy URL or logs.
+- Capability markers (`auth=required`, ack `"socksAuth":true`): the app
+  refuses a child without them instead of running unauthenticated (covered by
+  automated tests; not physically reproduced with an old binary).
+- No server, Cloudflare, DNS or firewall change: the Hysteria2 server and its
+  auth are unaffected.
+
+### Physical verification - 2026-10-02
+
+OPPO CPH2173, Android 14 / SDK 34, arm64-v8a; debug APK `0.1-poc`
+(versionCode 1) with the rebuilt child pair, against the live Stockholm
+Hysteria2 server (no server change). This is a device verification, not a
+release or production deployment.
+
+Verified on device:
+- Hysteria2 connection and QUIC transport (three sessions, exit IP Stockholm).
+- Authenticated loopback SOCKS5 on an ephemeral port: the only listener was
+  `127.0.0.1:<port>` (38061, 39615, 41281 in three sessions); no `41080`, no
+  `0.0.0.0`/`[::]` listener; all association UDP sockets on `127.0.0.1`.
+- From another local UID (`adb shell`): no-auth offer rejected, wrong
+  credentials rejected, valid per-session credentials accepted.
+- Forged SOCKS UDP datagrams from a foreign local socket into a live
+  association: 0 bytes delivered to the client.
+- TCP (HTTPS), UDP/53 (raw DNS query), HTTP/3 / QUIC in Chrome, long-lived UDP
+  (about 2 minutes of QUIC traffic, associations persisted), parallel traffic
+  (6 HTTPS + 6 DNS lookups concurrently).
+- Logs: 0 occurrences of the real SOCKS credentials or the Hysteria auth;
+  child config file mode 600.
+- Lifecycle: disconnect removes both children, the listener, the UDP sockets
+  and the config; SIGKILL of the Hysteria child tears down the whole session;
+  each new session gets a new port and new credentials.
+
+Not directly reproduced physically:
+- the UDP first-packet hijack race (covered by Go unit tests);
+- refusal of an old child without the capability markers (covered by Kotlin
+  unit tests);
+- the exact system DNS transport: Android Private DNS was "opportunistic", so
+  system lookups may use DoT; UDP/53 was verified separately.
 
 ## Status (historical, PR #111)
 
@@ -621,6 +689,11 @@ No Hysteria-specific heuristic was added this slice. Registry eligibility (above
 Physical evidence exists for **arm64-v8a only** (OPPO CPH2173). `Hysteria2AdapterEligibilityChecker` fails closed to `UnsupportedAbi` for any other device ABI set, and to `BinaryUnavailable` when either required child binary (`libnovatun2sockschild.so`, `libnovahysteriachild.so`) is missing/unreadable/non-executable - `HYSTERIA2` becomes `NOT_IMPLEMENTED`/unavailable for selection, never a crash, never an attempted launch with a missing binary.
 
 ## Native binary packaging
+
+> Superseded for the current pair by the local SOCKS5 hardening: the wrapper
+> sources are now committed under `third_party/hysteria2-child/` and
+> `third_party/tun2socks-child/` with reproducible build scripts and records.
+> The text below is the original B46-3B/3C provenance of the previous pair.
 
 Both child binaries were already reproducibly built and physically verified for B46-3B/B46-3C:
 - `libnovatun2sockschild.so` - tun2socks-child, pinned per B46-3B's own reproducible build record (`docs/B46_3B_HYSTERIA_PROCESS_ISOLATION.md`).
