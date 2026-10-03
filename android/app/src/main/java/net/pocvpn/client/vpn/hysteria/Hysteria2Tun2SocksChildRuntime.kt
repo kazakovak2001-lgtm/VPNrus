@@ -138,9 +138,20 @@ class Hysteria2Tun2SocksChildRuntime(
      * [binaryPath] is the resolved `tun2socks-child` executable path (see
      * [Hysteria2Tun2SocksChildBinaryResolver]). [controlSocketPath] is a per-session
      * app-private path this call binds and cleans up on both success and
-     * failure.
+     * failure. B46-4A: [socksAddr] must be the 127.0.0.1 address the
+     * Hysteria2 child actually bound, and [socksUsername]/[socksPassword]
+     * the per-session local SOCKS credentials - both required (fail closed),
+     * passed to the child only over the control socket, never logged.
      */
-    fun start(dupTunFd: Int, mtu: Int, socksAddr: String, binaryPath: String, controlSocketPath: File): Hysteria2Tun2SocksChildResult {
+    fun start(
+        dupTunFd: Int,
+        mtu: Int,
+        socksAddr: String,
+        socksUsername: String,
+        socksPassword: String,
+        binaryPath: String,
+        controlSocketPath: File,
+    ): Hysteria2Tun2SocksChildResult {
         synchronized(stateLock) {
             if (process != null) {
                 dupFdCloser.close(dupTunFd)
@@ -158,6 +169,14 @@ class Hysteria2Tun2SocksChildRuntime(
         if (socksAddr.isEmpty()) {
             dupFdCloser.close(dupTunFd)
             return Hysteria2Tun2SocksChildResult.Failed("empty socks address")
+        }
+        if (parseLoopbackSocksAddress(socksAddr) == null) {
+            dupFdCloser.close(dupTunFd)
+            return Hysteria2Tun2SocksChildResult.Failed("socks address is not 127.0.0.1:<port>")
+        }
+        if (socksUsername.isEmpty() || socksPassword.isEmpty()) {
+            dupFdCloser.close(dupTunFd)
+            return Hysteria2Tun2SocksChildResult.Failed("missing local socks credentials")
         }
 
         try {
@@ -177,7 +196,7 @@ class Hysteria2Tun2SocksChildRuntime(
 
         // From here on, sendStartRequestAndAwaitAck owns closing dupTunFd -
         // see this class's own FD OWNERSHIP CONTRACT doc.
-        val ack = controlChannel.sendStartRequestAndAwaitAck(dupTunFd, mtu, socksAddr, ackTimeoutMillis)
+        val ack = controlChannel.sendStartRequestAndAwaitAck(dupTunFd, mtu, socksAddr, socksUsername, socksPassword, ackTimeoutMillis)
         return when (ack) {
             is Hysteria2Tun2SocksChildAck.Ok -> {
                 synchronized(stateLock) {

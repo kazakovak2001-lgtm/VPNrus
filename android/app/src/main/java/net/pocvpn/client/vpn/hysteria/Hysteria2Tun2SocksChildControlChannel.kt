@@ -18,6 +18,26 @@ private const val LISTEN_BACKLOG = 2
 private const val ACK_READ_BUFFER_SIZE = 4096
 
 /** Result of the child's own startup ack - see [Hysteria2Tun2SocksChildControlChannel]'s own protocol doc. */
+/**
+ * Parses the child's JSON ack. B46-4A: a successful ack must also carry
+ * `"socksAuth": true` - only the hardened tun2socks child (novasocks5) sends
+ * it. A pre-hardening child that would talk anonymous SOCKS5 is refused, so a
+ * stale child binary can never run silently unauthenticated.
+ */
+internal fun parseTun2SocksChildAck(raw: String): Hysteria2Tun2SocksChildAck =
+    try {
+        val obj = JSONObject(raw.trim())
+        when {
+            !obj.optBoolean("ok", false) ->
+                Hysteria2Tun2SocksChildAck.Failed(obj.optString("error", "child reported failure with no reason"))
+            !obj.optBoolean("socksAuth", false) ->
+                Hysteria2Tun2SocksChildAck.Failed("child does not support authenticated local socks (pre-B46-4A binary)")
+            else -> Hysteria2Tun2SocksChildAck.Ok(pid = obj.optInt("pid", -1))
+        }
+    } catch (t: Throwable) {
+        Hysteria2Tun2SocksChildAck.Failed("malformed ack json ${raw.take(200)}: ${t.message}")
+    }
+
 sealed interface Hysteria2Tun2SocksChildAck {
     /** [pid] is the child's own `os.Getpid()`, reported over the wire (see the Go side's own doc on why). */
     data class Ok(val pid: Int) : Hysteria2Tun2SocksChildAck
@@ -40,8 +60,19 @@ interface Hysteria2Tun2SocksChildControlChannel {
      * sends the JSON control header + [fd] via SCM_RIGHTS, then accepts the
      * child's second connection and reads its JSON ack. Never throws - all
      * failure paths return [Hysteria2Tun2SocksChildAck.Failed].
+     *
+     * B46-4A: [socksUser]/[socksPass] are the per-session local SOCKS
+     * credentials. They travel only inside the JSON header over this
+     * app-private Unix socket and are never logged.
      */
-    fun sendStartRequestAndAwaitAck(fd: Int, mtu: Int, socksAddr: String, timeoutMillis: Long): Hysteria2Tun2SocksChildAck
+    fun sendStartRequestAndAwaitAck(
+        fd: Int,
+        mtu: Int,
+        socksAddr: String,
+        socksUser: String,
+        socksPass: String,
+        timeoutMillis: Long,
+    ): Hysteria2Tun2SocksChildAck
 
     fun close()
 }
@@ -78,7 +109,14 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
         boundPath = socketPath
     }
 
-    override fun sendStartRequestAndAwaitAck(fd: Int, mtu: Int, socksAddr: String, timeoutMillis: Long): Hysteria2Tun2SocksChildAck {
+    override fun sendStartRequestAndAwaitAck(
+        fd: Int,
+        mtu: Int,
+        socksAddr: String,
+        socksUser: String,
+        socksPass: String,
+        timeoutMillis: Long,
+    ): Hysteria2Tun2SocksChildAck {
         val server = serverSocket ?: return Hysteria2Tun2SocksChildAck.Failed("control channel not bound")
 
         val peer1 = acceptWithTimeout(server, timeoutMillis)
@@ -87,6 +125,8 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
             val header = JSONObject().apply {
                 put("mtu", mtu)
                 put("socksAddr", socksAddr)
+                put("socksUser", socksUser)
+                put("socksPass", socksPass)
             }.toString().toByteArray(Charsets.UTF_8)
 
             // ParcelFileDescriptor.adoptFd takes ownership of exactly this fd
@@ -120,20 +160,7 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
             runCatching { peer2.close() }
         }
 
-        return parseAck(ackJson)
-    }
-
-    private fun parseAck(raw: String): Hysteria2Tun2SocksChildAck {
-        return try {
-            val obj = JSONObject(raw.trim())
-            if (obj.optBoolean("ok", false)) {
-                Hysteria2Tun2SocksChildAck.Ok(pid = obj.optInt("pid", -1))
-            } else {
-                Hysteria2Tun2SocksChildAck.Failed(obj.optString("error", "child reported failure with no reason"))
-            }
-        } catch (t: Throwable) {
-            Hysteria2Tun2SocksChildAck.Failed("malformed ack json ${raw.take(200)}: ${t.message}")
-        }
+        return parseTun2SocksChildAck(ackJson)
     }
 
     /**

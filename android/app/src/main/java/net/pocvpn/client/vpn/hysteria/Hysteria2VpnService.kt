@@ -34,7 +34,6 @@ private const val WORKING_DIR_NAME = "hysteria2"
 private const val TUN_ADDRESS = "10.206.49.1"
 private const val TUN_PREFIX_LENGTH = 24
 private const val MTU = 1400
-private const val LOCAL_SOCKS_ADDR = "127.0.0.1:41080"
 private const val TUN2SOCKS_CONTROL_SOCKET_FILENAME = "hysteria2-tun2socks-control.sock"
 
 /** Typed, session-scoped lifecycle phase - mirrors `ShadowsocksRuntimePhase`'s own shape. */
@@ -389,6 +388,11 @@ class Hysteria2VpnService : VpnService() {
             }
             tunFd = established
 
+            // B46-4A - fresh local SOCKS credentials for THIS session only
+            // (memory + the children's private config/control channel; never
+            // persisted, never logged, never reused by a later session).
+            val localSocks = Hysteria2LocalSocksCredentials.generate()
+
             // Hysteria2 child FIRST - tun2socks needs its SOCKS5 listener ready (unchanged from B46-3C's own proven ordering).
             val hysteriaResult = hysteriaRuntime.start(
                 config = Hysteria2ChildConfig(
@@ -397,7 +401,9 @@ class Hysteria2VpnService : VpnService() {
                     sni = sni,
                     insecure = false, // Hard production gate - see Hysteria2ChildConfig.insecure's own doc.
                     obfsSalamander = credential.obfuscationSecret?.value ?: "",
-                    socksListen = LOCAL_SOCKS_ADDR,
+                    socksListen = LOCAL_SOCKS_LISTEN,
+                    socksUsername = localSocks.username,
+                    socksPassword = localSocks.password,
                 ),
                 binaryPath = hysteriaBinaryPath,
                 workingDir = File(filesDir, WORKING_DIR_NAME),
@@ -410,10 +416,29 @@ class Hysteria2VpnService : VpnService() {
                 return@launch
             }
 
+            // B46-4A - tun2socks connects to the port the child ACTUALLY bound
+            // (ephemeral, reported via SOCKS5_LISTENING) - never a fixed port.
+            val socksAddr = hysteriaRuntime.boundSocksAddress
+            if (socksAddr == null) {
+                Log.w(TAG, "hysteria child running without a reported local socks address")
+                hysteriaRuntime.stop()
+                closeTunFd()
+                failStartup(Hysteria2RuntimeError.HysteriaChildFailed("no bound local socks address"))
+                return@launch
+            }
+
             if (abandonedIfNotStarting()) return@launch
             val dupFd = ParcelFileDescriptor.dup(established.fileDescriptor).detachFd()
             val controlSocketPath = File(filesDir, TUN2SOCKS_CONTROL_SOCKET_FILENAME)
-            val tun2socksResult = tun2socksRuntime.start(dupFd, MTU, LOCAL_SOCKS_ADDR, tun2socksBinaryPath, controlSocketPath)
+            val tun2socksResult = tun2socksRuntime.start(
+                dupTunFd = dupFd,
+                mtu = MTU,
+                socksAddr = socksAddr,
+                socksUsername = localSocks.username,
+                socksPassword = localSocks.password,
+                binaryPath = tun2socksBinaryPath,
+                controlSocketPath = controlSocketPath,
+            )
             when (tun2socksResult) {
                 is Hysteria2Tun2SocksChildResult.Ok -> {
                     // B46-4A review fix (Finding 6) - only publish RUNNING

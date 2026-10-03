@@ -6,6 +6,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+private const val TEST_SOCKS_USER = "test-socks-user"
+private const val TEST_SOCKS_PASS = "test-socks-pass"
+
 private class FakeHysteria2Tun2SocksChildControlChannel(
     private val ackResult: Hysteria2Tun2SocksChildAck = Hysteria2Tun2SocksChildAck.Ok(pid = 4242),
 ) : Hysteria2Tun2SocksChildControlChannel {
@@ -14,6 +17,8 @@ private class FakeHysteria2Tun2SocksChildControlChannel(
     var lastFd = -1
     var lastMtu = -1
     var lastSocksAddr = ""
+    var lastSocksUser = ""
+    var lastSocksPass = ""
     var bindShouldThrow: Throwable? = null
     var sendStartRequestCalls = 0
 
@@ -22,11 +27,20 @@ private class FakeHysteria2Tun2SocksChildControlChannel(
         bindShouldThrow?.let { throw it }
     }
 
-    override fun sendStartRequestAndAwaitAck(fd: Int, mtu: Int, socksAddr: String, timeoutMillis: Long): Hysteria2Tun2SocksChildAck {
+    override fun sendStartRequestAndAwaitAck(
+        fd: Int,
+        mtu: Int,
+        socksAddr: String,
+        socksUser: String,
+        socksPass: String,
+        timeoutMillis: Long,
+    ): Hysteria2Tun2SocksChildAck {
         sendStartRequestCalls++
         lastFd = fd
         lastMtu = mtu
         lastSocksAddr = socksAddr
+        lastSocksUser = socksUser
+        lastSocksPass = socksPass
         return ackResult
     }
 
@@ -132,7 +146,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control, closer)
 
-        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertEquals(Hysteria2Tun2SocksChildResult.Ok(9001), result)
         assertTrue(runtime.isRunning())
@@ -155,9 +169,9 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val launcher = FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher()
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control, closer)
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
-        val second = runtime.start(dupTunFd = 43, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val second = runtime.start(dupTunFd = 43, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertTrue(second is Hysteria2Tun2SocksChildResult.Failed)
         assertEquals(1, launcher.launchCalls)
@@ -170,7 +184,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher(), control, closer)
 
-        val result = runtime.start(dupTunFd = -1, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = -1, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertEquals(Hysteria2Tun2SocksChildResult.Failed("invalid fd"), result)
         assertEquals(0, control.bindCalls)
@@ -184,8 +198,8 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher(), control, closer)
 
-        val zero = runtime.start(dupTunFd = 42, mtu = 0, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
-        val negative = runtime.start(dupTunFd = 43, mtu = -1, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val zero = runtime.start(dupTunFd = 42, mtu = 0, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val negative = runtime.start(dupTunFd = 43, mtu = -1, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertEquals(Hysteria2Tun2SocksChildResult.Failed("invalid mtu"), zero)
         assertEquals(Hysteria2Tun2SocksChildResult.Failed("invalid mtu"), negative)
@@ -199,7 +213,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher(), control, closer)
 
-        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertEquals(Hysteria2Tun2SocksChildResult.Failed("empty socks address"), result)
         assertEquals(0, control.bindCalls)
@@ -213,7 +227,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control, closer)
 
-        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertTrue(result is Hysteria2Tun2SocksChildResult.Failed)
         assertEquals(1, control.bindCalls)
@@ -228,7 +242,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control, closer)
 
-        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertTrue(result is Hysteria2Tun2SocksChildResult.Failed)
         assertEquals(1, launcher.launchCalls)
@@ -243,7 +257,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control, closer)
 
-        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertEquals(Hysteria2Tun2SocksChildResult.Failed("child never connected to send the start request within 5000ms"), result)
         assertFalse(runtime.isRunning())
@@ -261,7 +275,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val launcher = FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher()
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control)
 
-        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         assertEquals(Hysteria2Tun2SocksChildResult.Failed("engine start: invalid mtu"), result)
         assertFalse(runtime.isRunning())
@@ -287,7 +301,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control)
         var unexpectedExitCalls = 0
         runtime.onUnexpectedExit = { unexpectedExitCalls++ }
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         val result = runtime.stop()
 
@@ -303,7 +317,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         assertEquals(0, unexpectedExitCalls)
 
         // A fresh start is allowed again after a stop.
-        val restarted = runtime.start(dupTunFd = 44, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val restarted = runtime.start(dupTunFd = 44, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
         assertTrue(restarted is Hysteria2Tun2SocksChildResult.Ok)
     }
 
@@ -323,7 +337,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
             override fun launch(binaryPath: String, args: List<String>): Hysteria2Tun2SocksChildProcess = process
         }
         val runtime = Hysteria2Tun2SocksChildRuntime(customLauncher, control, gracefulStopTimeoutMillis = 10, forceStopWaitMillis = 10)
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         runtime.stop()
 
@@ -335,7 +349,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
     fun `repeated stop is idempotent`() {
         val control = FakeHysteria2Tun2SocksChildControlChannel()
         val runtime = Hysteria2Tun2SocksChildRuntime(FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher(), control)
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         val first = runtime.stop()
         val second = runtime.stop()
@@ -355,7 +369,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control)
         val notifiedCodes = mutableListOf<Int>()
         runtime.onUnexpectedExit = { code -> notifiedCodes.add(code) }
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
         assertTrue(runtime.isRunning())
 
         process.simulateUnexpectedExit(139)
@@ -376,7 +390,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control)
         var unexpectedExitCalls = 0
         runtime.onUnexpectedExit = { unexpectedExitCalls++ }
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         process.simulateUnexpectedExit(139)
         assertEquals(1, unexpectedExitCalls)
@@ -391,7 +405,7 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         assertEquals(1, unexpectedExitCalls)
 
         // A fresh start is possible after an unexpected death + stop.
-        val restarted = runtime.start(dupTunFd = 44, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        val restarted = runtime.start(dupTunFd = 44, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
         assertTrue(restarted is Hysteria2Tun2SocksChildResult.Ok)
     }
 
@@ -408,11 +422,58 @@ class Hysteria2Tun2SocksChildRuntimeTest {
         val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control)
         var unexpectedExitCalls = 0
         runtime.onUnexpectedExit = { unexpectedExitCalls++ }
-        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+        runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:41999", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
 
         runtime.stop()
 
         assertEquals(0, unexpectedExitCalls)
         assertFalse(runtime.isRunning())
+    }
+
+    // --- B46-4A: local SOCKS hardening ---------------------------------------
+
+    @Test
+    fun `B46-4A per-session credentials and the bound address are forwarded to the child only via the control channel`() {
+        val control = FakeHysteria2Tun2SocksChildControlChannel()
+        val launcher = FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher()
+        val runtime = Hysteria2Tun2SocksChildRuntime(launcher, control, FakeHysteria2Hysteria2Tun2SocksDupFdCloser())
+
+        val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:43210", socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+
+        assertTrue(result is Hysteria2Tun2SocksChildResult.Ok)
+        assertEquals("127.0.0.1:43210", control.lastSocksAddr)
+        assertEquals(TEST_SOCKS_USER, control.lastSocksUser)
+        assertEquals(TEST_SOCKS_PASS, control.lastSocksPass)
+        assertFalse("credentials must never be on argv", launcher.lastArgs.any { it.contains(TEST_SOCKS_PASS) || it.contains(TEST_SOCKS_USER) })
+    }
+
+    @Test
+    fun `B46-4A missing credentials fail closed and close the duplicate fd before touching the control channel`() {
+        for ((user, pass) in listOf("" to TEST_SOCKS_PASS, TEST_SOCKS_USER to "")) {
+            val control = FakeHysteria2Tun2SocksChildControlChannel()
+            val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
+            val runtime = Hysteria2Tun2SocksChildRuntime(FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher(), control, closer)
+
+            val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = "127.0.0.1:43210", socksUsername = user, socksPassword = pass, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+
+            assertEquals(Hysteria2Tun2SocksChildResult.Failed("missing local socks credentials"), result)
+            assertEquals(0, control.bindCalls)
+            assertEquals(listOf(42), closer.closedFds)
+        }
+    }
+
+    @Test
+    fun `B46-4A a non-loopback or zero-port socks address fails closed`() {
+        for (addr in listOf("0.0.0.0:43210", "127.0.0.1:0", "10.0.0.1:43210", "[::1]:43210", "localhost:43210", "127.0.0.1")) {
+            val control = FakeHysteria2Tun2SocksChildControlChannel()
+            val closer = FakeHysteria2Hysteria2Tun2SocksDupFdCloser()
+            val runtime = Hysteria2Tun2SocksChildRuntime(FakeHysteria2Hysteria2Tun2SocksChildProcessLauncher(), control, closer)
+
+            val result = runtime.start(dupTunFd = 42, mtu = 1500, socksAddr = addr, socksUsername = TEST_SOCKS_USER, socksPassword = TEST_SOCKS_PASS, binaryPath = "/fake/bin", controlSocketPath = controlSocketPath)
+
+            assertEquals(addr, Hysteria2Tun2SocksChildResult.Failed("socks address is not 127.0.0.1:<port>"), result)
+            assertEquals(addr, 0, control.bindCalls)
+            assertEquals(addr, listOf(42), closer.closedFds)
+        }
     }
 }
