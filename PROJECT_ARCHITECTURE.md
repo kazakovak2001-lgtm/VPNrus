@@ -3587,8 +3587,15 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   `X-Pocvpn-Edge` (`api/client_identity.py`), never `Host` or
   `X-Forwarded-For`; unusable values map to one still-limited
   `unattributed` client. Per-token is per device (credential + public
-  key) plus a per-credential cap. All limiter state is process-local and
-  resets on restart.
+  key) plus a per-credential cap. The global ceiling is the one shared
+  safety ceiling; class/edge ceilings are separate, unaligned fixed
+  windows, so no global share is reserved for activation. Gateway
+  self-connects (Xray connect confirmation and the relayed-session
+  watchdog dial the gateway's own `/v1/manifest` through its own Xray exit)
+  use a separate `gateway-self` bootstrap scope, selected only by an exact
+  match of the nginx-set `X-Real-IP` against configured
+  `GATEWAY_SELF_ADDRESSES` - never by a request header. All limiter state
+  is process-local and resets on restart.
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.

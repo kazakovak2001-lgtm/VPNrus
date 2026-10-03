@@ -10,7 +10,7 @@ if _GATEWAY_DIR not in sys.path:
     sys.path.insert(0, _GATEWAY_DIR)
 
 from api import admission, ratelimit
-from api.client_identity import ClientIdentity, EDGE_UNKNOWN, UNATTRIBUTED
+from api.client_identity import ClientIdentity, EDGE_UNKNOWN, GATEWAY_SELF, UNATTRIBUTED
 
 ACT = admission.CLASS_ACTIVATION
 BOOT = admission.CLASS_BOOTSTRAP
@@ -51,9 +51,15 @@ class ValuesTests(unittest.TestCase):
             for value in table.values():
                 self.assertLessEqual(value, admission.GLOBAL_LIMIT)
 
-    def test_activation_keeps_a_reserve_against_manifest_and_relay_floods(self):
-        reserved = admission.GLOBAL_LIMIT - admission.CLASS_CEILINGS[BOOT] - admission.CLASS_CEILINGS[RELAY]
-        self.assertGreaterEqual(reserved, PER_CLIENT_ACT)
+    def test_bootstrap_and_relay_ceilings_are_each_below_the_global_ceiling(self):
+        # The stated invariant: separate class ceilings below one shared
+        # global ceiling. NOT a reserve for activation - see
+        # UnalignedWindowTests for why no reserve is guaranteed.
+        self.assertLess(admission.CLASS_CEILINGS[BOOT], admission.GLOBAL_LIMIT)
+        self.assertLess(admission.CLASS_CEILINGS[RELAY], admission.GLOBAL_LIMIT)
+
+    def test_self_scope_exists_only_for_bootstrap(self):
+        self.assertEqual({BOOT: 20}, admission.SELF_SCOPE_LIMITS)
 
     def test_per_client_activation_fits_a_full_five_request_sequence(self):
         self.assertGreaterEqual(PER_CLIENT_ACT, 5)
@@ -125,13 +131,16 @@ class CeilingTests(AdmissionTestCase):
         self.assertEqual(admission.CLASS_CEILINGS[RELAY], admitted)
         self.assertTrue(self.ac.admit(client(500), ACT))
 
-    def test_manifest_and_relay_floods_together_leave_activation_its_reserve(self):
+    def test_aligned_windows_only_leave_activation_the_remainder(self):
+        # Frozen clock = every window starts together. Only in THIS aligned
+        # case is activation left the arithmetic remainder; it is not a
+        # guarantee (UnalignedWindowTests).
         for n in range(100):
             self.ac.admit(client(n), BOOT)
             self.ac.admit(client(n), RELAY)
-        reserve = admission.GLOBAL_LIMIT - admission.CLASS_CEILINGS[BOOT] - admission.CLASS_CEILINGS[RELAY]
+        remainder = admission.GLOBAL_LIMIT - admission.CLASS_CEILINGS[BOOT] - admission.CLASS_CEILINGS[RELAY]
         admitted = sum(self.ac.admit(client(1000 + n), ACT) for n in range(100))
-        self.assertEqual(reserve, admitted)
+        self.assertEqual(remainder, admitted)
 
     def test_global_safety_ceiling_still_holds(self):
         admitted = sum(self.ac.admit(client(n), ACT) for n in range(200))
@@ -152,6 +161,104 @@ class CeilingTests(AdmissionTestCase):
             self.assertTrue(self.ac.admit(staging, ACT))
         self.assertFalse(self.ac.admit(staging, ACT))
         self.assertTrue(self.ac.admit(public, ACT))
+
+
+class UnalignedWindowTests(AdmissionTestCase):
+    """Fixed windows start at each limiter's own first request, so they are
+    not aligned with the global window. This pins the real behaviour: no
+    activation reserve is guaranteed. It must not be "fixed" here."""
+
+    def test_unaligned_class_windows_can_take_the_whole_global_ceiling(self):
+        n = iter(range(10_000))
+        # t=0: one activation opens the global window G1 = [0, 10).
+        self.assertTrue(self.ac.admit(client(next(n)), ACT))
+        # t=5: first bootstrap and relay requests open their class windows
+        # [5, 15) - inside G1, so they spend G1, not G2.
+        self.clock.now += 5
+        self.assertTrue(self.ac.admit(client(next(n)), BOOT))
+        self.assertTrue(self.ac.admit(client(next(n)), RELAY))
+        # t=10: G1 expires; this activation opens G2 = [10, 20).
+        self.clock.now += 5
+        self.assertTrue(self.ac.admit(client(next(n)), ACT))
+        g2_start = self.clock.now
+        boot_in_g2 = relay_in_g2 = 0
+        # t=10..14: the rest of each class window ([5, 15)): 19 + 19.
+        for _ in range(30):
+            boot_in_g2 += self.ac.admit(client(next(n)), BOOT)
+            relay_in_g2 += self.ac.admit(client(next(n)), RELAY)
+        # t=15: new class windows [15, 25), still inside G2.
+        self.clock.now = g2_start + 5
+        for _ in range(30):
+            boot_in_g2 += self.ac.admit(client(next(n)), BOOT)
+            relay_in_g2 += self.ac.admit(client(next(n)), RELAY)
+        self.assertLess(self.clock.now, g2_start + admission.WINDOW_SECONDS)
+
+        self.assertGreater(boot_in_g2, admission.CLASS_CEILINGS[BOOT])
+        self.assertEqual(admission.GLOBAL_LIMIT, self.global_used())
+        self.assertEqual(admission.GLOBAL_LIMIT - 1, boot_in_g2 + relay_in_g2)
+        # The class limiters themselves accepted more than the global
+        # ceiling within G2: 19 in each first window + every slot of each
+        # second window (measured from the limiters); global is the only cap.
+        second_windows = (
+            self.ac.class_limiters[BOOT]._windows[BOOT][1] + self.ac.class_limiters[RELAY]._windows[RELAY][1]
+        )
+        class_level = 19 + 19 + second_windows
+        self.assertEqual(2 * admission.CLASS_CEILINGS[BOOT], second_windows)
+        self.assertGreater(class_level, admission.GLOBAL_LIMIT)
+        # Activation now gets nothing for the rest of G2: no reserve.
+        self.assertFalse(self.ac.admit(client(next(n)), ACT))
+
+
+class GatewaySelfScopeTests(AdmissionTestCase):
+    SELF_PUBLIC = ClientIdentity("public-443", GATEWAY_SELF)
+    SELF_STAGING = ClientIdentity("cp-loopback", GATEWAY_SELF)
+    GATEWAY_AS_CLIENT = ClientIdentity("public-443", "203.0.113.1/32")
+
+    def test_self_key_is_not_the_ordinary_client_key(self):
+        self.assertEqual("public-443|gateway-self|bootstrap", self.SELF_PUBLIC.limiter_key(BOOT))
+        self.assertNotEqual(self.GATEWAY_AS_CLIENT.limiter_key(BOOT), self.SELF_PUBLIC.limiter_key(BOOT))
+
+    def test_self_connects_do_not_spend_any_ordinary_bootstrap_bucket(self):
+        per_client_boot = admission.PER_CLIENT_LIMITS[BOOT]
+        admitted = sum(self.ac.admit(self.SELF_PUBLIC, BOOT) for _ in range(per_client_boot + 15))
+        self.assertGreater(admitted, per_client_boot)
+        self.assertEqual(0, self.ac.per_client_limiters[BOOT].size())
+        self.assertNotIn(BOOT, self.ac.class_limiters[BOOT]._windows)
+        # Ordinary clients - including one using the gateway's own address
+        # without the self configuration - keep their full budgets.
+        for _ in range(per_client_boot):
+            self.assertTrue(self.ac.admit(self.GATEWAY_AS_CLIENT, BOOT))
+        self.assertTrue(self.ac.admit(client(7), BOOT))
+
+    def test_many_self_connects_are_bounded_by_their_own_scope_and_global(self):
+        cap = admission.SELF_SCOPE_LIMITS[BOOT]
+        results = [self.ac.admit(self.SELF_PUBLIC, BOOT) for _ in range(cap + 10)]
+        self.assertEqual([True] * cap + [False] * 10, results)
+        self.assertEqual(cap, self.global_used())
+
+    def test_ordinary_bootstrap_flood_does_not_spend_the_self_scope(self):
+        for n in range(100):
+            self.ac.admit(client(n), BOOT)
+        self.assertFalse(self.ac.admit(client(500), BOOT))
+        self.assertTrue(self.ac.admit(self.SELF_PUBLIC, BOOT))
+
+    def test_self_scope_is_per_edge_and_still_bound_by_the_edge_ceiling(self):
+        cap = admission.SELF_SCOPE_LIMITS[BOOT]
+        for _ in range(cap):
+            self.assertTrue(self.ac.admit(self.SELF_PUBLIC, BOOT))
+        self.assertFalse(self.ac.admit(self.SELF_PUBLIC, BOOT))
+        self.assertTrue(self.ac.admit(self.SELF_STAGING, BOOT))
+        self.assertTrue(self.ac.admit(client(1, edge="cp-loopback"), BOOT))
+        used_on_staging = 2
+        edge_cap = admission.EDGE_CEILINGS["cp-loopback"]
+        staged = sum(self.ac.admit(self.SELF_STAGING, BOOT) for _ in range(50))
+        self.assertEqual(edge_cap - used_on_staging, staged)
+
+    def test_self_on_other_classes_uses_the_ordinary_path(self):
+        for _ in range(PER_CLIENT_ACT):
+            self.assertTrue(self.ac.admit(self.SELF_PUBLIC, ACT))
+        self.assertFalse(self.ac.admit(self.SELF_PUBLIC, ACT))
+        self.assertEqual(1, self.ac.per_client_limiters[ACT].size())
 
 
 class StateTests(AdmissionTestCase):

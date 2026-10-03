@@ -9,22 +9,35 @@ validation, store read, OS lock or provisioning. Layers, in order:
     3. class ceiling  (bootstrap / activation / relay_probe / field_enroll)
     4. global ceiling (the pre-B57 hard ceiling, one bucket per process)
 
+Gateway self-connect (client_identity.GATEWAY_SELF, bootstrap class only):
+layers 1 and 3 are replaced by ONE self-scope limiter (SELF_SCOPE_LIMITS),
+keyed (edge, gateway-self, class); layers 2 and 4 still apply. The self
+scope never spends an ordinary client's per-client bucket or the
+bootstrap class ceiling, and ordinary clients never spend the self scope.
+For every other class a GATEWAY_SELF request takes the ordinary path with
+`gateway-self` as its client key.
+
 A request rejected by a layer never reaches the later layers, so it never
 consumes their budget: one client is capped at its own per-client budget
 of every shared ceiling. A rejection by a later layer has already
 consumed the earlier ones (the client's own buckets), which is intended.
 
-The global ceiling keeps its pre-B57 value, so the total safety budget is
-unchanged. The class ceilings for bootstrap and relay_probe sit below it,
-so a /v1/manifest or /v1/relay-health flood can never take the activation
-class's reserve.
+The global ceiling keeps its pre-B57 value and remains the one shared,
+process-wide safety ceiling. The class, edge and self-scope ceilings are
+separate fixed-window limiters (ratelimit.py): each window starts at that
+limiter's own first request, so the windows are not aligned with the
+global window. A class can therefore admit up to twice its ceiling inside
+one global window (e.g. bootstrap 2 x 20), and bootstrap + relay_probe
+traffic together can use the whole global ceiling. This design caps each
+class; it does NOT guarantee activation any reserved number of global
+requests.
 
 All state is process-local and in memory (see ratelimit.py): one process
 per role (pocvpn-api 8443, -ingress 8444, -xhttp-ingress 8445), reset on
 restart. Values marked PROPOSED / NOT YET VERIFIED were not derived from
 measured traffic; they are deliberately kept in this one table.
 """
-from . import ratelimit
+from . import client_identity, ratelimit
 
 CLASS_BOOTSTRAP = "bootstrap"
 CLASS_ACTIVATION = "activation"
@@ -65,10 +78,21 @@ PER_CLIENT_LIMITS = {
 }
 
 EDGE_CEILINGS = {
-    # PROPOSED / NOT YET VERIFIED - the staging Cloudflare listener can use
-    # at most a third of the global ceiling, so staging traffic cannot
-    # exhaust the production vhosts served by the same process.
+    # PROPOSED / NOT YET VERIFIED - the staging Cloudflare listener is
+    # capped at a third of the global ceiling per window of its own (at
+    # most 2 x 20 inside one unaligned global window), so staging traffic
+    # alone cannot exhaust the production vhosts served by the same process.
     "cp-loopback": 20,
+}
+
+SELF_SCOPE_LIMITS = {
+    # PROPOSED / NOT YET VERIFIED - the same value as the bootstrap class
+    # ceiling, not derived from measured traffic. Every Xray connect
+    # confirmation and every relayed-session watchdog probe (one per 20 s,
+    # android XrayCoreController) on this gateway lands here, so 20 / 10 s
+    # is about 40 concurrently watched relayed sessions (computed, not
+    # measured), less whatever connect confirmations use.
+    CLASS_BOOTSTRAP: 20,
 }
 
 
@@ -82,16 +106,27 @@ class AdmissionControl:
         self.class_limiters = {name: _limiter(limit, clock) for name, limit in CLASS_CEILINGS.items()}
         self.per_client_limiters = {name: _limiter(limit, clock) for name, limit in PER_CLIENT_LIMITS.items()}
         self.edge_limiters = {edge: _limiter(limit, clock) for edge, limit in EDGE_CEILINGS.items()}
+        self.self_scope_limiters = {name: _limiter(limit, clock) for name, limit in SELF_SCOPE_LIMITS.items()}
 
     def admit(self, identity, endpoint_class):
         if endpoint_class not in self.class_limiters:
             raise ValueError(f"unknown endpoint class: {endpoint_class}")
+        self_scope = self.self_scope_limiters.get(endpoint_class)
+        if identity.client == client_identity.GATEWAY_SELF and self_scope is not None:
+            if not self_scope.allow(identity.limiter_key(endpoint_class)):
+                return False
+            if not self._edge_allows(identity):
+                return False
+            return self.global_limiter.allow("global")
         per_client = self.per_client_limiters.get(endpoint_class)
         if per_client is not None and not per_client.allow(identity.limiter_key(endpoint_class)):
             return False
-        edge_limiter = self.edge_limiters.get(identity.edge)
-        if edge_limiter is not None and not edge_limiter.allow(identity.edge):
+        if not self._edge_allows(identity):
             return False
         if not self.class_limiters[endpoint_class].allow(endpoint_class):
             return False
         return self.global_limiter.allow("global")
+
+    def _edge_allows(self, identity):
+        edge_limiter = self.edge_limiters.get(identity.edge)
+        return edge_limiter is None or edge_limiter.allow(identity.edge)

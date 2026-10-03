@@ -11,6 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 
+from . import client_identity
 from .wgkey import is_valid_wg_public_key
 
 _ENV_PREFIX = "POCVPN_API_"
@@ -219,6 +220,34 @@ class AppConfig:
     # start. Optional and independent of the /v1/hysteria-profile group above,
     # but when set it requires that whole group and must differ from api_port.
     hysteria2_auth_backend_port: int = 0
+    # B57 - this gateway's own addresses AS NGINX SEES THEM when the gateway
+    # connects to itself (Xray `freedom` -> own public address -> nginx ->
+    # X-Real-IP). A request whose X-Real-IP is exactly one of these is
+    # admitted in the separate gateway-self scope (client_identity.py,
+    # admission.py) instead of an ordinary per-client bucket. Comma-
+    # separated IP literals; loopback/unspecified/multicast are rejected.
+    # Empty (the default) = no self scope: such requests are ordinary
+    # clients. Which address nginx logs for a self-connect is host-specific
+    # and must be observed on the host, not assumed.
+    gateway_self_addresses: frozenset = frozenset()
+
+
+def _parse_gateway_self_addresses(raw):
+    addresses = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        address = client_identity.parse_address(item)
+        if address is None:
+            raise ConfigError(f"{_ENV_PREFIX}GATEWAY_SELF_ADDRESSES contains an invalid IP address: {item!r}")
+        if address.is_loopback or address.is_unspecified or address.is_multicast:
+            raise ConfigError(
+                f"{_ENV_PREFIX}GATEWAY_SELF_ADDRESSES must not contain loopback/unspecified/multicast "
+                f"addresses: {item!r}"
+            )
+        addresses.add(address)
+    return frozenset(addresses)
 
 
 def _get(env, key):
@@ -813,4 +842,5 @@ def load_config(env=None):
         hysteria2_server_port=hysteria2_server_port,
         hysteria2_sni=hysteria2_sni,
         hysteria2_auth_backend_port=hysteria2_auth_backend_port,
+        gateway_self_addresses=_parse_gateway_self_addresses(_get(env, "GATEWAY_SELF_ADDRESSES")),
     )

@@ -225,10 +225,21 @@ per client (`X-Real-IP` as /32 or IPv6 /64, plus the constant
 cp-loopback edge ceiling -> a ceiling per endpoint class (bootstrap,
 activation, relay_probe, field_enroll) -> the unchanged 60 / 10 s
 global ceiling. A request rejected by a layer does not spend the later
-ones. The per-token limit (5 / 10 s) is now per device (credential +
+ones. The global ceiling stays the one shared, process-wide safety
+ceiling; the class and edge ceilings are separate fixed-window limiters
+whose windows are not aligned with it, so the design does not reserve
+any number of global requests for activation. Gateway self-connects
+(Xray connect confirmation and the relayed-session watchdog dial the
+gateway's own `/v1/manifest` through its own Xray exit, so nginx sees the
+gateway as the client) get their own bootstrap scope instead of one
+ordinary per-client bucket, but only when the nginx-set `X-Real-IP`
+exactly matches `POCVPN_API_GATEWAY_SELF_ADDRESSES` (empty by default;
+the address nginx sees for a self-connect is NOT YET OBSERVED on either
+host). The per-token limit (5 / 10 s) is now per device (credential +
 presented public key), with a per-credential cap across devices. The
 new values (per-client 10 / 10 s, bootstrap and relay_probe class 20,
-cp-loopback edge 20, per-credential 10) are PROPOSED / NOT YET VERIFIED
+cp-loopback edge 20, gateway-self bootstrap scope 20, per-credential 10)
+are PROPOSED / NOT YET VERIFIED
 and were not derived from measured traffic. No nginx `limit_req` value
 was changed; the templates only add `X-Pocvpn-Edge`. Not deployed on
 Stockholm or Frankfurt, not staging-tested, no load test. Deployment

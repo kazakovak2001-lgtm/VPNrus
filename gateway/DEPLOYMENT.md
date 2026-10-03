@@ -440,6 +440,20 @@ step needs explicit owner approval.
   `X-Pocvpn-Edge` (`public-443` or `cp-loopback`). A missing, invalid or
   loopback address is one shared `unattributed` client per edge - still
   limited, never unlimited.
+- Gateway self-connect: Xray's connect confirmation and the relayed-session
+  watchdog (every 20 s per relayed session) dial the gateway's own
+  `/v1/manifest` through its own Xray exit, so nginx reports the gateway
+  itself as the client. `POCVPN_API_GATEWAY_SELF_ADDRESSES` (comma-separated
+  IP literals, empty by default) lists the address(es) nginx reports for
+  that; an exact `X-Real-IP` match is admitted in a separate
+  `gateway-self` bootstrap scope (20 / 10 s, PROPOSED - about 40 watched
+  relayed sessions, computed) instead of one ordinary per-client bucket
+  (10 / 10 s, about 20 sessions). It is "traffic from this host", not
+  trusted traffic: a VPN user's tunnelled request to the gateway's own
+  address lands there too and is limited the same way.
+- The global 60 / 10 s ceiling is the one shared safety ceiling. Class and
+  edge ceilings are separate fixed windows, not aligned with it, so no
+  share of it is reserved for activation.
 - Templates `nginx-pocvpn.conf`, `nginx-pocvpn-stockholm.conf`,
   `nginx-pocvpn-cp-loopback-{stockholm,frankfurt}.conf` add
   `proxy_set_header X-Pocvpn-Edge "<edge>";` to every API location. No
@@ -455,10 +469,16 @@ Rollout order (per host):
 2. Deploy the nginx `X-Pocvpn-Edge` lines first (`nginx -t`, graceful
    reload). The current API ignores the header, so this step alone
    changes nothing.
-3. Install the updated `gateway/api` and restart `pocvpn-api` (and the
+3. Read-only, per host: observe which address nginx logs as the client
+   for a self-connect (e.g. `curl https://<own public address>/v1/manifest`
+   run on the host, then the access log's client address) and set
+   `POCVPN_API_GATEWAY_SELF_ADDRESSES` to it. NOT YET OBSERVED on either
+   host; without it the self-connects stay in one ordinary per-client
+   bucket.
+4. Install the updated `gateway/api` and restart `pocvpn-api` (and the
    ingress roles, which run the same code). Restart resets all limiter
    state (process-local, in memory).
-4. Verify with bounded requests only (no load test): one client's full
+5. Verify with bounded requests only (no load test): one client's full
    activation sequence gets no 429; the staging harness
    (`tools/cp_loopback_staging_check.py`) stays within its budget.
 

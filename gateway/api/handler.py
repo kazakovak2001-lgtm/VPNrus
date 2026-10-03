@@ -1227,10 +1227,13 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         """Per-client -> edge -> class -> global admission. Called right
         after each endpoint's own config check and before any header/body
         validation, store read, lock or provisioning. Identity comes only
-        from the nginx-set X-Real-IP / X-Pocvpn-Edge headers (see
-        client_identity.py); the client address is never logged."""
+        from the nginx-set X-Real-IP / X-Pocvpn-Edge headers, plus the
+        configured gateway self addresses (see client_identity.py); the
+        client address is never logged."""
         identity = client_identity.from_header_values(
-            self.headers.get_all("X-Real-IP"), self.headers.get_all("X-Pocvpn-Edge")
+            self.headers.get_all("X-Real-IP"),
+            self.headers.get_all("X-Pocvpn-Edge"),
+            self.server.config.gateway_self_addresses,
         )
         self._log_fields["edge"] = identity.edge
         if not self.server.admission.admit(identity, endpoint_class):
