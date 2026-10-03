@@ -3549,6 +3549,29 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   statically links GPL-3.0-or-later `sing`/`sing-tun` - licence decision
   open (legal review). Record: `docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md`.
 
+## Control-plane loopback edge (B57-5A/5D/5E; Stockholm STAGING live since 2026-10-03)
+
+- Stockholm nginx serves the B57-5A loopback template on `127.0.0.1:8081`
+  ONLY (never `0.0.0.0`/`[::]`), additive to the existing vhosts and reusing
+  their `$pocvpn_ingress_profile_backend` map (defined once, in the existing
+  vhost). Its only external path: `cp-staging.aknova.pp.ua` -> Cloudflare ->
+  Tunnel `8290ff1b-...` -> systemd `cloudflared` (`--token-file`, metrics on
+  `127.0.0.1:20241`) -> 8081 -> loopback API. Staging only: no app client and
+  no production hostname uses it.
+- nginx owns Cache-Control there (B57-5A C1-C4); the Cloudflare Cache Rules
+  for `cp-staging` only narrow caching (anonymous `/v1/manifest` eligible,
+  any `Authorization` bypassed via `has_key(http.request.headers, ...)`).
+  `CF-Connecting-IP` is trusted only from 127.0.0.1 and keys nginx's
+  per-client zones; any local process can set it.
+- B57-5D (repo templates only, NOT deployed): server-level
+  `X-Forwarded-Proto != "https"` -> 403 with a server-level
+  `Cache-Control: private, no-store`; defense in depth, not a boundary.
+- `pocvpn-api`'s own limiter is process-wide (60 req/10 s, all clients and
+  endpoints) - behind a shared egress it is NOT per client.
+- Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
+  (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
+  `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
+
 ## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27; Xray exit layer live on Stockholm since 2026-09-28, Frankfurt Xray and AWG nftables layer not deployed)
 
 - A VPN exit is an Internet proxy, never a proxy into the gateway host, its
