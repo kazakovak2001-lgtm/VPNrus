@@ -6,6 +6,9 @@ hostname `cp-staging.aknova.pp.ua`. This is staging, not a production
 migration: no client, manifest, production DNS record, firewall rule or
 existing vhost was changed, and no app client uses this path. Open:
 section 11.7 (first log rotation) and 11.9 (rate limits vs CGNAT).
+Since 2026-10-03 17:38 UTC the staging listener also runs B57-5D
+(origin HTTPS enforcement, commit `7fbabaf`), deployed and verified on
+top of this staging topology (section 5).
 
 ```
 STAGING  client -> cp-staging.aknova.pp.ua (Cloudflare) -> Tunnel 8290ff1b-... -> http://127.0.0.1:8081 nginx -> 127.0.0.1:8443/8444/8445
@@ -17,7 +20,7 @@ LIVE     client -> control.aknova.pp.ua (DNS-only) -> 16.170.208.231:443 nginx -
 | Item | Value |
 |---|---|
 | Backup (before any change) | `/var/backups/nova-b57-5e-20261003T055634Z/` (`nginx.conf`, `sites-available/`, `sites-enabled/`, `conf.d/`, `nginx-T.before.txt`, `ss-ltnp.before.txt`; root-only, no private key) |
-| nginx listener | `/etc/nginx/sites-available/pocvpn-cp-loopback-stockholm` (+ symlink in `sites-enabled/`) = the B57-5A Stockholm template, SHA-256 `371c2e8482bd540e9b8ca92abf92986f649874364eb9f0b75d24fc12b02f1e43`; `nginx -t` PASS on nginx **1.24.0 (Ubuntu)**, graceful reload ~05:57 UTC. The B57-5D template change is NOT deployed. |
+| nginx listener | `/etc/nginx/sites-available/pocvpn-cp-loopback-stockholm` (+ symlink in `sites-enabled/`) = the B57-5A Stockholm template, SHA-256 `371c2e8482bd540e9b8ca92abf92986f649874364eb9f0b75d24fc12b02f1e43`; `nginx -t` PASS on nginx **1.24.0 (Ubuntu)**, graceful reload ~05:57 UTC. Replaced on 2026-10-03 17:38 UTC by the B57-5D version (SHA-256 `2b7562203f09c4f22f86950c01f669c15294fcc7997ee4c9e206ba03f27b024d`, commit `7fbabaf`; see section 5 and `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md` section 6). |
 | cloudflared | `2026.9.3` from `pkg.cloudflare.com` (key "CloudFlare Software Packaging 2025", fingerprint `CC94 B39C 77AE 7342 A68B 8962 8A68 2D30 8D4E 5E73`); apt installed only this package |
 | Connector | systemd `cloudflared.service`: `/usr/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/token`; token file `600 root:root`, not on any command line; metrics `127.0.0.1:20241` (loopback) |
 | Logs | `/var/log/nginx/pocvpn-cp-loopback-{access,error}.log` |
@@ -82,7 +85,22 @@ the access log.
 3. **Stockholm TCP 2093** (manifest v6 `stockholm-ingress-1`) is not listening (pre-existing, out of scope).
 4. Cloudflare does not redirect plain HTTP for `cp-staging` (B57-5D negative test).
 
-## 5. Rollback
+## 5. B57-5D on top of this staging (2026-10-03)
+
+The verified staging topology above was left as it was; only the
+listener file changed (B57-5D, `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`
+section 6). Through the real Cloudflare -> Tunnel -> nginx path:
+
+- HTTPS anonymous manifest still `200`, `public, max-age=300`,
+  cache-eligible, SHA `304afa8b...`; HTTPS with `Authorization` still
+  `200`, `private, no-store`, `DYNAMIC` (cache behaviour intact).
+- Plain HTTP is now rejected with `403`, `private, no-store`, also when
+  the client sends `X-Forwarded-Proto: https` (nginx received `http`).
+- Rejected requests did not reach the API (0 requests on 8443 during
+  both plain-HTTP requests); cloudflared `request_errors` 0; Tunnel
+  ingress unchanged; production unchanged; Frankfurt not touched.
+
+## 6. Rollback
 
 ```
 sudo systemctl disable --now cloudflared

@@ -3,12 +3,15 @@
 Status (2026-10-03):
 
 - **Stockholm variant: deployed as STAGING by B57-5E** (runtime verified,
-  nginx 1.24.0, deployed file SHA-256 `371c2e84...` = this B57-5A template,
-  without B57-5D), reachable only via the Cloudflare Tunnel staging hostname
-  `cp-staging.aknova.pp.ua`. See `docs/B57_5E_STAGING_VERIFICATION.md`.
-- **Frankfurt variant: repo-only, NOT DEPLOYED.**
-- **B57-5D `X-Forwarded-Proto` enforcement: implemented in both repo
-  templates, NOT deployed on any host.** See
+  nginx 1.24.0), reachable only via the Cloudflare Tunnel staging hostname
+  `cp-staging.aknova.pp.ua`. B57-5E first deployed this B57-5A template
+  (SHA-256 `371c2e84...`); since 2026-10-03 17:38 UTC it runs the B57-5D
+  version (`2b756220...`, commit `7fbabaf`). See
+  `docs/B57_5E_STAGING_VERIFICATION.md`.
+- **Frankfurt variant: repo-only, NOT DEPLOYED** (not touched by B57-5E or
+  B57-5D).
+- **B57-5D `X-Forwarded-Proto` enforcement: in both repo templates;
+  deployed and runtime verified on Stockholm STAGING only.** See
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
 
 The B57-5A step itself changed nothing in production: no nginx
@@ -173,7 +176,7 @@ not logged either, following the B57-5A field list. The owner can add
 ## 9. Deliberately excluded
 
 - **`/v1/field-enroll` is not part of this include.** It is not routed in production and must not be added in B57. It returns 404 here like any unknown path. `/v1/peers` and `/v1/relay-health` are excluded the same way.
-- **HTTP -> 403 / HTTPS enforcement** was a commented-out proposal here. It is now implemented in the templates by B57-5D (server-level `if ($http_x_forwarded_proto != "https") { return 403; }` plus a server-level `add_header Cache-Control "private, no-store" always;` so the 403 meets C4); repo only, not deployed. See `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
+- **HTTP -> 403 / HTTPS enforcement** was a commented-out proposal here. It is now implemented in the templates by B57-5D (server-level `if ($http_x_forwarded_proto != "https") { return 403; }` plus a server-level `add_header Cache-Control "private, no-store" always;` so the 403 meets C4); deployed on Stockholm STAGING only (2026-10-03), Frankfurt not deployed. See `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
 
 ## 10. Validation done in B57-5A (local only)
 

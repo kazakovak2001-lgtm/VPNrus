@@ -1,10 +1,13 @@
 # B57-5D - Origin-side HTTPS enforcement on the control-plane loopback
 
-Status: **IMPLEMENTED IN REPO (templates + tests + harness), NOT DEPLOYED.**
-The Stockholm listener still runs the B57-5E file (SHA-256 `371c2e84...`,
-enforcement commented out). Activating 5D on a host is a separate,
-approved redeploy (section 6). This is defense in depth on the origin,
-not a security boundary of its own.
+Status: **DEPLOYED AND RUNTIME VERIFIED ON STOCKHOLM STAGING (2026-10-03).**
+Implemented in commit `7fbabaf`; the Stockholm loopback listener
+(`cp-staging.aknova.pp.ua` via the Cloudflare Tunnel) runs it since
+2026-10-03 (section 6). Stockholm STAGING only - NOT a production
+migration: the production control plane (`control.aknova.pp.ua`, raw-IP
+vhosts) is unchanged, and the Frankfurt variant is not deployed and was
+not touched or verified in this session. This is defense in depth on the
+origin, not a security boundary of its own.
 
 ## 1. Change
 
@@ -93,13 +96,35 @@ two probes (no header; the plain-HTTP values) expect 403 + private with
 `on` or today's behaviour with `off`. The API budget stays <= 20 per run.
 `--mode cloudflare` sends no plain-HTTP request.
 
-## 6. Activation (not done; requires owner approval)
+## 6. Stockholm staging deployment (2026-10-03, owner-approved)
 
-1. Stockholm: back up `/etc/nginx/sites-available/pocvpn-cp-loopback-stockholm`, install the new template, `nginx -t`, graceful reload.
-2. On the host: harness `--mode loopback --scheme-enforcement on`.
-3. One HTTPS request through `cp-staging` must still be 200 (no new spoofing test needed).
-4. Rollback: restore the backed-up file, `nginx -t`, reload.
+| Item | Value |
+|---|---|
+| File | `/etc/nginx/sites-available/pocvpn-cp-loopback-stockholm` = Stockholm template from commit `7fbabaf` |
+| Deployed SHA-256 | `2b7562203f09c4f22f86950c01f669c15294fcc7997ee4c9e206ba03f27b024d` (previous: B57-5A `371c2e84...`) |
+| Backup | `/var/backups/nova-b57-5d-20261003T173827Z/` (previous file, `nginx -T`, `ss`; root-only, no private key) |
+| nginx | 1.24.0 (Ubuntu); `nginx -t` PASS; graceful reload PASS (17:38:27 UTC) |
+| Active config | `nginx -T`: the `X-Forwarded-Proto` `if`, `return 403` and the server-level `add_header Cache-Control "private, no-store" always;` once each; `listen 127.0.0.1:8081` only |
 
-No change to Cloudflare, the Tunnel, `control.aknova.pp.ua`, the
-production 443/80 vhosts, the manifest, the API, Frankfurt runtime,
-Hysteria2 or XHTTP.
+Runtime verification through the real path (Cloudflare -> Tunnel -> nginx), one request each:
+
+| Request | Result |
+|---|---|
+| HTTPS anonymous GET `/v1/manifest` | `200`, `public, max-age=300`, cache-eligible (`EXPIRED`), manifest SHA `304afa8b...` |
+| HTTPS GET with a non-secret `Authorization` sentinel | `200`, `private, no-store`, `DYNAMIC` |
+| plain HTTP, no `X-Forwarded-Proto` | `403`, `private, no-store` (nginx 403 page) |
+| plain HTTP, client-sent `X-Forwarded-Proto: https` | `403`, `private, no-store`; nginx received `X-Forwarded-Proto: http`, `CF-Visitor: {"scheme":"http"}` |
+
+- Rejected requests never reached the API: a packet capture on `lo`
+  during both plain-HTTP requests saw exactly 2 requests on 8081 and 0 on
+  8443; the nginx access log shows them as `403`.
+- cloudflared `request_errors` stayed 0; Tunnel 4 connections; ingress
+  still only `cp-staging.aknova.pp.ua -> http://127.0.0.1:8081`.
+- Unchanged: production vhosts (byte-identical to the B57-5E backup),
+  `control.aknova.pp.ua` (DNS-only -> `16.170.208.231`), the manifest on
+  disk, all API/Xray/Hysteria2/AWG services (not restarted), Cloudflare
+  and the Tunnel. Frankfurt was not touched and not verified.
+- Rollback: restore the backed-up file, `nginx -t`, graceful reload.
+- The template's own header comment still says B57-5D is "NOT yet
+  deployed"; it was left unedited so the deployed file stays identical to
+  commit `7fbabaf`. This section is the deployment record.

@@ -3551,7 +3551,8 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 
 ## Control-plane loopback edge (B57-5A/5D/5E; Stockholm STAGING live since 2026-10-03)
 
-- Stockholm nginx serves the B57-5A loopback template on `127.0.0.1:8081`
+- Stockholm nginx serves the loopback template (B57-5D version, commit
+  `7fbabaf`) on `127.0.0.1:8081`
   ONLY (never `0.0.0.0`/`[::]`), additive to the existing vhosts and reusing
   their `$pocvpn_ingress_profile_backend` map (defined once, in the existing
   vhost). Its only external path: `cp-staging.aknova.pp.ua` -> Cloudflare ->
@@ -3563,9 +3564,13 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   any `Authorization` bypassed via `has_key(http.request.headers, ...)`).
   `CF-Connecting-IP` is trusted only from 127.0.0.1 and keys nginx's
   per-client zones; any local process can set it.
-- B57-5D (repo templates only, NOT deployed): server-level
-  `X-Forwarded-Proto != "https"` -> 403 with a server-level
-  `Cache-Control: private, no-store`; defense in depth, not a boundary.
+- B57-5D (deployed and runtime verified on Stockholm STAGING 2026-10-03,
+  commit `7fbabaf`): server-level `X-Forwarded-Proto != "https"` -> 403
+  with a server-level `Cache-Control: private, no-store`, before any
+  location, so rejected requests never reach the API. Through the Tunnel,
+  Cloudflare sets `X-Forwarded-Proto` from the real edge scheme (a
+  client-sent `https` over plain HTTP arrives as `http`). Defense in depth,
+  not a boundary. Frankfurt variant: not deployed.
 - `pocvpn-api`'s own limiter is process-wide (60 req/10 s, all clients and
   endpoints) - behind a shared egress it is NOT per client.
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
