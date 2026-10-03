@@ -79,6 +79,15 @@ def _locations(active):
     }
 
 
+def _server_level(active):
+    """Server-block directives outside every location {} block."""
+    server = _block_after(active, "\nserver {")
+    for m in reversed(list(re.finditer(r"location\s+(?:=\s+)?\S+\s*\{", server))):
+        body = _block_after(server, m.group(0))
+        server = server.replace(m.group(0) + body + "}", "", 1)
+    return server
+
+
 def _manifest_map(active):
     """Parses the manifest cache map into (default, [(regex, value)])."""
     m = re.search(
@@ -305,15 +314,47 @@ class _LoopbackAssertions:
             re.findall(r"access_log\s+([^;]+);", self.active),
         )
 
-    # --- HTTP -> HTTPS proposal inactive ---
+    # --- B57-5D: server-level C4 + HTTPS enforcement ---
 
-    def test_https_enforcement_proposal_is_commented_out(self):
-        self.assertIn("NOT ACTIVE", self.raw)
-        self.assertIn("x_forwarded_proto", self.raw)
-        self.assertNotIn("x_forwarded_proto", self.active)
-        self.assertNotRegex(self.active, r"\bif\s*\(")
-        self.assertNotIn("return 403", self.active)
-        self.assertNotIn("return 301", self.active)
+    def test_server_level_cache_control_is_private_always(self):
+        server = _server_level(self.active)
+        self.assertEqual(
+            ['add_header Cache-Control "private, no-store" always;'],
+            re.findall(r"add_header[^;]*;", server),
+        )
+
+    def test_server_level_has_no_public_cache_control(self):
+        self.assertNotIn("public", _server_level(self.active))
+
+    def test_every_location_overrides_server_level_header(self):
+        # nginx inherits server-level add_header only into a location that
+        # declares none; every location must declare its own Cache-Control.
+        for route, body in self.locs.items():
+            self.assertRegex(body, r"add_header\s+Cache-Control\s+\S", route)
+
+    def test_https_enforcement_exactly_once_at_server_level(self):
+        server = _server_level(self.active)
+        self.assertEqual(1, len(re.findall(r"\bif\s*\(", self.active)))
+        self.assertEqual(1, len(re.findall(r"\bif\s*\(", server)))
+        for route, body in self.locs.items():
+            self.assertNotIn("x_forwarded_proto", body, route)
+
+    def test_https_enforcement_compares_exactly_https_and_returns_403(self):
+        server = _server_level(self.active)
+        m = re.search(r"\bif\s*\((.*?)\)\s*\{(.*?)\}", server, re.S)
+        self.assertIsNotNone(m)
+        self.assertEqual('$http_x_forwarded_proto != "https"', m.group(1).strip())
+        self.assertEqual("return 403;", " ".join(m.group(2).split()))
+
+    def test_enforcement_precedes_every_location(self):
+        server = _block_after(self.active, "\nserver {")
+        self.assertLess(server.index("if ("), server.index("location"))
+        self.assertLess(server.index("add_header"), server.index("location"))
+
+    def test_no_redirects(self):
+        self.assertNotRegex(self.active, r"\breturn\s+30[1278]\b")
+        self.assertNotRegex(self.active, r"\brewrite\b")
+        self.assertEqual({"403", "404"}, set(re.findall(r"\breturn\s+(\d+)", self.active)))
 
     # --- no production identifiers or secrets ---
 

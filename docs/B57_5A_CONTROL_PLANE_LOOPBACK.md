@@ -1,8 +1,22 @@
 # B57-5A - Control Plane Loopback Security Contract (`pocvpn-cp-loopback`)
 
-Status: **repo-only template, NOT DEPLOYED.** This step changes nothing in
-production: no nginx install/reload, no Cloudflare rule, no DNS record, no
-tunnel, no cloudflared, no firewall change, no APK change, no manifest change.
+Status (2026-10-03):
+
+- **Stockholm variant: deployed as STAGING by B57-5E** (runtime verified,
+  nginx 1.24.0), reachable only via the Cloudflare Tunnel staging hostname
+  `cp-staging.aknova.pp.ua`. B57-5E first deployed this B57-5A template
+  (SHA-256 `371c2e84...`); since 2026-10-03 17:38 UTC it runs the B57-5D
+  version (`2b756220...`, commit `7fbabaf`). See
+  `docs/B57_5E_STAGING_VERIFICATION.md`.
+- **Frankfurt variant: repo-only, NOT DEPLOYED** (not touched by B57-5E or
+  B57-5D).
+- **B57-5D `X-Forwarded-Proto` enforcement: in both repo templates;
+  deployed and runtime verified on Stockholm STAGING only.** See
+  `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
+
+The B57-5A step itself changed nothing in production: no nginx
+install/reload, no Cloudflare rule, no DNS record, no tunnel, no
+cloudflared, no firewall change, no APK change, no manifest change.
 
 ## 1. Purpose
 
@@ -162,7 +176,7 @@ not logged either, following the B57-5A field list. The owner can add
 ## 9. Deliberately excluded
 
 - **`/v1/field-enroll` is not part of this include.** It is not routed in production and must not be added in B57. It returns 404 here like any unknown path. `/v1/peers` and `/v1/relay-health` are excluded the same way.
-- **HTTP -> 403 / HTTPS enforcement is only a proposal for B57-5D.** It is present as a comment marked `NOT ACTIVE`, and tests assert that no `if`/`return 403` directive is active. Do not enable it until B57-5D confirms which header cloudflared forwards (`X-Forwarded-Proto` vs `CF-Visitor`).
+- **HTTP -> 403 / HTTPS enforcement** was a commented-out proposal here. It is now implemented in the templates by B57-5D (server-level `if ($http_x_forwarded_proto != "https") { return 403; }` plus a server-level `add_header Cache-Control "private, no-store" always;` so the 403 meets C4); deployed on Stockholm STAGING only (2026-10-03), Frankfurt not deployed. See `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
 
 ## 10. Validation done in B57-5A (local only)
 
@@ -186,7 +200,7 @@ not logged either, following the B57-5A field list. The owner can add
 3. `ss -ltnp`: 8081 is bound to `127.0.0.1` only, never `0.0.0.0` or `[::]`, and is not reachable externally.
 4. Through real cloudflared: `CF-Connecting-IP` arrives, `$remote_addr` resolves to the client, and rate limits key per client (not one shared 127.0.0.1 bucket).
 5. Through real Cloudflare: the anonymous manifest shows `cf-cache-status: HIT` after warm-up, and a request with `Authorization`, any error response and every POST are never HIT.
-6. The header cloudflared forwards for scheme (input for B57-5D).
+6. The header cloudflared forwards for scheme (input for B57-5D). Measured in B57-5E (2026-10-03): `X-Forwarded-Proto: https`, `CF-Visitor: {"scheme":"https"}`; see `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
 7. `/var/log/nginx/pocvpn-cp-loopback-*.log` are created, rotated by logrotate, and free of tokens.
 8. Error log: upstream-failure lines (502/504) still print the request line, including any query string. The API uses no query-string secrets today, but this should be confirmed.
 9. Rate-limit values against real client retry behaviour, e.g. carrier-grade NAT sharing a single client IP.
