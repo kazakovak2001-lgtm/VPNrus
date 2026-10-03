@@ -7,9 +7,11 @@ http://127.0.0.1:8081) or a Cloudflare-fronted staging hostname
 (``--mode cloudflare``, run from a machine OUTSIDE the gateway host).
 
 API budget rule (learned in B57-5E): pocvpn-api has ONE process-wide
-global limiter (60 requests / 10 s, gateway/api/server.py) shared by every
-client and every endpoint. A burst of manifest GETs therefore rate-limits
-real production activations. This harness keeps requests that reach the
+global ceiling (60 requests / 10 s) shared by every client and every
+endpoint. Since the B57 limiter follow-up (gateway/api/admission.py) a
+per-client, a cp-loopback edge and per-endpoint-class layer sit in front
+of it, but a burst through this listener still spends the same process's
+budget as production. This harness keeps requests that reach the
 API at or below ``API_REQUEST_BUDGET`` per run, and proves nginx's own
 per-client rate limit with methods that ``limit_except`` denies (counted
 by ``limit_req`` in PREACCESS, rejected 403 in ACCESS, never proxied).

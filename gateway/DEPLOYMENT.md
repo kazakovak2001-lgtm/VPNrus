@@ -425,6 +425,55 @@ Rollout order (per host):
    an activation issued with a short `--expires-in-days` disappears after
    expiry without any API request.
 
+## pocvpn-api client-isolated rate limits (B57) - PREPARED, NOT DEPLOYED
+
+Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
+step needs explicit owner approval.
+
+- `gateway/api/admission.py`: per-client -> edge -> endpoint-class ->
+  global (60 / 10 s, unchanged) admission, before any validation, store
+  read or lock. Per-token is now per device (credential + public key)
+  plus a per-credential cap. Values marked PROPOSED in that file were not
+  derived from measured traffic.
+- `gateway/api/client_identity.py`: the client is the nginx-set
+  `X-Real-IP` (/32, IPv6 /64); the edge is the nginx-set constant
+  `X-Pocvpn-Edge` (`public-443` or `cp-loopback`). A missing, invalid or
+  loopback address is one shared `unattributed` client per edge - still
+  limited, never unlimited.
+- Templates `nginx-pocvpn.conf`, `nginx-pocvpn-stockholm.conf`,
+  `nginx-pocvpn-cp-loopback-{stockholm,frankfurt}.conf` add
+  `proxy_set_header X-Pocvpn-Edge "<edge>";` to every API location. No
+  `limit_req` value changed.
+
+Rollout order (per host):
+1. Read-only pre-check: the LIVE vhosts send `X-Real-IP $remote_addr` on
+   every API location (live Stockholm nginx is known to differ from the
+   repo - B57-5E finding 2). Without it every client of that vhost shares
+   the one `unattributed` per-client bucket (10 activation-class requests
+   / 10 s for the whole vhost) - fail-safe, but an outage-shaped
+   regression.
+2. Deploy the nginx `X-Pocvpn-Edge` lines first (`nginx -t`, graceful
+   reload). The current API ignores the header, so this step alone
+   changes nothing.
+3. Install the updated `gateway/api` and restart `pocvpn-api` (and the
+   ingress roles, which run the same code). Restart resets all limiter
+   state (process-local, in memory).
+4. Verify with bounded requests only (no load test): one client's full
+   activation sequence gets no 429; the staging harness
+   (`tools/cp_loopback_staging_check.py`) stays within its budget.
+
+Known gap: `nginx-pocvpn-cdn-origin-stockholm.conf` proxies
+`/v1/ingress-profile` to 8445 without `X-Real-IP` and without trusted
+real-IP handling for the CDN, so those requests are `unattributed` on edge
+`unknown` and share one per-client bucket. Before relying on that route,
+it needs real_ip restricted to the CDN's published ranges and its own edge
+constant.
+
+Before any production move behind Cloudflare: a production vhost behind
+the Tunnel needs the same `set_real_ip_from 127.0.0.1;` +
+`real_ip_header CF-Connecting-IP;` as the cp-loopback listener, or every
+client collapses into `unattributed`.
+
 ## Deploying a second gateway (e.g. Stockholm)
 
 B14 (2026-08-31) - this entire codebase (`gateway/api/*.py`) is already

@@ -3576,11 +3576,19 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   network it resolved to the carrier's public IPv4 (`78.80.113.26`,
   B57-5E 11.9), so all subscribers behind one CGNAT address share one
   per-IP bucket.
-- `pocvpn-api`'s own limiter is process-wide (60 req/10 s, all clients and
-  endpoints) and one process on 8443 serves both the staging listener and
-  the production 443 vhosts - a shared bottleneck independent of the
-  nginx per-IP limits, NOT per client (open follow-up before any
-  production move behind Cloudflare).
+- One `pocvpn-api` process on 8443 serves both the staging listener and
+  the production 443 vhosts. Deployed (Stockholm today): one process-wide
+  60 req/10 s limiter shared by all clients and endpoints. Repository
+  (B57 follow-up, NOT deployed): `api/admission.py` admits per client ->
+  edge (cp-loopback ceiling) -> endpoint class -> unchanged global
+  ceiling, right after the endpoint's config check and before any
+  validation, store read or lock; a rejected request never spends a later
+  layer. Client = nginx-set `X-Real-IP` (/32, IPv6 /64) + constant
+  `X-Pocvpn-Edge` (`api/client_identity.py`), never `Host` or
+  `X-Forwarded-For`; unusable values map to one still-limited
+  `unattributed` client. Per-token is per device (credential + public
+  key) plus a per-credential cap. All limiter state is process-local and
+  resets on restart.
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
