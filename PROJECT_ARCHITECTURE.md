@@ -3571,8 +3571,16 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Cloudflare sets `X-Forwarded-Proto` from the real edge scheme (a
   client-sent `https` over plain HTTP arrives as `http`). Defense in depth,
   not a boundary. Frankfurt variant: not deployed.
+- The cp listener's nginx zones key on `$binary_remote_addr`, the client
+  address resolved from `CF-Connecting-IP`; on a real mobile CGNAT
+  network it resolved to the carrier's public IPv4 (`78.80.113.26`,
+  B57-5E 11.9), so all subscribers behind one CGNAT address share one
+  per-IP bucket.
 - `pocvpn-api`'s own limiter is process-wide (60 req/10 s, all clients and
-  endpoints) - behind a shared egress it is NOT per client.
+  endpoints) and one process on 8443 serves both the staging listener and
+  the production 443 vhosts - a shared bottleneck independent of the
+  nginx per-IP limits, NOT per client (open follow-up before any
+  production move behind Cloudflare).
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
