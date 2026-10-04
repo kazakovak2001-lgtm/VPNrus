@@ -3577,10 +3577,10 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   B57-5E 11.9), so all subscribers behind one CGNAT address share one
   per-IP bucket.
 - One `pocvpn-api` process on 8443 serves both the staging listener and
-  the production 443 vhosts. Deployed (Stockholm and Frankfurt, pre-B57
-  API code, verified read-only 2026-10-04): one process-wide 60 req/10 s
-  limiter shared by all clients and endpoints. Repository (B57 follow-up,
-  NOT deployed on either gateway): `api/admission.py` admits per client ->
+  the production 443 vhosts. Frankfurt (pre-B57 API code, verified
+  read-only 2026-10-04): one process-wide 60 req/10 s limiter shared by
+  all clients and endpoints. Stockholm (since 2026-10-04, all three API
+  roles) and repository (B57): `api/admission.py` admits per client ->
   edge (cp-loopback ceiling) -> endpoint class -> unchanged global
   ceiling, right after the endpoint's config check and before any
   validation, store read or lock; a rejected request never spends a later
@@ -3607,10 +3607,17 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   "public-443"` on the existing public API locations are live (Frankfurt
   `pocvpn`; Stockholm `pocvpn-stockholm`, all three 443 server blocks).
   Not yet given the edge header: Frankfurt `/v1/relay-health`, the
-  Stockholm cp-loopback listener, the CDN-origin `edge-sthlm` route. The
-  deployed API ignores `X-Pocvpn-Edge`; the per-client limiter and
-  `GATEWAY_SELF_ADDRESSES` are not deployed (gateway-self source observed:
-  Frankfurt `152.70.43.1`, Stockholm `16.170.208.231`; not configured).
+  Stockholm cp-loopback listener (edge `unknown`, so its edge ceiling is
+  inactive), the CDN-origin `edge-sthlm` route (also no `X-Real-IP`, so
+  one shared `unattributed` client).
+- Deployed API limiter (2026-10-04): Stockholm runs the B57 API (`main`
+  `3c7429b` files) with `GATEWAY_SELF_ADDRESSES=16.170.208.231` in
+  `api.env` only - a compatibility rate-limit scope for pre-B57
+  `/v1/manifest` probes, NOT an authentication or trust boundary.
+  Frankfurt still runs pre-B57 API code that ignores `X-Pocvpn-Edge`;
+  `GATEWAY_SELF_ADDRESSES` unset there (observed source `152.70.43.1`).
+  Frankfurt's B57 API needs the separate full API redeploy first (its live
+  copy lacks modules `main`'s handler imports).
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
