@@ -3650,7 +3650,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   replaces the other.
 - Not covered: tunnel -> gateway INPUT path (host's own listeners).
 
-## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; reconcile code on Stockholm only, reconcile timers not deployed on either)
+## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; Stockholm reconcile service units installed + first manual run 2026-10-04, reconcile timers not deployed on either host; Frankfurt reconcile blocked)
 
 - ONE predicate: `gateway/api/activations.py` `entitlement_state(record, now)`
   -> ACTIVE / REVOKED / EXPIRED (`status != ACTIVE` -> REVOKED; `expires_at`
@@ -3684,3 +3684,12 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   leaves the running config untouched (no staging write, no reload).
 - Relay `static_clients` (ingress -> exit infra identity) are NOT user
   entitlements and are never filtered by this predicate.
+- Deployed state (2026-10-04): Stockholm has the three reconcile SERVICE
+  units installed and each was run ONCE by hand (AWG, Xray exit,
+  `ingress-xhttp`); a run is a one-shot convergence, not ongoing
+  enforcement. No timer is installed or enabled on either host, so expired
+  entitlements are removed only when a render or a manual run happens. With
+  the AWG service unit installed, `activation_tokens.py revoke`'s
+  best-effort `systemctl start --no-block pocvpn-awg-reconcile.service`
+  now resolves to a real unit on Stockholm (from code; not yet exercised).
+  Frankfurt: no reconcile units (blocked).
