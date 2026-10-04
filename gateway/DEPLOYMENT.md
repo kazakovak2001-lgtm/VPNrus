@@ -432,10 +432,11 @@ starts with `flush ruleset`. Step 5 as written would enable that service
 chain that also drops `awg-ft31` forwarding. Do not run provision.sh step 5
 on Frankfurt; it needs an ACL design that fits its firewall model first.
 
-## Entitlement reconcile units (B47 T1/T2) - PREPARED, NOT DEPLOYED
+## Entitlement reconcile units (B47 T1/T2) - STOCKHOLM: SERVICE UNITS + FIRST MANUAL RUN (2026-10-04), TIMERS NOT DEPLOYED; FRANKFURT BLOCKED
 
-Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
-step needs explicit owner approval. (2026-10-04: the API part of step 2 -
+Repository-only until 2026-10-04 (what has run since is recorded in
+"Stockholm first manual run" below); each step needs explicit owner
+approval. (2026-10-04: the API part of step 2 -
 `gateway/api` only - is on both hosts, so the render-time expiry check is
 live; on Frankfurt the B57 rollout's controlled `xray_reconcile.py` dropped
 8 Xray identities of expired activations. `lib`, `scripts` and the AWG
@@ -495,6 +496,50 @@ Rollout order (per host):
 5. Verify: revoke a test activation -> its peer and Xray UUID disappear;
    an activation issued with a short `--expires-in-days` disappears after
    expiry without any API request.
+
+Stockholm first manual run (2026-10-04, owner-approved; the units ran by
+hand, NOT from a timer):
+1. Gate 1 - installed ONLY the three service units from
+   `/opt/pocvpn/gateway/systemd/` (hashes equal to `main`; none existed
+   before) into `/etc/systemd/system`, `systemctl daemon-reload`. They are
+   `static` (no `[Install]` target is enabled), so nothing starts them
+   except a manual `systemctl start`, a timer, or the revoke CLI trigger.
+   No timer unit installed.
+2. Snapshot before any run: `/var/backups/pocvpn-b47-reconcile-20261004T160356Z/`
+   (`awg0.conf`, `/etc/nova-xray/config.json`,
+   `/etc/nova-xray-xhttp-ingress/config.json`, both last-activated hashes
+   and both staging candidates, SHA256SUMS).
+3. Gate 2 - `systemctl start pocvpn-awg-reconcile.service`: rc 0; removed
+   only the peer of expired activation `24df65b8` (never handshaked);
+   4 -> 3 peers in `awg0.conf` and live; `awg-poc` reloaded (`syncconf`),
+   not restarted; the active handshake kept; AWG Exit ACL unchanged.
+4. Gate 3 (only after Gate 2 passed) - `systemctl start
+   nova-xray-reconcile.service`: rc 0, `sudo nova-xray-reload` worked under
+   the unit sandbox; removed only the identity of expired activation
+   `dd455189`; 3 -> 2 clients on reality and tls; live = candidate
+   `ca4f289f`; `xray run -test` OK; exactly one `nova-xray` restart; ACL,
+   routing, other inbound settings and the stores unchanged.
+5. Gate 4 (only after Gate 3 passed) - `systemctl start
+   nova-xray-ingress-reconcile@ingress-xhttp.service`: rc 0; removed the
+   only `nova-client-xhttp-in` client (expired 1-day activation `807faf0f`,
+   2026-09-14) - 1 -> 0 is the approved result; live = candidate
+   `81c63608`; `xray run -test` OK; exactly one `nova-xray-xhttp-ingress`
+   restart; REALITY ingress and the stores unchanged.
+No EROFS, permission or read-only error in any unit's journal; `nftables`,
+`pocvpn-api`, `nova-xray-ingress` were not restarted.
+Rollback (not needed): restore the snapshot files with their owner/mode,
+then `systemctl reload awg-poc` (AWG) and `systemctl restart nova-xray` /
+`nova-xray-xhttp-ingress`; uninstall a unit by removing it from
+`/etc/systemd/system` + `daemon-reload`.
+
+Future timer deployment (NOT DONE - needs its own approval): re-run the
+read-only plan first; install the three `.timer` units; note
+`OnBootSec=2min` has long elapsed, so `systemctl enable --now <timer>`
+triggers a run immediately and then every 5 minutes (`Persistent=true`);
+after that every expiry or revocation is applied without a manual step
+(for example the remaining Stockholm exit identity `bbe6beaf` expires
+2026-10-28). Frankfurt stays BLOCKED until the issues listed in the
+precheck above are fixed.
 
 ## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED (both)
 
