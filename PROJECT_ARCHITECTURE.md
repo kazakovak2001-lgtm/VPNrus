@@ -3650,7 +3650,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   replaces the other.
 - Not covered: tunnel -> gateway INPUT path (host's own listeners).
 
-## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; Stockholm reconcile service units installed + first manual run 2026-10-04, reconcile timers not deployed on either host; Frankfurt reconcile blocked)
+## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; Stockholm reconcile service units + first manual run 2026-10-04, timers for AWG / Xray exit / `ingress-xhttp` active since 2026-10-04 (REALITY `@ingress` timer not enabled); Frankfurt reconcile blocked, no timers)
 
 - ONE predicate: `gateway/api/activations.py` `entitlement_state(record, now)`
   -> ACTIVE / REVOKED / EXPIRED (`status != ACTIVE` -> REVOKED; `expires_at`
@@ -3685,10 +3685,14 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
 - Relay `static_clients` (ingress -> exit infra identity) are NOT user
   entitlements and are never filtered by this predicate.
 - Deployed state (2026-10-04): Stockholm has the three reconcile SERVICE
-  units installed and each was run ONCE by hand (AWG, Xray exit,
-  `ingress-xhttp`); a run is a one-shot convergence, not ongoing
-  enforcement. No timer is installed or enabled on either host, so expired
-  entitlements are removed only when a render or a manual run happens. With
+  units installed, each run once by hand, and the timers
+  `pocvpn-awg-reconcile.timer`, `nova-xray-reconcile.timer`,
+  `nova-xray-ingress-reconcile@ingress-xhttp.timer` enabled and active
+  (every 5 min; first automatic runs were no-ops). Expiry/revocation is
+  thus enforced automatically on Stockholm for AWG, Xray exit and XHTTP
+  ingress. `nova-xray-ingress-reconcile@ingress.timer` (REALITY ingress)
+  is NOT enabled, so that role converges only on a render. Frankfurt has
+  no reconcile unit or timer. With
   the AWG service unit installed, `activation_tokens.py revoke`'s
   best-effort `systemctl start --no-block pocvpn-awg-reconcile.service`
   now resolves to a real unit on Stockholm (from code; not yet exercised).
