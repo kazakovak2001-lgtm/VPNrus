@@ -216,6 +216,14 @@ per-IP limits.
   changed.
 
 **Follow-up status: IMPLEMENTED IN REPO + UNIT-TESTED, NOT DEPLOYED.**
+*Update 2026-10-04 (production, not this staging):* only the nginx part
+is deployed - `/v1/tunnel-probe` and `X-Pocvpn-Edge "public-443"` on the
+public vhosts of Frankfurt and Stockholm, physically verified; the API
+limiter and `POCVPN_API_GATEWAY_SELF_ADDRESSES` are still not deployed
+(gateway-self source observed: Frankfurt `152.70.43.1`, Stockholm
+`16.170.208.231`). The cp-loopback listener this document covers is
+unchanged (no `X-Pocvpn-Edge "cp-loopback"` yet). Record:
+`gateway/DEPLOYMENT.md` (B57 rate limits, rollout steps 1-3).
 The description above stays the record of what was measured and of
 what Stockholm still runs. In the repository, `pocvpn-api` now admits
 each request in layers (`gateway/api/admission.py`), right after the

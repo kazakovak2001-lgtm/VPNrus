@@ -3577,9 +3577,10 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   B57-5E 11.9), so all subscribers behind one CGNAT address share one
   per-IP bucket.
 - One `pocvpn-api` process on 8443 serves both the staging listener and
-  the production 443 vhosts. Deployed (Stockholm today): one process-wide
-  60 req/10 s limiter shared by all clients and endpoints. Repository
-  (B57 follow-up, NOT deployed): `api/admission.py` admits per client ->
+  the production 443 vhosts. Deployed (Stockholm and Frankfurt, pre-B57
+  API code, verified read-only 2026-10-04): one process-wide 60 req/10 s
+  limiter shared by all clients and endpoints. Repository (B57 follow-up,
+  NOT deployed on either gateway): `api/admission.py` admits per client ->
   edge (cp-loopback ceiling) -> endpoint class -> unchanged global
   ceiling, right after the endpoint's config check and before any
   validation, store read or lock; a rejected request never spends a later
@@ -3601,6 +3602,15 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   address-based `gateway-self` bootstrap scope (`GATEWAY_SELF_ADDRESSES`)
   exists only for pre-B57 builds that still probe `/v1/manifest`; it is
   not a trusted identity.
+- Deployed edge state (2026-10-04, both public gateways): the static
+  `/v1/tunnel-probe` location and `proxy_set_header X-Pocvpn-Edge
+  "public-443"` on the existing public API locations are live (Frankfurt
+  `pocvpn`; Stockholm `pocvpn-stockholm`, all three 443 server blocks).
+  Not yet given the edge header: Frankfurt `/v1/relay-health`, the
+  Stockholm cp-loopback listener, the CDN-origin `edge-sthlm` route. The
+  deployed API ignores `X-Pocvpn-Edge`; the per-client limiter and
+  `GATEWAY_SELF_ADDRESSES` are not deployed (gateway-self source observed:
+  Frankfurt `152.70.43.1`, Stockholm `16.170.208.231`; not configured).
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.

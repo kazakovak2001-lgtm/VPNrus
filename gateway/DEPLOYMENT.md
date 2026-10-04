@@ -425,10 +425,13 @@ Rollout order (per host):
    an activation issued with a short `--expires-in-days` disappears after
    expiry without any API request.
 
-## pocvpn-api client-isolated rate limits (B57) - PREPARED, NOT DEPLOYED
+## pocvpn-api client-isolated rate limits (B57) - nginx part DEPLOYED, API NOT DEPLOYED
 
-Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
-step needs explicit owner approval.
+Status 2026-10-04: rollout steps 1 and 2 below were done on Frankfurt and
+Stockholm (nginx only); steps 3-5 (`GATEWAY_SELF_ADDRESSES`, API install
+and restart, limiter verification) have NOT been run - both gateways still
+run pre-B57 API code with the old process-wide limiter. Each remaining step
+needs explicit owner approval.
 
 - `gateway/api/admission.py`: per-client -> edge -> endpoint-class ->
   global (60 / 10 s, unchanged) admission, before any validation, store
@@ -476,17 +479,30 @@ Rollout order (per host):
    the one `unattributed` per-client bucket (10 activation-class requests
    / 10 s for the whole vhost) - fail-safe, but an outage-shaped
    regression.
+   Done 2026-10-04 (read-only): every public 443 API location on both
+   hosts sets `X-Real-IP $remote_addr`; the known exception is the
+   CDN-origin `edge-sthlm` `/v1/ingress-profile` route (see Known gap).
 2. Deploy the nginx changes first (`nginx -t`, graceful reload). The
    current API ignores `X-Pocvpn-Edge` and no current client calls
    `/v1/tunnel-probe`, so this step alone changes nothing for clients.
+   Done 2026-10-04 as an additive patch of the LIVE vhosts (not a template
+   copy - the live files drift from the templates), with timestamped
+   backups on each host: `/v1/tunnel-probe` + `X-Pocvpn-Edge "public-443"`
+   on Frankfurt `pocvpn` and on all three 443 blocks of Stockholm
+   `pocvpn-stockholm`. Not yet done: the edge header on Frankfurt
+   `/v1/relay-health` and the Stockholm cp-loopback listener
+   (`"cp-loopback"`).
 3. Read-only, per host: observe which address nginx logs as the client
    for traffic leaving this gateway's own Xray exit towards its own address
    and set `POCVPN_API_GATEWAY_SELF_ADDRESSES` to it (pre-B57 probes only).
-   NOT YET OBSERVED on either host.
+   Observed 2026-10-04: Frankfurt `152.70.43.1`, Stockholm
+   `16.170.208.231` (IPv4); NOT YET CONFIGURED on either host.
    **Ordering for the probe path:** the `/v1/tunnel-probe` location must be
    live on every gateway (both public templates, `nginx -t` + reload)
    BEFORE any Android build using `TUNNEL_PROBE_PATH` ships; otherwise its
    connect confirmation fails and the watchdog ends relayed sessions.
+   Met 2026-10-04 on both gateways (Direct and Relayed probes physically
+   verified, 0 probe requests reached the API).
 4. Install the updated `gateway/api` and restart `pocvpn-api` (and the
    ingress roles, which run the same code). Restart resets all limiter
    state (process-local, in memory).
