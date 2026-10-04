@@ -432,7 +432,7 @@ starts with `flush ruleset`. Step 5 as written would enable that service
 chain that also drops `awg-ft31` forwarding. Do not run provision.sh step 5
 on Frankfurt; it needs an ACL design that fits its firewall model first.
 
-## Entitlement reconcile units (B47 T1/T2) - STOCKHOLM: SERVICE UNITS + FIRST MANUAL RUN + TIMERS ACTIVE (2026-10-04, REALITY `@ingress` TIMER NOT ENABLED); FRANKFURT BLOCKED
+## Entitlement reconcile units (B47 T1/T2) - STOCKHOLM: SERVICE UNITS + FIRST MANUAL RUN + TIMERS ACTIVE (2026-10-04, REALITY `@ingress` TIMER NOT ENABLED); FRANKFURT: CODE + FIRST MANUAL RECONCILE + SERVICE_NAME FIX DONE (2026-10-04), NO UNITS/TIMERS
 
 Repository-only until 2026-10-04 (what has run since is recorded in
 "Stockholm first manual run" and "Stockholm timer deployment"
@@ -613,7 +613,8 @@ Repo-side fix (not deployed):
   `ReadWritePaths=` reset to `/var/lib/pocvpn-xray /etc/nova-xray`.
   `pocvpn-awg-reconcile.service` needs no Frankfurt change.
 
-Frankfurt rollout ORDER (each step owner-approved; not done). The order
+Frankfurt rollout ORDER (steps 1-5 DONE 2026-10-04, owner-approved; step 6
+not done - see "Frankfurt rollout 2026-10-04" below). The order
 matters: once `SERVICE_NAME` is right, the next reload is an
 `awg syncconf` of the whole `awg0.conf`, which would put the revoked
 `OKs+/ytV` and expired `LmtTiZlM` live for the first time unless they are
@@ -635,7 +636,44 @@ removed from `awg0.conf` first.
    Frankfurt drop-in), manual runs, then timers.
 Note: `awg-quick@awg0` reloads with `/usr/bin/awg`, while the scripts'
 `PATH` resolves `awg show` to `/usr/local/bin/awg` (the B37 AWG 3.1
-build); both list peers/interfaces the same way, not separately verified.
+build); both list peers/interfaces the same way (verified in the
+rollout below: guard and convergence checks behaved as predicted).
+
+### Frankfurt rollout 2026-10-04 (owner-approved, steps 1-5; `main` `5724776`)
+
+- Artifact: `git -c core.autocrlf=false archive 5724776` of `gateway/lib`,
+  `scripts`, `tools` + `hosts/frankfurt/awg-host.env` (0 CRLF files),
+  staged root-only on the host, removed afterwards. `gateway/api` was not
+  touched (identical between the deployed `20280f0` and `5724776`).
+- Fresh state 19:40 UTC: unchanged from the precheck (19 configured / 15
+  live, stores untouched since 2026-09-27).
+- Step 1 (19:40:38): backup `/opt/pocvpn/backup-b47fra-20261004T194038Z`
+  (`lib/`, `scripts/`, `tools/`, `awg0.conf`, live peer list,
+  `iptables-save`, `nft list ruleset`; `SHA256SUMS` verified).
+- Step 2: 13 new + 9 updated files installed per file (temp + `mv`),
+  root-owned, `go-w` (31 unchanged); all equal to the artifact;
+  `bash -n` and Python imports OK.
+- Step 3: dry-run = exactly the predicted 10 keys, `MWF0412X` reported only.
+- Step 4 (19:41:16): `awg0.conf` 19 -> 9, exit 1 with
+  `awg0 is live but awg-poc.service is not active` (the new guard); live
+  set unchanged (15).
+- Step 5 (19:41:32): `/etc/pocvpn/awg-host.env` (root 0644,
+  `SERVICE_NAME=awg-quick@awg0`; `load_config` under `env -i` resolves it),
+  one `systemctl reload awg-quick@awg0.service` (rc 0): live = `awg0.conf`
+  = 9 peers - 8 revoked/expired removed, `ZXpu/oOA` and `czbrGTix` live for
+  the first time, the 7 kept peers' last handshakes unchanged.
+- Checks: second reconcile `already converged` (rc 0, no change); the real
+  `pocvpn-api -> sudo -n pocvpn-provision-peer` path with an existing key
+  returned `existing` with 0 reloads and `awg0.conf` unchanged; `awg-ft31`
+  (1 peer), `iptables-save` and the nft ruleset unchanged;
+  `awg-quick@awg0`, `awg-poc-ft31`, `awg-firewall`, `pocvpn-api`,
+  `nova-xray` active; no failed unit, no API warning.
+- Not done: step 6 (no reconcile unit, drop-in or timer installed), so
+  revocation/expiry is still applied to AWG on Frankfurt only by a manual
+  run. A NEW AWG peer from `/v1/activate` is now applied live at once.
+- Rollback: restore `lib/`, `scripts/`, `tools/` and `awg0.conf` from the
+  backup, remove `/etc/pocvpn/awg-host.env`, `systemctl reload
+  awg-quick@awg0` (would put the 8 removed peers back live).
 
 ## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED (both)
 
