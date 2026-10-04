@@ -340,7 +340,9 @@ live host:
 - the live host's actual firewall layout - `gateway/nftables/
   pocvpn.nft.template` assumes nftables; whether the live host runs
   nftables cleanly alongside (or instead of) any pre-existing iptables
-  rules is unconfirmed
+  rules is unconfirmed (checked 2026-10-04: Stockholm runs the nftables
+  model; Frankfurt (Oracle) runs iptables-nft via `netfilter-persistent`
+  and `awg-firewall.sh` - see "AWG Exit Target ACL (nftables)" below)
 - the exact AWG versions actually running live vs. the pinned
   `amneziawg-go`/`amneziawg-tools` tags in `gateway/build-awg.sh`
 - whether `gateway/systemd/pocvpn-api.service`'s `ReadWritePaths=
@@ -393,6 +395,43 @@ any script in this slice.
   1, and run `gateway/tools/enrollment_tokens.py init` - none of which is
   automated by this slice.
 
+## AWG Exit Target ACL (nftables) - DEPLOYED ON STOCKHOLM, BLOCKED ON FRANKFURT
+
+Stockholm, 2026-10-04 15:23:26 UTC (owner-approved; no AWG, Xray or
+`nftables.service` restart, no reconcile, no peer change):
+1. Backup `/var/backups/pocvpn-nft-acl-20261004T151910Z/` (0700):
+   `nftables.conf`, `nftables.pocvpn.conf`, `ruleset.before.nft`, SHA256SUMS;
+   `ruleset.after.nft` added after the apply.
+2. Render `gateway/nftables/pocvpn.nft.template` of `main` `7fdde04` with
+   the host's `lib/common.sh` `render_template` and `config/poc.env`
+   (`NFT_TABLE=pocvpn`, `awg0`, `10.77.0.0/24`) and
+   `detect_egress_interface` (`ens5`), each cross-checked against the live
+   ruleset; `nft -c -f <candidate>` OK; non-comment diff = the two sets and
+   the two reject rules only.
+3. `install -m 644 <candidate> /etc/nftables.pocvpn.conf` +
+   `nft -f /etc/nftables.pocvpn.conf` (atomic `delete table` + recreate;
+   conntrack untouched, established flows keep flowing).
+4. Verified: sets 15 + 10 ranges, reject rules after `established,related`
+   and before the `awg0 -> ens5` accept, `inet filter` hash unchanged,
+   `awg0` 4/4 peers with the same keys, `awg-poc` / `nftables.service`
+   start times and the `nova-xray` PID unchanged, `/etc/nftables.conf`
+   unchanged and `nft -c -f /etc/nftables.conf` OK (the boot/reload path
+   loads the same state).
+Rollback: `install -m 644 <backup>/nftables.pocvpn.conf
+/etc/nftables.pocvpn.conf && nft -f /etc/nftables.pocvpn.conf`.
+
+Frankfurt - BLOCKED (read-only precheck 2026-10-04): the AWG firewall is
+iptables-nft - `netfilter-persistent` (`/etc/iptables/rules.v4`) plus
+`awg-firewall.service` (`/usr/local/sbin/awg-firewall.sh`: INPUT 51820/80/443,
+FORWARD `awg0 <-> ens3`, NAT masquerade `10.77.0.0/24`), Oracle's own INPUT
+and `InstanceServices` rules, and the B37 `awg-ft31` interface
+(`10.77.31.0/24`) with its own FORWARD/NAT rules. `nftables.service` is
+disabled, `/etc/nftables.pocvpn.conf` does not exist and `/etc/nftables.conf`
+starts with `flush ruleset`. Step 5 as written would enable that service
+(flushing the iptables-nft ruleset) and install a `policy drop` forward
+chain that also drops `awg-ft31` forwarding. Do not run provision.sh step 5
+on Frankfurt; it needs an ACL design that fits its firewall model first.
+
 ## Entitlement reconcile units (B47 T1/T2) - PREPARED, NOT DEPLOYED
 
 Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
@@ -401,7 +440,34 @@ step needs explicit owner approval. (2026-10-04: the API part of step 2 -
 live; on Frankfurt the B57 rollout's controlled `xray_reconcile.py` dropped
 8 Xray identities of expired activations. `lib`, `scripts` and the AWG
 reconcile were not redeployed on Frankfurt; their state on Stockholm was
-not re-verified; no reconcile timer is deployed.)
+not re-verified at that point (see the precheck below); no reconcile timer
+is deployed.)
+
+Read-only precheck 2026-10-04 (planner = `main`'s `tools/awg_reconcile.py`
+run directly on the live `awg0.conf` and stores, without
+`reconcile-peers.sh`'s exclusive `.provision.lock`; Xray = candidate render
+compared with the last activated hash; nothing written):
+- Stockholm: `lib`, `scripts` and `tools` (incl. `reconcile-peers.sh`,
+  `awg_reconcile.py`) are byte-identical to `main` (deployed with the
+  2026-09-28 rollout); no unit, timer or cron. Env paths live under
+  `/var/lib/pocvpn-provision*`, matching the units' `ReadWritePaths`.
+  AWG plan: 4 peers, 2 entitled, 1 to remove (expired activation, no
+  handshake ever recorded on the live interface, none in the last 24 h),
+  1 unknown (report only). A first Xray reconcile would drop 1 exit
+  identity (3 -> 2 clients) and the only `ingress-xhttp` client (1 -> 0);
+  `ingress` is converged.
+- Frankfurt - BLOCKED: `reconcile-peers.sh` and `awg_reconcile.py` are
+  absent and `lib/peer_mutations.sh`, `tools/migrate_peer_markers.py`,
+  `xray_reconcile.py`, `ingress_reconcile.py` are older than `main`
+  (`peer_mutations.sh` is also used by provisioning); no unit, timer or
+  cron. Runtime drift: `awg0.conf` has 19 peers, the live interface 15;
+  the B37 `awg-ft31` interface still runs. AWG plan (`main` planner): 19
+  peers, 8 entitled, 10 to remove (4 expired, 6 revoked activations; none
+  with a handshake in the last 7 days), 1 unknown. Xray is converged. The
+  env uses `/var/lib/pocvpn-activation` and `/var/lib/pocvpn-xray`, which
+  `nova-xray-reconcile.service`'s `ReadWritePaths` does not cover, while
+  `xray_activation` opens its lock read-write - so the unit as written
+  would fail there (inferred from code, not run).
 
 - `pocvpn-awg-reconcile.service` + `.timer` (root): removes AWG peers whose
   activation/legacy token is revoked or expired - see

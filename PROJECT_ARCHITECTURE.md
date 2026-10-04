@@ -3622,7 +3622,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
 
-## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27; Xray exit layer live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04; AWG nftables layer not deployed on either)
+## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27; Xray exit layer live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04; AWG nftables layer live on Stockholm since 2026-10-04, blocked on Frankfurt)
 
 - A VPN exit is an Internet proxy, never a proxy into the gateway host, its
   VPC, cloud metadata, or special-purpose space. ONE canonical list:
@@ -3640,12 +3640,17 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   `ct established,related accept` -> tunnel-ingress reject to the sets ->
   tunnel<->egress accept; masquerade (postrouting) unchanged and after it.
   Match only `iifname <awg>` so return traffic and ICMP errors (PMTUD) pass.
+  Live on Stockholm (`nftables.service` includes `/etc/nftables.pocvpn.conf`).
+  Frankfurt's AWG firewall is iptables-nft (`netfilter-persistent`,
+  `awg-firewall.sh`, Oracle rules, `awg-ft31`); provision.sh step 5
+  (`enable --now nftables`, whose config starts with `flush ruleset`) does
+  not fit it - no AWG ACL there until a compatible design exists.
 - Hysteria2 (B46-4P.3) keeps its own application-layer ACL for the same
   classes. Defense in depth: application ACL -> host/network ACL; neither
   replaces the other.
 - Not covered: tunnel -> gateway INPUT path (host's own listeners).
 
-## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; reconcile timers not deployed)
+## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; reconcile code on Stockholm only, reconcile timers not deployed on either)
 
 - ONE predicate: `gateway/api/activations.py` `entitlement_state(record, now)`
   -> ACTIVE / REVOKED / EXPIRED (`status != ACTIVE` -> REVOKED; `expires_at`
