@@ -238,14 +238,29 @@ class PureHelpersTest(unittest.TestCase):
         self.assertFalse(h.classify_rate_limit([403] * 21 + [429] * 9, [429] * 3)[0])
 
     def test_budget_is_below_api_global_limiter(self):
-        # gateway/api/server.py: _GLOBAL_RATE_LIMIT = 60 per 10 s, shared by
-        # every client and endpoint - the harness must stay well below it.
-        server_src = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
-        self.assertIn("_GLOBAL_RATE_LIMIT = 60", server_src)
-        self.assertLess(h.API_REQUEST_BUDGET, 60)
+        # gateway/api/admission.py (B57): one run comes from one client on
+        # the cp-loopback edge, so every proxied request must fit that
+        # client's per-class budget, the cp-loopback edge ceiling and the
+        # process-wide global ceiling - even if all of them were manifest
+        # GETs (the tightest per-client class the harness uses).
+        import sys
+
+        gateway_dir = str(Path(__file__).resolve().parents[2])
+        if gateway_dir not in sys.path:
+            sys.path.insert(0, gateway_dir)
+        from api import admission
+
+        self.assertLess(h.API_REQUEST_BUDGET, admission.GLOBAL_LIMIT)
+        self.assertLessEqual(h.API_REQUEST_BUDGET, admission.EDGE_CEILINGS["cp-loopback"])
+        per_client = min(
+            admission.PER_CLIENT_LIMITS[admission.CLASS_BOOTSTRAP],
+            admission.PER_CLIENT_LIMITS[admission.CLASS_ACTIVATION],
+        )
         for mode in ("loopback", "cloudflare"):
             for scheme in h.SCHEME_ENFORCEMENT_MODES:
-                self.assertLessEqual(h.api_requests_planned(mode, scheme), h.API_REQUEST_BUDGET)
+                planned = h.api_requests_planned(mode, scheme)
+                self.assertLessEqual(planned, h.API_REQUEST_BUDGET)
+                self.assertLessEqual(planned, per_client)
 
     def test_forwarded_headers_match_b57_5e_measurement(self):
         self.assertEqual({"X-Forwarded-Proto": "https", "CF-Visitor": '{"scheme":"https"}'}, h.CLOUDFLARE_FORWARDED)

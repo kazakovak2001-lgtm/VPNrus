@@ -402,7 +402,7 @@ class XrayCoreControllerTest {
 
         assertEquals(XrayCoreStartOutcome.Started, outcome)
         assertEquals(1, runtime.measureDelayCallCount)
-        assertEquals("https://${validProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertEquals("https://${validProfile.server}/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
     }
 
     @Test
@@ -415,7 +415,7 @@ class XrayCoreControllerTest {
         val outcome = harness.controller.requestStart(TransportKind.TLS_TCP)
 
         assertEquals(XrayCoreStartOutcome.Started, outcome)
-        assertEquals("https://${validTlsProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertEquals("https://${validTlsProfile.server}/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
     }
 
     // --- B33 review fix (round 2, blocker): the timeout must be REAL wall-clock-bounded, not merely wrapped around the blocking call ---
@@ -520,7 +520,7 @@ class XrayCoreControllerTest {
 
         assertEquals(XrayCoreStartOutcome.Started, outcome)
         assertEquals(1, runtime.measureDelayCallCount)
-        assertEquals("https://${validProfile.server}/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertEquals("https://${validProfile.server}/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
     }
 
     // B33 relay follow-up (round 2) - a fixed EXIT host, deliberately
@@ -544,10 +544,10 @@ class XrayCoreControllerTest {
 
         assertEquals(XrayCoreStartOutcome.Started, outcome)
         assertEquals(1, runtime.measureDelayCallCount)
-        assertEquals("https://$relayExitProbeHost/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertEquals("https://$relayExitProbeHost/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
         assertTrue(
             "must never dial the client's own INGRESS dial target for a Relayed attempt (the round-1 self-referential-ingress bug)",
-            runtime.lastMeasureDelayUrl != "https://${validProfile.server}/v1/manifest",
+            runtime.lastMeasureDelayUrl != "https://${validProfile.server}/v1/tunnel-probe",
         )
         // B33 relay follow-up (round 3) - a genuine Relayed Started outcome
         // starts a real, independent, Dispatchers.IO-backed relay-health

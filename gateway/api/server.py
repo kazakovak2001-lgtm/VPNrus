@@ -13,15 +13,27 @@ from http.server import ThreadingHTTPServer
 
 from . import config as config_module
 from . import ingress_config as ingress_config_module
-from . import ratelimit
+from . import admission, ratelimit
 from .handler import ProvisioningRequestHandler
 
 _BIND_HOST = "127.0.0.1"
 
+# Per device: an activation credential + the presented device public key
+# (/v1/activate and the profile endpoints), or an enrollment token digest
+# (/v1/peers, whose token is bound to exactly one public key). Value
+# unchanged from the pre-B57 per-token limit.
 _PER_TOKEN_RATE_LIMIT = 5
 _PER_TOKEN_RATE_WINDOW_SECONDS = 10.0
-_GLOBAL_RATE_LIMIT = 60
-_GLOBAL_RATE_WINDOW_SECONDS = 10.0
+# B57 - per activation credential across all of its devices, so that
+# rotating the (not yet authenticated) public key cannot multiply the
+# per-device budget without bound. PROPOSED / NOT YET VERIFIED: two
+# devices' full activation sequences per window.
+_PER_CREDENTIAL_RATE_LIMIT = 10
+_PER_CREDENTIAL_RATE_WINDOW_SECONDS = 10.0
+# The hard global ceiling, value unchanged; see admission.py for the
+# per-client / edge / class layers checked before it.
+_GLOBAL_RATE_LIMIT = admission.GLOBAL_LIMIT
+_GLOBAL_RATE_WINDOW_SECONDS = admission.WINDOW_SECONDS
 
 # Field-test zero-touch enrollment (POST /v1/field-enroll) - a SEPARATE,
 # stricter, per-public-key limiter from per_token_limiter above (that one is
@@ -70,9 +82,13 @@ class ProvisioningServer(ThreadingHTTPServer):
         self.per_token_limiter = ratelimit.RateLimiter(
             _PER_TOKEN_RATE_LIMIT, _PER_TOKEN_RATE_WINDOW_SECONDS, clock=time.monotonic
         )
+        self.per_credential_limiter = ratelimit.RateLimiter(
+            _PER_CREDENTIAL_RATE_LIMIT, _PER_CREDENTIAL_RATE_WINDOW_SECONDS, clock=time.monotonic
+        )
         self.global_limiter = ratelimit.RateLimiter(
             _GLOBAL_RATE_LIMIT, _GLOBAL_RATE_WINDOW_SECONDS, clock=time.monotonic
         )
+        self.admission = admission.AdmissionControl(time.monotonic, self.global_limiter)
         self.field_enrollment_limiter = ratelimit.RateLimiter(
             _FIELD_ENROLLMENT_RATE_LIMIT, _FIELD_ENROLLMENT_RATE_WINDOW_SECONDS, clock=time.monotonic
         )

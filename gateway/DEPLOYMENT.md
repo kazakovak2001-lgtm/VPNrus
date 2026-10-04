@@ -425,6 +425,87 @@ Rollout order (per host):
    an activation issued with a short `--expires-in-days` disappears after
    expiry without any API request.
 
+## pocvpn-api client-isolated rate limits (B57) - PREPARED, NOT DEPLOYED
+
+Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
+step needs explicit owner approval.
+
+- `gateway/api/admission.py`: per-client -> edge -> endpoint-class ->
+  global (60 / 10 s, unchanged) admission, before any validation, store
+  read or lock. Per-token is now per device (credential + public key)
+  plus a per-credential cap. Values marked PROPOSED in that file were not
+  derived from measured traffic.
+- `gateway/api/client_identity.py`: the client is the nginx-set
+  `X-Real-IP` (/32, IPv6 /64); the edge is the nginx-set constant
+  `X-Pocvpn-Edge` (`public-443` or `cp-loopback`). A missing, invalid or
+  loopback address is one shared `unattributed` client per edge - still
+  limited, never unlimited.
+- In-tunnel probes: Xray's connect confirmation and the relayed-session
+  watchdog (every 20 s per relayed session) are sent by the Nova app on the
+  user's device through that user's tunnel and leave the gateway's own Xray
+  exit, so nginx sees the gateway's own address as the client - the same
+  for every user, and identical to any other user request on that path.
+  They cannot be told apart from user traffic at the HTTP layer, so current
+  builds (`XrayCoreController.TUNNEL_PROBE_PATH`) probe `/v1/tunnel-probe`,
+  which nginx answers itself with a static 200: no API, no `limit_req` /
+  `limit_conn`, no client input - nothing another user can exhaust, and
+  nothing gained by calling it. Templates: `nginx-pocvpn.conf`,
+  `nginx-pocvpn-stockholm.conf`.
+- Pre-B57 builds still probe `/v1/manifest`. For them only,
+  `POCVPN_API_GATEWAY_SELF_ADDRESSES` (comma-separated IP literals, empty
+  by default) lists the address(es) nginx reports for this gateway's own
+  traffic; an exact `X-Real-IP` match is admitted in a separate
+  `gateway-self` bootstrap scope (20 / 10 s, PROPOSED) instead of one
+  ordinary per-client bucket (10 / 10 s). Not a trusted identity: tunnelled
+  user traffic lands there too and can fill it. The repository templates'
+  own nginx limit on `/v1/manifest` (B56-3, per address) also applies to
+  these probes - a further reason they moved to `/v1/tunnel-probe`.
+- The global 60 / 10 s ceiling is the one shared safety ceiling. Class and
+  edge ceilings are separate fixed windows, not aligned with it, so no
+  share of it is reserved for activation.
+- Templates `nginx-pocvpn.conf`, `nginx-pocvpn-stockholm.conf`,
+  `nginx-pocvpn-cp-loopback-{stockholm,frankfurt}.conf` add
+  `proxy_set_header X-Pocvpn-Edge "<edge>";` to every API location; the two
+  public templates also add the static `/v1/tunnel-probe` location. No
+  `limit_req` value changed.
+
+Rollout order (per host):
+1. Read-only pre-check: the LIVE vhosts send `X-Real-IP $remote_addr` on
+   every API location (live Stockholm nginx is known to differ from the
+   repo - B57-5E finding 2). Without it every client of that vhost shares
+   the one `unattributed` per-client bucket (10 activation-class requests
+   / 10 s for the whole vhost) - fail-safe, but an outage-shaped
+   regression.
+2. Deploy the nginx changes first (`nginx -t`, graceful reload). The
+   current API ignores `X-Pocvpn-Edge` and no current client calls
+   `/v1/tunnel-probe`, so this step alone changes nothing for clients.
+3. Read-only, per host: observe which address nginx logs as the client
+   for traffic leaving this gateway's own Xray exit towards its own address
+   and set `POCVPN_API_GATEWAY_SELF_ADDRESSES` to it (pre-B57 probes only).
+   NOT YET OBSERVED on either host.
+   **Ordering for the probe path:** the `/v1/tunnel-probe` location must be
+   live on every gateway (both public templates, `nginx -t` + reload)
+   BEFORE any Android build using `TUNNEL_PROBE_PATH` ships; otherwise its
+   connect confirmation fails and the watchdog ends relayed sessions.
+4. Install the updated `gateway/api` and restart `pocvpn-api` (and the
+   ingress roles, which run the same code). Restart resets all limiter
+   state (process-local, in memory).
+5. Verify with bounded requests only (no load test): one client's full
+   activation sequence gets no 429; the staging harness
+   (`tools/cp_loopback_staging_check.py`) stays within its budget.
+
+Known gap: `nginx-pocvpn-cdn-origin-stockholm.conf` proxies
+`/v1/ingress-profile` to 8445 without `X-Real-IP` and without trusted
+real-IP handling for the CDN, so those requests are `unattributed` on edge
+`unknown` and share one per-client bucket. Before relying on that route,
+it needs real_ip restricted to the CDN's published ranges and its own edge
+constant.
+
+Before any production move behind Cloudflare: a production vhost behind
+the Tunnel needs the same `set_real_ip_from 127.0.0.1;` +
+`real_ip_header CF-Connecting-IP;` as the cp-loopback listener, or every
+client collapses into `unattributed`.
+
 ## Deploying a second gateway (e.g. Stockholm)
 
 B14 (2026-08-31) - this entire codebase (`gateway/api/*.py`) is already

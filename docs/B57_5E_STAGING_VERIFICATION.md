@@ -215,6 +215,40 @@ per-IP limits.
   migration of the control plane behind Cloudflare. No limiter value was
   changed.
 
+**Follow-up status: IMPLEMENTED IN REPO + UNIT-TESTED, NOT DEPLOYED.**
+The description above stays the record of what was measured and of
+what Stockholm still runs. In the repository, `pocvpn-api` now admits
+each request in layers (`gateway/api/admission.py`), right after the
+endpoint's config check and before any validation, store read or lock:
+per client (`X-Real-IP` as /32 or IPv6 /64, plus the constant
+`X-Pocvpn-Edge` nginx sets; `gateway/api/client_identity.py`) -> a
+cp-loopback edge ceiling -> a ceiling per endpoint class (bootstrap,
+activation, relay_probe, field_enroll) -> the unchanged 60 / 10 s
+global ceiling. A request rejected by a layer does not spend the later
+ones. The global ceiling stays the one shared, process-wide safety
+ceiling; the class and edge ceilings are separate fixed-window limiters
+whose windows are not aligned with it, so the design does not reserve
+any number of global requests for activation. The in-tunnel probes
+(Xray connect confirmation and the relayed-session watchdog) are sent by
+the Nova app through the user's own tunnel and reach nginx from the
+gateway's own address, indistinguishable from other user requests on that
+path; current Android code therefore probes `/v1/tunnel-probe`, which
+nginx answers itself (static 200, no API, no limiter). Pre-B57 builds
+still probe `/v1/manifest`; for them a separate, still limited
+`gateway-self` bootstrap scope applies when the nginx-set `X-Real-IP`
+exactly matches `POCVPN_API_GATEWAY_SELF_ADDRESSES` (empty by default;
+NOT YET OBSERVED on either host) - not a trusted identity. The per-token limit (5 / 10 s) is now per device (credential +
+presented public key), with a per-credential cap across devices. The
+new values (per-client 10 / 10 s, bootstrap and relay_probe class 20,
+cp-loopback edge 20, gateway-self bootstrap scope 20, per-credential 10)
+are PROPOSED / NOT YET VERIFIED
+and were not derived from measured traffic. No nginx `limit_req` value
+was changed; the templates add `X-Pocvpn-Edge` and the static
+`/v1/tunnel-probe` location. Not deployed on
+Stockholm or Frankfurt, not staging-tested, no load test. Deployment
+order and caveats: `gateway/DEPLOYMENT.md` ("pocvpn-api client-isolated
+rate limits (B57)").
+
 ### 6.5 Observation outside 11.9 scope: XHTTP 503
 
 `POST /v1/xray-profile` with `transport=xhttp` returned 503 in this

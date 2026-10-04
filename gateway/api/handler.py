@@ -37,6 +37,8 @@ from http.server import BaseHTTPRequestHandler
 
 from . import (
     activations,
+    admission,
+    client_identity,
     field_enrollment,
     hysteria_provisioning,
     hysteria_store,
@@ -235,8 +237,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             return self._error(exc.status, exc.error_code)
 
     def _handle_post_inner(self):
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_ACTIVATION)
 
         # Chunked (or any other) Transfer-Encoding is not supported at all -
         # never attempt to parse it. Checked before Content-Length so a
@@ -318,8 +319,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not self.server.config.activation_store_path:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_ACTIVATION)
 
         if self.headers.get_all("Transfer-Encoding"):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
@@ -343,8 +343,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
 
-        if not self.server.per_token_limiter.allow(credential_digest):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._allow_device(credential_digest, public_key)
 
         # B8C1C: ONE call does decide/reserve -> run_provision_peer ->
         # finalize-or-rollback, all inside a single per-activation OS lock
@@ -445,8 +444,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not (cfg.activation_store_path and cfg.xray_store_path and cfg.xray_server_port):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_ACTIVATION)
 
         if self.headers.get_all("Transfer-Encoding"):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
@@ -489,8 +487,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
 
-        if not self.server.per_token_limiter.allow(credential_digest):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._allow_device(credential_digest, public_key)
 
         if not cfg.xray_activation_wrapper_path:
             # The activation boundary (B8K2A) is a separate completeness
@@ -642,8 +639,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not (cfg.activation_store_path and cfg.hysteria2_store_path and cfg.hysteria2_server_port):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "hysteria_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_ACTIVATION)
 
         if self.headers.get_all("Transfer-Encoding"):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
@@ -663,8 +659,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
 
-        if not self.server.per_token_limiter.allow(credential_digest):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._allow_device(credential_digest, public_key)
 
         try:
             result = hysteria_provisioning.provision_hysteria_identity(
@@ -747,8 +742,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if ingress_cfg is None:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "ingress_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_ACTIVATION)
 
         if self.headers.get_all("Transfer-Encoding"):
             raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
@@ -790,8 +784,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
 
-        if not self.server.per_token_limiter.allow(credential_digest):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._allow_device(credential_digest, public_key)
 
         try:
             result = ingress_activation.provision_and_activate(credential, public_key, ingress_cfg)
@@ -935,8 +928,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not self.server.config.relay_probe_hmac_secret_file:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "relay_health_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_RELAY_PROBE)
 
         token = self._require_bearer_token()
         self._log_fields["relay_probe_digest"] = tokens.token_digest(token)[:8]
@@ -986,11 +978,10 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         ):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "field_enrollment_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_FIELD_ENROLL)
 
         # Round-2 review fix (cap exhaustion) - a SEPARATE, much stricter
-        # limiter than the general global_limiter above, scoped to this one
+        # limiter than the class/global admission above, scoped to this one
         # endpoint and applied regardless of which public key is presented.
         # An attacker who mints unlimited public keys cannot exhaust
         # field_enrollment_max_devices (a small number, e.g. 5) faster than
@@ -1107,8 +1098,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not self.server.config.manifest_path:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "manifest_not_configured")
 
-        if not self.server.global_limiter.allow("global"):
-            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        self._admit(admission.CLASS_BOOTSTRAP)
 
         try:
             with open(self.server.config.manifest_path, "rb") as f:
@@ -1231,6 +1221,33 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
         return int(status)
+
+    # --- B57 rate-limit layers (see admission.py) ---
+    def _admit(self, endpoint_class):
+        """Per-client -> edge -> class -> global admission. Called right
+        after each endpoint's own config check and before any header/body
+        validation, store read, lock or provisioning. Identity comes only
+        from the nginx-set X-Real-IP / X-Pocvpn-Edge headers, plus the
+        configured gateway self addresses (see client_identity.py); the
+        client address is never logged."""
+        identity = client_identity.from_header_values(
+            self.headers.get_all("X-Real-IP"),
+            self.headers.get_all("X-Pocvpn-Edge"),
+            self.server.config.gateway_self_addresses,
+        )
+        self._log_fields["edge"] = identity.edge
+        if not self.server.admission.admit(identity, endpoint_class):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+    def _allow_device(self, credential_digest, public_key):
+        """Per device (credential + presented public key), then per
+        credential across all its devices. The public key is not yet
+        authenticated here, so the per-credential bucket is what bounds a
+        caller that rotates keys under one credential."""
+        if not self.server.per_token_limiter.allow(f"{credential_digest}:{public_key}"):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+        if not self.server.per_credential_limiter.allow(credential_digest):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
 
     def _error(self, status, error_code):
         return self._write_json(status, {"error": error_code})
