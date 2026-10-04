@@ -399,8 +399,9 @@ Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
 step needs explicit owner approval. (2026-10-04: the API part of step 2 -
 `gateway/api` only - is on both hosts, so the render-time expiry check is
 live; on Frankfurt the B57 rollout's controlled `xray_reconcile.py` dropped
-8 Xray identities of expired activations. `lib`, `scripts`, the AWG
-reconcile and all timers are still NOT deployed.)
+8 Xray identities of expired activations. `lib`, `scripts` and the AWG
+reconcile were not redeployed on Frankfurt; their state on Stockholm was
+not re-verified; no reconcile timer is deployed.)
 
 - `pocvpn-awg-reconcile.service` + `.timer` (root): removes AWG peers whose
   activation/legacy token is revoked or expired - see
