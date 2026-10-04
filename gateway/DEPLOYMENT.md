@@ -396,7 +396,12 @@ any script in this slice.
 ## Entitlement reconcile units (B47 T1/T2) - PREPARED, NOT DEPLOYED
 
 Repository-only. Nothing below has been run on Frankfurt or Stockholm; each
-step needs explicit owner approval.
+step needs explicit owner approval. (2026-10-04: the API part of step 2 -
+`gateway/api` only - is on both hosts, so the render-time expiry check is
+live; on Frankfurt the B57 rollout's controlled `xray_reconcile.py` dropped
+8 Xray identities of expired activations. `lib`, `scripts` and the AWG
+reconcile were not redeployed on Frankfurt; their state on Stockholm was
+not re-verified; no reconcile timer is deployed.)
 
 - `pocvpn-awg-reconcile.service` + `.timer` (root): removes AWG peers whose
   activation/legacy token is revoked or expired - see
@@ -425,18 +430,17 @@ Rollout order (per host):
    an activation issued with a short `--expires-in-days` disappears after
    expiry without any API request.
 
-## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED ON STOCKHOLM ONLY
+## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED (both)
 
 Status 2026-10-04: rollout steps 1 and 2 below were done on Frankfurt and
-Stockholm (nginx only). Steps 3-5 were done on Stockholm only (owner
-approved, 13:43:45 UTC). Frankfurt still runs pre-B57 API code with the
-old process-wide limiter and is BLOCKED for step 4: its live API is a
-mixed pre-`main` file copy without `field_enrollment`, `exit_target_policy`
-and `hysteria_*`, which `main`'s `handler.py` imports, so installing B57
-there would also deploy non-B57 changes (Exit Target ACL, B47 T1/T2,
-B67.4, B46 Hysteria routes). It needs the separate full Frankfurt API
-redeploy (see the B17 drift note below) first. Each remaining step needs
-explicit owner approval.
+Stockholm (nginx only). Steps 3-5 were done on Stockholm (owner
+approved, 13:43:45 UTC) and on Frankfurt (owner approved, 14:26:30 UTC).
+Frankfurt was first blocked for step 4 - its live API was a mixed
+pre-`main` copy without `field_enrollment`, `exit_target_policy` and
+`hysteria_*`, which `main`'s `handler.py` imports - and was brought to the
+full `main` instead (Exit Target ACL Xray layer and B47 render included;
+see "Frankfurt steps 4-5" below). Each further step needs explicit owner
+approval.
 
 - `gateway/api/admission.py`: per-client -> edge -> endpoint-class ->
   global (60 / 10 s, unchanged) admission, before any validation, store
@@ -503,7 +507,8 @@ Rollout order (per host):
    Observed 2026-10-04: Frankfurt `152.70.43.1`, Stockholm
    `16.170.208.231` (IPv4). Stockholm: CONFIGURED 2026-10-04 in
    `/etc/pocvpn/api.env` only (8443 serves `/v1/manifest`; the ingress
-   env files are unchanged). Frankfurt: NOT CONFIGURED.
+   env files are unchanged). Frankfurt: CONFIGURED 2026-10-04 in
+   `/etc/pocvpn/api.env` (`152.70.43.1`).
    **Ordering for the probe path:** the `/v1/tunnel-probe` location must be
    live on every gateway (both public templates, `nginx -t` + reload)
    BEFORE any Android build using `TUNNEL_PROBE_PATH` ships; otherwise its
@@ -534,6 +539,46 @@ no 429; 11 invalid activates in one window with client-sent `X-Real-IP`,
 logged `edge=public-443`); no 5xx, no secret in logs. Not runtime-verified:
 the global, class and edge ceilings, the gateway-self scope, and a valid
 activation (unit-tested / computed only).
+
+Frankfurt steps 4-5 (2026-10-04, full `main`): installing only the B57
+files was impossible (the live copy lacked modules `main`'s `handler.py`
+imports) and a selective backport was rejected, so the WHOLE
+`gateway/api` of `main` `20280f0` was installed. Owner-approved gates:
+1. Backup `/opt/pocvpn/backup-fullmain-20261004T142339Z` (`chmod 700`):
+   `api/`, `/etc/pocvpn/api.env`, `/etc/nova-xray/config.json`,
+   `/var/lib/pocvpn-xray/xray-activation.last-sha256`,
+   `staging/candidate-config.json`, both stores; `OWNERSHIP.txt` (owner and
+   mode of each) and `SHA256SUMS`, checked against the live files.
+2. Artifact: `git -c core.autocrlf=false archive 20280f0 gateway/api`;
+   every file's sha256 checked against `git cat-file blob`. The first
+   archive, built with the local default `core.autocrlf=true`, had CRLF
+   line endings and failed that blob check; it was rebuilt before any
+   runtime change.
+3. Offline validation in a root-owned stage dir, `python3 -B`,
+   `PYTHONDONTWRITEBYTECODE=1`: hashes, import closure, `load_config()`
+   with the new env line, `import api.server`, candidate Xray render
+   (`xray_activation._render_candidate`) written to a 0600 temp file and
+   `/usr/local/bin/xray run -test -c` on it; candidate compared with the
+   live config (only clients and the ACL outbounds/routing differ).
+4. `mv api api.old-<ts>` + `mv <stage>/api api` (same filesystem), append
+   the `GATEWAY_SELF_ADDRESSES` line (no duplicate), `systemctl restart
+   pocvpn-api`; then the bounded checks of step 5.
+5. Pre-Xray snapshot (counts must match the plan), then ONE controlled
+   `cd /opt/pocvpn/gateway && sudo -u pocvpn-api env
+   PYTHONDONTWRITEBYTECODE=1 python3 -B tools/xray_reconcile.py --env-file
+   /etc/pocvpn/api.env` - exactly one `nova-xray` restart via the existing
+   wrapper - so no ordinary `/v1/xray-profile` request triggers the first
+   new render at an uncontrolled time.
+Result: as on Stockholm (10x 400 then 429 with spoofed client headers, next
+window 400, 0x 5xx); live Xray config = the checked candidate, Exit ACL
+present, 8 identities of expired activations dropped (18 -> 10 clients per
+inbound). Rollback (not needed): API - `mv api api.failed-<ts>`,
+`mv api.old-20261004T142630Z api`, restore `api.env` from the backup,
+restart `pocvpn-api`, check the old hashes. Xray - restore
+`/etc/nova-xray/config.json`, `xray-activation.last-sha256` and
+`candidate-config.json` from the backup with their recorded owner/mode,
+`systemctl restart nova-xray`, `xray run -test`. nginx was not changed, so
+it has no rollback step.
 
 Known gap: `nginx-pocvpn-cdn-origin-stockholm.conf` proxies
 `/v1/ingress-profile` to 8445 without `X-Real-IP` and without trusted
@@ -624,7 +669,10 @@ confirmed via `journalctl`/external curl that `/v1/activate`/
 code otherwise remains behind this repo's HEAD** - a full, reviewed
 redeployment of `gateway/api/*.py` to Frankfurt (bringing it byte-for-byte
 current, not just the manifest route) is a distinct, separate future
-slice, not performed here.
+slice, not performed here. **Resolved for `gateway/api` on 2026-10-04:**
+Frankfurt's `gateway/api` is byte-identical to `main` `20280f0` (B57 rollout,
+"Frankfurt steps 4-5" above); the rest of Frankfurt's `gateway/` tree was
+not redeployed.
 
 ## Hysteria2 on Stockholm (B46-4P.3, 2026-09-27) - PREPARED, NOT DEPLOYED
 

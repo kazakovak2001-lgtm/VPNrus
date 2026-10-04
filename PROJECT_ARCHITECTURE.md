@@ -3577,10 +3577,10 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   B57-5E 11.9), so all subscribers behind one CGNAT address share one
   per-IP bucket.
 - One `pocvpn-api` process on 8443 serves both the staging listener and
-  the production 443 vhosts. Frankfurt (pre-B57 API code, verified
-  read-only 2026-10-04): one process-wide 60 req/10 s limiter shared by
-  all clients and endpoints. Stockholm (since 2026-10-04, all three API
-  roles) and repository (B57): `api/admission.py` admits per client ->
+  the production 443 vhosts. Deployed on both gateways since 2026-10-04
+  (Stockholm: all three API roles; Frankfurt: `pocvpn-api`) and in the
+  repository (B57), replacing the old single process-wide 60 req/10 s
+  limiter: `api/admission.py` admits per client ->
   edge (cp-loopback ceiling) -> endpoint class -> unchanged global
   ceiling, right after the endpoint's config check and before any
   validation, store read or lock; a rejected request never spends a later
@@ -3610,19 +3610,19 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Stockholm cp-loopback listener (edge `unknown`, so its edge ceiling is
   inactive), the CDN-origin `edge-sthlm` route (also no `X-Real-IP`, so
   one shared `unattributed` client).
-- Deployed API limiter (2026-10-04): Stockholm runs the B57 API (`main`
-  `3c7429b` files) with `GATEWAY_SELF_ADDRESSES=16.170.208.231` in
-  `api.env` only - a compatibility rate-limit scope for pre-B57
-  `/v1/manifest` probes, NOT an authentication or trust boundary.
-  Frankfurt still runs pre-B57 API code that ignores `X-Pocvpn-Edge`;
-  `GATEWAY_SELF_ADDRESSES` unset there (observed source `152.70.43.1`).
-  Frankfurt's B57 API needs the separate full API redeploy first (its live
-  copy lacks modules `main`'s handler imports).
+- Deployed API limiter (2026-10-04, both gateways): Stockholm runs the
+  B57 API (`main` `3c7429b` files) with `GATEWAY_SELF_ADDRESSES=16.170.208.231`;
+  Frankfurt runs the whole `gateway/api` of `main` `20280f0` with
+  `GATEWAY_SELF_ADDRESSES=152.70.43.1` (each in `api.env` only). It is a
+  compatibility rate-limit scope for pre-B57 `/v1/manifest` probes, NOT an
+  authentication, authorization or edge-trust boundary. On Frankfurt the
+  B67.4 field-enrollment and B46 Hysteria2 code is present but inactive
+  (no env, no nginx route).
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.
 
-## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27; Xray exit layer live on Stockholm since 2026-09-28, Frankfurt Xray and AWG nftables layer not deployed)
+## Exit Target ACL / SSRF boundary (hard invariant, 2026-09-27; Xray exit layer live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04; AWG nftables layer not deployed on either)
 
 - A VPN exit is an Internet proxy, never a proxy into the gateway host, its
   VPC, cloud metadata, or special-purpose space. ONE canonical list:
@@ -3645,7 +3645,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   replaces the other.
 - Not covered: tunnel -> gateway INPUT path (host's own listeners).
 
-## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28, reconcile timers and Frankfurt not deployed)
+## Entitlement enforcement on the data plane (hard invariant, B47 T1/T2; API/render enforcement live on Stockholm since 2026-09-28 and Frankfurt since 2026-10-04 - its first render dropped 8 expired Xray identities; reconcile timers not deployed)
 
 - ONE predicate: `gateway/api/activations.py` `entitlement_state(record, now)`
   -> ACTIVE / REVOKED / EXPIRED (`status != ACTIVE` -> REVOKED; `expires_at`
