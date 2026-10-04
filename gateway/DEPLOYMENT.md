@@ -425,13 +425,18 @@ Rollout order (per host):
    an activation issued with a short `--expires-in-days` disappears after
    expiry without any API request.
 
-## pocvpn-api client-isolated rate limits (B57) - nginx part DEPLOYED, API NOT DEPLOYED
+## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED ON STOCKHOLM ONLY
 
 Status 2026-10-04: rollout steps 1 and 2 below were done on Frankfurt and
-Stockholm (nginx only); steps 3-5 (`GATEWAY_SELF_ADDRESSES`, API install
-and restart, limiter verification) have NOT been run - both gateways still
-run pre-B57 API code with the old process-wide limiter. Each remaining step
-needs explicit owner approval.
+Stockholm (nginx only). Steps 3-5 were done on Stockholm only (owner
+approved, 13:43:45 UTC). Frankfurt still runs pre-B57 API code with the
+old process-wide limiter and is BLOCKED for step 4: its live API is a
+mixed pre-`main` file copy without `field_enrollment`, `exit_target_policy`
+and `hysteria_*`, which `main`'s `handler.py` imports, so installing B57
+there would also deploy non-B57 changes (Exit Target ACL, B47 T1/T2,
+B67.4, B46 Hysteria routes). It needs the separate full Frankfurt API
+redeploy (see the B17 drift note below) first. Each remaining step needs
+explicit owner approval.
 
 - `gateway/api/admission.py`: per-client -> edge -> endpoint-class ->
   global (60 / 10 s, unchanged) admission, before any validation, store
@@ -496,7 +501,9 @@ Rollout order (per host):
    for traffic leaving this gateway's own Xray exit towards its own address
    and set `POCVPN_API_GATEWAY_SELF_ADDRESSES` to it (pre-B57 probes only).
    Observed 2026-10-04: Frankfurt `152.70.43.1`, Stockholm
-   `16.170.208.231` (IPv4); NOT YET CONFIGURED on either host.
+   `16.170.208.231` (IPv4). Stockholm: CONFIGURED 2026-10-04 in
+   `/etc/pocvpn/api.env` only (8443 serves `/v1/manifest`; the ingress
+   env files are unchanged). Frankfurt: NOT CONFIGURED.
    **Ordering for the probe path:** the `/v1/tunnel-probe` location must be
    live on every gateway (both public templates, `nginx -t` + reload)
    BEFORE any Android build using `TUNNEL_PROBE_PATH` ships; otherwise its
@@ -509,6 +516,24 @@ Rollout order (per host):
 5. Verify with bounded requests only (no load test): one client's full
    activation sequence gets no 429; the staging harness
    (`tools/cp_loopback_staging_check.py`) stays within its budget.
+
+Stockholm step 4 (2026-10-04): the live API differed from `main`
+`3c7429b` only by B57 (`config.py`, `handler.py`, `server.py`; all other
+modules byte-identical), so exactly `admission.py`, `client_identity.py`,
+`config.py`, `handler.py`, `server.py` were installed (`root:root 0644`,
+sha256 checked against `main`) after a `load_config` dry-run of all three
+env files; then `systemctl restart pocvpn-api pocvpn-api-ingress
+pocvpn-api-xhttp-ingress`. Rollback: restore `api/` and `api.env` from
+`/opt/pocvpn/backup-b57-20261004T134333Z` and restart the same three units.
+
+Stockholm step 5 (2026-10-04, about 20 external requests, no load test):
+manifest 200 (`304afa8b`); one invalid-key activate + 4 profile requests,
+no 429; 11 invalid activates in one window with client-sent `X-Real-IP`,
+`X-Forwarded-For` and `X-Pocvpn-Edge: cp-loopback` -> 10x 400 then 429
+`rate_limited` (admission before validation; spoofed headers ignored; API
+logged `edge=public-443`); no 5xx, no secret in logs. Not runtime-verified:
+the global, class and edge ceilings, the gateway-self scope, and a valid
+activation (unit-tested / computed only).
 
 Known gap: `nginx-pocvpn-cdn-origin-stockholm.conf` proxies
 `/v1/ingress-profile` to 8445 without `X-Real-IP` and without trusted
