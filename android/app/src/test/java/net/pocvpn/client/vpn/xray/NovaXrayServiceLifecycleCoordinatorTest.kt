@@ -211,7 +211,7 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         // measureDelay primitive Direct uses - see RemoteConfirmationContext
         // .Relayed's own docs.
         assertEquals(1, runtime.measureDelayCallCount)
-        assertEquals("https://203.0.113.60/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertEquals("https://203.0.113.60/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
         // B33 relay follow-up (round 3) - a genuine Relayed Started outcome
         // now also starts XrayCoreController's own post-Connected relay-
         // health watchdog on this SAME TestScope (probeScope = this) - an

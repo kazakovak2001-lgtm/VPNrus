@@ -220,15 +220,16 @@ class AppConfig:
     # start. Optional and independent of the /v1/hysteria-profile group above,
     # but when set it requires that whole group and must differ from api_port.
     hysteria2_auth_backend_port: int = 0
-    # B57 - this gateway's own addresses AS NGINX SEES THEM when the gateway
-    # connects to itself (Xray `freedom` -> own public address -> nginx ->
-    # X-Real-IP). A request whose X-Real-IP is exactly one of these is
-    # admitted in the separate gateway-self scope (client_identity.py,
-    # admission.py) instead of an ordinary per-client bucket. Comma-
-    # separated IP literals; loopback/unspecified/multicast are rejected.
-    # Empty (the default) = no self scope: such requests are ordinary
-    # clients. Which address nginx logs for a self-connect is host-specific
-    # and must be observed on the host, not assumed.
+    # B57 - this gateway's own addresses AS NGINX SEES THEM for traffic that
+    # leaves this gateway's own Xray exit towards its own public address
+    # (`freedom` -> own address -> nginx -> X-Real-IP). A request whose
+    # X-Real-IP is exactly one of these is admitted in the separate
+    # gateway-self scope (client_identity.py, admission.py) instead of an
+    # ordinary per-client bucket - compatibility for pre-B57 builds that
+    # still probe /v1/manifest; not a trusted identity. Comma-separated IP
+    # literals; loopback/unspecified/multicast are rejected. Empty (the
+    # default) = no such scope. The address is host-specific and must be
+    # observed on the host, not assumed.
     gateway_self_addresses: frozenset = frozenset()
 
 

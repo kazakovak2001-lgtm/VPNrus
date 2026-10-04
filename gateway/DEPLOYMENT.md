@@ -440,23 +440,33 @@ step needs explicit owner approval.
   `X-Pocvpn-Edge` (`public-443` or `cp-loopback`). A missing, invalid or
   loopback address is one shared `unattributed` client per edge - still
   limited, never unlimited.
-- Gateway self-connect: Xray's connect confirmation and the relayed-session
-  watchdog (every 20 s per relayed session) dial the gateway's own
-  `/v1/manifest` through its own Xray exit, so nginx reports the gateway
-  itself as the client. `POCVPN_API_GATEWAY_SELF_ADDRESSES` (comma-separated
-  IP literals, empty by default) lists the address(es) nginx reports for
-  that; an exact `X-Real-IP` match is admitted in a separate
-  `gateway-self` bootstrap scope (20 / 10 s, PROPOSED - about 40 watched
-  relayed sessions, computed) instead of one ordinary per-client bucket
-  (10 / 10 s, about 20 sessions). It is "traffic from this host", not
-  trusted traffic: a VPN user's tunnelled request to the gateway's own
-  address lands there too and is limited the same way.
+- In-tunnel probes: Xray's connect confirmation and the relayed-session
+  watchdog (every 20 s per relayed session) are sent by the Nova app on the
+  user's device through that user's tunnel and leave the gateway's own Xray
+  exit, so nginx sees the gateway's own address as the client - the same
+  for every user, and identical to any other user request on that path.
+  They cannot be told apart from user traffic at the HTTP layer, so current
+  builds (`XrayCoreController.TUNNEL_PROBE_PATH`) probe `/v1/tunnel-probe`,
+  which nginx answers itself with a static 200: no API, no `limit_req` /
+  `limit_conn`, no client input - nothing another user can exhaust, and
+  nothing gained by calling it. Templates: `nginx-pocvpn.conf`,
+  `nginx-pocvpn-stockholm.conf`.
+- Pre-B57 builds still probe `/v1/manifest`. For them only,
+  `POCVPN_API_GATEWAY_SELF_ADDRESSES` (comma-separated IP literals, empty
+  by default) lists the address(es) nginx reports for this gateway's own
+  traffic; an exact `X-Real-IP` match is admitted in a separate
+  `gateway-self` bootstrap scope (20 / 10 s, PROPOSED) instead of one
+  ordinary per-client bucket (10 / 10 s). Not a trusted identity: tunnelled
+  user traffic lands there too and can fill it. The repository templates'
+  own nginx limit on `/v1/manifest` (B56-3, per address) also applies to
+  these probes - a further reason they moved to `/v1/tunnel-probe`.
 - The global 60 / 10 s ceiling is the one shared safety ceiling. Class and
   edge ceilings are separate fixed windows, not aligned with it, so no
   share of it is reserved for activation.
 - Templates `nginx-pocvpn.conf`, `nginx-pocvpn-stockholm.conf`,
   `nginx-pocvpn-cp-loopback-{stockholm,frankfurt}.conf` add
-  `proxy_set_header X-Pocvpn-Edge "<edge>";` to every API location. No
+  `proxy_set_header X-Pocvpn-Edge "<edge>";` to every API location; the two
+  public templates also add the static `/v1/tunnel-probe` location. No
   `limit_req` value changed.
 
 Rollout order (per host):
@@ -466,15 +476,17 @@ Rollout order (per host):
    the one `unattributed` per-client bucket (10 activation-class requests
    / 10 s for the whole vhost) - fail-safe, but an outage-shaped
    regression.
-2. Deploy the nginx `X-Pocvpn-Edge` lines first (`nginx -t`, graceful
-   reload). The current API ignores the header, so this step alone
-   changes nothing.
+2. Deploy the nginx changes first (`nginx -t`, graceful reload). The
+   current API ignores `X-Pocvpn-Edge` and no current client calls
+   `/v1/tunnel-probe`, so this step alone changes nothing for clients.
 3. Read-only, per host: observe which address nginx logs as the client
-   for a self-connect (e.g. `curl https://<own public address>/v1/manifest`
-   run on the host, then the access log's client address) and set
-   `POCVPN_API_GATEWAY_SELF_ADDRESSES` to it. NOT YET OBSERVED on either
-   host; without it the self-connects stay in one ordinary per-client
-   bucket.
+   for traffic leaving this gateway's own Xray exit towards its own address
+   and set `POCVPN_API_GATEWAY_SELF_ADDRESSES` to it (pre-B57 probes only).
+   NOT YET OBSERVED on either host.
+   **Ordering for the probe path:** the `/v1/tunnel-probe` location must be
+   live on every gateway (both public templates, `nginx -t` + reload)
+   BEFORE any Android build using `TUNNEL_PROBE_PATH` ships; otherwise its
+   connect confirmation fails and the watchdog ends relayed sessions.
 4. Install the updated `gateway/api` and restart `pocvpn-api` (and the
    ingress roles, which run the same code). Restart resets all limiter
    state (process-local, in memory).

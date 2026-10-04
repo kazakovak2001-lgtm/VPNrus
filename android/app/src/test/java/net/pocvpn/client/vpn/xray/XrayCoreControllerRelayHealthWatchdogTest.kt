@@ -154,7 +154,7 @@ class XrayCoreControllerRelayHealthWatchdogTest {
         assertEquals(0, runtime.stopLoopCallCount)
         assertEquals(0, unhealthyCalls)
         assertTrue("expected repeated probes, got ${runtime.measureDelayCallCount}", runtime.measureDelayCallCount >= 5)
-        assertEquals("https://$exitProbeHost/v1/manifest", runtime.lastMeasureDelayUrl)
+        assertEquals("https://$exitProbeHost/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
 
         harness.controller.requestStop()
     }

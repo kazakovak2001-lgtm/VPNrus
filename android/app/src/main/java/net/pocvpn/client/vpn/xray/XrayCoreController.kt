@@ -68,7 +68,8 @@ sealed class XrayCoreStartOutcome {
  * class's own docs) picks the variant; this class only ever executes it.
  *
  * [Direct] is the default for every pre-existing call site - byte-for-byte
- * the SAME generic `/v1/manifest` round trip [confirmRemoteConnectivity]
+ * the SAME generic in-tunnel probe round trip ([TUNNEL_PROBE_PATH]; `/v1/manifest`
+ * before B57) [confirmRemoteConnectivity]
  * already performed before this type existed. Physical integration testing
  * (combined PR #55 + PR #53 pre-merge validation) proved that same generic
  * probe is UNSOUND for a Relayed attempt: the client's rendered Xray config
@@ -105,7 +106,7 @@ sealed class XrayCoreStartOutcome {
  * [Relayed] now instead carries [exitProbeHost] - the EXIT endpoint's own
  * plaintext HTTPS host (never the ingress host [Direct]'s own branch
  * effectively targets for a Direct attempt) - and [confirmRemoteConnectivity]
- * dials `https://$exitProbeHost/v1/manifest` via the SAME
+ * dials `https://$exitProbeHost` + [TUNNEL_PROBE_PATH] (`/v1/manifest` before B57) via the SAME
  * [XrayCoreRuntime.measureDelay] primitive [Direct] already uses, through
  * the SAME just-started core's own outbound/routing. **Empirically verified
  * safe end to end, read-only, against the real deployed Stockholm
@@ -374,7 +375,7 @@ class XrayCoreController(
      * same real native primitive v2rayNG's own "test configuration" feature
      * uses - see [XrayCoreRuntime.measureDelay]'s own docs), targeting THIS
      * attempt's own real gateway's already-deployed, unauthenticated
-     * `/v1/manifest` endpoint on port 443 (a real Let's Encrypt IP-SAN
+     * [TUNNEL_PROBE_PATH] (nginx-answered; `/v1/manifest` before B57) on port 443 (a real Let's Encrypt IP-SAN
      * certificate is deployed on both production gateways - verified
      * directly against both live hosts without `-k`/any certificate bypass,
      * `SSL certificate verify ok` in both cases - so this dials cleanly by
@@ -443,7 +444,7 @@ class XrayCoreController(
      *   introduces no new unbounded-retry surface.
      *
      * B33 relay follow-up - [context] selects WHICH host [measureDelay]
-     * dials `/v1/manifest` against inside the abandonable probe coroutine
+     * dials [TUNNEL_PROBE_PATH] against inside the abandonable probe coroutine
      * below (see [RemoteConfirmationContext]'s own docs for exactly why a
      * Relayed attempt must dial the EXIT's host, never the INGRESS host
      * [serverHost] names for that attempt) - every other guarantee described
@@ -456,18 +457,18 @@ class XrayCoreController(
      */
     private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
         val url = when (context) {
-            is RemoteConfirmationContext.Direct -> "https://$serverHost/v1/manifest"
+            is RemoteConfirmationContext.Direct -> "https://$serverHost$TUNNEL_PROBE_PATH"
             // B33 relay follow-up (round 2) - the EXIT's own host,
             // never [serverHost] (that is the client's dial target -
             // the INGRESS for a Relayed attempt, see this function's
             // own top-level docs for why that host specifically
             // reintroduces the round-1 self-referential-ingress bug).
             // Same real native primitive, same just-started core's
-            // outbound/routing, same unauthenticated `/v1/manifest`
-            // path every gateway already serves for Direct - see
+            // outbound/routing, same unauthenticated [TUNNEL_PROBE_PATH]
+            // every gateway serves for Direct - see
             // [RemoteConfirmationContext.Relayed]'s own docs for the
             // empirical proof this target is safe.
-            is RemoteConfirmationContext.Relayed -> "https://${context.exitProbeHost}/v1/manifest"
+            is RemoteConfirmationContext.Relayed -> "https://${context.exitProbeHost}$TUNNEL_PROBE_PATH"
         }
         return boundedMeasureDelay(url)
     }
@@ -569,7 +570,7 @@ class XrayCoreController(
      * separately-tracked session id that could drift).
      */
     private fun startRelayHealthWatchdog(exitProbeHost: String, onUnhealthy: suspend () -> Unit) {
-        val url = "https://$exitProbeHost/v1/manifest"
+        val url = "https://$exitProbeHost$TUNNEL_PROBE_PATH"
         relayHealthWatchdogJob = probeScope.launch {
             var consecutiveFailures = 0
             while (isActive) {
@@ -635,6 +636,21 @@ class XrayCoreController(
          * miss must never be terminal.
          */
         const val RELAY_HEALTH_FAILURE_THRESHOLD = 2
+
+        /**
+         * B57 - the path every in-tunnel liveness probe dials (connect
+         * confirmation, Direct and Relayed, and [startRelayHealthWatchdog]).
+         * Answered by the gateway's own nginx with a static 200 - never
+         * proxied to pocvpn-api, no rate-limit zone, no client input
+         * (gateway/edge/nginx-pocvpn*.conf). The probe leaves the gateway's
+         * own Xray exit, so every user of a gateway reaches nginx from that
+         * same gateway address and cannot be told apart; a probe target
+         * with no limiter is the only one another user's traffic cannot
+         * exhaust. Was `/v1/manifest` (rate-limited per source address)
+         * until B57; the location must be deployed on every gateway before
+         * a build using this path ships.
+         */
+        const val TUNNEL_PROBE_PATH = "/v1/tunnel-probe"
     }
 
     fun requestStop(): XrayCoreStopOutcome {

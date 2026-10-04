@@ -3589,13 +3589,18 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   `unattributed` client. Per-token is per device (credential + public
   key) plus a per-credential cap. The global ceiling is the one shared
   safety ceiling; class/edge ceilings are separate, unaligned fixed
-  windows, so no global share is reserved for activation. Gateway
-  self-connects (Xray connect confirmation and the relayed-session
-  watchdog dial the gateway's own `/v1/manifest` through its own Xray exit)
-  use a separate `gateway-self` bootstrap scope, selected only by an exact
-  match of the nginx-set `X-Real-IP` against configured
-  `GATEWAY_SELF_ADDRESSES` - never by a request header. All limiter state
-  is process-local and resets on restart.
+  windows, so no global share is reserved for activation. All limiter
+  state is process-local and resets on restart.
+- In-tunnel probes (Xray connect confirmation, relayed-session watchdog)
+  originate in the Nova app inside the user's own tunnel and reach the
+  gateway's nginx from the gateway's own address - indistinguishable from
+  other user traffic at the HTTP layer. They therefore target
+  `/v1/tunnel-probe` (`XrayCoreController.TUNNEL_PROBE_PATH`), answered by
+  nginx itself: static 200, never proxied to pocvpn-api, no limit zone, no
+  client input. Never point a probe at a rate-limited or API path. The
+  address-based `gateway-self` bootstrap scope (`GATEWAY_SELF_ADDRESSES`)
+  exists only for pre-B57 builds that still probe `/v1/manifest`; it is
+  not a trusted identity.
 - Production control plane is unchanged: raw IPs and `control.aknova.pp.ua`
   (DNS-only -> `16.170.208.231`). Records: `docs/B57_5E_STAGING_VERIFICATION.md`,
   `docs/B57_5D_ORIGIN_HTTPS_ENFORCEMENT.md`.

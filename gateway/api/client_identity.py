@@ -19,19 +19,21 @@ Never derived from `Host` (a client chooses it on a default_server) or
 from X-Forwarded-For (`$proxy_add_x_forwarded_for` appends to whatever
 the client sent).
 
-Gateway self-connect: Xray's connect confirmation and the relayed-session
-watchdog (android XrayCoreController: `https://<gateway>/v1/manifest`) leave
-the gateway's own Xray `freedom` outbound and dial the gateway's own public
-address, so nginx sees the gateway itself as the client - one address for
-every user of that gateway. When X-Real-IP is EXACTLY one of the operator-
-configured `self_addresses` (AppConfig.gateway_self_addresses), the client
-is GATEWAY_SELF, a separate admission scope (admission.py), never an
-ordinary client bucket and never UNATTRIBUTED. No request header can claim
-this scope: on the public vhosts X-Real-IP is the TCP peer, which no remote
-client can set to the gateway's own address. Any traffic that egresses
-this gateway's own Xray exit towards its own address (including a VPN
-user's tunnelled request) does land in this scope - it is "traffic from
-this host", not "trusted traffic", and stays limited.
+Gateway self address (GATEWAY_SELF): requests that leave this gateway's own
+Xray `freedom` outbound towards its own public address reach nginx FROM that
+address - one address for every user of the gateway. There is no
+server-originated self-connect: the in-tunnel probes (connect confirmation
+and the relayed-session watchdog) are sent by the Nova app on the user's
+device through that user's tunnel, and at the HTTP layer they are identical
+to any other user request taking the same path. Current builds therefore
+probe the nginx-answered `/v1/tunnel-probe` (gateway/edge/, no API, no
+limiter). GATEWAY_SELF only keeps pre-B57 builds, which still probe
+`/v1/manifest`, out of one ordinary 10/10 s per-client bucket: when
+X-Real-IP is EXACTLY one of the operator-configured `self_addresses`
+(AppConfig.gateway_self_addresses) the request gets its own, still limited
+scope (admission.py). It is "traffic leaving this gateway", NOT a trusted
+identity: any tunnelled user can reach and fill it. No request header can
+select it (on the public vhosts X-Real-IP is the TCP peer).
 """
 import ipaddress
 from dataclasses import dataclass

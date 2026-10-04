@@ -9,7 +9,8 @@ validation, store read, OS lock or provisioning. Layers, in order:
     3. class ceiling  (bootstrap / activation / relay_probe / field_enroll)
     4. global ceiling (the pre-B57 hard ceiling, one bucket per process)
 
-Gateway self-connect (client_identity.GATEWAY_SELF, bootstrap class only):
+Gateway self address (client_identity.GATEWAY_SELF, bootstrap class only;
+a compatibility scope for pre-B57 probes, not a trusted identity):
 layers 1 and 3 are replaced by ONE self-scope limiter (SELF_SCOPE_LIMITS),
 keyed (edge, gateway-self, class); layers 2 and 4 still apply. The self
 scope never spends an ordinary client's per-client bucket or the
@@ -87,11 +88,13 @@ EDGE_CEILINGS = {
 
 SELF_SCOPE_LIMITS = {
     # PROPOSED / NOT YET VERIFIED - the same value as the bootstrap class
-    # ceiling, not derived from measured traffic. Every Xray connect
-    # confirmation and every relayed-session watchdog probe (one per 20 s,
-    # android XrayCoreController) on this gateway lands here, so 20 / 10 s
-    # is about 40 concurrently watched relayed sessions (computed, not
-    # measured), less whatever connect confirmations use.
+    # ceiling, not derived from measured traffic. Compatibility scope for
+    # pre-B57 builds, whose connect confirmation and relayed-session
+    # watchdog (one per 20 s) still probe /v1/manifest through the
+    # gateway's own Xray exit: about 40 watched relayed sessions (computed).
+    # NOT a trusted identity - any tunnelled user request to this gateway's
+    # own address lands here too and can fill it. Current builds probe the
+    # nginx-answered /v1/tunnel-probe, which uses no limiter at all.
     CLASS_BOOTSTRAP: 20,
 }
 

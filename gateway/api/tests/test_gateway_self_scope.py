@@ -25,12 +25,13 @@ from api import admission
 from api import client_identity
 from api import config as config_module
 from _fixtures import RunningServer, make_app_config, write_fake_manifest_artifact, write_fake_provision_script
-from _http import get_manifest
+from _http import get_manifest, raw_request
 
 GATEWAY_IP = "203.0.113.1"
 USER_IP = "198.51.100.7"
 PER_CLIENT_BOOT = admission.PER_CLIENT_LIMITS[admission.CLASS_BOOTSTRAP]
 SELF_CAP = admission.SELF_SCOPE_LIMITS[admission.CLASS_BOOTSTRAP]
+TUNNEL_PROBE_PATH = "/v1/tunnel-probe"
 
 
 def nginx(ip, edge="public-443", **extra):
@@ -148,30 +149,123 @@ class ConfigTests(unittest.TestCase):
 
 
 class WatchdogPathFixtureTests(unittest.TestCase):
-    """Static source fixture (no device): the relayed-session watchdog and
-    the connect confirmation dial /v1/manifest, never /v1/relay-health -
-    that is why the self scope is a bootstrap-class scope."""
+    """Static source fixture (no device). The in-tunnel probes (connect
+    confirmation, Direct and Relayed, and the relayed-session watchdog)
+    dial TUNNEL_PROBE_PATH - never /v1/relay-health, and no longer the
+    rate-limited /v1/manifest (the original HIGH-1 path)."""
 
     SOURCE = os.path.join(
         _REPO_DIR, "android", "app", "src", "main", "java", "net", "pocvpn", "client", "vpn", "xray",
         "XrayCoreController.kt",
     )
 
+    def _text(self):
+        with open(self.SOURCE, encoding="utf-8") as handle:
+            return handle.read()
+
     def _function_body(self, text, name):
         start = re.search(rf"private (suspend )?fun {name}\(", text).start()
-        nxt = re.search(r"\n    (private |internal |override )?(suspend )?fun ", text[start + 1:])
-        return text[start:start + 1 + nxt.start()] if nxt else text[start:]
+        # Members sit at 4-space indent: the next such line is the
+        # function's own closing brace.
+        nxt = re.search(r"\n    \S", text[start + 1:])
+        return text[start:start + 1 + nxt.start()]
 
-    def test_watchdog_and_confirmation_use_the_manifest_path(self):
-        with open(self.SOURCE, encoding="utf-8") as handle:
-            text = handle.read()
+    def test_probe_path_constant(self):
+        self.assertEqual(TUNNEL_PROBE_PATH, kotlin_tunnel_probe_path(self._text()))
+
+    def test_watchdog_and_confirmation_use_the_tunnel_probe_path(self):
+        text = self._text()
         watchdog = self._function_body(text, "startRelayHealthWatchdog")
-        self.assertIn('"https://$exitProbeHost/v1/manifest"', watchdog)
-        self.assertNotIn("relay-health", watchdog)
+        self.assertIn('"https://$exitProbeHost$TUNNEL_PROBE_PATH"', watchdog)
         confirm = self._function_body(text, "confirmRemoteConnectivity")
-        self.assertIn('"https://$serverHost/v1/manifest"', confirm)
-        self.assertIn('"https://${context.exitProbeHost}/v1/manifest"', confirm)
-        self.assertNotIn("relay-health", confirm)
+        self.assertIn('"https://$serverHost$TUNNEL_PROBE_PATH"', confirm)
+        self.assertIn('"https://${context.exitProbeHost}$TUNNEL_PROBE_PATH"', confirm)
+        for body in (watchdog, confirm):
+            self.assertNotIn("relay-health", body)
+            self.assertNotIn("/v1/manifest", body)
+
+
+def kotlin_tunnel_probe_path(text):
+    return re.search(r'const val TUNNEL_PROBE_PATH = "([^"]+)"', text).group(1)
+
+
+def _nginx_location(text, path):
+    match = re.search(r"location = " + re.escape(path) + r" \{", text)
+    if match is None:
+        return None
+    depth, i = 1, match.end()
+    while depth:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return text[match.end():i - 1]
+
+
+def _strip_comments(text):
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+class TunnelProbeLocationTests(unittest.TestCase):
+    """The probe target is answered by nginx itself: no API, no limiter, no
+    client input - so no user's traffic can exhaust anything it depends
+    on, and calling it grants nothing."""
+
+    PUBLIC = ("nginx-pocvpn.conf", "nginx-pocvpn-stockholm.conf")
+    NOT_PROBE_TARGETS = ("nginx-pocvpn-cp-loopback-stockholm.conf", "nginx-pocvpn-cp-loopback-frankfurt.conf")
+
+    def _read(self, name):
+        with open(os.path.join(_GATEWAY_DIR, "edge", name), encoding="utf-8") as handle:
+            return _strip_comments(handle.read())
+
+    def test_every_public_gateway_vhost_answers_the_probe_statically(self):
+        for name in self.PUBLIC:
+            with self.subTest(name=name):
+                body = _nginx_location(self._read(name), TUNNEL_PROBE_PATH)
+                self.assertIsNotNone(body)
+                self.assertIn('return 200 "ok\\n";', body)
+                self.assertIn('add_header Cache-Control "private, no-store" always;', body)
+
+    def test_probe_location_shares_no_limiter_and_reaches_no_api(self):
+        for name in self.PUBLIC:
+            body = _nginx_location(self._read(name), TUNNEL_PROBE_PATH)
+            with self.subTest(name=name):
+                for directive in ("proxy_pass", "limit_req", "limit_conn", "fastcgi_pass", "include", "set "):
+                    self.assertNotIn(directive, body)
+
+    def test_probe_location_reads_no_client_input(self):
+        # The only variable is the request method (to refuse non-GET/HEAD);
+        # no header, address or argument can change what it answers.
+        for name in self.PUBLIC:
+            body = _nginx_location(self._read(name), TUNNEL_PROBE_PATH)
+            with self.subTest(name=name):
+                self.assertEqual(["$request_method"], re.findall(r"\$[a-z_]+", body))
+
+    def test_probe_path_is_not_served_on_the_staging_listener(self):
+        for name in self.NOT_PROBE_TARGETS:
+            with self.subTest(name=name):
+                self.assertIsNone(_nginx_location(self._read(name), TUNNEL_PROBE_PATH))
+
+
+class ApiNeverSeesTheProbeTests(_ServerCase):
+    def test_probe_path_is_not_an_api_route(self):
+        # Even if a request for the probe path reached pocvpn-api directly, it
+        # is an unknown route (404) - the API grants it no identity or scope.
+        status, _h, _b = raw_request(self.server.port, "GET", TUNNEL_PROBE_PATH, nginx(GATEWAY_IP), b"")
+        self.assertEqual(404, status)
+        self.assertEqual(0, self.server.srv.global_limiter.size())
+
+
+class SourceAddressLimitTests(unittest.TestCase):
+    """Pins the limitation that motivated moving the probe off the API: at
+    the HTTP layer a probe and any other request that leaves this gateway's
+    own Xray exit are identical, so the address-based gateway-self scope
+    (kept only for pre-B57 builds that still probe /v1/manifest) cannot be
+    a trusted identity."""
+
+    def test_tunnelled_user_and_probe_are_the_same_identity(self):
+        selfs = frozenset({client_identity.parse_address(GATEWAY_IP)})
+        probe = client_identity.from_header_values([GATEWAY_IP], ["public-443"], selfs)
+        tunnelled_user = client_identity.from_header_values([GATEWAY_IP], ["public-443"], selfs)
+        self.assertEqual(probe, tunnelled_user)
 
 
 class DocumentationTruthTests(unittest.TestCase):
@@ -198,6 +292,14 @@ class DocumentationTruthTests(unittest.TestCase):
             for phrase in self.FORBIDDEN:
                 with self.subTest(path=os.path.basename(path), phrase=phrase):
                     self.assertNotIn(phrase, text)
+
+    def test_docs_describe_the_real_probe_mechanism(self):
+        for path in self.FILES[1:]:
+            with open(path, encoding="utf-8") as handle:
+                text = " ".join(handle.read().split())
+            with self.subTest(path=os.path.basename(path)):
+                self.assertIn(TUNNEL_PROBE_PATH, text)
+                self.assertIn("not a trusted identity", text.lower())
 
     def test_admission_states_the_real_invariant(self):
         doc = " ".join((admission.__doc__ or "").split())
