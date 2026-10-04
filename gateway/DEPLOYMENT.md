@@ -572,6 +572,71 @@ the `.timer` file from `/etc/systemd/system` + `daemon-reload`.
 Frankfurt stays BLOCKED (no reconcile unit or timer) until the issues
 listed in the precheck above are fixed.
 
+### Frankfurt - second read-only precheck (2026-10-04 17:34 UTC) and repo-side fix
+
+Read-only (`systemctl show/cat`, `awg show … latest-handshakes`,
+`iptables-save`, `nft list`, stores read through the deployed `api`
+readers; nothing written, no reload):
+- **SERVICE_NAME mismatch (HIGH).** `config/poc.env` has
+  `SERVICE_NAME=awg-poc`; `awg-poc.service` is not-found. `awg0` is run by
+  `awg-quick@awg0.service` (`ExecReload` = `awg syncconf`). So
+  `converge_live_state` saw "service inactive" and returned success
+  without a reload: every API-provisioned AWG peer since the last manual
+  reload (2026-09-26 04:08 UTC) is durable-only. Evidence: `ZXpu/oOA`
+  (2026-09-26 23:52) and `czbrGTix` (2026-09-27 03:13) got
+  `/v1/activate 200` and are in `awg0.conf` but not live. A `main`
+  reconcile would have removed peers from `awg0.conf` only and reported
+  success with them still live.
+- `awg0.conf` 19 peers, live 15: CONFIG_ONLY 4 (`OKs+/ytV` revoked,
+  `LmtTiZlM` expired, `ZXpu/oOA` and `czbrGTix` entitled - all provisioned
+  after the last reload), LIVE_ONLY 0, BOTH 15 (6 entitled, 5 revoked,
+  3 expired, 1 unknown `MWF0412X`). `main` planner: remove 10 (8 live),
+  keep 8 entitled + 1 unknown.
+- Xray paths: lock `/var/lib/pocvpn-xray/xray-activation.lock`, last hash
+  `/var/lib/pocvpn-xray/xray-activation.last-sha256`, staging
+  `/var/lib/pocvpn-xray/staging/candidate-config.json` (= `xray.env`
+  `XRAY_STAGING_CONFIG`); activation store/lock under
+  `/var/lib/pocvpn-activation` (read-only for every reconcile); token store
+  under `/var/lib/pocvpn-provision` (exists).
+- `awg-ft31` (B37): own interface/config (`awg-ft31.conf`, 1 peer, not in
+  `awg0.conf`, no store record), `awg-poc-ft31.service` active but
+  disabled - outside B47.
+
+Repo-side fix (not deployed):
+- `/etc/pocvpn/awg-host.env` (tracked: `gateway/hosts/frankfurt/awg-host.env`,
+  `SERVICE_NAME=awg-quick@awg0`), read by `lib/common.sh`
+  `load_host_overrides` - parsed, only `SERVICE_NAME` accepted.
+- `converge_live_state` dies when the service is inactive but the
+  interface is live (or the interface list cannot be queried) instead of
+  returning success.
+- `gateway/hosts/frankfurt/nova-xray-reconcile.service.d/paths.conf`:
+  `ReadWritePaths=` reset to `/var/lib/pocvpn-xray /etc/nova-xray`.
+  `pocvpn-awg-reconcile.service` needs no Frankfurt change.
+
+Frankfurt rollout ORDER (each step owner-approved; not done). The order
+matters: once `SERVICE_NAME` is right, the next reload is an
+`awg syncconf` of the whole `awg0.conf`, which would put the revoked
+`OKs+/ytV` and expired `LmtTiZlM` live for the first time unless they are
+removed from `awg0.conf` first.
+1. Backup `awg0.conf`, `lib/`, `scripts/`, `tools/`.
+2. Install `lib/`, `scripts/` (incl. `reconcile-peers.sh`) and `tools/`
+   (incl. `awg_reconcile.py`, `migrate_peer_markers.py`) from `main`,
+   WITHOUT `awg-host.env`. From here an AWG provisioning attempt fails
+   closed (no silent durable-only peer) until step 5.
+3. `reconcile-peers.sh --env-file /etc/pocvpn/api.env --dry-run`: expect
+   the 10 keys above.
+4. One manual `reconcile-peers.sh` run: `awg0.conf` 19 -> 9; the run exits
+   non-zero with the SERVICE_NAME message (expected); live unchanged.
+5. Install `/etc/pocvpn/awg-host.env`, then ONE
+   `systemctl reload awg-quick@awg0`: live becomes the 9 peers (8 removed,
+   `ZXpu/oOA` + `czbrGTix` added, 6 entitled + `MWF0412X` kept). Verify
+   with `awg show awg0 peers` against `awg0.conf`.
+6. Separately: units (`pocvpn-awg-reconcile`, `nova-xray-reconcile` + the
+   Frankfurt drop-in), manual runs, then timers.
+Note: `awg-quick@awg0` reloads with `/usr/bin/awg`, while the scripts'
+`PATH` resolves `awg show` to `/usr/local/bin/awg` (the B37 AWG 3.1
+build); both list peers/interfaces the same way, not separately verified.
+
 ## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED (both)
 
 Status 2026-10-04: rollout steps 1 and 2 below were done on Frankfurt and

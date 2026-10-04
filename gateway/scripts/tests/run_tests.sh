@@ -56,11 +56,18 @@ make_fixture() {
 # Fake systemctl for gateway allocation tests - see run_tests.sh.
 case "$1" in
     is-active)
+        # .fake_active_unit (B47 Frankfurt tests) names the ONE unit that is
+        # really running awg0; without it, .fake_active answers for any name.
+        if [ -f "$POCVPN_TEST_ETC/.fake_active_unit" ]; then
+            [ "${!#}" = "$(cat "$POCVPN_TEST_ETC/.fake_active_unit").service" ] && exit 0
+            exit 1
+        fi
         [ -f "$POCVPN_TEST_ETC/.fake_active" ] && exit 0
         exit 1
         ;;
     reload)
         echo x >> "$POCVPN_TEST_ETC/.reload_count"
+        echo "${!#}" >> "$POCVPN_TEST_ETC/.reload_units"
         if [ -f "$POCVPN_TEST_ETC/.fake_reload_fail" ]; then
             exit 1
         fi
@@ -83,6 +90,21 @@ if [ "$1" = "show" ] && [ "${3:-}" = "peers" ]; then
         exit 1
     fi
     cat "$POCVPN_TEST_ETC/live_peers.txt" 2>/dev/null
+    exit 0
+fi
+# `awg show interfaces`: awg0 is up whenever the fake service is active,
+# or when a test forces the B47 Frankfurt mismatch (interface up, service
+# named by SERVICE_NAME not active).
+if [ "$1" = "show" ] && [ "${2:-}" = "interfaces" ] && [ $# -eq 2 ]; then
+    if [ -f "$POCVPN_TEST_ETC/.fake_iface_query_fail" ]; then
+        echo "fake: unable to list interfaces" >&2
+        exit 1
+    fi
+    if [ -f "$POCVPN_TEST_ETC/.fake_active" ] || [ -f "$POCVPN_TEST_ETC/.fake_iface_up" ]; then
+        echo "awg-ft31 awg0"
+    else
+        echo "awg-ft31"
+    fi
     exit 0
 fi
 exit 0
@@ -124,11 +146,11 @@ EOF
     echo "$root"
 }
 
-allocate() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/allocate-and-add-peer.sh" "$@" 2>/dev/null; }
-add_manual() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/add-peer.sh" "$@" 2>/dev/null; }
-remove_manual() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/remove-peer.sh" "$@" 2>/dev/null; }
-provision() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/provision-peer.sh" "$@" 2>/dev/null; }
-provision_stderr() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/provision-peer.sh" "$@" 2>&1 >/dev/null; }
+allocate() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/allocate-and-add-peer.sh" "$@" 2>/dev/null; }
+add_manual() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/add-peer.sh" "$@" 2>/dev/null; }
+remove_manual() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/remove-peer.sh" "$@" 2>/dev/null; }
+provision() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/provision-peer.sh" "$@" 2>/dev/null; }
+provision_stderr() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/provision-peer.sh" "$@" 2>&1 >/dev/null; }
 peer_count() { local n; n=$(grep -c '^\[Peer\]' "$1/etc/awg0.conf" 2>/dev/null); echo "${n:-0}"; }
 allowed_ips_of() { local root=$1 key=$2; grep -A2 "PublicKey = $key\$" "$root/etc/awg0.conf" | grep '^AllowedIPs' | sed -E 's#^AllowedIPs = ([0-9.]+)/32.*#\1#'; }
 has_peer() { grep -qF "PublicKey = $2" "$1/etc/awg0.conf"; }
@@ -145,6 +167,8 @@ live_peers_of() { cat "$1/etc/live_peers.txt" 2>/dev/null; }
 reload_count() { cat "$1/etc/.reload_count" 2>/dev/null | wc -l | tr -d ' '; }
 set_awg_query_fails() { touch "$1/etc/.fake_awg_query_fail"; }
 set_awg_query_succeeds() { rm -f "$1/etc/.fake_awg_query_fail"; }
+set_iface_up_service_mismatch() { touch "$1/etc/.fake_iface_up"; }
+set_iface_query_fails() { touch "$1/etc/.fake_iface_query_fail"; }
 
 # --- peer-marker corruption helpers (for _validate_peer_markers tests) ---
 corrupt_remove_begin_marker() { sed -i '/^# --- PEERS BEGIN ---/d' "$1/etc/awg0.conf"; }
@@ -202,7 +226,7 @@ corrupt_add_peer_with_ip() {
 # config - never a duplicate mutation.
 converge_only() {
     local root=$1 expected=$2 key=$3
-    PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" bash -c '
+    PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" bash -c '
         set -euo pipefail
         source "'"$root"'/lib/common.sh"
         source "'"$root"'/lib/peer_mutations.sh"
@@ -1143,7 +1167,7 @@ RGWKEY="ggggggggggggggggggggggggggggggggggggggggggg="
 # remove_if_present_only <root> <key> -> prints mutate_remove_peer_if_present's rc
 remove_if_present_only() {
     local root=$1 key=$2
-    PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" bash -c '
+    PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" bash -c '
         set -euo pipefail
         source "'"$root"'/lib/common.sh"
         source "'"$root"'/lib/peer_mutations.sh"
@@ -1195,8 +1219,8 @@ POCVPN_API_ACTIVATION_STORE_PATH=$root/etc/activations.json
 ENV
 }
 
-reconcile() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/reconcile-peers.sh" --env-file "$root/etc/api.env" "$@" 2>/dev/null; }
-reconcile_stderr() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" "$root/scripts/reconcile-peers.sh" --env-file "$root/etc/api.env" "$@" 2>&1 >/dev/null; }
+reconcile() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/reconcile-peers.sh" --env-file "$root/etc/api.env" "$@" 2>/dev/null; }
+reconcile_stderr() { local root=$1; shift; PATH="$root/bin:$PATH" POCVPN_TEST_ETC="$root/etc" POCVPN_AWG_HOST_ENV_FILE="$root/etc/awg-host.env" "$root/scripts/reconcile-peers.sh" --env-file "$root/etc/api.env" "$@" 2>&1 >/dev/null; }
 export -f reconcile
 
 test_remove_if_present_absent_is_noop() {
@@ -1456,6 +1480,165 @@ reconcile_structural_case "last peer block unterminated before END" corrupt_last
 reconcile_structural_case "key line outside a peer block" corrupt_key_line_after_block_end
 reconcile_structural_case "missing END marker" corrupt_remove_end_marker
 reconcile_structural_case "duplicated BEGIN marker" corrupt_duplicate_begin_marker
+
+# --- B47 Frankfurt: SERVICE_NAME / live-interface mismatch guard and the
+# per-host /etc/pocvpn/awg-host.env override. Frankfurt runtime (precheck
+# 2026-10-04): poc.env SERVICE_NAME=awg-poc (unit not-found) while awg0 is
+# run by awg-quick@awg0, so converge_live_state skipped every reload. ---
+
+# frankfurt_world <root>: awg0 is up and run by awg-quick@awg0; the
+# poc.env SERVICE_NAME (pocvpn-test-nonexistent-*) names no running unit.
+frankfurt_world() {
+    echo "awg-quick@awg0" > "$1/etc/.fake_active_unit"
+    set_iface_up_service_mismatch "$1"
+    set_reload_converges "$1"
+}
+set_host_service_name() { printf '# host override\n\nSERVICE_NAME=%s\n' "$2" > "$1/etc/awg-host.env"; }
+
+test_mismatch_provision_fails_not_false_success() {
+    local root; root=$(make_fixture "10.151.60.0/29" "10.151.60.1" 29)
+    frankfurt_world "$root"
+    local rc=0 err; err=$(provision_stderr "$root" "$KEY1") || rc=$?
+    if [ "$rc" != "0" ] && has_peer "$root" "$KEY1" && [ "$(reload_count "$root")" = "0" ] \
+        && [ -z "$(live_peers_of "$root" | grep -xF "$KEY1")" ] && echo "$err" | grep -q "SERVICE_NAME does not name the unit"; then
+        pass "B47 FRA: interface live + SERVICE_NAME unit inactive -> provision fails (non-zero), durable entry retained, no false success"
+    else
+        fail "B47 FRA mismatch provision: rc=$rc reloads=$(reload_count "$root") err='$err'"
+    fi
+    rm -rf "$root"
+}
+
+test_inactive_and_interface_down_still_applies_next_start() {
+    local root; root=$(make_fixture "10.151.61.0/29" "10.151.61.1" 29)
+    local rc=0 out; out=$(provision "$root" "$KEY1") || rc=$?
+    if [ "$rc" = "0" ] && [ "$out" = "$(printf 'created\t10.151.61.2')" ] && [ "$(reload_count "$root")" = "0" ]; then
+        pass "B47 FRA: service inactive AND interface down -> unchanged 'applies next start' success, no reload"
+    else
+        fail "B47 FRA inactive+down: rc=$rc out='$out' reloads=$(reload_count "$root")"
+    fi
+    rm -rf "$root"
+}
+
+test_inactive_interface_query_failure_fails_closed() {
+    local root; root=$(make_fixture "10.151.62.0/29" "10.151.62.1" 29)
+    set_iface_query_fails "$root"
+    local rc=0; provision "$root" "$KEY1" >/dev/null || rc=$?
+    if [ "$rc" != "0" ] && has_peer "$root" "$KEY1" && [ "$(reload_count "$root")" = "0" ]; then
+        pass "B47 FRA: service inactive and interface list unqueryable -> non-zero (state unknown is never 'down')"
+    else
+        fail "B47 FRA iface query failure: rc=$rc"
+    fi
+    rm -rf "$root"
+}
+
+test_host_override_service_name_converges() {
+    local root; root=$(make_fixture "10.151.63.0/29" "10.151.63.1" 29)
+    frankfurt_world "$root"
+    set_host_service_name "$root" "awg-quick@awg0"
+    local rc=0; provision "$root" "$KEY1" >/dev/null || rc=$?
+    if [ "$rc" = "0" ] && live_peers_of "$root" | grep -qxF "$KEY1" \
+        && [ "$(cat "$root/etc/.reload_units")" = "awg-quick@awg0.service" ]; then
+        pass "B47 FRA: awg-host.env SERVICE_NAME=awg-quick@awg0 -> provision reloads that unit and the peer is live"
+    else
+        fail "B47 FRA host override: rc=$rc reload_units='$(cat "$root/etc/.reload_units" 2>/dev/null)'"
+    fi
+    rm -rf "$root"
+}
+
+host_override_rejected_case() {
+    local label=$1 content=$2
+    local root; root=$(make_fixture "10.151.64.0/29" "10.151.64.1" 29)
+    frankfurt_world "$root"
+    printf '%s\n' "$content" > "$root/etc/awg-host.env"
+    local before rc=0; before=$(sha256sum "$root/etc/awg0.conf")
+    provision "$root" "$KEY1" >/dev/null || rc=$?
+    if [ "$rc" != "0" ] && [ "$(sha256sum "$root/etc/awg0.conf")" = "$before" ] && [ "$(reload_count "$root")" = "0" ]; then
+        pass "B47 FRA: awg-host.env rejected ($label) before any mutation"
+    else
+        fail "B47 FRA host override '$label': rc=$rc unchanged=$([ "$(sha256sum "$root/etc/awg0.conf")" = "$before" ] && echo y || echo n)"
+    fi
+    rm -rf "$root"
+}
+
+# Frankfurt-shaped first reconcile (mirrors the 2026-10-04 precheck classes):
+#   K1 live + revoked, K2 live + expired, K3 config-only + revoked,
+#   K4 config-only + entitled, K5 live + entitled, K6 live + unknown.
+FKEY1="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE="
+FKEY2="GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGE="
+FKEY3="HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHE="
+FKEY4="JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJE="
+FKEY5="KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKE="
+FKEY6="LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLE="
+frankfurt_reconcile_fixture() {
+    local root; root=$(make_fixture "10.151.65.0/28" "10.151.65.1" 28)
+    local k
+    # durable-only writes (service inactive, interface down), like Frankfurt's
+    # API path wrote them; live set then set to the precheck shape.
+    for k in "$FKEY1" "$FKEY2" "$FKEY3" "$FKEY4" "$FKEY5" "$FKEY6"; do provision "$root" "$k" >/dev/null; done
+    set_live_peers "$root" "$FKEY1" "$FKEY2" "$FKEY5" "$FKEY6"
+    write_entitlement_stores "$root" "$FKEY1:REVOKED:none" "$FKEY2:ACTIVE:past" "$FKEY3:REVOKED:none" \
+        "$FKEY4:ACTIVE:none" "$FKEY5:ACTIVE:none"
+    frankfurt_world "$root"
+    echo "$root"
+}
+
+test_frankfurt_reconcile_without_override_is_not_false_success() {
+    local root; root=$(frankfurt_reconcile_fixture)
+    local rc=0 err; err=$(reconcile_stderr "$root") || rc=$?
+    local live; live=$(live_peers_of "$root")
+    if [ "$rc" != "0" ] && ! has_peer "$root" "$FKEY1" && echo "$live" | grep -qxF "$FKEY1" \
+        && [ "$(reload_count "$root")" = "0" ] && echo "$err" | grep -q "SERVICE_NAME does not name the unit"; then
+        pass "B47 FRA: reconcile under today's SERVICE_NAME mismatch exits non-zero (durable removal done, live untouched) - never 'converged'"
+    else
+        fail "B47 FRA reconcile w/o override: rc=$rc reloads=$(reload_count "$root") err='$err'"
+    fi
+    rm -rf "$root"
+}
+
+test_frankfurt_reconcile_with_override_converges_exact_set() {
+    local root; root=$(frankfurt_reconcile_fixture)
+    set_host_service_name "$root" "awg-quick@awg0"
+    local rc=0; reconcile "$root" >/dev/null || rc=$?
+    local live conf
+    live=$(live_peers_of "$root" | sort)
+    conf=$(grep '^PublicKey = ' "$root/etc/awg0.conf" | sed 's/^PublicKey = //' | sort)
+    local want; want=$(printf '%s\n' "$FKEY4" "$FKEY5" "$FKEY6" | sort)
+    local rc2=0; reconcile "$root" >/dev/null || rc2=$?
+    if [ "$rc" = "0" ] && [ "$conf" = "$want" ] && [ "$live" = "$want" ] \
+        && [ "$(reload_count "$root")" = "1" ] && [ "$rc2" = "0" ] && [ "$(reload_count "$root")" = "1" ]; then
+        pass "B47 FRA: reconcile with awg-host.env removes revoked/expired (live + config-only), keeps entitled + unknown, config-only entitled peer becomes live, one reload, second run a no-op"
+    else
+        fail "B47 FRA reconcile with override: rc=$rc rc2=$rc2 reloads=$(reload_count "$root") conf=[$conf] live=[$live]"
+    fi
+    rm -rf "$root"
+}
+
+test_tracked_frankfurt_host_file_accepted() {
+    local got rc=0
+    got=$(POCVPN_AWG_HOST_ENV_FILE="$REPO_GATEWAY_DIR/hosts/frankfurt/awg-host.env" bash -c '
+        set -euo pipefail
+        source "'"$REPO_GATEWAY_DIR"'/lib/common.sh"
+        load_config
+        printf "%s|%s|%s" "$SERVICE_NAME" "$INTERFACE_NAME" "$CONFIG_DIR"
+    ' 2>/dev/null) || rc=$?
+    if [ "$rc" = "0" ] && [ "$got" = "awg-quick@awg0|awg0|/etc/amnezia/amneziawg" ]; then
+        pass "B47 FRA: tracked hosts/frankfurt/awg-host.env parses to SERVICE_NAME=awg-quick@awg0, addressing unchanged"
+    else
+        fail "B47 FRA tracked host file: rc=$rc got='$got'"
+    fi
+}
+
+test_tracked_frankfurt_host_file_accepted
+test_mismatch_provision_fails_not_false_success
+test_inactive_and_interface_down_still_applies_next_start
+test_inactive_interface_query_failure_fails_closed
+test_host_override_service_name_converges
+host_override_rejected_case "unsupported key" "CONFIG_DIR=/tmp/evil"
+host_override_rejected_case "shell in value" 'SERVICE_NAME=$(touch /tmp/pwn)'
+host_override_rejected_case "empty value" "SERVICE_NAME="
+host_override_rejected_case "malformed line" "this is not a key value pair"
+test_frankfurt_reconcile_without_override_is_not_false_success
+test_frankfurt_reconcile_with_override_converges_exact_set
 
 echo
 echo "== results: $PASSES passed, $FAILURES failed =="

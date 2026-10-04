@@ -234,14 +234,35 @@ _live_peer_state_matches() {
     esac
 }
 
+# _require_interface_not_live
+# B47 Frankfurt: "service inactive" is only a safe reason to skip the live
+# step when the interface really is down. If $INTERFACE_NAME is up while
+# $SERVICE_NAME is not active, SERVICE_NAME names the wrong unit (observed
+# on Frankfurt: poc.env said awg-poc, the interface is run by
+# awg-quick@awg0), and returning success would leave every durable add or
+# removal unapplied while reporting it as done. Dies in that case, and when
+# the interface list cannot be queried (state unknown, never "down").
+_require_interface_not_live() {
+    local interfaces awg_rc=0
+    interfaces=$(awg show interfaces 2>/dev/null) || awg_rc=$?
+    if [ "$awg_rc" -ne 0 ]; then
+        die "$SERVICE_NAME.service is not active and the live AWG interface list could not be queried - cannot confirm $INTERFACE_NAME is down; config change is retained, live state NOT converged"
+    fi
+    if printf '%s\n' "$interfaces" | tr ' \t' '\n\n' | grep -qxF "$INTERFACE_NAME"; then
+        die "$INTERFACE_NAME is live but $SERVICE_NAME.service is not active - SERVICE_NAME does not name the unit running $INTERFACE_NAME (set it in /etc/pocvpn/awg-host.env); config change is retained, live state NOT converged"
+    fi
+}
+
 # converge_live_state <present|absent> <PUBLIC_KEY>
 #
 # Call only AFTER the corresponding mutate_add_peer/mutate_remove_peer has
 # already durably persisted the change, still holding the same lock.
 #
-# - Service inactive: durable config is sufficient: it applies on next
-#   start. Returns success (0) without attempting a reload - matches the
-#   existing CLI behavior of "peer will apply the next time it starts".
+# - Service inactive AND interface down (see _require_interface_not_live):
+#   durable config is sufficient: it applies on next start. Returns
+#   success (0) without attempting a reload - matches the existing CLI
+#   behavior of "peer will apply the next time it starts". Service
+#   inactive while the interface is live dies instead.
 # - Service active: success requires the live interface to actually
 #   reflect the expected peer state. If it doesn't yet (or the live query
 #   itself fails - see _live_peer_state_matches), one reload is attempted
@@ -259,6 +280,7 @@ converge_live_state() {
     local match_rc
 
     if ! systemctl is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+        _require_interface_not_live
         log "$SERVICE_NAME.service is not currently active - durable config will apply next start"
         return 0
     fi

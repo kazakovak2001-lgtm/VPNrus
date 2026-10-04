@@ -11,6 +11,41 @@ load_config() {
     source "$GATEWAY_ROOT/config/poc.env"
     # shellcheck disable=SC1090
     source "$GATEWAY_ROOT/config/awg-profile.env"
+    load_host_overrides "${POCVPN_AWG_HOST_ENV_FILE:-/etc/pocvpn/awg-host.env}"
+}
+
+# load_host_overrides <PATH>
+# B47 Frankfurt: per-host facts the tracked config/poc.env cannot carry.
+# Stockholm's AWG unit is awg-poc.service (poc.env default); Frankfurt's is
+# awg-quick@awg0.service, and a wrong SERVICE_NAME makes converge_live_state
+# skip every live reload. The file lives outside the deployed tree, so a
+# redeploy of config/ never reverts it. Absent file = no override.
+#
+# PARSED, never sourced: exactly SERVICE_NAME is accepted, any other key or
+# a malformed value fails closed - this runs as root for provisioning and
+# reconcile, so a host file must not be able to inject shell or silently
+# change addressing (CONFIG_DIR/INTERFACE_NAME stay repo-defined).
+# POCVPN_AWG_HOST_ENV_FILE exists for the test harness only; the sudo
+# wrapper's `env -i` and the systemd units never set it.
+load_host_overrides() {
+    local path=$1 line key value
+    [ -e "$path" ] || return 0
+    [ -f "$path" ] && [ -r "$path" ] || die "host override $path is not a readable regular file"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || die "host override $path: malformed line"
+        key=${BASH_REMATCH[1]}
+        value=${BASH_REMATCH[2]}
+        case "$key" in
+            SERVICE_NAME)
+                [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9@._-]{0,99}$ ]] \
+                    || die "host override $path: invalid SERVICE_NAME value"
+                SERVICE_NAME=$value
+                ;;
+            *) die "host override $path: unsupported key $key (only SERVICE_NAME may be overridden)" ;;
+        esac
+    done < "$path"
 }
 
 # A WireGuard/AmneziaWG key is 32 raw bytes, base64-encoded -> 44 chars, last char '='.
