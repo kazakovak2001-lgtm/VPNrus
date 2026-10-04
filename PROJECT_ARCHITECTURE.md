@@ -3677,6 +3677,17 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Lock order: `.provision.lock` -> store shared locks; the reconcile never
   takes a per-activation lock (the API holds per-activation -> waits on
   `.provision.lock`), so no cycle.
+- Live convergence (provisioning AND reconcile) goes through
+  `converge_live_state`, which reloads `$SERVICE_NAME`. `SERVICE_NAME` is
+  per host: `config/poc.env` default `awg-poc`, overridable ONLY by
+  `/etc/pocvpn/awg-host.env` (parsed, never sourced; `SERVICE_NAME` is the
+  sole accepted key; Frankfurt: `awg-quick@awg0`, tracked in
+  `gateway/hosts/frankfurt/`). "Service inactive" is success only when
+  `$INTERFACE_NAME` is really down (`awg show interfaces`); interface up +
+  service inactive, or an unqueryable interface list, dies - a wrong
+  `SERVICE_NAME` can never again report durable-only changes as converged.
+- Per-host systemd path differences are tracked drop-ins under
+  `gateway/hosts/<host>/` (reset + exact list), never widened base units.
 - Xray: the existing render -> hash compare -> `nova-xray-reload` path, run
   periodically by `nova-xray-reconcile.timer` /
   `nova-xray-ingress-reconcile@<env>.timer`; expiry changes the render, so
@@ -3696,4 +3707,6 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   the AWG service unit installed, `activation_tokens.py revoke`'s
   best-effort `systemctl start --no-block pocvpn-awg-reconcile.service`
   now resolves to a real unit on Stockholm (from code; not yet exercised).
-  Frankfurt: no reconcile units (blocked).
+  Frankfurt: no reconcile units (blocked on deployment; the repo-side
+  blockers - SERVICE_NAME mismatch and Xray reconcile write paths - are
+  addressed in the repo, see gateway/DEPLOYMENT.md).
