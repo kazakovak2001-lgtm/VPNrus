@@ -432,17 +432,18 @@ starts with `flush ruleset`. Step 5 as written would enable that service
 chain that also drops `awg-ft31` forwarding. Do not run provision.sh step 5
 on Frankfurt; it needs an ACL design that fits its firewall model first.
 
-## Entitlement reconcile units (B47 T1/T2) - STOCKHOLM: SERVICE UNITS + FIRST MANUAL RUN (2026-10-04), TIMERS NOT DEPLOYED; FRANKFURT BLOCKED
+## Entitlement reconcile units (B47 T1/T2) - STOCKHOLM: SERVICE UNITS + FIRST MANUAL RUN + TIMERS ACTIVE (2026-10-04, REALITY `@ingress` TIMER NOT ENABLED); FRANKFURT BLOCKED
 
 Repository-only until 2026-10-04 (what has run since is recorded in
-"Stockholm first manual run" below); each step needs explicit owner
+"Stockholm first manual run" and "Stockholm timer deployment"
+below); each step needs explicit owner
 approval. (2026-10-04: the API part of step 2 -
 `gateway/api` only - is on both hosts, so the render-time expiry check is
 live; on Frankfurt the B57 rollout's controlled `xray_reconcile.py` dropped
 8 Xray identities of expired activations. `lib`, `scripts` and the AWG
 reconcile were not redeployed on Frankfurt; their state on Stockholm was
 not re-verified at that point (see the precheck below); no reconcile timer
-is deployed.)
+was deployed at that point.)
 
 Read-only precheck 2026-10-04 (planner = `main`'s `tools/awg_reconcile.py`
 run directly on the live `awg0.conf` and stores, without
@@ -532,17 +533,44 @@ then `systemctl reload awg-poc` (AWG) and `systemctl restart nova-xray` /
 `nova-xray-xhttp-ingress`; uninstall a unit by removing it from
 `/etc/systemd/system` + `daemon-reload`.
 
-Future timer deployment (NOT DONE - needs its own approval): re-run the
-read-only plan first; install the three `.timer` units; note
-`OnBootSec=2min` has long elapsed on a running host, so `systemctl enable
---now <timer>` triggers a run immediately and then every 5 minutes
-(`OnUnitActiveSec=5min`). `Persistent=true` is also set, but it is not
-what causes that immediate run - it only applies to `OnCalendar=` timers,
-not to these monotonic `OnBootSec`/`OnUnitActiveSec` ones. After that
-every expiry or revocation is applied without a manual step (for example
-the remaining Stockholm exit identity `bbe6beaf` expires 2026-10-28).
-Frankfurt stays BLOCKED until the issues listed in the precheck above are
-fixed.
+Stockholm timer deployment (2026-10-04 17:05 UTC, owner-approved):
+1. Pre-check (read-only): host, `main` = `daf24c8`, service units and
+   timer files identical to `main`, no timer installed, fresh plan a
+   no-op for AWG, Xray exit and both ingress roles.
+2. Installed ONLY `pocvpn-awg-reconcile.timer`,
+   `nova-xray-reconcile.timer` and the template
+   `nova-xray-ingress-reconcile@.timer` from `/opt/pocvpn/gateway/systemd/`,
+   `systemctl daemon-reload`, then `systemctl enable --now` of
+   `pocvpn-awg-reconcile.timer`, `nova-xray-reconcile.timer` and
+   `nova-xray-ingress-reconcile@ingress-xhttp.timer`, one at a time.
+3. Result: all three timers loaded, enabled, active (waiting). Timer
+   semantics: `OnBootSec=2min` has long elapsed on a running host, so
+   `enable --now` triggered a run immediately, then every 5 minutes
+   (`OnUnitActiveSec=5min`). `Persistent=true` is also set, but it is
+   not what causes that immediate run - it only applies to
+   `OnCalendar=` timers, not to these monotonic
+   `OnBootSec`/`OnUnitActiveSec` ones.
+4. First automatic runs PASS, all no-ops: AWG rc 0 (3 peers, 2
+   entitled, 0 to remove, 1 unknown reported only, "already
+   converged"); Xray exit rc 0 and `ingress-xhttp` rc 0 ("already
+   converged"). No peer or client added or removed, no restart of
+   `awg-poc`, `nova-xray`, `nova-xray-xhttp-ingress`,
+   `nova-xray-ingress` or `pocvpn-api`; configs and stores unchanged
+   (AWG 3 peers, Xray exit 2 clients, XHTTP ingress 0 clients;
+   candidate = live). No warning or failed unit in the journal.
+From now on every expiry or revocation is applied on Stockholm for AWG,
+Xray exit and XHTTP ingress within ~5 minutes without a manual step (the
+next one with a runtime effect there is the exit identity `bbe6beaf`,
+expiring 2026-10-28 - not applied yet).
+NOT enabled: `nova-xray-ingress-reconcile@ingress.timer` (REALITY
+ingress). It shows `loaded` only because the shared `@.timer` template
+is installed; it is disabled and inactive and its service has never run,
+so REALITY ingress expiry is still enforced only at render time.
+Enabling it needs its own approval.
+Rollback: `systemctl disable --now <timer>`; to uninstall, also remove
+the `.timer` file from `/etc/systemd/system` + `daemon-reload`.
+Frankfurt stays BLOCKED (no reconcile unit or timer) until the issues
+listed in the precheck above are fixed.
 
 ## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED (both)
 
