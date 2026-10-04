@@ -534,12 +534,15 @@ then `systemctl reload awg-poc` (AWG) and `systemctl restart nova-xray` /
 
 Future timer deployment (NOT DONE - needs its own approval): re-run the
 read-only plan first; install the three `.timer` units; note
-`OnBootSec=2min` has long elapsed, so `systemctl enable --now <timer>`
-triggers a run immediately and then every 5 minutes (`Persistent=true`);
-after that every expiry or revocation is applied without a manual step
-(for example the remaining Stockholm exit identity `bbe6beaf` expires
-2026-10-28). Frankfurt stays BLOCKED until the issues listed in the
-precheck above are fixed.
+`OnBootSec=2min` has long elapsed on a running host, so `systemctl enable
+--now <timer>` triggers a run immediately and then every 5 minutes
+(`OnUnitActiveSec=5min`). `Persistent=true` is also set, but it is not
+what causes that immediate run - it only applies to `OnCalendar=` timers,
+not to these monotonic `OnBootSec`/`OnUnitActiveSec` ones. After that
+every expiry or revocation is applied without a manual step (for example
+the remaining Stockholm exit identity `bbe6beaf` expires 2026-10-28).
+Frankfurt stays BLOCKED until the issues listed in the precheck above are
+fixed.
 
 ## pocvpn-api client-isolated rate limits (B57) - nginx DEPLOYED (both), API DEPLOYED (both)
 
