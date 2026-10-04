@@ -215,21 +215,21 @@ per-IP limits.
   migration of the control plane behind Cloudflare. No limiter value was
   changed.
 
-**Follow-up status: IMPLEMENTED IN REPO + UNIT-TESTED; API DEPLOYED ON STOCKHOLM 2026-10-04, NOT ON FRANKFURT.**
+**Follow-up status: IMPLEMENTED IN REPO + UNIT-TESTED; API DEPLOYED ON STOCKHOLM AND FRANKFURT 2026-10-04.**
 *Update 2026-10-04 (production, not this staging):* only the nginx part
 is deployed - `/v1/tunnel-probe` and `X-Pocvpn-Edge "public-443"` on the
 public vhosts of Frankfurt and Stockholm, physically verified; the API
 limiter and `POCVPN_API_GATEWAY_SELF_ADDRESSES` were then deployed on
-Stockholm only (13:43:45 UTC; `16.170.208.231` in `api.env`); Frankfurt
-still runs pre-B57 API code (gateway-self source observed `152.70.43.1`,
-not configured). Since then the cp-loopback staging traffic of this
+Stockholm (13:43:45 UTC; `16.170.208.231` in `api.env`) and Frankfurt
+(14:26:30 UTC, full `main` `20280f0`; `152.70.43.1` in `api.env`). Since then the cp-loopback staging traffic of this
 document is admitted by the B57 limiter as edge `unknown` (the 20 / 10 s
 cp-loopback edge ceiling is inactive until that header is added); the
 staging harness was not re-run after the rollout. The cp-loopback listener this document covers is
 unchanged (no `X-Pocvpn-Edge "cp-loopback"` yet). Record:
 `gateway/DEPLOYMENT.md` (B57 rate limits, rollout steps 1-3).
 The description above stays the record of what was measured and of
-what Frankfurt still runs (Stockholm until 2026-10-04 13:43 UTC). In the repository, `pocvpn-api` now admits
+what both gateways ran until 2026-10-04 (Stockholm until 13:43 UTC,
+Frankfurt until 14:26 UTC). In the repository, `pocvpn-api` now admits
 each request in layers (`gateway/api/admission.py`), right after the
 endpoint's config check and before any validation, store read or lock:
 per client (`X-Real-IP` as /32 or IPv6 /64, plus the constant
