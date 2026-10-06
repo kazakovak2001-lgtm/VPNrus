@@ -15,10 +15,25 @@ import org.amnezia.awg.backend.GoBackend
  * is a static registration independent of any particular instance).
  */
 class NovaVpnApplication : Application() {
+    private companion object {
+        const val XHTTP_HANDOFF_KEY_ALIAS = "nova_xhttp_session_handoff_key"
+    }
+
+
     override fun onCreate() {
         super.onCreate()
         // Records uncaught JVM crashes locally for diagnostics reports (never uploaded).
         net.pocvpn.client.diagnostics.fieldtest.CrashRecorder.install(this)
+        // Both processes: the XHTTP session handoff crosses from the main
+        // process to `:xray` as an encrypted app-private file.
+        net.pocvpn.client.vpn.xray.XhttpSessionConfigStore.installFileHandoff(
+            noBackupFilesDir,
+            net.pocvpn.client.identity.AndroidKeystoreAesGcmEncryptor(XHTTP_HANDOFF_KEY_ALIAS),
+        )
+        // `:xray` hosts only NovaXrayVpnService (one Go runtime per process -
+        // see XrayProcessBridge); everything else is main-process only.
+        if (net.pocvpn.client.vpn.xray.XrayProcessBridge.isXrayProcess(this)) return
         GoBackend.setAlwaysOnCallback { AlwaysOnVpnState.markConfirmedEnabled() }
+        net.pocvpn.client.vpn.xray.XrayProcessBridge.installMainProcess(this)
     }
 }

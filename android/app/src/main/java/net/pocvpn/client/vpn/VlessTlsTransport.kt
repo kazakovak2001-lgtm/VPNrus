@@ -3,6 +3,8 @@ package net.pocvpn.client.vpn
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -106,6 +108,11 @@ class VlessTlsTransport(
     }
 
     override suspend fun disconnect() {
+        // Already idle (e.g. VpnController disconnecting after a failure on a
+        // DIFFERENT transport): sending ACTION_STOP to a service that is not
+        // running yields no Stopped event, so this transport would sit in
+        // Disconnecting forever. Same guard as ShadowsocksTransport/Hysteria2Transport.
+        if (state.value is TransportState.Disconnected) return
         if (state.value is TransportState.Error) {
             state.value = TransportState.Disconnected
             return
@@ -116,12 +123,20 @@ class VlessTlsTransport(
             context.startService(intent)
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "disconnect failed", t)
+            return
         }
+        // Confirm via the service's Stopped event; fall back after a bound so a
+        // lost event (service already gone, `:xray` process died) cannot wedge it.
+        withTimeoutOrNull(DISCONNECT_CONFIRM_TIMEOUT_MS) {
+            state.first { it is TransportState.Disconnected || it is TransportState.Error }
+        }
+        if (state.value is TransportState.Disconnecting) state.value = TransportState.Disconnected
     }
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 
     private companion object {
         val nextSessionId = AtomicLong(0)
+        const val DISCONNECT_CONFIRM_TIMEOUT_MS = 5_000L
     }
 }

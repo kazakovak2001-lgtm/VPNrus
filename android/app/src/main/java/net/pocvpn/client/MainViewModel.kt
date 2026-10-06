@@ -3819,6 +3819,8 @@ class MainViewModel(
         override fun crashes() = net.pocvpn.client.diagnostics.fieldtest.CrashRecorder.recent(context)
         override suspend fun logs() = net.pocvpn.client.diagnostics.fieldtest.FieldLogs.collect()
         override fun activeNetworkSummary() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.activeSummary(context)
+        override suspend fun measureViaXrayCore(urls: List<String>) =
+            net.pocvpn.client.vpn.xray.XrayProcessBridge.measureThroughCore(context, urls)
     }
 
     /**
