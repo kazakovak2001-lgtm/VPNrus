@@ -16,4 +16,6 @@ import java.io.File
  */
 object LocalDiagnosticsExporter {
     fun exportLatest(filesDir: File, json: String): File? = null
+
+    fun exportFieldTest(filesDir: File, epochMillis: Long, json: String): File? = null
 }

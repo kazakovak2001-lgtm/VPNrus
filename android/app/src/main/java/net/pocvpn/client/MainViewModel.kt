@@ -1,5 +1,6 @@
 package net.pocvpn.client
 
+import net.pocvpn.client.diagnostics.fieldtest.toJson
 import android.content.Context
 import net.pocvpn.client.reachability.signedTransportProfile
 import androidx.lifecycle.ViewModel
@@ -3690,6 +3691,179 @@ class MainViewModel(
             nowEpochMillis = nowProvider(),
         )
         return bundle.toJson()
+    }
+
+    // --- Russia/restricted-network field test (debug UI only) ---------------
+    //
+    // Runs every gateway x transport through the SAME connect()/disconnect()
+    // path and the SAME debug transport pin the Diagnostics dialog's "Force"
+    // buttons use, measures the data plane inside the tunnel, and assembles
+    // one shareable report (network context, direct reachability, per-run
+    // results, full app state, sanitized support bundle). Only reachable from
+    // the debug-gated Diagnostics dialog; production behavior is unchanged.
+
+    private val _fieldTestProgress = MutableStateFlow<net.pocvpn.client.diagnostics.fieldtest.FieldTestProgress?>(null)
+    val fieldTestProgress: StateFlow<net.pocvpn.client.diagnostics.fieldtest.FieldTestProgress?> = _fieldTestProgress.asStateFlow()
+    private var fieldTestJob: kotlinx.coroutines.Job? = null
+
+    fun startFieldTest(appContext: android.content.Context, diagnosticsLines: () -> List<String>) {
+        if (fieldTestJob?.isActive == true) return
+        val host = FieldTestHostAdapter(appContext.applicationContext, diagnosticsLines)
+        fieldTestJob = viewModelScope.launch {
+            net.pocvpn.client.diagnostics.fieldtest.FieldTestRunner(host).run { _fieldTestProgress.value = it }
+        }
+    }
+
+    fun cancelFieldTest() {
+        fieldTestJob?.cancel()
+    }
+
+    fun fieldTestReportJson(): String? =
+        _fieldTestProgress.value?.report?.toJson()?.toString(2)
+
+    fun fieldTestReportSummary(): String? =
+        _fieldTestProgress.value?.report?.let { report ->
+            report.toJson().optJSONArray("summary")?.let { arr -> (0 until arr.length()).joinToString("\n") { arr.getString(it) } }
+        }
+
+    private data class FieldTestSavedSelection(
+        val preference: UserTransportPreference,
+        val mode: net.pocvpn.client.vpn.config.GatewaySelectionMode,
+        val gateway: net.pocvpn.client.vpn.config.ProductionGatewayId,
+    )
+
+    private inner class FieldTestHostAdapter(
+        private val context: android.content.Context,
+        private val diagnosticsLines: () -> List<String>,
+    ) : net.pocvpn.client.diagnostics.fieldtest.FieldTestHost {
+        override val transportState get() = this@MainViewModel.transportState
+        override val sessionHealth get() = this@MainViewModel.sessionHealth
+        override val currentTransportKind get() = this@MainViewModel.currentTransportKind
+
+        override fun vpnPermissionGranted(): Boolean = android.net.VpnService.prepare(context) == null
+        override fun provisionedGateways() = provisionedGatewayIds
+        override fun trustedManifest() = manifestRepository?.trusted()
+        override fun endpointIdFor(gateway: net.pocvpn.client.vpn.config.ProductionGatewayId): String =
+            net.pocvpn.client.vpn.config.ProductionGatewayCatalog.byId(gateway).endpointId.value
+
+        override fun saveSelection(): Any = FieldTestSavedSelection(userTransportPreference, gatewaySelectionMode.value, selectedGateway.value)
+
+        override fun restoreSelection(saved: Any) {
+            val s = saved as FieldTestSavedSelection
+            when (s.mode) {
+                net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO -> setGatewayAutoMode(true)
+                net.pocvpn.client.vpn.config.GatewaySelectionMode.MANUAL_MANAGED -> selectGateway(s.gateway)
+                net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE -> selectGatewaySelectionMode(s.mode)
+            }
+            debugSetTransportPreference(s.preference)
+        }
+
+        override fun applyTarget(target: net.pocvpn.client.diagnostics.fieldtest.FieldAttemptTarget): String? {
+            if (transportState.value.blocksGatewaySelection()) return "a session is still active"
+            val gateway = target.gateway
+            if (gateway == null) {
+                setGatewayAutoMode(true)
+                if (gatewaySelectionMode.value != net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO) {
+                    selectGatewaySelectionMode(net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO)
+                }
+            } else {
+                if (!isGatewayProvisioned(gateway)) return "gateway not activated on this device"
+                selectGateway(gateway)
+            }
+            debugSetTransportPreference(target.transport?.let { UserTransportPreference.Manual(it) } ?: UserTransportPreference.Auto)
+            return null
+        }
+
+        override fun connect() = this@MainViewModel.connect()
+        override fun disconnect() = this@MainViewModel.disconnect()
+        override fun transportScores() = this@MainViewModel.transportScores()
+        override fun lastErrorText(): String? = diagnostics.value.lastError?.displayText()
+
+        override fun latestDiagnosticSession(): org.json.JSONObject? {
+            val latest = supportDiagnosticsStore?.recent()?.firstOrNull() ?: return null
+            val bundle = net.pocvpn.client.diagnostics.support.buildSupportBundle(
+                listOf(latest), supportDiagnosticsAppVersionName, supportDiagnosticsAppVersionCode, nowProvider(),
+            )
+            return org.json.JSONObject(bundle.toJson()).optJSONArray("sessions")?.optJSONObject(0)
+        }
+
+        override fun supportBundle(): org.json.JSONObject? =
+            try { org.json.JSONObject(exportSupportBundleJson()) } catch (e: org.json.JSONException) { null }
+
+        override fun networkContext() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.collect(context)
+        override fun vpnNetwork() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.vpnNetwork(context)
+        override fun deviceInfo() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.device()
+
+        override fun appInfo(): org.json.JSONObject = org.json.JSONObject()
+            .put("versionName", BuildConfig.VERSION_NAME)
+            .put("versionCode", BuildConfig.VERSION_CODE)
+            .put("buildType", BuildConfig.BUILD_TYPE)
+            .put("gitCommit", BuildConfig.GIT_COMMIT)
+
+        override fun appState(): org.json.JSONObject = fieldTestAppState(diagnosticsLines)
+    }
+
+    /**
+     * Everything the app currently knows that decides how it connects - one
+     * snapshot per field-test report (before and after). Values are taken
+     * from the same non-secret sources the Diagnostics dialog already shows;
+     * states that could carry a profile (ingress/provisioning success) are
+     * reduced to their type name.
+     */
+    private fun fieldTestAppState(diagnosticsLines: () -> List<String>): org.json.JSONObject {
+        val o = org.json.JSONObject()
+        fun safe(key: String, block: () -> Any?) {
+            o.put(key, try { block() ?: org.json.JSONObject.NULL } catch (e: Exception) { "error: ${e.javaClass.simpleName}" })
+        }
+        safe("transportState") { transportState.value.toString() }
+        safe("sessionHealth") { sessionHealth.value.toString() }
+        safe("currentTransportKind") { currentTransportKind.value?.name }
+        safe("gatewaySelectionMode") { gatewaySelectionMode.value.name }
+        safe("gatewayAutoMode") { gatewayAutoMode.value }
+        safe("selectedGateway") { selectedGateway.value.name }
+        safe("activeGateway") { activeGatewayId.value.name }
+        safe("provisionedGateways") { org.json.JSONArray(provisionedGatewayIds.map { it.name }.sorted()) }
+        safe("transportPreference") { userTransportPreference.toString() }
+        safe("routingMode") { savedRoutingMode.value.name }
+        safe("appliedRoutingMode") { appliedRoutingMode.value?.name }
+        safe("appRoutingMode") { savedAppRoutingPolicy.value.mode.name }
+        safe("profileSource") { profileSource.value.name }
+        safe("provisioningState") { provisioningState.value.let { s -> if (s is ProvisioningUiState.Error) "Error: ${s.message}" else s.javaClass.simpleName } }
+        safe("xrayProfileProvisioning") { xrayProfileProvisioningState.value?.toString() }
+        safe("hysteria2ProfileProvisioning") { hysteria2ProfileProvisioningState.value?.toString() }
+        safe("ingressActivation") { ingressActivationState.value?.javaClass?.simpleName }
+        safe("restrictionClassRaw") { restrictionClass().name }
+        safe("restrictionClassStabilized") { stabilizedRestrictionClass().name }
+        safe("networkProfile") { networkProfile.value.toString() }
+        safe("manifest") {
+            val trusted = manifestRepository?.trusted()
+            trusted?.let { m ->
+                org.json.JSONObject()
+                    .put("version", m.manifestVersion)
+                    .put("issuedAtEpochMillis", m.issuedAtEpochMillis)
+                    .put("expiresAtEpochMillis", m.expiresAtEpochMillis)
+                    .put("signingKeyId", m.signingKeyId)
+                    .put("source", manifestRepository?.trustedSource()?.toString())
+                    .put("endpoints", org.json.JSONArray(m.endpoints.map { e ->
+                        "${e.id.value} roles=${e.roles} relayTo=${e.relayTo?.value} " +
+                            e.transports.joinToString(" ") { "${it.kind}@${it.host}:${it.port}" }
+                    }))
+            }
+        }
+        safe("lastManifestRefreshOutcome") { lastManifestRefreshOutcome.value }
+        safe("transportScores") { org.json.JSONObject(transportScores().mapKeys { it.key.name }) }
+        safe("transportHealth") { org.json.JSONObject(transportHealth().mapKeys { it.key.name }.mapValues { it.value.toString() }) }
+        safe("smartConnectDecision") { smartConnectDecision().toString() }
+        safe("combinedAutoRanking") { combinedAutoRankingDiagnostics().toString() }
+        safe("autoGatewayDiagnostics") { autoGatewayDiagnostics.value?.toString() }
+        safe("reachability") { reachabilityDiagnostics()?.toString() }
+        safe("recentConnectionOutcomes") { org.json.JSONArray(recentConnectionOutcomes().takeLast(30).map { it.toString() }) }
+        safe("lastError") { diagnostics.value.lastError?.displayText() }
+        safe("lastHandshakeEpochMillis") { diagnostics.value.lastHandshakeEpochMillis }
+        safe("bytesReceived") { diagnostics.value.bytesReceived }
+        safe("bytesSent") { diagnostics.value.bytesSent }
+        safe("diagnosticsDialogLines") { org.json.JSONArray(diagnosticsLines()) }
+        return o
     }
 
     /** B29 (task J) - an explicit user action ("Clear diagnostics"), never automatic. */

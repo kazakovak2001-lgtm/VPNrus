@@ -46,4 +46,17 @@ object LocalDiagnosticsExporter {
         file.writeText(json)
         return file
     }
+
+    /**
+     * Field test - one file per report (never overwritten), next to
+     * [FILE_NAME]: `support-diagnostics/field-test-<epochMillis>.json`.
+     * Same app-private directory; nothing is shared from here.
+     */
+    fun exportFieldTest(filesDir: File, epochMillis: Long, json: String): File? {
+        val dir = File(filesDir, RELATIVE_DIR)
+        dir.mkdirs()
+        val file = File(dir, "field-test-$epochMillis.json")
+        file.writeText(json)
+        return file
+    }
 }

@@ -91,6 +91,9 @@ fun DiagnosticsDialog(
     // source set, a no-op stub in release). Never shares/uploads anything.
     onSaveDiagnosticsLocally: () -> Unit,
     saveLocallyStatus: String?,
+    // Field test - opens FieldTestDialog (all gateways x transports, one
+    // shareable report). Debug-only like everything in this dialog.
+    onOpenFieldTest: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val maxDialogHeight = LocalConfiguration.current.screenHeightDp.dp * 0.85f
@@ -144,6 +147,9 @@ fun DiagnosticsDialog(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
+                    TextButton(onClick = onOpenFieldTest, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_field_test))
+                    }
                     TextButton(onClick = onCopyPublicKey, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_copy_public_key))
                     }

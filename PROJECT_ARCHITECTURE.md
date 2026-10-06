@@ -3710,3 +3710,17 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Frankfurt (2026-10-04): reconcile code, `awg-host.env`
   (`awg-quick@awg0`) and one manual AWG reconcile deployed; no reconcile
   units or timers yet, so no automatic expiry there.
+
+## Field test (debug-only measurement tool, 2026-10-06)
+
+- `diagnostics/fieldtest/`: `FieldTestRunner` drives the EXISTING
+  `connect()`/`disconnect()`, gateway selection and debug transport pin
+  through the narrow `FieldTestHost` (implemented in `MainViewModel`) - no
+  second connection path, no selection or scoring change. It saves and
+  restores the user's selection (also on cancel/failure).
+- In-tunnel probes bind to the VPN `Network`; direct probes run only while
+  disconnected. The device's own public IP is never stored.
+- Reachable only from the `isDebugBuild`-gated Diagnostics dialog; the
+  local save is a no-op in release (`LocalDiagnosticsExporter`).
+- Measurement only: a report is B54 evidence for one network, never a
+  reachability claim by itself.
