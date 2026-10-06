@@ -17,6 +17,8 @@ import org.amnezia.awg.backend.GoBackend
 class NovaVpnApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        // Records uncaught JVM crashes locally for diagnostics reports (never uploaded).
+        net.pocvpn.client.diagnostics.fieldtest.CrashRecorder.install(this)
         GoBackend.setAlwaysOnCallback { AlwaysOnVpnState.markConfirmedEnabled() }
     }
 }

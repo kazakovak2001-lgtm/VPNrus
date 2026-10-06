@@ -128,8 +128,12 @@
     <string name="diagnostics_title">Diagnostics</string>
     <string name="diagnostics_field_test">Field test (all gateways x transports)</string>
     <string name="field_test_title">Field test</string>
-    <string name="field_test_intro">Connects every gateway with every transport in turn (about 15-25 minutes) and measures what really works on this network: direct reachability, connection, exit IP, DNS, a 1 MB download and stability. The VPN connects and disconnects repeatedly. Your gateway and transport selection is restored at the end.</string>
-    <string name="field_test_start">Start field test</string>
+    <string name="field_test_intro">Full test (15-30 min): first what this network blocks and how (DNS, IP, SNI filtering, throttling, block pages, UDP), server and activation reachability; then connects every gateway with every transport and every relay/CDN path in turn and measures connection, exit IP, DNS and IPv6 leaks, a 1 MB download and stability. Monitor: keeps your normal connection up and records drops, reconnects and network changes. Every report also contains recent crashes and logs (secrets removed). Your gateway and transport selection is restored at the end.</string>
+    <string name="field_test_start">Start full field test (15-30 min)</string>
+    <string name="field_test_start_quick">Quick network check (2-4 min, no VPN cycling)</string>
+    <string name="field_test_start_monitor">Monitor my connection for %1$d min</string>
+    <string name="field_test_intro_quick">Checks what this network blocks and how (DNS, IP, SNI filtering, throttling, block pages), whether the Nova servers and activation are reachable, and collects recent errors and logs (secrets removed). The VPN is paused during the check and reconnected afterwards. Nothing is sent anywhere - you choose whether to share the report.</string>
+    <string name="settings_network_check">Network check (diagnostics report)</string>
     <string name="field_test_cancel">Cancel (keeps a partial report)</string>
     <string name="field_test_share">Share report (JSON)</string>
     <string name="field_test_share_summary">Share summary (text)</string>

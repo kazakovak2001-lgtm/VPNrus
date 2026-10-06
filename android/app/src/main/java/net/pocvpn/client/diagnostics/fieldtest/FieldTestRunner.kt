@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.reachability.EndpointManifest
+import net.pocvpn.client.reachability.ingressKind
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VpnSessionHealth
@@ -36,6 +37,8 @@ interface FieldTestHost {
     fun disconnect()
     fun transportScores(): Map<TransportKind, Int>
     fun lastErrorText(): String?
+    /** Attempt keys a forced relay run actually kept (null when no forced run happened). */
+    fun lastForcedRelayKeys(): List<String>?
     fun latestDiagnosticSession(): JSONObject?
     fun appState(): JSONObject
     fun supportBundle(): JSONObject?
@@ -43,6 +46,22 @@ interface FieldTestHost {
     fun vpnNetwork(): Network?
     fun appInfo(): JSONObject
     fun deviceInfo(): JSONObject
+    /** The app's own signed-manifest refresh from every origin (MultiOriginRefreshResult as text). */
+    suspend fun refreshManifestOutcome(): String?
+    fun exitReasons(): org.json.JSONArray
+    fun crashes(): org.json.JSONArray
+    suspend fun logs(): List<String>
+    /** One-line description of the current default network (for monitor samples). */
+    fun activeNetworkSummary(): String
+}
+
+enum class FieldTestMode {
+    /** Everything, including every gateway x transport and relay run (15-30 min). */
+    FULL,
+    /** No VPN cycling: context, direct probes, censorship analysis, API, crashes, logs (2-4 min). */
+    QUICK,
+    /** Keep the user's normal connection up and observe it over time. */
+    MONITOR,
 }
 
 data class FieldTestProgress(
@@ -101,6 +120,9 @@ class FieldProbeSet(
     val tcp: suspend (String, String, Int, Network?) -> TcpProbeResult = { l, h, p, n -> FieldProbes.tcp(l, h, p, n) },
     val https: suspend (label: String, url: String, network: Network?, maxBytes: Long, parseTrace: Boolean) -> HttpProbeResult =
         { l, u, n, m, t -> FieldProbes.https(l, u, n, maxBytes = m, parseTrace = t) },
+    val censorship: suspend ((String) -> Unit) -> CensorshipReport = { onLine -> CensorshipProbe.run(onLine) },
+    val api: suspend (List<String>) -> org.json.JSONArray = { origins -> ApiReachability.check(origins) },
+    val leaks: suspend (Network?, List<String>) -> JSONObject = { n, direct -> LeakChecks.inTunnel(n, direct) },
 )
 
 /** UDP-only transport kinds: a TCP connect says nothing about them, the VPN run does. */
@@ -116,10 +138,25 @@ val FIELD_TEST_TRANSPORTS = listOf(
     TransportKind.HYSTERIA2,
 )
 
-/** Pure: the attempt list for a run. Every gateway x transport, then Smart Connect. */
-internal fun planAttempts(gateways: List<ProductionGatewayId>): List<FieldAttemptTarget> =
+/** Pure: API origins to check - every IP-literal host in the manifest, then the control-plane hostname. */
+internal fun apiOrigins(manifest: EndpointManifest?): List<String> =
+    (expectedExitIps(manifest, null).sorted() + FieldTestTargets.CONTROL_PLANE_HOST).distinct()
+
+/**
+ * Pure: the attempt list for a run. Every gateway x transport, then one run
+ * per relay ingress the signed manifest declares (CDN-fronted XHTTP, DIRECT_IP
+ * REALITY, ...), then Smart Connect.
+ */
+internal fun planAttempts(gateways: List<ProductionGatewayId>, relayIngresses: List<String> = emptyList()): List<FieldAttemptTarget> =
     gateways.flatMap { g -> FIELD_TEST_TRANSPORTS.map { FieldAttemptTarget(g, it) } } +
+        relayIngresses.map { FieldAttemptTarget(null, null, relayIngress = it) } +
         FieldAttemptTarget(null, null)
+
+/** Pure: ingress endpoints in [manifest] (role INGRESS or an ingress-kind binding), manifest order. */
+internal fun relayIngressIds(manifest: EndpointManifest?): List<String> =
+    manifest?.endpoints.orEmpty()
+        .filter { e -> net.pocvpn.client.reachability.EndpointRole.INGRESS in e.roles || e.transports.any { it.ingressKind() != null } }
+        .map { it.id.value }
 
 /** Pure: IP-literal hosts of [endpointId]'s signed bindings (all endpoints when null). */
 internal fun expectedExitIps(manifest: EndpointManifest?, endpointId: String?): Set<String> {
@@ -130,6 +167,28 @@ internal fun expectedExitIps(manifest: EndpointManifest?, endpointId: String?): 
 private val IPV4_LITERAL = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
 private const val POLL_MS = 250L
 
+/** Readable state names for reports (plain objects would print as Class@hash). */
+internal fun TransportState.label(): String = when (this) {
+    is TransportState.Error -> "Error(${message}${failureKind?.let { ", $it" } ?: ""})"
+    is TransportState.Reconnecting -> "Reconnecting($attempt)"
+    else -> this::class.simpleName ?: toString()
+}
+
+/** Public bridge for MainViewModel's app-state snapshot. */
+object FieldStateLabels {
+    fun TransportState.text(): String = label()
+    fun VpnSessionHealth.text(): String = label()
+}
+
+internal fun VpnSessionHealth.label(): String = when (this) {
+    is VpnSessionHealth.Failed -> "Failed($message)"
+    is VpnSessionHealth.RelayHandshake -> "RelayHandshake($stage)"
+    else -> this::class.simpleName ?: toString()
+}
+internal const val MONITOR_SAMPLE_MS = 30_000L
+internal const val MONITOR_TICK_MS = 1_000L
+internal const val MONITOR_BULK_EVERY = 10
+
 class FieldTestRunner(
     private val host: FieldTestHost,
     private val probes: FieldProbeSet = FieldProbeSet(),
@@ -138,48 +197,89 @@ class FieldTestRunner(
 ) {
     private val log = mutableListOf<String>()
 
-    suspend fun run(onProgress: (FieldTestProgress) -> Unit): FieldTestReport {
+    suspend fun run(onProgress: (FieldTestProgress) -> Unit): FieldTestReport = run(FieldTestMode.FULL, 0, onProgress)
+
+    suspend fun run(mode: FieldTestMode, monitorDurationMs: Long, onProgress: (FieldTestProgress) -> Unit): FieldTestReport {
         val startedAt = clock()
-        val gateways = ProductionGatewayId.entries.toList()
-        val attempts = planAttempts(gateways)
-        val totalSteps = attempts.size + 2
+        val manifest = host.trustedManifest()
+        val attempts = if (mode == FieldTestMode.FULL) {
+            planAttempts(ProductionGatewayId.entries.toList(), relayIngressIds(manifest))
+        } else {
+            emptyList()
+        }
+        val totalSteps = when (mode) {
+            FieldTestMode.FULL -> attempts.size + 4
+            FieldTestMode.QUICK -> 4
+            FieldTestMode.MONITOR -> ((monitorDurationMs / MONITOR_SAMPLE_MS).toInt() + 2).coerceAtLeast(2)
+        }
         var step = 0
         fun progress(phase: String, line: String? = null) {
             line?.let { log += it }
             onProgress(FieldTestProgress(true, phase, step, totalSteps, log.toList()))
         }
 
-        val manifest = host.trustedManifest()
         val networkBefore = host.networkContext()
         val appBefore = host.appState()
         val saved = host.saveSelection()
+        val wasConnected = host.transportState.value is TransportState.Connected
         val runs = mutableListOf<FieldTransportRun>()
         var direct: FieldDirectProbes? = null
+        var censorship: CensorshipReport? = null
+        var api: org.json.JSONArray? = null
+        var manifestRefresh: String? = null
+        var directResolver: DnsProbeResult? = null
+        var monitor: JSONObject? = null
         var abort: String? = null
         var cancelled = false
         try {
-            progress("Preparing", "Network: ${networkBefore.optString("summary")}")
-            if (!host.vpnPermissionGranted()) {
+            progress("Preparing", "Mode: $mode. Network: ${networkBefore.optString("summary")}")
+            val needsVpn = mode != FieldTestMode.QUICK
+            if (needsVpn && !host.vpnPermissionGranted()) {
                 abort = "VPN permission not granted - connect once from the home screen first"
+            } else if (mode == FieldTestMode.MONITOR) {
+                monitor = monitorSession(monitorDurationMs) { line ->
+                    step = (step + 1).coerceAtMost(totalSteps - 1)
+                    progress("Monitoring", line)
+                }
             } else {
                 if (host.transportState.value !is TransportState.Disconnected) {
-                    progress("Preparing", "Disconnecting the current session first")
+                    progress("Preparing", "Disconnecting the current session (direct probes must not use the tunnel)")
                     disconnectAndWait()
                 }
                 step++
-                progress("Direct probes", "Direct (outside VPN) probes...")
+                progress("Direct probes", "Direct (VPN off) probes...")
                 direct = directProbes(manifest) { progress("Direct probes", it) }
+                val resolver = probes.dns(LeakChecks.RESOLVER_WHOAMI, null)
+                directResolver = resolver
+                progress("Direct probes", "  DNS resolver (VPN off): ${resolver.addresses.joinToString(",").ifBlank { resolver.error.orEmpty() }}")
+                step++
+                progress("Censorship analysis", "What is blocked on this network, and how...")
+                val c = probes.censorship { progress("Censorship analysis", it) }
+                censorship = c
+                c.networkVerdicts.forEach { progress("Censorship analysis", "  => $it") }
+                step++
+                progress("API checks", "Activation / profile API and manifest from this network...")
+                val apiResult = probes.api(apiOrigins(manifest))
+                api = apiResult
+                for (i in 0 until apiResult.length()) {
+                    val o = apiResult.getJSONObject(i)
+                    progress("API checks", "  ${o.optString("origin")}${o.optString("path")}: ${o.optString("verdict")} ${o.opt("httpStatus")}")
+                }
+                manifestRefresh = host.refreshManifestOutcome()
+                progress("API checks", "  manifest refresh: ${manifestRefresh ?: "-"}")
                 attempts.forEach { target ->
                     step++
                     progress("VPN runs", "[$step/$totalSteps] ${target.label}")
-                    val run = runOne(target, manifest)
+                    val run = runOne(target, manifest, resolver.addresses)
                     runs += run
-                    progress("VPN runs", "  -> ${run.outcome}${run.exitIp?.let { " exit $it" } ?: ""}${run.errorMessage?.let { " ($it)" } ?: run.skipReason?.let { " ($it)" } ?: ""}")
+                    val leakText = run.leaks?.optString("verdict")?.let { " leaks=$it" } ?: ""
+                    val why = run.errorMessage?.let { " ($it)" } ?: run.skipReason?.let { " ($it)" } ?: ""
+                    progress("VPN runs", "  -> ${run.outcome}${run.exitIp?.let { " exit $it" } ?: ""}$leakText$why")
                     if (run.outcome != FieldRunOutcome.SKIPPED) delay(timings.betweenRunsMs)
                 }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
-            // Cancel still yields a (partial) report - every finished run is evidence.
+            // Cancel still yields a (partial) report - every finished measurement is evidence.
             cancelled = true
             log += "Cancelled by the user."
         } finally {
@@ -188,6 +288,7 @@ class FieldTestRunner(
                 host.restoreSelection(saved)
             }
         }
+        val logs = kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { host.logs() }
         step = totalSteps
         val report = FieldTestReport(
             startedAtEpochMillis = startedAt,
@@ -203,11 +304,125 @@ class FieldTestRunner(
             direct = direct,
             runs = runs,
             supportBundle = host.supportBundle(),
+            mode = mode,
+            censorship = censorship,
+            apiChecks = api,
+            manifestRefresh = manifestRefresh,
+            directResolver = directResolver,
+            monitor = monitor,
+            exitReasons = host.exitReasons(),
+            crashes = host.crashes(),
+            logs = logs,
         )
         abort?.let { log += "ABORTED: $it" }
+        // QUICK during a normal session: give the user the connection back.
+        if (mode == FieldTestMode.QUICK && wasConnected && !cancelled) {
+            log += "Reconnecting the session that was active before the check."
+            host.connect()
+        }
         log += "Done."
         onProgress(FieldTestProgress(false, "Done", totalSteps, totalSteps, log.toList(), report))
         return report
+    }
+
+    /**
+     * MONITOR: one normal connect with the user's own selection (nothing
+     * pinned), then a small probe every MONITOR_SAMPLE_MS and a 256 KB
+     * download every MONITOR_BULK_EVERY samples, recording every state,
+     * health, transport and network change in between. The app's own
+     * reconnect logic is observed, never replaced.
+     */
+    private suspend fun monitorSession(durationMs: Long, onLine: (String) -> Unit): JSONObject {
+        val samples = org.json.JSONArray()
+        val events = org.json.JSONArray()
+        val start = clock()
+        fun event(text: String) {
+            events.put(JSONObject().put("tMs", clock() - start).put("event", text))
+            onLine("  +${(clock() - start) / 1000}s $text")
+        }
+        if (host.transportState.value !is TransportState.Connected) {
+            host.connect()
+            event("connect requested (user selection)")
+        }
+        var lastState = ""
+        var lastHealth = ""
+        var lastTransport = ""
+        var lastNetwork = ""
+        var probesOk = 0
+        var probesTotal = 0
+        var connectedMs = 0L
+        var reconnects = 0
+        var sampleIndex = 0
+        var nextSample = start
+        var lastTick = start
+        while (clock() - start < durationMs) {
+            val now = clock()
+            val state = host.transportState.value
+            if (state is TransportState.Connected) connectedMs += now - lastTick
+            lastTick = now
+            val stateText = state.label()
+            if (stateText != lastState) {
+                if (state is TransportState.Reconnecting) reconnects++
+                event("state $stateText")
+                lastState = stateText
+            }
+            val healthText = host.sessionHealth.value.label()
+            if (healthText != lastHealth) {
+                event("health $healthText")
+                lastHealth = healthText
+            }
+            val transportText = host.currentTransportKind.value?.name ?: "-"
+            if (transportText != lastTransport) {
+                event("transport $transportText")
+                lastTransport = transportText
+            }
+            val networkText = host.activeNetworkSummary()
+            if (networkText != lastNetwork) {
+                event("network $networkText")
+                lastNetwork = networkText
+            }
+            if (now >= nextSample) {
+                nextSample = now + MONITOR_SAMPLE_MS
+                val vpn = host.vpnNetwork()
+                val connected = state is TransportState.Connected
+                val probe = if (connected) probes.https("monitor 204", FieldTestTargets.CONNECTIVITY_204, vpn, 4 * 1024, false) else null
+                val bulk = if (connected && sampleIndex % MONITOR_BULK_EVERY == 0) {
+                    probes.https("monitor 256KB", FieldTestTargets.BULK_DIRECT, vpn, 262_144, false)
+                } else {
+                    null
+                }
+                if (probe != null) {
+                    probesTotal++
+                    if (probe.httpStatus != null) probesOk++
+                }
+                samples.put(
+                    JSONObject().put("tMs", now - start).put("state", stateText).put("transport", transportText)
+                        .put("probeOk", probe?.let { it.httpStatus != null } ?: JSONObject.NULL)
+                        .put("probeMs", probe?.elapsedMs ?: JSONObject.NULL)
+                        .put("probeError", probe?.error ?: JSONObject.NULL)
+                        .put("bulkBytes", bulk?.bytesRead ?: JSONObject.NULL)
+                        .put("bulkMs", bulk?.elapsedMs ?: JSONObject.NULL)
+                        .put("bulkStalledAt", bulk?.stalledAtBytes ?: JSONObject.NULL),
+                )
+                val probeText = when {
+                    !connected -> "not connected ($stateText)"
+                    probe?.httpStatus != null -> "probe OK ${probe.elapsedMs}ms"
+                    else -> "probe FAIL ${probe?.error}"
+                }
+                val bulkText = bulk?.let { b -> ", 256KB ${b.bytesRead}B/${b.elapsedMs}ms${b.stalledAtBytes?.let { " STALL@$it" } ?: ""}" } ?: ""
+                onLine("  +${(now - start) / 1000}s $probeText$bulkText")
+                sampleIndex++
+            }
+            delay(MONITOR_TICK_MS)
+        }
+        val elapsed = (clock() - start).coerceAtLeast(1)
+        return JSONObject()
+            .put("durationMs", elapsed)
+            .put("connectedPercent", connectedMs * 100 / elapsed)
+            .put("probeSuccess", "$probesOk/$probesTotal")
+            .put("reconnects", reconnects)
+            .put("events", events)
+            .put("samples", samples)
     }
 
     private suspend fun directProbes(manifest: EndpointManifest?, onLine: (String) -> Unit): FieldDirectProbes {
@@ -246,9 +461,11 @@ class FieldTestRunner(
         return FieldDirectProbes(dns, http, tcp)
     }
 
-    private suspend fun runOne(target: FieldAttemptTarget, manifest: EndpointManifest?): FieldTransportRun {
+    private suspend fun runOne(target: FieldAttemptTarget, manifest: EndpointManifest?, directResolver: List<String>): FieldTransportRun {
         val startedAt = clock()
+        // A relay run exits at the ingress' relayTo endpoint; Auto may exit anywhere.
         val endpointId = target.gateway?.let { host.endpointIdFor(it) }
+            ?: target.relayIngress?.let { id -> manifest?.endpoints?.firstOrNull { it.id.value == id }?.relayTo?.value }
         if (target.gateway != null && target.gateway !in host.provisionedGateways()) {
             return FieldTransportRun(target, startedAt, FieldRunOutcome.SKIPPED, skipReason = "gateway not activated on this device")
         }
@@ -304,6 +521,7 @@ class FieldTestRunner(
         var exitColo: String? = null
         var exitLoc: String? = null
         val notes = mutableListOf<String>()
+        var leaks: JSONObject? = null
         if (connected) {
             health = withTimeoutOrNull(timings.healthGraceMs) {
                 host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
@@ -322,7 +540,11 @@ class FieldTestRunner(
             delay(timings.stabilityHoldMs)
             stability += probes.https("Google 204 after hold", FieldTestTargets.CONNECTIVITY_204, vpn, 4 * 1024, false)
             stability += probes.https("Cloudflare trace after hold", FieldTestTargets.CLOUDFLARE_TRACE, vpn, 4 * 1024, true)
-            if (host.transportState.value !is TransportState.Connected) notes += "session left Connected during probes: ${host.transportState.value}"
+            leaks = probes.leaks(vpn, directResolver)
+            if (host.transportState.value !is TransportState.Connected) notes += "session left Connected during probes: ${host.transportState.value.label()}"
+        }
+        if (target.relayIngress != null) {
+            notes += "forced relay attempts kept: ${host.lastForcedRelayKeys()?.let { if (it.isEmpty()) "none (no relay candidate - ingress not activated or not eligible)" else it.joinToString(", ") } ?: "-"}"
         }
         val activeTransport = host.currentTransportKind.value?.name
         val session = host.latestDiagnosticSession()
@@ -337,12 +559,12 @@ class FieldTestRunner(
         return FieldTransportRun(
             target = target,
             startedAtEpochMillis = startedAt,
-            outcome = classifyRun(connected, state.toString(), errorText, timedOut, probeResults, throughput, stability, exitIp, expected),
+            outcome = classifyRun(connected, state.label(), errorText, timedOut, probeResults, throughput, stability, exitIp, expected),
             connectMs = connectMs,
-            terminalState = (terminal ?: state).toString(),
+            terminalState = (terminal ?: state).label(),
             errorMessage = errorText,
             activeTransport = activeTransport,
-            sessionHealth = health.toString(),
+            sessionHealth = health.label(),
             expectedExitIps = expected,
             exitIp = exitIp,
             exitColo = exitColo,
@@ -355,6 +577,7 @@ class FieldTestRunner(
             diagnosticSession = session,
             disconnectMs = disconnectMs,
             notes = notes,
+            leaks = leaks,
         )
     }
 

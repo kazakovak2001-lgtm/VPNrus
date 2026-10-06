@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import net.pocvpn.client.R
+import net.pocvpn.client.diagnostics.fieldtest.FieldTestMode
 import net.pocvpn.client.diagnostics.fieldtest.FieldTestProgress
 
 /**
@@ -35,7 +36,9 @@ import net.pocvpn.client.diagnostics.fieldtest.FieldTestProgress
 @Composable
 fun FieldTestDialog(
     progress: FieldTestProgress?,
-    onStart: () -> Unit,
+    /** Debug build: full test + monitor modes; release: the quick network check only. */
+    allModes: Boolean,
+    onStart: (FieldTestMode, Int) -> Unit,
     onCancel: () -> Unit,
     onShareJson: () -> Unit,
     onShareSummary: () -> Unit,
@@ -48,6 +51,13 @@ fun FieldTestDialog(
     val hasReport = progress?.report != null
     val scroll = rememberScrollState()
     LaunchedEffect(progress?.log?.size) { scroll.animateScrollTo(scroll.maxValue) }
+    // Long runs (full test, monitor) must not be cut short by the screen
+    // turning off and the activity going away - keep it on while running.
+    val view = androidx.compose.ui.platform.LocalView.current
+    androidx.compose.runtime.DisposableEffect(running) {
+        view.keepScreenOn = running
+        onDispose { view.keepScreenOn = false }
+    }
 
     Dialog(onDismissRequest = { if (!running) onDismiss() }) {
         Surface(
@@ -83,7 +93,7 @@ fun FieldTestDialog(
                 ) {
                     if (progress == null) {
                         Text(
-                            text = stringResource(R.string.field_test_intro),
+                            text = stringResource(if (allModes) R.string.field_test_intro else R.string.field_test_intro_quick),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
@@ -102,8 +112,21 @@ fun FieldTestDialog(
                             Text(stringResource(R.string.field_test_cancel))
                         }
                     } else {
-                        TextButton(onClick = onStart, modifier = Modifier.fillMaxWidth()) {
-                            Text(stringResource(R.string.field_test_start))
+                        if (allModes) {
+                            TextButton(onClick = { onStart(FieldTestMode.FULL, 0) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(stringResource(R.string.field_test_start))
+                            }
+                        }
+                        TextButton(onClick = { onStart(FieldTestMode.QUICK, 0) }, modifier = Modifier.fillMaxWidth()) {
+                            Text(stringResource(R.string.field_test_start_quick))
+                        }
+                        if (allModes) {
+                            TextButton(onClick = { onStart(FieldTestMode.MONITOR, 30) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(stringResource(R.string.field_test_start_monitor, 30))
+                            }
+                            TextButton(onClick = { onStart(FieldTestMode.MONITOR, 120) }, modifier = Modifier.fillMaxWidth()) {
+                                Text(stringResource(R.string.field_test_start_monitor, 120))
+                            }
                         }
                     }
                     if (hasReport && !running) {
@@ -113,8 +136,10 @@ fun FieldTestDialog(
                         TextButton(onClick = onShareSummary, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.field_test_share_summary))
                         }
-                        TextButton(onClick = onSaveLocally, modifier = Modifier.fillMaxWidth()) {
-                            Text(stringResource(R.string.field_test_save))
+                        if (allModes) {
+                            TextButton(onClick = onSaveLocally, modifier = Modifier.fillMaxWidth()) {
+                                Text(stringResource(R.string.field_test_save))
+                            }
                         }
                         saveStatus?.let {
                             Text(text = it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface)

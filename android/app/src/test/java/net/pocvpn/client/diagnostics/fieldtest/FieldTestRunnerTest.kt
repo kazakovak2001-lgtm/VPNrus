@@ -93,6 +93,7 @@ class FieldTestRunnerTest {
         }
         override fun transportScores() = mapOf(TransportKind.XRAY_REALITY to 10)
         override fun lastErrorText() = lastError
+        override fun lastForcedRelayKeys(): List<String>? = null
         override fun latestDiagnosticSession(): JSONObject? = JSONObject().put("selectedPathKind", "DIRECT")
         override fun appState() = JSONObject().put("state", "x")
         override fun supportBundle(): JSONObject? = JSONObject().put("schemaVersion", 1)
@@ -100,6 +101,12 @@ class FieldTestRunnerTest {
         override fun vpnNetwork(): Network? = null
         override fun appInfo() = JSONObject().put("gitCommit", "abc")
         override fun deviceInfo() = JSONObject().put("model", "test")
+        override suspend fun refreshManifestOutcome(): String? = "Refreshed(v6)"
+        override fun exitReasons() = org.json.JSONArray().put(JSONObject().put("reason", "EXIT_SELF").put("status", 2))
+        override fun crashes() = org.json.JSONArray()
+        override suspend fun logs() = listOf("I/Nova: line")
+        var network = "WIFI validated=true net=100"
+        override fun activeNetworkSummary() = network
     }
 
     private fun okProbe(label: String, url: String, maxBytes: Long, trace: Map<String, String> = emptyMap()) =
@@ -109,6 +116,9 @@ class FieldTestRunnerTest {
     private fun fakeProbes(host: FakeHost, stallBulk: Boolean = false) = FieldProbeSet(
         dns = { h, _ -> DnsProbeResult(h, true, listOf("1.2.3.4"), 1, null) },
         tcp = { l, h, p, _ -> TcpProbeResult(l, h, p, true, 5, null) },
+        censorship = { _ -> CensorshipReport(emptyList(), mapOf("8.8.8.8:53" to false), mapOf("cloudflare" to true), listOf("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED")) },
+        api = { origins -> org.json.JSONArray().apply { origins.forEach { put(JSONObject().put("origin", it).put("path", "/v1/activate").put("verdict", "API_REACHABLE").put("httpStatus", 400)) } } },
+        leaks = { _, direct -> JSONObject().put("verdict", if (direct.isEmpty()) "NO_LEAK_OBSERVED" else "NO_LEAK_OBSERVED") },
         https = { label, url, _, maxBytes, parseTrace ->
             val inTunnel = host.transportState.value is TransportState.Connected
             when {
@@ -218,5 +228,62 @@ class FieldTestRunnerTest {
         assertEquals("abc", json.getJSONObject("app").getString("gitCommit"))
         assertTrue(json.getJSONArray("summary").getString(0).startsWith("Nova field test"))
         assertEquals("DIRECT", json.getJSONArray("runs").getJSONObject(1).getJSONObject("diagnosticSession").getString("selectedPathKind"))
+    }
+
+    @Test
+    fun `full run also carries censorship, API, manifest refresh, exit reasons, logs and leak verdicts`() = runTest {
+        val report = runner(FakeHost()).run { }
+        assertEquals(listOf("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED"), report.censorship!!.networkVerdicts)
+        assertEquals("Refreshed(v6)", report.manifestRefresh)
+        assertTrue(report.apiChecks!!.length() >= 3) // 152.70.43.1, 16.170.208.231, control.aknova.pp.ua
+        assertEquals("EXIT_SELF", report.exitReasons!!.getJSONObject(0).getString("reason"))
+        assertEquals(listOf("I/Nova: line"), report.logs)
+        assertEquals("NO_LEAK_OBSERVED", report.runs.first { it.target.label == "GERMANY / XRAY_REALITY" }.leaks!!.getString("verdict"))
+        val json = report.toJson()
+        assertEquals("FULL", json.getString("mode"))
+        assertTrue(json.getJSONArray("summary").toString().contains("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED"))
+    }
+
+    @Test
+    fun `quick mode never connects, works without VPN permission and reconnects a session it paused`() = runTest {
+        val host = FakeHost(permission = false)
+        host.applyTarget(FieldAttemptTarget(null, null))
+        host.connect() // the user was connected before the check
+        host.connects.clear()
+        val report = runner(host).run(FieldTestMode.QUICK, 0) { }
+        assertTrue(report.runs.isEmpty())
+        assertNull(report.abortReason)
+        assertTrue(report.censorship != null && report.direct != null)
+        assertEquals(1, host.connects.size) // only the final reconnect
+    }
+
+    @Test
+    fun `monitor mode samples the user's own connection and records events`() = runTest {
+        val host = FakeHost()
+        host.applyTarget(FieldAttemptTarget(null, null))
+        val report = runner(host).run(FieldTestMode.MONITOR, 5 * 60_000L) { }
+        val m = report.monitor!!
+        assertEquals(10, m.getJSONArray("samples").length())
+        assertTrue(m.getString("probeSuccess").startsWith("10/"))
+        assertTrue(m.getJSONArray("events").toString().contains("state Connected"))
+        assertTrue(host.transportState.value is TransportState.Disconnected)
+    }
+
+    @Test
+    fun `relay ingresses in the manifest each get a forced relay run`() {
+        val withIngress = manifest().let { m ->
+            m.copy(
+                endpoints = m.endpoints + EndpointDescriptor(
+                    id = EndpointId("stockholm-xhttp-ingress-1"), roles = setOf(EndpointRole.INGRESS), region = "SE", provider = "test",
+                    transports = listOf(EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example", 443)),
+                    relayTo = EndpointId("frankfurt"),
+                ),
+            )
+        }
+        assertEquals(listOf("stockholm-xhttp-ingress-1"), relayIngressIds(withIngress))
+        val plan = planAttempts(ProductionGatewayId.entries.toList(), relayIngressIds(withIngress))
+        assertTrue(plan.contains(FieldAttemptTarget(null, null, relayIngress = "stockholm-xhttp-ingress-1")))
+        assertEquals(FieldAttemptTarget(null, null), plan.last())
+        assertEquals(setOf("152.70.43.1"), expectedExitIps(withIngress, "frankfurt"))
     }
 }

@@ -3706,11 +3706,17 @@ class MainViewModel(
     val fieldTestProgress: StateFlow<net.pocvpn.client.diagnostics.fieldtest.FieldTestProgress?> = _fieldTestProgress.asStateFlow()
     private var fieldTestJob: kotlinx.coroutines.Job? = null
 
-    fun startFieldTest(appContext: android.content.Context, diagnosticsLines: () -> List<String>) {
+    fun startFieldTest(
+        appContext: android.content.Context,
+        mode: net.pocvpn.client.diagnostics.fieldtest.FieldTestMode = net.pocvpn.client.diagnostics.fieldtest.FieldTestMode.FULL,
+        monitorMinutes: Int = 0,
+        diagnosticsLines: () -> List<String>,
+    ) {
         if (fieldTestJob?.isActive == true) return
         val host = FieldTestHostAdapter(appContext.applicationContext, diagnosticsLines)
         fieldTestJob = viewModelScope.launch {
-            net.pocvpn.client.diagnostics.fieldtest.FieldTestRunner(host).run { _fieldTestProgress.value = it }
+            net.pocvpn.client.diagnostics.fieldtest.FieldTestRunner(host)
+                .run(mode, monitorMinutes * 60_000L) { _fieldTestProgress.value = it }
         }
     }
 
@@ -3756,11 +3762,14 @@ class MainViewModel(
                 net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE -> selectGatewaySelectionMode(s.mode)
             }
             debugSetTransportPreference(s.preference)
+            net.pocvpn.client.smartconnect.DebugPathOverride.clear()
         }
 
         override fun applyTarget(target: net.pocvpn.client.diagnostics.fieldtest.FieldAttemptTarget): String? {
             if (transportState.value.blocksGatewaySelection()) return "a session is still active"
             val gateway = target.gateway
+            net.pocvpn.client.smartconnect.DebugPathOverride.clear()
+            target.relayIngress?.let { net.pocvpn.client.smartconnect.DebugPathOverride.forceRelayedVia(it) }
             if (gateway == null) {
                 setGatewayAutoMode(true)
                 if (gatewaySelectionMode.value != net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO) {
@@ -3778,6 +3787,7 @@ class MainViewModel(
         override fun disconnect() = this@MainViewModel.disconnect()
         override fun transportScores() = this@MainViewModel.transportScores()
         override fun lastErrorText(): String? = diagnostics.value.lastError?.displayText()
+        override fun lastForcedRelayKeys(): List<String>? = net.pocvpn.client.smartconnect.DebugPathOverride.lastAppliedAttemptKeys()
 
         override fun latestDiagnosticSession(): org.json.JSONObject? {
             val latest = supportDiagnosticsStore?.recent()?.firstOrNull() ?: return null
@@ -3801,6 +3811,14 @@ class MainViewModel(
             .put("gitCommit", BuildConfig.GIT_COMMIT)
 
         override fun appState(): org.json.JSONObject = fieldTestAppState(diagnosticsLines)
+
+        override suspend fun refreshManifestOutcome(): String? =
+            try { refreshManifest()?.toString() ?: "no manifest refresh client wired" } catch (e: Exception) { "failed: ${e.javaClass.simpleName}" }
+
+        override fun exitReasons() = net.pocvpn.client.diagnostics.fieldtest.ExitReasons.collect(context)
+        override fun crashes() = net.pocvpn.client.diagnostics.fieldtest.CrashRecorder.recent(context)
+        override suspend fun logs() = net.pocvpn.client.diagnostics.fieldtest.FieldLogs.collect()
+        override fun activeNetworkSummary() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.activeSummary(context)
     }
 
     /**
@@ -3815,8 +3833,8 @@ class MainViewModel(
         fun safe(key: String, block: () -> Any?) {
             o.put(key, try { block() ?: org.json.JSONObject.NULL } catch (e: Exception) { "error: ${e.javaClass.simpleName}" })
         }
-        safe("transportState") { transportState.value.toString() }
-        safe("sessionHealth") { sessionHealth.value.toString() }
+        safe("transportState") { with(net.pocvpn.client.diagnostics.fieldtest.FieldStateLabels) { transportState.value.text() } }
+        safe("sessionHealth") { with(net.pocvpn.client.diagnostics.fieldtest.FieldStateLabels) { sessionHealth.value.text() } }
         safe("currentTransportKind") { currentTransportKind.value?.name }
         safe("gatewaySelectionMode") { gatewaySelectionMode.value.name }
         safe("gatewayAutoMode") { gatewayAutoMode.value }
@@ -4067,7 +4085,10 @@ class MainViewModel(
         // re-deriving their own snapshot on their own next read) diagnostics
         // - never a second, independently-timed stabilizedRestrictionClass() call here.
         val snapshot = buildCombinedAutoRankingSnapshot()
-        val attempts = snapshot.attempts
+        // Build-type-scoped: the release DebugPathOverride returns
+        // snapshot.attempts unchanged; the debug one can keep only Relayed
+        // attempts (optionally one ingress) for one forced connect.
+        val attempts = net.pocvpn.client.smartconnect.DebugPathOverride.applyAndConsume(snapshot.attempts)
         // B29 (task G) - the diagnostic session's own raw/stabilized fields
         // come from THIS SAME snapshot (snapshot.restrictionClass is the
         // stabilized value that just decided `attempts` above) - never a

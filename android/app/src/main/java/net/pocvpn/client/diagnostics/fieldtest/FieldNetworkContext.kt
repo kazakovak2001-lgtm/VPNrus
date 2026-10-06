@@ -37,6 +37,18 @@ object FieldNetworkContext {
         return obj
     }
 
+    /** Cheap one-liner of the default network's UNDERLYING (non-VPN) network, for monitor events. */
+    fun activeSummary(context: Context): String {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return "unknown"
+        val underlying = cm.allNetworks.firstOrNull { n ->
+            val c = cm.getNetworkCapabilities(n)
+            c != null && !c.hasTransport(NetworkCapabilities.TRANSPORT_VPN) && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } ?: return "no underlying network"
+        val caps = cm.getNetworkCapabilities(underlying)
+        val transports = TRANSPORTS.filter { caps?.hasTransport(it.first) == true }.joinToString("+") { it.second }
+        return "$transports validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)} net=$underlying"
+    }
+
     /** The network carrying our own VPN tunnel, or null when no VPN network exists. */
     fun vpnNetwork(context: Context): Network? = vpnNetwork(context.getSystemService(ConnectivityManager::class.java))
 

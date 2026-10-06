@@ -322,6 +322,7 @@ fun AppRoot(
                         )
                     },
                     onClearDiagnosticsClick = { viewModel.clearDiagnosticSessions() },
+                    onNetworkCheckClick = { showFieldTest = true },
                 )
                 else -> HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),
@@ -563,7 +564,9 @@ fun AppRoot(
             transportState, alwaysOnState, savedRoutingPolicy, appliedRoutingPolicy, networkProfile,
         )
     }
-    if (isDebugBuild && showFieldTest) {
+    // Debug: every mode (opened from Diagnostics). Release: the quick network
+    // check only (opened from Settings) - no transport cycling, no local save.
+    if (showFieldTest) {
         val fieldTestProgress by viewModel.fieldTestProgress.collectAsStateWithLifecycle()
         fun share(text: String, mime: String) {
             val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -576,9 +579,10 @@ fun AppRoot(
         }
         FieldTestDialog(
             progress = fieldTestProgress,
-            onStart = {
+            allModes = isDebugBuild,
+            onStart = { mode, minutes ->
                 fieldTestSaveStatus = null
-                viewModel.startFieldTest(context) { currentDiagnosticsLines.value() }
+                viewModel.startFieldTest(context, mode, minutes) { currentDiagnosticsLines.value() }
             },
             onCancel = { viewModel.cancelFieldTest() },
             onShareJson = { viewModel.fieldTestReportJson()?.let { share(it, "application/json") } },

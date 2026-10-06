@@ -14,9 +14,14 @@ import org.json.JSONObject
 data class FieldAttemptTarget(
     val gateway: ProductionGatewayId?,
     val transport: TransportKind?,
+    /** Non-null: an Auto connect restricted to relays entering via this ingress endpoint (DebugPathOverride). */
+    val relayIngress: String? = null,
 ) {
     val label: String
-        get() = "${gateway?.name ?: "AUTO"} / ${transport?.name ?: "SMART_CONNECT"}"
+        get() = when {
+            relayIngress != null -> "RELAY via $relayIngress"
+            else -> "${gateway?.name ?: "AUTO"} / ${transport?.name ?: "SMART_CONNECT"}"
+        }
 }
 
 enum class FieldRunOutcome {
@@ -60,6 +65,8 @@ data class FieldTransportRun(
     val diagnosticSession: JSONObject? = null,
     val disconnectMs: Long? = null,
     val notes: List<String> = emptyList(),
+    /** In-tunnel DNS/IPv6 leak check (LeakChecks.inTunnel). */
+    val leaks: JSONObject? = null,
 )
 
 /** Byte range in which a freeze is reported as the suspected throttling pattern. */
@@ -127,6 +134,15 @@ data class FieldTestReport(
     val direct: FieldDirectProbes?,
     val runs: List<FieldTransportRun>,
     val supportBundle: JSONObject?,
+    val mode: FieldTestMode = FieldTestMode.FULL,
+    val censorship: CensorshipReport? = null,
+    val apiChecks: JSONArray? = null,
+    val manifestRefresh: String? = null,
+    val directResolver: DnsProbeResult? = null,
+    val monitor: JSONObject? = null,
+    val exitReasons: JSONArray? = null,
+    val crashes: JSONArray? = null,
+    val logs: List<String> = emptyList(),
 ) {
     companion object {
         const val SCHEMA = "nova-field-test"
@@ -138,7 +154,7 @@ data class FieldTestReport(
 
 internal fun FieldTestReport.summaryLines(): List<String> {
     val lines = mutableListOf<String>()
-    lines += "Nova field test - ${if (cancelled) "CANCELLED" else if (abortReason != null) "ABORTED: $abortReason" else "COMPLETE"}"
+    lines += "Nova field test ($mode) - ${if (cancelled) "CANCELLED" else if (abortReason != null) "ABORTED: $abortReason" else "COMPLETE"}"
     lines += "Duration: ${(finishedAtEpochMillis - startedAtEpochMillis) / 1000}s, runs: ${runs.size}"
     networkContextBefore.optString("summary").takeIf { it.isNotBlank() }?.let { lines += "Network: $it" }
     direct?.let { d ->
@@ -147,7 +163,26 @@ internal fun FieldTestReport.summaryLines(): List<String> {
         d.tcp.forEach { lines += "  ${it.label}: ${if (it.ok) "TCP OK ${it.elapsedMs}ms" else "TCP FAIL (${it.error})"}" }
         d.dns.filter { !it.ok }.forEach { lines += "  DNS ${it.host}: FAIL (${it.error})" }
     }
-    lines += "-- VPN runs --"
+    censorship?.let { lines += it.summaryLines() }
+    apiChecks?.let { arr ->
+        lines += "-- Activation/profile API (VPN off) --"
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            lines += "  ${o.optString("origin")}${o.optString("path")}: ${o.optString("verdict")} (${o.opt("httpStatus")})"
+        }
+    }
+    manifestRefresh?.let { lines += "Manifest refresh: $it" }
+    directResolver?.let { lines += "DNS resolver (VPN off): ${it.addresses.joinToString(",").ifBlank { it.error.orEmpty() }}" }
+    monitor?.let { m ->
+        lines += "-- Monitor --"
+        lines += "  connected ${m.optLong("connectedPercent")}% of ${m.optLong("durationMs") / 1000}s, probes ${m.optString("probeSuccess")}, reconnects ${m.optInt("reconnects")}, events ${m.optJSONArray("events")?.length() ?: 0}"
+    }
+    exitReasons?.let { arr ->
+        val recent = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.filter { it.has("reason") }.take(5)
+        if (recent.isNotEmpty()) lines += "Recent process exits: " + recent.joinToString("; ") { "${it.optString("reason")} status=${it.opt("status")}" }
+    }
+    crashes?.let { if (it.length() > 0) lines += "Recorded crashes: ${it.length()}" }
+    if (runs.isNotEmpty()) lines += "-- VPN runs --"
     runs.forEach { r ->
         val detail = when (r.outcome) {
             FieldRunOutcome.SKIPPED -> r.skipReason.orEmpty()
@@ -161,12 +196,15 @@ internal fun FieldTestReport.summaryLines(): List<String> {
                 r.throughput?.let { append(", bulk ${throughputText(it)}") }
                 val stalls = (r.probes + r.stability + listOfNotNull(r.throughput)).mapNotNull { it.stalledAtBytes }
                 if (stalls.isNotEmpty()) append(", STALL at ${stalls.joinToString("/")} B")
+                r.leaks?.optString("verdict")?.let { append(", leaks $it") }
             }
         }
         lines += "  ${r.target.label}: ${r.outcome} - $detail"
     }
-    val working = runs.filter { it.outcome == FieldRunOutcome.DATA_PLANE_OK }.map { it.target.label }
-    lines += "Working end-to-end: ${if (working.isEmpty()) "NONE" else working.joinToString(", ")}"
+    if (runs.isNotEmpty()) {
+        val working = runs.filter { it.outcome == FieldRunOutcome.DATA_PLANE_OK }.map { it.target.label }
+        lines += "Working end-to-end: ${if (working.isEmpty()) "NONE" else working.joinToString(", ")}"
+    }
     return lines
 }
 
@@ -202,6 +240,15 @@ fun FieldTestReport.toJson(): JSONObject {
     root.put("direct", direct?.toJson() ?: JSONObject.NULL)
     root.put("runs", JSONArray().apply { runs.forEach { put(it.toJson()) } })
     root.put("supportBundle", supportBundle ?: JSONObject.NULL)
+    root.put("mode", mode.name)
+    root.put("censorship", censorship?.toJson() ?: JSONObject.NULL)
+    root.put("apiChecks", apiChecks ?: JSONObject.NULL)
+    root.put("manifestRefresh", manifestRefresh ?: JSONObject.NULL)
+    root.put("directResolver", directResolver?.toJson() ?: JSONObject.NULL)
+    root.put("monitor", monitor ?: JSONObject.NULL)
+    root.put("exitReasons", exitReasons ?: JSONObject.NULL)
+    root.put("crashes", crashes ?: JSONObject.NULL)
+    root.put("logs", JSONArray(logs))
     return root
 }
 
@@ -214,6 +261,7 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("label", target.label)
     .put("gateway", target.gateway?.name ?: "AUTO")
     .put("transport", target.transport?.name ?: "SMART_CONNECT")
+    .put("relayIngress", target.relayIngress ?: JSONObject.NULL)
     .put("startedAtEpochMillis", startedAtEpochMillis)
     .put("outcome", outcome.name)
     .put("skipReason", skipReason ?: JSONObject.NULL)
@@ -234,6 +282,7 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("diagnosticSession", diagnosticSession ?: JSONObject.NULL)
     .put("disconnectMs", disconnectMs ?: JSONObject.NULL)
     .put("notes", JSONArray(notes))
+    .put("leaks", leaks ?: JSONObject.NULL)
 
 internal fun DnsProbeResult.toJson(): JSONObject = JSONObject()
     .put("host", host).put("ok", ok).put("addresses", JSONArray(addresses))

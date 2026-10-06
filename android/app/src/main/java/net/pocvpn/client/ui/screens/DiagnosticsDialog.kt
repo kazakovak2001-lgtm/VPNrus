@@ -13,6 +13,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
@@ -196,6 +201,27 @@ fun DiagnosticsDialog(
                     // trusted signed binding + credential + ABI/binary gate holds.
                     TextButton(onClick = { onSetTransportForce(TransportKind.HYSTERIA2) }, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_force_hysteria2))
+                    }
+                    // Build-type-scoped DebugPathOverride: the debug source set
+                    // supplies the status line and actions; the release one
+                    // returns null / no actions, so nothing renders there. Not
+                    // Compose state, so its line is re-read after each action.
+                    var pathOverrideRevision by remember { mutableIntStateOf(0) }
+                    key(pathOverrideRevision) {
+                        net.pocvpn.client.smartconnect.DebugPathOverride.statusLine()?.let { status ->
+                            Text(text = status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                    net.pocvpn.client.smartconnect.DebugPathOverride.actions().forEach { (label, action) ->
+                        TextButton(
+                            onClick = {
+                                action()
+                                pathOverrideRevision++
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(label)
+                        }
                     }
                     TextButton(onClick = onSimulateAwgFailure, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_simulate_awg_failure))
