@@ -33,6 +33,7 @@ import net.pocvpn.client.transport.TransportHealthState
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
+import net.pocvpn.client.ui.screens.FieldTestDialog
 import net.pocvpn.client.ui.screens.HomeScreen
 import net.pocvpn.client.ui.screens.SettingsScreen
 import net.pocvpn.client.vpn.AlwaysOnDetectionState
@@ -137,6 +138,9 @@ fun AppRoot(
     // diagnostics locally" button (DebugDiagnosticsExport), shown in the
     // SAME dialog. Never persisted, never read by production logic.
     var diagnosticsSaveStatus by remember { mutableStateOf<String?>(null) }
+    // Field test (debug-only, opened from the Diagnostics dialog).
+    var showFieldTest by remember { mutableStateOf(false) }
+    var fieldTestSaveStatus by remember { mutableStateOf<String?>(null) }
     var showGatewayPicker by remember { mutableStateOf(false) }
     var showPrivateGatewayDialog by remember { mutableStateOf(false) }
     var privateGatewayValidationError by remember { mutableStateOf<net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason?>(null) }
@@ -318,6 +322,7 @@ fun AppRoot(
                         )
                     },
                     onClearDiagnosticsClick = { viewModel.clearDiagnosticSessions() },
+                    onNetworkCheckClick = { showFieldTest = true },
                 )
                 else -> HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),
@@ -543,7 +548,55 @@ fun AppRoot(
                 }.getOrElse { "failed: ${it.message}" }
             },
             saveLocallyStatus = diagnosticsSaveStatus,
+            onOpenFieldTest = {
+                showDiagnostics = false
+                showFieldTest = true
+            },
             onDismiss = { showDiagnostics = false },
+        )
+    }
+
+    // Field test - always reads the CURRENT diagnostics lines (before AND
+    // after snapshots), never the values captured when the test started.
+    val currentDiagnosticsLines = androidx.compose.runtime.rememberUpdatedState {
+        buildDiagnosticsLines(
+            viewModel, publicKey, diagnosticsSnapshot, provisioningState, profileSource,
+            transportState, alwaysOnState, savedRoutingPolicy, appliedRoutingPolicy, networkProfile,
+        )
+    }
+    // Debug: every mode (opened from Diagnostics). Release: the quick network
+    // check only (opened from Settings) - no transport cycling, no local save.
+    if (showFieldTest) {
+        val fieldTestProgress by viewModel.fieldTestProgress.collectAsStateWithLifecycle()
+        fun share(text: String, mime: String) {
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = mime
+                putExtra(android.content.Intent.EXTRA_TEXT, text)
+            }
+            context.startActivity(
+                android.content.Intent.createChooser(send, context.getString(net.pocvpn.client.R.string.field_test_share_title)),
+            )
+        }
+        FieldTestDialog(
+            progress = fieldTestProgress,
+            allModes = isDebugBuild,
+            onStart = { mode, minutes ->
+                fieldTestSaveStatus = null
+                viewModel.startFieldTest(context, mode, minutes) { currentDiagnosticsLines.value() }
+            },
+            onCancel = { viewModel.cancelFieldTest() },
+            onShareJson = { viewModel.fieldTestReportJson()?.let { share(it, "application/json") } },
+            onShareSummary = { viewModel.fieldTestReportSummary()?.let { share(it, "text/plain") } },
+            onSaveLocally = {
+                fieldTestSaveStatus = runCatching {
+                    val json = viewModel.fieldTestReportJson() ?: return@runCatching "no report yet"
+                    val file = net.pocvpn.client.diagnostics.support.LocalDiagnosticsExporter
+                        .exportFieldTest(context.filesDir, System.currentTimeMillis(), json)
+                    if (file != null) "${file.absolutePath} (${json.length}B)" else "unavailable (release build)"
+                }.getOrElse { "failed: ${it.message}" }
+            },
+            saveStatus = fieldTestSaveStatus,
+            onDismiss = { showFieldTest = false },
         )
     }
 }

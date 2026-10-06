@@ -3710,3 +3710,24 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Frankfurt (2026-10-04): reconcile code, `awg-host.env`
   (`awg-quick@awg0`) and one manual AWG reconcile deployed; no reconcile
   units or timers yet, so no automatic expiry there.
+
+## Field test (measurement tool, 2026-10-06)
+
+- `diagnostics/fieldtest/`: `FieldTestRunner` drives the EXISTING
+  `connect()`/`disconnect()`, gateway selection, debug transport pin and
+  debug path override through the narrow `FieldTestHost` (implemented in
+  `MainViewModel`) - no second connection path, no selection or scoring
+  change. It saves and restores the user's selection (also on cancel).
+- `DebugPathOverride` is build-type-scoped (src/debug real, src/release
+  no-op): it only filters the attempt list connectAuto already built to
+  the Relayed attempts (optionally one ingress), fail-closed.
+- In-tunnel probes bind to the VPN `Network`; direct and censorship probes
+  run only while disconnected. The device's own public IP is never stored;
+  log lines pass `LogSanitizer`; reports leave the device only via the
+  user's share action.
+- UI: FULL/MONITOR only from the `isDebugBuild`-gated Diagnostics dialog;
+  release exposes only QUICK (Settings -> Network check). Local save is a
+  no-op in release. `CrashRecorder` (installed in NovaVpnApplication) keeps
+  the newest 5 sanitized JVM crash records in app-private storage.
+- Measurement only: a report is B54 evidence for one network, never a
+  reachability claim by itself.

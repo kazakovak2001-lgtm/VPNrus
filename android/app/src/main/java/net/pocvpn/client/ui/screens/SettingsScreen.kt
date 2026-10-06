@@ -62,6 +62,10 @@ fun SettingsScreen(
     lastConnectionResult: String,
     onExportDiagnosticsClick: () -> Unit,
     onClearDiagnosticsClick: () -> Unit,
+    // Network check: the field test's QUICK mode (what this network blocks,
+    // server/activation reachability, crashes, sanitized logs) - an explicit
+    // user action; the report is only shared if the user chooses to.
+    onNetworkCheckClick: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     // B30A - physical-validation fix: this Column has no bound on its
@@ -264,6 +268,9 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurface,
         )
         Spacer(modifier = Modifier.height(12.dp))
+        androidx.compose.material3.TextButton(onClick = onNetworkCheckClick, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.settings_network_check))
+        }
         androidx.compose.material3.TextButton(onClick = onExportDiagnosticsClick, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.settings_diagnostics_export))
         }

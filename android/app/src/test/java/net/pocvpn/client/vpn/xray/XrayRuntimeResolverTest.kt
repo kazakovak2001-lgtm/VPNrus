@@ -263,7 +263,9 @@ class XrayXhttpRuntimeResolverTest {
     @Test
     fun `an unrecognized wire mode value fails closed`() = runBlocking {
         val repository = newXhttpRepository()
-        repository.saveProfile(validXhttpProfile.copy(mode = "stream-up"))
+        // "stream-up" became a recognized XrayXhttpMode in B61 - use a value
+        // no XrayXhttpMode.wireValue will ever match.
+        repository.saveProfile(validXhttpProfile.copy(mode = "stream-sideways"))
 
         val resolution = XrayRuntimeResolver.resolveXhttp(repository)
 

@@ -65,6 +65,17 @@ fun resolveManifestUrls(): String {
     return PRODUCTION_MANIFEST_URLS
 }
 
+// Field-test reports name the exact build they came from. "unknown" when
+// git is unavailable (e.g. a source archive) - never fails the build.
+val gitCommit: String = try {
+    providers.exec {
+        commandLine("git", "rev-parse", "--short=12", "HEAD")
+        isIgnoreExitValue = true
+    }.standardOutput.asText.get().trim().ifBlank { "unknown" }
+} catch (e: Exception) {
+    "unknown"
+}
+
 android {
     namespace = "net.pocvpn.client"
     compileSdk = 35
@@ -76,6 +87,8 @@ android {
         versionCode = 1
         versionName = "0.1-poc"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "GIT_COMMIT", "\"$gitCommit\"")
 
         buildConfigField("String", "GATEWAY_ENDPOINT_HOST", "\"${gatewayDevProp("endpointHost")}\"")
         buildConfigField("String", "GATEWAY_ENDPOINT_PORT", "\"${gatewayDevProp("endpointPort")}\"")
