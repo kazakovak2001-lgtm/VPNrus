@@ -3729,6 +3729,9 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   release exposes only QUICK (Settings -> Network check). Local save is a
   no-op in release. `CrashRecorder` (installed in NovaVpnApplication) keeps
   the newest 5 sanitized JVM crash records in app-private storage.
+- Every rendered Xray config disables the access log (`"access": "none"`):
+  per-connection destination records never reach logcat or a report
+  (`LogSanitizer.isConnectionRecord` drops any that still appear).
 - Measurement only: a report is B54 evidence for one network, never a
   reachability claim by itself.
 

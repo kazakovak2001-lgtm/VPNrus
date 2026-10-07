@@ -55,7 +55,7 @@ object XrayConfigRenderer {
 
     fun render(config: XrayVlessRealityConfig): String {
         val root = JSONObject()
-        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put("log", JSONObject().put("loglevel", "warning").put("access", "none"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessRealityOutbound(config)))
         return root.toString()
@@ -64,7 +64,7 @@ object XrayConfigRenderer {
     /** B8O1 - see this object's own docs for exactly what differs from [render] above. */
     fun render(config: XrayVlessTlsConfig): String {
         val root = JSONObject()
-        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put("log", JSONObject().put("loglevel", "warning").put("access", "none"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessTlsOutbound(config)))
         return root.toString()
@@ -77,7 +77,7 @@ object XrayConfigRenderer {
      */
     fun render(config: XrayVlessXhttpConfig): String {
         val root = JSONObject()
-        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put("log", JSONObject().put("loglevel", "warning").put("access", "none"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessXhttpOutbound(config)))
         return root.toString()

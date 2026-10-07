@@ -21,7 +21,7 @@ object FieldLogs {
                     .start()
                 val lines = process.inputStream.bufferedReader().readLines()
                 process.waitFor(2, TimeUnit.SECONDS)
-                lines.takeLast(maxLines).map(LogSanitizer::sanitize)
+                lines.takeLast(maxLines).filterNot(LogSanitizer::isConnectionRecord).map(LogSanitizer::sanitize)
             } catch (e: Exception) {
                 listOf("log collection failed: ${describeError(e)}")
             }
@@ -48,4 +48,13 @@ object LogSanitizer {
     )
 
     fun sanitize(line: String): String = rules.fold(line) { acc, (regex, replacement) -> regex.replace(acc, replacement) }
+
+    private val connectionRecord = Regex("""\baccepted (tcp|udp):\S+""")
+
+    /**
+     * Xray access-log lines (`from ... accepted tcp:1.2.3.4:443 [in >> out]`)
+     * reveal where the user's apps connect - never part of a report. The
+     * access log is disabled in every rendered config; this is the backstop.
+     */
+    fun isConnectionRecord(line: String): Boolean = connectionRecord.containsMatchIn(line)
 }

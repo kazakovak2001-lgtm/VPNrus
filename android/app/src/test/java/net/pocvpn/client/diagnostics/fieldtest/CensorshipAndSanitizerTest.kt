@@ -113,4 +113,10 @@ class CensorshipAndSanitizerTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test fun `xray access-log connection records are recognised and dropped`() {
+        assertTrue(LogSanitizer.isConnectionRecord("I/GoLog: from udp:172.19.0.1:44278 accepted udp:157.240.30.18:443 [nova-tun-in >> nova-vless-xhttp-out]"))
+        assertTrue(LogSanitizer.isConnectionRecord("I/GoLog: from tcp:172.19.0.1:42630 accepted tcp:57.144.248.196:443 [nova-tun-in >> out]"))
+        assertFalse(LogSanitizer.isConnectionRecord("I/NovaXrayVpnService: Xray core started"))
+    }
 }
