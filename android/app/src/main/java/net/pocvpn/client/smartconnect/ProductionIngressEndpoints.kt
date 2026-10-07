@@ -108,4 +108,22 @@ object ProductionIngressEndpoints {
 
     /** Every deployed ingress endpoint - today, just Stockholm's. */
     val all: List<EndpointDescriptor> = listOf(STOCKHOLM)
+
+    /**
+     * The B35 CDN-fronted XHTTP ingress (Cloudflare -> Stockholm XHTTP
+     * ingress -> Frankfurt exit), named by the signed production manifest
+     * (v6) as `stockholm-xhttp-ingress-1`.
+     */
+    val STOCKHOLM_XHTTP_INGRESS_ID: EndpointId = EndpointId("stockholm-xhttp-ingress-1")
+
+    /**
+     * Every code-reviewed ingress id - the membership MainViewModel's
+     * transport registry gates ingress availability on (B32 round 2: never
+     * "any manifest-named id"). The CDN ingress is reviewed but has NO
+     * hardcoded fallback descriptor in [all]: its binding is only
+     * executable with the signed CDN provider profile metadata, so it exists only when the signed manifest names it. Without this id, XRAY_XHTTP for
+     * the CDN ingress fell through to the Direct/EXIT gate and the Cloudflare
+     * path could never be selected by Smart Connect or a forced relay.
+     */
+    val reviewedIngressIds: Set<EndpointId> = all.map { it.id }.toSet() + STOCKHOLM_XHTTP_INGRESS_ID
 }

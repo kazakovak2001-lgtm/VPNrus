@@ -211,6 +211,9 @@ object XrayProcessBridge {
 internal class XrayProcessWatcher(private val context: Context) : ServiceConnection {
     @Volatile private var watchedSession: Long? = null
     @Volatile private var bound = false
+    private var binder: IBinder? = null
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val deathRecipient = IBinder.DeathRecipient { processDied() }
 
     fun onEvent(event: XrayRuntimeEvent) {
         when (event) {
@@ -233,15 +236,19 @@ internal class XrayProcessWatcher(private val context: Context) : ServiceConnect
     @Synchronized
     private fun unwatch() {
         watchedSession = null
+        binder?.let { b -> try { b.unlinkToDeath(deathRecipient, 0) } catch (e: java.util.NoSuchElementException) {} }
+        binder = null
         if (bound) {
             bound = false
             try { context.unbindService(this) } catch (e: IllegalArgumentException) {}
         }
     }
 
+    @Synchronized
     override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+        binder = service
         try {
-            service?.linkToDeath({ processDied() }, 0)
+            service?.linkToDeath(deathRecipient, 0)
         } catch (e: android.os.RemoteException) {
             processDied()
         }
@@ -249,15 +256,26 @@ internal class XrayProcessWatcher(private val context: Context) : ServiceConnect
 
     override fun onServiceDisconnected(name: ComponentName?) = processDied()
 
-    // linkToDeath and onServiceDisconnected can both fire for one death.
+    /**
+     * A normal stop also ends `:xray` (stopSelf, and some OEMs reap the empty
+     * process at once) - possibly before its Stopped broadcast reaches us.
+     * So a death only becomes Failed if, after a short grace, the session
+     * is STILL Started: a real crash never sends Stopped.
+     */
     @Synchronized
     private fun processDied() {
         val session = watchedSession ?: return
-        val current = XrayRuntimeState.events.value
-        if (current is XrayRuntimeEvent.Started && current.sessionId == session) {
-            Log.e("XrayProcessBridge", "Xray process died during session $session")
-            XrayRuntimeState.publish(XrayRuntimeEvent.Failed(session, "xray process died"))
-        }
         unwatch()
+        handler.postDelayed({
+            val current = XrayRuntimeState.events.value
+            if (current is XrayRuntimeEvent.Started && current.sessionId == session) {
+                Log.e("XrayProcessBridge", "Xray process died during session $session")
+                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(session, "xray process died"))
+            }
+        }, DEATH_GRACE_MS)
+    }
+
+    private companion object {
+        const val DEATH_GRACE_MS = 2_000L
     }
 }

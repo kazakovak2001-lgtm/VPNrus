@@ -186,6 +186,9 @@ class MainViewModelIngressWiringTest {
         transport: VpnTransport = FakeVpnTransport(),
         relayIngressResolver: RelayIngressResolver = NotProvisionedRelayIngressResolver,
         ingressProfileProvisioner: IngressProfileProvisioner? = null,
+        xrayXhttpTransport: VpnTransport? = null,
+        cdnRuntimeCapabilities: net.pocvpn.client.reachability.CdnClientRuntimeCapabilities =
+            net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.unsupported(),
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
@@ -202,6 +205,8 @@ class MainViewModelIngressWiringTest {
         relayIngressResolver = relayIngressResolver,
         relayEndToEndProbe = NotConfiguredRelayEndToEndProbe,
         ingressProfileProvisioner = ingressProfileProvisioner,
+        xrayXhttpTransport = xrayXhttpTransport,
+        cdnRuntimeCapabilities = cdnRuntimeCapabilities,
         ioDispatcher = testDispatcher,
     )
 
@@ -341,6 +346,67 @@ class MainViewModelIngressWiringTest {
         )
         // The real Stockholm-ingress fallback merge still worked despite the unrelated unknown entry.
         assertTrue(attempts.filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>().any { it.candidate.ingressEndpointId == ProductionIngressEndpoints.STOCKHOLM_INGRESS_ID })
+    }
+
+    private fun signedManifestWithCdnIngress(): EndpointManifestRepository = signedRepositoryFor(
+        EndpointManifest(
+            manifestVersion = 6,
+            issuedAtEpochMillis = 1_000L,
+            expiresAtEpochMillis = 9_000_000_000_000L,
+            signingKeyId = "test-manifest-key",
+            endpoints = listOf(
+                manifestEndpointFor(ProductionGatewayCatalog.GERMANY),
+                manifestEndpointFor(ProductionGatewayCatalog.STOCKHOLM),
+                EndpointDescriptor(
+                    id = ProductionIngressEndpoints.STOCKHOLM_XHTTP_INGRESS_ID,
+                    roles = setOf(EndpointRole.INGRESS),
+                    region = "Sweden / Stockholm",
+                    provider = "AWS / Cloudflare",
+                    transports = listOf(
+                        // Metadata exactly as the signed production manifest v6 carries it.
+                        EndpointTransportBinding(
+                            TransportKind.XRAY_XHTTP, "edge-sthlm.aknova.pp.ua", 443,
+                            metadata = mapOf("ingressKind" to "CDN_FRONTED", "cdnProviderProfile" to CDN_PROFILE_V6),
+                        ),
+                    ),
+                    relayTo = ProductionGatewayCatalog.GERMANY.endpointId,
+                ),
+            ),
+        ),
+    )
+
+    @Test
+    fun `the signed CDN XHTTP ingress is an eligible relayed candidate when this client can execute the pinned XHTTP profile`() {
+        val viewModel = newViewModel(
+            manifestRepository = signedManifestWithCdnIngress(),
+            xrayXhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP),
+            cdnRuntimeCapabilities = net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(clientVersionCode = 1),
+        )
+
+        val relayed = viewModel.combinedAutoAttempts().filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>()
+
+        assertTrue(
+            "the reviewed, signed CDN ingress must be selectable - before this fix XRAY_XHTTP fell through to the Direct/EXIT gate",
+            relayed.any { it.candidate.ingressEndpointId == ProductionIngressEndpoints.STOCKHOLM_XHTTP_INGRESS_ID && it.candidate.ingressTransport == TransportKind.XRAY_XHTTP },
+        )
+    }
+
+    @Test
+    fun `the CDN ingress stays ineligible when the client cannot execute the pinned XHTTP profile`() {
+        val viewModel = newViewModel(
+            manifestRepository = signedManifestWithCdnIngress(),
+            xrayXhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP),
+        )
+
+        val relayed = viewModel.combinedAutoAttempts().filterIsInstance<AutoGatewaySelector.AutoConnectAttempt.RelayedAttempt>()
+
+        assertFalse(relayed.any { it.candidate.ingressEndpointId == ProductionIngressEndpoints.STOCKHOLM_XHTTP_INGRESS_ID })
+    }
+
+    @Test
+    fun `the CDN ingress id is reviewed but never supplied as a hardcoded fallback descriptor`() {
+        assertTrue(ProductionIngressEndpoints.STOCKHOLM_XHTTP_INGRESS_ID in ProductionIngressEndpoints.reviewedIngressIds)
+        assertFalse(ProductionIngressEndpoints.all.any { it.id == ProductionIngressEndpoints.STOCKHOLM_XHTTP_INGRESS_ID })
     }
 
     @Test
@@ -548,3 +614,6 @@ class MainViewModelIngressWiringTest {
         assertFalse(reason.lowercase().contains("privatekey"))
     }
 }
+
+/** The signed production manifest v6 `cdnProviderProfile` of `stockholm-xhttp-ingress-1` (public, non-secret). */
+private const val CDN_PROFILE_V6 = """{"asn":13335,"hosts":{"cdnTechnicalHostname":"edge-sthlm.aknova.pp.ua","clientFacingHostname":"edge-sthlm.aknova.pp.ua","controlPlaneHostname":"control.aknova.pp.ua","originHostname":"origin-sthlm.aknova.pp.ua","originTlsServerName":"edge-sthlm.aknova.pp.ua"},"minimumClientVersionCode":1,"minimumXrayCoreVersion":"26.7.28","provider":"Cloudflare","requests":{"cachePolicy":"BYPASS_REQUIRED","maxRequestBodyBytes":524288,"originHostHeader":"edge-sthlm.aknova.pp.ua","requestTimeoutMillis":30000,"streamingSupported":true},"requiredClientCapabilities":["xhttp","cdn-profile-v2"],"supportedExits":["frankfurt"],"tls":{"alpn":["h2"],"clientFingerprint":"chrome","clientServerName":"edge-sthlm.aknova.pp.ua","minimumVersion":"TLS_1_3"},"version":2,"xhttp":{"extraParameters":{},"headers":{},"mode":"PACKET_UP","paddingMaxBytes":64,"paddingMinBytes":1,"paddingPlacement":"QUERY","path":"/nova-xhttp/","queryParameters":{},"uplinkHttpMethod":"POST"}}"""

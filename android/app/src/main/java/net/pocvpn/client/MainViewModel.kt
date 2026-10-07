@@ -1335,7 +1335,7 @@ class MainViewModel(
         // B32's own discovery-wiring fix before it could take effect. Every
         // GATEWAY endpoint id (Germany's/Stockholm's own) is completely
         // unaffected - still gated by isXrayAvailableFor exactly as before.
-        val isKnownIngressEndpoint = net.pocvpn.client.smartconnect.ProductionIngressEndpoints.all.any { it.id == endpointId }
+        val isKnownIngressEndpoint = endpointId in net.pocvpn.client.smartconnect.ProductionIngressEndpoints.reviewedIngressIds
         val xray = xrayTransport
         if (xray != null) {
             val available = if (isKnownIngressEndpoint) true else isXrayAvailableFor(endpointId)
