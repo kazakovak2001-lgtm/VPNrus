@@ -77,6 +77,8 @@ Mobile data: about 12-15 MB per full run; monitor about 3 MB per hour.
 | Outcome | Meaning |
 |---|---|
 | `DATA_PLANE_OK` | Connected, exit = this gateway, 1 MB download completed |
+| `DATA_PLANE_CORE_CONFIRMED` | Xray-family path (REALITY, TLS, XHTTP, relays): the app is excluded from the Xray tunnel by design, so the Xray core measured through it (latency to Google 204, the exit gateway, Telegram, YouTube). No bulk download, exit IP or leak check |
+| `CONNECTED_APP_EXCLUDED` | Connected and confirmed by the transport (e.g. Hysteria2), but the VPN excludes the Nova app - not measurable from the app; check with a browser |
 | `DATA_PLANE_DEGRADED` | Small probes worked, bulk download incomplete |
 | `DATA_PLANE_STALL_SUSPECTED` | A flow froze after 8-64 KB (reported TLS throttling pattern) |
 | `CONNECTED_NO_DATA` | Tunnel up, nothing answered through it |

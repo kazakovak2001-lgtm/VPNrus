@@ -3731,3 +3731,31 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   the newest 5 sanitized JVM crash records in app-private storage.
 - Measurement only: a report is B54 evidence for one network, never a
   reachability claim by itself.
+
+## Process boundary: Xray runs in `:xray` (hard invariant, 2026-10-06)
+
+- ONE Go runtime per process. AmneziaWG (`libwg-go`, GoBackend in the main
+  process) and Xray (`libgojni`) in one process crash it (`E/Go: SIGSEGV`,
+  ApplicationExitInfo `EXIT_SELF status=2` - the B57 "unexplained" exits),
+  reproduced 3/3 by the field test when an Xray session followed an AWG
+  session. `NovaXrayVpnService` therefore runs with `android:process=":xray"`;
+  nothing in `:xray` may load `libwg-go` (NovaVpnApplication returns early
+  there) and nothing in the main process may load `libgojni`.
+- The only cross-process state is `XrayProcessBridge`: `XrayRuntimeEvent`s
+  as an app-private broadcast (setPackage + RECEIVER_NOT_EXPORTED) re-published
+  into the main process' `XrayRuntimeState` (transports unchanged);
+  `:xray` death during a Started session -> `XrayRuntimeEvent.Failed`
+  (zero-flag bind + linkToDeath); an orphaned `:xray` tunnel is stopped when
+  a new main process starts; field-test core measurements
+  (`ACTION_MEASURE` -> Xray `measureDelay`).
+- Secrets never cross Intent/Binder: the XHTTP session config (VLESS uuid)
+  is handed over as an Android-Keystore AES-GCM encrypted app-private file
+  (`XhttpSessionConfigStore`), consumed once and deleted; stale files swept.
+- Xray (and Hysteria2) sessions exclude the Nova app from their tunnel by
+  design, so app sockets cannot probe through them (EPERM); the field test
+  measures Xray through the core and reports Hysteria2 as
+  CONNECTED_APP_EXCLUDED.
+- Xray transports' `disconnect()` is a no-op when already Disconnected and
+  falls back to Disconnected after a bounded wait (same rule as
+  Shadowsocks/Hysteria2) - an idle transport can no longer wedge the
+  controller in Disconnecting.

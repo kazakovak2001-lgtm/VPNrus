@@ -37,13 +37,16 @@ class FieldTestRunnerTest {
                 transports = listOf(
                     EndpointTransportBinding(TransportKind.AMNEZIA_WG, "152.70.43.1", 51820),
                     EndpointTransportBinding(TransportKind.XRAY_REALITY, "152.70.43.1", 2053),
+                    EndpointTransportBinding(TransportKind.TLS_TCP, "152.70.43.1", 2083),
                 ),
             ),
             EndpointDescriptor(
                 id = EndpointId("stockholm"), roles = setOf(EndpointRole.GATEWAY), region = "SE", provider = "test",
                 transports = listOf(
+                    EndpointTransportBinding(TransportKind.AMNEZIA_WG, "16.170.208.231", 51820),
                     EndpointTransportBinding(TransportKind.XRAY_REALITY, "16.170.208.231", 2053),
                     EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example", 443),
+                    EndpointTransportBinding(TransportKind.HYSTERIA2, "16.170.208.231", 443),
                 ),
             ),
         ),
@@ -77,7 +80,7 @@ class FieldTestRunnerTest {
             val t = applied!!
             connects += t.label
             when (t.transport) {
-                TransportKind.AMNEZIA_WG -> transportState.value = TransportState.Error("handshake timeout")
+                TransportKind.TLS_TCP -> transportState.value = TransportState.Error("handshake timeout")
                 TransportKind.XRAY_XHTTP -> lastError = "NoCandidateAvailable"
                 else -> {
                     transportState.value = TransportState.Connected
@@ -107,6 +110,9 @@ class FieldTestRunnerTest {
         override suspend fun logs() = listOf("I/Nova: line")
         var network = "WIFI validated=true net=100"
         override fun activeNetworkSummary() = network
+        var coreAnswers = true
+        override suspend fun measureViaXrayCore(urls: List<String>) =
+            if (coreAnswers) urls.map { net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement(it, 42, null) } else null
     }
 
     private fun okProbe(label: String, url: String, maxBytes: Long, trace: Map<String, String> = emptyMap()) =
@@ -122,6 +128,8 @@ class FieldTestRunnerTest {
         https = { label, url, _, maxBytes, parseTrace ->
             val inTunnel = host.transportState.value is TransportState.Connected
             when {
+                inTunnel && host.currentTransportKind.value == TransportKind.HYSTERIA2 ->
+                    HttpProbeResult(label, url, false, null, 1, null, 0, null, false, "SocketException: Binding socket to network 196 failed: EPERM (Operation not permitted)")
                 parseTrace -> okProbe(label, url, 200, mapOf("ip" to if (inTunnel) "152.70.43.1" else "198.51.100.7", "loc" to "RU", "colo" to "ARN"))
                 stallBulk && url == FieldTestTargets.BULK_TUNNEL ->
                     HttpProbeResult(label, url, false, 200, 9000, 100, 16_384, 16_384, false, "stalled after 16384 bytes")
@@ -145,15 +153,21 @@ class FieldTestRunnerTest {
         val byLabel = report.runs.associateBy { it.target.label }
 
         assertEquals(ProductionGatewayId.entries.size * FIELD_TEST_TRANSPORTS.size + 1, report.runs.size)
-        assertEquals(FieldRunOutcome.CONNECT_FAILED, byLabel.getValue("GERMANY / AMNEZIA_WG").outcome)
-        assertEquals(FieldRunOutcome.DATA_PLANE_OK, byLabel.getValue("GERMANY / XRAY_REALITY").outcome)
-        assertEquals("152.70.43.1", byLabel.getValue("GERMANY / XRAY_REALITY").exitIp)
-        // Stockholm REALITY exits through 152.70.43.1 in the fake -> not a Stockholm address.
-        assertEquals(FieldRunOutcome.EXIT_MISMATCH, byLabel.getValue("STOCKHOLM / XRAY_REALITY").outcome)
+        // AWG: the app is inside the tunnel -> app-level probes.
+        assertEquals(FieldRunOutcome.DATA_PLANE_OK, byLabel.getValue("GERMANY / AMNEZIA_WG").outcome)
+        assertEquals("152.70.43.1", byLabel.getValue("GERMANY / AMNEZIA_WG").exitIp)
+        // Stockholm AWG exits through 152.70.43.1 in the fake -> not a Stockholm address.
+        assertEquals(FieldRunOutcome.EXIT_MISMATCH, byLabel.getValue("STOCKHOLM / AMNEZIA_WG").outcome)
+        assertEquals(FieldRunOutcome.CONNECT_FAILED, byLabel.getValue("GERMANY / TLS_TCP").outcome)
+        // Xray family: the app is excluded from the tunnel -> measured by the Xray core.
+        val reality = byLabel.getValue("GERMANY / XRAY_REALITY")
+        assertEquals(FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED, reality.outcome)
+        assertNull(reality.exitIp)
+        assertTrue(reality.coreMeasurements!!.any { it.url == "https://152.70.43.1/v1/tunnel-probe" })
         assertEquals(FieldRunOutcome.UNAVAILABLE, byLabel.getValue("STOCKHOLM / XRAY_XHTTP").outcome)
-        assertEquals(FieldRunOutcome.SKIPPED, byLabel.getValue("GERMANY / TLS_TCP").outcome)
-        assertEquals("not offered by the signed manifest for this gateway", byLabel.getValue("GERMANY / TLS_TCP").skipReason)
-        assertEquals(FieldRunOutcome.DATA_PLANE_OK, byLabel.getValue("AUTO / SMART_CONNECT").outcome)
+        assertEquals(FieldRunOutcome.SKIPPED, byLabel.getValue("GERMANY / XRAY_XHTTP").outcome)
+        assertEquals("not offered by the signed manifest for this gateway", byLabel.getValue("GERMANY / XRAY_XHTTP").skipReason)
+        assertEquals(FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED, byLabel.getValue("AUTO / SMART_CONNECT").outcome)
         assertEquals("saved", host.restored)
         assertTrue(host.transportState.value is TransportState.Disconnected)
         assertFalse(report.cancelled)
@@ -182,7 +196,7 @@ class FieldTestRunnerTest {
     @Test
     fun `a freeze after 16 KB is reported as the suspected throttling pattern`() = runTest {
         val report = FakeHost().let { h -> runner(h, fakeProbes(h, stallBulk = true)) }.run { }
-        val run = report.runs.first { it.target.label == "GERMANY / XRAY_REALITY" }
+        val run = report.runs.first { it.target.label == "GERMANY / AMNEZIA_WG" }
         assertEquals(FieldRunOutcome.DATA_PLANE_STALL_SUSPECTED, run.outcome)
         assertTrue(report.summaryLines().any { it.contains("STALL at 16384") })
     }
@@ -238,7 +252,8 @@ class FieldTestRunnerTest {
         assertTrue(report.apiChecks!!.length() >= 3) // 152.70.43.1, 16.170.208.231, control.aknova.pp.ua
         assertEquals("EXIT_SELF", report.exitReasons!!.getJSONObject(0).getString("reason"))
         assertEquals(listOf("I/Nova: line"), report.logs)
-        assertEquals("NO_LEAK_OBSERVED", report.runs.first { it.target.label == "GERMANY / XRAY_REALITY" }.leaks!!.getString("verdict"))
+        assertEquals("NO_LEAK_OBSERVED", report.runs.first { it.target.label == "GERMANY / AMNEZIA_WG" }.leaks!!.getString("verdict"))
+        assertNull(report.runs.first { it.target.label == "GERMANY / XRAY_REALITY" }.leaks)
         val json = report.toJson()
         assertEquals("FULL", json.getString("mode"))
         assertTrue(json.getJSONArray("summary").toString().contains("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED"))
@@ -285,5 +300,22 @@ class FieldTestRunnerTest {
         assertTrue(plan.contains(FieldAttemptTarget(null, null, relayIngress = "stockholm-xhttp-ingress-1")))
         assertEquals(FieldAttemptTarget(null, null), plan.last())
         assertEquals(setOf("152.70.43.1"), expectedExitIps(withIngress, "frankfurt"))
+    }
+
+    @Test
+    fun `an Xray run whose core does not answer is CONNECTED_NO_DATA with an explanation`() = runTest {
+        val host = FakeHost().apply { coreAnswers = false }
+        val run = runner(host).run { }.runs.first { it.target.label == "GERMANY / XRAY_REALITY" }
+        assertEquals(FieldRunOutcome.CONNECTED_NO_DATA, run.outcome)
+        assertTrue(run.notes.any { "did not answer" in it })
+    }
+
+    @Test
+    fun `a VPN that excludes the app is CONNECTED_APP_EXCLUDED, never a false leak or no-data verdict`() = runTest {
+        val run = runner(FakeHost()).run { }.runs.first { it.target.label == "STOCKHOLM / HYSTERIA2" }
+        assertEquals(FieldRunOutcome.CONNECTED_APP_EXCLUDED, run.outcome)
+        assertNull(run.leaks)
+        assertNull(run.throughput)
+        assertTrue(run.notes.any { "EPERM" in it })
     }
 }

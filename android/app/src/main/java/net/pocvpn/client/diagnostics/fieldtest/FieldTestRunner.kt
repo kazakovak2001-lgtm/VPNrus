@@ -51,6 +51,12 @@ interface FieldTestHost {
     fun exitReasons(): org.json.JSONArray
     fun crashes(): org.json.JSONArray
     suspend fun logs(): List<String>
+    /**
+     * Xray-family sessions exclude the Nova app from their own tunnel, so the
+     * app cannot probe through them; the `:xray` process measures with the
+     * Xray core itself (latency only). Null when it does not answer.
+     */
+    suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>?
     /** One-line description of the current default network (for monitor samples). */
     fun activeNetworkSummary(): String
 }
@@ -166,6 +172,7 @@ internal fun expectedExitIps(manifest: EndpointManifest?, endpointId: String?): 
 
 private val IPV4_LITERAL = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
 private const val POLL_MS = 250L
+private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
 
 /** Readable state names for reports (plain objects would print as Class@hash). */
 internal fun TransportState.label(): String = when (this) {
@@ -522,7 +529,23 @@ class FieldTestRunner(
         var exitLoc: String? = null
         val notes = mutableListOf<String>()
         var leaks: JSONObject? = null
-        if (connected) {
+        var core: List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? = null
+        var appExcluded = false
+        val coreMeasured = connected && host.currentTransportKind.value in XRAY_FAMILY
+        if (coreMeasured) {
+            health = withTimeoutOrNull(timings.healthGraceMs) {
+                host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
+            } ?: host.sessionHealth.value
+            delay(timings.settleMs)
+            val urls = listOf(FieldTestTargets.CONNECTIVITY_204) +
+                expected.sorted().take(1).map { "https://$it/v1/tunnel-probe" } +
+                listOf("https://telegram.org/", "https://www.youtube.com/")
+            core = host.measureViaXrayCore(urls)
+            notes += "app is excluded from the Xray tunnel by design; data plane measured by the Xray core (latency only - no bulk download, exit IP or leak check)"
+            if (core == null) notes += "the Xray process did not answer the measurement request"
+            delay(timings.stabilityHoldMs)
+            host.measureViaXrayCore(listOf(FieldTestTargets.CONNECTIVITY_204))?.let { later -> core = core.orEmpty() + later.map { it.copy(url = it.url + " (after hold)") } }
+        } else if (connected) {
             health = withTimeoutOrNull(timings.healthGraceMs) {
                 host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
             } ?: host.sessionHealth.value
@@ -530,7 +553,16 @@ class FieldTestRunner(
             val vpn = host.vpnNetwork()
             if (vpn == null) notes += "no VPN network visible to the app - in-tunnel probes ran unbound"
             dns = probes.dns(FieldTestTargets.TUNNEL_DNS, vpn)
-            FieldTestTargets.TUNNEL_HTTP.forEach { (label, url) -> probeResults += probes.https(label, url, vpn, 64 * 1024, false) }
+            val first = probes.https(FieldTestTargets.TUNNEL_HTTP.first().first, FieldTestTargets.TUNNEL_HTTP.first().second, vpn, 64 * 1024, false)
+            probeResults += first
+            if (first.error?.contains("EPERM") == true) {
+                appExcluded = true
+                notes += "this VPN excludes the Nova app (binding to the VPN network: EPERM); connection confirmed by the transport, data plane not measurable from the app - verify with a browser"
+            }
+        }
+        if (connected && !coreMeasured && !appExcluded) {
+            val vpn = host.vpnNetwork()
+            FieldTestTargets.TUNNEL_HTTP.drop(1).forEach { (label, url) -> probeResults += probes.https(label, url, vpn, 64 * 1024, false) }
             val trace = probes.https("Cloudflare trace (exit)", FieldTestTargets.CLOUDFLARE_TRACE, vpn, 4 * 1024, true)
             probeResults += trace
             exitIp = trace.trace["ip"]
@@ -559,7 +591,10 @@ class FieldTestRunner(
         return FieldTransportRun(
             target = target,
             startedAtEpochMillis = startedAt,
-            outcome = classifyRun(connected, state.label(), errorText, timedOut, probeResults, throughput, stability, exitIp, expected),
+            outcome = core?.let { measured -> if (measured.any { it.ok }) FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED else FieldRunOutcome.CONNECTED_NO_DATA }
+                ?: if (coreMeasured) FieldRunOutcome.CONNECTED_NO_DATA
+                else if (appExcluded) FieldRunOutcome.CONNECTED_APP_EXCLUDED
+                else classifyRun(connected, state.label(), errorText, timedOut, probeResults, throughput, stability, exitIp, expected),
             connectMs = connectMs,
             terminalState = (terminal ?: state).label(),
             errorMessage = errorText,
@@ -578,6 +613,7 @@ class FieldTestRunner(
             disconnectMs = disconnectMs,
             notes = notes,
             leaks = leaks,
+            coreMeasurements = core,
         )
     }
 

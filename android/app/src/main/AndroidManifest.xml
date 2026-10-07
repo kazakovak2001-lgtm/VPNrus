@@ -74,6 +74,7 @@
              net.pocvpn.client.vpn.xray.NovaXrayVpnService's own docs. -->
         <service
             android:name=".vpn.xray.NovaXrayVpnService"
+            android:process=":xray"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE">
             <intent-filter>

@@ -177,7 +177,8 @@ internal fun classifyNetwork(
         v += "WHITELIST_MODE_SUSPECTED (domestic sites reachable, foreign control sites not)"
     }
     if (domestic.isNotEmpty() && domestic.none(::reachable)) v += "NO_WORKING_INTERNET_OR_TOTAL_SHUTDOWN"
-    val blockedCount = blockedSet.count { !reachable(it) || it.verdicts.any { x -> x != "OK" } }
+    // DNS_DIFFERS_FROM_DOH alone is weak (CDNs answer per region) - not "affected".
+    val blockedCount = blockedSet.count { !reachable(it) || it.verdicts.any { x -> x != "OK" && x != "DNS_DIFFERS_FROM_DOH" } }
     if (blockedSet.isNotEmpty()) v += "COMMONLY_BLOCKED_SERVICES_AFFECTED $blockedCount/${blockedSet.size}"
     val mechanisms = targets.flatMap { it.verdicts }.filter { it != "OK" }.groupingBy { it }.eachCount()
     if (mechanisms.isNotEmpty()) v += "MECHANISMS " + mechanisms.entries.sortedByDescending { it.value }.joinToString(", ") { "${it.key}x${it.value}" }

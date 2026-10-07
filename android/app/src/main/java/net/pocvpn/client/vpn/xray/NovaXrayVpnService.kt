@@ -124,6 +124,24 @@ class NovaXrayVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            XrayProcessBridge.ACTION_MEASURE -> {
+                // Field test: the Nova app is excluded from its own Xray tunnel
+                // (addDisallowedApplication), so only the core can measure
+                // through it. Non-secret URLs in, delays/errors out.
+                val requestId = intent.getLongExtra(XrayProcessBridge.EXTRA_REQUEST_ID, 0L)
+                val urls: Array<String> = intent.getStringArrayExtra(XrayProcessBridge.EXTRA_URLS)?.map { it }?.toTypedArray() ?: emptyArray()
+                scope.launch {
+                    val results = urls.map { url ->
+                        if (!coreRuntime.isRunning) {
+                            -1L to "xray core not running"
+                        } else {
+                            try { coreRuntime.measureDelay(url) to null } catch (t: Throwable) { -1L to (t.message ?: t.javaClass.simpleName).take(160) }
+                        }
+                    }
+                    XrayProcessBridge.publishMeasureResult(this@NovaXrayVpnService, requestId, urls, results)
+                }
+                return Service.START_NOT_STICKY
+            }
             ACTION_STOP -> {
                 teardown("explicit stop")
                 return Service.START_NOT_STICKY
@@ -176,6 +194,13 @@ class NovaXrayVpnService : VpnService() {
         }
     }
 
+    // Main-process death watch (XrayProcessBridge): a plain binder whose
+    // death tells the main process that this `:xray` process is gone.
+    private val watchBinder = android.os.Binder()
+
+    override fun onBind(intent: Intent?): android.os.IBinder? =
+        if (intent?.action == XrayProcessBridge.ACTION_WATCH) watchBinder else super.onBind(intent)
+
     override fun onRevoke() {
         teardown("permission revoked")
     }
@@ -216,7 +241,7 @@ class NovaXrayVpnService : VpnService() {
             // sites already use.
             if (isRelayed && relayExitProbeHost == null) {
                 Log.e(TAG, "refusing to start: relayed attempt with no exit probe host")
-                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, "relayed attempt missing exit probe host"))
+                XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, "relayed attempt missing exit probe host"))
                 stopSelf()
                 return@launch
             }
@@ -237,7 +262,7 @@ class NovaXrayVpnService : VpnService() {
             // startRelayHealthWatchdog docs) - never before.
             val onRelayHealthLost: suspend () -> Unit = {
                 Log.w(TAG, "relay health watchdog: consecutive probe failures exceeded threshold, session torn down")
-                XrayRuntimeState.publishRelayHealthLost(sessionId, kind)
+                XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeState.relayHealthLostEvent(sessionId, kind))
                 stopSelf()
             }
             val xhttpConfig =
@@ -249,7 +274,7 @@ class NovaXrayVpnService : VpnService() {
 
             if (kind == TransportKind.XRAY_XHTTP && xhttpConfig == null) {
                 Log.e(TAG, "refusing to start: XHTTP runtime config missing")
-                XrayRuntimeState.publish(
+                XrayProcessBridge.publishFromService(this@NovaXrayVpnService, 
                     XrayRuntimeEvent.Failed(
                         sessionId,
                         "XHTTP runtime config missing",
@@ -274,17 +299,17 @@ class NovaXrayVpnService : VpnService() {
                 is XrayCoreStartOutcome.StartInFlight -> Log.i(TAG, "start requested while a start is already in flight - ignored")
                 is XrayCoreStartOutcome.Rejected -> {
                     Log.w(TAG, "refusing to start: ${outcome.reason}")
-                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
                 is XrayCoreStartOutcome.EstablishFailed -> {
                     Log.e(TAG, "failed to establish VPN interface: ${outcome.reason}")
-                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
                 is XrayCoreStartOutcome.CoreStartFailed -> {
                     Log.e(TAG, "Xray core failed to start: ${outcome.reason}")
-                    XrayRuntimeState.publish(XrayRuntimeEvent.Failed(sessionId, outcome.reason))
+                    XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, outcome.reason))
                     stopSelf()
                 }
                 is XrayCoreStartOutcome.RemoteUnconfirmed -> {
@@ -294,7 +319,7 @@ class NovaXrayVpnService : VpnService() {
                     // docs) - a real, distinct terminal failure, never
                     // reported as Started/Connected.
                     Log.w(TAG, "Xray core started locally but remote connectivity never confirmed: ${outcome.reason}")
-                    XrayRuntimeState.publish(
+                    XrayProcessBridge.publishFromService(this@NovaXrayVpnService, 
                         XrayRuntimeEvent.Failed(
                             sessionId,
                             outcome.reason,
@@ -309,7 +334,7 @@ class NovaXrayVpnService : VpnService() {
                     // VlessRealityTransport waits for before ever reporting
                     // Connected - never fabricated from startService()
                     // merely returning.
-                    XrayRuntimeState.publish(XrayRuntimeEvent.Started(sessionId))
+                    XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Started(sessionId))
                 }
             }
         }
@@ -356,7 +381,7 @@ class NovaXrayVpnService : VpnService() {
         }
         Log.i(TAG, "tearing down: $reason")
         outcome.stopLoopFailureReason?.let { Log.e(TAG, "stopLoop failed: $it") }
-        XrayRuntimeState.publish(XrayRuntimeEvent.Stopped(currentSessionId))
+        XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Stopped(currentSessionId))
         stopSelf()
     }
 

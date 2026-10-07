@@ -53,12 +53,13 @@ object XrayRuntimeState {
 
     /** The watchdog calls back only after tearing down a previously Connected relay. */
     internal fun publishRelayHealthLost(sessionId: Long, kind: TransportKind) {
-        publish(
-            XrayRuntimeEvent.Failed(
-                sessionId,
-                "relay data-plane health check failed",
-                if (kind == TransportKind.XRAY_XHTTP) TransportFailureKind.RELAY_DATA_PLANE_LOST else null,
-            ),
-        )
+        publish(relayHealthLostEvent(sessionId, kind))
     }
+
+    internal fun relayHealthLostEvent(sessionId: Long, kind: TransportKind): XrayRuntimeEvent.Failed =
+        XrayRuntimeEvent.Failed(
+            sessionId,
+            "relay data-plane health check failed",
+            if (kind == TransportKind.XRAY_XHTTP) TransportFailureKind.RELAY_DATA_PLANE_LOST else null,
+        )
 }

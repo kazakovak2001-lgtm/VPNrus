@@ -27,6 +27,17 @@ data class FieldAttemptTarget(
 enum class FieldRunOutcome {
     /** Connected, exit IP matched, small probes AND the bulk download completed. */
     DATA_PLANE_OK,
+    /**
+     * Xray-family session (the app is excluded from it): the Xray core reached
+     * at least one target through the tunnel. Latency only - no bulk/exit/leak.
+     */
+    DATA_PLANE_CORE_CONFIRMED,
+    /**
+     * Connected and confirmed by the transport itself, but this VPN excludes
+     * the Nova app (binding to the VPN network: EPERM), so the app cannot
+     * measure through it (e.g. Hysteria2). Verify with another app/browser.
+     */
+    CONNECTED_APP_EXCLUDED,
     /** Connected; small probes worked but the bulk download did not complete (slow/partial). */
     DATA_PLANE_DEGRADED,
     /** Connected, then a flow froze after a few KB (8-64 KB) - the throttling pattern to look for. */
@@ -67,6 +78,8 @@ data class FieldTransportRun(
     val notes: List<String> = emptyList(),
     /** In-tunnel DNS/IPv6 leak check (LeakChecks.inTunnel). */
     val leaks: JSONObject? = null,
+    /** Xray-family runs: measurements by the Xray core through its own tunnel. */
+    val coreMeasurements: List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? = null,
 )
 
 /** Byte range in which a freeze is reported as the suspected throttling pattern. */
@@ -111,7 +124,7 @@ internal fun classifyRun(
 
 private val UNAVAILABLE_MARKERS = listOf(
     "nocandidateavailable", "no candidate", "not available", "unavailable", "not_implemented", "not implemented",
-    "not provisioned", "no profile", "not eligible", "unsupportedtransportselected",
+    "not provisioned", "no profile", "not eligible", "unsupportedtransportselected", "candidate available",
 )
 
 data class FieldDirectProbes(
@@ -197,13 +210,16 @@ internal fun FieldTestReport.summaryLines(): List<String> {
                 val stalls = (r.probes + r.stability + listOfNotNull(r.throughput)).mapNotNull { it.stalledAtBytes }
                 if (stalls.isNotEmpty()) append(", STALL at ${stalls.joinToString("/")} B")
                 r.leaks?.optString("verdict")?.let { append(", leaks $it") }
+                r.coreMeasurements?.let { m -> append(", core ${m.joinToString(" ") { c -> "${c.url.substringAfter("//").substringBefore('/')}=${if (c.ok) "${c.delayMs}ms" else "FAIL"}" }}") }
             }
         }
         lines += "  ${r.target.label}: ${r.outcome} - $detail"
     }
     if (runs.isNotEmpty()) {
-        val working = runs.filter { it.outcome == FieldRunOutcome.DATA_PLANE_OK }.map { it.target.label }
+        val working = runs.filter { it.outcome == FieldRunOutcome.DATA_PLANE_OK || it.outcome == FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED }.map { it.target.label }
         lines += "Working end-to-end: ${if (working.isEmpty()) "NONE" else working.joinToString(", ")}"
+        val excluded = runs.filter { it.outcome == FieldRunOutcome.CONNECTED_APP_EXCLUDED }.map { it.target.label }
+        if (excluded.isNotEmpty()) lines += "Connected, not measurable from the app (check with a browser): ${excluded.joinToString(", ")}"
     }
     return lines
 }
@@ -283,6 +299,9 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("disconnectMs", disconnectMs ?: JSONObject.NULL)
     .put("notes", JSONArray(notes))
     .put("leaks", leaks ?: JSONObject.NULL)
+    .put("coreMeasurements", coreMeasurements?.let { list ->
+        JSONArray().apply { list.forEach { put(JSONObject().put("url", it.url).put("delayMs", it.delayMs).put("ok", it.ok).put("error", it.error ?: JSONObject.NULL)) } }
+    } ?: JSONObject.NULL)
 
 internal fun DnsProbeResult.toJson(): JSONObject = JSONObject()
     .put("host", host).put("ok", ok).put("addresses", JSONArray(addresses))
