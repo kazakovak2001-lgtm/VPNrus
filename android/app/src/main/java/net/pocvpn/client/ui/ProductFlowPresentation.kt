@@ -174,6 +174,20 @@ fun shouldShowDiagnostics(isDebugBuild: Boolean): Boolean = isDebugBuild
  * user (clone, work) bypass the VPN. Unknown (null) shows nothing here; the
  * static Settings note still applies.
  */
+/**
+ * B57 c4 residual - Android only keeps traffic inside the VPN when Nova
+ * stops if the user turned on Always-on + "Block connections without VPN".
+ * The app cannot see lockdown itself (see AlwaysOnVpnState), so this is a
+ * one-time hint after the first Protected, skipped once Always-on is
+ * confirmed or the user dismissed it.
+ */
+fun showsLockdownHint(
+    visualState: HomeVisualState,
+    alwaysOn: net.pocvpn.client.vpn.AlwaysOnDetectionState,
+    dismissed: Boolean,
+): Boolean =
+    visualState == HomeVisualState.CONNECTED && alwaysOn == net.pocvpn.client.vpn.AlwaysOnDetectionState.UNKNOWN && !dismissed
+
 fun showsOtherProfileNotice(visualState: HomeVisualState, otherProfiles: Int?): Boolean =
     visualState == HomeVisualState.CONNECTED && (otherProfiles ?: 0) > 0
 

@@ -56,6 +56,18 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
  */
 internal enum class SettingsRoute { Settings, AppSelector }
 
+private const val UI_HINT_PREFS = "nova_ui_hints"
+private const val LOCKDOWN_HINT_DISMISSED = "lockdown_hint_dismissed"
+
+/** Android's own VPN settings, where Always-on and "Block connections without VPN" live. */
+private fun openAndroidVpnSettings(context: android.content.Context) {
+    try {
+        context.startActivity(android.content.Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
+    } catch (e: android.content.ActivityNotFoundException) {
+        context.startActivity(android.content.Intent(android.provider.Settings.ACTION_SETTINGS))
+    }
+}
+
 /**
  * B30A - physical-validation fix: the SAME transition each screen's own
  * "back arrow" onBack lambda already performs (AppSelector -> Settings,
@@ -323,6 +335,7 @@ fun AppRoot(
                     },
                     onClearDiagnosticsClick = { viewModel.clearDiagnosticSessions() },
                     onNetworkCheckClick = { showFieldTest = true },
+                    onOpenVpnSettingsClick = { openAndroidVpnSettings(context) },
                 )
                 else -> HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),
@@ -364,6 +377,30 @@ fun AppRoot(
                 )
             }
         }
+    }
+
+    val hintPrefs = remember { context.getSharedPreferences(UI_HINT_PREFS, android.content.Context.MODE_PRIVATE) }
+    var lockdownHintDismissed by remember { mutableStateOf(hintPrefs.getBoolean(LOCKDOWN_HINT_DISMISSED, false)) }
+    if (settingsRoute == null && showsLockdownHint(sessionHealth.toHomeVisualState(), alwaysOnState, lockdownHintDismissed)) {
+        val dismiss = {
+            lockdownHintDismissed = true
+            hintPrefs.edit().putBoolean(LOCKDOWN_HINT_DISMISSED, true).apply()
+        }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = dismiss,
+            title = { androidx.compose.material3.Text(androidx.compose.ui.res.stringResource(net.pocvpn.client.R.string.lockdown_hint_title)) },
+            text = { androidx.compose.material3.Text(androidx.compose.ui.res.stringResource(net.pocvpn.client.R.string.lockdown_hint_text)) },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = { dismiss(); openAndroidVpnSettings(context) }) {
+                    androidx.compose.material3.Text(androidx.compose.ui.res.stringResource(net.pocvpn.client.R.string.lockdown_hint_open))
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = dismiss) {
+                    androidx.compose.material3.Text(androidx.compose.ui.res.stringResource(net.pocvpn.client.R.string.lockdown_hint_later))
+                }
+            },
+        )
     }
 
     if (showGatewayPicker) {

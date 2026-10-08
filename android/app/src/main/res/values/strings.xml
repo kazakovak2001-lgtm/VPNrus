@@ -21,6 +21,13 @@
     <string name="home_diagnostics_entry">Diagnostics</string>
     <string name="home_kill_switch_notice">Internet blocked until VPN reconnects</string>
     <string name="home_other_profile_notice">Cloned apps and work-profile apps on this phone are NOT protected</string>
+    <string name="lockdown_hint_title">Stay protected if Nova stops</string>
+    <string name="lockdown_hint_text">If Nova VPN is ever closed or crashes, Android sends your traffic outside the VPN. In Android VPN settings, open Nova VPN and turn on \"Always-on VPN\" and \"Block connections without VPN\".</string>
+    <string name="lockdown_hint_open">Open VPN settings</string>
+    <string name="lockdown_hint_later">Not now</string>
+    <string name="settings_always_on_title">Always-on VPN</string>
+    <string name="settings_always_on_explanation">Turn on \"Always-on VPN\" and \"Block connections without VPN\" for Nova VPN so nothing leaks if the app stops.</string>
+    <string name="settings_always_on_open">Open Android VPN settings</string>
     <string name="settings_other_profiles_note">Cloned apps (Dual apps, App Cloner), a work profile and other Android users are not protected: Android limits a VPN to the user that started it.</string>
 
     <!-- Gateway picker -->
