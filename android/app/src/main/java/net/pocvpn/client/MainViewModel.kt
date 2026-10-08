@@ -595,6 +595,9 @@ class MainViewModel(
     // activateIngress() below is a no-op that reports
     // IngressActivationOutcome.Unavailable, never a fabricated success.
     private val ingressProfileProvisioner: net.pocvpn.client.relay.IngressProfileProvisioner? = null,
+    // Field test only: read-only lookup of whether this device holds an
+    // activated relay ingress profile (never written from here).
+    private val ingressProfileStore: net.pocvpn.client.relay.IngressProfileStore? = null,
     // B12/B20 - additive, defaults to null (same seam as every optional
     // dependency above): with no client, refreshManifest() below is a
     // no-op that returns null, and manifestRepository's trusted state is
@@ -3796,6 +3799,15 @@ class MainViewModel(
         override fun transportScores() = this@MainViewModel.transportScores()
         override fun lastErrorText(): String? = diagnostics.value.lastError?.displayText()
         override fun lastForcedRelayKeys(): List<String>? = net.pocvpn.client.smartconnect.DebugPathOverride.lastAppliedAttemptKeys()
+        override suspend fun relayIngressActivation(ingressId: String): String {
+            val store = ingressProfileStore ?: return "unknown (no ingress profile store wired)"
+            return try {
+                val profile = store.getProfileOrNull(net.pocvpn.client.reachability.EndpointId(ingressId))
+                if (profile == null) "NOT_ACTIVATED" else "ACTIVATED (${profile.transport}, ${profile.ingressKind})"
+            } catch (e: Exception) {
+                "unreadable: ${e.javaClass.simpleName}"
+            }
+        }
 
         override fun latestDiagnosticSession(): org.json.JSONObject? {
             val latest = supportDiagnosticsStore?.recent()?.firstOrNull() ?: return null
@@ -5275,6 +5287,7 @@ class MainViewModel(
                 relayXrayProfileRepositoryResolver = relayComposition.relayXrayProfileRepositoryResolver,
                 relayXrayTlsProfileRepositoryResolver = relayComposition.relayXrayTlsProfileRepositoryResolver,
                 ingressProfileProvisioner = relayComposition.ingressProfileProvisioner,
+                ingressProfileStore = ingressProfileStore,
                 supportDiagnosticsRecorder = supportDiagnosticsRecorder,
                 supportDiagnosticsStore = supportDiagnosticsStore,
                 supportDiagnosticsAppVersionName = BuildConfig.VERSION_NAME,

@@ -1,7 +1,10 @@
 package net.pocvpn.client.diagnostics.fieldtest
 
 import android.net.Network
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -39,6 +42,8 @@ interface FieldTestHost {
     fun lastErrorText(): String?
     /** Attempt keys a forced relay run actually kept (null when no forced run happened). */
     fun lastForcedRelayKeys(): List<String>?
+    /** Whether this device holds an activated profile for relay ingress [ingressId] (read-only). */
+    suspend fun relayIngressActivation(ingressId: String): String = "unknown"
     fun latestDiagnosticSession(): JSONObject?
     fun appState(): JSONObject
     fun supportBundle(): JSONObject?
@@ -172,6 +177,7 @@ internal fun expectedExitIps(manifest: EndpointManifest?, endpointId: String?): 
 
 private val IPV4_LITERAL = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
 private const val POLL_MS = 250L
+private const val NOT_STARTED = "NotStarted"
 private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
 
 /** Readable state names for reports (plain objects would print as Class@hash). */
@@ -488,34 +494,54 @@ class FieldTestRunner(
         val scores = host.transportScores().mapKeys { it.key.name }
         val expected = expectedExitIps(manifest, endpointId)
         val errorBefore = host.lastErrorText()
+        // A failed previous run can leave the controller in Error/HandshakeFailed
+        // (disconnect() of an idle transport does not reset it). That state is
+        // not this attempt's result: it only counts once the attempt is seen in
+        // progress, or once it has changed.
+        val leftover = host.transportState.value.takeIf { it is TransportState.Error || it is TransportState.HandshakeFailed }
+        var sawProgress = false
         val connectStart = clock()
-        host.connect()
-
-        // Wait for Connected or a terminal failure. Polled, not collected: an
-        // attempt the app refuses up front may never leave Disconnected, and a
-        // StateFlow does not re-emit an unchanged value.
-        var sawActivity = false
         var terminal: TransportState? = null
-        while (clock() - connectStart < timings.connectTimeoutMs) {
-            val s = host.transportState.value
-            if (s !is TransportState.Disconnected) sawActivity = true
-            val done = when (s) {
-                is TransportState.Connected, is TransportState.Error, is TransportState.HandshakeFailed -> true
-                is TransportState.Disconnected -> sawActivity || clock() - connectStart > timings.notStartedGraceMs
-                else -> false
+        var leftoverOnly = false
+        coroutineScope {
+            val watcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                host.transportState.collect { s ->
+                    if (s is TransportState.Connecting || s is TransportState.Reconnecting || s is TransportState.Disconnecting) sawProgress = true
+                }
             }
-            if (done) {
-                terminal = s
-                break
+            host.connect()
+
+            // Wait for Connected or a terminal failure. Polled, not collected: an
+            // attempt the app refuses up front may never leave Disconnected, and a
+            // StateFlow does not re-emit an unchanged value.
+            var sawActivity = false
+            while (clock() - connectStart < timings.connectTimeoutMs) {
+                val s = host.transportState.value
+                val stale = leftover != null && s == leftover && !sawProgress
+                if (s !is TransportState.Disconnected && !stale) sawActivity = true
+                val done = when {
+                    stale -> clock() - connectStart > timings.notStartedGraceMs
+                    s is TransportState.Connected || s is TransportState.Error || s is TransportState.HandshakeFailed -> true
+                    s is TransportState.Disconnected -> sawActivity || clock() - connectStart > timings.notStartedGraceMs
+                    else -> false
+                }
+                if (done) {
+                    terminal = s
+                    leftoverOnly = stale
+                    break
+                }
+                delay(POLL_MS)
             }
-            delay(POLL_MS)
+            watcher.cancel()
         }
         val timedOut = terminal == null
         val connected = terminal is TransportState.Connected
         val connectMs = if (connected) clock() - connectStart else null
         val state = host.transportState.value
-        val errorText = when (terminal) {
-            is TransportState.Error -> terminal.message
+        val errorText = when {
+            leftoverOnly -> host.lastErrorText()?.takeIf { it != errorBefore }
+                ?: "attempt not observed - the previous run's ${leftover?.label()} never changed"
+            terminal is TransportState.Error -> (terminal as TransportState.Error).message
             else -> host.lastErrorText()?.takeIf { it != errorBefore || !connected }
         }
 
@@ -576,6 +602,7 @@ class FieldTestRunner(
             if (host.transportState.value !is TransportState.Connected) notes += "session left Connected during probes: ${host.transportState.value.label()}"
         }
         if (target.relayIngress != null) {
+            notes += "relay ingress ${target.relayIngress} on this device: ${host.relayIngressActivation(target.relayIngress)}"
             notes += "forced relay attempts kept: ${host.lastForcedRelayKeys()?.let { if (it.isEmpty()) "none (no relay candidate - ingress not activated or not eligible)" else it.joinToString(", ") } ?: "-"}"
         }
         val activeTransport = host.currentTransportKind.value?.name
@@ -594,9 +621,9 @@ class FieldTestRunner(
             outcome = core?.let { measured -> if (measured.any { it.ok }) FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED else FieldRunOutcome.CONNECTED_NO_DATA }
                 ?: if (coreMeasured) FieldRunOutcome.CONNECTED_NO_DATA
                 else if (appExcluded) FieldRunOutcome.CONNECTED_APP_EXCLUDED
-                else classifyRun(connected, state.label(), errorText, timedOut, probeResults, throughput, stability, exitIp, expected),
+                else classifyRun(connected, if (leftoverOnly) NOT_STARTED else state.label(), errorText, timedOut, probeResults, throughput, stability, exitIp, expected),
             connectMs = connectMs,
-            terminalState = (terminal ?: state).label(),
+            terminalState = if (leftoverOnly) NOT_STARTED else (terminal ?: state).label(),
             errorMessage = errorText,
             activeTransport = activeTransport,
             sessionHealth = health.label(),
