@@ -3485,6 +3485,11 @@ class MainViewModel(
                         )
                         return
                     }
+                } else if (kind == TransportKind.XRAY_REALITY) {
+                    // Pinned when present so VpnController takes the signed
+                    // port (see directRealityConfigFromSignedBinding); absent
+                    // keeps the stored profile's port, never a rejection.
+                    trustedTransportBindingFor(endpointId, kind)
                 } else {
                     null
                 }
@@ -4522,7 +4527,13 @@ class MainViewModel(
         )
         if (!eligible) return
 
-        when (val xrayResolution = orchestrator.resolve(TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY), endpointId)) {
+        when (
+            val xrayResolution = orchestrator.resolve(
+                TransportSelectionDecision.SelectTransport(TransportKind.XRAY_REALITY),
+                endpointId,
+                endpointTransportBinding = trustedTransportBindingFor(endpointId, TransportKind.XRAY_REALITY),
+            )
+        ) {
             is TransportOrchestrator.Resolution.Resolved -> {
                 supportDiagnosticsRecorder?.recordAttemptFailed()
                 controller.disconnect()
