@@ -1745,6 +1745,43 @@ class MainViewModelTest {
     }
 
     @Test
+    fun `AWG handshake up but no data flowing - falls back to Xray instead of staying Protected`() = runTest {
+        // RU field test CONNECTED_NO_DATA: the AWG handshake succeeds, we keep
+        // sending, nothing comes back.
+        val awgTransport = FakeVpnTransport()
+        var polls = 0
+        awgTransport.statsProvider = {
+            polls++
+            net.pocvpn.client.transport.TransportStats.Counters(bytesReceived = 0L, bytesSent = polls * 50L, lastHandshakeEpochMillis = System.currentTimeMillis())
+        }
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val diagnostics = DiagnosticsStore()
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = diagnostics,
+            initialNetworkProfile = USABLE_WIFI,
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+        assertEquals(0, xrayTransport.connectCallCount)
+
+        testDispatcher.scheduler.advanceTimeBy(31_000)
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(awgTransport.disconnectCallCount >= 1)
+        assertEquals(1, xrayTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
     fun `B8K6A stale async AWG failure after disconnect is ignored`() = runTest {
         val awgTransport = FakeVpnTransport()
         val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)

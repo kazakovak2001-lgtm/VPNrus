@@ -28,6 +28,10 @@ object AutoGatewayFailoverPolicy {
 
         return when (error) {
             is VpnError.HandshakeTimeout -> true
+            // Raised only inside the bounded post-handshake window of THIS
+            // attempt (VpnController.failDeadDataPlane) - the tunnel is not
+            // healthy, so requirement 8 does not apply.
+            is VpnError.DataPlaneNoTraffic -> true
             is VpnError.BackendStartFailure -> true
             // An async, post-Connected retry-exhaustion signal for an
             // attempt that already succeeded once - never the outcome of

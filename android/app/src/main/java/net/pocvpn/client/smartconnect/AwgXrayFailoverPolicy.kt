@@ -68,6 +68,8 @@ object AwgXrayFailoverPolicy {
         // failure, and is deliberately NOT eligible for fallback.
         return when (awgError) {
             is VpnError.HandshakeTimeout -> true
+            // AWG handshake up, data plane dead (see VpnError.DataPlaneNoTraffic).
+            is VpnError.DataPlaneNoTraffic -> true
             is VpnError.BackendStartFailure -> true
             // Recorded only by VpnController.reconnectLoop() - an async,
             // post-Connected retry-exhaustion signal for an attempt that

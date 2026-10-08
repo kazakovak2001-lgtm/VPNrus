@@ -29,6 +29,7 @@ fun mapVpnErrorToFailureReason(error: VpnError): DiagnosticFailureReason = when 
     is VpnError.ConfigurationMappingFailure -> DiagnosticFailureReason.INTERNAL_ERROR
     VpnError.AlreadyInProgress -> DiagnosticFailureReason.INTERNAL_ERROR
     VpnError.HandshakeTimeout -> DiagnosticFailureReason.PROTOCOL_OR_TRANSPORT_BLOCKED
+    VpnError.DataPlaneNoTraffic -> DiagnosticFailureReason.PROTOCOL_OR_TRANSPORT_BLOCKED
     VpnError.SplitTunnelingNoAppsSelected -> DiagnosticFailureReason.INTERNAL_ERROR
     VpnError.NoCandidateAvailable -> DiagnosticFailureReason.NO_CANDIDATE
     is VpnError.UnsupportedTransportSelected -> DiagnosticFailureReason.INTERNAL_ERROR

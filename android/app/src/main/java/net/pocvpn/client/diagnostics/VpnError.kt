@@ -16,6 +16,12 @@ sealed class VpnError(val category: String, val reason: String? = null) {
     data class ConfigurationMappingFailure(val detail: String) : VpnError("ConfigurationMappingFailure", detail)
     object AlreadyInProgress : VpnError("AlreadyInProgress")
     object HandshakeTimeout : VpnError("HandshakeTimeout")
+    // AWG handshake succeeded but, within the bounded post-connect window,
+    // we kept sending and the peer sent nothing back (NO_PAYLOAD) or stopped
+    // after a little (STALLED_AFTER_INITIAL_PAYLOAD) - a dead data plane
+    // behind a live handshake (RU field test, CONNECTED_NO_DATA). Reported
+    // instead of a false Protected; eligible for the next candidate.
+    object DataPlaneNoTraffic : VpnError("DataPlaneNoTraffic")
     // B8H - VPN_ONLY_SELECTED resolved to zero installed apps (see
     // EffectiveRoutingResult.NoAppsSelected's own docs for why this must
     // fail rather than silently behave like ALL_APPS).

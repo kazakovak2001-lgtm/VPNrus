@@ -4,6 +4,7 @@ import android.content.Intent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -1735,12 +1736,18 @@ class VpnController(
      * poll, never a duplicate for the same attempt (superseded by a NEWER
      * attempt's [progressObservationJob] via [cancelReconnectLocked]/
      * [cancelReconnectForExplicitConnect], which cancel this exact job before
-     * it can race a fresher one). Never calls disconnect()/startReconnect()/
-     * setState() - purely a store write, so this can never itself trigger a
-     * reconnect or alter transport execution.
+     * it can race a fresher one). Never calls startReconnect().
+     *
+     * A decisive dead-data-plane verdict (NO_PAYLOAD or
+     * STALLED_AFTER_INITIAL_PAYLOAD) is the one exception to "observation
+     * only": after the observation is recorded, [failDeadDataPlane] ends the
+     * session with [VpnError.DataPlaneNoTraffic] instead of leaving a false
+     * Protected (RU field test: AWG handshake up, no data). Every other
+     * verdict (VERIFIED, IDLE, UNAVAILABLE, still VERIFYING at the window
+     * end) leaves the session untouched.
      */
     private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport) {
-        val store = transportObservationStore ?: return
+        val store = transportObservationStore
         // Same synchronized(reconnectOwnershipLock) discipline startReconnect()
         // already uses for reconnectJob - never a bare, unsynchronized
         // cross-coroutine write (cancelReconnectLocked/
@@ -1762,8 +1769,42 @@ class VpnController(
                     if (verdict != TrafficProgressVerdict.VERIFYING) break
                     if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
                 }
-                recordLiveProgressObservation(store, endpointId, transport, samples, verdict)
+                store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
+                if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
+                    failDeadDataPlane(endpointId, transport, verdict)
+                }
             }
+        }
+    }
+
+    /**
+     * Ends the session [launchLiveProgressObservation] sampled, only if it is
+     * still that same Connected session: tears it down exactly like
+     * [abandonAttemptWithTerminalError] and reports [VpnError.DataPlaneNoTraffic],
+     * which the existing failover watches (Auto: next candidate; Manual with
+     * Auto transport: AWG->Xray) already act on. The job first detaches itself
+     * from [progressObservationJob] so the teardown's [cancelReconnectLocked]
+     * cannot cancel it halfway.
+     */
+    private suspend fun failDeadDataPlane(endpointId: EndpointId, transport: VpnTransport, verdict: TrafficProgressVerdict) {
+        val self = currentCoroutineContext()[Job]
+        synchronized(reconnectOwnershipLock) {
+            if (progressObservationJob !== self) return
+            progressObservationJob = null
+        }
+        connectMutex.withLock {
+            if (_state.value !is TransportState.Connected || activeTransport !== transport) return@withLock
+            teardownActiveAttemptLocked()
+            // The handshake already recorded this path as a success; the
+            // later truth is that it carried no data, so Auto ranks it down.
+            recordPathHistory(success = false, kind = transport.kind, endpointId = endpointId, nowEpochMillis = System.currentTimeMillis())
+            diagnostics.recordError(VpnError.DataPlaneNoTraffic)
+            setState(
+                TransportState.Error(
+                    "Connected, but no data passes through the tunnel ($verdict)",
+                    failureKind = TransportFailureKind.REMOTE_UNCONFIRMED,
+                ),
+            )
         }
     }
 
