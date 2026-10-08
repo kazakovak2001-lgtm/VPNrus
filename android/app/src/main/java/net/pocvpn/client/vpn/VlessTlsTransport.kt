@@ -24,7 +24,6 @@ import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
 import net.pocvpn.client.vpn.xray.XrayRuntimeState
 import net.pocvpn.client.vpn.xray.XrayTlsRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * B8O2 - the TLS/TCP counterpart of [VlessRealityTransport]: same isolated
@@ -80,7 +79,7 @@ class VlessTlsTransport(
             is XrayTlsRuntimeResolution.Ready -> Unit
         }
 
-        val sessionId = nextSessionId.incrementAndGet()
+        val sessionId = XrayRuntimeState.nextSessionId()
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -136,7 +135,6 @@ class VlessTlsTransport(
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 
     private companion object {
-        val nextSessionId = AtomicLong(0)
         const val DISCONNECT_CONFIRM_TIMEOUT_MS = 5_000L
     }
 }

@@ -2,6 +2,7 @@ package net.pocvpn.client.vpn.xray
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.util.concurrent.atomic.AtomicLong
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.TransportFailureKind
 
@@ -45,6 +46,15 @@ sealed class XrayRuntimeEvent {
 object XrayRuntimeState {
     private val _events = MutableStateFlow<XrayRuntimeEvent?>(null)
     val events: StateFlow<XrayRuntimeEvent?> = _events
+
+    // ONE counter for every transport reading [events] (REALITY, TLS, XHTTP).
+    // Per-class counters let a TLS attempt with id 1 adopt a REALITY attempt's
+    // replayed Failed(1) and "fail" in ~100 ms (RU field test). Seeded from the
+    // wall clock so ids never repeat across a main-process restart while the
+    // `:xray` process may still publish for an older session.
+    private val sessionIds = AtomicLong(System.currentTimeMillis())
+
+    fun nextSessionId(): Long = sessionIds.incrementAndGet()
 
     /** Call ONLY from NovaXrayVpnService's own lifecycle - never fabricated elsewhere. */
     fun publish(event: XrayRuntimeEvent) {

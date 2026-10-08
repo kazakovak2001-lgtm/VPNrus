@@ -147,10 +147,15 @@ internal fun classifyTarget(
             "IP_BLOCKED_RESET"
         }
     }
-    if (tcp?.ok == true && tlsReal != null && !tlsReal.ok) {
+    // The server answered TLS with a certificate Android does not trust (e.g.
+    // Russian domestic services on the national root CA) - not blocking.
+    val untrustedCert = isUntrustedCertificate(tlsReal?.error) || isUntrustedCertificate(https?.error)
+    if (untrustedCert) {
+        v += "UNTRUSTED_CERTIFICATE"
+    } else if (tcp?.ok == true && tlsReal != null && !tlsReal.ok) {
         v += if (tlsNeutral?.ok == true) "SNI_FILTERED" else "TLS_BLOCKED"
     }
-    if (https != null) {
+    if (https != null && !untrustedCert) {
         when {
             https.stalledAtBytes?.let { it in STALL_SUSPECT_RANGE } == true -> v += "THROTTLED_STALL"
             !https.ok && https.httpStatus == null && tlsReal?.ok == true -> v += "HTTPS_INTERFERENCE"
@@ -163,13 +168,16 @@ internal fun classifyTarget(
     return v
 }
 
+internal fun isUntrustedCertificate(error: String?): Boolean =
+    error != null && (error.contains("CertPathValidatorException") || error.contains("Trust anchor for certification path not found"))
+
 internal fun classifyNetwork(
     targets: List<TargetCensorshipResult>,
     udpDns: Map<String, Boolean>,
     dohReachable: Map<String, Boolean>,
 ): List<String> {
     val v = mutableListOf<String>()
-    fun reachable(t: TargetCensorshipResult) = "OK" in t.verdicts || t.https?.httpStatus != null
+    fun reachable(t: TargetCensorshipResult) = "OK" in t.verdicts || "UNTRUSTED_CERTIFICATE" in t.verdicts || t.https?.httpStatus != null
     val domestic = targets.filter { it.target.category == "domestic-control" }
     val foreignControl = targets.filter { it.target.category == "foreign-control" }
     val blockedSet = targets.filter { it.target.category == "foreign-commonly-blocked" || it.target.category == "registry-blocked-classic" }
@@ -178,7 +186,7 @@ internal fun classifyNetwork(
     }
     if (domestic.isNotEmpty() && domestic.none(::reachable)) v += "NO_WORKING_INTERNET_OR_TOTAL_SHUTDOWN"
     // DNS_DIFFERS_FROM_DOH alone is weak (CDNs answer per region) - not "affected".
-    val blockedCount = blockedSet.count { !reachable(it) || it.verdicts.any { x -> x != "OK" && x != "DNS_DIFFERS_FROM_DOH" } }
+    val blockedCount = blockedSet.count { !reachable(it) || it.verdicts.any { x -> x != "OK" && x != "DNS_DIFFERS_FROM_DOH" && x != "UNTRUSTED_CERTIFICATE" } }
     if (blockedSet.isNotEmpty()) v += "COMMONLY_BLOCKED_SERVICES_AFFECTED $blockedCount/${blockedSet.size}"
     val mechanisms = targets.flatMap { it.verdicts }.filter { it != "OK" }.groupingBy { it }.eachCount()
     if (mechanisms.isNotEmpty()) v += "MECHANISMS " + mechanisms.entries.sortedByDescending { it.value }.joinToString(", ") { "${it.key}x${it.value}" }

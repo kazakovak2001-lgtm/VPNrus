@@ -218,7 +218,7 @@ class VpnControllerPathHistoryTest {
     )
 
     @Test
-    fun `AWG failure followed by a successful Xray failover records exactly one path-history entry, not two`() = runTest {
+    fun `AWG failure followed by a confirmed Xray failover records one entry per attempt`() = runTest {
         val awgTransport = FakeVpnTransport()
         awgTransport.handshakeAvailable = false
         val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
@@ -247,15 +247,15 @@ class VpnControllerPathHistoryTest {
         controller.connect(TransportOrchestrator.Resolution.Resolved(xrayTransport, TransportKind.XRAY_REALITY, EndpointId(ProductionGateway.ID)))
         runCurrent()
 
-        // Xray's own connect() succeeds (no exception) - per doConnectAttempt's
-        // own "no ConnectionOutcome/PathHistory recording for a non-exception
-        // XRAY_REALITY branch" model (this codebase has no proven Xray
-        // handshake-evidence channel yet) - so still exactly ONE record total,
-        // never a second one fabricated for the failover attempt.
+        // Xray reports Connected only after its own remote confirmation (B33),
+        // so that is real evidence: one SUCCESS record for the Xray attempt
+        // (VpnController.pendingStateOutcome), next to the AWG FAILURE.
         assertEquals(1, xrayTransport.connectCallCount)
-        assertEquals(1, store.records.size)
-        assertTrue(!store.records.single().success)
-        assertEquals(TransportKind.AMNEZIA_WG, store.records.single().transport)
+        assertEquals(2, store.records.size)
+        assertTrue(!store.records[0].success)
+        assertEquals(TransportKind.AMNEZIA_WG, store.records[0].transport)
+        assertTrue(store.records[1].success)
+        assertEquals(TransportKind.XRAY_REALITY, store.records[1].transport)
     }
 
     @Test

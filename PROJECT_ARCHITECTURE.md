@@ -240,6 +240,18 @@ NetworkProfiler
   resets to 0 on the next success, expires on its own after the window, never
   a permanent blacklist, never a second persistence system (same
   `FilePathHistoryStore` file, format version bumped 1->2).
+- **Evidence from every remote-confirmed Direct attempt (RU field test fix)**:
+  `ConnectionOutcomeStore`/`PathHistoryStore` get one record per Direct
+  attempt for AWG (synchronous handshake check) AND for XRAY_REALITY/TLS_TCP/
+  XRAY_XHTTP/HYSTERIA2 (`VpnController.pendingStateOutcome`: the transport's
+  first Connected = success, first Error = failure; user disconnect = no
+  record). SHADOWSOCKS_2022 is excluded (its Connected is local-only).
+  Relayed attempts stay with `recordRelayOutcome`. `restrictionClass()`'s
+  `awgHandshakeFresh` reads the newest AMNEZIA_WG outcome only.
+- **Xray session ids**: REALITY/TLS/XHTTP transports share
+  `XrayRuntimeState.nextSessionId()` (one wall-clock-seeded counter) - never
+  per-class counters, which let one transport adopt another's replayed
+  `Failed` event.
 - **Typed reasons**: `PathScorer.Reason` (`ENDPOINT_REACHABLE`/`TRANSPORT_HEALTHY`/
   `FAILURE_COOLDOWN`/`DIVERSITY_BONUS`/etc) are appended to `PathScoreResult
   .reasons` alongside the pre-existing free-text summaries - never replacing
