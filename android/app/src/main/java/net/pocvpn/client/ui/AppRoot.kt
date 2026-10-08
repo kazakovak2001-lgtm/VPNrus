@@ -334,6 +334,12 @@ fun AppRoot(
                     showDiagnosticsEntry = isDebugBuild,
                     onDiagnosticsClick = { showDiagnostics = true },
                     showKillSwitchNotice = transportState.showsKillSwitchNotice(),
+                    // Re-read on every session change: a clone/work profile can be
+                    // created or removed while the app is running.
+                    showOtherProfileNotice = showsOtherProfileNotice(
+                        sessionHealth.toHomeVisualState(),
+                        androidx.compose.runtime.remember(sessionHealth) { net.pocvpn.client.vpn.OtherProfiles.count(context) },
+                    ),
                     // B8H1 - the APPLIED policy's mode, never savedRoutingPolicy's -
                     // see homeConnectedSubtitle's own docs for why.
                     appliedRoutingMode = appliedRoutingPolicy?.mode ?: AppRoutingMode.ALL_APPS,
