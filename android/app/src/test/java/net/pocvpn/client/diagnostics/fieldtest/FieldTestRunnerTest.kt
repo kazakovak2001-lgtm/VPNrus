@@ -59,6 +59,10 @@ class FieldTestRunnerTest {
     private inner class FakeHost(
         private val provisioned: Set<ProductionGatewayId> = setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
         private val permission: Boolean = true,
+        // Like the real controller: disconnect() of an idle transport leaves Error in place.
+        private val stickyError: Boolean = false,
+        private val signedManifest: EndpointManifest = manifest(),
+        private val ingressActivation: String = "unknown",
     ) : FieldTestHost {
         override val transportState = MutableStateFlow<TransportState>(TransportState.Disconnected)
         override val sessionHealth = MutableStateFlow<VpnSessionHealth>(VpnSessionHealth.Idle)
@@ -70,7 +74,7 @@ class FieldTestRunnerTest {
 
         override fun vpnPermissionGranted() = permission
         override fun provisionedGateways() = provisioned
-        override fun trustedManifest() = manifest()
+        override fun trustedManifest() = signedManifest
         override fun endpointIdFor(gateway: ProductionGatewayId) =
             if (gateway == ProductionGatewayId.GERMANY) "frankfurt" else "stockholm"
         override fun saveSelection(): Any = "saved"
@@ -90,6 +94,7 @@ class FieldTestRunnerTest {
             }
         }
         override fun disconnect() {
+            if (stickyError && transportState.value is TransportState.Error) return
             transportState.value = TransportState.Disconnected
             sessionHealth.value = VpnSessionHealth.Idle
             currentTransportKind.value = null
@@ -97,6 +102,7 @@ class FieldTestRunnerTest {
         override fun transportScores() = mapOf(TransportKind.XRAY_REALITY to 10)
         override fun lastErrorText() = lastError
         override fun lastForcedRelayKeys(): List<String>? = null
+        override suspend fun relayIngressActivation(ingressId: String) = ingressActivation
         override fun latestDiagnosticSession(): JSONObject? = JSONObject().put("selectedPathKind", "DIRECT")
         override fun appState() = JSONObject().put("state", "x")
         override fun supportBundle(): JSONObject? = JSONObject().put("schemaVersion", 1)
@@ -231,6 +237,62 @@ class FieldTestRunnerTest {
         assertTrue(r.runs.size < ProductionGatewayId.entries.size * FIELD_TEST_TRANSPORTS.size + 1)
         assertTrue(host.transportState.value is TransportState.Disconnected)
         assertEquals("saved", host.restored)
+    }
+
+    private fun manifestWith(extraFrankfurt: List<EndpointTransportBinding> = emptyList(), ingress: EndpointDescriptor? = null): EndpointManifest {
+        val base = manifest()
+        val endpoints = base.endpoints.map { e ->
+            if (e.id.value == "frankfurt") e.copy(transports = e.transports + extraFrankfurt) else e
+        } + listOfNotNull(ingress)
+        return base.copy(endpoints = endpoints)
+    }
+
+    @Test
+    fun `a previous run's Error is not reported as the next attempt's result`() = runTest {
+        // GERMANY / TLS_TCP ends in Error, which disconnect() does not clear; the
+        // next attempt (GERMANY / XRAY_XHTTP) is refused without any state change.
+        val host = FakeHost(
+            stickyError = true,
+            signedManifest = manifestWith(listOf(EndpointTransportBinding(TransportKind.XRAY_XHTTP, "edge.example", 443))),
+        )
+        val report = runner(host).run { }
+        val xhttp = report.runs.first { it.target.label == "GERMANY / XRAY_XHTTP" }
+
+        assertEquals(FieldRunOutcome.UNAVAILABLE, xhttp.outcome)
+        assertEquals("NoCandidateAvailable", xhttp.errorMessage)
+        assertEquals("NotStarted", xhttp.terminalState)
+        // The attempt waited for its own result instead of returning on the first poll.
+        assertTrue(xhttp.errorMessage != "handshake timeout")
+    }
+
+    @Test
+    fun `a leftover Error that never changes is reported as not observed`() = runTest {
+        val host = FakeHost(stickyError = true)
+        host.transportState.value = TransportState.Error("handshake timeout")
+        // Every connect is refused silently (no state change, no new error).
+        val silent = object : FieldTestHost by host {
+            override fun connect() { host.applied?.let { host.connects += it.label } }
+        }
+        val report = FieldTestRunner(silent, fakeProbes(host), fastTimings, clock = { testScheduler.currentTime }).run { }
+        val reality = report.runs.first { it.target.label == "GERMANY / XRAY_REALITY" }
+
+        assertEquals("NotStarted", reality.terminalState)
+        assertTrue(reality.errorMessage!!.startsWith("attempt not observed"))
+        assertTrue(reality.outcome != FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED)
+    }
+
+    @Test
+    fun `relay runs record whether the ingress is activated on this device`() = runTest {
+        val ingress = EndpointDescriptor(
+            id = EndpointId("stockholm-ingress-1"), roles = setOf(EndpointRole.INGRESS), region = "SE", provider = "test",
+            transports = listOf(EndpointTransportBinding(TransportKind.XRAY_REALITY, "16.170.208.231", 2093)),
+            relayTo = EndpointId("frankfurt"),
+        )
+        val host = FakeHost(signedManifest = manifestWith(ingress = ingress), ingressActivation = "NOT_ACTIVATED")
+        val report = runner(host).run { }
+        val relay = report.runs.first { it.target.relayIngress == "stockholm-ingress-1" }
+
+        assertTrue(relay.notes.contains("relay ingress stockholm-ingress-1 on this device: NOT_ACTIVATED"))
     }
 
     @Test
