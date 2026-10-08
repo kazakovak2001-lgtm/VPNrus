@@ -2,7 +2,7 @@
   "manifestVersion": 7,
   "issuedAtEpochMillis": 1791487207977,
   "expiresAtEpochMillis": 1806163688355,
-  "signingKeyId": "prod-manifest-key-2026-09-14",
+  "signingKeyId": "prod-manifest-key-2026-09-01",
   "endpoints": [
     {
       "id": "frankfurt",

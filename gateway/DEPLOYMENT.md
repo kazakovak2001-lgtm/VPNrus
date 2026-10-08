@@ -1022,7 +1022,7 @@ rejects `127.0.0.1:8446` / `169.254.169.254` / `localhost`, no secret in the
 journal, renewed cert served without restart. `systemd-analyze security`:
 1.7 (nova-hysteria), 2.9 (auth). 35/35 checks passed.
 
-## Hysteria2 Salamander obfuscation (Stockholm) - PREPARED, NOT DEPLOYED
+## Hysteria2 Salamander obfuscation (Stockholm) - DEPLOYED 2026-10-08 (server + manifest v7); devices must re-activate Stockholm
 
 Why: RU field evidence (2026-10-08, home Wi-Fi): Hysteria2 timed out ("no
 recent network activity") while AWG and REALITY to the same host worked.
@@ -1065,7 +1065,7 @@ credential. Every step needs explicit owner approval.
    `obfs:` block, install as `root:nova-hysteria 0640`,
    `systemctl restart nova-hysteria`. Existing NONE clients stop working
    for Hysteria2 here (test devices only).
-5. Sign v7 offline (`gateway/tools/manifest_signing.py package`, production
+5. Sign v7 offline (`gateway/tools/manifest_signing.py sign-and-package`, production
    key, see `docs/B12_MANIFEST_KEY_CEREMONY.md`), install it on BOTH
    gateways as `/etc/pocvpn/endpoint-manifest.bin` (`root:pocvpn-api 0640`,
    same as the B17 section above); verify `GET /v1/manifest` sha256 on both.
@@ -1080,3 +1080,32 @@ Rollback: remove the env line, restart `pocvpn-api pocvpn-hysteria-auth`,
 re-render and install the no-obfs config, restart `nova-hysteria`, and
 publish a v8 manifest with `NONE` (v6 cannot be re-served: rollback
 protection rejects a lower version). Devices re-activate Stockholm again.
+
+### Rollout record 2026-10-08 (owner-approved, `main` `bbd3f2e`)
+
+- Precheck: Stockholm `gateway/api` was byte-identical to `main` before
+  #159; only `config.py`/`handler.py`/`hysteria_server_config.py` differed.
+- Step 1: those three files installed (backups `*.backup-salamander-20261008T192933Z`),
+  `pocvpn-api`/`pocvpn-hysteria-auth` restarted; `/v1/manifest` 200,
+  `/v1/hysteria-profile` without credential 401.
+- Steps 2-3: `/etc/pocvpn/hysteria2-obfs.secret` (`root:pocvpn-api 0640`,
+  64 hex chars, never printed); env line appended (backup
+  `api.env.backup-salamander-<UTC>`); config loads with obfs set.
+- Step 4: rendered config differs from the old one only by the header
+  line and the `obfs:` block; installed `root:nova-hysteria 0640` (backup
+  `config.yaml.backup-salamander-<UTC>`); `nova-hysteria` up on UDP 443.
+- Step 5: v7 (`gateway/tools/endpoint-manifest-2026-10-08-v7.bin`, sha256
+  `b5f74d8e60e9a6dc1c308b2202ccb44b175ef1edc3dac130af7e76331b3e8db6`)
+  installed on BOTH gateways (backups `endpoint-manifest.bin.v6-backup-20261008`,
+  sha256 `304afa8b...`); both serve `b5f74d8e...`. **Signed with
+  `prod-manifest-key-2026-09-01`** (the bootstrap anchor, trusted by every
+  build): the `prod-manifest-key-2026-09-14` private key lives only in the
+  WSL distro (`/root/.local/share/vpnrus/manifest-signing-2026-09-14.key`),
+  which currently fails to mount on the owner's PC. Verified against the
+  app-embedded anchor before install. Re-signing v6 with the 09-01 key gave
+  identical canonical bytes (tooling/format unchanged).
+- On-host probe (temp client, invalid credential, deleted afterwards):
+  without obfs -> `timeout: no recent network activity`; with Salamander
+  -> `authentication error` (obfs + TLS OK, auth rejected as expected).
+- Not yet done: device re-activation (step 6) and a real Hysteria2
+  connect from CZ/RU (step 7).
