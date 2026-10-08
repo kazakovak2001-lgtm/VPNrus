@@ -698,18 +698,22 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # reads. server_address is endpoint_host - the host a signed HYSTERIA2
         # EndpointTransportBinding must pin; the client refuses a credential
         # whose host/port/sni/obfuscation disagree with its signed profile.
-        # obfuscation_mode is NONE-only (Salamander is listener-level, never
-        # per device).
+        # Salamander is listener-level: when configured, every device gets
+        # the SAME shared obfuscation password (it hides the QUIC shape; the
+        # per-device auth_secret is still what grants access). Must match the
+        # signed profile's obfuscationMode or the client refuses the profile.
         payload = {
             "profile_version": 1,
             "server_address": cfg.endpoint_host,
             "server_port": cfg.hysteria2_server_port,
             "auth_secret": result.auth_secret,
             "sni": cfg.hysteria2_sni,
-            "obfuscation_mode": "NONE",
+            "obfuscation_mode": "SALAMANDER" if cfg.hysteria2_obfs_password else "NONE",
             "issued_at_epoch_seconds": issued_at,
             "expires_at_epoch_seconds": expires_at,
         }
+        if cfg.hysteria2_obfs_password:
+            payload["obfuscation_secret"] = cfg.hysteria2_obfs_password
         return self._success(HTTPStatus.OK, payload)
 
     # --- POST /v1/ingress-profile (B25 task G) ---

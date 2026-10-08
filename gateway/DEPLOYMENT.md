@@ -1021,3 +1021,62 @@ Hysteria2 UDP 443 only (no TCP), `CapEff` = `CAP_NET_BIND_SERVICE` only
 rejects `127.0.0.1:8446` / `169.254.169.254` / `localhost`, no secret in the
 journal, renewed cert served without restart. `systemd-analyze security`:
 1.7 (nova-hysteria), 2.9 (auth). 35/35 checks passed.
+
+## Hysteria2 Salamander obfuscation (Stockholm) - PREPARED, NOT DEPLOYED
+
+Why: RU field evidence (2026-10-08, home Wi-Fi): Hysteria2 timed out ("no
+recent network activity") while AWG and REALITY to the same host worked.
+Plain QUIC exposes its shape and the SNI `origin-sthlm.aknova.pp.ua`, and
+`*.aknova.pp.ua` is SNI-filtered there. Salamander turns every packet into
+random-looking UDP before the QUIC handshake.
+
+Model: Salamander is LISTENER-LEVEL in upstream Hysteria2 - ONE shared
+password for the whole server. It hides the protocol and grants no access:
+the per-device `auth_secret` (HTTP auth backend) is unchanged. A leaked
+obfs password only unmasks the protocol shape.
+
+Artifacts: `POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE` (config.py; the API
+then returns `obfuscation_mode: SALAMANDER` + the shared
+`obfuscation_secret`), `api.hysteria_server_config` (renders the
+`obfs: salamander` block), signed manifest
+`gateway/tools/production_manifest_2026-10-08_v7.json` (v6 + Stockholm
+`hysteria2Profile.obfuscationMode = SALAMANDER`, nothing else). The tracked
+`gateway/hysteria/nova-hysteria-stockholm.yaml` stays the no-obfs render
+(no secret in git); the real config differs only by the `obfs:` block.
+
+Order matters: the client accepts a credential only when its obfs mode
+matches the SIGNED profile, and the server's listener mode must match the
+credential. Every step needs explicit owner approval.
+
+1. Deploy `gateway/api/{config,handler,hysteria_server_config}.py` from
+   `main` to Stockholm `/opt/pocvpn/gateway/api/` (back up the originals,
+   `python3 -m py_compile` first).
+2. Create the shared password (never printed, never in git):
+   `sudo sh -c 'umask 027; openssl rand -hex 32 > /etc/pocvpn/hysteria2-obfs.secret'`,
+   then `sudo chown root:pocvpn-api /etc/pocvpn/hysteria2-obfs.secret` (0640).
+3. Append `POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE=/etc/pocvpn/hysteria2-obfs.secret`
+   to `/etc/pocvpn/api.env`; `systemctl restart pocvpn-api pocvpn-hysteria-auth`.
+   From now on new Hysteria2 provisions return SALAMANDER (clients on
+   manifest v6 reject them as a mismatch until step 5 - Hysteria2-only,
+   AWG/Xray unaffected).
+4. Render as `pocvpn-api`: `cd /opt/pocvpn/gateway && python3 -m api.hysteria_server_config`
+   into a 0640 temp file, verify `diff` vs the current
+   `/etc/nova-hysteria/config.yaml` is ONLY the header line and the
+   `obfs:` block, install as `root:nova-hysteria 0640`,
+   `systemctl restart nova-hysteria`. Existing NONE clients stop working
+   for Hysteria2 here (test devices only).
+5. Sign v7 offline (`gateway/tools/manifest_signing.py package`, production
+   key, see `docs/B12_MANIFEST_KEY_CEREMONY.md`), install it on BOTH
+   gateways as `/etc/pocvpn/endpoint-manifest.bin` (`root:pocvpn-api 0640`,
+   same as the B17 section above); verify `GET /v1/manifest` sha256 on both.
+6. Devices: update the app (accepts SALAMANDER), let it refresh the
+   manifest (v7), then Diagnostics -> "Re-activate Stockholm" with the
+   Stockholm activation code (server-side idempotent for the same device):
+   this re-provisions the Hysteria2 credential with the shared secret. The
+   app never stores activation codes, so this step cannot be automatic.
+7. Verify: a Hysteria2 connect from CZ, then the RU tester's full field test.
+
+Rollback: remove the env line, restart `pocvpn-api pocvpn-hysteria-auth`,
+re-render and install the no-obfs config, restart `nova-hysteria`, and
+publish a v8 manifest with `NONE` (v6 cannot be re-served: rollback
+protection rejects a lower version). Devices re-activate Stockholm again.

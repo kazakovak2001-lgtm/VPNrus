@@ -9,10 +9,12 @@ from here or anywhere else, per the B8B1B server-boundary requirement.
 import ipaddress
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import client_identity
 from .wgkey import is_valid_wg_public_key
+
+HYSTERIA2_OBFS_PASSWORD_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
 _ENV_PREFIX = "POCVPN_API_"
 
@@ -220,6 +222,14 @@ class AppConfig:
     # start. Optional and independent of the /v1/hysteria-profile group above,
     # but when set it requires that whole group and must differ from api_port.
     hysteria2_auth_backend_port: int = 0
+    # Salamander obfuscation (RU field evidence: plain QUIC with a visible SNI
+    # is filtered). Salamander is LISTENER-LEVEL in upstream Hysteria2: ONE
+    # shared password for the whole server, applied before the per-device
+    # `auth` exchange - it hides the QUIC/TLS shape, it grants no access (the
+    # per-device auth_secret still does). Read from
+    # POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE (never inline in the env file);
+    # empty = obfuscation off (`NONE`). repr=False: never in logs/tracebacks.
+    hysteria2_obfs_password: str = field(default="", repr=False)
     # B57 - this gateway's own addresses AS NGINX SEES THEM for traffic that
     # leaves this gateway's own Xray exit towards its own public address
     # (`freedom` -> own address -> nginx -> X-Real-IP). A request whose
@@ -770,6 +780,30 @@ def load_config(env=None):
         if any(ch.isspace() for ch in hysteria2_sni) or len(hysteria2_sni) > 253:
             raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SNI is not a plausible hostname: {hysteria2_sni!r}")
 
+    # See AppConfig.hysteria2_obfs_password's own docs.
+    hysteria2_obfs_password = ""
+    hysteria2_obfs_password_file = _get(env, "HYSTERIA2_OBFS_PASSWORD_FILE")
+    if hysteria2_obfs_password_file:
+        if not hysteria2_store_path:
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE is set but the Hysteria2 group "
+                f"({_ENV_PREFIX}HYSTERIA2_STORE_PATH etc.) is not configured"
+            )
+        if not os.path.isabs(hysteria2_obfs_password_file):
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE must be an absolute path: {hysteria2_obfs_password_file!r}"
+            )
+        try:
+            with open(hysteria2_obfs_password_file, "r", encoding="ascii") as handle:
+                hysteria2_obfs_password = handle.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE is not readable: {type(exc).__name__}")
+        # Never echo the value. A closed charset also keeps it inert in YAML.
+        if not HYSTERIA2_OBFS_PASSWORD_RE.match(hysteria2_obfs_password):
+            raise ConfigError(
+                f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE must contain 32-128 characters of [A-Za-z0-9_-]"
+            )
+
     # B46-4P.2 - see AppConfig.hysteria2_auth_backend_port's own docs.
     hysteria2_auth_backend_port_raw = _get(env, "HYSTERIA2_AUTH_BACKEND_PORT")
     hysteria2_auth_backend_port = 0
@@ -843,5 +877,6 @@ def load_config(env=None):
         hysteria2_server_port=hysteria2_server_port,
         hysteria2_sni=hysteria2_sni,
         hysteria2_auth_backend_port=hysteria2_auth_backend_port,
+        hysteria2_obfs_password=hysteria2_obfs_password,
         gateway_self_addresses=_parse_gateway_self_addresses(_get(env, "GATEWAY_SELF_ADDRESSES")),
     )

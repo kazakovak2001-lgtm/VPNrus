@@ -529,6 +529,10 @@ fun AppRoot(
                 activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY
                 showDiagnostics = false
             },
+            onReactivateStockholm = {
+                activatingGatewayId = net.pocvpn.client.vpn.config.ProductionGatewayId.STOCKHOLM
+                showDiagnostics = false
+            },
             onRefreshManifest = { viewModel.debugRefreshManifest() },
             // SG-002 evidence-closure - reuses the SAME
             // viewModel.exportSupportBundleJson() the real Export

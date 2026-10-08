@@ -252,6 +252,13 @@ NetworkProfiler
   `XrayRuntimeState.nextSessionId()` (one wall-clock-seeded counter) - never
   per-class counters, which let one transport adopt another's replayed
   `Failed` event.
+- **Hysteria2 obfuscation**: the signed `hysteria2Profile.obfuscationMode`
+  (`NONE`/`SALAMANDER`) is authoritative; the provisioned credential must
+  agree (provisioner + `Hysteria2VpnService` fail closed). Salamander is one
+  SHARED listener-level secret per server (gateway
+  `POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE`), never per device; per-device
+  access stays the HTTP-auth `auth_secret`. Activation codes are never
+  stored, so a mode change needs re-activation of that gateway.
 - **Typed reasons**: `PathScorer.Reason` (`ENDPOINT_REACHABLE`/`TRANSPORT_HEALTHY`/
   `FAILURE_COOLDOWN`/`DIVERSITY_BONUS`/etc) are appended to `PathScoreResult
   .reasons` alongside the pre-existing free-text summaries - never replacing

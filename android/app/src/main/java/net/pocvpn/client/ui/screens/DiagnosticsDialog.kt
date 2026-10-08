@@ -80,6 +80,12 @@ fun DiagnosticsDialog(
     // screen calls the SAME MainViewModel.activateDevice(credential,
     // targetGatewayId) every other activation flow uses.
     onReactivateGermany: () -> Unit,
+    // Same as onReactivateGermany, for Stockholm: re-runs activateDevice for
+    // an already-activated gateway (idempotent server-side for the same
+    // device), which re-provisions every transport credential - e.g. the
+    // Hysteria2 Salamander obfuscation secret after the signed profile
+    // switched to SALAMANDER (the activation credential is never stored).
+    onReactivateStockholm: () -> Unit,
     // B20 - debug-only: manually triggers the SAME real
     // MainViewModel.refreshManifest() -> MultiOriginManifestDistributionClient
     // path the ViewModel init-time startup refresh already uses (never a
@@ -231,6 +237,9 @@ fun DiagnosticsDialog(
                     }
                     TextButton(onClick = onReactivateGermany, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_reactivate_germany))
+                    }
+                    TextButton(onClick = onReactivateStockholm, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_reactivate_stockholm))
                     }
                     TextButton(onClick = onRefreshManifest, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_refresh_manifest))

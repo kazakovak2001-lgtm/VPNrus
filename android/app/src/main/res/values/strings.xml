@@ -152,6 +152,7 @@
     <string name="diagnostics_force_shadowsocks">Force SHADOWSOCKS_2022 on next connect</string>
     <string name="diagnostics_force_hysteria2">Force HYSTERIA2 on next connect</string>
     <string name="diagnostics_reactivate_germany">Re-activate Germany (debug only)</string>
+    <string name="diagnostics_reactivate_stockholm">Re-activate Stockholm (debug only)</string>
     <string name="diagnostics_simulate_awg_failure">Simulate AWG failure (debug only)</string>
     <string name="diagnostics_simulate_awg_success">Simulate AWG success (debug only)</string>
     <string name="diagnostics_refresh_manifest">Refresh manifest (debug only)</string>

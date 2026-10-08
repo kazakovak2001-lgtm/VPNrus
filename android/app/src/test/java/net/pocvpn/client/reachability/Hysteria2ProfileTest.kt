@@ -58,10 +58,21 @@ class Hysteria2ProfileTest {
     }
 
     @Test
-    fun `SALAMANDER is not yet representable - fails closed as Invalid (Finding 8 - not a real per-device server capability)`() {
+    fun `SALAMANDER (shared listener-level obfuscation) parses and round-trips`() {
         val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
             .copy(metadata = mapOf("hysteria2Profile" to "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"SALAMANDER\"}"))
-        assertEquals(Hysteria2ProfileReadResult.Invalid, binding.hysteria2Profile())
+        val result = binding.hysteria2Profile()
+        assertTrue(result is Hysteria2ProfileReadResult.Parsed)
+        assertEquals(Hysteria2Profile("hy2.example.com", "SALAMANDER"), (result as Hysteria2ProfileReadResult.Parsed).profile)
+    }
+
+    @Test
+    fun `a lower-case or unknown obfuscation mode still fails closed`() {
+        for (mode in listOf("salamander", "SALAMANDER2", "")) {
+            val binding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+                .copy(metadata = mapOf("hysteria2Profile" to "{\"version\":1,\"sni\":\"hy2.example.com\",\"obfuscationMode\":\"$mode\"}"))
+            assertEquals(mode, Hysteria2ProfileReadResult.Invalid, binding.hysteria2Profile())
+        }
     }
 
     @Test
