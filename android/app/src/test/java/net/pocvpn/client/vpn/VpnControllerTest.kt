@@ -15,6 +15,9 @@ import net.pocvpn.client.identity.FileIdentityStore
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.withHysteria2Profile
+import net.pocvpn.client.reachability.Hysteria2Profile
+import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.reachability.Shadowsocks2022Profile
 import net.pocvpn.client.reachability.withShadowsocks2022Profile
 import net.pocvpn.client.transport.TransportKind
@@ -1037,6 +1040,96 @@ class VpnControllerTest {
 
         val sentConfig = shadowsocksTransport.lastConfig as TransportConfig.Shadowsocks
         assertEquals(28388, sentConfig.port)
+    }
+
+    // --- B46-4A completion: HYSTERIA2 config branch - signed binding is the only host/port/SNI authority ---
+
+    private fun hysteria2Binding(port: Int = 443, sni: String = "origin-sthlm.aknova.pp.ua") =
+        EndpointTransportBinding(kind = TransportKind.HYSTERIA2, host = "16.170.208.231", port = port)
+            .withHysteria2Profile(Hysteria2Profile(sni = sni, obfuscationMode = "NONE"))
+
+    private fun kotlinx.coroutines.test.TestScope.hysteria2Controller(hysteriaTransport: FakeVpnTransport, awgTransport: FakeVpnTransport = FakeVpnTransport()) =
+        VpnController(
+            awgTransport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), DiagnosticsStore(), backgroundScope,
+            hysteria2Transport = hysteriaTransport,
+        )
+
+    @Test
+    fun `resolved HYSTERIA2 uses the pinned binding host-port-SNI-obfuscation and the attempt's endpoint id`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val hysteriaTransport = FakeVpnTransport(kind = TransportKind.HYSTERIA2)
+        val controller = hysteria2Controller(hysteriaTransport, awgTransport)
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                hysteriaTransport, TransportKind.HYSTERIA2,
+                endpointId = EndpointId("stockholm"),
+                endpointTransportBinding = hysteria2Binding(),
+            ),
+        )
+        runCurrent()
+
+        assertEquals(1, hysteriaTransport.connectCallCount)
+        assertEquals(0, awgTransport.connectCallCount)
+        val sent = hysteriaTransport.lastConfig as TransportConfig.Hysteria2
+        assertEquals(EndpointId("stockholm"), sent.endpointId)
+        assertEquals("16.170.208.231", sent.host)
+        // Never AWG's GatewayConfiguration port.
+        assertEquals(443, sent.port)
+        assertEquals("origin-sthlm.aknova.pp.ua", sent.sni)
+        assertEquals("NONE", sent.obfuscationMode)
+    }
+
+    @Test
+    fun `HYSTERIA2 fails closed with no pinned binding - the service is never started`() = runTest {
+        val hysteriaTransport = FakeVpnTransport(kind = TransportKind.HYSTERIA2)
+        val controller = hysteria2Controller(hysteriaTransport)
+
+        controller.connect(TransportOrchestrator.Resolution.Resolved(hysteriaTransport, TransportKind.HYSTERIA2, endpointId = EndpointId("stockholm")))
+        runCurrent()
+
+        assertEquals(0, hysteriaTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `HYSTERIA2 fails closed for a Legacy binding without a typed signed profile`() = runTest {
+        val hysteriaTransport = FakeVpnTransport(kind = TransportKind.HYSTERIA2)
+        val controller = hysteria2Controller(hysteriaTransport)
+        val legacy = EndpointTransportBinding(kind = TransportKind.HYSTERIA2, host = "16.170.208.231", port = 443)
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                hysteriaTransport, TransportKind.HYSTERIA2,
+                endpointId = EndpointId("stockholm"),
+                endpointTransportBinding = legacy,
+            ),
+        )
+        runCurrent()
+
+        assertEquals(0, hysteriaTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `HYSTERIA2 fails closed for a wrong-kind pinned binding`() = runTest {
+        val hysteriaTransport = FakeVpnTransport(kind = TransportKind.HYSTERIA2)
+        val controller = hysteria2Controller(hysteriaTransport)
+        val wrongKind = EndpointTransportBinding(kind = TransportKind.XRAY_REALITY, host = "16.170.208.231", port = 2053)
+
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                hysteriaTransport, TransportKind.HYSTERIA2,
+                endpointId = EndpointId("stockholm"),
+                endpointTransportBinding = wrongKind,
+            ),
+        )
+        runCurrent()
+
+        assertEquals(0, hysteriaTransport.connectCallCount)
+        assertTrue(controller.state.value is TransportState.Error)
     }
 
     // --- B45B-4P (correction, lifecycle hygiene): pendingConnectTransportBinding cleared on every terminal teardown ---

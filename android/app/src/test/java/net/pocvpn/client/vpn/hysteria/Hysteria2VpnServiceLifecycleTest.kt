@@ -246,6 +246,27 @@ class Hysteria2VpnServiceLifecycleTest {
         assertEquals(Hysteria2ServiceLifecycle.Idle, service.lifecycle)
     }
 
+    @Test
+    fun `blank host, out-of-range port or blank SNI fail closed before any credential work`() {
+        val service = newService()
+        service.credentialRepositoryFactory = { _, _ -> throw AssertionError("must never be called") }
+        val bad = listOf(
+            validStart(sessionId = 11L).putExtra(Hysteria2VpnService.EXTRA_HOST, " "),
+            validStart(sessionId = 12L).putExtra(Hysteria2VpnService.EXTRA_PORT, 0),
+            validStart(sessionId = 13L).putExtra(Hysteria2VpnService.EXTRA_PORT, 65536),
+            validStart(sessionId = 14L).apply { removeExtra(Hysteria2VpnService.EXTRA_PORT) },
+            validStart(sessionId = 15L).putExtra(Hysteria2VpnService.EXTRA_SNI, ""),
+        )
+        for (intent in bad) {
+            service.onStartCommand(intent, 0, 1)
+            val status = Hysteria2VpnService.status.value
+            assertEquals(intent.getLongExtra(Hysteria2VpnService.EXTRA_SESSION_ID, -1), status?.sessionId)
+            assertEquals(Hysteria2RuntimePhase.FAILED, status?.phase)
+            assertTrue(status?.error is Hysteria2RuntimeError.InvalidStartRequest)
+            assertEquals(Hysteria2ServiceLifecycle.Idle, service.lifecycle)
+        }
+    }
+
     private fun validStart(sessionId: Long) = android.content.Intent(Hysteria2VpnService.ACTION_START)
         .putExtra(Hysteria2VpnService.EXTRA_SESSION_ID, sessionId)
         .putExtra(Hysteria2VpnService.EXTRA_ENDPOINT_ID, "stockholm")

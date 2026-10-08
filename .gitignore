@@ -115,3 +115,7 @@ research/b46-2p-android-physical/**/novaminimal-android-arm64
 research/b46-2p-android-physical/**/*.pem
 research/b46-2p-android-physical/**/*.key
 research/b46-2p-android-physical/**/*-sources.jar
+
+# local scratch: device screenshots and the issuer tooling venv
+/.t_*.png
+/.venv-issuer/
