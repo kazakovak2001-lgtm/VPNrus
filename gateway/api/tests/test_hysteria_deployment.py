@@ -107,6 +107,22 @@ class RendererTests(unittest.TestCase):
         for key in ("listenHTTP", "listenHTTPS", "password", "obfs", "userpass", "command"):
             self.assertNotIn(key, text)
 
+    def test_salamander_block_is_listener_level_and_only_when_configured(self):
+        password = "Q" * 40
+        text = hsc.render_server_config(443, _STOCKHOLM_SNI, 8446, obfs_password=password)
+        self.assertIn('obfs:\n  type: salamander\n  salamander:\n    password: "' + password + '"\n', text)
+        self.assertIn("never commit", text)
+        self.assertNotIn("Contains no secrets", text)
+        # Everything else is unchanged: same listener, auth, TLS, ACL.
+        without = hsc.render_server_config(443, _STOCKHOLM_SNI, 8446)
+        stripped = text.replace('obfs:\n  type: salamander\n  salamander:\n    password: "' + password + '"\n', "")
+        self.assertEqual(stripped.split("listen:", 1)[1], without.split("listen:", 1)[1])
+
+    def test_salamander_password_charset_is_enforced(self):
+        for bad in ("short", 'x"; inject: true #' + "a" * 20, "a" * 129):
+            with self.subTest(bad=bad[:8]), self.assertRaises(hsc.HysteriaServerConfigError):
+                hsc.render_server_config(443, _STOCKHOLM_SNI, 8446, obfs_password=bad)
+
     def test_acl_rejects_loopback_linklocal_private_then_direct_last(self):
         text = hsc.render_server_config(443, _STOCKHOLM_SNI, 8446)
         rules = re.findall(r"^    - (.+)$", text, re.MULTILINE)
@@ -166,6 +182,10 @@ class RenderFromAppConfigTests(unittest.TestCase):
 
     def test_full_config_renders_the_stockholm_file(self):
         self.assertEqual(hsc.render_from_app_config(self.full), _read(_STOCKHOLM_CONFIG))
+
+    def test_app_config_obfs_password_reaches_the_rendered_config(self):
+        text = hsc.render_from_app_config(dataclasses.replace(self.full, hysteria2_obfs_password="W" * 40))
+        self.assertIn("  type: salamander\n", text)
 
     def test_missing_auth_backend_port_fails_closed(self):
         with self.assertRaises(hsc.HysteriaServerConfigError):

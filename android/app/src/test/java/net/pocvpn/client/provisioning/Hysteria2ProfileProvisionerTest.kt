@@ -102,6 +102,33 @@ class Hysteria2ProfileProvisionerTest {
     }
 
     @Test
+    fun `a signed SALAMANDER profile saves the shared obfuscation secret with the per-device auth secret`() = runBlocking {
+        val salamanderBinding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .withHysteria2Profile(trustedProfile.copy(obfuscationMode = "SALAMANDER"))
+        val response = validSuccess.copy(obfuscationMode = "SALAMANDER", obfuscationSecret = "s".repeat(48))
+        val repository = newRepository()
+        val provisioner = Hysteria2ProfileProvisioner(repository) { _, _, _ -> response }
+
+        val outcome = provisioner.provision(endpointId, salamanderBinding, "pk", "activation-credential")
+
+        assertEquals(Hysteria2ProvisioningOutcome.Saved, outcome)
+        val saved = (repository.getCredential() as Hysteria2CredentialGetResult.Present).credential
+        assertEquals("a".repeat(64), saved.authSecret.value)
+        assertEquals("s".repeat(48), saved.obfuscationSecret?.value)
+    }
+
+    @Test
+    fun `a signed SALAMANDER profile never accepts a NONE response`() = runBlocking {
+        val salamanderBinding = EndpointTransportBinding(TransportKind.HYSTERIA2, "hy2.example", 443)
+            .withHysteria2Profile(trustedProfile.copy(obfuscationMode = "SALAMANDER"))
+        val provisioner = Hysteria2ProfileProvisioner(newRepository()) { _, _, _ -> validSuccess }
+
+        val outcome = provisioner.provision(endpointId, salamanderBinding, "pk", "activation-credential")
+
+        assertTrue("expected Mismatched, got $outcome", outcome is Hysteria2ProvisioningOutcome.Mismatched)
+    }
+
+    @Test
     fun `obfuscation mode mismatch against the trusted signed profile is rejected - response cannot override signed policy`() = runBlocking {
         // The response claims SALAMANDER even though the trusted signed profile says NONE.
         val mismatched = validSuccess.copy(obfuscationMode = "SALAMANDER", obfuscationSecret = "b".repeat(64))

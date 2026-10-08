@@ -119,6 +119,28 @@ class HysteriaProfileEndpointTests(unittest.TestCase):
         self.assertIsNone(payload["expires_at_epoch_seconds"])
         self.assertLessEqual(abs(payload["issued_at_epoch_seconds"] - time.time()), 60)
 
+    def test_salamander_hands_every_device_the_same_shared_obfuscation_secret(self):
+        password = "S" * 48
+        server = RunningServer(dataclasses.replace(self.app_config, hysteria2_obfs_password=password))
+        self.addCleanup(server.close)
+        _aid, cred_a = self._issue_and_bind()
+        _aid, cred_b = self._issue_and_bind(key=self.key_b)
+        payloads = []
+        for credential, key in ((cred_a, self.key_a), (cred_b, self.key_b)):
+            status, _h, body = post_hysteria_profile(server.port, credential=credential, body_obj={"public_key": key})
+            self.assertEqual(status, 200)
+            payloads.append(json.loads(body))
+        for payload in payloads:
+            self.assertEqual(payload["obfuscation_mode"], "SALAMANDER")
+            self.assertEqual(payload["obfuscation_secret"], password)
+        # Listener-level obfuscation is shared; per-device auth is not.
+        self.assertNotEqual(payloads[0]["auth_secret"], payloads[1]["auth_secret"])
+
+    def test_without_salamander_no_obfuscation_secret_field_is_sent(self):
+        _aid, credential = self._issue_and_bind()
+        _status, _h, body = self._provision(credential)
+        self.assertNotIn("obfuscation_secret", json.loads(body))
+
     def test_expiring_activation_reports_its_expiry(self):
         _aid, credential = self._issue_and_bind(expires_in_days=10)
         payload = json.loads(self._provision(credential)[2])
@@ -318,6 +340,40 @@ class HysteriaConfigTests(unittest.TestCase):
         self.assertEqual(cfg.hysteria2_server_port, _PORT)
         self.assertEqual(cfg.hysteria2_sni, _SNI)
         self.assertEqual(cfg.hysteria2_store_path, self.hy["POCVPN_API_HYSTERIA2_STORE_PATH"])
+
+    def _write_obfs(self, content):
+        path = os.path.join(self._tmp.name, "hysteria2-obfs.secret")
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write(content)
+        return path
+
+    def test_obfs_password_file_loads_and_never_appears_in_repr(self):
+        password = "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6"
+        env = {**self.env, **self.hy, "POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE": self._write_obfs(password + "\n")}
+        cfg = config_module.load_config(env=env)
+        self.assertEqual(cfg.hysteria2_obfs_password, password)
+        self.assertNotIn(password, repr(cfg))
+
+    def test_obfs_password_unset_means_no_obfuscation(self):
+        cfg = config_module.load_config(env={**self.env, **self.hy})
+        self.assertEqual(cfg.hysteria2_obfs_password, "")
+
+    def test_obfs_password_file_is_validated_without_echoing_it(self):
+        for bad in ("short", "x" * 129, "has space in it and is long enough!!", 'quote"inside_and_long_enough_123456'):
+            env = {**self.env, **self.hy, "POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE": self._write_obfs(bad)}
+            with self.subTest(bad=bad[:8]):
+                with self.assertRaises(config_module.ConfigError) as ctx:
+                    config_module.load_config(env=env)
+                self.assertNotIn(bad, str(ctx.exception))
+
+    def test_obfs_password_file_requires_the_group_and_an_absolute_existing_path(self):
+        path = self._write_obfs("Z" * 40)
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env={**self.env, "POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE": path})
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env={**self.env, **self.hy, "POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE": "relative.secret"})
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env={**self.env, **self.hy, "POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE": path + ".missing"})
 
     def test_each_partial_group_is_a_startup_error(self):
         for missing in self.hy:

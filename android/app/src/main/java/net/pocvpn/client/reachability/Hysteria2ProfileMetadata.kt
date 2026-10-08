@@ -14,24 +14,22 @@ private const val MAX_SNI_LENGTH = 253 // RFC 1035 max DNS name length.
  * B46-4A review fix (Finding 8) - the closed, non-secret Hysteria2
  * obfuscation-mode identifiers this typed profile is willing to represent -
  * mirrors [SUPPORTED_SHADOWSOCKS_METHODS]'s own "closed set, not a freeform
- * string" discipline. **`NONE` only for this production slice.**
+ * string" discipline.
  *
  * Upstream `apernet/hysteria`'s `obfs: {type: salamander, salamander:
- * {password: ...}}` is a LISTENER-LEVEL server config setting - one static
- * password applied to obfuscate every packet before any QUIC handshake (and
- * therefore before any per-connection `auth` credential is ever exchanged),
- * not a per-connection/per-device value the `auth.type: http` backend could
- * select. A per-device Salamander secret is therefore not representable by
- * this server architecture at all - provisioning one would be fiction, not
- * a real capability (see `docs/B46_4A_HYSTERIA2_PRODUCTION_INTEGRATION.md`'s
- * own "Salamander server architecture" section). `SALAMANDER` is
- * deliberately NOT in this set: a manifest naming it fails closed as
- * [Hysteria2ProfileReadResult.Invalid], never silently accepted. A future
- * slice may reintroduce it once a real SHARED, endpoint-level Salamander
- * secret distribution/rotation design exists, independent of per-device
- * Hysteria auth provisioning.
+ * {password: ...}}` is a LISTENER-LEVEL server setting: ONE shared password
+ * for the whole server, applied before any QUIC handshake and before the
+ * per-device `auth` exchange. B46-4A therefore shipped `NONE` only (a
+ * per-device Salamander secret is not a real server capability - Finding 8).
+ * `SALAMANDER` is now accepted as exactly that SHARED, endpoint-level secret:
+ * `/v1/hysteria-profile` hands every device the same `obfuscation_secret`
+ * (gateway `POCVPN_API_HYSTERIA2_OBFS_PASSWORD_FILE`); it only hides the QUIC
+ * shape and SNI on the wire (RU field evidence: plain QUIC with a visible SNI
+ * was filtered), it never grants access - the per-device `auth_secret` does.
+ * The signed manifest decides the mode; the credential must agree with it
+ * (Hysteria2ProfileProvisioner / Hysteria2VpnService fail closed otherwise).
  */
-internal val SUPPORTED_HYSTERIA2_OBFUSCATION_MODES = setOf("NONE")
+internal val SUPPORTED_HYSTERIA2_OBFUSCATION_MODES = setOf("NONE", "SALAMANDER")
 
 /**
  * B46-4A - the PUBLIC/SIGNED half of a Hysteria2 endpoint's config (mirrors
