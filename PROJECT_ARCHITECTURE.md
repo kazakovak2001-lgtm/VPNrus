@@ -252,6 +252,12 @@ NetworkProfiler
   `XrayRuntimeState.nextSessionId()` (one wall-clock-seeded counter) - never
   per-class counters, which let one transport adopt another's replayed
   `Failed` event.
+- **Signed binding is the transport address authority**: for Direct
+  HYSTERIA2/SHADOWSOCKS_2022 (host+port) and XRAY_REALITY (port; the
+  per-device profile must match the binding host or the attempt fails
+  closed) the pinned signed manifest binding wins over stored profiles, so
+  a port move is a manifest change, not a re-activation. Relayed attempts
+  keep their own ingress/relay profiles.
 - **Hysteria2 obfuscation**: the signed `hysteria2Profile.obfuscationMode`
   (`NONE`/`SALAMANDER`) is authoritative; the provisioned credential must
   agree (provisioner + `Hysteria2VpnService` fail closed). Salamander is one

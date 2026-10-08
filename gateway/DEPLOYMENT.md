@@ -1109,3 +1109,63 @@ protection rejects a lower version). Devices re-activate Stockholm again.
   -> `authentication error` (obfs + TLS OK, auth rejected as expected).
 - Not yet done: device re-activation (step 6) and a real Hysteria2
   connect from CZ/RU (step 7).
+
+## REALITY Frankfurt on TCP/443 (SNI split) - PREPARED, NOT DEPLOYED
+
+Why: RU field evidence (2026-10-08, home Wi-Fi): Frankfurt TCP 2053/2083/28388
+were reachable at 21:00 MSK but timed out at 21:17 and 21:39, while Frankfurt
+443 worked every time and REALITY to Stockholm on 2053 worked. That points to
+IP:port blocking of the Oracle address, not REALITY detection. One network,
+one evening: 443 may help, it is not proven.
+
+Design (`gateway/edge/nginx-pocvpn-stream-frankfurt.conf`): nginx `stream`
+owns public 443 (v4+v6) and reads only the ClientHello SNI.
+- SNI in REALITY `serverNames` (`www.wikipedia.org`) goes to `127.0.0.1:2054`, which
+  strips the PROXY header, then to Xray `127.0.0.1:2053` (no Xray change).
+- Anything else, including no SNI (API by IP), goes to `127.0.0.1:4443`, the existing
+  HTTPS vhosts with `listen ... proxy_protocol` and
+  `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`, so
+  `$remote_addr`/X-Real-IP stays the real client (B57 per-client limits).
+Public 2053 stays (Stockholm relay `stockholm-ingress-1 -> 152.70.43.1:2053`,
+older clients). Validated on a real nginx (1.28 + stream, isolated instance):
+no-SNI and other-SNI reach HTTPS with the real client address, REALITY SNI
+reaches the backend as a raw TLS ClientHello without a PROXY header.
+
+Client: Direct XRAY_REALITY takes its PORT from the pinned signed binding
+(`VpnController.directRealityConfigFromSignedBinding`); the per-device profile
+keeps identity and must match the binding host (fail closed otherwise). So the
+port move needs app >= this change plus manifest v8 - no re-activation, and the
+API's `XRAY_SERVER_PORT` stays 2053. Older apps keep using 2053 (still open).
+
+Steps (each requires explicit owner approval; Frankfurt drifted from the repo
+templates, so edit the DEPLOYED files, never replace them with templates):
+1. Read-only precheck: `sudo nginx -T` saved; live REALITY `serverNames` of the
+   2053 inbound in `/etc/nova-xray/config.json` == the stream map keys;
+   `ss -tlnp` shows nothing on 2054/4443.
+2. `sudo apt-get install libnginx-mod-stream` (adds the `load_module` line in
+   `/etc/nginx/modules-enabled/`; no listener change yet).
+3. Back up `/etc/nginx/nginx.conf` and `sites-available/{pocvpn,aknova-xhttp}`.
+   Install the stream file as `/etc/nginx/pocvpn-stream.conf` (root 0644) and
+   add `include /etc/nginx/pocvpn-stream.conf;` at the TOP LEVEL of
+   nginx.conf (after the `events {}` block, outside `http {}`).
+4. In `pocvpn` replace `listen 443 ssl default_server;` +
+   `listen [::]:443 ssl default_server;` with
+   `listen 127.0.0.1:4443 ssl default_server proxy_protocol;`; in
+   `aknova-xhttp` replace both 443 listens with
+   `listen 127.0.0.1:4443 ssl http2 proxy_protocol;`; add
+   `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;` to both
+   443-era server blocks.
+5. `sudo nginx -t`, then `sudo systemctl restart nginx` (about 1 s outage of
+   the Frankfurt API; a reload cannot move 443 from http to stream).
+6. Verify: `curl -sk https://152.70.43.1/v1/manifest` (200, v7 hash), API log
+   shows the real client IP, `openssl s_client -connect 152.70.43.1:443
+   -servername www.wikipedia.org` completes (REALITY camouflage), a REALITY
+   client on 443 connects, the Stockholm relay still works (2053).
+7. Sign v8 (`gateway/tools/production_manifest_2026-10-09_v8.json`, only
+   Frankfurt XRAY_REALITY 2053 -> 443; key `prod-manifest-key-2026-09-14`),
+   install on both gateways like v7, verify the served hash.
+8. Devices: update the app; it picks up v8 by itself. CZ test, then RU tester.
+
+Rollback: restore the three nginx backups, remove the include, `nginx -t`,
+restart (seconds). Publish v9 with Frankfurt REALITY back on 2053 (rollback
+protection rejects re-serving v7). 2053 stays reachable throughout.

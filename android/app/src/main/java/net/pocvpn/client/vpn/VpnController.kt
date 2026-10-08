@@ -68,6 +68,7 @@ import net.pocvpn.client.vpn.policy.RoutingModeStore
 import net.pocvpn.client.vpn.policy.resolveAppRoutingLists
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
+import net.pocvpn.client.vpn.xray.XrayVlessRealityConfig
 import net.pocvpn.client.vpn.xray.XrayTlsRuntimeResolution
 
 sealed class ControllerEvent {
@@ -1288,7 +1289,7 @@ class VpnController(
                 when (val resolution = XrayRuntimeResolver.resolve(repository)) {
                     is XrayRuntimeResolution.Rejected -> throw XrayProfileNotReadyException(resolution.reason)
                     is XrayRuntimeResolution.Ready -> TransportConfig.Xray(
-                        resolution.config,
+                        directRealityConfigFromSignedBinding(resolution.config),
                         endpointId = pendingConnectEndpointId,
                         routingMode = routingMode,
                         // B33 relay follow-up - see TransportConfig.Xray.isRelayed's own docs.
@@ -1539,6 +1540,30 @@ class VpnController(
      * this class. Called ONLY from real evidence (a completed connect()
      * attempt or an exhausted reconnect cycle) - never speculatively.
      */
+    /**
+     * The pinned, signed manifest binding is authoritative for a Direct
+     * XRAY_REALITY attempt's PORT (same rule HYSTERIA2/SHADOWSOCKS_2022
+     * already follow for host and port): the per-device profile from
+     * /v1/xray-profile supplies only identity (uuid, REALITY key/shortId/
+     * serverName) and the host it was issued for. So a gateway can move its
+     * public REALITY port (Frankfurt 2053 -> 443, RU field evidence) with a
+     * new signed manifest alone - no device re-activation. Fails closed when
+     * the profile was issued for a DIFFERENT host than the signed binding.
+     * Unchanged (profile as-is) for relayed attempts and when no binding is
+     * pinned (legacy path).
+     */
+    private fun directRealityConfigFromSignedBinding(config: XrayVlessRealityConfig): XrayVlessRealityConfig {
+        if (pendingAttemptContext is VpnAttemptContext.Relayed) return config
+        val binding = pendingConnectTransportBinding ?: return config
+        if (binding.kind != TransportKind.XRAY_REALITY) return config
+        if (binding.host != config.server) {
+            throw XrayProfileNotReadyException(
+                "Xray profile host does not match the signed XRAY_REALITY binding for endpoint ${pendingConnectEndpointId.value}",
+            )
+        }
+        return if (binding.port == config.serverPort) config else config.copy(serverPort = binding.port)
+    }
+
     /** See [pendingStateOutcome]. No-op for any state other than the attempt's first Connected/Error. */
     private fun recordStateDrivenOutcome(kind: TransportKind, transportState: TransportState) {
         val pending = pendingStateOutcome ?: return
