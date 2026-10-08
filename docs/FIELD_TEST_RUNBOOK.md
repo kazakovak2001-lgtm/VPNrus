@@ -102,9 +102,12 @@ Mobile data: about 12-15 MB per full run; monitor about 3 MB per hour.
    operator, different times of day), plus a 2 h monitor on the network
    that will really be used. Never merge networks. Note what the app cannot
    see (city, announced mobile-internet restrictions).
-4. Share every report ("Share report (JSON)"; "Share summary" for a quick
-   look). Debug builds can also save a copy locally
-   (`files/support-diagnostics/field-test-<time>.json`).
+4. Share every report ("Share report (JSON)" sends a `nova-field-test-<time>.json`
+   FILE through the share sheet - a full report is larger than Android's
+   ~1 MB intent limit, so it is never sent as text; "Share summary" for a
+   quick look). Debug builds can also save a copy locally
+   (`files/support-diagnostics/field-test-<time>.json`) - app-private, only
+   reachable with adb, not from the phone's file manager.
 
 ## Server-side correlation (optional, owner-approved per session)
 

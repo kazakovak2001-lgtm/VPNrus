@@ -573,9 +573,12 @@ fun AppRoot(
                 type = mime
                 putExtra(android.content.Intent.EXTRA_TEXT, text)
             }
-            context.startActivity(
-                android.content.Intent.createChooser(send, context.getString(net.pocvpn.client.R.string.field_test_share_title)),
-            )
+            fieldTestSaveStatus = runCatching {
+                context.startActivity(
+                    android.content.Intent.createChooser(send, context.getString(net.pocvpn.client.R.string.field_test_share_title)),
+                )
+                null
+            }.getOrElse { "share failed: ${it.javaClass.simpleName}: ${it.message}" }
         }
         FieldTestDialog(
             progress = fieldTestProgress,
@@ -585,7 +588,18 @@ fun AppRoot(
                 viewModel.startFieldTest(context, mode, minutes) { currentDiagnosticsLines.value() }
             },
             onCancel = { viewModel.cancelFieldTest() },
-            onShareJson = { viewModel.fieldTestReportJson()?.let { share(it, "application/json") } },
+            onShareJson = {
+                viewModel.fieldTestReportJson()?.let { json ->
+                    fieldTestSaveStatus = runCatching {
+                        context.startActivity(
+                            net.pocvpn.client.diagnostics.fieldtest.FieldTestReportShare.shareIntent(
+                                context, json, context.getString(net.pocvpn.client.R.string.field_test_share_title),
+                            ),
+                        )
+                        null
+                    }.getOrElse { "share failed: ${it.javaClass.simpleName}: ${it.message}" }
+                }
+            },
             onShareSummary = { viewModel.fieldTestReportSummary()?.let { share(it, "text/plain") } },
             onSaveLocally = {
                 fieldTestSaveStatus = runCatching {

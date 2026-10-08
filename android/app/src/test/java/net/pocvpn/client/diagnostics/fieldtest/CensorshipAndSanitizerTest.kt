@@ -119,4 +119,28 @@ class CensorshipAndSanitizerTest {
         assertTrue(LogSanitizer.isConnectionRecord("I/GoLog: from tcp:172.19.0.1:42630 accepted tcp:57.144.248.196:443 [nova-tun-in >> out]"))
         assertFalse(LogSanitizer.isConnectionRecord("I/NovaXrayVpnService: Xray core started"))
     }
+    @Test fun `probe errors never carry the device's local address`() {
+        val e = java.net.SocketTimeoutException("failed to connect to telegram.org/149.154.167.99 (port 443) from /192.168.1.3 (port 43046) after 10000ms")
+        val out = describeError(e)
+        assertFalse(out.contains("192.168.1.3"))
+        assertFalse(out.contains("43046"))
+        assertEquals("SocketTimeoutException: failed to connect to telegram.org/149.154.167.99 (port 443) after 10000ms", out)
+        val v6 = describeError(java.net.ConnectException("failed to connect to /1.2.3.4 (port 443) from /fe80::1%wlan0 (port 5) after 5ms"))
+        assertFalse(v6.contains("fe80"))
+    }
+
+    @Test fun `field test report is shared as a fresh file in its own cache dir`() {
+        val cache = createTempDir("cache")
+        try {
+            FieldTestReportShare.writeReportFile(cache, 1L, "{\"old\":1}")
+            val big = "x".repeat(3_000_000)
+            val file = FieldTestReportShare.writeReportFile(cache, 2L, big)
+            assertEquals(java.io.File(cache, FieldTestReportShare.DIR), file.parentFile)
+            assertEquals("nova-field-test-2.json", file.name)
+            assertEquals(3_000_000L, file.length())
+            assertEquals(listOf("nova-field-test-2.json"), file.parentFile!!.list()!!.toList())
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
 }
