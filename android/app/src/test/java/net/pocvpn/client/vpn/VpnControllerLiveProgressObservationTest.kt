@@ -225,4 +225,90 @@ class VpnControllerLiveProgressObservationTest {
 
         assertTrue(store.recent(fingerprint()).isEmpty())
     }
+
+    // --- dead data plane behind a live AWG handshake (RU field test CONNECTED_NO_DATA) ---
+
+    private suspend fun kotlinx.coroutines.test.TestScope.connectWith(
+        stats: (Int) -> TransportStats,
+        store: TransportObservationStore? = TransportObservationStore(),
+    ): Triple<VpnController, FakeVpnTransport, DiagnosticsStore> {
+        val transport = FakeVpnTransport()
+        var calls = 0
+        transport.statsProvider = { calls++; stats(calls) }
+        val diagnostics = DiagnosticsStore()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            transportObservationStore = store,
+            fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
+            networkProfileProvider = { fakeUsableNetworkProfile },
+        )
+        controller.connect()
+        runCurrent()
+        return Triple(controller, transport, diagnostics)
+    }
+
+    @Test
+    fun `sending with nothing coming back ends the session with DataPlaneNoTraffic instead of a false Protected`() = runTest {
+        val (controller, transport, diagnostics) = connectWith({ n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) })
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        advanceTimeBy(31_000)
+        runCurrent()
+
+        val state = controller.state.value
+        assertTrue(state is TransportState.Error)
+        assertEquals(TransportFailureKind.REMOTE_UNCONFIRMED, (state as TransportState.Error).failureKind)
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.DataPlaneNoTraffic, diagnostics.snapshot.value.lastError)
+        assertTrue(transport.disconnectCallCount >= 1)
+    }
+
+    @Test
+    fun `an early-drop stall after initial payload also ends the session`() = runTest {
+        val (controller, _, diagnostics) = connectWith({ n -> TransportStats.Counters(bytesReceived = 100L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) })
+
+        advanceTimeBy(31_000)
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+        assertEquals(net.pocvpn.client.diagnostics.VpnError.DataPlaneNoTraffic, diagnostics.snapshot.value.lastError)
+    }
+
+    @Test
+    fun `the dead data plane is acted on even without an observation store`() = runTest {
+        val (controller, _, _) = connectWith({ n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) }, store = null)
+
+        advanceTimeBy(31_000)
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Error)
+    }
+
+    @Test
+    fun `a working or idle session is never torn down by the progress check`() = runTest {
+        val (working, workingTransport, _) = connectWith({ n -> TransportStats.Counters(bytesReceived = n * 100L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) })
+        val (idle, _, _) = connectWith({ _ -> TransportStats.Counters(bytesReceived = 0L, bytesSent = 0L, lastHandshakeEpochMillis = System.currentTimeMillis()) })
+
+        advanceTimeBy(31_000)
+        runCurrent()
+
+        assertTrue(working.state.value is TransportState.Connected)
+        assertTrue(idle.state.value is TransportState.Connected)
+        assertEquals(0, workingTransport.disconnectCallCount)
+    }
+
+    @Test
+    fun `a user disconnect during the window wins - no late Error`() = runTest {
+        val (controller, _, _) = connectWith({ n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) })
+        advanceTimeBy(5_000)
+        runCurrent()
+
+        controller.disconnect()
+        runCurrent()
+        advanceTimeBy(31_000)
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Disconnected)
+    }
 }

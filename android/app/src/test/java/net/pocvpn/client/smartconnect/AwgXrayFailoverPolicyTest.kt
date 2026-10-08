@@ -162,4 +162,9 @@ class AwgXrayFailoverPolicyTest {
     fun `Disconnected (e_g_ user cancelled) is never eligible even with a stale eligible error`() {
         assertFalse(eligible(awgState = TransportState.Disconnected, awgError = VpnError.HandshakeTimeout))
     }
+
+    @Test
+    fun `a dead AWG data plane falls back to Xray like a handshake timeout`() {
+        assertTrue(eligible(awgState = TransportState.Error("no data"), awgError = VpnError.DataPlaneNoTraffic))
+    }
 }

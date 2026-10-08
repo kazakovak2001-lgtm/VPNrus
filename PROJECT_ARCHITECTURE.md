@@ -3460,14 +3460,26 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   indefinitely. It writes exactly ONE `TransportAttemptObservation` per
   attempt (tracked in `progressObservationJob`, cancelled under the SAME
   `reconnectOwnershipLock`/generation discipline `reconnectJob` already uses,
-  so a superseded attempt can never record stale evidence), and never calls
-  `disconnect()`/`startReconnect()`/`setState()` - purely a store write. A
+  so a superseded attempt can never record stale evidence). A
   transport whose `stats()` reports no real counters (every non-AmneziaWG
   kind today) is recorded `NOT_OBSERVED` on the very first poll, never a
-  fabricated claim. B33's existing post-Connected confirmation
-  (`confirmRemoteConnectivity`, the relay-health watchdog) remains the sole
-  live connection-health/reconnect authority, unmodified - this object is
-  never a second watchdog and never itself triggers a reconnect/teardown.
+  fabricated claim.
+- **AWG dead-data-plane gate (2026-10-09, RU field test `CONNECTED_NO_DATA`)**:
+  the one exception to "observation only". After recording, a decisive
+  `NO_PAYLOAD` or `STALLED_AFTER_INITIAL_PAYLOAD` verdict makes
+  `VpnController.failDeadDataPlane` end THAT session (only if it is still
+  Connected on the same transport; the job detaches from
+  `progressObservationJob` first so its own teardown cannot cancel it) via
+  the same teardown as `abandonAttemptWithTerminalError`, recording
+  `VpnError.DataPlaneNoTraffic` and `TransportState.Error(failureKind =
+  REMOTE_UNCONFIRMED)`. It acts at most once, within the first ~30 s after
+  the handshake; it never reconnects and never re-checks later. The
+  existing failover watches do the rest: `AutoGatewayFailoverPolicy` advances
+  Auto to the next candidate and `AwgXrayFailoverPolicy` falls back
+  AWG->Xray (Manual gateway, Auto transport). VERIFIED/IDLE/UNAVAILABLE/
+  still-VERIFYING leave the session alone; a healthy AWG session was held 45 s
+  on the OPPO without teardown. B33's Xray confirmation and relay watchdog
+  are unchanged.
 - **What this means for real production evidence, stated precisely**:
   `POSSIBLE_FULL_SHUTDOWN` (all-transports-connect-failed) and a
   connect-level `POSSIBLE_UDP_FILTERING` (AWG handshake fails while another

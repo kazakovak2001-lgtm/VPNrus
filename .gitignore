@@ -119,3 +119,6 @@ research/b46-2p-android-physical/**/*-sources.jar
 # local scratch: device screenshots and the issuer tooling venv
 /.t_*.png
 /.venv-issuer/
+
+# B46-4P prototype build output (rebuild from tools/hysteria-server-prototype)
+/tools/hysteria-server-prototype/hysteria-server-prototype-*

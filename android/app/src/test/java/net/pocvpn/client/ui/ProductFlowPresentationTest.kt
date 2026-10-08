@@ -213,4 +213,15 @@ class ProductFlowPresentationTest {
         assertFalse(showsOtherProfileNotice(HomeVisualState.IN_PROGRESS, 1))
         assertFalse(showsOtherProfileNotice(HomeVisualState.FAILED, 1))
     }
+
+    @Test
+    fun `lockdown hint shows once while Protected, only while Always-on is not confirmed`() {
+        val unknown = net.pocvpn.client.vpn.AlwaysOnDetectionState.UNKNOWN
+        val confirmed = net.pocvpn.client.vpn.AlwaysOnDetectionState.CONFIRMED_ENABLED
+        assertTrue(showsLockdownHint(HomeVisualState.CONNECTED, unknown, dismissed = false))
+        assertFalse(showsLockdownHint(HomeVisualState.CONNECTED, unknown, dismissed = true))
+        assertFalse(showsLockdownHint(HomeVisualState.CONNECTED, confirmed, dismissed = false))
+        assertFalse(showsLockdownHint(HomeVisualState.DISCONNECTED, unknown, dismissed = false))
+        assertFalse(showsLockdownHint(HomeVisualState.IN_PROGRESS, unknown, dismissed = false))
+    }
 }

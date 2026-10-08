@@ -66,6 +66,8 @@ fun SettingsScreen(
     // server/activation reachability, crashes, sanitized logs) - an explicit
     // user action; the report is only shared if the user chooses to.
     onNetworkCheckClick: () -> Unit = {},
+    // Opens Android's VPN settings (Always-on + Block connections without VPN).
+    onOpenVpnSettingsClick: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     // B30A - physical-validation fix: this Column has no bound on its
@@ -242,6 +244,24 @@ fun SettingsScreen(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Text(
+            text = stringResource(R.string.settings_always_on_title),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_always_on_explanation),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        androidx.compose.material3.TextButton(onClick = onOpenVpnSettingsClick, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.settings_always_on_open))
+        }
 
         Spacer(modifier = Modifier.height(28.dp))
 

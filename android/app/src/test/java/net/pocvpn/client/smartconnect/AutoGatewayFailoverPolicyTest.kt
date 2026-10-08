@@ -37,4 +37,9 @@ class AutoGatewayFailoverPolicyTest {
     fun `an unrecognized error alongside a terminal state is never eligible`() {
         assertFalse(AutoGatewayFailoverPolicy.isEligibleForNextCandidate(TransportState.Error("x"), VpnError.PermissionDenied))
     }
+
+    @Test
+    fun `a dead data plane behind a live handshake advances to the next candidate`() {
+        assertTrue(AutoGatewayFailoverPolicy.isEligibleForNextCandidate(TransportState.Error("no data"), VpnError.DataPlaneNoTraffic))
+    }
 }
