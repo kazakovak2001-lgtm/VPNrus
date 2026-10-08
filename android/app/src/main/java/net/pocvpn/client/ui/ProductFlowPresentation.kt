@@ -170,6 +170,14 @@ fun shouldClearIngressCredentialInput(state: net.pocvpn.client.relay.IngressActi
 fun shouldShowDiagnostics(isDebugBuild: Boolean): Boolean = isDebugBuild
 
 /**
+ * B57 C6-R2 - warn while Protected that apps in another profile of this
+ * user (clone, work) bypass the VPN. Unknown (null) shows nothing here; the
+ * static Settings note still applies.
+ */
+fun showsOtherProfileNotice(visualState: HomeVisualState, otherProfiles: Int?): Boolean =
+    visualState == HomeVisualState.CONNECTED && (otherProfiles ?: 0) > 0
+
+/**
  * B8G - true whenever the app-session kill switch is genuinely "holding":
  * a full-tunnel VpnService session that has been intentionally requested is
  * either recovering from a hiccup or has not yet proven itself, so internet

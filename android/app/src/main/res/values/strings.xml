@@ -20,6 +20,8 @@
     <string name="home_location_chevron_content_description">Change location</string>
     <string name="home_diagnostics_entry">Diagnostics</string>
     <string name="home_kill_switch_notice">Internet blocked until VPN reconnects</string>
+    <string name="home_other_profile_notice">Cloned apps and work-profile apps on this phone are NOT protected</string>
+    <string name="settings_other_profiles_note">Cloned apps (Dual apps, App Cloner), a work profile and other Android users are not protected: Android limits a VPN to the user that started it.</string>
 
     <!-- Gateway picker -->
     <string name="gateway_picker_title">Choose a server</string>

@@ -202,4 +202,15 @@ class ProductFlowPresentationTest {
         assertFalse(TransportState.Error("boom").blocksGatewaySelection())
         assertFalse(TransportState.HandshakeFailed.blocksGatewaySelection())
     }
+
+    @Test
+    fun `other-profile notice shows only while Protected and a clone or work profile exists`() {
+        assertTrue(showsOtherProfileNotice(HomeVisualState.CONNECTED, 1))
+        assertFalse(showsOtherProfileNotice(HomeVisualState.CONNECTED, 0))
+        // Android did not answer: no claim either way on Home.
+        assertFalse(showsOtherProfileNotice(HomeVisualState.CONNECTED, null))
+        assertFalse(showsOtherProfileNotice(HomeVisualState.DISCONNECTED, 1))
+        assertFalse(showsOtherProfileNotice(HomeVisualState.IN_PROGRESS, 1))
+        assertFalse(showsOtherProfileNotice(HomeVisualState.FAILED, 1))
+    }
 }

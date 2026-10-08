@@ -3831,6 +3831,7 @@ class MainViewModel(
             .put("gitCommit", BuildConfig.GIT_COMMIT)
 
         override fun appState(): org.json.JSONObject = fieldTestAppState(diagnosticsLines)
+            .put("otherProfiles", net.pocvpn.client.vpn.OtherProfiles.count(context) ?: org.json.JSONObject.NULL)
 
         override suspend fun refreshManifestOutcome(): String? =
             try { refreshManifest()?.toString() ?: "no manifest refresh client wired" } catch (e: Exception) { "failed: ${e.javaClass.simpleName}" }

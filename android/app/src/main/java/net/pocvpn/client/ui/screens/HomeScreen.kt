@@ -48,6 +48,8 @@ fun HomeScreen(
     // blocked (see net.pocvpn.client.ui.showsKillSwitchNotice). A small,
     // truthful extra line only - no technical clutter, no redesign.
     showKillSwitchNotice: Boolean = false,
+    // B57 C6-R2 - see net.pocvpn.client.ui.showsOtherProfileNotice.
+    showOtherProfileNotice: Boolean = false,
     // B8H1 - the APPLIED routing policy's mode (VpnController
     // .appliedRoutingPolicy.mode), NEVER the merely-saved one - see
     // homeConnectedSubtitle's own docs. Only read while visualState ==
@@ -122,6 +124,15 @@ fun HomeScreen(
                         text = stringResource(R.string.home_kill_switch_notice),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (showOtherProfileNotice) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.home_other_profile_notice),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     )
                 }
             }
