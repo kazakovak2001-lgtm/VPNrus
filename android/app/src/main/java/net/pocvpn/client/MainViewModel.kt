@@ -1566,7 +1566,10 @@ class MainViewModel(
         RestrictionEvidence(
             networkProfile = networkProfile.value,
             transportState = transportState.value,
-            awgHandshakeFresh = recentConnectionOutcomes().lastOrNull()?.let { it.result == ConnectionOutcomeResult.SUCCESS },
+            // AWG outcomes only: non-AWG kinds are recorded too (VpnController
+            // pendingStateOutcome) and must not read as AWG/UDP evidence.
+            awgHandshakeFresh = recentConnectionOutcomes().lastOrNull { it.transport == TransportKind.AMNEZIA_WG }
+                ?.let { it.result == ConnectionOutcomeResult.SUCCESS },
             gatewayHttpsReachable = restrictionMonitor?.lastProbeResult?.value,
             diverseInternetReachable = restrictionMonitor?.lastDiverseReachabilityResult?.value,
             gatewayProbeEpochMillis = restrictionMonitor?.lastProbeEpochMillis?.value,

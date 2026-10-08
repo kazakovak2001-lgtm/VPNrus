@@ -473,6 +473,21 @@ class VpnController(
     // own docs for why this field, not a literal, is what they read.
     private var pendingConnectEndpointId: EndpointId = EndpointId(ProductionGateway.ID)
 
+    /**
+     * The one not-yet-recorded Direct attempt of a transport whose result is
+     * only known from its own observeState() (every kind except AMNEZIA_WG,
+     * whose result doConnectAttempt knows synchronously). Recorded exactly
+     * once - first Connected = success, first Error = failure - by
+     * [recordStateDrivenOutcome], into the SAME ConnectionOutcome/PathHistory
+     * stores AWG uses, so Auto ranking learns which non-AWG paths work on a
+     * network (field evidence: on a RU network REALITY to one gateway failed
+     * while REALITY to the other worked, and Auto could never learn it).
+     * Relayed attempts stay with MainViewModel.recordRelayOutcome (B25).
+     */
+    private data class PendingStateOutcome(val kind: TransportKind, val endpointId: EndpointId, val startEpochMillis: Long)
+
+    @Volatile private var pendingStateOutcome: PendingStateOutcome? = null
+
     // B16 - the PINNED GatewayConfigSnapshot for the CURRENT/most recent
     // connect() attempt, when [connect]'s resolved value carried one (an
     // automatic-gateway-selection candidate - see
@@ -617,6 +632,7 @@ class VpnController(
                 ) {
                     diagnostics.recordError(VpnError.HandshakeTimeout)
                 }
+                recordStateDrivenOutcome(newTransport.kind, transportState)
                 val failureIncidentGeneration = if (
                     transportState is TransportState.Error &&
                     _state.value is TransportState.Connected &&
@@ -793,6 +809,8 @@ class VpnController(
                 return@withLock
             }
             userInitiatedDisconnect = true
+            // A user-cancelled attempt is not evidence about the path.
+            pendingStateOutcome = null
             cancelReconnectLocked()
             hasTouchedTransport = true
             activeTransport.disconnect()
@@ -1031,6 +1049,18 @@ class VpnController(
                 // declared outside the try below (not inside it) so it is
                 // also visible to the catch branch's own outcome recording.
                 val attemptStartEpochMillis = System.currentTimeMillis()
+                // Armed BEFORE connect(): a transport may report Error from
+                // inside connect() itself (permission/profile checks).
+                // SHADOWSOCKS_2022 excluded: its Connected means "local
+                // sslocal is up", not a remote round trip - no real evidence.
+                pendingStateOutcome = if (
+                    kind != TransportKind.AMNEZIA_WG && kind != TransportKind.SHADOWSOCKS_2022 &&
+                    pendingAttemptContext !is VpnAttemptContext.Relayed
+                ) {
+                    PendingStateOutcome(kind, pendingConnectEndpointId, attemptStartEpochMillis)
+                } else {
+                    null
+                }
                 return try {
                     hasTouchedTransport = true
                     runCatching { onTransportAttemptStarting?.invoke(pendingConnectEndpointId, kind) }
@@ -1112,18 +1142,19 @@ class VpnController(
                         // docs for why recording it there (not here) is what
                         // lets a concurrently-attached armFailoverWatch
                         // correctly advance the combined Auto sequence past
-                        // a genuinely failed Xray Direct attempt. No
-                        // ConnectionOutcome/PathHistory recording here either
-                        // - that model is AWG-handshake-specific (see
-                        // recordConnectionOutcome's own docs) and does not
-                        // yet have an Xray equivalent - see
-                        // handleNetworkLost's own docs for why this also
-                        // means no automatic RECONNECT (distinct from Auto
-                        // gateway advancement, which B33 does now support)
-                        // for this kind.
+                        // a genuinely failed Xray Direct attempt. The
+                        // ConnectionOutcome/PathHistory record for this kind
+                        // is written by that same collector once the real
+                        // result arrives (see pendingStateOutcome) - never
+                        // here. See handleNetworkLost's own docs for why
+                        // there is still no automatic RECONNECT (distinct
+                        // from Auto gateway advancement, which B33 does now
+                        // support) for this kind.
                         true
                     }
                 } catch (e: Exception) {
+                    // Recorded below as BACKEND_START_FAILURE - never twice.
+                    pendingStateOutcome = null
                     if (e is CancellationException) throw e
                     diagnostics.recordError(VpnError.BackendStartFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Backend failed to start"))
@@ -1508,6 +1539,30 @@ class VpnController(
      * this class. Called ONLY from real evidence (a completed connect()
      * attempt or an exhausted reconnect cycle) - never speculatively.
      */
+    /** See [pendingStateOutcome]. No-op for any state other than the attempt's first Connected/Error. */
+    private fun recordStateDrivenOutcome(kind: TransportKind, transportState: TransportState) {
+        val pending = pendingStateOutcome ?: return
+        if (pending.kind != kind) return
+        val success = when (transportState) {
+            is TransportState.Connected -> true
+            is TransportState.Error -> false
+            else -> return
+        }
+        pendingStateOutcome = null
+        val nowEpochMillis = System.currentTimeMillis()
+        connectionOutcomeStore?.record(
+            ConnectionOutcome(
+                transport = kind,
+                gatewayId = pending.endpointId.value,
+                result = if (success) ConnectionOutcomeResult.SUCCESS else ConnectionOutcomeResult.FAILURE,
+                handshakeDurationMs = nowEpochMillis - pending.startEpochMillis,
+                errorCategory = if (success) ConnectionErrorCategory.NONE else ConnectionErrorCategory.HANDSHAKE_TIMEOUT,
+                timestampEpochMillis = nowEpochMillis,
+            ),
+        )
+        recordPathHistory(success = success, kind = kind, endpointId = pending.endpointId, nowEpochMillis = nowEpochMillis)
+    }
+
     private fun recordConnectionOutcome(
         result: ConnectionOutcomeResult,
         errorCategory: ConnectionErrorCategory,

@@ -143,4 +143,17 @@ class CensorshipAndSanitizerTest {
             cache.deleteRecursively()
         }
     }
+    @Test fun `national-CA certificate is UNTRUSTED_CERTIFICATE, not blocking`() {
+        val tlsFail = TlsProbeResult("vk.com", false, 5, "SSLHandshakeException: java.security.cert.CertPathValidatorException: Trust anchor for certification path not found.")
+        val v = classifyTarget(dns(true, "1.2.3.4"), listOf("1.2.3.4"), tcp(true), tlsFail, tls(false, "www.example.org"), https(false, null), null)
+        assertEquals(listOf("UNTRUSTED_CERTIFICATE"), v)
+        val net = classifyNetwork(
+            listOf(
+                TargetCensorshipResult(CensorshipTarget("vk.com", "domestic-control"), dns(true, "1.2.3.4"), listOf("1.2.3.4"), null, null, null, null, https(false, null), null, v),
+                result("www.google.com", "foreign-control", "OK"),
+            ),
+            emptyMap(), emptyMap(),
+        )
+        assertFalse(net.any { it.startsWith("NO_WORKING_INTERNET") })
+    }
 }

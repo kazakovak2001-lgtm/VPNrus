@@ -24,7 +24,6 @@ import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolution
 import net.pocvpn.client.vpn.xray.XrayRuntimeResolver
 import net.pocvpn.client.vpn.xray.XrayRuntimeState
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * B8K1B - VpnTransport wrapper around NovaXrayVpnService. As of B8I7 this is
@@ -119,7 +118,7 @@ class VlessRealityTransport(
         // against the same race switchActiveTransport's own docs describe
         // (cancel() takes effect at the next suspension point, not
         // necessarily synchronously).
-        val sessionId = nextSessionId.incrementAndGet()
+        val sessionId = XrayRuntimeState.nextSessionId()
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -194,7 +193,6 @@ class VlessRealityTransport(
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 
     private companion object {
-        val nextSessionId = AtomicLong(0)
         const val DISCONNECT_CONFIRM_TIMEOUT_MS = 5_000L
     }
 }

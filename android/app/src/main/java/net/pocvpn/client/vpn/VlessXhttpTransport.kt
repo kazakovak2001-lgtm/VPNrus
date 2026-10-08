@@ -19,7 +19,6 @@ import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
 import net.pocvpn.client.vpn.xray.XhttpSessionConfigStore
 import net.pocvpn.client.vpn.xray.XrayRuntimeState
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * B35 - VLESS/XHTTP CDN-fronted transport using the same NovaXrayVpnService
@@ -61,7 +60,7 @@ class VlessXhttpTransport(
             return
         }
 
-        val sessionId = nextSessionId.incrementAndGet()
+        val sessionId = XrayRuntimeState.nextSessionId()
         pendingConfigSessionId?.let(XhttpSessionConfigStore::remove)
 
         observerJob?.cancel()
@@ -162,7 +161,6 @@ class VlessXhttpTransport(
         state.asStateFlow()
 
     private companion object {
-        val nextSessionId = AtomicLong(0)
         const val DISCONNECT_CONFIRM_TIMEOUT_MS = 5_000L
     }
 }
