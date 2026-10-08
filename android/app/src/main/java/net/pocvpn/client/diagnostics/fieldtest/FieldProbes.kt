@@ -61,8 +61,12 @@ data class HttpProbeResult(
 )
 
 /** One short, non-secret description of a failure: exception class + first line of the message. */
+// "failed to connect to host/1.2.3.4 (port 443) from /192.168.1.3 (port 43046)" -
+// the device's own local address/port never goes into a report.
+private val localEndpoint = Regex(""" from /\S+ \(port \d+\)""")
+
 internal fun describeError(e: Throwable): String {
-    val message = e.message?.lineSequence()?.firstOrNull()?.take(160)
+    val message = e.message?.lineSequence()?.firstOrNull()?.replace(localEndpoint, "")?.take(160)
     return if (message.isNullOrBlank()) e.javaClass.simpleName else "${e.javaClass.simpleName}: $message"
 }
 

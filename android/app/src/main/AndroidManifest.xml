@@ -112,5 +112,17 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+        <!-- Field test: the JSON report is shared as a file (too large for
+             Intent text). Not exported; read access only via the one-shot
+             grant on the share intent; exposes only cache/field-test-share/. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fieldtestshare"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/field_test_share_paths" />
+        </provider>
     </application>
 </manifest>
