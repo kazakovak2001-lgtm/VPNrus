@@ -14,6 +14,31 @@ val gatewayDevProperties = Properties().apply {
 }
 fun gatewayDevProp(key: String): String = gatewayDevProperties.getProperty(key, "")
 
+// Day 1 Beta cut (docs/NOVA_VPN_BETA_CUT.md section 6) - release signing.
+// Same pattern as gatewayDevProperties above: a gitignored, developer/CI-
+// local file (never committed - see .gitignore and
+// android/app/keystore.properties.example for the template), with an
+// environment-variable fallback for CI (where secrets are injected as env
+// vars, never checked out as a file). Neither source is ever logged. If
+// neither is present, `release` stays unsigned exactly as it was before
+// this change - a plain `./gradlew assembleDebug`/`assembleRelease` for
+// local testing is never broken by this.
+val keystorePropertiesFile = file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) keystorePropertiesFile.inputStream().use { load(it) }
+}
+fun releaseSigningProp(key: String, envVar: String): String? =
+    keystoreProperties.getProperty(key)?.takeIf { it.isNotBlank() }
+        ?: System.getenv(envVar)?.takeIf { it.isNotBlank() }
+
+val releaseStoreFilePath = releaseSigningProp("storeFile", "NOVA_RELEASE_STORE_FILE")
+val releaseStorePassword = releaseSigningProp("storePassword", "NOVA_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = releaseSigningProp("keyAlias", "NOVA_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = releaseSigningProp("keyPassword", "NOVA_RELEASE_KEY_PASSWORD")
+val hasReleaseSigningConfig = listOf(
+    releaseStoreFilePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword,
+).all { it != null }
+
 // B45A data-plane validation (round 6) - a SEPARATE, debug-only, gitignored
 // local properties file carrying the disposable Frankfurt test server's
 // endpoint/credential (see docs/B45A_SHADOWSOCKS_RUST_SPIKE.md Section 30).
@@ -84,8 +109,18 @@ android {
         applicationId = "net.pocvpn.client"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1-poc"
+        // Day 1 Beta cut (docs/NOVA_VPN_BETA_CUT.md) - first version bump
+        // since this field was created. versionCode must only ever
+        // increase for future updates; versionName follows this project's
+        // existing "-poc" suffix convention with a "-beta1" successor.
+        // versionCode is also read by CdnClientCapabilityPolicy's dormant
+        // (no live provider profile deployed - B27 is PLANNED-tier)
+        // `clientVersionCode < minimumClientVersionCode` gate - increasing
+        // it can only ever help that comparison, never hurt it, so this
+        // bump is safe there too (see docs/NOVA_VPN_BETA_CUT.md section 7
+        // for the full check).
+        versionCode = 2
+        versionName = "0.1.0-beta1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GIT_COMMIT", "\"$gitCommit\"")
@@ -126,6 +161,21 @@ android {
         buildConfigField("boolean", "FIELD_ENROLLMENT_ENABLED", gatewayDevProp("fieldEnrollmentEnabled").ifBlank { "false" })
     }
 
+    signingConfigs {
+        // Only created when real signing material is actually available
+        // (see hasReleaseSigningConfig above) - keeps this block itself
+        // free of any secret value, and never fails a build that has no
+        // signing material configured (e.g. a plain local checkout).
+        if (hasReleaseSigningConfig) {
+            create("release") {
+                storeFile = file(releaseStoreFilePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // B17/B20 - explicit for reviewability: debug builds (including
@@ -149,6 +199,13 @@ android {
         }
         release {
             isMinifyEnabled = false
+            // Day 1/2 Beta cut - sign with the real release key when one is
+            // configured (see hasReleaseSigningConfig above); otherwise
+            // this build type is unchanged from before (unsigned), so a
+            // checkout with no signing material still builds.
+            if (hasReleaseSigningConfig) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             // B17/B20 - explicit, not derived from any gitignored developer
             // file - a release build always points at the real production
             // origins.

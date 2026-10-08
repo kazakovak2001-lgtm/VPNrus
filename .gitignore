@@ -18,6 +18,12 @@ local.properties
 *.keystore
 !debug.keystore
 
+# Beta release signing (Day 1 execution) - the real keystore is *.jks/
+# *.keystore (already ignored above); this properties file holds the
+# store/key passwords and alias pointing at it. Never committed - see
+# android/app/keystore.properties.example for the template.
+android/app/keystore.properties
+
 # Python bytecode cache (never intentional - regenerated on any test run)
 __pycache__/
 *.pyc
