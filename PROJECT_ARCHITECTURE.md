@@ -3327,12 +3327,18 @@ or moved, and no commercial/billing/subscription concept of any kind.
   live, EXIT-role-capable transport (B35 CDN-relay origin work, plus this
   branch's own B59-B64 Direct-EXIT-XHTTP plumbing, confirmed wired into
   `MainViewModel.buildTransportRegistry`'s transport registry surfacing and
-  client-side provisioning). **Correction (2026-09-26 baseline
-  reconciliation)**: B66.18's conditional AWG->Direct-EXIT-XHTTP failover
-  policy (`AwgXrayFailoverPolicy`, commit `a2e4a77`) is NOT part of this
-  baseline - it exists only on a separate, not-yet-reconciled branch
-  (`b66-18-awg-xhttp-failover`) and is out of scope for this reconciliation
-  pass; do not assume it is wired here. B-WL2 does not build XHTTP; its
+  client-side provisioning). **B66.18 (rebased onto main 2026-10-09, from
+  `a2e4a77`)**: the AWG->Xray intra-gateway failover target is chosen by
+  `AwgXrayFailoverPolicy.selectXrayFailoverTarget` - `XRAY_XHTTP` only when
+  `MainViewModel.restrictionAssessment()` says `POSSIBLE_UDP_OR_AWG_FILTERING`
+  with HIGH/MEDIUM evidence quality AND the endpoint's registry has a Direct
+  EXIT XHTTP descriptor AVAILABLE; otherwise `XRAY_REALITY` as before. The
+  target's binding is pinned from the signed manifest
+  (`trustedTransportBindingFor(endpointId, targetKind)`). `RestrictionMonitor.probeNow()`
+  refreshes evidence inline before that decision. Still one-shot: a failed
+  XHTTP fallback ends in Error, never a second fallback to REALITY. Applies
+  to Manual gateway + Auto transport only; Auto gateway mode advances
+  candidates instead (B16/B34). B-WL2 does not build XHTTP; its
   ranking role is B-WL5's `PathScorer.restrictionPreference` (in source):
   under `POSSIBLE_UDP_FILTERING` the only profile declaring
   `suitableForRestrictiveNetworks` (`XRAY_XHTTP`) gets +1 and UDP-only -1,

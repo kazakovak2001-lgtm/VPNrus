@@ -1055,6 +1055,226 @@ class MainViewModelTest {
         assertTrue(viewModel.transportState.value is TransportState.Connected)
     }
 
+    // --- B66.18: conditional AWG -> Direct EXIT XHTTP failover ---
+
+    private val germanyEndpointIdForFailoverTests = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.GERMANY.endpointId
+
+    private fun validXhttpProfileForFailoverTests() = net.pocvpn.client.identity.XrayXhttpProfile(
+        server = "edge.aknova.pp.ua",
+        serverPort = 443,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        xhttpHost = "edge.aknova.pp.ua",
+        xhttpPath = "/nova-xhttp/",
+        mode = "packet-up",
+        uplinkHttpMethod = "POST",
+        fingerprint = "chrome",
+    )
+
+    @Test
+    fun `Auto plus AWG filtering evidence plus Direct XHTTP available - fails over to XHTTP, never REALITY`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val xhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        val realityTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true },
+            diverseReachabilityProbes = listOf(net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true }),
+            xrayTransport = realityTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+            xrayXhttpTransport = xhttpTransport,
+            xrayXhttpProfileRepositories = mapOf(germanyEndpointIdForFailoverTests to net.pocvpn.client.vpn.FakeXrayXhttpProfileRepository(validXhttpProfileForFailoverTests())),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+
+        // validated internet + gateway HTTPS reachable + AWG handshake failed
+        // -> POSSIBLE_UDP_OR_AWG_FILTERING, and a diverse probe was wired so
+        // evidence quality clears the >= MEDIUM bar (see RestrictionClassifier).
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, viewModel.restrictionClass())
+        assertEquals(1, awgTransport.connectCallCount)
+        assertEquals(1, awgTransport.disconnectCallCount)
+        assertEquals(1, xhttpTransport.connectCallCount)
+        assertEquals(0, realityTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Auto plus AWG filtering evidence but INSUFFICIENT quality - falls back to existing REALITY behavior`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val xhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        val realityTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true },
+            // No diverse probe wired here: diverseInternetReachable stays null,
+            // which RestrictionClassifier.assess treats as EVIDENCE_INCOMPLETE
+            // -> RestrictionEvidenceQuality.INSUFFICIENT, below the >= MEDIUM bar.
+            xrayTransport = realityTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+            xrayXhttpTransport = xhttpTransport,
+            xrayXhttpProfileRepositories = mapOf(germanyEndpointIdForFailoverTests to net.pocvpn.client.vpn.FakeXrayXhttpProfileRepository(validXhttpProfileForFailoverTests())),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, viewModel.restrictionClass())
+        assertEquals(0, xhttpTransport.connectCallCount)
+        assertEquals(1, realityTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Auto plus AWG filtering evidence plus sufficient quality but no Direct XHTTP profile - falls back to existing REALITY behavior`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val realityTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true },
+            diverseReachabilityProbes = listOf(net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true }),
+            xrayTransport = realityTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+            // xrayXhttpTransport/xrayXhttpProfileRepositories intentionally not wired:
+            // no Direct EXIT XHTTP profile exists for this endpoint at all.
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(net.pocvpn.client.smartconnect.RestrictionClass.POSSIBLE_UDP_OR_AWG_FILTERING, viewModel.restrictionClass())
+        assertEquals(1, realityTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Auto plus AWG filtering evidence plus only CDN XHTTP capability wired - never qualifies as Direct XHTTP fallback`() = runTest {
+        // cdnRuntimeCapabilities.isPinnedXhttpExecutable() governs ONLY the
+        // CDN/relay ingress role - it must never make the Direct/EXIT failover
+        // target XRAY_XHTTP for a real gateway endpoint. No
+        // xrayXhttpProfileRepositories entry exists for Germany here, so even
+        // with a pinned-capable runtime and a wired xrayXhttpTransport, the
+        // registry's Direct/EXIT descriptor for XRAY_XHTTP stays NOT_IMPLEMENTED
+        // for this endpoint and the existing REALITY fallback must run instead.
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val xhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        val realityTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true },
+            diverseReachabilityProbes = listOf(net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true }),
+            xrayTransport = realityTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+            xrayXhttpTransport = xhttpTransport,
+            cdnRuntimeCapabilities = net.pocvpn.client.reachability.CdnClientRuntimeCapabilities.pinnedXhttp(1L),
+            // xrayXhttpProfileRepositories intentionally not wired for Germany.
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, xhttpTransport.connectCallCount)
+        assertEquals(1, realityTransport.connectCallCount)
+    }
+
+    @Test
+    fun `AWG to XHTTP fallback failure surfaces truthfully with no second fallback to REALITY or bounce back to AWG`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        // Malformed XHTTP profile -> XrayRuntimeResolver.resolveXhttp rejects
+        // it -> the fallback's own attempt fails - never a second automatic hop.
+        val xhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        val realityTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            connectionOutcomeStore = net.pocvpn.client.vpn.FakeConnectionOutcomeStore(),
+            restrictionProbe = net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true },
+            diverseReachabilityProbes = listOf(net.pocvpn.client.smartconnect.GatewayReachabilityProbe { true }),
+            xrayTransport = realityTransport,
+            xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+            xrayXhttpTransport = xhttpTransport,
+            xrayXhttpProfileRepositories = mapOf(
+                germanyEndpointIdForFailoverTests to net.pocvpn.client.vpn.FakeXrayXhttpProfileRepository(
+                    validXhttpProfileForFailoverTests().copy(mode = "not-a-real-mode"),
+                ),
+            ),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+
+        // The Direct XHTTP descriptor never became AVAILABLE for an invalid
+        // stored profile (same fail-closed discipline as REALITY/TLS), so the
+        // existing REALITY fallback ran instead - this is not a loop, it's the
+        // SAME single failover-target decision made once, deterministically.
+        assertEquals(1, awgTransport.connectCallCount)
+        assertEquals(0, xhttpTransport.connectCallCount)
+        assertEquals(1, realityTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Manual XRAY_XHTTP preference is unaffected by B66_18 failover target selection`() = runTest {
+        val awgTransport = FakeVpnTransport()
+        val xhttpTransport = FakeVpnTransport(kind = TransportKind.XRAY_XHTTP)
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            initialNetworkProfile = USABLE_WIFI,
+            xrayXhttpTransport = xhttpTransport,
+            xrayXhttpProfileRepositories = mapOf(germanyEndpointIdForFailoverTests to net.pocvpn.client.vpn.FakeXrayXhttpProfileRepository(validXhttpProfileForFailoverTests())),
+            userTransportPreference = UserTransportPreference.Manual(TransportKind.XRAY_XHTTP),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, awgTransport.connectCallCount)
+        assertEquals(1, xhttpTransport.connectCallCount)
+    }
+
     @Test
     fun `Auto plus AWG failure plus Xray unavailable - no fallback`() = runTest {
         val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
