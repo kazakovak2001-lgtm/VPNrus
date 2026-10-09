@@ -3831,11 +3831,16 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   as an app-private broadcast (setPackage + RECEIVER_NOT_EXPORTED) re-published
   into the main process' `XrayRuntimeState` (transports unchanged);
   `:xray` death during a Started session -> `XrayRuntimeEvent.Failed`
-  (zero-flag bind + linkToDeath) - at once when the main process did not
-  ask that session to stop (Android has already removed the VPN
-  interface), after the 2 s grace only for a stop it requested
-  (`noteStopRequested`); the main mirror takes at most one terminal event
-  per session (`publishInMain`); an orphaned `:xray` tunnel is stopped when
+  (zero-flag bind + linkToDeath; onBindingDied too) - at once when the main
+  process did not ask that session to stop (Android has already removed
+  the VPN interface), after the 2 s grace only for a stop it requested
+  (`stopSession` marks it before ACTION_STOP). The service writes every
+  terminal event to an app-private record (`XrayTerminalRecord`) before
+  its broadcast, so a death that beats the broadcast still yields the real
+  event of THAT session (Stopped after a system revoke, a typed relay
+  Failed). The main mirror takes at most one terminal event per session
+  and nothing from an older session (`acceptInMain`); the watcher ends
+  only on its own session's events; an orphaned `:xray` tunnel is stopped when
   a new main process starts; field-test core measurements
   (`ACTION_MEASURE` -> Xray `measureDelay`); B-WL7 tunnel byte totals
   (`ACTION_QUERY_TRAFFIC` -> session id + two counts, asked only while the

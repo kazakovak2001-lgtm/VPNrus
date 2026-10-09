@@ -121,10 +121,10 @@ class VlessTlsTransport(
         }
         state.value = TransportState.Disconnecting
         try {
-            // An expected stop: the main-process death watch keeps its grace for it.
-            activeSessionId?.let(XrayProcessBridge::noteStopRequested)
-            val intent = Intent(context, NovaXrayVpnService::class.java).setAction(NovaXrayVpnService.ACTION_STOP)
-            context.startService(intent)
+            // An expected stop: marked for the main-process death watch before ACTION_STOP goes out.
+            XrayProcessBridge.stopSession(activeSessionId) {
+                context.startService(Intent(context, NovaXrayVpnService::class.java).setAction(NovaXrayVpnService.ACTION_STOP))
+            }
         } catch (t: Throwable) {
             state.value = TransportState.Error(t.message ?: "disconnect failed", t)
             return

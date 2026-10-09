@@ -23,6 +23,8 @@ import net.pocvpn.client.transport.TransportOrchestrator
 import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
+import net.pocvpn.client.vpn.xray.XrayProcessBridge
+import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -184,5 +186,27 @@ class VpnControllerXrayDataPlaneGateTest {
 
         assertTrue(h.controller.state.value is TransportState.Disconnected)
         assertTrue(h.store.recent(fingerprint()).isEmpty())
+    }
+
+    @Test
+    fun `an Xray Failed mid-window ends as that Error - the gate never adds its own teardown`() = runTest {
+        // Uplink with no downlink: left alone, the gate would end this as DataPlaneNoTraffic.
+        val h = connectXray { n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 300L, lastHandshakeEpochMillis = null) }
+        start(h)
+        advanceTimeBy(5_000)
+        runCurrent()
+
+        // What VlessRealityTransport maps a death-time Failed of its session to.
+        val error = requireNotNull(xrayTransportStateFor(XrayRuntimeEvent.Failed(77L, XrayProcessBridge.DIED_REASON), sessionId = 77L))
+        h.xray.forceState(error)
+        runCurrent()
+        advanceTimeBy(31_000)
+        runCurrent()
+
+        val state = h.controller.state.value
+        assertTrue(state is TransportState.Error)
+        assertEquals(XrayProcessBridge.DIED_REASON, (state as TransportState.Error).message)
+        assertEquals(VpnError.HandshakeTimeout, h.diagnostics.snapshot.value.lastError)
+        assertEquals(0, h.xray.disconnectCallCount)
     }
 }
