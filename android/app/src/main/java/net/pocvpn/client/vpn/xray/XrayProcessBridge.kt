@@ -231,6 +231,56 @@ object XrayProcessBridge {
 
     // --- main process side --------------------------------------------------------
 
+    /**
+     * The last session whose stop the MAIN process itself asked for (an
+     * Xray transport's disconnect(), right before ACTION_STOP). Session ids
+     * only grow, so an old value can never match a later session.
+     */
+    @Volatile var stopRequestedSession: Long? = null
+        private set
+
+    /** Called by the Xray transports right before they send ACTION_STOP for [sessionId]. */
+    fun noteStopRequested(sessionId: Long) {
+        stopRequestedSession = sessionId
+    }
+
+    /** What the main process does when the watched `:xray` process dies. */
+    internal enum class DeathAction {
+        /** Crash/kill nobody asked for: report Failed at once - no false Protected window. */
+        FAIL_NOW,
+        /** A stop we asked for: the process may be reaped before its Stopped broadcast lands - wait [XrayProcessWatcher]'s grace. */
+        AWAIT_GRACE,
+        /** The session is already over (Stopped/Failed) or superseded by a newer one. */
+        IGNORE,
+    }
+
+    internal fun deathAction(watchedSession: Long, current: XrayRuntimeEvent?, stopRequestedSession: Long?): DeathAction =
+        when {
+            current !is XrayRuntimeEvent.Started || current.sessionId != watchedSession -> DeathAction.IGNORE
+            stopRequestedSession == watchedSession -> DeathAction.AWAIT_GRACE
+            else -> DeathAction.FAIL_NOW
+        }
+
+    /**
+     * At most one terminal event per session reaches the main-process mirror:
+     * with Failed now published at death time, the service's own Stopped/
+     * Failed for the same session can still arrive afterwards and must not
+     * flip the state again (or re-trigger failover).
+     */
+    internal fun acceptInMain(current: XrayRuntimeEvent?, incoming: XrayRuntimeEvent): Boolean {
+        val incomingTerminal = incoming is XrayRuntimeEvent.Stopped || incoming is XrayRuntimeEvent.Failed
+        val currentTerminal = current is XrayRuntimeEvent.Stopped || current is XrayRuntimeEvent.Failed
+        return !(incomingTerminal && currentTerminal && current?.sessionId == incoming.sessionId)
+    }
+
+    /** Main-process publish: drops a second terminal event for the same session (see [acceptInMain]). */
+    @Synchronized
+    internal fun publishInMain(event: XrayRuntimeEvent): Boolean {
+        if (!acceptInMain(XrayRuntimeState.events.value, event)) return false
+        XrayRuntimeState.publish(event)
+        return true
+    }
+
     @Volatile private var installed = false
     private var watcher: XrayProcessWatcher? = null
 
@@ -251,7 +301,7 @@ object XrayProcessBridge {
                         intent.getStringExtra(EXTRA_FAILURE_KIND),
                     ),
                 ) ?: return
-                XrayRuntimeState.publish(event)
+                if (!publishInMain(event)) return
                 w.onEvent(event)
             }
         }
@@ -344,22 +394,32 @@ internal class XrayProcessWatcher(private val context: Context) : ServiceConnect
     override fun onServiceDisconnected(name: ComponentName?) = processDied()
 
     /**
-     * A normal stop also ends `:xray` (stopSelf, and some OEMs reap the empty
-     * process at once) - possibly before its Stopped broadcast reaches us.
-     * So a death only becomes Failed if, after a short grace, the session
-     * is STILL Started: a real crash never sends Stopped.
+     * A death nobody asked for (crash, OOM kill) becomes Failed at once:
+     * Android has already torn the VPN interface down, so waiting would show
+     * Protected over a missing tunnel (measured ~2.3 s on the OPPO with the
+     * old unconditional grace). A stop the main process requested also ends
+     * `:xray` (stopSelf, and some OEMs reap the empty process at once) -
+     * possibly before its Stopped broadcast reaches us - so only that case
+     * keeps the grace, and becomes Failed only if the session is STILL
+     * Started afterwards. See [XrayProcessBridge.deathAction].
      */
     @Synchronized
     private fun processDied() {
         val session = watchedSession ?: return
         unwatch()
-        handler.postDelayed({
-            val current = XrayRuntimeState.events.value
-            if (current is XrayRuntimeEvent.Started && current.sessionId == session) {
-                Log.e("XrayProcessBridge", "Xray process died during session $session")
-                XrayRuntimeState.publish(XrayRuntimeEvent.Failed(session, "xray process died"))
-            }
-        }, DEATH_GRACE_MS)
+        when (XrayProcessBridge.deathAction(session, XrayRuntimeState.events.value, XrayProcessBridge.stopRequestedSession)) {
+            XrayProcessBridge.DeathAction.FAIL_NOW -> publishDied(session)
+            XrayProcessBridge.DeathAction.AWAIT_GRACE -> handler.postDelayed({
+                val current = XrayRuntimeState.events.value
+                if (current is XrayRuntimeEvent.Started && current.sessionId == session) publishDied(session)
+            }, DEATH_GRACE_MS)
+            XrayProcessBridge.DeathAction.IGNORE -> Unit
+        }
+    }
+
+    private fun publishDied(session: Long) {
+        Log.e("XrayProcessBridge", "Xray process died during session $session")
+        XrayProcessBridge.publishInMain(XrayRuntimeEvent.Failed(session, "xray process died"))
     }
 
     private companion object {

@@ -3520,10 +3520,12 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Manual pinned Xray ends in Error with no substitute; Auto advances.
   Device (OPPO, 2026-10-09): healthy REALITY (11 runs) and TLS (1 run)
   sessions reached `VERIFIED` with rx/tx growing both ways and were never
-  torn down; the teardown path is unit-tested only. Separate, pre-existing:
-  after `:xray` dies the main process learns it only after
-  `DEATH_GRACE_MS` (~2.3 s measured), during which the UI still shows
-  Protected and, without Always-on + lockdown, traffic leaves directly.
+  torn down; the teardown path is unit-tested only. Separate: before the
+  death-time Failed above, an unexpected `:xray` death was reported only
+  after `DEATH_GRACE_MS` (~2.3 s measured) with the UI still Protected
+  while the VPN network was gone. Packets leaving the device in that window
+  were NOT measured; without Always-on + lockdown Android does not block
+  them, and no app change can.
 - **What this means for real production evidence, stated precisely**:
   `POSSIBLE_FULL_SHUTDOWN` (all-transports-connect-failed) and a
   connect-level `POSSIBLE_UDP_FILTERING` (AWG handshake fails while another
@@ -3829,7 +3831,11 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   as an app-private broadcast (setPackage + RECEIVER_NOT_EXPORTED) re-published
   into the main process' `XrayRuntimeState` (transports unchanged);
   `:xray` death during a Started session -> `XrayRuntimeEvent.Failed`
-  (zero-flag bind + linkToDeath); an orphaned `:xray` tunnel is stopped when
+  (zero-flag bind + linkToDeath) - at once when the main process did not
+  ask that session to stop (Android has already removed the VPN
+  interface), after the 2 s grace only for a stop it requested
+  (`noteStopRequested`); the main mirror takes at most one terminal event
+  per session (`publishInMain`); an orphaned `:xray` tunnel is stopped when
   a new main process starts; field-test core measurements
   (`ACTION_MEASURE` -> Xray `measureDelay`); B-WL7 tunnel byte totals
   (`ACTION_QUERY_TRAFFIC` -> session id + two counts, asked only while the
