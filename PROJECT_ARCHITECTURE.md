@@ -2759,6 +2759,22 @@ gateway (real handshake, real bidirectional data plane, distinct exit IP,
 DNS/IPv6 invariants held, managed identity/state completely unaffected - see
 `docs/ROADMAP.md`'s B22 row for the full evidence).
 
+## Signed manifest transport-kind compatibility (hard invariant, 2026-10-09)
+
+- The signed manifest encodes `TransportKind` by **ordinal**
+  (`ManifestCanonicalizer`, and `kindOrdinal` in `gateway/tools/manifest_signing.py`
+  JSON). `TransportKind` is therefore **append-only**: never reorder, remove
+  or insert in the middle (pinned by `ManifestForwardCompatibilityTest`).
+- A binding whose ordinal this build does not know (a kind a newer server
+  added) is decoded into `EndpointDescriptor.opaqueTransports`
+  (`OpaqueTransportBinding`), never `transports`: it is re-emitted in
+  ordinal order so `ManifestVerifier`'s re-canonicalization still matches the
+  signed bytes, and it is never a candidate, never dialed. Before this, one
+  unknown ordinal rejected the whole manifest (older APKs stayed on their
+  last-known-good copy until it expired - e.g. pre-HYSTERIA2 builds vs v6/v7).
+- Unknown `EndpointRole` ordinals still reject the manifest (unchanged).
+- Supersedes draft #113's schema-2 approach: no wire-format or server change.
+
 ## Production vs debug boundary
 
 - `XrayDiagnosticsActivity` (and any future manual/debug provisioning helper) lives in
