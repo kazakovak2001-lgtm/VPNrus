@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
 import net.pocvpn.client.transport.TransportStats
+import net.pocvpn.client.vpn.DataPlaneConfirmation
 import net.pocvpn.client.vpn.TransportFailureKind
 import java.io.File
 
@@ -48,6 +49,10 @@ object XrayProcessBridge {
     const val ACTION_MEASURE_RESULT = "net.pocvpn.client.vpn.xray.action.MEASURE_RESULT"
     const val ACTION_QUERY_TRAFFIC = "net.pocvpn.client.vpn.xray.action.QUERY_TRAFFIC"
     const val ACTION_TRAFFIC_RESULT = "net.pocvpn.client.vpn.xray.action.TRAFFIC_RESULT"
+    const val ACTION_CONFIRM_TUNNEL = "net.pocvpn.client.vpn.xray.action.CONFIRM_TUNNEL"
+    const val ACTION_CONFIRM_TUNNEL_RESULT = "net.pocvpn.client.vpn.xray.action.CONFIRM_TUNNEL_RESULT"
+    const val EXTRA_CONFIRM_SESSION_ID = "confirmSessionId"
+    private const val EXTRA_CONFIRMED = "confirmed"
     const val EXTRA_REQUEST_ID = "requestId"
     const val EXTRA_URLS = "urls"
     private const val EXTRA_DELAYS = "delays"
@@ -228,6 +233,63 @@ object XrayProcessBridge {
         } else {
             TransportStats.Counters(bytesReceived = totals.downlinkBytes, bytesSent = totals.uplinkBytes, lastHandshakeEpochMillis = null)
         }
+
+    /** Service side of [confirmTunnel]. */
+    fun publishTunnelConfirmation(context: Context, requestId: Long, confirmed: Boolean) {
+        val intent = Intent(ACTION_CONFIRM_TUNNEL_RESULT)
+            .setPackage(context.packageName)
+            .putExtra(EXTRA_REQUEST_ID, requestId)
+            .putExtra(EXTRA_CONFIRMED, confirmed)
+        context.sendBroadcast(intent, dynamicReceiverPermission(context))
+    }
+
+    /**
+     * B-WL7 - main process: asks `:xray` to repeat [sessionId]'s own B33
+     * in-tunnel probe (XrayCoreController.reconfirmRemoteConnectivity - the
+     * same `https://<server>/v1/tunnel-probe` round trip through the same
+     * core outbound, bounded at 6 s there). CONFIRMED only for a positive
+     * answer while this process' mirror shows that SAME session Started
+     * both before and after; anything else (no answer within [timeoutMs],
+     * service unreachable, another session) is NOT_CONFIRMED.
+     */
+    internal suspend fun confirmTunnel(context: Context, sessionId: Long?, timeoutMs: Long = 8_000): DataPlaneConfirmation {
+        val owned = sessionId ?: return DataPlaneConfirmation.NOT_CONFIRMED
+        if (!isStartedSession(owned)) return DataPlaneConfirmation.NOT_CONFIRMED
+        val app = context.applicationContext
+        val requestId = measureRequests.incrementAndGet()
+        val result = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                if (intent.getLongExtra(EXTRA_REQUEST_ID, -1) != requestId) return
+                result.complete(intent.getBooleanExtra(EXTRA_CONFIRMED, false))
+            }
+        }
+        ContextCompat.registerReceiver(app, receiver, IntentFilter(ACTION_CONFIRM_TUNNEL_RESULT), ContextCompat.RECEIVER_NOT_EXPORTED)
+        val answer = try {
+            app.startService(
+                Intent(app, NovaXrayVpnService::class.java)
+                    .setAction(ACTION_CONFIRM_TUNNEL)
+                    .putExtra(EXTRA_REQUEST_ID, requestId)
+                    .putExtra(EXTRA_CONFIRM_SESSION_ID, owned),
+            )
+            kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { result.await() }
+        } catch (e: IllegalStateException) {
+            null
+        } catch (e: SecurityException) {
+            null
+        } finally {
+            app.unregisterReceiver(receiver)
+        }
+        return tunnelConfirmationFor(answer, stillStartedSameSession = isStartedSession(owned))
+    }
+
+    internal fun tunnelConfirmationFor(answer: Boolean?, stillStartedSameSession: Boolean): DataPlaneConfirmation =
+        if (answer == true && stillStartedSameSession) DataPlaneConfirmation.CONFIRMED else DataPlaneConfirmation.NOT_CONFIRMED
+
+    private fun isStartedSession(sessionId: Long?): Boolean {
+        val current = XrayRuntimeState.events.value
+        return sessionId != null && current is XrayRuntimeEvent.Started && current.sessionId == sessionId
+    }
 
     // --- main process side --------------------------------------------------------
 

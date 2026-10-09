@@ -34,7 +34,9 @@ class NovaXrayServiceLifecycleCoordinator(
 ) {
     private val mutex = Mutex()
     private var controllerEndpointId: EndpointId? = null
-    private var cachedController: XrayCoreController? = null
+    // Written only under [mutex]; @Volatile for the lock-free read in
+    // [reconfirmActiveSession].
+    @Volatile private var cachedController: XrayCoreController? = null
 
     /**
      * Selects (reusing the cached instance for the SAME endpoint) or builds
@@ -99,6 +101,13 @@ class NovaXrayServiceLifecycleCoordinator(
     suspend fun stop(): XrayCoreStopOutcome = mutex.withLock {
         cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false)
     }
+
+    /**
+     * B-WL7 - repeats the active session's B33 probe (see
+     * [XrayCoreController.reconfirmRemoteConnectivity]). Never takes [mutex]:
+     * a network round trip must not hold up a concurrent start/stop.
+     */
+    suspend fun reconfirmActiveSession(): Boolean = cachedController?.reconfirmRemoteConnectivity() ?: false
 
     /** Caller must already hold [mutex]. */
     private fun selectControllerLocked(endpointId: EndpointId): XrayCoreController {

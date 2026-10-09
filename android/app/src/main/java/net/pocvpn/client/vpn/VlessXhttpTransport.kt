@@ -165,6 +165,9 @@ class VlessXhttpTransport(
 
     override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
 
+    // B-WL7 - repeats this session's own B33 in-tunnel probe (see XrayProcessBridge.confirmTunnel).
+    override suspend fun confirmDataPlane(): DataPlaneConfirmation = XrayProcessBridge.confirmTunnel(context, activeSessionId)
+
     override fun observeState(): Flow<TransportState> =
         state.asStateFlow()
 

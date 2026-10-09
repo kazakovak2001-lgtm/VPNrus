@@ -98,6 +98,17 @@ class FakeVpnTransport(
 
     override suspend fun dataPlaneCounters(): TransportStats = dataPlaneProvider?.invoke() ?: stats()
 
+    // B-WL7 - what confirmDataPlane() answers; null = UNSUPPORTED, the
+    // default every existing transport (and test) has.
+    var dataPlaneConfirmer: (suspend () -> DataPlaneConfirmation)? = null
+    var confirmDataPlaneCallCount = 0
+        private set
+
+    override suspend fun confirmDataPlane(): DataPlaneConfirmation {
+        confirmDataPlaneCallCount++
+        return dataPlaneConfirmer?.invoke() ?: DataPlaneConfirmation.UNSUPPORTED
+    }
+
     override suspend fun stats(): TransportStats = statsProvider?.invoke() ?: TransportStats.Counters(
         bytesReceived = statsBytesReceived,
         bytesSent = statsBytesSent,

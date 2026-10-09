@@ -261,4 +261,41 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         assertEquals(1, endpointBRuntime.startLoopCallCount)
         assertEquals(1, endpointBRuntime.stopLoopCallCount) // torn down when A restarted
     }
+
+    // --- B-WL7 M1: the in-tunnel re-probe never takes the start/stop mutex ---
+
+    @Test
+    fun `reconfirm never waits on an in-flight start and answers false without a Started session`() = runTest {
+        val gate = CompletableDeferred<Unit>()
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(gate, runtime, probeScope = this) }
+
+        val start = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY) }
+        runCurrent()
+        val reconfirm = async { coordinator.reconfirmActiveSession() }
+        runCurrent()
+
+        // Answered while start() still holds the mutex - no lock was taken.
+        assertTrue(reconfirm.isCompleted)
+        assertEquals(false, reconfirm.await())
+        assertEquals(0, runtime.measureDelayCallCount)
+
+        gate.complete(Unit)
+        runCurrent()
+        assertEquals(XrayCoreStartOutcome.Started, start.await())
+    }
+
+    @Test
+    fun `reconfirm on a Started session repeats its probe, and is false again after stop`() = runTest {
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(runtime = runtime, probeScope = this) }
+        assertEquals(XrayCoreStartOutcome.Started, coordinator.start(endpointA, TransportKind.XRAY_REALITY))
+
+        assertEquals(true, coordinator.reconfirmActiveSession())
+        assertEquals(2, runtime.measureDelayCallCount)
+
+        coordinator.stop()
+        assertEquals(false, coordinator.reconfirmActiveSession())
+        assertEquals(2, runtime.measureDelayCallCount)
+    }
 }

@@ -43,6 +43,27 @@ interface VpnTransport {
      * but no handshake timestamp (Xray) must not be fed into.
      */
     suspend fun dataPlaneCounters(): TransportStats = TransportStats.Unsupported
+
+    /**
+     * B-WL7 - an active, in-tunnel round trip VpnController asks for at most
+     * once per attempt, only when [dataPlaneCounters] alone would end the
+     * session. Xray needs it because its counters carry no TCP ACKs: a
+     * healthy upload-only flow looks exactly like a dead exit (uplink up,
+     * downlink flat). [DataPlaneConfirmation.UNSUPPORTED] (default) keeps
+     * the counters' verdict final.
+     */
+    suspend fun confirmDataPlane(): DataPlaneConfirmation = DataPlaneConfirmation.UNSUPPORTED
+}
+
+enum class DataPlaneConfirmation {
+    /** A valid response came back through this session's own tunnel. */
+    CONFIRMED,
+
+    /** Asked, but no valid in-tunnel response (failure, timeout, session changed, unreachable). */
+    NOT_CONFIRMED,
+
+    /** This transport has no active in-tunnel check. */
+    UNSUPPORTED,
 }
 
 enum class UnderlyingNetworkRecovery {

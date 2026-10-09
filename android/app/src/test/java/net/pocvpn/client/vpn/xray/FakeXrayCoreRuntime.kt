@@ -15,7 +15,8 @@ class FakeXrayCoreRuntime(
     // byte-for-byte unaffected: XrayCoreController.requestStart's new
     // bounded confirmation step succeeds by default, exactly as if the
     // remote gateway were genuinely reachable.
-    private val measureDelayThrows: Throwable? = null,
+    // var (B-WL7): a test can make a LATER probe fail after a successful start.
+    var measureDelayThrows: Throwable? = null,
     private val measureDelayResult: Long = 42L,
 ) : XrayCoreRuntime {
 

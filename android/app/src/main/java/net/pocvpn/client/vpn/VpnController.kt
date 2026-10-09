@@ -17,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
@@ -302,6 +303,10 @@ class VpnController(
         // B8B3D - "small bounded startup window" per the task's own wording.
         const val HANDSHAKE_TIMEOUT_MS = 8_000L
         const val HANDSHAKE_POLL_INTERVAL_MS = 500L
+
+        // B-WL7 - caller-side bound on VpnTransport.confirmDataPlane() (Xray:
+        // the 6 s B33 probe plus IPC); no answer in time = NOT_CONFIRMED.
+        const val DATA_PLANE_CONFIRM_TIMEOUT_MS = 10_000L
     }
 
     // B8I5/B8I6/B8O2 - the kinds this controller instance can actually build
@@ -1800,7 +1805,11 @@ class VpnController(
      * Protected (RU field test: AWG handshake up, no data; for Xray: core
      * up and B33-confirmed, then no VLESS bytes back). Every other
      * verdict (VERIFIED, IDLE, UNAVAILABLE, still VERIFYING at the window
-     * end) leaves the session untouched.
+     * end) leaves the session untouched. Before acting on such a verdict
+     * the loop asks [VpnTransport.confirmDataPlane] once per attempt
+     * (bounded by [DATA_PLANE_CONFIRM_TIMEOUT_MS]): CONFIRMED discards the
+     * stalled samples and keeps sampling for the rest of the window;
+     * NOT_CONFIRMED/UNSUPPORTED/timeout keep the verdict as it was.
      */
     private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport, recordWithoutSamples: Boolean = true) {
         val store = transportObservationStore
@@ -1829,16 +1838,35 @@ class VpnController(
                 val maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
                 val samples = mutableListOf<TrafficProgressSample>()
                 var verdict = TrafficProgressVerdict.VERIFYING
+                var confirmation: DataPlaneConfirmation? = null
                 for (pollIndex in 0..maxPolls) {
                     val stats = transport.dataPlaneCounters()
                     if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) break
                     TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
                     verdict = TrafficProgressMonitor.evaluate(samples, policy)
+                    // Counters alone would end the session: ask the transport
+                    // for one in-tunnel round trip first (at most once per
+                    // attempt, bounded, no lock held). A confirmed tunnel
+                    // discards the stalled samples and keeps observing from
+                    // here, so only new evidence can end this session.
+                    if (TrafficProgressMonitor.isUnhealthy(verdict) && confirmation == null) {
+                        confirmation = try {
+                            withTimeoutOrNull(DATA_PLANE_CONFIRM_TIMEOUT_MS) { transport.confirmDataPlane() }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            null
+                        } ?: DataPlaneConfirmation.NOT_CONFIRMED
+                        if (confirmation == DataPlaneConfirmation.CONFIRMED) {
+                            samples.clear()
+                            verdict = TrafficProgressVerdict.VERIFYING
+                        }
+                    }
                     if (verdict != TrafficProgressVerdict.VERIFYING) break
                     if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
                 }
-                // One non-secret line per attempt (kind, verdict, sample count) for field diagnostics.
-                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size}")
+                // One non-secret line per attempt (kind, verdict, sample count, probe) for field diagnostics.
+                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size} confirmation=$confirmation")
                 if (recordWithoutSamples || samples.isNotEmpty()) {
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }

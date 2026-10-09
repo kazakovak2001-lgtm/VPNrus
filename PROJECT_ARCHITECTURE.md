@@ -3518,6 +3518,15 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   mirror = `Unavailable` (no sample); a transport without counts
   (Hysteria2) breaks at once and, for this caller, records no observation.
   Manual pinned Xray ends in Error with no substitute; Auto advances.
+  Xray counters carry no TCP ACKs, so an upload-only flow looks like a dead
+  exit: before acting on NO_PAYLOAD/STALLED the sampler asks
+  `VpnTransport.confirmDataPlane()` once per attempt (10 s bound, no lock
+  held). Xray repeats the session's own B33 probe in `:xray`
+  (`ACTION_CONFIRM_TUNNEL` -> `XrayCoreController.reconfirmRemoteConnectivity`,
+  same URL/6 s bound, session checked before and after); CONFIRMED drops the
+  stalled samples and keeps sampling, anything else keeps the teardown.
+  The probe proves client->server->gateway nginx, not the exit's onward
+  internet egress.
   Device: a healthy forced Direct REALITY session on the OPPO reached
   `VERIFIED` (21 samples) and stayed up, so the native counters do report
   traffic; the teardown path is unit-tested only.
@@ -3835,7 +3844,8 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   a new main process starts; field-test core measurements
   (`ACTION_MEASURE` -> Xray `measureDelay`); B-WL7 tunnel byte totals
   (`ACTION_QUERY_TRAFFIC` -> session id + two counts, asked only while the
-  main mirror shows that session Started).
+  main mirror shows that session Started); B-WL7 in-tunnel re-probe
+  (`ACTION_CONFIRM_TUNNEL` -> session id in, confirmed flag out).
 - Secrets never cross Intent/Binder: the XHTTP session config (VLESS uuid)
   is handed over as an Android-Keystore AES-GCM encrypted app-private file
   (`XhttpSessionConfigStore`), consumed once and deleted; stale files swept.

@@ -244,6 +244,13 @@ class XrayCoreController(
     // failure branch clearing itself.
     @Volatile private var relayHealthWatchdogJob: Job? = null
 
+    // B-WL7 - what the CURRENT Started session's B33 confirmation dialed, so
+    // [reconfirmRemoteConnectivity] repeats exactly that probe. Set only once
+    // B33 succeeded, cleared by [requestStop] and by every new [requestStart].
+    private class ConfirmationTarget(val serverHost: String, val context: RemoteConfirmationContext)
+
+    @Volatile private var activeConfirmationTarget: ConfirmationTarget? = null
+
     suspend fun requestStart(
         kind: TransportKind = TransportKind.XRAY_REALITY,
         routingMode: RoutingMode = RoutingMode.FULL_VPN,
@@ -276,6 +283,7 @@ class XrayCoreController(
         // forever against nothing.
         relayHealthWatchdogJob?.cancel()
         relayHealthWatchdogJob = null
+        activeConfirmationTarget = null
 
         var success = false
         try {
@@ -331,6 +339,7 @@ class XrayCoreController(
                 // evidence the tunnel is actually usable.
                 if (confirmRemoteConnectivity(ready.serverHost, confirmationContext)) {
                     success = true
+                    activeConfirmationTarget = ConfirmationTarget(ready.serverHost, confirmationContext)
                     // B33 relay follow-up (round 3) - a genuine Connected
                     // relayed session gets ongoing health monitoring; a
                     // Direct one does not (no ownerless-relay-tun class of
@@ -455,6 +464,19 @@ class XrayCoreController(
      * just as much an ordinary blocking-native call running on [probeScope]
      * here, abandoned exactly the same way on timeout.
      */
+    /**
+     * B-WL7 - repeats THIS Started session's own B33 confirmation (same URL,
+     * same [REMOTE_CONFIRM_TIMEOUT_MS] bound, same abandonable
+     * [boundedMeasureDelay]) on demand. False when no session is Started.
+     * Deliberately takes no lifecycle lock: a concurrent [requestStop] is
+     * never delayed by it, and a probe that races a stop simply fails
+     * (callers re-check session ownership after it returns).
+     */
+    suspend fun reconfirmRemoteConnectivity(): Boolean {
+        val target = activeConfirmationTarget ?: return false
+        return confirmRemoteConnectivity(target.serverHost, target.context)
+    }
+
     private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
         val url = when (context) {
             is RemoteConfirmationContext.Direct -> "https://$serverHost$TUNNEL_PROBE_PATH"
@@ -663,6 +685,7 @@ class XrayCoreController(
         // is safe regardless, this just avoids the pointless overlap.
         relayHealthWatchdogJob?.cancel()
         relayHealthWatchdogJob = null
+        activeConfirmationTarget = null
         if (!lifecycleGate.tryBeginTeardown()) return XrayCoreStopOutcome(didTeardown = false)
         val failureReason = try {
             coreRuntime.stopLoop()

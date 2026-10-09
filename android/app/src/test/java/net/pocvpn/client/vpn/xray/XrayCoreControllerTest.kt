@@ -598,4 +598,65 @@ class XrayCoreControllerTest {
         assertEquals(XrayCoreStartOutcome.AlreadyRunning, second)
         assertEquals(1, harness.coreRuntime.startLoopCallCount)
     }
+
+    // --- B-WL7 M1: reconfirmRemoteConnectivity repeats the Started session's own B33 probe ---
+
+    @Test
+    fun `reconfirm before any start is false and never measures`() = runBlocking {
+        val harness = Harness(newRepository())
+
+        assertFalse(harness.controller.reconfirmRemoteConnectivity())
+        assertEquals(0, harness.coreRuntime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `reconfirm repeats exactly the B33 probe of the Started session`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        assertEquals(XrayCoreStartOutcome.Started, harness.controller.requestStart())
+        val b33Url = harness.coreRuntime.lastMeasureDelayUrl
+
+        assertTrue(harness.controller.reconfirmRemoteConnectivity())
+
+        assertEquals(2, harness.coreRuntime.measureDelayCallCount)
+        assertEquals("https://152.70.43.1/v1/tunnel-probe", b33Url)
+        assertEquals(b33Url, harness.coreRuntime.lastMeasureDelayUrl)
+    }
+
+    @Test
+    fun `reconfirm reports a failing in-tunnel probe as false`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        harness.controller.requestStart()
+        harness.coreRuntime.measureDelayThrows = java.io.IOException("connection reset")
+
+        assertFalse(harness.controller.reconfirmRemoteConnectivity())
+    }
+
+    @Test
+    fun `reconfirm after stop is false and never measures`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        harness.controller.requestStart()
+        harness.controller.requestStop()
+
+        assertFalse(harness.controller.reconfirmRemoteConnectivity())
+        assertEquals(1, harness.coreRuntime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `a RemoteUnconfirmed start leaves nothing to reconfirm`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime(measureDelayThrows = java.io.IOException("timeout"))
+        val harness = Harness(repository, coreRuntime = runtime)
+        assertTrue(harness.controller.requestStart() is XrayCoreStartOutcome.RemoteUnconfirmed)
+        runtime.measureDelayThrows = null
+
+        assertFalse(harness.controller.reconfirmRemoteConnectivity())
+        assertEquals(1, runtime.measureDelayCallCount)
+    }
 }

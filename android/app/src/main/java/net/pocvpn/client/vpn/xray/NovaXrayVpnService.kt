@@ -160,6 +160,24 @@ class NovaXrayVpnService : VpnService() {
                 }
                 return Service.START_NOT_STICKY
             }
+            XrayProcessBridge.ACTION_CONFIRM_TUNNEL -> {
+                // B-WL7: repeat THIS session's B33 probe before a counters-only
+                // dead-data-plane verdict ends it. Session checked before and
+                // after; any mismatch answers "not confirmed".
+                val requestId = intent.getLongExtra(XrayProcessBridge.EXTRA_REQUEST_ID, 0L)
+                val sessionId = intent.getLongExtra(XrayProcessBridge.EXTRA_CONFIRM_SESSION_ID, -1L)
+                scope.launch {
+                    val confirmed = try {
+                        sessionId == currentSessionId && coreRuntime.isRunning &&
+                            lifecycleCoordinator.reconfirmActiveSession() &&
+                            sessionId == currentSessionId
+                    } catch (t: Throwable) {
+                        false
+                    }
+                    XrayProcessBridge.publishTunnelConfirmation(this@NovaXrayVpnService, requestId, confirmed)
+                }
+                return Service.START_NOT_STICKY
+            }
             ACTION_STOP -> {
                 teardown("explicit stop")
                 return Service.START_NOT_STICKY
