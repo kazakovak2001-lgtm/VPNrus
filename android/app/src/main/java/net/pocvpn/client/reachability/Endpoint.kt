@@ -171,6 +171,19 @@ fun EndpointTransportBinding.withFailureDomains(domains: InfrastructureFailureDo
  * (Client -> INGRESS -> [relayTo]) - this slice models the relationship, it
  * does not implement forwarding (see PathCandidate.Relayed's own docs).
  */
+/**
+ * A signed transport binding whose kind ordinal this build does not know -
+ * a newer server added a TransportKind after this APK was built. Kept only
+ * so [ManifestCanonicalizer] re-encodes the manifest to the exact bytes that
+ * were signed; it is never a candidate, never dialed, never shown.
+ */
+data class OpaqueTransportBinding(
+    val kindOrdinal: Int,
+    val host: String,
+    val port: Int,
+    val metadata: Map<String, String> = emptyMap(),
+)
+
 data class EndpointDescriptor(
     val id: EndpointId,
     val roles: Set<EndpointRole>,
@@ -179,15 +192,21 @@ data class EndpointDescriptor(
     val asn: Int? = null,
     val transports: List<EndpointTransportBinding>,
     val relayTo: EndpointId? = null,
+    // Forward compatibility: bindings of kinds unknown to this build (see
+    // OpaqueTransportBinding). Empty for every manifest this build can fully read.
+    val opaqueTransports: List<OpaqueTransportBinding> = emptyList(),
 ) {
     init {
         require(roles.isNotEmpty()) { "EndpointDescriptor ${id.value} must declare at least one role" }
-        require(transports.isNotEmpty()) { "EndpointDescriptor ${id.value} must declare at least one transport binding" }
+        require(transports.isNotEmpty() || opaqueTransports.isNotEmpty()) { "EndpointDescriptor ${id.value} must declare at least one transport binding" }
+        require(opaqueTransports.none { it.kindOrdinal in 0 until TransportKind.entries.size }) {
+            "EndpointDescriptor ${id.value} holds a known TransportKind as opaque"
+        }
         require(region.isNotBlank()) { "EndpointDescriptor ${id.value} region must not be blank" }
         require(provider.isNotBlank()) { "EndpointDescriptor ${id.value} provider must not be blank" }
         asn?.let { require(it > 0) { "EndpointDescriptor ${id.value} ASN must be positive: $it" } }
         require(relayTo != id) { "EndpointDescriptor ${id.value} must not relay to itself" }
-        val distinctKinds = transports.map { it.kind }
+        val distinctKinds = transports.map { it.kind.ordinal } + opaqueTransports.map { it.kindOrdinal }
         require(distinctKinds.size == distinctKinds.toSet().size) {
             "EndpointDescriptor ${id.value} declares the same TransportKind more than once"
         }

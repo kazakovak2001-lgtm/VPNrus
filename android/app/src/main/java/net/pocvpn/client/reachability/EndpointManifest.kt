@@ -1,5 +1,7 @@
 package net.pocvpn.client.reachability
 
+import net.pocvpn.client.transport.TransportKind
+
 /**
  * The signed set of endpoints the client is willing to trust. [manifestVersion]
  * is monotonic - ManifestRollbackGuard rejects any candidate whose version is
@@ -99,7 +101,12 @@ object ManifestCanonicalizer {
         writeString(d, e.provider)
         d.writeBoolean(e.asn != null)
         d.writeInt(e.asn ?: 0)
-        val transportsSorted = e.transports.sortedBy { it.kind.ordinal }
+        // Known and opaque (unknown-kind) bindings share one ordinal-sorted
+        // list - exactly the order the signer wrote them in.
+        val transportsSorted = (
+            e.transports.map { b -> WireBinding(b.kind.ordinal, b.host, b.port, b.metadata) } +
+                e.opaqueTransports.map { b -> WireBinding(b.kindOrdinal, b.host, b.port, b.metadata) }
+            ).sortedBy { it.kindOrdinal }
         d.writeInt(transportsSorted.size)
         transportsSorted.forEach { writeBinding(d, it) }
         d.writeBoolean(e.relayTo != null)
@@ -129,7 +136,15 @@ object ManifestCanonicalizer {
         val asnValue = d.readInt()
         val transportCount = d.readInt()
         require(transportCount in 0..MAX_TRANSPORTS) { "implausible transport count: $transportCount" }
-        val transports = (0 until transportCount).map { readBinding(d) }
+        val wire = (0 until transportCount).map { readBinding(d) }
+        val transports = wire.mapNotNull { w ->
+            TransportKind.entries.getOrNull(w.kindOrdinal)?.let { EndpointTransportBinding(it, w.host, w.port, w.metadata) }
+        }
+        // Forward compatibility: a kind added by a newer server must not
+        // make this build reject the whole signed manifest - keep it opaque
+        // (see OpaqueTransportBinding) and simply never use it.
+        val opaqueTransports = wire.filter { TransportKind.entries.getOrNull(it.kindOrdinal) == null }
+            .map { OpaqueTransportBinding(it.kindOrdinal, it.host, it.port, it.metadata) }
         val hasRelay = d.readBoolean()
         val relayTo = readString(d)
         return EndpointDescriptor(
@@ -140,11 +155,15 @@ object ManifestCanonicalizer {
             asn = if (hasAsn) asnValue else null,
             transports = transports,
             relayTo = if (hasRelay) EndpointId(relayTo) else null,
+            opaqueTransports = opaqueTransports,
         )
     }
 
-    private fun writeBinding(d: java.io.DataOutputStream, b: EndpointTransportBinding) {
-        d.writeInt(b.kind.ordinal)
+    /** One binding exactly as it appears on the wire, whether or not this build knows its kind. */
+    private data class WireBinding(val kindOrdinal: Int, val host: String, val port: Int, val metadata: Map<String, String>)
+
+    private fun writeBinding(d: java.io.DataOutputStream, b: WireBinding) {
+        d.writeInt(b.kindOrdinal)
         writeString(d, b.host)
         d.writeInt(b.port)
         val metadataSorted = b.metadata.entries.sortedBy { it.key }
@@ -152,10 +171,9 @@ object ManifestCanonicalizer {
         metadataSorted.forEach { (k, v) -> writeString(d, k); writeString(d, v) }
     }
 
-    private fun readBinding(d: java.io.DataInputStream): EndpointTransportBinding {
+    private fun readBinding(d: java.io.DataInputStream): WireBinding {
         val kindOrdinal = d.readInt()
-        val kind = net.pocvpn.client.transport.TransportKind.entries.getOrNull(kindOrdinal)
-            ?: throw IllegalArgumentException("unknown TransportKind ordinal $kindOrdinal")
+        require(kindOrdinal >= 0) { "negative TransportKind ordinal $kindOrdinal" }
         val host = readString(d)
         val port = d.readInt()
         val metadataCount = d.readInt()
@@ -168,7 +186,7 @@ object ManifestCanonicalizer {
         // from the bytes actually signed - reject instead of accepting
         // ambiguous input.
         require(metadata.size == metadataEntries.size) { "duplicate metadata key in encoded transport binding" }
-        return EndpointTransportBinding(kind, host, port, metadata)
+        return WireBinding(kindOrdinal, host, port, metadata)
     }
 
     private fun writeString(d: java.io.DataOutputStream, s: String) {
