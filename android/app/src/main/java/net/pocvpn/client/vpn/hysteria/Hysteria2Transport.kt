@@ -75,7 +75,7 @@ class Hysteria2Transport(
         observerJob = scope.launch {
             Hysteria2VpnService.status.collect { status ->
                 if (status != null && status.sessionId == sessionId) {
-                    hysteria2TransportStateFor(status.phase)?.let { state.value = it }
+                    hysteria2TransportStateFor(status.phase, status.error)?.let { state.value = it }
                 }
             }
         }
@@ -133,10 +133,13 @@ class Hysteria2Transport(
  * "process exists" (see [Hysteria2VpnService]'s own "connected definition"
  * doc).
  */
-internal fun hysteria2TransportStateFor(phase: Hysteria2RuntimePhase): TransportState? = when (phase) {
+internal fun hysteria2TransportStateFor(phase: Hysteria2RuntimePhase, error: Hysteria2RuntimeError? = null): TransportState? = when (phase) {
     Hysteria2RuntimePhase.STOPPED -> TransportState.Disconnected
     Hysteria2RuntimePhase.STARTING -> TransportState.Connecting
     Hysteria2RuntimePhase.RUNNING -> TransportState.Connected
     Hysteria2RuntimePhase.STOPPING -> TransportState.Disconnecting
-    Hysteria2RuntimePhase.FAILED -> TransportState.Error("Hysteria2 runtime failed")
+    Hysteria2RuntimePhase.FAILED -> when (error) {
+        is Hysteria2RuntimeError.RemoteUnconfirmed -> TransportState.Error("Hysteria2 in-tunnel probe failed: ${error.reason}")
+        else -> TransportState.Error("Hysteria2 runtime failed")
+    }
 }

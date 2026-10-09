@@ -57,6 +57,8 @@ sealed interface Hysteria2RuntimeError {
     data class HysteriaChildFailed(val reason: String) : Hysteria2RuntimeError
     data class Tun2SocksChildFailed(val reason: String) : Hysteria2RuntimeError
     data class ChildDiedUnexpectedly(val which: String, val exitCode: Int) : Hysteria2RuntimeError
+    /** QUIC + auth succeeded but the in-tunnel probe ([Hysteria2TunnelProbe]) did not; [reason] is a non-secret stage name. */
+    data class RemoteUnconfirmed(val reason: String) : Hysteria2RuntimeError
 }
 
 /**
@@ -109,9 +111,11 @@ internal data class Hysteria2ServiceStatus(
  *
  * CONNECTED DEFINITION: [Hysteria2RuntimePhase.RUNNING] is published only
  * after the Hysteria2 child has reported `SOCKS5_LISTENING` AND a
- * successful QUIC connect (`hysteriaRuntime.quicConnected`) AND the
- * tun2socks child has itself started (a real SCM_RIGHTS TUN-fd handoff ack)
- * - never merely "TUN established" or "a child process object exists".
+ * successful QUIC connect (`hysteriaRuntime.quicConnected`) AND a real
+ * request through the tunnel to the gateway's `/v1/tunnel-probe` returned 200
+ * ([Hysteria2TunnelProbe], the B33 counterpart) AND the tun2socks child has
+ * itself started (a real SCM_RIGHTS TUN-fd handoff ack) - never merely "TUN
+ * established" or "a child process object exists".
  *
  * ROUTING: this slice wires FULL_VPN only (see `TransportConfig.Hysteria2`'s
  * own doc) - any other requested [RoutingMode] fails closed
@@ -150,6 +154,9 @@ class Hysteria2VpnService : VpnService() {
 
     /** Test seam - same reasoning as `ShadowsocksVpnService.teardownDispatcher`: lets a test run startup/teardown dispatch synchronously (e.g. `Dispatchers.Unconfined`) instead of waiting on a real background dispatcher. Production default unchanged. */
     internal var workDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Default
+
+    /** Test seam - the in-tunnel confirmation run before RUNNING is published. */
+    internal var tunnelProbe: Hysteria2TunnelProbe = Hysteria2TunnelProbe()
 
     init {
         tun2socksRuntime.onUnexpectedExit = { code -> handleUnexpectedExit("tun2socks", code) }
@@ -426,6 +433,20 @@ class Hysteria2VpnService : VpnService() {
                 failStartup(Hysteria2RuntimeError.HysteriaChildFailed("no bound local socks address"))
                 return@launch
             }
+
+            // In-tunnel confirmation before tun2socks starts: the child's QUIC
+            // handshake proves the outer path only. Host is the signed
+            // binding host - the gateway that serves /v1/tunnel-probe.
+            if (abandonedIfNotStarting()) return@launch
+            val probe = tunnelProbe.confirm(socksAddr, localSocks.username, localSocks.password, host)
+            if (probe is Hysteria2TunnelProbeResult.Failed) {
+                Log.w(TAG, "in-tunnel probe failed: ${probe.reason}")
+                hysteriaRuntime.stop()
+                closeTunFd()
+                failStartup(Hysteria2RuntimeError.RemoteUnconfirmed(probe.reason))
+                return@launch
+            }
+            Log.i(TAG, "in-tunnel probe confirmed")
 
             if (abandonedIfNotStarting()) return@launch
             val dupFd = ParcelFileDescriptor.dup(established.fileDescriptor).detachFd()
