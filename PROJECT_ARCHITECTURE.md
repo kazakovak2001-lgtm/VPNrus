@@ -3483,9 +3483,9 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   attempt (tracked in `progressObservationJob`, cancelled under the SAME
   `reconnectOwnershipLock`/generation discipline `reconnectJob` already uses,
   so a superseded attempt can never record stale evidence). A
-  transport whose `stats()` reports no real counters (every non-AmneziaWG
-  kind today) is recorded `NOT_OBSERVED` on the very first poll, never a
-  fabricated claim.
+  transport whose `dataPlaneCounters()` reports no real counters is
+  recorded `NOT_OBSERVED` on the very first poll (AWG caller) or not at all
+  (state-driven caller, see below), never a fabricated claim.
 - **AWG dead-data-plane gate (2026-10-09, RU field test `CONNECTED_NO_DATA`)**:
   the one exception to "observation only". After recording, a decisive
   `NO_PAYLOAD` or `STALLED_AFTER_INITIAL_PAYLOAD` verdict makes
@@ -3502,6 +3502,22 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   still-VERIFYING leave the session alone; a healthy AWG session was held 45 s
   on the OPPO without teardown. B33's Xray confirmation and relay watchdog
   are unchanged.
+- **Direct Xray uses the same gate (2026-10-09)**: the sampler reads
+  `VpnTransport.dataPlaneCounters()`, never `stats()` - `stats()` Counters
+  also drive `awaitFreshHandshake` (connect and reconnect), and Xray has
+  byte counts but no handshake timestamp, so it must stay `Unsupported`
+  there. AWG's `dataPlaneCounters()` is its `stats()`; REALITY/TLS/XHTTP
+  return the `:xray` core's VLESS-outbound uplink (sent) / downlink
+  (received) totals: the renderer enables `stats` + `policy.system.
+  statsOutbound{Uplink,Downlink}`, xray-core counts AFTER TLS/REALITY/XHTTP
+  security (no handshake or ACK bytes), and `NovaXrayVpnService` sums the
+  resetting `queryAllOutboundTrafficStats()` readings per Started session
+  (`XrayTrafficCounters`). Started from `recordStateDrivenOutcome` on a
+  Direct non-AWG attempt's first Connected (after B33), so relayed attempts
+  keep only the relay watchdog. No answer / another session / no Started
+  mirror = `Unavailable` (no sample); a transport without counts
+  (Hysteria2) breaks at once and, for this caller, records no observation.
+  Manual pinned Xray ends in Error with no substitute; Auto advances.
 - **What this means for real production evidence, stated precisely**:
   `POSSIBLE_FULL_SHUTDOWN` (all-transports-connect-failed) and a
   connect-level `POSSIBLE_UDP_FILTERING` (AWG handshake fails while another
@@ -3809,7 +3825,9 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   `:xray` death during a Started session -> `XrayRuntimeEvent.Failed`
   (zero-flag bind + linkToDeath); an orphaned `:xray` tunnel is stopped when
   a new main process starts; field-test core measurements
-  (`ACTION_MEASURE` -> Xray `measureDelay`).
+  (`ACTION_MEASURE` -> Xray `measureDelay`); B-WL7 tunnel byte totals
+  (`ACTION_QUERY_TRAFFIC` -> session id + two counts, asked only while the
+  main mirror shows that session Started).
 - Secrets never cross Intent/Binder: the XHTTP session config (VLESS uuid)
   is handed over as an Android-Keystore AES-GCM encrypted app-private file
   (`XhttpSessionConfigStore`), consumed once and deleted; stale files swept.

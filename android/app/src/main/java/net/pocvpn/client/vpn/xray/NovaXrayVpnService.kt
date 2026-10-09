@@ -122,6 +122,10 @@ class NovaXrayVpnService : VpnService() {
     // doing nothing.
     @Volatile private var currentSessionId: Long = 0L
 
+    // B-WL7 - running totals of the core's resetting outbound counters for
+    // the session that last reached Started (see XrayTrafficCounters).
+    private val trafficCounters = XrayTrafficCounters()
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             XrayProcessBridge.ACTION_MEASURE -> {
@@ -139,6 +143,20 @@ class NovaXrayVpnService : VpnService() {
                         }
                     }
                     XrayProcessBridge.publishMeasureResult(this@NovaXrayVpnService, requestId, urls, results)
+                }
+                return Service.START_NOT_STICKY
+            }
+            XrayProcessBridge.ACTION_QUERY_TRAFFIC -> {
+                // B-WL7: byte counts only (no config, no destinations) for
+                // VpnController's bounded post-connect data-plane check.
+                val requestId = intent.getLongExtra(XrayProcessBridge.EXTRA_REQUEST_ID, 0L)
+                scope.launch {
+                    val totals = if (coreRuntime.isRunning) {
+                        try { trafficCounters.add(coreRuntime.queryAllOutboundTrafficStats()) } catch (t: Throwable) { null }
+                    } else {
+                        null
+                    }
+                    XrayProcessBridge.publishTrafficResult(this@NovaXrayVpnService, requestId, totals)
                 }
                 return Service.START_NOT_STICKY
             }
@@ -330,6 +348,10 @@ class NovaXrayVpnService : VpnService() {
                 }
                 is XrayCoreStartOutcome.Started -> {
                     Log.i(TAG, "Xray core started")
+                    // A fresh core has fresh counters; bytes from the B33
+                    // confirmation are still in the core and land in the
+                    // first reading of THIS session.
+                    trafficCounters.reset(sessionId)
                     // B8I7 - the ONE real, positive confirmation
                     // VlessRealityTransport waits for before ever reporting
                     // Connected - never fabricated from startService()

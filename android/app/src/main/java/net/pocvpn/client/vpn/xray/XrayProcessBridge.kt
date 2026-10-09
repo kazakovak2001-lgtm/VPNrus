@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.TransportFailureKind
 import java.io.File
 
@@ -31,6 +32,8 @@ import java.io.File
  *  - process death (main learns when `:xray` dies mid-session): a
  *    zero-flag bind + linkToDeath while a session is Started, turned into a
  *    [XrayRuntimeEvent.Failed] - before, the whole app died with it.
+ *  - B-WL7 tunnel byte totals (main asks, service answers): two counts
+ *    and a session id, see [queryTrafficCounters].
  *  - an orphaned `:xray` tunnel (main process died, Xray kept running) is
  *    stopped when a new main process starts, so the app never shows
  *    Disconnected over a live tunnel it no longer controls.
@@ -43,10 +46,15 @@ object XrayProcessBridge {
     const val PROCESS_SUFFIX = ":xray"
     const val ACTION_MEASURE = "net.pocvpn.client.vpn.xray.action.MEASURE"
     const val ACTION_MEASURE_RESULT = "net.pocvpn.client.vpn.xray.action.MEASURE_RESULT"
+    const val ACTION_QUERY_TRAFFIC = "net.pocvpn.client.vpn.xray.action.QUERY_TRAFFIC"
+    const val ACTION_TRAFFIC_RESULT = "net.pocvpn.client.vpn.xray.action.TRAFFIC_RESULT"
     const val EXTRA_REQUEST_ID = "requestId"
     const val EXTRA_URLS = "urls"
     private const val EXTRA_DELAYS = "delays"
     private const val EXTRA_ERRORS = "errors"
+    private const val EXTRA_TRAFFIC_SESSION_ID = "trafficSessionId"
+    private const val EXTRA_UPLINK = "uplinkBytes"
+    private const val EXTRA_DOWNLINK = "downlinkBytes"
 
     private const val EXTRA_TYPE = "type"
     private const val EXTRA_SESSION_ID = "sessionId"
@@ -141,6 +149,85 @@ object XrayProcessBridge {
             app.unregisterReceiver(receiver)
         }
     }
+
+    /** Service side of [queryTrafficCounters]; [totals] null = core not running / no reading. */
+    fun publishTrafficResult(context: Context, requestId: Long, totals: XrayTrafficCounters.Totals?) {
+        val intent = Intent(ACTION_TRAFFIC_RESULT)
+            .setPackage(context.packageName)
+            .putExtra(EXTRA_REQUEST_ID, requestId)
+        if (totals != null) {
+            intent.putExtra(EXTRA_TRAFFIC_SESSION_ID, totals.sessionId)
+                .putExtra(EXTRA_UPLINK, totals.uplinkBytes)
+                .putExtra(EXTRA_DOWNLINK, totals.downlinkBytes)
+        }
+        context.sendBroadcast(intent, dynamicReceiverPermission(context))
+    }
+
+    /**
+     * B-WL7 - main process: the `:xray` core's cumulative tunnel-outbound
+     * byte totals for its current session. Null when no answer arrives
+     * within [timeoutMs], the service cannot be reached (e.g. background
+     * start not allowed), or the core is not running - the caller treats
+     * null as "no sample", never as progress or as failure.
+     */
+    suspend fun queryTrafficCounters(context: Context, timeoutMs: Long = 2_000): XrayTrafficCounters.Totals? {
+        val app = context.applicationContext
+        val requestId = measureRequests.incrementAndGet()
+        val result = kotlinx.coroutines.CompletableDeferred<XrayTrafficCounters.Totals?>()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                if (intent.getLongExtra(EXTRA_REQUEST_ID, -1) != requestId) return
+                result.complete(
+                    if (intent.hasExtra(EXTRA_TRAFFIC_SESSION_ID)) {
+                        XrayTrafficCounters.Totals(
+                            intent.getLongExtra(EXTRA_TRAFFIC_SESSION_ID, 0L),
+                            intent.getLongExtra(EXTRA_UPLINK, 0L),
+                            intent.getLongExtra(EXTRA_DOWNLINK, 0L),
+                        )
+                    } else {
+                        null
+                    },
+                )
+            }
+        }
+        ContextCompat.registerReceiver(app, receiver, IntentFilter(ACTION_TRAFFIC_RESULT), ContextCompat.RECEIVER_NOT_EXPORTED)
+        return try {
+            app.startService(
+                Intent(app, NovaXrayVpnService::class.java)
+                    .setAction(ACTION_QUERY_TRAFFIC)
+                    .putExtra(EXTRA_REQUEST_ID, requestId),
+            )
+            kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { result.await() }
+        } catch (e: IllegalStateException) {
+            null
+        } catch (e: SecurityException) {
+            null
+        } finally {
+            app.unregisterReceiver(receiver)
+        }
+    }
+
+    /**
+     * B-WL7 - maps one [queryTrafficCounters] answer onto [TransportStats] for
+     * the transport that owns [sessionId]: uplink = sent, downlink =
+     * received. Unavailable (never Unsupported, so the bounded sampler keeps
+     * polling) when there is no answer or it belongs to another session.
+     */
+    internal suspend fun dataPlaneStats(context: Context, sessionId: Long?): TransportStats {
+        // Only ask while this process' mirror says THIS session is Started:
+        // a startService() to a stopped `:xray` would otherwise spawn an idle
+        // service just to answer "not running".
+        val current = XrayRuntimeState.events.value
+        if (sessionId == null || current !is XrayRuntimeEvent.Started || current.sessionId != sessionId) return TransportStats.Unavailable
+        return dataPlaneStatsFor(sessionId, queryTrafficCounters(context))
+    }
+
+    internal fun dataPlaneStatsFor(sessionId: Long?, totals: XrayTrafficCounters.Totals?): TransportStats =
+        if (sessionId == null || totals == null || totals.sessionId != sessionId) {
+            TransportStats.Unavailable
+        } else {
+            TransportStats.Counters(bytesReceived = totals.downlinkBytes, bytesSent = totals.uplinkBytes, lastHandshakeEpochMillis = null)
+        }
 
     // --- main process side --------------------------------------------------------
 

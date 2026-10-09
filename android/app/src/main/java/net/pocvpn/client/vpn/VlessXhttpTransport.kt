@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.xray.XrayProcessBridge
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
 import net.pocvpn.client.vpn.xray.XhttpSessionConfigStore
@@ -61,6 +63,7 @@ class VlessXhttpTransport(
         }
 
         val sessionId = XrayRuntimeState.nextSessionId()
+        activeSessionId = sessionId
         pendingConfigSessionId?.let(XhttpSessionConfigStore::remove)
 
         observerJob?.cancel()
@@ -156,6 +159,11 @@ class VlessXhttpTransport(
         }
         if (state.value is TransportState.Disconnecting) state.value = TransportState.Disconnected
     }
+
+    // B-WL7 - the session whose `:xray` byte totals dataPlaneCounters() may report.
+    @Volatile private var activeSessionId: Long? = null
+
+    override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
 
     override fun observeState(): Flow<TransportState> =
         state.asStateFlow()

@@ -18,6 +18,8 @@ import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.xray.XrayProcessBridge
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
 import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
@@ -119,6 +121,7 @@ class VlessRealityTransport(
         // (cancel() takes effect at the next suspension point, not
         // necessarily synchronously).
         val sessionId = XrayRuntimeState.nextSessionId()
+        activeSessionId = sessionId
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -189,6 +192,11 @@ class VlessRealityTransport(
         }
         if (state.value is TransportState.Disconnecting) state.value = TransportState.Disconnected
     }
+
+    // B-WL7 - the session whose `:xray` byte totals dataPlaneCounters() may report.
+    @Volatile private var activeSessionId: Long? = null
+
+    override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 

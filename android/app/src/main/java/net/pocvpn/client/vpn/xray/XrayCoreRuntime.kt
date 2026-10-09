@@ -45,6 +45,14 @@ interface XrayCoreRuntime {
      */
     @Throws(Exception::class)
     fun measureDelay(url: String): Long
+
+    /**
+     * B-WL7 - mirrors the pinned AAR's `CoreController.queryAllOutboundTrafficStats()`:
+     * reads AND resets every outbound byte counter, returning
+     * `tag,direction,value;...` (empty when stats are off or nothing moved).
+     * See [XrayTrafficCounters] for how the resetting readings are summed.
+     */
+    fun queryAllOutboundTrafficStats(): String = ""
 }
 
 /**
@@ -92,6 +100,8 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
     }
 
     override fun measureDelay(url: String): Long = controller.measureDelay(url)
+
+    override fun queryAllOutboundTrafficStats(): String = controller.queryAllOutboundTrafficStats() ?: ""
 
     /**
      * This adapter shell does not yet surface core lifecycle events anywhere

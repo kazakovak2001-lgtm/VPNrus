@@ -122,6 +122,9 @@ class AmneziaWgTransport(private val context: Context) : VpnTransport {
         }
     }
 
+    /** B-WL7 - peer RX/TX are real tunnel byte counts, so the same Counters serve the data-plane check. */
+    override suspend fun dataPlaneCounters(): TransportStats = stats()
+
     private companion object {
         const val TUNNEL_NAME = "pocvpn"
     }
