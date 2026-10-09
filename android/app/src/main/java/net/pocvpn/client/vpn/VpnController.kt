@@ -1787,8 +1787,8 @@ class VpnController(
                     if (verdict != TrafficProgressVerdict.VERIFYING) break
                     if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
                 }
-                // One non-secret line per attempt (kind, verdict, sample count) for field diagnostics.
-                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size}")
+                // One non-secret line per attempt (kind, verdict, sample count, final byte totals) for field diagnostics.
+                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size} rx=${samples.lastOrNull()?.bytesReceived} tx=${samples.lastOrNull()?.bytesSent}")
                 if (recordWithoutSamples || samples.isNotEmpty()) {
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }
