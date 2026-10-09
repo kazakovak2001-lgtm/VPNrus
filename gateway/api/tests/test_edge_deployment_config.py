@@ -125,7 +125,14 @@ class StockholmNginxExposesIngressProfileTests(unittest.TestCase):
         # that would silently 503 forever (the exit-role process's own
         # ingress_config is always None) rather than actually working.
         block = self.conf.split("location = /v1/ingress-profile {", 1)[1].split("\n    }", 1)[0]
-        self.assertIn("proxy_pass http://127.0.0.1:8444;", block)
+        # Since B35 the route goes through a map (default: ingress 8444;
+        # X-Ingress-Transport: xhttp -> the XHTTP ingress 8445); no branch
+        # may ever reach the exit role's 8443.
+        self.assertIn("proxy_pass http://$pocvpn_ingress_profile_backend;", block)
+        backend_map = re.search(r"map \$http_x_ingress_transport \$pocvpn_ingress_profile_backend \{(.*?)\}", self.conf, re.S)
+        self.assertIsNotNone(backend_map)
+        self.assertRegex(backend_map.group(1), r"default\s+127\.0\.0\.1:8444;")
+        self.assertNotIn("8443", backend_map.group(1))
         self.assertNotIn("127.0.0.1:8443", block)
 
     def test_no_wildcard_prefix_location_added(self):

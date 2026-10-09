@@ -1,0 +1,43 @@
+# Gateway (server-side) test suites on every PR and on main.
+# They need Linux (fcntl/flock, POSIX permissions) and never run on the
+# Windows dev box, which is how 10 broken tests went unnoticed until
+# 2026-10-09. The Android suite is not run here: it needs native libraries
+# that are deliberately not committed (android/app/libs, jniLibs).
+name: gateway-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: gateway python (api + tools)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Ubuntu 24.04 (the gateways' OS) ships Python 3.12.
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install "cryptography==46.0.5" "PyYAML==6.0.2"
+      - name: api tests
+        run: bash gateway/api/tests/run_tests.sh
+      - name: tools tests
+        run: bash gateway/tools/tests/run_tests.sh
+
+  shell:
+    name: gateway shell (peer allocation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # The harness works only on isolated temp copies and documents that it
+      # runs as root (chattr +i is needed to simulate a write failure).
+      - name: scripts tests
+        run: sudo bash gateway/scripts/tests/run_tests.sh
