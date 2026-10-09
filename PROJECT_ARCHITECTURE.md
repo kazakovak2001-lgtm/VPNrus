@@ -3518,6 +3518,9 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   mirror = `Unavailable` (no sample); a transport without counts
   (Hysteria2) breaks at once and, for this caller, records no observation.
   Manual pinned Xray ends in Error with no substitute; Auto advances.
+  Device: a healthy forced Direct REALITY session on the OPPO reached
+  `VERIFIED` (21 samples) and stayed up, so the native counters do report
+  traffic; the teardown path is unit-tested only.
 - **What this means for real production evidence, stated precisely**:
   `POSSIBLE_FULL_SHUTDOWN` (all-transports-connect-failed) and a
   connect-level `POSSIBLE_UDP_FILTERING` (AWG handshake fails while another
