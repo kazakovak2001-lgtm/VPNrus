@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn
 
 import android.content.Intent
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -516,6 +517,23 @@ class VpnController(
     internal val pendingConnectTransportBindingForTest: net.pocvpn.client.reachability.EndpointTransportBinding?
         get() = pendingConnectTransportBinding
 
+    /**
+     * Test-only concurrency seam for the failDeadDataPlane() vs. automatic-
+     * reconnect race (see VpnControllerLiveProgressObservationTest's "stale
+     * observer vs automatic reconnect" group). Acquires the SAME real
+     * [connectMutex] every production lifecycle operation already
+     * serializes on, and holds it until [release] completes - letting a
+     * test force a real waiter (a stale sampler already inside
+     * failDeadDataPlane) to genuinely queue behind it, with no arbitrary
+     * real-time sleep. No production call site invokes this; it changes
+     * connectMutex's existing semantics for no real caller, and adds no
+     * new behavior - it only lets a test observe the EXISTING mutex's
+     * EXISTING fairness/ordering.
+     */
+    internal suspend fun holdConnectMutexForTest(release: CompletableDeferred<Unit>) {
+        connectMutex.withLock { release.await() }
+    }
+
     private var activeTransportConfig: TransportConfig? = null
 
     // B22 - the private-gateway keypair repository for the CURRENT/most
@@ -635,6 +653,29 @@ class VpnController(
                     diagnostics.recordError(VpnError.HandshakeTimeout)
                 }
                 recordStateDrivenOutcome(newTransport, transportState)
+                // Unlike the diagnostics.recordError block just above,
+                // [publishReconnectIncidentStarted] below is NOT restricted
+                // to newTransport.kind - this condition can be satisfied for
+                // an AMNEZIA_WG transport too (AmneziaWgTransport.disconnect()
+                // can itself emit TransportState.Error if the native backend
+                // throws). That does not reopen the stale-observer gap
+                // [failDeadDataPlane] closes: every real call site that
+                // invokes activeTransport.disconnect() on an AWG transport
+                // (VpnController.disconnect(), teardownActiveAttemptLocked())
+                // already runs cancelReconnectLocked() - which bumps
+                // reconnectGeneration - strictly before that disconnect()
+                // call, so by the time this Error could even be observed
+                // here, any AWG sampler's ownedGeneration snapshot is already
+                // stale. (The third disconnect() call site,
+                // restartActiveTransportForNetworkChange, only ever runs for
+                // a RESTART_SESSION-kind transport, never AWG's own IN_PLACE
+                // recovery.) As with the rest of this class, this ordering
+                // argument relies on [scope] being confined to a single
+                // thread in production (viewModelScope's Dispatchers.Main.immediate) -
+                // it is not a dispatcher-independent guarantee. A Direct Xray
+                // sampler (started from recordStateDrivenOutcome) needs no
+                // such ordering: an async `:xray` Failed moves _state off
+                // Connected first, and failDeadDataPlane re-checks that.
                 val failureIncidentGeneration = if (
                     transportState is TransportState.Error &&
                     _state.value is TransportState.Connected &&
@@ -1774,6 +1815,18 @@ class VpnController(
         // yet - see cancelReconnectForExplicitConnect's own call site).
         synchronized(reconnectOwnershipLock) {
             progressObservationJob?.cancel()
+            // Snapshotted here, under the SAME lock that assigns
+            // progressObservationJob below - the generation this attempt
+            // owned at the moment it started observing. startReconnect()/
+            // cancelReconnectLocked()/cancelReconnectForExplicitConnect()
+            // all bump this SAME counter, synchronously, the instant any of
+            // them runs - strictly before the asynchronous work that acts
+            // on their behalf (e.g. reconnectLoop's own state transition)
+            // ever gets a chance to - see failDeadDataPlane's own docs for
+            // why re-checking it there, atomically with the destructive
+            // action, closes a gap the pre-existing _state/activeTransport
+            // check alone could not.
+            val ownedGeneration = reconnectGeneration
             progressObservationJob = scope.launch {
                 val policy = TrafficProgressPolicy()
                 val maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
@@ -1793,7 +1846,7 @@ class VpnController(
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }
                 if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
-                    failDeadDataPlane(endpointId, transport, verdict)
+                    failDeadDataPlane(endpointId, transport, verdict, ownedGeneration)
                 }
             }
         }
@@ -1807,15 +1860,30 @@ class VpnController(
      * Auto transport: AWG->Xray) already act on. The job first detaches itself
      * from [progressObservationJob] so the teardown's [cancelReconnectLocked]
      * cannot cancel it halfway.
+     *
+     * [ownedGeneration] is the [reconnectGeneration] this attempt owned when
+     * it started observing (captured by [launchLiveProgressObservation]).
+     * The self-detach above only protects against being superseded by a
+     * NEWER sampler, and _state/activeTransport alone can look unchanged
+     * even after a real automatic reconnect has already taken ownership -
+     * reconnectLoop's own first state transition runs without connectMutex,
+     * so a stale observer that was already queued on it can otherwise still
+     * win the race and tear down a session it no longer owns (reproduced
+     * deterministically in VpnControllerLiveProgressObservationTest). Re-
+     * checking [isCurrentReconnect] here, inside the SAME connectMutex
+     * section as the destructive action, closes that gap unconditionally -
+     * startReconnect()/cancelReconnectLocked()/cancelReconnectForExplicitConnect()
+     * all bump the generation synchronously, strictly before any competing
+     * operation's own asynchronous work runs, regardless of scheduling order.
      */
-    private suspend fun failDeadDataPlane(endpointId: EndpointId, transport: VpnTransport, verdict: TrafficProgressVerdict) {
+    private suspend fun failDeadDataPlane(endpointId: EndpointId, transport: VpnTransport, verdict: TrafficProgressVerdict, ownedGeneration: Long) {
         val self = currentCoroutineContext()[Job]
         synchronized(reconnectOwnershipLock) {
             if (progressObservationJob !== self) return
             progressObservationJob = null
         }
         connectMutex.withLock {
-            if (_state.value !is TransportState.Connected || activeTransport !== transport) return@withLock
+            if (_state.value !is TransportState.Connected || activeTransport !== transport || !isCurrentReconnect(ownedGeneration)) return@withLock
             teardownActiveAttemptLocked()
             // The handshake already recorded this path as a success; the
             // later truth is that it carried no data, so Auto ranks it down.

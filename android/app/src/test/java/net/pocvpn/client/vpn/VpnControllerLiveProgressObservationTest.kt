@@ -2,6 +2,8 @@
 
 package net.pocvpn.client.vpn
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -310,5 +312,172 @@ class VpnControllerLiveProgressObservationTest {
         runCurrent()
 
         assertTrue(controller.state.value is TransportState.Disconnected)
+    }
+
+    // --- stale observer vs automatic reconnect: ownership-generation fix ---
+
+    /**
+     * Builds the same AWG session shape [connectWith] does, but also
+     * returns the real [FakeReconnectManager] so a test can drive an
+     * automatic network-loss reconnect directly.
+     */
+    private suspend fun kotlinx.coroutines.test.TestScope.connectWithReconnectManager(
+        stats: (Int) -> TransportStats,
+    ): Pair<VpnController, FakeVpnTransport> {
+        val transport = FakeVpnTransport()
+        var calls = 0
+        transport.statsProvider = { calls++; stats(calls) }
+        val reconnectManager = FakeReconnectManager()
+        val controller = VpnController(
+            transport, FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(configuredGateway()),
+            reconnectManager, DiagnosticsStore(), backgroundScope,
+            transportObservationStore = null,
+            fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
+            networkProfileProvider = { fakeUsableNetworkProfile },
+        )
+        controller.connect()
+        runCurrent()
+        reconnectManagerForLastController = reconnectManager
+        return controller to transport
+    }
+
+    private var reconnectManagerForLastController: FakeReconnectManager? = null
+
+    /**
+     * Integration-level reproduction of the end-to-end scenario: a stale
+     * observer reaches its decisive NO_PAYLOAD verdict and self-detaches,
+     * then genuinely suspends trying to acquire connectMutex (held by this
+     * test via holdConnectMutexForTest - no arbitrary sleep). A real
+     * automatic network-loss reconnect is triggered while it waits. In this
+     * exact interleaving, reconnectLoop's own state transition to
+     * Reconnecting typically runs (on the test dispatcher's enqueue order)
+     * before the queued observer resumes, so the pre-existing _state guard
+     * alone may already be what rejects the observer here - this test does
+     * NOT by itself isolate or prove the new reconnect-generation guard is
+     * necessary (see the next test, which is built specifically to do
+     * that). What this test does verify end-to-end is that the overall
+     * outcome is correct and safe: whichever guard actually fires, the
+     * stale observer must back off instead of tearing the session down or
+     * overwriting the reconnect's state, and the automatic reconnect must
+     * be left to proceed normally into Reconnecting.
+     */
+    @Test
+    fun `integration - a stale observer queued on connectMutex does not undo an automatic reconnect that already took ownership`() = runTest {
+        val (controller, transport) = connectWithReconnectManager { n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) }
+        val reconnectManager = reconnectManagerForLastController!!
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        val release = CompletableDeferred<Unit>()
+        backgroundScope.launch { controller.holdConnectMutexForTest(release) }
+        runCurrent()
+
+        // Advance the sampler to its decisive NO_PAYLOAD verdict. It self-
+        // detaches, then suspends acquiring connectMutex - held above.
+        advanceTimeBy(31_000)
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(0, transport.disconnectCallCount)
+
+        // A real automatic network-loss reconnect begins WHILE the stale
+        // observer is queued on the mutex it no longer has authority over.
+        reconnectManager.triggerNetworkLost()
+
+        release.complete(Unit)
+        runCurrent()
+
+        val stateAfterRelease = controller.state.value
+        assertTrue(
+            "a stale NO_PAYLOAD verdict sampled before the outage must never " +
+                "produce a terminal Error for a session an automatic reconnect " +
+                "already owns - saw $stateAfterRelease",
+            stateAfterRelease !is TransportState.Error,
+        )
+        assertTrue(
+            "the automatic reconnect must have been left to proceed into " +
+                "Reconnecting, not silently stuck in some other non-Error state " +
+                "- saw $stateAfterRelease",
+            stateAfterRelease is TransportState.Reconnecting,
+        )
+        assertEquals(
+            "the stale observer must not have disconnected the transport the reconnect still owns",
+            0,
+            transport.disconnectCallCount,
+        )
+    }
+
+    /**
+     * Isolates the NEW ownership check from the pre-existing _state/
+     * activeTransport one, using a path that provably never touches either:
+     * a second explicit [VpnController.connect] call, superseding an
+     * already-started (but not yet dispatched) reconnect, cancels that
+     * reconnectJob BEFORE it is ever resumed for the first time - which
+     * means reconnectLoop's body (the only code that would move _state to
+     * Reconnecting) never runs at all - then itself queues on the same held
+     * connectMutex. [Mutex] is documented to hand the lock to waiters in
+     * strict FIFO order, so when the mutex is released, the stale observer -
+     * parked first, well before this second connect() call ever asked for
+     * it - is guaranteed to run its ownership check first, not as an
+     * artifact of this test's dispatcher happening to pick that order. At
+     * that exact point reconnectGeneration has already moved past the
+     * observer's own [ownedGeneration], while _state is still Connected and
+     * activeTransport is still the same instance (connect()'s own early
+     * "already Connected" return, reached only after it eventually gets the
+     * mutex, confirms neither was ever touched). If the fix were removed,
+     * the pre-existing checks alone would see exactly that - _state
+     * Connected, activeTransport unchanged - and incorrectly let the stale
+     * observer tear the session down.
+     */
+    @Test
+    fun `a stale observer is rejected by a reconnect-generation change even when state and transport identity look unchanged`() = runTest {
+        val (controller, transport) = connectWithReconnectManager { n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 50L, lastHandshakeEpochMillis = System.currentTimeMillis()) }
+        val reconnectManager = reconnectManagerForLastController!!
+
+        val release = CompletableDeferred<Unit>()
+        backgroundScope.launch { controller.holdConnectMutexForTest(release) }
+        runCurrent()
+
+        advanceTimeBy(31_000)
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Connected)
+        // The stale observer is now parked on connectMutex - it queued for
+        // the lock before either of the two bumps below ever existed.
+
+        // Bump #1: starts a reconnect (generation -> 2); its reconnectLoop
+        // job is scheduled but, with no runCurrent() yet, never dispatched.
+        reconnectManager.triggerNetworkLost()
+        // Bump #2: a second explicit connect() call's own synchronous
+        // prefix (cancelReconnectForExplicitConnect) cancels that
+        // not-yet-started reconnectJob BEFORE it is ever resumed for the
+        // first time - so reconnectLoop(generation=2) never runs its body -
+        // and bumps the generation again (to 3). connect() then itself
+        // queues on the same still-held connectMutex, behind the observer.
+        // CoroutineStart.UNDISPATCHED runs that synchronous prefix right
+        // here, on this call, strictly before reconnectLoop(2)'s own
+        // scope.launch (from bump #1) is ever dispatched by runCurrent().
+        backgroundScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { controller.connect() }
+        runCurrent()
+
+        // Neither bump needed the mutex or ran any state-changing code:
+        // reconnectLoop(2) was cancelled before its first dispatch, and
+        // connect() is still queued behind the held lock.
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(0, transport.disconnectCallCount)
+
+        // Release the mutex. Mutex's documented FIFO fairness hands it to
+        // the observer (queued first) before connect() (queued second), so
+        // the observer's ownership check is the first thing to run, with
+        // _state/activeTransport still exactly as they were and only
+        // reconnectGeneration (3, not the observer's own 1) having moved.
+        release.complete(Unit)
+        runCurrent()
+
+        assertTrue(
+            "the stale observer must be rejected by the generation check even " +
+                "though _state/activeTransport were still provably unchanged when " +
+                "its own check ran - saw ${controller.state.value}",
+            controller.state.value !is TransportState.Error,
+        )
+        assertEquals(0, transport.disconnectCallCount)
     }
 }
