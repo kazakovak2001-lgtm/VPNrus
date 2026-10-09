@@ -261,4 +261,66 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         assertEquals(1, endpointBRuntime.startLoopCallCount)
         assertEquals(1, endpointBRuntime.stopLoopCallCount) // torn down when A restarted
     }
+
+    // --- M1: teardown reports the session it actually stopped ------------------
+
+    @Test
+    fun `a stop queued behind start N reports N even after start N+1 was requested`() = runTest {
+        val gate = CompletableDeferred<Unit>()
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(gate, runtime, probeScope = this) }
+
+        // N's start is in flight (holds the mutex); the user stops N; ACTION_START N+1 follows.
+        val startN = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 100L) }
+        runCurrent()
+        val stopN = async { coordinator.stopSession() }
+        runCurrent()
+        val startN1 = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 101L) }
+        runCurrent()
+
+        gate.complete(Unit)
+        runCurrent()
+
+        assertEquals(XrayCoreStartOutcome.Started, startN.await())
+        val stopped = stopN.await()
+        assertTrue(stopped.outcome.didTeardown)
+        assertEquals(100L, stopped.sessionId) // never 101 - N+1 had not started when N was torn down
+        assertEquals(XrayCoreStartOutcome.Started, startN1.await())
+        assertEquals(101L, coordinator.stopSession().sessionId)
+    }
+
+    @Test
+    fun `a failed start leaves no running session to report`() = runTest {
+        val runtime = FakeXrayCoreRuntime(startLoopThrows = IllegalStateException("boom"))
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(null, runtime, probeScope = this) }
+
+        val outcome = coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 200L)
+        val stopped = coordinator.stopSession()
+
+        assertTrue(outcome is XrayCoreStartOutcome.CoreStartFailed)
+        assertEquals(false, stopped.outcome.didTeardown)
+        assertEquals(null, stopped.sessionId)
+    }
+
+    @Test
+    fun `AlreadyRunning keeps the session that really runs`() = runTest {
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(null, runtime, probeScope = this) }
+
+        coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 300L)
+        assertEquals(XrayCoreStartOutcome.AlreadyRunning, coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 301L))
+
+        assertEquals(300L, coordinator.stopSession().sessionId)
+    }
+
+    @Test
+    fun `an endpoint switch reports only the new session afterwards`() = runTest {
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(null, FakeXrayCoreRuntime(), probeScope = this) }
+
+        coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 400L)
+        coordinator.start(endpointB, TransportKind.XRAY_REALITY, sessionId = 401L)
+
+        assertEquals(401L, coordinator.stopSession().sessionId)
+        assertEquals(null, coordinator.stopSession().sessionId) // nothing left running
+    }
 }

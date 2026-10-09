@@ -311,6 +311,7 @@ class NovaXrayVpnService : VpnService() {
                         confirmationContext = confirmationContext,
                         onRelayHealthLost = onRelayHealthLost,
                         xhttpConfig = xhttpConfig,
+                        sessionId = sessionId,
                     )
             ) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
@@ -396,14 +397,18 @@ class NovaXrayVpnService : VpnService() {
 
     /** Caller must run this on [scope] - see [teardown]/[onDestroy], its only two call sites. */
     private suspend fun teardownAndPublish(reason: String) {
-        val outcome = lifecycleCoordinator.stop()
+        val stopped = lifecycleCoordinator.stopSession()
+        val outcome = stopped.outcome
         if (!outcome.didTeardown) {
             Log.i(TAG, "teardown($reason) requested while not running - no-op")
             return
         }
         Log.i(TAG, "tearing down: $reason")
         outcome.stopLoopFailureReason?.let { Log.e(TAG, "stopLoop failed: $it") }
-        XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Stopped(currentSessionId))
+        // The session whose core was just stopped - not currentSessionId,
+        // which an ACTION_START for the next session may already have changed
+        // while this stop waited behind the previous start.
+        XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Stopped(stopped.sessionId ?: currentSessionId))
         stopSelf()
     }
 

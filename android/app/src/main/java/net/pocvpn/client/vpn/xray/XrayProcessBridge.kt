@@ -85,21 +85,34 @@ object XrayProcessBridge {
 
     // --- service side -----------------------------------------------------------
 
-    /** Called by NovaXrayVpnService instead of XrayRuntimeState.publish. */
+    @Volatile private var serviceJournal: XrayTerminalJournal? = null
+
+    private fun journalFor(context: Context): XrayTerminalJournal =
+        serviceJournal ?: synchronized(this) {
+            serviceJournal ?: XrayTerminalJournal(XrayTerminalRecord.forContext(context)).also { serviceJournal = it }
+        }
+
+    /**
+     * Called by NovaXrayVpnService instead of XrayRuntimeState.publish. The
+     * terminal record is updated and the broadcast sent under ONE lock, so
+     * the record (read by the main process when `:xray` dies before the
+     * broadcast lands) always reflects the same event order the broadcasts
+     * have - and it is written before any stopSelf() can follow.
+     */
     fun publishFromService(context: Context, event: XrayRuntimeEvent) {
-        // Before the broadcast (and so before any stopSelf()): if `:xray` dies
-        // before the broadcast lands, the main process reads the real
-        // terminal event from here (see XrayTerminalRecord).
-        XrayTerminalRecord.forContext(context).write(event)
-        XrayRuntimeState.publish(event)
-        val e = encode(event)
-        val intent = Intent(ACTION_RUNTIME_EVENT)
-            .setPackage(context.packageName)
-            .putExtra(EXTRA_TYPE, e.type)
-            .putExtra(EXTRA_SESSION_ID, e.sessionId)
-            .putExtra(EXTRA_REASON, e.reason)
-            .putExtra(EXTRA_FAILURE_KIND, e.failureKind)
-        context.sendBroadcast(intent, dynamicReceiverPermission(context))
+        val journal = journalFor(context)
+        synchronized(journal.lock) {
+            journal.onPublish(event)
+            XrayRuntimeState.publish(event)
+            val e = encode(event)
+            val intent = Intent(ACTION_RUNTIME_EVENT)
+                .setPackage(context.packageName)
+                .putExtra(EXTRA_TYPE, e.type)
+                .putExtra(EXTRA_SESSION_ID, e.sessionId)
+                .putExtra(EXTRA_REASON, e.reason)
+                .putExtra(EXTRA_FAILURE_KIND, e.failureKind)
+            context.sendBroadcast(intent, dynamicReceiverPermission(context))
+        }
     }
 
     /** Service side of [measureThroughCore]. */

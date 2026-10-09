@@ -211,4 +211,34 @@ class XrayProcessWatcherTest {
         assertEquals(XrayRuntimeEvent.Started(new), XrayRuntimeState.events.value)
         assertEquals(new, h.watcher.watching)
     }
+
+    // --- M1 sequence as the fixed service now broadcasts it -------------------------
+
+    @Test
+    fun `Start N, Stop N, Start N+1 - Started N+1 is accepted and watched`() {
+        val (h, n) = startedSession()
+        val n1 = nextId()
+
+        assertTrue(h.deliver(XrayRuntimeEvent.Stopped(n))) // teardown of N reports N
+        assertTrue(h.deliver(XrayRuntimeEvent.Started(n1)))
+        h.connect()
+
+        assertEquals(n1, h.watcher.watching)
+        assertEquals(XrayRuntimeEvent.Started(n1), XrayRuntimeState.events.value)
+    }
+
+    @Test
+    fun `an unexpected death of N+1 is Failed N+1, never N's recorded Stopped`() {
+        var record: XrayRuntimeEvent? = null
+        val (h, n) = startedSession { record }
+        assertTrue(h.deliver(XrayRuntimeEvent.Stopped(n)))
+        record = XrayRuntimeEvent.Stopped(n) // whatever the file still holds
+        val n1 = nextId()
+        assertTrue(h.deliver(XrayRuntimeEvent.Started(n1)))
+        h.connect()
+
+        h.processDies()
+
+        assertEquals(XrayRuntimeEvent.Failed(n1, XrayProcessBridge.DIED_REASON), XrayRuntimeState.events.value)
+    }
 }

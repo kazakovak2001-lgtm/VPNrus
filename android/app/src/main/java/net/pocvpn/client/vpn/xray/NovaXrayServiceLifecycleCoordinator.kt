@@ -36,6 +36,17 @@ class NovaXrayServiceLifecycleCoordinator(
     private var controllerEndpointId: EndpointId? = null
     private var cachedController: XrayCoreController? = null
 
+    // The session whose core is running right now - set only when a start
+    // for it returns Started, cleared by any stop or failed start, always
+    // under [mutex] together with the start/stop it describes. Teardown
+    // reports THIS id, never the service's latest ACTION_START id, which a
+    // newer start request may already have overwritten (field race: stop of
+    // N queued behind N's in-flight start, then ACTION_START N+1 arrives).
+    private var runningSessionId: Long? = null
+
+    /** What [stopSession] tore down and for which session (null when nothing ran or no id was given at start). */
+    data class StoppedSession(val outcome: XrayCoreStopOutcome, val sessionId: Long?)
+
     /**
      * Selects (reusing the cached instance for the SAME endpoint) or builds
      * (for a DIFFERENT endpoint, after an authoritative [XrayCoreController.requestStop]
@@ -77,14 +88,23 @@ class NovaXrayServiceLifecycleCoordinator(
         confirmationContext: RemoteConfirmationContext = RemoteConfirmationContext.Direct,
         onRelayHealthLost: suspend () -> Unit = {},
         xhttpConfig: XrayVlessXhttpConfig? = null,
+        sessionId: Long? = null,
     ): XrayCoreStartOutcome = mutex.withLock {
-        selectControllerLocked(endpointId).requestStart(
+        val outcome = selectControllerLocked(endpointId).requestStart(
             kind,
             routingMode,
             confirmationContext,
             onRelayHealthLost,
             xhttpConfig,
         )
+        runningSessionId = when (outcome) {
+            XrayCoreStartOutcome.Started -> sessionId
+            // The earlier session keeps running (same endpoint) - its id stays.
+            XrayCoreStartOutcome.AlreadyRunning, XrayCoreStartOutcome.StartInFlight -> runningSessionId
+            // Nothing runs after a failed start (an endpoint switch has already stopped the old core).
+            else -> null
+        }
+        outcome
     }
 
     /**
@@ -96,8 +116,14 @@ class NovaXrayServiceLifecycleCoordinator(
      * been cached is the SAME "not running" no-op every other case already
      * produces - callers treat it identically.
      */
-    suspend fun stop(): XrayCoreStopOutcome = mutex.withLock {
-        cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false)
+    suspend fun stop(): XrayCoreStopOutcome = stopSession().outcome
+
+    /** [stop] plus the id of the session whose core was actually torn down. */
+    suspend fun stopSession(): StoppedSession = mutex.withLock {
+        val outcome = cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false)
+        val stopped = if (outcome.didTeardown) runningSessionId else null
+        runningSessionId = null
+        StoppedSession(outcome, stopped)
     }
 
     /** Caller must already hold [mutex]. */

@@ -3834,11 +3834,15 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   (zero-flag bind + linkToDeath; onBindingDied too) - at once when the main
   process did not ask that session to stop (Android has already removed
   the VPN interface), after the 2 s grace only for a stop it requested
-  (`stopSession` marks it before ACTION_STOP). The service writes every
-  terminal event to an app-private record (`XrayTerminalRecord`) before
-  its broadcast, so a death that beats the broadcast still yields the real
-  event of THAT session (Stopped after a system revoke, a typed relay
-  Failed). The main mirror takes at most one terminal event per session
+  (`stopSession` marks it before ACTION_STOP). Teardown reports the
+  session whose core it actually stopped (`NovaXrayServiceLifecycleCoordinator
+  .stopSession`, tracked under the lifecycle mutex), never the latest
+  ACTION_START id. Under one lock with each broadcast, `:xray` keeps an
+  app-private record (`XrayTerminalJournal`/`XrayTerminalRecord`, atomic
+  move) of the first terminal event of the session it last started;
+  Started clears it. A death that beats the broadcast therefore yields the
+  real event of THAT session (Stopped after a system revoke, a typed relay
+  Failed), and a record of any other session or run is never read. The main mirror takes at most one terminal event per session
   and nothing from an older session (`acceptInMain`); the watcher ends
   only on its own session's events; an orphaned `:xray` tunnel is stopped when
   a new main process starts; field-test core measurements
