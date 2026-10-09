@@ -9,6 +9,9 @@
 !gateway/edge/nginx-pocvpn.conf
 !gateway/edge/nginx-pocvpn-stockholm.conf
 !gateway/edge/nginx-pocvpn-cdn-origin-frankfurt.conf
+# PR #161 Frankfurt 443 SNI split (a template; its tests read it - it was
+# silently swallowed by *.conf above and never reached the remote).
+!gateway/edge/nginx-pocvpn-stream-frankfurt.conf
 .env
 .env.*
 !.env.example

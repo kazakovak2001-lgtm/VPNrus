@@ -417,11 +417,24 @@ class HysteriaEdgeExposureTests(unittest.TestCase):
     # only (the one host with a Hysteria2 listener), POST-only, to the EXIT
     # API. Every other edge config still never mentions it, and no edge
     # config may ever reference the loopback auth backend port.
+    # The Stockholm public edge and its B57 cp-loopback staging variant both
+    # front the same Stockholm exit API, which is the only Hysteria2 host.
+    _STOCKHOLM_EDGES = ("nginx-pocvpn-stockholm.conf", "nginx-pocvpn-cp-loopback-stockholm.conf")
+
     def test_only_stockholm_routes_hysteria_profile(self):
         for name in os.listdir(self._EDGE):
-            if name.endswith(".conf") and name != "nginx-pocvpn-stockholm.conf":
+            if name.endswith(".conf") and name not in self._STOCKHOLM_EDGES:
                 with self.subTest(conf=name):
                     self.assertNotIn("hysteria", self._read(name).lower())
+
+    def test_cp_loopback_stockholm_hysteria_profile_is_post_only_to_exit_api(self):
+        text = self._read("nginx-pocvpn-cp-loopback-stockholm.conf")
+        match = re.search(r"location = /v1/hysteria-profile \{(.*?)\n    \}", text, re.S)
+        self.assertIsNotNone(match)
+        block = match.group(1)
+        self.assertRegex(block, r"limit_except POST \{\s*deny all;\s*\}")
+        self.assertIn("proxy_pass http://127.0.0.1:8443;", block)
+        self.assertEqual(1, text.count("location = /v1/hysteria-profile"))
 
     def test_stockholm_hysteria_profile_is_post_only_to_exit_api(self):
         text = self._read("nginx-pocvpn-stockholm.conf")

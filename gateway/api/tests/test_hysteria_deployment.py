@@ -332,7 +332,7 @@ class DeploymentBoundaryTests(unittest.TestCase):
                 self.assertNotIn("8446", text, name)
                 # B46-4A completion - Stockholm's edge routes ONLY the
                 # client provisioning path; nothing else Hysteria-related.
-                if name == "nginx-pocvpn-stockholm.conf":
+                if name in ("nginx-pocvpn-stockholm.conf", "nginx-pocvpn-cp-loopback-stockholm.conf"):
                     text = text.replace("/v1/hysteria-profile", "")
                     text = re.sub(r"(?m)^\s*#.*$", "", text)
                 self.assertNotIn("hysteria", text.lower(), name)
