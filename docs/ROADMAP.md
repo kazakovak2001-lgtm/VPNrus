@@ -199,8 +199,9 @@ measured repeatedly or across environments. Nothing here is FIELD-VERIFIED.
   the B-WL7 post-connect traffic-progress gate (`VpnController`'s single
   caller is the AmneziaWG success branch). Xray REALITY/TLS already have a
   connect-time in-tunnel confirmation (B33 `confirmRemoteConnectivity`) and
-  relays have the post-Connected relay-health watchdog. Hysteria2's
-  in-tunnel confirmation was not found in this pass - marked **verify**.
+  relays have the post-Connected relay-health watchdog. Hysteria2 had no
+  in-tunnel confirmation; added 2026-10-09 (`Hysteria2TunnelProbe`, see the
+  B-WL7 acceptance table).
 - B57 is the control-plane edge behind Cloudflare; B35 is the CDN/XHTTP
   data-plane ingress. The summary conflated them; this roadmap keeps them
   separate.
@@ -449,9 +450,9 @@ not established by this pass):
 | Transport | 1 Handshake | 2 Data through tunnel | 3 Protection checks in-app | 4 Post-connect loss -> failover |
 |---|---|---|---|---|
 | AmneziaWG | yes | yes - B-WL7 gate ends the session with `DataPlaneNoTraffic` | no per-session in-app check (B10-1 manual evidence only) | yes (`AwgXrayFailoverPolicy`, `AutoGatewayFailoverPolicy`) |
-| Xray REALITY / TLS (Direct) | yes | connect-time only - B33 `confirmRemoteConnectivity` (in-tunnel round trip to the gateway's `/v1/manifest`) | no per-session in-app check | verify - no B-WL7 gate for Direct Xray |
+| Xray REALITY / TLS (Direct) | yes | connect-time only - B33 `confirmRemoteConnectivity` (in-tunnel round trip to the gateway's `/v1/tunnel-probe`, B57) | no per-session in-app check | verify - no B-WL7 gate for Direct Xray |
 | Relayed REALITY / CDN XHTTP | yes | B33 confirmation + post-Connected relay-health watchdog | no per-session in-app check | yes for relays (watchdog terminal failure) |
-| Hysteria2 (debug/field-test only) | yes | verify - no in-tunnel confirmation found in this pass | verify (B46-4A did not isolate DNS transport) | verify |
+| Hysteria2 (debug/field-test only) | yes (QUIC + server auth before `SOCKS5_LISTENING`) | connect-time only - `Hysteria2TunnelProbe` (2026-10-09): HTTPS GET of the gateway's `/v1/tunnel-probe` through the child's authenticated loopback SOCKS5, 6 s bound, required before RUNNING/Connected; failure = `RemoteUnconfirmed` -> transport Error -> existing failover. Unit-tested; server leg checked on Stockholm (hairpin `200`, cert verified); not yet verified on a device | verify (B46-4A did not isolate DNS transport) | verify |
 
 No transport is claimed to satisfy all four layers today.
 
