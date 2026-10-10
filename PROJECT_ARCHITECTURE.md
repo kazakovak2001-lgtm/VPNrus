@@ -3631,6 +3631,11 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Provisioning goes through the Stockholm edge `location =
   /v1/hysteria-profile` (POST -> 127.0.0.1:8443); the client rejects a
   response whose server/port/SNI/obfuscation differ from the binding.
+- Connected = child QUIC + server auth (before `SOCKS5_LISTENING`) AND
+  `Hysteria2TunnelProbe` (B33 counterpart): verified HTTPS GET of the
+  binding host's `/v1/tunnel-probe` through the child's loopback SOCKS5,
+  bounded 6 s, before tun2socks starts. Failure publishes FAILED with
+  `Hysteria2RuntimeError.RemoteUnconfirmed`; no post-connect gate yet.
 - Live (2026-09-28): Stockholm runs both units (official pinned v2.12.3);
   manifest v6 (`prod-manifest-key-2026-09-14`) carries the only HYSTERIA2
   binding, `16.170.208.231:443`, SNI `origin-sthlm.aknova.pp.ua`, `NONE`;
