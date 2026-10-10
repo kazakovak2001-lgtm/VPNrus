@@ -17,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
@@ -302,6 +303,10 @@ class VpnController(
         // B8B3D - "small bounded startup window" per the task's own wording.
         const val HANDSHAKE_TIMEOUT_MS = 8_000L
         const val HANDSHAKE_POLL_INTERVAL_MS = 500L
+
+        // B-WL7 M1 - caller-side bound on VpnTransport.probeIndependentEgress()
+        // (Xray: the 6 s in-core probe plus IPC); no answer in time = NOT_REACHED.
+        const val INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS = 10_000L
     }
 
     // B8I5/B8I6/B8O2 - the kinds this controller instance can actually build
@@ -1800,7 +1805,13 @@ class VpnController(
      * Protected (RU field test: AWG handshake up, no data; for Xray: core
      * up and B33-confirmed, then no VLESS bytes back). Every other
      * verdict (VERIFIED, IDLE, UNAVAILABLE, still VERIFYING at the window
-     * end) leaves the session untouched.
+     * end) leaves the session untouched. Before acting on such a verdict the
+     * loop asks [VpnTransport.probeIndependentEgress] once per attempt
+     * (bounded by [INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS]): REACHED reads the
+     * counters again (the probe's own bytes included), restarts from that
+     * sample and extends the window ONCE by one stall window from it, so a
+     * stall observed after the probe still ends the session; no fresh sample,
+     * NOT_REACHED, UNAVAILABLE, an exception or a timeout keep the verdict.
      */
     private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport, recordWithoutSamples: Boolean = true) {
         val store = transportObservationStore
@@ -1826,19 +1837,52 @@ class VpnController(
             val ownedGeneration = reconnectGeneration
             progressObservationJob = scope.launch {
                 val policy = TrafficProgressPolicy()
-                val maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
+                var maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
                 val samples = mutableListOf<TrafficProgressSample>()
                 var verdict = TrafficProgressVerdict.VERIFYING
-                for (pollIndex in 0..maxPolls) {
+                var egressProbe: IndependentEgressProbeResult? = null
+                var pollIndex = 0
+                while (pollIndex <= maxPolls) {
                     val stats = transport.dataPlaneCounters()
                     if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) break
                     TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
                     verdict = TrafficProgressMonitor.evaluate(samples, policy)
+                    // B-WL7 M1 - counters alone would end the session. Xray
+                    // counters carry no TCP ACKs, so ask once per attempt
+                    // whether this exit still reaches an INDEPENDENT
+                    // destination (bounded, no lock held, cancelled with this
+                    // job). REACHED explains the stall seen so far. The probe
+                    // itself dials through the same counted outbound, so its
+                    // bytes are in the counters now: read them again AFTER the
+                    // probe and restart from that sample, so the probe's
+                    // traffic is never mistaken for user progress, then watch
+                    // one more full stall window from it - a stall that
+                    // starts after the probe still ends the session (no
+                    // second probe). No fresh sample = the stall stands.
+                    if (TrafficProgressMonitor.isUnhealthy(verdict) && egressProbe == null) {
+                        egressProbe = try {
+                            withTimeoutOrNull(INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS) { transport.probeIndependentEgress() }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            null
+                        } ?: IndependentEgressProbeResult.NOT_REACHED
+                        if (egressProbe == IndependentEgressProbeResult.REACHED) {
+                            val postProbe = TrafficProgressSample.fromCounters(transport.dataPlaneCounters(), pollIndex * HANDSHAKE_POLL_INTERVAL_MS)
+                            if (postProbe != null) {
+                                samples.clear()
+                                samples += postProbe
+                                verdict = TrafficProgressVerdict.VERIFYING
+                                maxPolls = maxOf(maxPolls, pollIndex + (policy.stallWindowMillis / HANDSHAKE_POLL_INTERVAL_MS).toInt())
+                            }
+                        }
+                    }
                     if (verdict != TrafficProgressVerdict.VERIFYING) break
                     if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
+                    pollIndex++
                 }
-                // One non-secret line per attempt (kind, verdict, sample count) for field diagnostics.
-                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size}")
+                // One non-secret line per attempt (kind, verdict, sample count, egress probe) for field diagnostics.
+                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size} egressProbe=$egressProbe")
                 if (recordWithoutSamples || samples.isNotEmpty()) {
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }

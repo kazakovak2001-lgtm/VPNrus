@@ -98,6 +98,17 @@ class FakeVpnTransport(
 
     override suspend fun dataPlaneCounters(): TransportStats = dataPlaneProvider?.invoke() ?: stats()
 
+    // B-WL7 M1 - what probeIndependentEgress() answers; null = UNAVAILABLE,
+    // the default every existing transport (and test) has.
+    var egressProber: (suspend () -> IndependentEgressProbeResult)? = null
+    var egressProbeCallCount = 0
+        private set
+
+    override suspend fun probeIndependentEgress(): IndependentEgressProbeResult {
+        egressProbeCallCount++
+        return egressProber?.invoke() ?: IndependentEgressProbeResult.UNAVAILABLE
+    }
+
     override suspend fun stats(): TransportStats = statsProvider?.invoke() ?: TransportStats.Counters(
         bytesReceived = statsBytesReceived,
         bytesSent = statsBytesSent,

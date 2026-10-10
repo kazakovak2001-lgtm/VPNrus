@@ -12,6 +12,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
 import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
@@ -244,6 +245,13 @@ class XrayCoreController(
     // failure branch clearing itself.
     @Volatile private var relayHealthWatchdogJob: Job? = null
 
+    // B-WL7 M1 - the CURRENT Started session's own server (and relay exit),
+    // which [probeIndependentEgress] must never probe. Set only once B33
+    // succeeded; cleared by [requestStop] and by every new [requestStart].
+    private class StartedSession(val serverHost: String, val relayExitHost: String?)
+
+    @Volatile private var startedSession: StartedSession? = null
+
     suspend fun requestStart(
         kind: TransportKind = TransportKind.XRAY_REALITY,
         routingMode: RoutingMode = RoutingMode.FULL_VPN,
@@ -276,6 +284,7 @@ class XrayCoreController(
         // forever against nothing.
         relayHealthWatchdogJob?.cancel()
         relayHealthWatchdogJob = null
+        startedSession = null
 
         var success = false
         try {
@@ -331,6 +340,10 @@ class XrayCoreController(
                 // evidence the tunnel is actually usable.
                 if (confirmRemoteConnectivity(ready.serverHost, confirmationContext)) {
                     success = true
+                    startedSession = StartedSession(
+                        serverHost = ready.serverHost,
+                        relayExitHost = (confirmationContext as? RemoteConfirmationContext.Relayed)?.exitProbeHost,
+                    )
                     // B33 relay follow-up (round 3) - a genuine Connected
                     // relayed session gets ongoing health monitoring; a
                     // Direct one does not (no ownerless-relay-tun class of
@@ -455,6 +468,24 @@ class XrayCoreController(
      * just as much an ordinary blocking-native call running on [probeScope]
      * here, abandoned exactly the same way on timeout.
      */
+    /**
+     * B-WL7 M1 - one bounded `https://<target>/v1/tunnel-probe` round trip
+     * through THIS Started session's core to a gateway OTHER than the one
+     * it is connected to ([IndependentEgressTargets.select] over
+     * [candidates]): leaves the current gateway through its real egress,
+     * TLS-verified against the target's IP certificate, 200/204 only
+     * ([XrayCoreRuntime.measureDelay]), same [REMOTE_CONFIRM_TIMEOUT_MS]
+     * abandonable bound as B33. NOT_REACHED without a Started session;
+     * UNAVAILABLE when no candidate is independent. Takes no lifecycle
+     * lock - a concurrent [requestStop] is never delayed by it.
+     */
+    suspend fun probeIndependentEgress(candidates: List<String>): IndependentEgressProbeResult {
+        val session = startedSession ?: return IndependentEgressProbeResult.NOT_REACHED
+        val target = IndependentEgressTargets.select(candidates, session.serverHost, session.relayExitHost)
+            ?: return IndependentEgressProbeResult.UNAVAILABLE
+        return if (boundedMeasureDelay("https://$target$TUNNEL_PROBE_PATH")) IndependentEgressProbeResult.REACHED else IndependentEgressProbeResult.NOT_REACHED
+    }
+
     private suspend fun confirmRemoteConnectivity(serverHost: String, context: RemoteConfirmationContext): Boolean {
         val url = when (context) {
             is RemoteConfirmationContext.Direct -> "https://$serverHost$TUNNEL_PROBE_PATH"
@@ -663,6 +694,7 @@ class XrayCoreController(
         // is safe regardless, this just avoids the pointless overlap.
         relayHealthWatchdogJob?.cancel()
         relayHealthWatchdogJob = null
+        startedSession = null
         if (!lifecycleGate.tryBeginTeardown()) return XrayCoreStopOutcome(didTeardown = false)
         val failureReason = try {
             coreRuntime.stopLoop()

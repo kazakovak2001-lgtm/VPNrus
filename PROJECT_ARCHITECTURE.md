@@ -3518,6 +3518,25 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   mirror = `Unavailable` (no sample); a transport without counts
   (Hysteria2) breaks at once and, for this caller, records no observation.
   Manual pinned Xray ends in Error with no substitute; Auto advances.
+  Independent-egress probe (M1): Xray counters carry no TCP ACKs, so an
+  upload-only flow looks like a dead exit. Before acting on NO_PAYLOAD /
+  STALLED the sampler calls `VpnTransport.probeIndependentEgress()` once
+  per attempt (10 s bound, no lock, cancelled with the sampler). Xray asks
+  `:xray` (`ACTION_PROBE_INDEPENDENT_EGRESS`) for one
+  `https://<OTHER catalog gateway IP>/v1/tunnel-probe` through the
+  session's own core (TLS checked against that IP certificate, 200/204
+  only, 6 s). Never the current gateway: its own probe is answered by its
+  own nginx without touching egress. REACHED = that one independent
+  TCP/443 destination answered through this exit - not DNS, UDP, other
+  ports or general Internet health. The probe dials through the same
+  counted outbound, so the counters are read again after it and that
+  sample becomes the new baseline (probe bytes are never user progress);
+  the window is extended ONCE by one stall window from it, so a stall
+  after the probe still ends the session. No fresh sample, NOT_REACHED,
+  UNAVAILABLE (endpoint outside the catalog, AWG, Hysteria2), exception or
+  timeout keep the teardown. Independence assumption: the two catalog
+  gateways (Oracle Frankfurt / AWS Stockholm) - if the target is down the
+  probe fails and the teardown happens as before.
   Device: a healthy forced Direct REALITY session on the OPPO reached
   `VERIFIED` (21 samples) and stayed up, so the native counters do report
   traffic; the teardown path is unit-tested only.
@@ -3835,7 +3854,9 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   a new main process starts; field-test core measurements
   (`ACTION_MEASURE` -> Xray `measureDelay`); B-WL7 tunnel byte totals
   (`ACTION_QUERY_TRAFFIC` -> session id + two counts, asked only while the
-  main mirror shows that session Started).
+  main mirror shows that session Started); B-WL7 independent-egress probe
+  (`ACTION_PROBE_INDEPENDENT_EGRESS` -> session id + target IPs in, result
+  name out).
 - Secrets never cross Intent/Binder: the XHTTP session config (VLESS uuid)
   is handed over as an Android-Keystore AES-GCM encrypted app-private file
   (`XhttpSessionConfigStore`), consumed once and deleted; stale files swept.
