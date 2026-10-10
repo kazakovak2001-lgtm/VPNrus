@@ -177,7 +177,7 @@ class VlessRealityTransport(
         try {
             // An expected stop: marked for the main-process death watch before ACTION_STOP goes out.
             XrayProcessBridge.stopSession(activeSessionId) {
-                context.startService(Intent(context, NovaXrayVpnService::class.java).setAction(NovaXrayVpnService.ACTION_STOP))
+                context.startService(NovaXrayVpnService.stopIntent(context, activeSessionId))
             }
             // Real confirmation (Stopped, tagged with the SAME sessionId
             // connect() is still observing) arrives via the SAME observer

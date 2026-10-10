@@ -336,6 +336,7 @@ object XrayProcessBridge {
         if (installed) return
         installed = true
         val app = context.applicationContext
+        XrayRuntimeState.installSessionIdCeiling(XraySessionIdCeilingFile.forContext(app))
         val w = XrayProcessWatcher(app)
         watcher = w
         val receiver = object : BroadcastReceiver() {

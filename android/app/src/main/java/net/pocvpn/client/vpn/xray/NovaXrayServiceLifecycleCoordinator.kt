@@ -44,8 +44,11 @@ class NovaXrayServiceLifecycleCoordinator(
     // N queued behind N's in-flight start, then ACTION_START N+1 arrives).
     private var runningSessionId: Long? = null
 
-    /** What [stopSession] tore down and for which session (null when nothing ran or no id was given at start). */
-    data class StoppedSession(val outcome: XrayCoreStopOutcome, val sessionId: Long?)
+    /**
+     * What [stopSession] tore down and for which session (null when nothing ran or no id was given at start).
+     * [otherRunningSessionId] is set when the stop was refused because a different session is running.
+     */
+    data class StoppedSession(val outcome: XrayCoreStopOutcome, val sessionId: Long?, val otherRunningSessionId: Long? = null)
 
     /**
      * Selects (reusing the cached instance for the SAME endpoint) or builds
@@ -118,8 +121,17 @@ class NovaXrayServiceLifecycleCoordinator(
      */
     suspend fun stop(): XrayCoreStopOutcome = stopSession().outcome
 
-    /** [stop] plus the id of the session whose core was actually torn down. */
-    suspend fun stopSession(): StoppedSession = mutex.withLock {
+    /**
+     * [stop] plus the id of the session whose core was actually torn down.
+     * With [expectedSessionId] (an ACTION_STOP for that session) nothing is
+     * torn down while a DIFFERENT known session is running: a late stop of
+     * session N must never end session N+1.
+     */
+    suspend fun stopSession(expectedSessionId: Long? = null): StoppedSession = mutex.withLock {
+        val running = runningSessionId
+        if (expectedSessionId != null && running != null && running != expectedSessionId) {
+            return@withLock StoppedSession(XrayCoreStopOutcome(didTeardown = false), null, otherRunningSessionId = running)
+        }
         val outcome = cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false)
         val stopped = if (outcome.didTeardown) runningSessionId else null
         runningSessionId = null

@@ -249,9 +249,11 @@ NetworkProfiler
   Relayed attempts stay with `recordRelayOutcome`. `restrictionClass()`'s
   `awgHandshakeFresh` reads the newest AMNEZIA_WG outcome only.
 - **Xray session ids**: REALITY/TLS/XHTTP transports share
-  `XrayRuntimeState.nextSessionId()` (one wall-clock-seeded counter) - never
-  per-class counters, which let one transport adopt another's replayed
-  `Failed` event.
+  `XrayRuntimeState.nextSessionId()` (one counter) - never per-class
+  counters, which let one transport adopt another's replayed `Failed`
+  event. Ids only grow, also across main-process restarts and wall-clock
+  rollback: `XraySessionIdAllocator` covers every id by a persisted ceiling
+  (`XraySessionIdCeilingFile`, no-backup, atomic move) before handing it out.
 - **Signed binding is the transport address authority**: for Direct
   HYSTERIA2/SHADOWSOCKS_2022 (host+port) and XRAY_REALITY (port; the
   per-device profile must match the binding host or the attempt fails
@@ -3834,7 +3836,12 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   (zero-flag bind + linkToDeath; onBindingDied too) - at once when the main
   process did not ask that session to stop (Android has already removed
   the VPN interface), after the 2 s grace only for a stop it requested
-  (`stopSession` marks it before ACTION_STOP). Teardown reports the
+  (`stopSession` marks it before ACTION_STOP). START/STOP/revoke run in
+  intent order on one `XrayLifecycleQueue`; ACTION_STOP carries the session
+  id and never tears down a different running session. Session work stops
+  the service only via `stopSelf(startId)` while no newer START/STOP/revoke
+  exists (`XrayServiceStopGate`); `onDestroy`'s unscoped teardown is the
+  only one left. Teardown reports the
   session whose core it actually stopped (`NovaXrayServiceLifecycleCoordinator
   .stopSession`, tracked under the lifecycle mutex), never the latest
   ACTION_START id. Under one lock with each broadcast, `:xray` keeps an
