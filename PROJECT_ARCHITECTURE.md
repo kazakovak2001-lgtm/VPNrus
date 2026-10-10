@@ -249,9 +249,11 @@ NetworkProfiler
   Relayed attempts stay with `recordRelayOutcome`. `restrictionClass()`'s
   `awgHandshakeFresh` reads the newest AMNEZIA_WG outcome only.
 - **Xray session ids**: REALITY/TLS/XHTTP transports share
-  `XrayRuntimeState.nextSessionId()` (one wall-clock-seeded counter) - never
-  per-class counters, which let one transport adopt another's replayed
-  `Failed` event.
+  `XrayRuntimeState.nextSessionId()` (one counter) - never per-class
+  counters, which let one transport adopt another's replayed `Failed`
+  event. Ids only grow, also across main-process restarts and wall-clock
+  rollback: `XraySessionIdAllocator` covers every id by a persisted ceiling
+  (`XraySessionIdCeilingFile`, no-backup, atomic move) before handing it out.
 - **Signed binding is the transport address authority**: for Direct
   HYSTERIA2/SHADOWSOCKS_2022 (host+port) and XRAY_REALITY (port; the
   per-device profile must match the binding host or the attempt fails
@@ -704,11 +706,15 @@ shell`), not inferred.
   (2) *consecutive* failures (reset by any intervening success) declare the
   session unhealthy.
 - **Teardown ordering closes the "ownerless tun" risk by construction, not a
-  new ack primitive.** On reaching the threshold, the watchdog calls
-  `requestStop()` - the SAME real, `XrayServiceLifecycleGate`-serialized
-  teardown `ACTION_STOP`/disconnect already uses - SYNCHRONOUSLY on its own
-  coroutine and awaits it to completion BEFORE invoking the caller's
-  `onRelayHealthLost` callback. `NovaXrayVpnService` wires that callback to
+  new ack primitive.** On reaching the threshold, the watchdog hands its
+  stop to `NovaXrayServiceLifecycleCoordinator` (`relayHealthStop`), which
+  runs it under the SAME lifecycle mutex as every START/STOP: it stops only
+  the watchdog's own session (`stopSessionLocked` refuses while a different
+  session runs, so a newer session's core and tun are never touched) and
+  invokes the caller's `onRelayHealthLost` callback, still under that lock,
+  only when that stop actually tore the session down. The watchdog never
+  calls `requestStop()` outside the coordinator in production (that direct
+  path remains only for controller-level tests). `NovaXrayVpnService` wires that callback to
   the SAME `XrayRuntimeEvent.Failed` + `stopSelf()` shape every other Xray
   failure already uses, so `VlessRealityTransport`/`VlessTlsTransport`'s
   existing `observeState()` mapping (never a new one) carries it into
@@ -719,11 +725,11 @@ shell`), not inferred.
 - **Lifecycle**: cancelled by `requestStop()` (covers explicit disconnect,
   and an endpoint switch - `NovaXrayServiceLifecycleCoordinator.selectControllerLocked`
   already tears down the OLD endpoint's controller before building a new
-  one) and defensively at the top of every `requestStart()`. Never keyed on
-  a separately-tracked session id - `relayHealthWatchdogJob` is this
-  controller's own single field, and `lifecycleGate` guarantees only one
-  session is ever active at a time, so a stale watchdog cannot outlive into
-  a later, different session by construction.
+  one) and defensively at the top of every `requestStart()`.
+  `relayHealthWatchdogJob` is this controller's own single field (a
+  watchdog clears it only while it still holds its own job); a watchdog
+  that already passed its threshold is bounded by the coordinator's
+  session-id check above, not by cancellation.
 - **Known, explicitly out-of-scope boundary**: this fix makes the app
   correctly LEAVE `Protected` and fully tear down on a relay-upstream
   failure - it does NOT re-attempt a different candidate automatically
@@ -3483,9 +3489,9 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   attempt (tracked in `progressObservationJob`, cancelled under the SAME
   `reconnectOwnershipLock`/generation discipline `reconnectJob` already uses,
   so a superseded attempt can never record stale evidence). A
-  transport whose `stats()` reports no real counters (every non-AmneziaWG
-  kind today) is recorded `NOT_OBSERVED` on the very first poll, never a
-  fabricated claim.
+  transport whose `dataPlaneCounters()` reports no real counters is
+  recorded `NOT_OBSERVED` on the very first poll (AWG caller) or not at all
+  (state-driven caller, see below), never a fabricated claim.
 - **AWG dead-data-plane gate (2026-10-09, RU field test `CONNECTED_NO_DATA`)**:
   the one exception to "observation only". After recording, a decisive
   `NO_PAYLOAD` or `STALLED_AFTER_INITIAL_PAYLOAD` verdict makes
@@ -3502,6 +3508,30 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   still-VERIFYING leave the session alone; a healthy AWG session was held 45 s
   on the OPPO without teardown. B33's Xray confirmation and relay watchdog
   are unchanged.
+- **Direct Xray uses the same gate (2026-10-09)**: the sampler reads
+  `VpnTransport.dataPlaneCounters()`, never `stats()` - `stats()` Counters
+  also drive `awaitFreshHandshake` (connect and reconnect), and Xray has
+  byte counts but no handshake timestamp, so it must stay `Unsupported`
+  there. AWG's `dataPlaneCounters()` is its `stats()`; REALITY/TLS/XHTTP
+  return the `:xray` core's VLESS-outbound uplink (sent) / downlink
+  (received) totals: the renderer enables `stats` + `policy.system.
+  statsOutbound{Uplink,Downlink}`, xray-core counts AFTER TLS/REALITY/XHTTP
+  security (no handshake or ACK bytes), and `NovaXrayVpnService` sums the
+  resetting `queryAllOutboundTrafficStats()` readings per Started session
+  (`XrayTrafficCounters`). Started from `recordStateDrivenOutcome` on a
+  Direct non-AWG attempt's first Connected (after B33), so relayed attempts
+  keep only the relay watchdog. No answer / another session / no Started
+  mirror = `Unavailable` (no sample); a transport without counts
+  (Hysteria2) breaks at once and, for this caller, records no observation.
+  Manual pinned Xray ends in Error with no substitute; Auto advances.
+  Device (OPPO, 2026-10-09): healthy REALITY (11 runs) and TLS (1 run)
+  sessions reached `VERIFIED` with rx/tx growing both ways and were never
+  torn down; the teardown path is unit-tested only. Separate: before the
+  death-time Failed above, an unexpected `:xray` death was reported only
+  after `DEATH_GRACE_MS` (~2.3 s measured) with the UI still Protected
+  while the VPN network was gone. Packets leaving the device in that window
+  were NOT measured; without Always-on + lockdown Android does not block
+  them, and no app change can.
 - **What this means for real production evidence, stated precisely**:
   `POSSIBLE_FULL_SHUTDOWN` (all-transports-connect-failed) and a
   connect-level `POSSIBLE_UDP_FILTERING` (AWG handshake fails while another
@@ -3812,9 +3842,42 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   as an app-private broadcast (setPackage + RECEIVER_NOT_EXPORTED) re-published
   into the main process' `XrayRuntimeState` (transports unchanged);
   `:xray` death during a Started session -> `XrayRuntimeEvent.Failed`
-  (zero-flag bind + linkToDeath); an orphaned `:xray` tunnel is stopped when
+  (zero-flag bind + linkToDeath; onBindingDied too) - at once when the main
+  process did not ask that session to stop (Android has already removed
+  the VPN interface), after the 2 s grace only for a stop it requested
+  (`stopSession` marks it before ACTION_STOP). START/STOP/revoke run in
+  intent order on one `XrayLifecycleQueue`; ACTION_STOP carries the session
+  id and never tears down a different running session. Session work stops
+  the service only via `stopSelf(startId)` while no newer START/STOP/revoke
+  exists (`XrayServiceStopGate`); `onDestroy`'s unscoped teardown is the
+  only one left. Teardown reports the
+  session whose core it actually stopped (`NovaXrayServiceLifecycleCoordinator
+  .stopSession`, tracked under the lifecycle mutex), never the latest
+  ACTION_START id. `XrayProcessCore` owns the one `LibXrayCoreRuntime`
+  (one native `libv2ray.CoreController`) and the one `XrayCoreStopState` of
+  the `:xray` process - never per service instance, so a recreated service
+  drives the same core. A stop counts as confirmed only when the runtime
+  reports `isRunning == false` after `stopLoop()` (at most one retry);
+  otherwise it is StopUnconfirmed: teardown publishes `Failed`, never
+  `Stopped`, and every START on that process returns `StopUnconfirmed`
+  (no tun, no `startLoop()` - the pinned wrapper's `StartLoop` silently
+  succeeds while its core still runs) until a later stop or the runtime
+  reports the core down, or the process dies. `isRunning == false` is the
+  wrapper's flag only: its shutdown logs and swallows a `Close()` error,
+  so it does NOT prove every native resource was released. Xray
+  transports' `disconnect()` from `Error` sends a best-effort ACTION_STOP so
+  an unconfirmed stop is retried. Under one lock with each broadcast, `:xray` keeps an
+  app-private record (`XrayTerminalJournal`/`XrayTerminalRecord`, atomic
+  move) of the first terminal event of the session it last started;
+  Started clears it. A death that beats the broadcast therefore yields the
+  real event of THAT session (Stopped after a system revoke, a typed relay
+  Failed), and a record of any other session or run is never read. The main mirror takes at most one terminal event per session
+  and nothing from an older session (`acceptInMain`); the watcher ends
+  only on its own session's events; an orphaned `:xray` tunnel is stopped when
   a new main process starts; field-test core measurements
-  (`ACTION_MEASURE` -> Xray `measureDelay`).
+  (`ACTION_MEASURE` -> Xray `measureDelay`); B-WL7 tunnel byte totals
+  (`ACTION_QUERY_TRAFFIC` -> session id + two counts, asked only while the
+  main mirror shows that session Started).
 - Secrets never cross Intent/Binder: the XHTTP session config (VLESS uuid)
   is handed over as an Android-Keystore AES-GCM encrypted app-private file
   (`XhttpSessionConfigStore`), consumed once and deleted; stale files swept.

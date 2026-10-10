@@ -78,10 +78,11 @@ enum class TrafficProgressVerdict {
  * window) is reached. This object stays pure; VpnController alone acts on a
  * NO_PAYLOAD / STALLED_AFTER_INITIAL_PAYLOAD verdict by ending that session
  * with VpnError.DataPlaneNoTraffic (one bounded post-handshake check, never
- * a recurring watchdog, never a reconnect). Every non-AmneziaWG transport's `stats()`
- * still reports no real counters, so this call site honestly records
- * NOT_OBSERVED for them (see [TrafficProgressSample.fromCounters]) rather
- * than fabricating progress evidence.
+ * a recurring watchdog, never a reconnect). The samples come from
+ * `VpnTransport.dataPlaneCounters()`: AmneziaWG peer RX/TX, and (Direct
+ * attempts) the `:xray` core's VLESS-outbound totals; a transport with no
+ * counts (Hysteria2) yields no samples and no fabricated progress evidence
+ * (see [TrafficProgressSample.fromCounters]).
  */
 object TrafficProgressMonitor {
 

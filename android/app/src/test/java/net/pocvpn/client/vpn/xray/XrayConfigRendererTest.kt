@@ -105,6 +105,12 @@ class XrayConfigRendererTest {
                 "\"publicKey\":\"${"A".repeat(43)}\",\"shortId\":\"ab12cd34\"}}}]}",
         )
         val actual = JSONObject(XrayConfigRenderer.render(config))
+        // B-WL7 added the core-local `stats`/`policy` counters - they change
+        // nothing on the wire; everything else must stay exactly as captured.
+        assertTrue(
+            JSONObject("{\"stats\":{},\"policy\":{\"system\":{\"statsOutboundUplink\":true,\"statsOutboundDownlink\":true}}}")
+                .similar(JSONObject().put("stats", actual.remove("stats")).put("policy", actual.remove("policy"))),
+        )
         assertTrue("expected=$expected actual=$actual", expected.similar(actual))
     }
 

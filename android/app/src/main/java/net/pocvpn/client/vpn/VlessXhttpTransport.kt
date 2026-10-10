@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.xray.XrayProcessBridge
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
 import net.pocvpn.client.vpn.xray.XhttpSessionConfigStore
@@ -61,6 +63,7 @@ class VlessXhttpTransport(
         }
 
         val sessionId = XrayRuntimeState.nextSessionId()
+        activeSessionId = sessionId
         pendingConfigSessionId?.let(XhttpSessionConfigStore::remove)
 
         observerJob?.cancel()
@@ -130,6 +133,9 @@ class VlessXhttpTransport(
         pendingConfigSessionId?.let(XhttpSessionConfigStore::remove)
         pendingConfigSessionId = null
         if (state.value is TransportState.Error) {
+            // 3H - a Failed session may still own a core whose stop was not confirmed; let the
+            // service retry it. Disconnected stays immediate - no Stopped will come.
+            NovaXrayVpnService.sendBestEffortStop(context, activeSessionId)
             state.value = TransportState.Disconnected
             return
         }
@@ -137,11 +143,10 @@ class VlessXhttpTransport(
         state.value = TransportState.Disconnecting
 
         try {
-            val intent =
-                Intent(context, NovaXrayVpnService::class.java)
-                    .setAction(NovaXrayVpnService.ACTION_STOP)
-
-            context.startService(intent)
+            // An expected stop: marked for the main-process death watch before ACTION_STOP goes out.
+            XrayProcessBridge.stopSession(activeSessionId) {
+                context.startService(NovaXrayVpnService.stopIntent(context, activeSessionId))
+            }
         } catch (t: Throwable) {
             state.value =
                 TransportState.Error(
@@ -156,6 +161,11 @@ class VlessXhttpTransport(
         }
         if (state.value is TransportState.Disconnecting) state.value = TransportState.Disconnected
     }
+
+    // B-WL7 - the session whose `:xray` byte totals dataPlaneCounters() may report.
+    @Volatile private var activeSessionId: Long? = null
+
+    override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
 
     override fun observeState(): Flow<TransportState> =
         state.asStateFlow()
