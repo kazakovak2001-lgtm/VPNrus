@@ -133,6 +133,9 @@ class VlessXhttpTransport(
         pendingConfigSessionId?.let(XhttpSessionConfigStore::remove)
         pendingConfigSessionId = null
         if (state.value is TransportState.Error) {
+            // 3H - a Failed session may still own a core whose stop was not confirmed; let the
+            // service retry it. Disconnected stays immediate - no Stopped will come.
+            NovaXrayVpnService.sendBestEffortStop(context, activeSessionId)
             state.value = TransportState.Disconnected
             return
         }

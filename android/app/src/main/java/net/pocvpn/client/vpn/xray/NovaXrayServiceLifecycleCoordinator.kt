@@ -1,5 +1,6 @@
 package net.pocvpn.client.vpn.xray
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import net.pocvpn.client.reachability.EndpointId
@@ -92,13 +93,52 @@ class NovaXrayServiceLifecycleCoordinator(
         onRelayHealthLost: suspend () -> Unit = {},
         xhttpConfig: XrayVlessXhttpConfig? = null,
         sessionId: Long? = null,
+        onSuperseded: suspend (supersededSessionId: Long) -> Unit = {},
+        onSupersededFailed: (Throwable) -> Unit = {},
     ): XrayCoreStartOutcome = mutex.withLock {
-        val outcome = selectControllerLocked(endpointId).requestStart(
+        // 3D - a START whose session id is NEWER than the running session's (ids only grow) is a
+        // new owner asking for a new session, never a duplicate of the running one: the core that
+        // runs for the old session is stopped first, in the same lock hold, and the old session is
+        // reported through [onSuperseded] (the service publishes Stopped(old)) BEFORE the new
+        // session starts. Same, older or unknown ids keep AlreadyRunning (duplicate/stale START).
+        val running = runningSessionId
+        if (sessionId != null && running != null && sessionId > running) {
+            val stop = cachedController?.requestStop()
+            runningSessionId = null
+            if (stop?.didTeardown == true) {
+                // 3F - the old core may still be alive. No second core is started over it and
+                // Stopped(old) is NOT reported (it was not confirmed); the caller publishes
+                // Failed(new) from this outcome. 3H - only an UNCONFIRMED stop counts (a throwing
+                // stopLoop() whose core then reads stopped is a real stop); the shared
+                // [XrayCoreStopState] keeps later STARTs blocked and a later STOP retries.
+                if (stop.unconfirmed) {
+                    return@withLock XrayCoreStartOutcome.CoreStartFailed("previous session did not stop: ${stop.stopLoopFailureReason}")
+                }
+                // 3F - only a failing PUBLISH is tolerated here (reported through
+                // [onSupersededFailed]); the core is confirmed stopped, so the new START still runs.
+                // Cancellation always propagates.
+                try {
+                    onSuperseded(running)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    onSupersededFailed(e)
+                }
+            }
+        }
+        val controller = selectControllerLocked(endpointId)
+        if (controller == null) {
+            // 3H - the previous endpoint's core did not confirm its stop: no new controller.
+            runningSessionId = null
+            return@withLock XrayCoreStartOutcome.StopUnconfirmed("previous endpoint did not stop")
+        }
+        val outcome = controller.requestStart(
             kind,
             routingMode,
             confirmationContext,
             onRelayHealthLost,
             xhttpConfig,
+            relayHealthStop = { relayHealthStop(sessionId, onRelayHealthLost) },
         )
         runningSessionId = when (outcome) {
             XrayCoreStartOutcome.Started -> sessionId
@@ -127,30 +167,46 @@ class NovaXrayServiceLifecycleCoordinator(
      * torn down while a DIFFERENT known session is running: a late stop of
      * session N must never end session N+1.
      */
-    suspend fun stopSession(expectedSessionId: Long? = null): StoppedSession = mutex.withLock {
+    suspend fun stopSession(expectedSessionId: Long? = null): StoppedSession = mutex.withLock { stopSessionLocked(expectedSessionId) }
+
+    /**
+     * 3J - the relay-health watchdog's stop of [sessionId], under the SAME lock as every start and
+     * stop: a START can neither run between this stop and its report nor be overtaken by it, and
+     * the stop never reaches a different session (the [stopSession] identity check). The watchdog
+     * runs on its own coroutine and nothing here waits for it, so holding the lock cannot
+     * deadlock. [onRelayHealthLost] is reported (still under the lock, so before any later
+     * Started) only when THIS call tore down [sessionId]'s core; an unconfirmed stop is still
+     * reported as that failure, never as Stopped.
+     */
+    private suspend fun relayHealthStop(sessionId: Long?, onRelayHealthLost: suspend () -> Unit) = mutex.withLock {
+        val stopped = stopSessionLocked(sessionId)
+        if (stopped.outcome.didTeardown && stopped.sessionId == sessionId) onRelayHealthLost()
+    }
+
+    /** Caller must already hold [mutex]. */
+    private fun stopSessionLocked(expectedSessionId: Long?): StoppedSession {
         val running = runningSessionId
         if (expectedSessionId != null && running != null && running != expectedSessionId) {
-            return@withLock StoppedSession(XrayCoreStopOutcome(didTeardown = false), null, otherRunningSessionId = running)
+            return StoppedSession(XrayCoreStopOutcome(didTeardown = false), null, otherRunningSessionId = running)
         }
         val outcome = cachedController?.requestStop() ?: XrayCoreStopOutcome(didTeardown = false)
         val stopped = if (outcome.didTeardown) runningSessionId else null
         runningSessionId = null
-        StoppedSession(outcome, stopped)
+        return StoppedSession(outcome, stopped)
     }
 
-    /** Caller must already hold [mutex]. */
-    private fun selectControllerLocked(endpointId: EndpointId): XrayCoreController {
+    /** Caller must already hold [mutex]. Null (3H) when the old endpoint's stop was not confirmed - the old controller stays cached so a later STOP can retry it. */
+    private fun selectControllerLocked(endpointId: EndpointId): XrayCoreController? {
         cachedController?.let { existing ->
             if (controllerEndpointId == endpointId) return existing
             // Authoritative teardown of the OLD endpoint's controller BEFORE
             // this new one is even constructed - endpoint B can never start
             // while endpoint A's own session is still considered active by
-            // this coordinator. A's requestStop() outcome is irrelevant here
-            // (a not-running A is a harmless no-op, same as every other
-            // "nothing to tear down" case) - what matters is that this call
-            // always happens, and always completes, before B's controller
-            // is built, under the SAME lock.
-            existing.requestStop()
+            // this coordinator. A not-running A is a harmless no-op; an
+            // UNCONFIRMED stop of A (3H) builds nothing - A may still run.
+            // The call always happens, and always completes, before B's
+            // controller is built, under the SAME lock.
+            if (existing.requestStop().unconfirmed) return null
         }
         val fresh = controllerFactory(endpointId)
         cachedController = fresh

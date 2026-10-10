@@ -170,6 +170,9 @@ class VlessRealityTransport(
             // nothing left running to tear down, and no Stopped event will
             // ever arrive for that session. Reflect that directly instead of
             // sending ACTION_STOP and hanging at Disconnecting forever.
+            // 3H - a Failed session may still own a core whose stop was not confirmed; let the
+            // service retry it. Disconnected stays immediate - no Stopped will come.
+            NovaXrayVpnService.sendBestEffortStop(context, activeSessionId)
             state.value = TransportState.Disconnected
             return
         }

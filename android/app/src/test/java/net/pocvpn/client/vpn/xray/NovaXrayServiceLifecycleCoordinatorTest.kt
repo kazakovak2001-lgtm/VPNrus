@@ -308,7 +308,9 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(null, runtime, probeScope = this) }
 
         coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 300L)
-        assertEquals(XrayCoreStartOutcome.AlreadyRunning, coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 301L))
+        // 3D: only a duplicate (same id) or stale (older id) START is AlreadyRunning; a NEWER id
+        // supersedes the running session (see NovaXrayServiceLifecycleAlreadyRunningTest).
+        assertEquals(XrayCoreStartOutcome.AlreadyRunning, coordinator.start(endpointA, TransportKind.XRAY_REALITY, sessionId = 300L))
 
         assertEquals(300L, coordinator.stopSession().sessionId)
     }
