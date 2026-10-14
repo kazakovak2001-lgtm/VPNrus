@@ -71,6 +71,9 @@ private val network = NetworkProfile(
  */
 class VpnControllerXrayDataPlaneGateTest {
 
+    // P2: the bounded Xray check now spans verification (10s) + stall (65s), so "past the window" is > 75s.
+    private val XRAY_WINDOW_MILLIS = 76_000L
+
     private class Harness(val controller: VpnController, val xray: FakeVpnTransport, val diagnostics: DiagnosticsStore, val store: TransportObservationStore)
 
     private fun TestScope.connectXray(dataPlane: (Int) -> TransportStats): Harness {
@@ -107,7 +110,7 @@ class VpnControllerXrayDataPlaneGateTest {
         start(h)
         assertTrue(h.controller.state.value is TransportState.Connected)
 
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         val state = h.controller.state.value
@@ -125,7 +128,7 @@ class VpnControllerXrayDataPlaneGateTest {
         val h = connectXray { n -> TransportStats.Counters(bytesReceived = 512L, bytesSent = 1_000L + n * 300L, lastHandshakeEpochMillis = null) }
         start(h)
 
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         assertTrue(h.controller.state.value is TransportState.Error)
@@ -139,7 +142,7 @@ class VpnControllerXrayDataPlaneGateTest {
         start(working)
         start(idle)
 
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         assertTrue(working.controller.state.value is TransportState.Connected)
@@ -153,7 +156,7 @@ class VpnControllerXrayDataPlaneGateTest {
         val h = connectXray { _ -> TransportStats.Unsupported }
         start(h)
 
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         assertTrue(h.controller.state.value is TransportState.Connected)
@@ -165,7 +168,7 @@ class VpnControllerXrayDataPlaneGateTest {
         val h = connectXray { _ -> TransportStats.Unavailable }
         start(h)
 
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         assertTrue(h.controller.state.value is TransportState.Connected)
@@ -181,7 +184,7 @@ class VpnControllerXrayDataPlaneGateTest {
 
         h.controller.disconnect()
         runCurrent()
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         assertTrue(h.controller.state.value is TransportState.Disconnected)
@@ -200,7 +203,7 @@ class VpnControllerXrayDataPlaneGateTest {
         val error = requireNotNull(xrayTransportStateFor(XrayRuntimeEvent.Failed(77L, XrayProcessBridge.DIED_REASON), sessionId = 77L))
         h.xray.forceState(error)
         runCurrent()
-        advanceTimeBy(31_000)
+        advanceTimeBy(XRAY_WINDOW_MILLIS)
         runCurrent()
 
         val state = h.controller.state.value
@@ -208,5 +211,28 @@ class VpnControllerXrayDataPlaneGateTest {
         assertEquals(XrayProcessBridge.DIED_REASON, (state as TransportState.Error).message)
         assertEquals(VpnError.HandshakeTimeout, h.diagnostics.snapshot.value.lastError)
         assertEquals(0, h.xray.disconnectCallCount)
+    }
+
+    @Test
+    fun `P2 - Xray uplink-only is not torn down at 20s, only after the 65s stall window`() = runTest {
+        // This harness wires only a REALITY profile; TLS_TCP/XRAY_XHTTP get the same policy from
+        // TrafficProgressPolicy.forTransport(transport.kind) - covered in TrafficProgressMonitorTest.
+        val h = connectXray { n -> TransportStats.Counters(bytesReceived = 0L, bytesSent = n * 300L, lastHandshakeEpochMillis = null) }
+        start(h)
+
+        advanceTimeBy(21_000)
+        runCurrent()
+        assertTrue("at 21s", h.controller.state.value is TransportState.Connected)
+
+        advanceTimeBy(43_000) // 64s
+        runCurrent()
+        assertTrue("at 64s", h.controller.state.value is TransportState.Connected)
+        assertEquals(0, h.xray.disconnectCallCount)
+
+        advanceTimeBy(2_000) // 66s
+        runCurrent()
+        assertTrue("at 66s", h.controller.state.value is TransportState.Error)
+        assertEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+        assertEquals(TrafficProgressOutcome.NO_PAYLOAD, h.store.recent(fingerprint()).single().progress)
     }
 }

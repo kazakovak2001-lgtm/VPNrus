@@ -3530,7 +3530,10 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   the counters cannot tell an upload awaiting a delayed reply from a dead
   exit, so such a healthy Direct Xray session can be ended with
   `DataPlaneNoTraffic` (decision-logic behavior; frequency unknown; not
-  reproduced on a device; see ROADMAP). Separate: before the
+  reproduced on a device; see ROADMAP). P2 mitigation: the policy is chosen
+  by the sampled transport's kind (`TrafficProgressPolicy.forTransport`) -
+  Xray family stall window 65 s, AWG/others 20 s, verification 10 s for
+  all; this only narrows M1, it does not resolve it. Separate: before the
   death-time Failed above, an unexpected `:xray` death was reported only
   after `DEATH_GRACE_MS` (~2.3 s measured) with the UI still Protected
   while the VPN network was gone. Packets leaving the device in that window

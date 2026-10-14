@@ -1,5 +1,6 @@
 package net.pocvpn.client.smartconnect
 
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportStats
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -101,5 +102,45 @@ class TrafficProgressMonitorTest {
             threw = true
         }
         assertEquals(true, threw)
+    }
+
+    // P2 (M1 mitigation) - per-transport stall window.
+
+    @Test
+    fun `Xray family transports get the 65s stall window`() {
+        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)) {
+            assertEquals(kind.name, 65_000L, TrafficProgressPolicy.forTransport(kind).stallWindowMillis)
+        }
+    }
+
+    @Test
+    fun `AWG and every other transport keep the 20s stall window`() {
+        for (kind in TransportKind.values().filterNot { it == TransportKind.XRAY_REALITY || it == TransportKind.TLS_TCP || it == TransportKind.XRAY_XHTTP }) {
+            assertEquals(kind.name, 20_000L, TrafficProgressPolicy.forTransport(kind).stallWindowMillis)
+        }
+        assertEquals(TrafficProgressPolicy(), TrafficProgressPolicy.forTransport(TransportKind.AMNEZIA_WG))
+    }
+
+    @Test
+    fun `verification window stays 10s for every transport`() {
+        for (kind in TransportKind.values()) {
+            assertEquals(kind.name, 10_000L, TrafficProgressPolicy.forTransport(kind).verificationWindowMillis)
+        }
+    }
+
+    @Test
+    fun `Xray uplink-only past 20s but under 65s is not yet a stall, AWG with the same samples is`() {
+        val samples = listOf(sample(0, 0, 0), sample(30_000, 0, 9_000), sample(64_500, 0, 18_000))
+        assertEquals(TrafficProgressVerdict.VERIFYING, TrafficProgressMonitor.evaluate(samples, TrafficProgressPolicy.forTransport(TransportKind.XRAY_REALITY)))
+        assertEquals(TrafficProgressVerdict.NO_PAYLOAD, TrafficProgressMonitor.evaluate(samples, TrafficProgressPolicy.forTransport(TransportKind.AMNEZIA_WG)))
+    }
+
+    @Test
+    fun `Xray stall logic still applies once the 65s window is exceeded`() {
+        val xray = TrafficProgressPolicy.forTransport(TransportKind.XRAY_XHTTP)
+        val noPayload = listOf(sample(0, 0, 0), sample(65_000, 0, 18_000))
+        val stalled = listOf(sample(0, 0, 0), sample(500, 512, 300), sample(65_500, 512, 18_000))
+        assertEquals(TrafficProgressVerdict.NO_PAYLOAD, TrafficProgressMonitor.evaluate(noPayload, xray))
+        assertEquals(TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD, TrafficProgressMonitor.evaluate(stalled, xray))
     }
 }
