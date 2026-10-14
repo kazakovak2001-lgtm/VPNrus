@@ -3526,7 +3526,11 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Manual pinned Xray ends in Error with no substitute; Auto advances.
   Device (OPPO, 2026-10-09): healthy REALITY (11 runs) and TLS (1 run)
   sessions reached `VERIFIED` with rx/tx growing both ways and were never
-  torn down; the teardown path is unit-tested only. Separate: before the
+  torn down; the teardown path is unit-tested only. Known limitation M1:
+  the counters cannot tell an upload awaiting a delayed reply from a dead
+  exit, so such a healthy Direct Xray session can be ended with
+  `DataPlaneNoTraffic` (decision-logic behavior; frequency unknown; not
+  reproduced on a device; see ROADMAP). Separate: before the
   death-time Failed above, an unexpected `:xray` death was reported only
   after `DEATH_GRACE_MS` (~2.3 s measured) with the UI still Protected
   while the VPN network was gone. Packets leaving the device in that window
