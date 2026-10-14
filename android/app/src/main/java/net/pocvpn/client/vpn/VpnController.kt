@@ -1828,7 +1828,8 @@ class VpnController(
             // check alone could not.
             val ownedGeneration = reconnectGeneration
             progressObservationJob = scope.launch {
-                val policy = TrafficProgressPolicy()
+                // Keyed on the sampled transport's own kind - the one place both lifecycle paths build a policy.
+                val policy = TrafficProgressPolicy.forTransport(transport.kind)
                 val maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
                 val samples = mutableListOf<TrafficProgressSample>()
                 var verdict = TrafficProgressVerdict.VERIFYING

@@ -1,5 +1,6 @@
 package net.pocvpn.client.smartconnect
 
+import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.TransportStats
 
 /**
@@ -37,6 +38,20 @@ data class TrafficProgressPolicy(
     companion object {
         const val DEFAULT_VERIFICATION_WINDOW_MILLIS: Long = 10_000L
         const val DEFAULT_STALL_WINDOW_MILLIS: Long = 20_000L
+
+        /**
+         * P2 (M1 mitigation) - Xray-family stall window. Longer than the
+         * default so a briefly quiet uplink-only Xray session is not torn
+         * down early; NOT evidence of a healthy data plane, and it delays
+         * detection of a really dead one.
+         */
+        const val XRAY_STALL_WINDOW_MILLIS: Long = 65_000L
+
+        private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
+
+        /** Policy for the ACTIVE transport [kind]: Xray family gets [XRAY_STALL_WINDOW_MILLIS], everything else (AWG included) the defaults. */
+        fun forTransport(kind: TransportKind): TrafficProgressPolicy =
+            if (kind in XRAY_FAMILY) TrafficProgressPolicy(stallWindowMillis = XRAY_STALL_WINDOW_MILLIS) else TrafficProgressPolicy()
     }
 }
 
