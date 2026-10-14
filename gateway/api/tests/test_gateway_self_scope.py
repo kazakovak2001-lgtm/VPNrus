@@ -164,11 +164,11 @@ class WatchdogPathFixtureTests(unittest.TestCase):
             return handle.read()
 
     def _function_body(self, text, name):
-        start = re.search(rf"private (suspend )?fun {name}\(", text).start()
-        # Members sit at 4-space indent: the next such line is the
-        # function's own closing brace.
-        nxt = re.search(r"\n    \S", text[start + 1:])
-        return text[start:start + 1 + nxt.start()]
+        match = re.search(rf"private (suspend )?fun {name}\(", text)
+        # Balance the parameter list first (a multi-line signature ends in
+        # a 4-space-indented ") {"), then the body's braces.
+        i = _matching_close(text, match.end() - 1, "(", ")")
+        return text[match.start():_matching_close(text, text.index("{", i), "{", "}")]
 
     def test_probe_path_constant(self):
         self.assertEqual(TUNNEL_PROBE_PATH, kotlin_tunnel_probe_path(self._text()))
@@ -183,6 +183,16 @@ class WatchdogPathFixtureTests(unittest.TestCase):
         for body in (watchdog, confirm):
             self.assertNotIn("relay-health", body)
             self.assertNotIn("/v1/manifest", body)
+
+
+def _matching_close(text, i, opening, closing):
+    """Index just past the bracket that closes the one at text[i]."""
+    depth = 0
+    while True:
+        depth += {opening: 1, closing: -1}.get(text[i], 0)
+        i += 1
+        if depth == 0:
+            return i
 
 
 def kotlin_tunnel_probe_path(text):

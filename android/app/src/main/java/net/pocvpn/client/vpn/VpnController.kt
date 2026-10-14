@@ -652,7 +652,7 @@ class VpnController(
                 ) {
                     diagnostics.recordError(VpnError.HandshakeTimeout)
                 }
-                recordStateDrivenOutcome(newTransport.kind, transportState)
+                recordStateDrivenOutcome(newTransport, transportState)
                 // Unlike the diagnostics.recordError block just above,
                 // [publishReconnectIncidentStarted] below is NOT restricted
                 // to newTransport.kind - this condition can be satisfied for
@@ -672,7 +672,10 @@ class VpnController(
                 // recovery.) As with the rest of this class, this ordering
                 // argument relies on [scope] being confined to a single
                 // thread in production (viewModelScope's Dispatchers.Main.immediate) -
-                // it is not a dispatcher-independent guarantee.
+                // it is not a dispatcher-independent guarantee. A Direct Xray
+                // sampler (started from recordStateDrivenOutcome) needs no
+                // such ordering: an async `:xray` Failed moves _state off
+                // Connected first, and failDeadDataPlane re-checks that.
                 val failureIncidentGeneration = if (
                     transportState is TransportState.Error &&
                     _state.value is TransportState.Connected &&
@@ -1603,8 +1606,16 @@ class VpnController(
         return if (binding.port == config.serverPort) config else config.copy(serverPort = binding.port)
     }
 
-    /** See [pendingStateOutcome]. No-op for any state other than the attempt's first Connected/Error. */
-    private fun recordStateDrivenOutcome(kind: TransportKind, transportState: TransportState) {
+    /**
+     * See [pendingStateOutcome]. No-op for any state other than the attempt's
+     * first Connected/Error. A first Connected also starts the B-WL7
+     * post-connect data-plane check (Direct non-AWG attempts only - exactly
+     * the attempts [pendingStateOutcome] is armed for); it only acts when the
+     * transport reports real tunnel byte counts (Xray today), see
+     * [launchLiveProgressObservation].
+     */
+    private fun recordStateDrivenOutcome(transport: VpnTransport, transportState: TransportState) {
+        val kind = transport.kind
         val pending = pendingStateOutcome ?: return
         if (pending.kind != kind) return
         val success = when (transportState) {
@@ -1625,6 +1636,7 @@ class VpnController(
             ),
         )
         recordPathHistory(success = success, kind = kind, endpointId = pending.endpointId, nowEpochMillis = nowEpochMillis)
+        if (success) launchLiveProgressObservation(endpointId = pending.endpointId, transport = transport, recordWithoutSamples = false)
     }
 
     private fun recordConnectionOutcome(
@@ -1738,16 +1750,18 @@ class VpnController(
 
     /**
      * B-WL7 - launches the bounded, OBSERVATIONAL-ONLY live traffic-progress
-     * sample for the attempt that JUST reached a real, fresh handshake (the
-     * ONE production caller is doConnectAttempt's AmneziaWG success branch -
-     * see its own docs for why a reconnect-recovery success never calls this,
+     * sample for the attempt that JUST reached a real, fresh handshake (two
+     * production callers: doConnectAttempt's AmneziaWG success branch, and
+     * [recordStateDrivenOutcome] for a Direct non-AWG attempt's first
+     * confirmed Connected - see doConnectAttempt's docs for why a
+     * reconnect-recovery success never calls this,
      * same "one logical outcome per attempt" model
      * [recordTransportBehaviorObservation] already follows). Runs in [scope]
      * so it never blocks doConnectAttempt's own return or delays the
      * Connected transition by even one poll interval - this is additive
      * evidence collection, not a gate.
      *
-     * Samples [transport]'s real `stats()` at the SAME
+     * Samples [transport]'s real `dataPlaneCounters()` at the SAME
      * [HANDSHAKE_POLL_INTERVAL_MS] cadence [awaitFreshHandshake] already
      * polls at (no second polling cadence invented), converting each sample
      * via [TrafficProgressSample.fromCounters] and feeding the accumulated
@@ -1757,7 +1771,7 @@ class VpnController(
      * `verificationWindowMillis + stallWindowMillis` worth of polls, whichever
      * comes first - so this always terminates in bounded time, never loops
      * indefinitely, and is never itself a second watchdog. A transport whose
-     * `stats()` is [TransportStats.Unsupported]/[TransportStats.NotImplemented]
+     * `dataPlaneCounters()` is [TransportStats.Unsupported]/[TransportStats.NotImplemented]
      * (i.e. there is nothing to observe) breaks out on the FIRST poll rather
      * than spending the whole window doing nothing - the resulting empty
      * sample list evaluates to [TrafficProgressVerdict.VERIFYING], which
@@ -1768,6 +1782,12 @@ class VpnController(
      * wall-clock, and exactly as fast-forwardable under
      * kotlinx-coroutines-test's virtual time as [awaitFreshHandshake]'s own
      * poll loop already is.
+     *
+     * [recordWithoutSamples] false (the state-driven caller) skips the write
+     * when not a single Counters sample arrived - a transport with no byte
+     * counts (Hysteria2) or an unreachable `:xray` adds no observation at
+     * all, rather than a new NOT_OBSERVED record the pre-existing evidence
+     * pipeline never received for those kinds.
      *
      * Writes exactly ONE [TransportAttemptObservation] via
      * [recordLiveProgressObservation] once the loop ends - never one per
@@ -1780,11 +1800,12 @@ class VpnController(
      * STALLED_AFTER_INITIAL_PAYLOAD) is the one exception to "observation
      * only": after the observation is recorded, [failDeadDataPlane] ends the
      * session with [VpnError.DataPlaneNoTraffic] instead of leaving a false
-     * Protected (RU field test: AWG handshake up, no data). Every other
+     * Protected (RU field test: AWG handshake up, no data; for Xray: core
+     * up and B33-confirmed, then no VLESS bytes back). Every other
      * verdict (VERIFIED, IDLE, UNAVAILABLE, still VERIFYING at the window
      * end) leaves the session untouched.
      */
-    private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport) {
+    private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport, recordWithoutSamples: Boolean = true) {
         val store = transportObservationStore
         // Same synchronized(reconnectOwnershipLock) discipline startReconnect()
         // already uses for reconnectJob - never a bare, unsynchronized
@@ -1812,14 +1833,18 @@ class VpnController(
                 val samples = mutableListOf<TrafficProgressSample>()
                 var verdict = TrafficProgressVerdict.VERIFYING
                 for (pollIndex in 0..maxPolls) {
-                    val stats = transport.stats()
+                    val stats = transport.dataPlaneCounters()
                     if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) break
                     TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
                     verdict = TrafficProgressMonitor.evaluate(samples, policy)
                     if (verdict != TrafficProgressVerdict.VERIFYING) break
                     if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
                 }
-                store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
+                // One non-secret line per attempt (kind, verdict, sample count, final byte totals) for field diagnostics.
+                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size} rx=${samples.lastOrNull()?.bytesReceived} tx=${samples.lastOrNull()?.bytesSent}")
+                if (recordWithoutSamples || samples.isNotEmpty()) {
+                    store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
+                }
                 if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
                     failDeadDataPlane(endpointId, transport, verdict, ownedGeneration)
                 }

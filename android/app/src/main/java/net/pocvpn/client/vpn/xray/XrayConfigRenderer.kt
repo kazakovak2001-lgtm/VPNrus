@@ -53,11 +53,15 @@ object XrayConfigRenderer {
     private const val VLESS_XHTTP_OUTBOUND_TAG = "nova-vless-xhttp-out"
     private const val TUN_INTERFACE_NAME = "nova-xray-tun"
 
+    /** The VLESS tunnel outbounds - the only ones [XrayTrafficCounters] counts as tunnel traffic. */
+    val TUNNEL_OUTBOUND_TAGS: Set<String> = setOf(VLESS_OUTBOUND_TAG, VLESS_TLS_OUTBOUND_TAG, VLESS_XHTTP_OUTBOUND_TAG)
+
     fun render(config: XrayVlessRealityConfig): String {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning").put("access", "none"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessRealityOutbound(config)))
+        putOutboundTrafficStats(root)
         return root.toString()
     }
 
@@ -67,7 +71,27 @@ object XrayConfigRenderer {
         root.put("log", JSONObject().put("loglevel", "warning").put("access", "none"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessTlsOutbound(config)))
+        putOutboundTrafficStats(root)
         return root.toString()
+    }
+
+    /**
+     * B-WL7 - enables xray-core's per-outbound byte counters (infra/conf/xray.go
+     * `stats`, infra/conf/policy.go `policy.system.statsOutboundUplink/
+     * statsOutboundDownlink`, verified at v26.7.28). Without the `stats`
+     * object the core registers a no-op stats manager and
+     * `queryAllOutboundTrafficStats()` returns nothing. Counts only - no
+     * per-user stats, no stats API inbound, nothing leaves the process.
+     */
+    private fun putOutboundTrafficStats(root: JSONObject) {
+        root.put("stats", JSONObject())
+        root.put(
+            "policy",
+            JSONObject().put(
+                "system",
+                JSONObject().put("statsOutboundUplink", true).put("statsOutboundDownlink", true),
+            ),
+        )
     }
 
     /**
@@ -80,6 +104,7 @@ object XrayConfigRenderer {
         root.put("log", JSONObject().put("loglevel", "warning").put("access", "none"))
         root.put("inbounds", JSONArray().put(renderTunInbound(config.mtu)))
         root.put("outbounds", JSONArray().put(renderVlessXhttpOutbound(config)))
+        putOutboundTrafficStats(root)
         return root.toString()
     }
 

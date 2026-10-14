@@ -53,6 +53,24 @@ sealed class XrayCoreStartOutcome {
      * never left half-up.
      */
     data class RemoteUnconfirmed(val reason: String) : XrayCoreStartOutcome()
+
+    /**
+     * 3H - an earlier stop of the shared core could not be confirmed ([XrayCoreStopState]): the
+     * native core may still run, so no tun was established and startLoop() was not called
+     * (the pinned wrapper's StartLoop() silently returns success while its core still runs).
+     */
+    data class StopUnconfirmed(val reason: String) : XrayCoreStartOutcome()
+}
+
+/**
+ * 3H - "a stop of the native core could not be confirmed", shared by every [XrayCoreController]
+ * that drives the SAME [XrayCoreRuntime] (a released [XrayServiceLifecycleGate] alone never
+ * means the core is down). While [unconfirmedReason] is set no controller starts a core; only
+ * a later stop that [XrayCoreRuntime.isRunning] confirms clears it.
+ */
+class XrayCoreStopState {
+    @Volatile var unconfirmedReason: String? = null
+        internal set
 }
 
 /**
@@ -158,6 +176,8 @@ data class XrayCoreStopOutcome(
     val didTeardown: Boolean,
     /** Non-null only if stopLoop() itself threw - the tun is still closed regardless (see [requestStop][XrayCoreController.requestStop]). */
     val stopLoopFailureReason: String? = null,
+    /** 3H - true when the core may still run after this stop ([XrayCoreStopState]); never report it as stopped. */
+    val unconfirmed: Boolean = false,
 )
 
 /**
@@ -200,6 +220,10 @@ class XrayCoreController(
     // can use its own controllable scope/dispatcher instead of a real
     // background thread.
     private val probeScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    // 3H - must be the SAME instance for every controller on the same [coreRuntime]
+    // (NovaXrayVpnService passes the process-wide one); the default suits a controller
+    // that owns its runtime alone.
+    private val stopState: XrayCoreStopState = XrayCoreStopState(),
 ) {
     private val lifecycleGate = XrayServiceLifecycleGate()
 
@@ -263,6 +287,11 @@ class XrayCoreController(
         // .Relayed] already established.
         onRelayHealthLost: suspend () -> Unit = {},
         xhttpConfig: XrayVlessXhttpConfig? = null,
+        // 3J - when set, the watchdog hands its whole "stop this session, then report it" step
+        // to the caller instead of calling [requestStop]/[onRelayHealthLost] itself, so the
+        // caller can serialize it with every other start/stop (see
+        // NovaXrayServiceLifecycleCoordinator.start). Null keeps the direct, uncoordinated path.
+        relayHealthStop: (suspend () -> Unit)? = null,
     ): XrayCoreStartOutcome {
         when (lifecycleGate.tryBeginStart()) {
             XrayServiceStartDecision.IGNORE_ALREADY_RUNNING -> return XrayCoreStartOutcome.AlreadyRunning
@@ -279,6 +308,13 @@ class XrayCoreController(
 
         var success = false
         try {
+            // 3H - never a tun or startLoop() over a core whose stop was not confirmed. A runtime
+            // that now reports the core down (wrapper contract: IsRunning is cleared by its own
+            // shutdown) lifts the block; anything else keeps it.
+            stopState.unconfirmedReason?.let { reason ->
+                if (coreReportsRunning()) return XrayCoreStartOutcome.StopUnconfirmed(reason)
+                stopState.unconfirmedReason = null
+            }
             val ready = when (kind) {
                 TransportKind.TLS_TCP -> {
                     val tlsRepo = tlsRepository
@@ -338,7 +374,7 @@ class XrayCoreController(
                     // own docs for exactly why only [RemoteConfirmationContext
                     // .Relayed] qualifies).
                     if (confirmationContext is RemoteConfirmationContext.Relayed) {
-                        startRelayHealthWatchdog(confirmationContext.exitProbeHost, onRelayHealthLost)
+                        startRelayHealthWatchdog(confirmationContext.exitProbeHost, onRelayHealthLost, relayHealthStop)
                     }
                     XrayCoreStartOutcome.Started
                 } else {
@@ -349,14 +385,15 @@ class XrayCoreController(
                     // means tryBeginTeardown() will never fire for this
                     // attempt (isRunning was never set true), so this is the
                     // ONLY teardown this attempt will ever get.
-                    val stopReason = try {
-                        coreRuntime.stopLoop()
-                        null
-                    } catch (t: Throwable) {
-                        t.javaClass.simpleName
-                    }
+                    val stop = stopCore()
                     closeTun()
-                    XrayCoreStartOutcome.RemoteUnconfirmed(stopReason?.let { "remote handshake not confirmed (stopLoop also failed: $it)" } ?: "remote handshake not confirmed")
+                    XrayCoreStartOutcome.RemoteUnconfirmed(
+                        when {
+                            stop.unconfirmed -> "remote handshake not confirmed (core stop unconfirmed: ${stop.reason})"
+                            stop.reason != null -> "remote handshake not confirmed (stopLoop also failed: ${stop.reason})"
+                            else -> "remote handshake not confirmed"
+                        },
+                    )
                 }
             } catch (t: Throwable) {
                 closeTun()
@@ -569,7 +606,11 @@ class XrayCoreController(
      * later, different session, by construction (never keyed on a
      * separately-tracked session id that could drift).
      */
-    private fun startRelayHealthWatchdog(exitProbeHost: String, onUnhealthy: suspend () -> Unit) {
+    private fun startRelayHealthWatchdog(
+        exitProbeHost: String,
+        onUnhealthy: suspend () -> Unit,
+        coordinatedStop: (suspend () -> Unit)?,
+    ) {
         val url = "https://$exitProbeHost$TUNNEL_PROBE_PATH"
         relayHealthWatchdogJob = probeScope.launch {
             var consecutiveFailures = 0
@@ -590,9 +631,15 @@ class XrayCoreController(
                     // null, rather than this coroutine cancelling itself and
                     // risking onUnhealthy() below never running (cancellation
                     // is cooperative, but there is no reason to court it).
-                    relayHealthWatchdogJob = null
-                    requestStop()
-                    onUnhealthy()
+                    // 3J - only this watchdog's own job is cleared: a newer session's watchdog
+                    // already stored here must stay cancellable by its own stop.
+                    if (relayHealthWatchdogJob === coroutineContext[Job]) relayHealthWatchdogJob = null
+                    if (coordinatedStop != null) {
+                        coordinatedStop()
+                    } else {
+                        requestStop()
+                        onUnhealthy()
+                    }
                     return@launch
                 }
             }
@@ -651,6 +698,9 @@ class XrayCoreController(
          * a build using this path ships.
          */
         const val TUNNEL_PROBE_PATH = "/v1/tunnel-probe"
+
+        /** 3H - first stopLoop() plus one retry, see [stopCore]. */
+        const val STOP_ATTEMPTS = 2
     }
 
     fun requestStop(): XrayCoreStopOutcome {
@@ -663,15 +713,49 @@ class XrayCoreController(
         // is safe regardless, this just avoids the pointless overlap.
         relayHealthWatchdogJob?.cancel()
         relayHealthWatchdogJob = null
-        if (!lifecycleGate.tryBeginTeardown()) return XrayCoreStopOutcome(didTeardown = false)
-        val failureReason = try {
-            coreRuntime.stopLoop()
-            null
-        } catch (t: Throwable) {
-            t.javaClass.simpleName
+        // 3H - a released gate with an unconfirmed stop still has a core to stop: retry it.
+        if (!lifecycleGate.tryBeginTeardown() && stopState.unconfirmedReason == null) {
+            return XrayCoreStopOutcome(didTeardown = false)
+        }
+        val stop = try {
+            stopCore()
         } finally {
             closeTun()
         }
-        return XrayCoreStopOutcome(didTeardown = true, stopLoopFailureReason = failureReason)
+        return XrayCoreStopOutcome(didTeardown = true, stopLoopFailureReason = stop.reason, unconfirmed = stop.unconfirmed)
+    }
+
+    private class CoreStop(val reason: String?, val unconfirmed: Boolean)
+
+    /**
+     * 3H - stopLoop() at most [STOP_ATTEMPTS] times, synchronously (each call is as bounded as
+     * the first one; nothing new can block longer). Confirmed only by [XrayCoreRuntime.isRunning]
+     * reading false afterwards: in the pinned wrapper (AndroidLibXrayLite c634d1b,
+     * libv2ray_main.go) StopLoop() is idempotent under its own mutex and its doShutdown()
+     * always clears IsRunning, so a throwing call that still leaves it true, or an unreadable
+     * flag, is unconfirmed. Sets or clears [stopState] accordingly.
+     */
+    private fun stopCore(): CoreStop {
+        var reason: String? = null
+        repeat(STOP_ATTEMPTS) {
+            try {
+                coreRuntime.stopLoop()
+            } catch (t: Throwable) {
+                reason = t.javaClass.simpleName
+            }
+            if (!coreReportsRunning()) {
+                stopState.unconfirmedReason = null
+                return CoreStop(reason, unconfirmed = false)
+            }
+        }
+        val unconfirmed = reason ?: "core still running after stopLoop"
+        stopState.unconfirmedReason = unconfirmed
+        return CoreStop(unconfirmed, unconfirmed = true)
+    }
+
+    private fun coreReportsRunning(): Boolean = try {
+        coreRuntime.isRunning
+    } catch (t: Throwable) {
+        true
     }
 }

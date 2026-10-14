@@ -58,7 +58,9 @@ class NovaXrayVpnService : VpnService() {
 
     private var tunInterface: ParcelFileDescriptor? = null
 
-    private val coreRuntime: XrayCoreRuntime = LibXrayCoreRuntime()
+    // 3H - process-wide (see [XrayProcessCore]): a new service instance in the same `:xray`
+    // process must drive the SAME native controller and see the same unconfirmed stop.
+    private val coreRuntime: XrayCoreRuntime = XrayProcessCore.runtime
 
     private val supervisorJob = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + supervisorJob)
@@ -110,6 +112,7 @@ class NovaXrayVpnService : VpnService() {
                 // destroyed, rather than an independent, never-cleaned-up
                 // scope living for the process's whole lifetime.
                 probeScope = scope,
+                stopState = XrayProcessCore.stopState,
             )
         }
     }
@@ -122,7 +125,32 @@ class NovaXrayVpnService : VpnService() {
     // doing nothing.
     @Volatile private var currentSessionId: Long = 0L
 
+    // START, STOP and revoke run one at a time in intent arrival order (see XrayLifecycleQueue).
+    private val lifecycleQueue = XrayLifecycleQueue(scope) { t -> Log.e(TAG, "lifecycle command failed: ${t.javaClass.simpleName}") }
+
+    private fun enqueueLifecycle(command: suspend () -> Unit) = lifecycleQueue.enqueue(command)
+
+    // Work of one lifecycle request stops the service only while no newer
+    // request exists, and only via stopSelf(startId) - see XrayServiceStopGate.
+    private val stopGate = XrayServiceStopGate()
+
+    /** [token] null = no stop (the service is already being destroyed). */
+    private fun stopSelfIfOwned(token: Long?) {
+        if (token == null) return
+        val startId = stopGate.stopStartIdFor(token)
+        if (startId == null) {
+            Log.i(TAG, "not stopping the service - a newer start/stop request owns it")
+        } else {
+            stopSelf(startId)
+        }
+    }
+
+    // B-WL7 - running totals of the core's resetting outbound counters for
+    // the session that last reached Started (see XrayTrafficCounters).
+    private val trafficCounters = XrayTrafficCounters()
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        stopGate.onStartCommand(startId)
         when (intent?.action) {
             XrayProcessBridge.ACTION_MEASURE -> {
                 // Field test: the Nova app is excluded from its own Xray tunnel
@@ -142,12 +170,29 @@ class NovaXrayVpnService : VpnService() {
                 }
                 return Service.START_NOT_STICKY
             }
+            XrayProcessBridge.ACTION_QUERY_TRAFFIC -> {
+                // B-WL7: byte counts only (no config, no destinations) for
+                // VpnController's bounded post-connect data-plane check.
+                val requestId = intent.getLongExtra(XrayProcessBridge.EXTRA_REQUEST_ID, 0L)
+                scope.launch {
+                    val totals = if (coreRuntime.isRunning) {
+                        try { trafficCounters.add(coreRuntime.queryAllOutboundTrafficStats()) } catch (t: Throwable) { null }
+                    } else {
+                        null
+                    }
+                    XrayProcessBridge.publishTrafficResult(this@NovaXrayVpnService, requestId, totals)
+                }
+                return Service.START_NOT_STICKY
+            }
             ACTION_STOP -> {
-                teardown("explicit stop")
+                // The session the transport is stopping; absent = stop whatever runs.
+                val sessionId = if (intent.hasExtra(EXTRA_SESSION_ID)) intent.getLongExtra(EXTRA_SESSION_ID, 0L) else null
+                teardown("explicit stop", sessionId, stopGate.onLifecycleRequest())
                 return Service.START_NOT_STICKY
             }
 
             ACTION_START -> {
+                val lifecycleToken = stopGate.onLifecycleRequest()
                 val sessionId = intent.getLongExtra(EXTRA_SESSION_ID, currentSessionId)
                 currentSessionId = sessionId
                 // B8O2 - defaults to XRAY_REALITY so an intent built by any
@@ -183,7 +228,7 @@ class NovaXrayVpnService : VpnService() {
                 // defect, never silently downgraded to Direct - see
                 // startIfNotAlreadyRunning's own handling.
                 val relayExitProbeHost = intent.getStringExtra(EXTRA_RELAY_EXIT_PROBE_HOST)
-                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode, isRelayed, relayExitProbeHost)
+                startIfNotAlreadyRunning(sessionId, kind, endpointId, routingMode, isRelayed, relayExitProbeHost, lifecycleToken)
                 return Service.START_NOT_STICKY
             }
 
@@ -202,7 +247,7 @@ class NovaXrayVpnService : VpnService() {
         if (intent?.action == XrayProcessBridge.ACTION_WATCH) watchBinder else super.onBind(intent)
 
     override fun onRevoke() {
-        teardown("permission revoked")
+        teardown("permission revoked", null, stopGate.onLifecycleRequest())
     }
 
     // B13 (PR #25 review fix) - teardown is now itself async (it must
@@ -213,8 +258,12 @@ class NovaXrayVpnService : VpnService() {
     // Instead the job this launches cancels [supervisorJob] itself, from
     // its own completion handler, so cancellation only happens AFTER
     // teardown has genuinely finished (or been safely skipped as a no-op).
+    // The one unscoped teardown: the service object itself is going away, so
+    // whatever core it holds must stop. Session work never gets here while a
+    // newer start/stop request exists (stopSelfIfOwned), so this cannot end a
+    // session that was requested after the decision to stop.
     override fun onDestroy() {
-        val job = scope.launch { teardownAndPublish("service destroyed") }
+        val job = scope.launch { teardownAndPublish("service destroyed", expectedSessionId = null, stopToken = null) }
         job.invokeOnCompletion { supervisorJob.cancel() }
         super.onDestroy()
     }
@@ -226,8 +275,9 @@ class NovaXrayVpnService : VpnService() {
         routingMode: RoutingMode,
         isRelayed: Boolean,
         relayExitProbeHost: String?,
+        lifecycleToken: Long,
     ) {
-        scope.launch {
+        enqueueLifecycle {
             // B33 relay follow-up (round 2) - a genuinely missing exit host
             // for a Relayed attempt fails closed immediately (never a silent
             // Direct-shaped fallback, which would dial the WRONG host's
@@ -242,8 +292,8 @@ class NovaXrayVpnService : VpnService() {
             if (isRelayed && relayExitProbeHost == null) {
                 Log.e(TAG, "refusing to start: relayed attempt with no exit probe host")
                 XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, "relayed attempt missing exit probe host"))
-                stopSelf()
-                return@launch
+                stopSelfIfOwned(lifecycleToken)
+                return@enqueueLifecycle
             }
             val confirmationContext = if (isRelayed) {
                 RemoteConfirmationContext.Relayed(exitProbeHost = relayExitProbeHost!!)
@@ -253,7 +303,7 @@ class NovaXrayVpnService : VpnService() {
             // B33 relay follow-up (round 3) - the ONE place a watchdog-
             // detected relay-health failure is turned into a real,
             // production-shaped terminal event - the SAME XrayRuntimeEvent
-            // .Failed + stopSelf() shape every other failure branch below
+            // .Failed + stopSelfIfOwned() shape every other failure branch below
             // already uses, so VlessRealityTransport/VlessTlsTransport's
             // existing observeState() mapping (never a new one) carries it
             // into TransportState.Error exactly like any other Xray
@@ -263,7 +313,7 @@ class NovaXrayVpnService : VpnService() {
             val onRelayHealthLost: suspend () -> Unit = {
                 Log.w(TAG, "relay health watchdog: consecutive probe failures exceeded threshold, session torn down")
                 XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeState.relayHealthLostEvent(sessionId, kind))
-                stopSelf()
+                stopSelfIfOwned(lifecycleToken)
             }
             val xhttpConfig =
                 if (kind == TransportKind.XRAY_XHTTP) {
@@ -280,8 +330,8 @@ class NovaXrayVpnService : VpnService() {
                         "XHTTP runtime config missing",
                     ),
                 )
-                stopSelf()
-                return@launch
+                stopSelfIfOwned(lifecycleToken)
+                return@enqueueLifecycle
             }
 
             when (
@@ -293,6 +343,16 @@ class NovaXrayVpnService : VpnService() {
                         confirmationContext = confirmationContext,
                         onRelayHealthLost = onRelayHealthLost,
                         xhttpConfig = xhttpConfig,
+                        sessionId = sessionId,
+                        // The core of an older session was stopped for this newer START: say so
+                        // before this session's own Started/Failed (the mirror accepts both, in order).
+                        onSuperseded = { old ->
+                            Log.i(TAG, "session $old superseded by $sessionId - its core was stopped first")
+                            XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Stopped(old))
+                        },
+                        // Publishing Stopped(old) failed: the old core IS stopped, so this session's
+                        // start goes on; the failure is only logged (no secrets in the class name).
+                        onSupersededFailed = { t -> Log.e(TAG, "publishing Stopped of the superseded session failed: ${t.javaClass.simpleName}") },
                     )
             ) {
                 is XrayCoreStartOutcome.AlreadyRunning -> Log.i(TAG, "start requested while already running - ignored")
@@ -300,17 +360,17 @@ class NovaXrayVpnService : VpnService() {
                 is XrayCoreStartOutcome.Rejected -> {
                     Log.w(TAG, "refusing to start: ${outcome.reason}")
                     XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, outcome.reason))
-                    stopSelf()
+                    stopSelfIfOwned(lifecycleToken)
                 }
                 is XrayCoreStartOutcome.EstablishFailed -> {
                     Log.e(TAG, "failed to establish VPN interface: ${outcome.reason}")
                     XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, outcome.reason))
-                    stopSelf()
+                    stopSelfIfOwned(lifecycleToken)
                 }
                 is XrayCoreStartOutcome.CoreStartFailed -> {
                     Log.e(TAG, "Xray core failed to start: ${outcome.reason}")
                     XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, outcome.reason))
-                    stopSelf()
+                    stopSelfIfOwned(lifecycleToken)
                 }
                 is XrayCoreStartOutcome.RemoteUnconfirmed -> {
                     // B33 - the local core genuinely started but the bounded
@@ -326,10 +386,19 @@ class NovaXrayVpnService : VpnService() {
                             if (kind == TransportKind.XRAY_XHTTP) TransportFailureKind.REMOTE_UNCONFIRMED else null,
                         ),
                     )
-                    stopSelf()
+                    stopSelfIfOwned(lifecycleToken)
+                }
+                is XrayCoreStartOutcome.StopUnconfirmed -> {
+                    Log.e(TAG, "refusing to start: an earlier core stop was not confirmed (${outcome.reason})")
+                    XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Failed(sessionId, "core stop unconfirmed: ${outcome.reason}"))
+                    stopSelfIfOwned(lifecycleToken)
                 }
                 is XrayCoreStartOutcome.Started -> {
                     Log.i(TAG, "Xray core started")
+                    // A fresh core has fresh counters; bytes from the B33
+                    // confirmation are still in the core and land in the
+                    // first reading of THIS session.
+                    trafficCounters.reset(sessionId)
                     // B8I7 - the ONE real, positive confirmation
                     // VlessRealityTransport waits for before ever reporting
                     // Connected - never fabricated from startService()
@@ -368,21 +437,38 @@ class NovaXrayVpnService : VpnService() {
     // mutex (see that class's own docs) - a STOP arriving while a START is
     // still mid-flight now correctly WAITS for it rather than racing it (or
     // silently observing "nothing running yet" and being lost).
-    private fun teardown(reason: String) {
-        scope.launch { teardownAndPublish(reason) }
+    private fun teardown(reason: String, expectedSessionId: Long?, stopToken: Long) {
+        enqueueLifecycle { teardownAndPublish(reason, expectedSessionId, stopToken) }
     }
 
     /** Caller must run this on [scope] - see [teardown]/[onDestroy], its only two call sites. */
-    private suspend fun teardownAndPublish(reason: String) {
-        val outcome = lifecycleCoordinator.stop()
+    private suspend fun teardownAndPublish(reason: String, expectedSessionId: Long?, stopToken: Long?) {
+        val stopped = lifecycleCoordinator.stopSession(expectedSessionId)
+        val outcome = stopped.outcome
         if (!outcome.didTeardown) {
-            Log.i(TAG, "teardown($reason) requested while not running - no-op")
+            if (stopped.otherRunningSessionId != null) {
+                // A stale stop: a different session is running and keeps the service.
+                Log.i(TAG, "teardown($reason) for session $expectedSessionId ignored - session ${stopped.otherRunningSessionId} is running")
+            } else {
+                Log.i(TAG, "teardown($reason) requested while not running - no-op")
+                stopSelfIfOwned(stopToken)
+            }
             return
         }
         Log.i(TAG, "tearing down: $reason")
         outcome.stopLoopFailureReason?.let { Log.e(TAG, "stopLoop failed: $it") }
-        XrayProcessBridge.publishFromService(this@NovaXrayVpnService, XrayRuntimeEvent.Stopped(currentSessionId))
-        stopSelf()
+        // The session whose core was just stopped - never currentSessionId,
+        // which an ACTION_START for the next session may already have changed
+        // while this stop waited behind the previous start. Every start
+        // passes its id, so a torn-down core without one is not expected.
+        val event = teardownEventFor(stopped)
+        if (event == null) {
+            Log.w(TAG, "teardown($reason) stopped a core with no session id - nothing published")
+        } else {
+            if (event is XrayRuntimeEvent.Failed) Log.e(TAG, "teardown($reason): core stop unconfirmed - Failed, not Stopped")
+            XrayProcessBridge.publishFromService(this@NovaXrayVpnService, event)
+        }
+        stopSelfIfOwned(stopToken)
     }
 
     private fun closeTunInterface() {
@@ -405,6 +491,25 @@ class NovaXrayVpnService : VpnService() {
         // events can never be mistaken for the CURRENT attempt's - see
         // XrayRuntimeEvent's own docs.
         const val EXTRA_SESSION_ID = "net.pocvpn.client.vpn.xray.extra.SESSION_ID"
+
+        /**
+         * 3H - ACTION_STOP for a session that already ended in Failed: a stop the service could
+         * not confirm is retried there; with nothing to stop it is a no-op. Never throws (a
+         * background-start refusal only loses the retry) and waits for no event.
+         */
+        fun sendBestEffortStop(context: Context, sessionId: Long?) {
+            try {
+                context.startService(stopIntent(context, sessionId))
+            } catch (e: Exception) {
+                Log.w(TAG, "best-effort stop not delivered: ${e.javaClass.simpleName}")
+            }
+        }
+
+        /** ACTION_STOP for [sessionId] (null = whatever runs): the service never ends a different running session for it. */
+        fun stopIntent(context: Context, sessionId: Long?): Intent =
+            Intent(context, NovaXrayVpnService::class.java)
+                .setAction(ACTION_STOP)
+                .apply { sessionId?.let { putExtra(EXTRA_SESSION_ID, it) } }
 
         // B8O2 - the transport kind to start THIS attempt with: the
         // TransportKind enum constant name (e.g. "TLS_TCP"), or absent for
@@ -452,5 +557,31 @@ class NovaXrayVpnService : VpnService() {
  * real production endpoint - never a crash, never an arbitrary/empty
  * EndpointId (EndpointId itself rejects blank - see its own validation).
  */
+/**
+ * 3H - the one `:xray` process's native core and its unconfirmed-stop state. Each
+ * [LibXrayCoreRuntime] owns its own `libv2ray.CoreController` (NewCoreController returns a new
+ * struct), so a per-service-instance runtime would let a new instance start a second core next
+ * to one an earlier instance failed to stop. The process boundary is the core's real lifetime.
+ */
+internal object XrayProcessCore {
+    val runtime: XrayCoreRuntime by lazy { LibXrayCoreRuntime() }
+    val stopState = XrayCoreStopState()
+}
+
+/**
+ * 3H - what a teardown that did tear down publishes: Stopped only for a confirmed stop, Failed
+ * when the core may still run (the main process must not see that as Disconnected), nothing
+ * without a session id.
+ */
+internal fun teardownEventFor(stopped: NovaXrayServiceLifecycleCoordinator.StoppedSession): XrayRuntimeEvent? {
+    val id = stopped.sessionId ?: return null
+    val outcome = stopped.outcome
+    return if (outcome.unconfirmed) {
+        XrayRuntimeEvent.Failed(id, "core stop unconfirmed: ${outcome.stopLoopFailureReason}")
+    } else {
+        XrayRuntimeEvent.Stopped(id)
+    }
+}
+
 internal fun parseEndpointIdExtra(raw: String?): EndpointId =
     raw?.takeIf { it.isNotBlank() }?.let { EndpointId(it) } ?: EndpointId(ProductionGateway.ID)

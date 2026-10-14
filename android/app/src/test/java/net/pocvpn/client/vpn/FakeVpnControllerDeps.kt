@@ -92,6 +92,12 @@ class FakeVpnTransport(
         stateFlow.value = state
     }
 
+    // B-WL7 - what dataPlaneCounters() reports; null = same as stats(), the
+    // AmneziaWgTransport shape every existing B-WL7 test relies on.
+    var dataPlaneProvider: (() -> TransportStats)? = null
+
+    override suspend fun dataPlaneCounters(): TransportStats = dataPlaneProvider?.invoke() ?: stats()
+
     override suspend fun stats(): TransportStats = statsProvider?.invoke() ?: TransportStats.Counters(
         bytesReceived = statsBytesReceived,
         bytesSent = statsBytesSent,

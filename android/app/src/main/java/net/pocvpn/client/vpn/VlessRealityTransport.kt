@@ -18,6 +18,8 @@ import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.xray.XrayProcessBridge
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
 import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
@@ -119,6 +121,7 @@ class VlessRealityTransport(
         // (cancel() takes effect at the next suspension point, not
         // necessarily synchronously).
         val sessionId = XrayRuntimeState.nextSessionId()
+        activeSessionId = sessionId
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -167,13 +170,18 @@ class VlessRealityTransport(
             // nothing left running to tear down, and no Stopped event will
             // ever arrive for that session. Reflect that directly instead of
             // sending ACTION_STOP and hanging at Disconnecting forever.
+            // 3H - a Failed session may still own a core whose stop was not confirmed; let the
+            // service retry it. Disconnected stays immediate - no Stopped will come.
+            NovaXrayVpnService.sendBestEffortStop(context, activeSessionId)
             state.value = TransportState.Disconnected
             return
         }
         state.value = TransportState.Disconnecting
         try {
-            val intent = Intent(context, NovaXrayVpnService::class.java).setAction(NovaXrayVpnService.ACTION_STOP)
-            context.startService(intent)
+            // An expected stop: marked for the main-process death watch before ACTION_STOP goes out.
+            XrayProcessBridge.stopSession(activeSessionId) {
+                context.startService(NovaXrayVpnService.stopIntent(context, activeSessionId))
+            }
             // Real confirmation (Stopped, tagged with the SAME sessionId
             // connect() is still observing) arrives via the SAME observer
             // job connect() already started - deliberately does NOT force
@@ -189,6 +197,11 @@ class VlessRealityTransport(
         }
         if (state.value is TransportState.Disconnecting) state.value = TransportState.Disconnected
     }
+
+    // B-WL7 - the session whose `:xray` byte totals dataPlaneCounters() may report.
+    @Volatile private var activeSessionId: Long? = null
+
+    override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 

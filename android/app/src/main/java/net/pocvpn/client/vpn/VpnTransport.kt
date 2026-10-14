@@ -34,6 +34,15 @@ interface VpnTransport {
 
     suspend fun probe(context: ProbeContext): ProbeResult = ProbeResult.Unsupported
     suspend fun stats(): TransportStats = TransportStats.Unsupported
+
+    /**
+     * B-WL7 - cumulative tunnel byte counts read ONLY by VpnController's
+     * bounded post-connect data-plane check. Kept apart from [stats] on
+     * purpose: [stats] Counters also drive handshake-freshness checks
+     * (initial connect and reconnect), which a transport with byte counts
+     * but no handshake timestamp (Xray) must not be fed into.
+     */
+    suspend fun dataPlaneCounters(): TransportStats = TransportStats.Unsupported
 }
 
 enum class UnderlyingNetworkRecovery {
