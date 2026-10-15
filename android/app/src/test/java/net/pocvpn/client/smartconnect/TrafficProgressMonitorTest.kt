@@ -5,6 +5,7 @@ import net.pocvpn.client.transport.TransportStats
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TrafficProgressMonitorTest {
@@ -142,5 +143,116 @@ class TrafficProgressMonitorTest {
         val stalled = listOf(sample(0, 0, 0), sample(500, 512, 300), sample(65_500, 512, 18_000))
         assertEquals(TrafficProgressVerdict.NO_PAYLOAD, TrafficProgressMonitor.evaluate(noPayload, xray))
         assertEquals(TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD, TrafficProgressMonitor.evaluate(stalled, xray))
+    }
+
+    // P2 boundary matrix - controlled sample times only, no clock or sleep.
+
+    private val xrayKinds = listOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
+    private val pollMillis = 500L
+
+    private fun boundaryCases() = xrayKinds.map { it to 65_000L } + (TransportKind.AMNEZIA_WG to 20_000L)
+
+    @Test
+    fun `TX with no reply - VERIFYING 500ms before the stall window, NO_PAYLOAD exactly at it`() {
+        for ((kind, window) in boundaryCases()) {
+            val policy = TrafficProgressPolicy.forTransport(kind)
+            assertEquals(kind.name, window, policy.stallWindowMillis)
+            val before = listOf(sample(0, 0, 0), sample(window - 500, 0, 9_000))
+            val at = before + sample(window, 0, 9_300)
+            assertEquals(kind.name, TrafficProgressVerdict.VERIFYING, TrafficProgressMonitor.evaluate(before, policy))
+            assertEquals(kind.name, TrafficProgressVerdict.NO_PAYLOAD, TrafficProgressMonitor.evaluate(at, policy))
+            assertEquals(kind.name, window, TrafficProgressMonitor.silentForMillis(at))
+        }
+    }
+
+    @Test
+    fun `Xray TX with no reply at exactly 20s is still VERIFYING, AWG at 20s is NO_PAYLOAD`() {
+        val samples = listOf(sample(0, 0, 0), sample(20_000, 0, 6_000))
+        for (kind in xrayKinds) {
+            assertEquals(kind.name, TrafficProgressVerdict.VERIFYING, TrafficProgressMonitor.evaluate(samples, TrafficProgressPolicy.forTransport(kind)))
+        }
+        assertEquals(TrafficProgressVerdict.NO_PAYLOAD, TrafficProgressMonitor.evaluate(samples, TrafficProgressPolicy.forTransport(TransportKind.AMNEZIA_WG)))
+    }
+
+    @Test
+    fun `payload then TX-only silence - measured from the last RX advance, STALLED exactly at the window`() {
+        for ((kind, window) in boundaryCases()) {
+            val policy = TrafficProgressPolicy.forTransport(kind)
+            val payload = listOf(sample(0, 0, 0), sample(500, 512, 300))
+            val before = payload + sample(500 + window - 500, 512, 9_000)
+            val at = payload + sample(500 + window, 512, 9_300)
+            assertEquals(kind.name, window - 500, TrafficProgressMonitor.silentForMillis(before))
+            assertEquals(kind.name, TrafficProgressVerdict.VERIFYING, TrafficProgressMonitor.evaluate(before, policy))
+            assertEquals(kind.name, TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD, TrafficProgressMonitor.evaluate(at, policy))
+        }
+    }
+
+    @Test
+    fun `the same silence without TX is IDLE at the window, never a stall`() {
+        for ((kind, window) in boundaryCases()) {
+            val policy = TrafficProgressPolicy.forTransport(kind)
+            val payload = listOf(sample(0, 0, 0), sample(500, 512, 300))
+            assertEquals(kind.name, TrafficProgressVerdict.VERIFYING, TrafficProgressMonitor.evaluate(payload + sample(500 + window - 500, 512, 300), policy))
+            assertEquals(kind.name, TrafficProgressVerdict.IDLE, TrafficProgressMonitor.evaluate(payload + sample(500 + window, 512, 300), policy))
+            assertEquals(kind.name, TrafficProgressVerdict.IDLE, TrafficProgressMonitor.evaluate(listOf(sample(0, 0, 0), sample(window, 0, 0)), policy))
+        }
+    }
+
+    @Test
+    fun `RX resuming 500ms before the window resets the silence and verifies`() {
+        for ((kind, window) in boundaryCases()) {
+            val policy = TrafficProgressPolicy.forTransport(kind)
+            val samples = listOf(sample(0, 0, 0), sample(500, 512, 300), sample(window, 1_024, 9_000))
+            assertEquals(kind.name, 0L, TrafficProgressMonitor.silentForMillis(samples))
+            assertEquals(kind.name, TrafficProgressVerdict.VERIFIED, TrafficProgressMonitor.evaluate(samples, policy))
+        }
+    }
+
+    @Test
+    fun `silentForMillis is null exactly where evaluate has no silence to measure`() {
+        assertNull(TrafficProgressMonitor.silentForMillis(emptyList()))
+        assertNull(TrafficProgressMonitor.silentForMillis(listOf(sample(0, 100, 0), sample(500, 50, 0))))
+    }
+
+    @Test
+    fun `bounded check is 150 polls for Xray and 60 for AWG at the 500ms cadence`() {
+        for (kind in xrayKinds) assertEquals(kind.name, 150, TrafficProgressPolicy.forTransport(kind).maxPolls(pollMillis))
+        assertEquals(60, TrafficProgressPolicy.forTransport(TransportKind.AMNEZIA_WG).maxPolls(pollMillis))
+    }
+
+    @Test
+    fun `polled TX-only trace first turns decisive at poll 130 for Xray and poll 40 for AWG`() {
+        for ((kind, window) in boundaryCases()) {
+            val policy = TrafficProgressPolicy.forTransport(kind)
+            val samples = mutableListOf<TrafficProgressSample>()
+            var decisiveAt = -1
+            for (poll in 0..policy.maxPolls(pollMillis)) {
+                samples += sample(poll * pollMillis, 0, poll * 300L)
+                if (TrafficProgressMonitor.evaluate(samples, policy) != TrafficProgressVerdict.VERIFYING) {
+                    decisiveAt = poll
+                    break
+                }
+            }
+            assertEquals(kind.name, (window / pollMillis).toInt(), decisiveAt)
+        }
+    }
+
+    @Test
+    fun `diagnostics line names the applied policy, measured silence and end reason - no secrets`() {
+        val samples = listOf(sample(0, 0, 0), sample(65_000, 0, 9_000))
+        val line = TrafficProgressDiagnostics.line(
+            TransportKind.TLS_TCP, TrafficProgressPolicy.forTransport(TransportKind.TLS_TCP), samples,
+            TrafficProgressVerdict.NO_PAYLOAD, polls = 131, maxPolls = 150, end = TrafficProgressCheckEnd.DECISIVE_VERDICT,
+        )
+        assertEquals(
+            "B-WL7 data-plane check: kind=TLS_TCP verdict=NO_PAYLOAD samples=2 rx=0 tx=9000 stallWindowMs=65000 " +
+                "verificationWindowMs=10000 silentForMs=65000 polls=131 maxPolls=150 end=DECISIVE_VERDICT",
+            line,
+        )
+        val empty = TrafficProgressDiagnostics.line(
+            TransportKind.HYSTERIA2, TrafficProgressPolicy.forTransport(TransportKind.HYSTERIA2), emptyList(),
+            TrafficProgressVerdict.VERIFYING, polls = 1, maxPolls = 60, end = TrafficProgressCheckEnd.COUNTERS_UNSUPPORTED,
+        )
+        assertTrue(empty, empty.endsWith("rx=null tx=null stallWindowMs=20000 verificationWindowMs=10000 silentForMs=null polls=1 maxPolls=60 end=COUNTERS_UNSUPPORTED"))
     }
 }

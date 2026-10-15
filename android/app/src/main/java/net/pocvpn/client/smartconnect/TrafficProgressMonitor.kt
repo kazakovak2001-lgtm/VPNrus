@@ -35,6 +35,9 @@ data class TrafficProgressPolicy(
         require(verificationWindowMillis > 0 && stallWindowMillis > 0) { "windows must be positive" }
     }
 
+    /** Last poll index of the bounded check at [pollIntervalMillis]: polls 0..maxPolls cover verification + stall window. */
+    fun maxPolls(pollIntervalMillis: Long): Int = ((verificationWindowMillis + stallWindowMillis) / pollIntervalMillis).toInt()
+
     companion object {
         const val DEFAULT_VERIFICATION_WINDOW_MILLIS: Long = 10_000L
         const val DEFAULT_STALL_WINDOW_MILLIS: Long = 20_000L
@@ -113,8 +116,7 @@ object TrafficProgressMonitor {
         val totalReceived = last.bytesReceived
 
         // Last moment the peer's counter moved, and how much we sent since then.
-        val lastRxAdvance = ordered.zipWithNext().lastOrNull { (a, b) -> b.bytesReceived > a.bytesReceived }?.second
-        val silentSince = lastRxAdvance ?: first
+        val silentSince = silentSince(ordered)
         val silentForMillis = last.elapsedMillis - silentSince.elapsedMillis
         val sentDuringSilence = last.bytesSent > silentSince.bytesSent
 
@@ -132,6 +134,22 @@ object TrafficProgressMonitor {
         return TrafficProgressVerdict.VERIFYING
     }
 
+    /**
+     * The silence [evaluate] judged: from the sample of the last receive
+     * advance (or the first sample, if receive never advanced) to the last
+     * sample. Null when [evaluate] reaches no silence measurement (no samples,
+     * or counters going backwards). Diagnostics only.
+     */
+    fun silentForMillis(samples: List<TrafficProgressSample>): Long? {
+        if (samples.isEmpty()) return null
+        val ordered = samples.sortedBy { it.elapsedMillis }
+        if (ordered.zipWithNext().any { (a, b) -> b.bytesReceived < a.bytesReceived || b.bytesSent < a.bytesSent }) return null
+        return ordered.last().elapsedMillis - silentSince(ordered).elapsedMillis
+    }
+
+    private fun silentSince(ordered: List<TrafficProgressSample>): TrafficProgressSample =
+        ordered.zipWithNext().lastOrNull { (a, b) -> b.bytesReceived > a.bytesReceived }?.second ?: ordered.first()
+
     /** Maps a verdict onto the B-WL1 observation vocabulary; VERIFYING/IDLE/UNAVAILABLE carry no progress claim. */
     fun toProgressOutcome(verdict: TrafficProgressVerdict): TrafficProgressOutcome = when (verdict) {
         TrafficProgressVerdict.VERIFIED -> TrafficProgressOutcome.SUSTAINED
@@ -143,4 +161,39 @@ object TrafficProgressMonitor {
     /** Only a real stall/no-payload verdict is UNHEALTHY; everything else is not (yet) evidence of failure. */
     fun isUnhealthy(verdict: TrafficProgressVerdict): Boolean =
         verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD || verdict == TrafficProgressVerdict.NO_PAYLOAD
+}
+
+/** Why one bounded B-WL7 check stopped sampling. */
+enum class TrafficProgressCheckEnd {
+    /** [TrafficProgressMonitor.evaluate] returned something other than VERIFYING. */
+    DECISIVE_VERDICT,
+    /** All polls 0..maxPolls ran and the verdict stayed VERIFYING. */
+    WINDOW_EXHAUSTED,
+    /** The transport reported Unsupported/NotImplemented counters - no samples to judge. */
+    COUNTERS_UNSUPPORTED,
+}
+
+/**
+ * B-WL7 - the one non-secret field-diagnostics line per check: transport
+ * kind, verdict, the stall policy actually applied, the silence
+ * [TrafficProgressMonitor.evaluate] judged and why sampling ended.
+ * silentForMs is NOMINAL - derived from the samples' poll-index times, not
+ * elapsed device time (each counter read adds real latency). Byte totals
+ * only; never payload, keys or config.
+ */
+object TrafficProgressDiagnostics {
+    fun line(
+        kind: TransportKind,
+        policy: TrafficProgressPolicy,
+        samples: List<TrafficProgressSample>,
+        verdict: TrafficProgressVerdict,
+        polls: Int,
+        maxPolls: Int,
+        end: TrafficProgressCheckEnd,
+    ): String {
+        val last = samples.lastOrNull()
+        return "B-WL7 data-plane check: kind=$kind verdict=$verdict samples=${samples.size} rx=${last?.bytesReceived} tx=${last?.bytesSent}" +
+            " stallWindowMs=${policy.stallWindowMillis} verificationWindowMs=${policy.verificationWindowMillis}" +
+            " silentForMs=${TrafficProgressMonitor.silentForMillis(samples)} polls=$polls maxPolls=$maxPolls end=$end"
+    }
 }

@@ -44,6 +44,8 @@ import net.pocvpn.client.smartconnect.ConnectionOutcomeStore
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
+import net.pocvpn.client.smartconnect.TrafficProgressCheckEnd
+import net.pocvpn.client.smartconnect.TrafficProgressDiagnostics
 import net.pocvpn.client.smartconnect.TrafficProgressMonitor
 import net.pocvpn.client.smartconnect.TrafficProgressOutcome
 import net.pocvpn.client.smartconnect.TrafficProgressPolicy
@@ -512,6 +514,11 @@ class VpnController(
     // not consume it (AMNEZIA_WG/XRAY_REALITY/TLS_TCP/XRAY_XHTTP keep reading
     // their own existing address authorities, byte-for-byte unaffected).
     private var pendingConnectTransportBinding: net.pocvpn.client.reachability.EndpointTransportBinding? = null
+
+    /** Test-only observation seam: the last B-WL7 field-diagnostics line exactly as logged. No production code path reads it. */
+    @Volatile
+    internal var lastDataPlaneCheckDiagnostic: String? = null
+        private set
 
     /** Test-only observation seam - no production code path reads this; buildTransportConfig reads [pendingConnectTransportBinding] directly. Exists only so lifecycle tests can prove the field is cleared on every terminal teardown path without making the field itself public. */
     internal val pendingConnectTransportBindingForTest: net.pocvpn.client.reachability.EndpointTransportBinding?
@@ -1830,19 +1837,31 @@ class VpnController(
             progressObservationJob = scope.launch {
                 // Keyed on the sampled transport's own kind - the one place both lifecycle paths build a policy.
                 val policy = TrafficProgressPolicy.forTransport(transport.kind)
-                val maxPolls = ((policy.verificationWindowMillis + policy.stallWindowMillis) / HANDSHAKE_POLL_INTERVAL_MS).toInt()
+                val maxPolls = policy.maxPolls(HANDSHAKE_POLL_INTERVAL_MS)
                 val samples = mutableListOf<TrafficProgressSample>()
                 var verdict = TrafficProgressVerdict.VERIFYING
+                var polls = 0
+                var end = TrafficProgressCheckEnd.WINDOW_EXHAUSTED
                 for (pollIndex in 0..maxPolls) {
                     val stats = transport.dataPlaneCounters()
-                    if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) break
+                    polls++
+                    if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) {
+                        end = TrafficProgressCheckEnd.COUNTERS_UNSUPPORTED
+                        break
+                    }
                     TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
                     verdict = TrafficProgressMonitor.evaluate(samples, policy)
-                    if (verdict != TrafficProgressVerdict.VERIFYING) break
+                    if (verdict != TrafficProgressVerdict.VERIFYING) {
+                        end = TrafficProgressCheckEnd.DECISIVE_VERDICT
+                        break
+                    }
                     if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
                 }
-                // One non-secret line per attempt (kind, verdict, sample count, final byte totals) for field diagnostics.
-                android.util.Log.i("VpnController", "B-WL7 data-plane check: kind=${transport.kind} verdict=$verdict samples=${samples.size} rx=${samples.lastOrNull()?.bytesReceived} tx=${samples.lastOrNull()?.bytesSent}")
+                // One non-secret line per attempt (kind, verdict, applied stall policy, silence, end reason, byte totals) for field diagnostics.
+                // silentForMs and sample times are NOMINAL (pollIndex * HANDSHAKE_POLL_INTERVAL_MS), not measured device time.
+                val diagnosticLine = TrafficProgressDiagnostics.line(transport.kind, policy, samples, verdict, polls, maxPolls, end)
+                lastDataPlaneCheckDiagnostic = diagnosticLine
+                android.util.Log.i("VpnController", diagnosticLine)
                 if (recordWithoutSamples || samples.isNotEmpty()) {
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }
