@@ -10,6 +10,7 @@ import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayProfileRepository
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -398,5 +399,42 @@ class NovaXrayServiceLifecycleCoordinatorTest {
         assertEquals(null, again.sessionId)
         assertEquals(null, again.otherRunningSessionId) // nothing runs: the service may stop
         assertEquals(1, runtime.stopLoopCallCount)
+    }
+
+    // --- B-WL7 M1: the egress probe never takes the start/stop mutex ---
+
+    @Test
+    fun `the egress probe never waits on an in-flight start`() = runTest {
+        val gate = CompletableDeferred<Unit>()
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(gate, runtime, probeScope = this) }
+
+        val start = async { coordinator.start(endpointA, TransportKind.XRAY_REALITY) }
+        runCurrent()
+        val probe = async { coordinator.probeIndependentEgress(listOf("16.170.208.231")) }
+        runCurrent()
+
+        // Answered while start() still holds the mutex - no lock was taken.
+        assertTrue(probe.isCompleted)
+        assertEquals(IndependentEgressProbeResult.NOT_REACHED, probe.await())
+        assertEquals(0, runtime.measureDelayCallCount)
+
+        gate.complete(Unit)
+        runCurrent()
+        assertEquals(XrayCoreStartOutcome.Started, start.await())
+    }
+
+    @Test
+    fun `the egress probe on a Started session reaches the other gateway, and not after stop`() = runTest {
+        val runtime = FakeXrayCoreRuntime()
+        val coordinator = NovaXrayServiceLifecycleCoordinator { buildController(runtime = runtime, probeScope = this) }
+        assertEquals(XrayCoreStartOutcome.Started, coordinator.start(endpointA, TransportKind.XRAY_REALITY))
+
+        assertEquals(IndependentEgressProbeResult.REACHED, coordinator.probeIndependentEgress(listOf("16.170.208.231")))
+        assertEquals("https://16.170.208.231/v1/tunnel-probe", runtime.lastMeasureDelayUrl)
+
+        coordinator.stop()
+        assertEquals(IndependentEgressProbeResult.NOT_REACHED, coordinator.probeIndependentEgress(listOf("16.170.208.231")))
+        assertEquals(2, runtime.measureDelayCallCount)
     }
 }

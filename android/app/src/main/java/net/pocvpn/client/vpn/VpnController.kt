@@ -17,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 import net.pocvpn.client.diagnostics.DiagnosticsStore
 import net.pocvpn.client.diagnostics.VpnError
@@ -309,6 +310,10 @@ class VpnController(
         // B8B3D - "small bounded startup window" per the task's own wording.
         const val HANDSHAKE_TIMEOUT_MS = 8_000L
         const val HANDSHAKE_POLL_INTERVAL_MS = 500L
+
+        // B-WL7 M1 - caller-side bound on VpnTransport.probeIndependentEgress()
+        // (Xray: the 6 s in-core probe plus IPC); no answer in time = CALLER_TIMEOUT.
+        const val INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS = 10_000L
     }
 
     // B8I5/B8I6/B8O2 - the kinds this controller instance can actually build
@@ -1816,6 +1821,18 @@ class VpnController(
      * up and B33-confirmed, then no VLESS bytes back). Every other
      * verdict (VERIFIED, IDLE, UNAVAILABLE, still VERIFYING at the window
      * end) leaves the session untouched.
+     *
+     * B-WL7 M1 - before acting on such a verdict the loop asks
+     * [VpnTransport.probeIndependentEgress] ONCE per attempt (bounded by
+     * [INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS], no lock held). REACHED means
+     * only that the other gateway's `/v1/tunnel-probe` answered 200/204
+     * through this exit - never that arbitrary destinations work. It re-reads
+     * the counters (the probe's own bytes included), restarts from that
+     * sample and extends the window ONCE by one stall window from it: a stall
+     * seen after it still ends the session, while silence in BOTH directions
+     * afterwards ends IDLE and, like any IDLE, leaves the session up. No
+     * fresh sample, NOT_REACHED, UNAVAILABLE, an exception or a timeout keep
+     * the verdict. The gate is not repeated after the window ends.
      */
     private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport, recordWithoutSamples: Boolean = true) {
         val store = transportObservationStore
@@ -1842,14 +1859,16 @@ class VpnController(
             progressObservationJob = scope.launch {
                 // Keyed on the sampled transport's own kind - the one place both lifecycle paths build a policy.
                 val policy = TrafficProgressPolicy.forTransport(transport.kind)
-                val maxPolls = policy.maxPolls(HANDSHAKE_POLL_INTERVAL_MS)
+                var maxPolls = policy.maxPolls(HANDSHAKE_POLL_INTERVAL_MS)
                 val samples = mutableListOf<TrafficProgressSample>()
                 var verdict = TrafficProgressVerdict.VERIFYING
                 var polls = 0
                 var end = TrafficProgressCheckEnd.WINDOW_EXHAUSTED
-                val checkId = dataPlaneCheckLog?.start(transport.kind, policy, maxPolls)
+                var egressProbe: net.pocvpn.client.smartconnect.EgressProbeRecord? = null
+                val checkId = dataPlaneCheckLog?.start(transport.kind, policy, maxPolls, ownedGeneration)
                 try {
-                    for (pollIndex in 0..maxPolls) {
+                    var pollIndex = 0
+                    while (pollIndex <= maxPolls) {
                         val stats = transport.dataPlaneCounters()
                         polls++
                         if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) {
@@ -1858,29 +1877,60 @@ class VpnController(
                         }
                         TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
                         verdict = TrafficProgressMonitor.evaluate(samples, policy)
+                        // B-WL7 M1 - counters alone would end the session, and Xray
+                        // counters carry no TCP ACKs: ask once whether this exit still
+                        // reaches the independent gateway (see this function's docs).
+                        if (TrafficProgressMonitor.isUnhealthy(verdict) && egressProbe == null) {
+                            val verdictBefore = verdict
+                            val (result, outcome, durationMs) = probeIndependentEgress(transport)
+                            var rebaselined = false
+                            if (result == IndependentEgressProbeResult.REACHED) {
+                                // The probe dialled through the same counted outbound: restart
+                                // from a sample taken AFTER it, so its bytes are never user progress.
+                                val postProbe = TrafficProgressSample.fromCounters(transport.dataPlaneCounters(), pollIndex * HANDSHAKE_POLL_INTERVAL_MS)
+                                if (postProbe != null) {
+                                    samples.clear()
+                                    samples += postProbe
+                                    verdict = TrafficProgressVerdict.VERIFYING
+                                    maxPolls = maxOf(maxPolls, pollIndex + (policy.stallWindowMillis / HANDSHAKE_POLL_INTERVAL_MS).toInt())
+                                    rebaselined = true
+                                }
+                            }
+                            val record = net.pocvpn.client.smartconnect.EgressProbeRecord(outcome, durationMs, verdictBefore, rebaselined)
+                            egressProbe = record
+                            checkId?.let { dataPlaneCheckLog?.recordEgressProbe(it, record) }
+                        }
                         if (verdict != TrafficProgressVerdict.VERIFYING) {
                             end = TrafficProgressCheckEnd.DECISIVE_VERDICT
                             break
                         }
                         if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
+                        pollIndex++
                     }
                 } catch (e: Throwable) {
                     // Record how far the check got, then let the exception propagate exactly as before.
                     checkId?.let { dataPlaneCheckLog?.interrupt(it, e is kotlinx.coroutines.CancellationException, verdict, samples, polls) }
                     throw e
                 }
-                checkId?.let { dataPlaneCheckLog?.complete(it, verdict, samples, polls, end) }
+                checkId?.let { dataPlaneCheckLog?.complete(it, verdict, samples, polls, end, maxPolls) }
                 // One non-secret line per attempt (kind, verdict, applied stall policy, silence, end reason, byte totals) for field diagnostics.
                 // silentForMs and sample times are NOMINAL (pollIndex * HANDSHAKE_POLL_INTERVAL_MS), not measured device time.
-                val diagnosticLine = TrafficProgressDiagnostics.line(transport.kind, policy, samples, verdict, polls, maxPolls, end)
+                val diagnosticLine = TrafficProgressDiagnostics.line(transport.kind, policy, samples, verdict, polls, maxPolls, end, egressProbe)
                 lastDataPlaneCheckDiagnostic = diagnosticLine
                 android.util.Log.i("VpnController", diagnosticLine)
                 if (recordWithoutSamples || samples.isNotEmpty()) {
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }
-                if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
-                    failDeadDataPlane(endpointId, transport, verdict, ownedGeneration)
+                val action = if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
+                    if (failDeadDataPlane(endpointId, transport, verdict, ownedGeneration)) {
+                        net.pocvpn.client.smartconnect.DataPlaneCheckAction.TORN_DOWN
+                    } else {
+                        net.pocvpn.client.smartconnect.DataPlaneCheckAction.STALE_IGNORED
+                    }
+                } else {
+                    net.pocvpn.client.smartconnect.DataPlaneCheckAction.PRESERVED
                 }
+                checkId?.let { dataPlaneCheckLog?.recordAction(it, action) }
             }
         }
     }
@@ -1909,14 +1959,15 @@ class VpnController(
      * all bump the generation synchronously, strictly before any competing
      * operation's own asynchronous work runs, regardless of scheduling order.
      */
-    private suspend fun failDeadDataPlane(endpointId: EndpointId, transport: VpnTransport, verdict: TrafficProgressVerdict, ownedGeneration: Long) {
+    /** True only when it really tore the session down; false = no longer this check's session, nothing touched. */
+    private suspend fun failDeadDataPlane(endpointId: EndpointId, transport: VpnTransport, verdict: TrafficProgressVerdict, ownedGeneration: Long): Boolean {
         val self = currentCoroutineContext()[Job]
         synchronized(reconnectOwnershipLock) {
-            if (progressObservationJob !== self) return
+            if (progressObservationJob !== self) return false
             progressObservationJob = null
         }
-        connectMutex.withLock {
-            if (_state.value !is TransportState.Connected || activeTransport !== transport || !isCurrentReconnect(ownedGeneration)) return@withLock
+        return connectMutex.withLock {
+            if (_state.value !is TransportState.Connected || activeTransport !== transport || !isCurrentReconnect(ownedGeneration)) return@withLock false
             teardownActiveAttemptLocked()
             // The handshake already recorded this path as a success; the
             // later truth is that it carried no data, so Auto ranks it down.
@@ -1928,7 +1979,30 @@ class VpnController(
                     failureKind = TransportFailureKind.REMOTE_UNCONFIRMED,
                 ),
             )
+            true
         }
+    }
+
+    /**
+     * B-WL7 M1 - the one bounded [VpnTransport.probeIndependentEgress] call of a
+     * check. Only the outer bound and an exception thrown back here are told
+     * apart; whatever the transport already folded into NOT_REACHED stays
+     * NOT_REACHED. Cancellation propagates. Duration is measured wall-clock.
+     */
+    private suspend fun probeIndependentEgress(transport: VpnTransport): Triple<IndependentEgressProbeResult, net.pocvpn.client.smartconnect.EgressProbeOutcome, Long> {
+        val startedAt = System.nanoTime()
+        var outcome: net.pocvpn.client.smartconnect.EgressProbeOutcome? = null
+        val result = try {
+            withTimeoutOrNull(INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS) { transport.probeIndependentEgress() }
+                ?: IndependentEgressProbeResult.NOT_REACHED.also { outcome = net.pocvpn.client.smartconnect.EgressProbeOutcome.CALLER_TIMEOUT }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            outcome = net.pocvpn.client.smartconnect.EgressProbeOutcome.EXCEPTION
+            IndependentEgressProbeResult.NOT_REACHED
+        }
+        val durationMs = (System.nanoTime() - startedAt) / 1_000_000
+        return Triple(result, outcome ?: net.pocvpn.client.smartconnect.EgressProbeOutcome.valueOf(result.name), durationMs)
     }
 
     /**

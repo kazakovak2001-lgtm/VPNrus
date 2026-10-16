@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
 import net.pocvpn.client.transport.TransportStats
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
 import net.pocvpn.client.vpn.TransportFailureKind
 import java.io.File
 
@@ -48,6 +49,11 @@ object XrayProcessBridge {
     const val ACTION_MEASURE_RESULT = "net.pocvpn.client.vpn.xray.action.MEASURE_RESULT"
     const val ACTION_QUERY_TRAFFIC = "net.pocvpn.client.vpn.xray.action.QUERY_TRAFFIC"
     const val ACTION_TRAFFIC_RESULT = "net.pocvpn.client.vpn.xray.action.TRAFFIC_RESULT"
+    const val ACTION_PROBE_INDEPENDENT_EGRESS = "net.pocvpn.client.vpn.xray.action.PROBE_INDEPENDENT_EGRESS"
+    const val ACTION_INDEPENDENT_EGRESS_RESULT = "net.pocvpn.client.vpn.xray.action.INDEPENDENT_EGRESS_RESULT"
+    const val EXTRA_EGRESS_SESSION_ID = "egressSessionId"
+    const val EXTRA_EGRESS_TARGETS = "egressTargets"
+    private const val EXTRA_EGRESS_RESULT = "egressResult"
     const val EXTRA_REQUEST_ID = "requestId"
     const val EXTRA_URLS = "urls"
     private const val EXTRA_DELAYS = "delays"
@@ -245,6 +251,63 @@ object XrayProcessBridge {
         } else {
             TransportStats.Counters(bytesReceived = totals.downlinkBytes, bytesSent = totals.uplinkBytes, lastHandshakeEpochMillis = null)
         }
+
+    /** Service side of [probeIndependentEgress]. */
+    fun publishIndependentEgressResult(context: Context, requestId: Long, result: IndependentEgressProbeResult) {
+        val intent = Intent(ACTION_INDEPENDENT_EGRESS_RESULT)
+            .setPackage(context.packageName)
+            .putExtra(EXTRA_REQUEST_ID, requestId)
+            .putExtra(EXTRA_EGRESS_RESULT, result.name)
+        context.sendBroadcast(intent, dynamicReceiverPermission(context))
+    }
+
+    /**
+     * B-WL7 M1 - main process: asks `:xray` to send [sessionId]'s
+     * independent-egress probe to one of [targets] (public gateway
+     * addresses, never secrets; see [IndependentEgressTargets]). Same
+     * request/receiver shape as [queryTrafficCounters]: a non-exported
+     * receiver for this package only, matched by a fresh request id
+     * ([EgressProbeReply]), always unregistered. The `:xray` side bounds
+     * the probe at 6 s; [timeoutMs] bounds the whole exchange. REACHED only
+     * while this process' mirror shows the SAME session Started before and
+     * after ([IndependentEgressDecision.forCaller]).
+     */
+    internal suspend fun probeIndependentEgress(context: Context, sessionId: Long?, targets: List<String>, timeoutMs: Long = 8_000): IndependentEgressProbeResult {
+        if (targets.isEmpty()) return IndependentEgressProbeResult.UNAVAILABLE
+        val owned = sessionId ?: return IndependentEgressProbeResult.NOT_REACHED
+        if (!isStartedSession(owned)) return IndependentEgressProbeResult.NOT_REACHED
+        val app = context.applicationContext
+        val requestId = measureRequests.incrementAndGet()
+        val reply = EgressProbeReply(requestId)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                reply.offer(intent.getLongExtra(EXTRA_REQUEST_ID, -1), intent.getStringExtra(EXTRA_EGRESS_RESULT))
+            }
+        }
+        ContextCompat.registerReceiver(app, receiver, IntentFilter(ACTION_INDEPENDENT_EGRESS_RESULT), ContextCompat.RECEIVER_NOT_EXPORTED)
+        val answer = try {
+            app.startService(
+                Intent(app, NovaXrayVpnService::class.java)
+                    .setAction(ACTION_PROBE_INDEPENDENT_EGRESS)
+                    .putExtra(EXTRA_REQUEST_ID, requestId)
+                    .putExtra(EXTRA_EGRESS_SESSION_ID, owned)
+                    .putExtra(EXTRA_EGRESS_TARGETS, targets.toTypedArray()),
+            )
+            kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { reply.result.await() }
+        } catch (e: IllegalStateException) {
+            null
+        } catch (e: SecurityException) {
+            null
+        } finally {
+            app.unregisterReceiver(receiver)
+        }
+        return IndependentEgressDecision.forCaller(answer, stillStartedSameSession = isStartedSession(owned))
+    }
+
+    private fun isStartedSession(sessionId: Long): Boolean {
+        val current = XrayRuntimeState.events.value
+        return current is XrayRuntimeEvent.Started && current.sessionId == sessionId
+    }
 
     // --- main process side --------------------------------------------------------
 

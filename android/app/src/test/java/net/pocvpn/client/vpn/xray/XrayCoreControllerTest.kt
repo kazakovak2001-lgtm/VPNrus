@@ -9,6 +9,7 @@ import net.pocvpn.client.identity.SecureXrayTlsProfileRepository
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -597,5 +598,80 @@ class XrayCoreControllerTest {
         assertEquals(XrayCoreStartOutcome.Started, first)
         assertEquals(XrayCoreStartOutcome.AlreadyRunning, second)
         assertEquals(1, harness.coreRuntime.startLoopCallCount)
+    }
+
+    // --- B-WL7 M1: probeIndependentEgress leaves through this gateway's egress to ANOTHER gateway ---
+
+    private val ownProbe = "https://152.70.43.1/v1/tunnel-probe"
+    private val independentProbe = "https://16.170.208.231/v1/tunnel-probe"
+    private val candidates = listOf("152.70.43.1", "16.170.208.231")
+
+    @Test
+    fun `before any start the egress probe is not reached and never measures`() = runBlocking {
+        val harness = Harness(newRepository())
+
+        assertEquals(IndependentEgressProbeResult.NOT_REACHED, harness.controller.probeIndependentEgress(candidates))
+        assertEquals(0, harness.coreRuntime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `the egress probe targets the other gateway, never the session's own`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        assertEquals(XrayCoreStartOutcome.Started, harness.controller.requestStart())
+
+        assertEquals(IndependentEgressProbeResult.REACHED, harness.controller.probeIndependentEgress(candidates))
+
+        // B33 at start, then exactly one independent probe.
+        assertEquals(listOf(ownProbe, independentProbe), harness.coreRuntime.measuredUrls)
+    }
+
+    @Test
+    fun `own gateway answering but its egress dead is not reached`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val runtime = FakeXrayCoreRuntime()
+        // nginx on the current gateway answers its own address; nothing beyond it does.
+        runtime.measureDelayHandler = { url -> if (url == ownProbe) 20L else throw java.io.IOException("connect timed out") }
+        val harness = Harness(repository, coreRuntime = runtime)
+        assertEquals(XrayCoreStartOutcome.Started, harness.controller.requestStart())
+
+        assertEquals(IndependentEgressProbeResult.NOT_REACHED, harness.controller.probeIndependentEgress(candidates))
+    }
+
+    @Test
+    fun `an invalid status or certificate from the target is not reached`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        harness.controller.requestStart()
+        // measureDelay throws for any non-200/204 status and any TLS verification failure.
+        harness.coreRuntime.measureDelayThrows = java.io.IOException("invalid status: 404 Not Found")
+
+        assertEquals(IndependentEgressProbeResult.NOT_REACHED, harness.controller.probeIndependentEgress(candidates))
+    }
+
+    @Test
+    fun `with only the session's own gateway as candidate nothing is probed`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        harness.controller.requestStart()
+
+        assertEquals(IndependentEgressProbeResult.UNAVAILABLE, harness.controller.probeIndependentEgress(listOf("152.70.43.1")))
+        assertEquals(1, harness.coreRuntime.measureDelayCallCount)
+    }
+
+    @Test
+    fun `after stop the egress probe is not reached and never measures`() = runBlocking {
+        val repository = newRepository()
+        repository.saveProfile(validProfile)
+        val harness = Harness(repository)
+        harness.controller.requestStart()
+        harness.controller.requestStop()
+
+        assertEquals(IndependentEgressProbeResult.NOT_REACHED, harness.controller.probeIndependentEgress(candidates))
+        assertEquals(1, harness.coreRuntime.measureDelayCallCount)
     }
 }

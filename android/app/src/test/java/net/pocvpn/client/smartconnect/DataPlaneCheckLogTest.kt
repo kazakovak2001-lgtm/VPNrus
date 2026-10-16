@@ -111,4 +111,61 @@ class DataPlaneCheckLogTest {
         assertEquals(first, second)
         assertEquals("RECORDED", DataPlaneCheckLog.reportJson(l.snapshot()).getString("status"))
     }
+
+    // --- B-WL7 M1: the probe and the controller action ---
+
+    @Test
+    fun `a check without a probe or action serializes them as null`() {
+        val l = log()
+        val id = l.start(TransportKind.XRAY_REALITY, xray, 150)
+        l.complete(id, TrafficProgressVerdict.VERIFIED, listOf(sample(0, 0, 0)), 21, TrafficProgressCheckEnd.DECISIVE_VERDICT)
+        val json = l.snapshot().single().toJson()
+        assertTrue(json.isNull("generation"))
+        assertTrue(json.isNull("egressProbe"))
+        assertTrue(json.isNull("action"))
+    }
+
+    @Test
+    fun `the one probe, the extended window, the generation and the action are recorded once`() {
+        val l = log()
+        val id = l.start(TransportKind.XRAY_REALITY, xray, 150, generation = 7L)
+        val probe = EgressProbeRecord(EgressProbeOutcome.REACHED, 341L, TrafficProgressVerdict.NO_PAYLOAD, rebaselined = true)
+        l.recordEgressProbe(id, probe)
+        // A second probe for the same check is ignored.
+        l.recordEgressProbe(id, probe.copy(outcome = EgressProbeOutcome.NOT_REACHED))
+        // No action before the check completed.
+        l.recordAction(id, DataPlaneCheckAction.TORN_DOWN)
+        assertNull(l.snapshot().single().action)
+
+        l.complete(id, TrafficProgressVerdict.IDLE, listOf(sample(65_000, 0, 9_000), sample(130_000, 0, 9_000)), 261, TrafficProgressCheckEnd.DECISIVE_VERDICT, maxPolls = 260)
+        l.recordAction(id, DataPlaneCheckAction.PRESERVED)
+        l.recordAction(id, DataPlaneCheckAction.TORN_DOWN) // set once only
+
+        val r = l.snapshot().single()
+        assertEquals(7L, r.generation)
+        assertEquals(probe, r.egressProbe)
+        assertEquals(260, r.maxPolls)
+        assertEquals(DataPlaneCheckAction.PRESERVED, r.action)
+        val json = r.toJson()
+        assertEquals(7L, json.getLong("generation"))
+        assertEquals("PRESERVED", json.getString("action"))
+        val p = json.getJSONObject("egressProbe")
+        assertEquals("REACHED", p.getString("outcome"))
+        assertEquals(341L, p.getLong("durationMs"))
+        assertEquals("NO_PAYLOAD", p.getString("verdictBefore"))
+        assertTrue(p.getBoolean("rebaselined"))
+    }
+
+    @Test
+    fun `a probe arriving after the check was cancelled is not attached, and a cancelled check gets no action`() {
+        val l = log()
+        val id = l.start(TransportKind.XRAY_REALITY, xray, 150)
+        l.interrupt(id, cancelled = true, verdict = TrafficProgressVerdict.NO_PAYLOAD, samples = emptyList(), polls = 131)
+        l.recordEgressProbe(id, EgressProbeRecord(EgressProbeOutcome.REACHED, 1L, TrafficProgressVerdict.NO_PAYLOAD, rebaselined = false))
+        l.recordAction(id, DataPlaneCheckAction.TORN_DOWN)
+        val r = l.snapshot().single()
+        assertEquals(DataPlaneCheckStatus.CANCELLED, r.status)
+        assertNull(r.egressProbe)
+        assertNull(r.action)
+    }
 }

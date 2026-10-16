@@ -5,6 +5,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
 import net.pocvpn.client.vpn.policy.RoutingMode
 
 /**
@@ -35,7 +36,9 @@ class NovaXrayServiceLifecycleCoordinator(
 ) {
     private val mutex = Mutex()
     private var controllerEndpointId: EndpointId? = null
-    private var cachedController: XrayCoreController? = null
+    // Written only under [mutex]; @Volatile for the lock-free read in
+    // [probeIndependentEgress].
+    @Volatile private var cachedController: XrayCoreController? = null
 
     // The session whose core is running right now - set only when a start
     // for it returns Started, cleared by any stop or failed start, always
@@ -182,6 +185,13 @@ class NovaXrayServiceLifecycleCoordinator(
         val stopped = stopSessionLocked(sessionId)
         if (stopped.outcome.didTeardown && stopped.sessionId == sessionId) onRelayHealthLost()
     }
+
+    /**
+     * B-WL7 M1 - see [XrayCoreController.probeIndependentEgress]. Never takes
+     * [mutex]: a network round trip must not hold up a concurrent start/stop.
+     */
+    suspend fun probeIndependentEgress(candidates: List<String>): IndependentEgressProbeResult =
+        cachedController?.probeIndependentEgress(candidates) ?: IndependentEgressProbeResult.NOT_REACHED
 
     /** Caller must already hold [mutex]. */
     private fun stopSessionLocked(expectedSessionId: Long?): StoppedSession {

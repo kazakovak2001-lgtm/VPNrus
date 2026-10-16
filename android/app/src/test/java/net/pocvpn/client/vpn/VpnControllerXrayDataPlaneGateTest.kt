@@ -2,8 +2,10 @@
 
 package net.pocvpn.client.vpn
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import net.pocvpn.client.diagnostics.DiagnosticsStore
@@ -30,8 +32,13 @@ import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.xray.XrayProcessBridge
 import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
+import net.pocvpn.client.reachability.EndpointTransportBinding
+import net.pocvpn.client.reachability.Hysteria2Profile
+import net.pocvpn.client.reachability.withHysteria2Profile
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 private val XRAY_TLS_PROFILE = XrayTlsProfile(
@@ -98,15 +105,22 @@ class VpnControllerXrayDataPlaneGateTest {
     // P2: the bounded Xray check now spans verification (10s) + stall (65s), so "past the window" is > 75s.
     private val XRAY_WINDOW_MILLIS = 76_000L
 
-    private class Harness(val controller: VpnController, val xray: FakeVpnTransport, val diagnostics: DiagnosticsStore, val store: TransportObservationStore)
+    private class Harness(
+        val controller: VpnController,
+        val xray: FakeVpnTransport,
+        val diagnostics: DiagnosticsStore,
+        val store: TransportObservationStore,
+        val reconnect: FakeReconnectManager,
+    )
 
     private fun TestScope.connectXray(dataPlane: (Int) -> TransportStats): Harness {
         val diagnostics = DiagnosticsStore()
         val store = TransportObservationStore()
+        val reconnect = FakeReconnectManager()
         val controller = VpnController(
             FakeVpnTransport(), FakeClientKeyRepository(),
             FakeGatewayConfigurationRepository(gateway()),
-            FakeReconnectManager(), diagnostics, backgroundScope,
+            reconnect, diagnostics, backgroundScope,
             xrayProfileRepository = FakeXrayProfileRepository(XRAY_PROFILE),
             transportObservationStore = store,
             fingerprintKeyProvider = NetworkFingerprintKeyProvider { byteArrayOf(1, 2, 3, 4) },
@@ -115,7 +129,7 @@ class VpnControllerXrayDataPlaneGateTest {
         val xray = FakeVpnTransport(kind = TransportKind.XRAY_REALITY, capabilitiesOverride = TransportCapabilities.xrayRealityAdapterShell())
         var polls = 0
         xray.dataPlaneProvider = { polls++; dataPlane(polls) }
-        return Harness(controller, xray, diagnostics, store)
+        return Harness(controller, xray, diagnostics, store, reconnect)
     }
 
     private suspend fun TestScope.start(h: Harness) {
@@ -266,10 +280,11 @@ class VpnControllerXrayDataPlaneGateTest {
         val diagnostics = DiagnosticsStore()
         val store = TransportObservationStore()
         val endpoint = EndpointId(ProductionGateway.ID)
+        val reconnect = FakeReconnectManager()
         val controller = VpnController(
             FakeVpnTransport(), FakeClientKeyRepository(),
             FakeGatewayConfigurationRepository(gateway()),
-            FakeReconnectManager(), diagnostics, backgroundScope,
+            reconnect, diagnostics, backgroundScope,
             xrayProfileRepository = FakeXrayProfileRepository(XRAY_PROFILE),
             xrayTlsProfileRepository = FakeXrayTlsProfileRepository(XRAY_TLS_PROFILE),
             xrayXhttpProfileRepositoryResolver = MapXrayXhttpProfileRepositoryResolver(mapOf(endpoint to FakeXrayXhttpProfileRepository(XRAY_XHTTP_PROFILE))),
@@ -280,7 +295,7 @@ class VpnControllerXrayDataPlaneGateTest {
         val xray = FakeVpnTransport(kind = kind, capabilitiesOverride = TransportCapabilities.xrayRealityAdapterShell())
         var polls = 0
         xray.dataPlaneProvider = { polls++; dataPlane(polls) }
-        return Harness(controller, xray, diagnostics, store)
+        return Harness(controller, xray, diagnostics, store, reconnect)
     }
 
     @Test
@@ -403,5 +418,337 @@ class VpnControllerXrayDataPlaneGateTest {
         val line = controller.lastDataPlaneCheckDiagnostic!!
         assertTrue(line, line.startsWith("B-WL7 data-plane check: kind=AMNEZIA_WG verdict=NO_PAYLOAD samples=41 rx=0 tx="))
         assertTrue(line, line.endsWith(" stallWindowMs=20000 verificationWindowMs=10000 silentForMs=20000 polls=41 maxPolls=60 end=DECISIVE_VERDICT"))
+    }
+
+    // --- M1: counters alone cannot tell a dead exit from a healthy upload-only flow ---
+    // Xray counts VLESS stream bytes: TCP ACKs never cross the tunnel and the
+    // VLESS server sends nothing until the destination replies, so an upload
+    // with no reply has exactly the `stalled` shape below. Before ending such
+    // a session the controller asks once whether the exit still reaches an
+    // INDEPENDENT destination (another gateway). Timeline (P2 Xray policy,
+    // 65 s stall window): the stall is decisive at 65 s; after a REACHED probe
+    // the counters are read again (the probe's own bytes included) and one more
+    // stall window is watched from that post-probe baseline, i.e. until 130 s.
+
+    private val stalled: (Int) -> TransportStats = { n -> TransportStats.Counters(bytesReceived = 512L, bytesSent = 1_000L + n * 300L, lastHandshakeEpochMillis = null) }
+
+    private fun assertNoDataPlaneFailure(h: Harness) {
+        assertNotEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+        val state = h.controller.state.value
+        assertTrue("unexpected $state", state !is TransportState.Error)
+    }
+
+    private fun assertDataPlaneFailure(h: Harness) {
+        val state = h.controller.state.value
+        assertTrue("unexpected $state", state is TransportState.Error)
+        assertEquals(TransportFailureKind.REMOTE_UNCONFIRMED, (state as TransportState.Error).failureKind)
+        assertEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+    }
+
+    /**
+     * Behaves like the `:xray` VLESS-outbound totals the controller reads via
+     * dataPlaneCounters(): cumulative, driven by (virtual) time, and - like the
+     * real core, whose measureDelay dials through the SAME counted outbound
+     * (core.Dial -> outbound Handler.Dial -> CounterConnection) - the egress
+     * probe's own TLS round trip to the other gateway lands in them.
+     */
+    private class XrayCounters(private val clock: () -> Long) {
+        var uploading = true
+        var replying = false
+        var unavailable = false
+        var reads = 0
+            private set
+        private var tick = 0L
+        private var userSent = 1_000L
+        private var userReceived = 512L // B33 confirmation bytes
+        private var probeSent = 0L
+        private var probeReceived = 0L
+
+        fun read(): TransportStats {
+            reads++
+            val now = clock()
+            val elapsedTicks = (now - tick) / 500L
+            tick += elapsedTicks * 500L
+            if (uploading) userSent += elapsedTicks * 300L
+            if (replying) userReceived += elapsedTicks * 900L
+            if (unavailable) return TransportStats.Unavailable
+            return TransportStats.Counters(bytesReceived = userReceived + probeReceived, bytesSent = userSent + probeSent, lastHandshakeEpochMillis = null)
+        }
+
+        /** The probe's ClientHello/request up, certificate chain + 200 down. */
+        fun probeRoundTrip() {
+            probeSent += 700L
+            probeReceived += 4_096L
+        }
+    }
+
+    private fun TestScope.connectXray(counters: XrayCounters): Harness = connectXray { _ -> counters.read() }
+
+    private fun TestScope.xrayCounters() = XrayCounters { currentTime }
+
+    @Test
+    fun `healthy upload - probe bytes then real replies - session stays, recorded from real traffic`() = runTest {
+        val counters = xrayCounters()
+        val h = connectXray(counters)
+        h.xray.egressProber = {
+            counters.probeRoundTrip()
+            counters.replying = true // the destination starts answering after the probe
+            IndependentEgressProbeResult.REACHED
+        }
+        start(h)
+
+        advanceTimeBy(100_000)
+        runCurrent()
+
+        assertTrue(h.controller.state.value is TransportState.Connected)
+        assertNoDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+        assertEquals(0, h.xray.disconnectCallCount)
+        assertEquals(TrafficProgressOutcome.SUSTAINED, h.store.recent(fingerprint()).single().progress)
+    }
+
+    @Test
+    fun `probe bytes are not user progress - upload with no reply after a reached probe ends at the post-probe stall window`() = runTest {
+        val counters = xrayCounters()
+        val h = connectXray(counters)
+        h.xray.egressProber = { counters.probeRoundTrip(); IndependentEgressProbeResult.REACHED }
+        start(h)
+
+        // Probe at 65 s; the probe completing ends nothing.
+        advanceTimeBy(66_000)
+        runCurrent()
+        assertEquals(1, h.xray.egressProbeCallCount)
+        assertTrue(h.controller.state.value is TransportState.Connected)
+
+        // Still within one stall window of the post-probe baseline (65 s -> 130 s).
+        advanceTimeBy(63_500)
+        runCurrent()
+        assertTrue(h.controller.state.value is TransportState.Connected)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+        assertEquals(TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD, h.store.recent(fingerprint()).single().progress)
+    }
+
+    @Test
+    fun `nothing moves after the post-probe baseline - the window ends IDLE, bounded, not VERIFYING`() = runTest {
+        val counters = xrayCounters()
+        val h = connectXray(counters)
+        h.xray.egressProber = {
+            counters.probeRoundTrip()
+            counters.uploading = false
+            IndependentEgressProbeResult.REACHED
+        }
+        start(h)
+
+        advanceTimeBy(200_000)
+        runCurrent()
+
+        assertTrue(h.controller.state.value is TransportState.Connected)
+        assertNoDataPlaneFailure(h)
+        // 131 reads up to the probe (0..65 s), 1 post-probe baseline read, then
+        // exactly one stall window (130 reads, 65.5..130 s) and no more.
+        assertEquals(262, counters.reads)
+        assertEquals(1, h.xray.egressProbeCallCount)
+        // The window concluded (IDLE -> NOT_OBSERVED), it did not run out undecided.
+        assertEquals(TrafficProgressOutcome.NOT_OBSERVED, h.store.recent(fingerprint()).single().progress)
+    }
+
+    @Test
+    fun `a reached probe without a fresh post-probe sample keeps the original failure`() = runTest {
+        val counters = xrayCounters()
+        val h = connectXray(counters)
+        h.xray.egressProber = {
+            counters.probeRoundTrip()
+            counters.unavailable = true // :xray stops answering the counter query
+            IndependentEgressProbeResult.REACHED
+        }
+        start(h)
+
+        advanceTimeBy(66_000)
+        runCurrent()
+
+        assertDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+    }
+
+    @Test
+    fun `a reconnect taking ownership right before the post-probe sample leaves the new session alone`() = runTest {
+        val counters = xrayCounters()
+        val h = connectXray(counters)
+        var readsAtReconnect = -1
+        h.xray.egressProber = {
+            counters.probeRoundTrip()
+            readsAtReconnect = counters.reads
+            h.reconnect.triggerUnderlyingNetworkChanged()
+            IndependentEgressProbeResult.REACHED
+        }
+        start(h)
+
+        advanceTimeBy(200_000)
+        runCurrent()
+
+        assertNoDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+        // The superseded sampler takes at most its post-probe read, then stops:
+        // no further polling, no observation written for the new session.
+        assertTrue("reads ${counters.reads} vs $readsAtReconnect", counters.reads <= readsAtReconnect + 1)
+        assertTrue(h.store.recent(fingerprint()).isEmpty())
+    }
+
+    @Test
+    fun `dead gateway egress - independent probe not reached - session ends with DataPlaneNoTraffic`() = runTest {
+        val h = connectXray(stalled)
+        h.xray.egressProber = { IndependentEgressProbeResult.NOT_REACHED }
+        start(h)
+
+        advanceTimeBy(66_000)
+        runCurrent()
+
+        assertDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+        assertEquals(TrafficProgressOutcome.STALLED_AFTER_INITIAL_PAYLOAD, h.store.recent(fingerprint()).single().progress)
+    }
+
+    @Test
+    fun `no independent target (UNAVAILABLE) keeps the existing failure`() = runTest {
+        val h = connectXray(stalled)
+        h.xray.egressProber = { IndependentEgressProbeResult.UNAVAILABLE }
+        start(h)
+
+        advanceTimeBy(66_000)
+        runCurrent()
+
+        assertDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+    }
+
+    @Test
+    fun `a probe that never answers is bounded at 10 s and keeps the failure`() = runTest {
+        val h = connectXray(stalled)
+        val never = CompletableDeferred<IndependentEgressProbeResult>()
+        h.xray.egressProber = { never.await() }
+        start(h)
+
+        advanceTimeBy(74_000)
+        runCurrent()
+        assertEquals(1, h.xray.egressProbeCallCount)
+        assertTrue(h.controller.state.value is TransportState.Connected)
+
+        advanceTimeBy(1_500)
+        runCurrent()
+        assertDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+    }
+
+    @Test
+    fun `a probe that throws counts as not reached and keeps the failure`() = runTest {
+        val h = connectXray(stalled)
+        h.xray.egressProber = { throw IllegalStateException("receiver not registered") }
+        start(h)
+
+        advanceTimeBy(66_000)
+        runCurrent()
+
+        assertDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+    }
+
+    @Test
+    fun `a user disconnect during the probe wins - no stale failure afterwards`() = runTest {
+        val h = connectXray(stalled)
+        val answer = CompletableDeferred<IndependentEgressProbeResult>()
+        h.xray.egressProber = { answer.await() }
+        start(h)
+        advanceTimeBy(65_500)
+        runCurrent()
+        assertEquals(1, h.xray.egressProbeCallCount)
+
+        h.controller.disconnect()
+        runCurrent()
+        answer.complete(IndependentEgressProbeResult.NOT_REACHED)
+        advanceTimeBy(80_000)
+        runCurrent()
+
+        assertTrue(h.controller.state.value is TransportState.Disconnected)
+        assertNotEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+        assertEquals(1, h.xray.disconnectCallCount)
+        assertTrue(h.store.recent(fingerprint()).isEmpty())
+    }
+
+    @Test
+    fun `a reconnect that takes ownership during the probe makes its result inert`() = runTest {
+        val h = connectXray(stalled)
+        val answer = CompletableDeferred<IndependentEgressProbeResult>()
+        h.xray.egressProber = { answer.await() }
+        start(h)
+        advanceTimeBy(65_500)
+        runCurrent()
+        assertEquals(1, h.xray.egressProbeCallCount)
+
+        // Xray restarts its session on a network change: a new reconnect
+        // generation owns the controller while the old probe is in flight.
+        h.reconnect.triggerUnderlyingNetworkChanged()
+        runCurrent()
+        answer.complete(IndependentEgressProbeResult.NOT_REACHED)
+        advanceTimeBy(80_000)
+        runCurrent()
+
+        assertNoDataPlaneFailure(h)
+        assertEquals(1, h.xray.egressProbeCallCount)
+    }
+
+    @Test
+    fun `normal progress, idle and unavailable samples never trigger a probe`() = runTest {
+        val working = connectXray { n -> TransportStats.Counters(bytesReceived = n * 900L, bytesSent = n * 300L, lastHandshakeEpochMillis = null) }
+        val idle = connectXray { _ -> TransportStats.Counters(bytesReceived = 512L, bytesSent = 300L, lastHandshakeEpochMillis = null) }
+        val unavailable = connectXray { _ -> TransportStats.Unavailable }
+        listOf(working, idle, unavailable).forEach { h -> h.xray.egressProber = { fail("probe must not run"); IndependentEgressProbeResult.NOT_REACHED } }
+        start(working)
+        start(idle)
+        start(unavailable)
+
+        advanceTimeBy(80_000)
+        runCurrent()
+
+        listOf(working, idle, unavailable).forEach { h ->
+            assertEquals(0, h.xray.egressProbeCallCount)
+            assertTrue(h.controller.state.value is TransportState.Connected)
+        }
+        assertTrue(unavailable.store.recent(fingerprint()).isEmpty())
+    }
+
+    @Test
+    fun `Hysteria2 with Unsupported counters is never probed or failed`() = runTest {
+        val diagnostics = DiagnosticsStore()
+        val hysteria = FakeVpnTransport(kind = TransportKind.HYSTERIA2)
+        hysteria.dataPlaneProvider = { TransportStats.Unsupported }
+        hysteria.egressProber = { fail("probe must not run"); IndependentEgressProbeResult.NOT_REACHED }
+        val controller = VpnController(
+            FakeVpnTransport(), FakeClientKeyRepository(),
+            FakeGatewayConfigurationRepository(gateway()),
+            FakeReconnectManager(), diagnostics, backgroundScope,
+            hysteria2Transport = hysteria,
+        )
+        controller.connect(
+            TransportOrchestrator.Resolution.Resolved(
+                hysteria, TransportKind.HYSTERIA2,
+                endpointId = EndpointId("stockholm"),
+                endpointTransportBinding = EndpointTransportBinding(kind = TransportKind.HYSTERIA2, host = "16.170.208.231", port = 443)
+                    .withHysteria2Profile(Hysteria2Profile(sni = "origin-sthlm.aknova.pp.ua", obfuscationMode = "NONE")),
+            ),
+        )
+        runCurrent()
+        assertTrue(controller.state.value is TransportState.Connected)
+
+        advanceTimeBy(80_000)
+        runCurrent()
+
+        assertTrue(controller.state.value is TransportState.Connected)
+        assertEquals(0, hysteria.egressProbeCallCount)
+        assertEquals(0, hysteria.disconnectCallCount)
+        assertNotEquals(VpnError.DataPlaneNoTraffic, diagnostics.snapshot.value.lastError)
     }
 }
