@@ -334,4 +334,34 @@ class VpnControllerDataPlaneCheckLogTest {
         assertEquals(VpnError.HandshakeTimeout, h.diagnostics.snapshot.value.lastError)
         assertTrue(h.controller.state.value === current)
     }
+
+    @Test
+    fun `a Disconnected state with no new generation - a pending NOT_REACHED verdict is STALE_IGNORED`() = runTest {
+        val h = connectXray(dataPlane = txOnly)
+        val answer = kotlinx.coroutines.CompletableDeferred<IndependentEgressProbeResult>()
+        h.xray.egressProber = { answer.await() }
+        start(h)
+        advanceTimeBy(65_500)
+        runCurrent()
+        assertEquals(1, h.xray.egressProbeCallCount)
+        val disconnectsBefore = h.xray.disconnectCallCount
+
+        // Unlike Error, a transport-reported Disconnected only changes the controller state:
+        // no reconnect incident, so no new generation and no cancelled check. Only the
+        // state guard in failDeadDataPlane can reject the teardown here.
+        h.xray.forceState(TransportState.Disconnected)
+        runCurrent()
+        val current = h.controller.state.value
+        assertTrue(current is TransportState.Disconnected)
+
+        answer.complete(IndependentEgressProbeResult.NOT_REACHED)
+        runCurrent()
+
+        val r = h.log.snapshot().single()
+        assertEquals(DataPlaneCheckStatus.COMPLETED, r.status)
+        assertEquals(DataPlaneCheckAction.STALE_IGNORED, r.action)
+        assertEquals(disconnectsBefore, h.xray.disconnectCallCount)
+        org.junit.Assert.assertNotEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+        assertTrue(h.controller.state.value === current)
+    }
 }
