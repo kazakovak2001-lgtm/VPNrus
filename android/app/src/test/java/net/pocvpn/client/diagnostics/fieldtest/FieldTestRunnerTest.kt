@@ -380,4 +380,39 @@ class FieldTestRunnerTest {
         assertNull(run.throughput)
         assertTrue(run.notes.any { "EPERM" in it })
     }
+
+    @Test
+    fun `a host without the B-WL7 log leaves dataPlaneChecks out of the JSON - older report shape unchanged`() = runTest {
+        val report = runner(FakeHost()).run(FieldTestMode.QUICK, 0) { }
+        assertNull(report.dataPlaneChecks)
+        assertFalse(report.toJson().has("dataPlaneChecks"))
+    }
+
+    @Test
+    fun `the B-WL7 checks the host holds at report time are carried into the JSON`() = runTest {
+        val host = FakeHost()
+        val log = net.pocvpn.client.smartconnect.DataPlaneCheckLog(clock = { 1_000L })
+        val policy = net.pocvpn.client.smartconnect.TrafficProgressPolicy.forTransport(TransportKind.XRAY_REALITY)
+        val id = log.start(TransportKind.XRAY_REALITY, policy, 150)
+        log.complete(
+            id, net.pocvpn.client.smartconnect.TrafficProgressVerdict.VERIFIED,
+            listOf(
+                net.pocvpn.client.smartconnect.TrafficProgressSample(0, 0, 0),
+                net.pocvpn.client.smartconnect.TrafficProgressSample(500, 10, 5),
+                net.pocvpn.client.smartconnect.TrafficProgressSample(10_000, 20, 9),
+            ),
+            21, net.pocvpn.client.smartconnect.TrafficProgressCheckEnd.DECISIVE_VERDICT,
+        )
+        val withLog = object : FieldTestHost by host {
+            override fun dataPlaneChecks() = net.pocvpn.client.smartconnect.DataPlaneCheckLog.reportJson(log.snapshot())
+        }
+        val report = FieldTestRunner(withLog, fakeProbes(host), fastTimings, clock = { testScheduler.currentTime }).run(FieldTestMode.QUICK, 0) { }
+        val section = report.toJson().getJSONObject("dataPlaneChecks")
+        assertEquals("RECORDED", section.getString("status"))
+        val item = section.getJSONArray("items").getJSONObject(0)
+        assertEquals("XRAY_REALITY", item.getString("transport"))
+        assertEquals("COMPLETED", item.getString("status"))
+        assertEquals(65_000L, item.getLong("stallWindowMs"))
+        assertEquals("DECISIVE_VERDICT", item.getString("end"))
+    }
 }

@@ -299,6 +299,11 @@ class VpnController(
     // this wiring only decides whether THIS controller can build a
     // TransportConfig for HYSTERIA2 at all.
     private val hysteria2Transport: VpnTransport? = null,
+    // B-WL7 report - additive, defaults to null (no recording). When wired,
+    // every post-connect data-plane check is also kept in this bounded
+    // in-memory log so the field report carries it independently of logcat.
+    // Recording only: it never feeds back into the check, teardown or failover.
+    private val dataPlaneCheckLog: net.pocvpn.client.smartconnect.DataPlaneCheckLog? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -1842,21 +1847,29 @@ class VpnController(
                 var verdict = TrafficProgressVerdict.VERIFYING
                 var polls = 0
                 var end = TrafficProgressCheckEnd.WINDOW_EXHAUSTED
-                for (pollIndex in 0..maxPolls) {
-                    val stats = transport.dataPlaneCounters()
-                    polls++
-                    if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) {
-                        end = TrafficProgressCheckEnd.COUNTERS_UNSUPPORTED
-                        break
+                val checkId = dataPlaneCheckLog?.start(transport.kind, policy, maxPolls)
+                try {
+                    for (pollIndex in 0..maxPolls) {
+                        val stats = transport.dataPlaneCounters()
+                        polls++
+                        if (stats is TransportStats.Unsupported || stats is TransportStats.NotImplemented) {
+                            end = TrafficProgressCheckEnd.COUNTERS_UNSUPPORTED
+                            break
+                        }
+                        TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
+                        verdict = TrafficProgressMonitor.evaluate(samples, policy)
+                        if (verdict != TrafficProgressVerdict.VERIFYING) {
+                            end = TrafficProgressCheckEnd.DECISIVE_VERDICT
+                            break
+                        }
+                        if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
                     }
-                    TrafficProgressSample.fromCounters(stats, pollIndex * HANDSHAKE_POLL_INTERVAL_MS)?.let { samples += it }
-                    verdict = TrafficProgressMonitor.evaluate(samples, policy)
-                    if (verdict != TrafficProgressVerdict.VERIFYING) {
-                        end = TrafficProgressCheckEnd.DECISIVE_VERDICT
-                        break
-                    }
-                    if (pollIndex < maxPolls) delay(HANDSHAKE_POLL_INTERVAL_MS)
+                } catch (e: Throwable) {
+                    // Record how far the check got, then let the exception propagate exactly as before.
+                    checkId?.let { dataPlaneCheckLog?.interrupt(it, e is kotlinx.coroutines.CancellationException, verdict, samples, polls) }
+                    throw e
                 }
+                checkId?.let { dataPlaneCheckLog?.complete(it, verdict, samples, polls, end) }
                 // One non-secret line per attempt (kind, verdict, applied stall policy, silence, end reason, byte totals) for field diagnostics.
                 // silentForMs and sample times are NOMINAL (pollIndex * HANDSHAKE_POLL_INTERVAL_MS), not measured device time.
                 val diagnosticLine = TrafficProgressDiagnostics.line(transport.kind, policy, samples, verdict, polls, maxPolls, end)

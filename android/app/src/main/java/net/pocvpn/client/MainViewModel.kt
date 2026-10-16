@@ -1037,6 +1037,10 @@ class MainViewModel(
         xrayXhttpProfileRepositories.takeIf { it.isNotEmpty() }
             ?.let { net.pocvpn.client.identity.MapXrayXhttpProfileRepositoryResolver(it) }
 
+    // B-WL7 report - the ONE log VpnController writes each post-connect data-plane
+    // check into and the field report reads (independent of logcat retention).
+    private val dataPlaneCheckLog = net.pocvpn.client.smartconnect.DataPlaneCheckLog()
+
     private val controller = VpnController(
         transport = transport,
         clientKeyRepository = clientKeyRepository,
@@ -1085,6 +1089,7 @@ class MainViewModel(
             supportDiagnosticsRecorder?.recordTransportAttemptStarted(endpointId, kind)
         },
         onReconnectIncident = { event -> recordReconnectIncidentEvent(event) },
+        dataPlaneCheckLog = dataPlaneCheckLog,
     )
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
@@ -3855,6 +3860,7 @@ class MainViewModel(
         override fun exitReasons() = net.pocvpn.client.diagnostics.fieldtest.ExitReasons.collect(context)
         override fun crashes() = net.pocvpn.client.diagnostics.fieldtest.CrashRecorder.recent(context)
         override suspend fun logs() = net.pocvpn.client.diagnostics.fieldtest.FieldLogs.collect()
+        override fun dataPlaneChecks() = net.pocvpn.client.smartconnect.DataPlaneCheckLog.reportJson(dataPlaneCheckLog.snapshot())
         override fun activeNetworkSummary() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.activeSummary(context)
         override suspend fun measureViaXrayCore(urls: List<String>) =
             net.pocvpn.client.vpn.xray.XrayProcessBridge.measureThroughCore(context, urls)
