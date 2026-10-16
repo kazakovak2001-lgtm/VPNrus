@@ -56,6 +56,8 @@ interface FieldTestHost {
     fun exitReasons(): org.json.JSONArray
     fun crashes(): org.json.JSONArray
     suspend fun logs(): List<String>
+    /** B-WL7 checks kept in memory (see DataPlaneCheckLog); null when not wired - the report then omits the section. */
+    fun dataPlaneChecks(): JSONObject? = null
     /**
      * Xray-family sessions exclude the Nova app from their own tunnel, so the
      * app cannot probe through them; the `:xray` process measures with the
@@ -302,6 +304,7 @@ class FieldTestRunner(
             }
         }
         val logs = kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { host.logs() }
+        val dataPlaneChecks = host.dataPlaneChecks()
         step = totalSteps
         val report = FieldTestReport(
             startedAtEpochMillis = startedAt,
@@ -326,6 +329,7 @@ class FieldTestRunner(
             exitReasons = host.exitReasons(),
             crashes = host.crashes(),
             logs = logs,
+            dataPlaneChecks = dataPlaneChecks,
         )
         abort?.let { log += "ABORTED: $it" }
         // QUICK during a normal session: give the user the connection back.
