@@ -19,6 +19,7 @@ import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.xray.XrayProcessBridge
+import net.pocvpn.client.vpn.xray.IndependentEgressTargets
 import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.xray.NovaXrayVpnService
@@ -83,6 +84,7 @@ class VlessTlsTransport(
 
         val sessionId = XrayRuntimeState.nextSessionId()
         activeSessionId = sessionId
+        activeEndpointId = config.endpointId
         observerJob?.cancel()
         observerJob = scope.launch {
             XrayRuntimeState.events.collect { event ->
@@ -144,6 +146,12 @@ class VlessTlsTransport(
     @Volatile private var activeSessionId: Long? = null
 
     override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
+
+    // B-WL7 M1 - the gateway this session exits through, so the egress probe targets a DIFFERENT one.
+    @Volatile private var activeEndpointId: net.pocvpn.client.reachability.EndpointId? = null
+
+    override suspend fun probeIndependentEgress(): IndependentEgressProbeResult =
+        XrayProcessBridge.probeIndependentEgress(context, activeSessionId, IndependentEgressTargets.forSession(activeEndpointId))
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
 

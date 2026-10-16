@@ -17,6 +17,7 @@ import net.pocvpn.client.identity.XrayTlsProfileRepository
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
 import net.pocvpn.client.vpn.TransportFailureKind
 import net.pocvpn.client.vpn.policy.RoutingMode
 
@@ -181,6 +182,29 @@ class NovaXrayVpnService : VpnService() {
                         null
                     }
                     XrayProcessBridge.publishTrafficResult(this@NovaXrayVpnService, requestId, totals)
+                }
+                return Service.START_NOT_STICKY
+            }
+            XrayProcessBridge.ACTION_PROBE_INDEPENDENT_EGRESS -> {
+                // B-WL7 M1: one bounded probe through THIS session's exit to
+                // another gateway (public addresses only), so a counters-only
+                // stall is not taken as a dead exit when the exit demonstrably
+                // still reaches an independent destination.
+                val requestId = intent.getLongExtra(XrayProcessBridge.EXTRA_REQUEST_ID, 0L)
+                val sessionId = intent.getLongExtra(XrayProcessBridge.EXTRA_EGRESS_SESSION_ID, -1L)
+                val targets = intent.getStringArrayExtra(XrayProcessBridge.EXTRA_EGRESS_TARGETS)?.toList().orEmpty()
+                scope.launch {
+                    val result = try {
+                        IndependentEgressDecision.forService(
+                            requestedSessionId = sessionId,
+                            currentSessionId = { currentSessionId },
+                            coreRunning = { coreRuntime.isRunning },
+                            probe = { lifecycleCoordinator.probeIndependentEgress(targets) },
+                        )
+                    } catch (t: Throwable) {
+                        IndependentEgressProbeResult.NOT_REACHED
+                    }
+                    XrayProcessBridge.publishIndependentEgressResult(this@NovaXrayVpnService, requestId, result)
                 }
                 return Service.START_NOT_STICKY
             }

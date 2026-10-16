@@ -3533,7 +3533,13 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   reproduced on a device; see ROADMAP). P2 mitigation: the policy is chosen
   by the sampled transport's kind (`TrafficProgressPolicy.forTransport`) -
   Xray family stall window 65 s, AWG/others 20 s, verification 10 s for
-  all; this only narrows M1, it does not resolve it. Separate: before the
+  all; this only narrows M1, it does not resolve it. F1: before acting on
+  NO_PAYLOAD/STALLED the gate asks `VpnTransport.probeIndependentEgress()`
+  once (10 s caller bound) for the other catalog gateway's
+  `/v1/tunnel-probe` through this session's core; REACHED (probe endpoint
+  only, not general connectivity) restarts from a post-probe sample and
+  extends the window once by one stall window, so a later stall still ends
+  the session and a later IDLE keeps it; the gate stays one-shot. Separate: before the
   death-time Failed above, an unexpected `:xray` death was reported only
   after `DEATH_GRACE_MS` (~2.3 s measured) with the UI still Protected
   while the VPN network was gone. Packets leaving the device in that window

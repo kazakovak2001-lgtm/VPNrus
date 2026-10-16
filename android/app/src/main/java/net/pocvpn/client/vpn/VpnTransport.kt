@@ -43,6 +43,28 @@ interface VpnTransport {
      * but no handshake timestamp (Xray) must not be fed into.
      */
     suspend fun dataPlaneCounters(): TransportStats = TransportStats.Unsupported
+
+    /**
+     * B-WL7 - one bounded request through THIS session's tunnel to a
+     * destination outside the current gateway, asked by VpnController at
+     * most once per attempt and only when [dataPlaneCounters] alone would
+     * end the session. Xray needs it: its counters carry no TCP ACKs, so a
+     * healthy upload-only flow looks exactly like a dead exit. REACHED
+     * means only "that one independent destination answered through this
+     * exit", never general Internet health. Default [IndependentEgressProbeResult.UNAVAILABLE].
+     */
+    suspend fun probeIndependentEgress(): IndependentEgressProbeResult = IndependentEgressProbeResult.UNAVAILABLE
+}
+
+enum class IndependentEgressProbeResult {
+    /** A TLS-verified 200/204 from a different gateway came back through this session's exit. */
+    REACHED,
+
+    /** Asked, but no valid answer (failure, invalid response, timeout, session changed, unreachable `:xray`). */
+    NOT_REACHED,
+
+    /** No probe possible: transport without one, or no independent target known for this gateway. */
+    UNAVAILABLE,
 }
 
 enum class UnderlyingNetworkRecovery {

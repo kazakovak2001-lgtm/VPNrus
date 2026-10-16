@@ -190,10 +190,14 @@ object TrafficProgressDiagnostics {
         polls: Int,
         maxPolls: Int,
         end: TrafficProgressCheckEnd,
+        egressProbe: EgressProbeRecord? = null,
     ): String {
         val last = samples.lastOrNull()
         return "B-WL7 data-plane check: kind=$kind verdict=$verdict samples=${samples.size} rx=${last?.bytesReceived} tx=${last?.bytesSent}" +
             " stallWindowMs=${policy.stallWindowMillis} verificationWindowMs=${policy.verificationWindowMillis}" +
-            " silentForMs=${TrafficProgressMonitor.silentForMillis(samples)} polls=$polls maxPolls=$maxPolls end=$end"
+            " silentForMs=${TrafficProgressMonitor.silentForMillis(samples)} polls=$polls maxPolls=$maxPolls end=$end" +
+            // Appended only when a probe really ran (UNAVAILABLE = the transport has none, e.g. AWG;
+            // still in the DataPlaneCheckLog record), so every other check keeps its exact line.
+            (egressProbe?.takeIf { it.outcome != EgressProbeOutcome.UNAVAILABLE }?.let { " egressProbe=${it.outcome} probeMs=${it.durationMs} probeOn=${it.verdictBefore} rebaselined=${it.rebaselined}" } ?: "")
     }
 }

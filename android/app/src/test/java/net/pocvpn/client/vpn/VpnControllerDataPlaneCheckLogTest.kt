@@ -26,6 +26,10 @@ import net.pocvpn.client.vpn.config.GatewayConfiguration
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import net.pocvpn.client.smartconnect.DataPlaneCheckAction
+import net.pocvpn.client.smartconnect.EgressProbeOutcome
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Test
 
 private val LOG_TEST_XRAY_PROFILE = XrayProfile(
@@ -202,5 +206,95 @@ class VpnControllerDataPlaneCheckLogTest {
         advanceTimeBy(66_000)
         runCurrent()
         assertEquals(VpnError.DataPlaneNoTraffic, diagnostics.snapshot.value.lastError)
+    }
+
+    // --- B-WL7 M1: what the record says about the probe and the controller's action ---
+
+    @Test
+    fun `REACHED then silence in both directions - IDLE, session preserved, probe and extended window recorded`() = runTest {
+        var uploading = true
+        var sent = 0L
+        val h = connectXray { _ -> if (uploading) sent += 300L; TransportStats.Counters(bytesReceived = 0L, bytesSent = sent, lastHandshakeEpochMillis = null) }
+        h.xray.egressProber = { uploading = false; IndependentEgressProbeResult.REACHED }
+        start(h)
+        advanceTimeBy(200_000)
+        runCurrent()
+
+        val r = h.log.snapshot().single()
+        assertEquals(DataPlaneCheckStatus.COMPLETED, r.status)
+        assertEquals(TrafficProgressVerdict.IDLE, r.verdict)
+        assertEquals(DataPlaneCheckAction.PRESERVED, r.action)
+        assertEquals(260, r.maxPolls) // 130 polls to the stall + one 65 s stall window
+        assertNotNull(r.generation)
+        val probe = r.egressProbe!!
+        assertEquals(EgressProbeOutcome.REACHED, probe.outcome)
+        assertEquals(TrafficProgressVerdict.NO_PAYLOAD, probe.verdictBefore)
+        assertTrue(probe.rebaselined)
+        assertTrue(probe.durationMs >= 0)
+        // Policy unchanged: an IDLE window never ends the session.
+        assertTrue(h.controller.state.value is TransportState.Connected)
+        val line = h.controller.lastDataPlaneCheckDiagnostic!!
+        assertTrue(line, line.contains(" verdict=IDLE "))
+        assertTrue(line, line.contains(" egressProbe=REACHED probeMs="))
+        assertTrue(line, line.endsWith(" probeOn=NO_PAYLOAD rebaselined=true"))
+    }
+
+    @Test
+    fun `NOT_REACHED - the session is torn down and the record says so`() = runTest {
+        val h = connectXray(dataPlane = txOnly)
+        h.xray.egressProber = { IndependentEgressProbeResult.NOT_REACHED }
+        start(h)
+        advanceTimeBy(66_000)
+        runCurrent()
+
+        val r = h.log.snapshot().single()
+        assertEquals(TrafficProgressVerdict.NO_PAYLOAD, r.verdict)
+        assertEquals(DataPlaneCheckAction.TORN_DOWN, r.action)
+        assertEquals(EgressProbeOutcome.NOT_REACHED, r.egressProbe!!.outcome)
+        assertFalse(r.egressProbe!!.rebaselined)
+        assertEquals(150, r.maxPolls) // no extension
+        assertEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+    }
+
+    @Test
+    fun `the caller's own 10 s bound and an exception are recorded apart, both still end the session`() = runTest {
+        val never = connectXray(dataPlane = txOnly)
+        never.xray.egressProber = { kotlinx.coroutines.awaitCancellation() }
+        val throws = connectXray(dataPlane = txOnly)
+        throws.xray.egressProber = { throw IllegalStateException("receiver not registered") }
+        start(never)
+        start(throws)
+        advanceTimeBy(76_000)
+        runCurrent()
+
+        assertEquals(EgressProbeOutcome.CALLER_TIMEOUT, never.log.snapshot().single().egressProbe!!.outcome)
+        assertEquals(EgressProbeOutcome.EXCEPTION, throws.log.snapshot().single().egressProbe!!.outcome)
+        listOf(never, throws).forEach { h ->
+            assertEquals(DataPlaneCheckAction.TORN_DOWN, h.log.snapshot().single().action)
+            assertEquals(VpnError.DataPlaneNoTraffic, h.diagnostics.snapshot.value.lastError)
+        }
+    }
+
+    @Test
+    fun `a disconnect while the probe runs leaves a CANCELLED record with no probe and no action`() = runTest {
+        val h = connectXray(dataPlane = txOnly)
+        val answer = kotlinx.coroutines.CompletableDeferred<IndependentEgressProbeResult>()
+        h.xray.egressProber = { answer.await() }
+        start(h)
+        advanceTimeBy(65_500)
+        runCurrent()
+        assertEquals(1, h.xray.egressProbeCallCount)
+
+        h.controller.disconnect()
+        runCurrent()
+        answer.complete(IndependentEgressProbeResult.REACHED)
+        advanceTimeBy(80_000)
+        runCurrent()
+
+        val r = h.log.snapshot().single()
+        assertEquals(DataPlaneCheckStatus.CANCELLED, r.status)
+        assertNull(r.egressProbe)
+        assertNull(r.action)
+        assertTrue(h.controller.state.value is TransportState.Disconnected)
     }
 }
