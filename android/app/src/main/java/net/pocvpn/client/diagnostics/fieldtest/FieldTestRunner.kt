@@ -135,8 +135,22 @@ class FieldProbeSet(
         { l, u, n, m, t -> FieldProbes.https(l, u, n, maxBytes = m, parseTrace = t) },
     val censorship: suspend ((String) -> Unit) -> CensorshipReport = { onLine -> CensorshipProbe.run(onLine) },
     val api: suspend (List<String>) -> org.json.JSONArray = { origins -> ApiReachability.check(origins) },
-    val leaks: suspend (Network?, List<String>) -> JSONObject = { n, direct -> LeakChecks.inTunnel(n, direct) },
+    val leaks: suspend (Network?, List<String>, Boolean?) -> JSONObject = { n, direct, v6 -> LeakChecks.inTunnel(n, direct, v6) },
 )
+
+/**
+ * B54 Scope A - `hasGlobalIpv6` of the ordinary (non-VPN) default network.
+ * Null - unknown, never "no IPv6" - when there is no active network, the
+ * context does not say, or the active network is (or may be) a VPN: a VPN's
+ * own addresses say nothing about the network underneath it.
+ */
+internal fun baselineHasGlobalIpv6(networkContext: JSONObject): Boolean? {
+    val active = networkContext.optJSONObject("activeNetwork") ?: return null
+    if (!active.has("hasGlobalIpv6") || active.optBoolean("notVpn", false).not()) return null
+    val transports = active.optJSONArray("transports") ?: return null
+    if ((0 until transports.length()).any { transports.optString(it) == "VPN" }) return null
+    return active.getBoolean("hasGlobalIpv6")
+}
 
 /** UDP-only transport kinds: a TCP connect says nothing about them, the VPN run does. */
 private val UDP_KINDS = setOf(TransportKind.AMNEZIA_WG, TransportKind.HYSTERIA2, TransportKind.QUIC)
@@ -261,6 +275,9 @@ class FieldTestRunner(
                     progress("Preparing", "Disconnecting the current session (direct probes must not use the tunnel)")
                     disconnectAndWait()
                 }
+                // B54 Scope A - the IPv6 baseline describes the ordinary network, so it is
+                // read only once the session is confirmed Disconnected; otherwise unknown.
+                val ipv6Baseline = if (host.transportState.value is TransportState.Disconnected) baselineHasGlobalIpv6(host.networkContext()) else null
                 step++
                 progress("Direct probes", "Direct (VPN off) probes...")
                 direct = directProbes(manifest) { progress("Direct probes", it) }
@@ -285,9 +302,9 @@ class FieldTestRunner(
                 attempts.forEach { target ->
                     step++
                     progress("VPN runs", "[$step/$totalSteps] ${target.label}")
-                    val run = runOne(target, manifest, resolver.addresses)
+                    val run = runOne(target, manifest, resolver.addresses, ipv6Baseline)
                     runs += run
-                    val leakText = run.leaks?.optString("verdict")?.let { " leaks=$it" } ?: ""
+                    val leakText = run.leaks?.let { " leaks=${LeakChecks.summaryText(it)}" } ?: ""
                     val why = run.errorMessage?.let { " ($it)" } ?: run.skipReason?.let { " ($it)" } ?: ""
                     progress("VPN runs", "  -> ${run.outcome}${run.exitIp?.let { " exit $it" } ?: ""}$leakText$why")
                     if (run.outcome != FieldRunOutcome.SKIPPED) delay(timings.betweenRunsMs)
@@ -478,7 +495,7 @@ class FieldTestRunner(
         return FieldDirectProbes(dns, http, tcp)
     }
 
-    private suspend fun runOne(target: FieldAttemptTarget, manifest: EndpointManifest?, directResolver: List<String>): FieldTransportRun {
+    private suspend fun runOne(target: FieldAttemptTarget, manifest: EndpointManifest?, directResolver: List<String>, baselineHasGlobalIpv6: Boolean?): FieldTransportRun {
         val startedAt = clock()
         // A relay run exits at the ingress' relayTo endpoint; Auto may exit anywhere.
         val endpointId = target.gateway?.let { host.endpointIdFor(it) }
@@ -602,7 +619,7 @@ class FieldTestRunner(
             delay(timings.stabilityHoldMs)
             stability += probes.https("Google 204 after hold", FieldTestTargets.CONNECTIVITY_204, vpn, 4 * 1024, false)
             stability += probes.https("Cloudflare trace after hold", FieldTestTargets.CLOUDFLARE_TRACE, vpn, 4 * 1024, true)
-            leaks = probes.leaks(vpn, directResolver)
+            leaks = probes.leaks(vpn, directResolver, baselineHasGlobalIpv6)
             if (host.transportState.value !is TransportState.Connected) notes += "session left Connected during probes: ${host.transportState.value.label()}"
         }
         if (target.relayIngress != null) {

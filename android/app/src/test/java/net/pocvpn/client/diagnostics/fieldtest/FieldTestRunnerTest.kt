@@ -106,7 +106,8 @@ class FieldTestRunnerTest {
         override fun latestDiagnosticSession(): JSONObject? = JSONObject().put("selectedPathKind", "DIRECT")
         override fun appState() = JSONObject().put("state", "x")
         override fun supportBundle(): JSONObject? = JSONObject().put("schemaVersion", 1)
-        override fun networkContext() = JSONObject().put("summary", "WIFI, operator Test (25001, ru)")
+        var context: (TransportState) -> JSONObject = { JSONObject().put("summary", "WIFI, operator Test (25001, ru)") }
+        override fun networkContext() = context(transportState.value)
         override fun vpnNetwork(): Network? = null
         override fun appInfo() = JSONObject().put("gitCommit", "abc")
         override fun deviceInfo() = JSONObject().put("model", "test")
@@ -121,6 +122,14 @@ class FieldTestRunnerTest {
             if (coreAnswers) urls.map { net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement(it, 42, null) } else null
     }
 
+    /** IPv6 baseline the runner handed to each leak check, in call order. */
+    private val leakBaselines = mutableListOf<Boolean?>()
+
+    private fun context(vararg transports: String, globalIpv6: Boolean) = JSONObject().put(
+        "activeNetwork",
+        JSONObject().put("transports", org.json.JSONArray(transports.toList())).put("notVpn", "VPN" !in transports).put("hasGlobalIpv6", globalIpv6),
+    )
+
     private fun okProbe(label: String, url: String, maxBytes: Long, trace: Map<String, String> = emptyMap()) =
         HttpProbeResult(label, url, true, 200, 10, 5, maxBytes, null, true, null, trace)
 
@@ -130,7 +139,7 @@ class FieldTestRunnerTest {
         tcp = { l, h, p, _ -> TcpProbeResult(l, h, p, true, 5, null) },
         censorship = { _ -> CensorshipReport(emptyList(), mapOf("8.8.8.8:53" to false), mapOf("cloudflare" to true), listOf("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED")) },
         api = { origins -> org.json.JSONArray().apply { origins.forEach { put(JSONObject().put("origin", it).put("path", "/v1/activate").put("verdict", "API_REACHABLE").put("httpStatus", 400)) } } },
-        leaks = { _, direct -> JSONObject().put("verdict", if (direct.isEmpty()) "NO_LEAK_OBSERVED" else "NO_LEAK_OBSERVED") },
+        leaks = { _, direct, v6 -> leakBaselines += v6; JSONObject().put("verdict", if (direct.isEmpty()) "NO_LEAK_OBSERVED" else "NO_LEAK_OBSERVED") },
         https = { label, url, _, maxBytes, parseTrace ->
             val inTunnel = host.transportState.value is TransportState.Connected
             when {
@@ -414,5 +423,45 @@ class FieldTestRunnerTest {
         assertEquals("COMPLETED", item.getString("status"))
         assertEquals(65_000L, item.getLong("stallWindowMs"))
         assertEquals("DECISIVE_VERDICT", item.getString("end"))
+    }
+
+    @Test
+    fun `IPv6 baseline is read after the active VPN is disconnected, not through it`() = runTest {
+        val host = FakeHost()
+        host.transportState.value = TransportState.Connected
+        // Through the VPN no global IPv6 is visible; the ordinary network underneath has it.
+        host.context = { state -> if (state is TransportState.Connected) context("WIFI", "VPN", globalIpv6 = false) else context("WIFI", globalIpv6 = true) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == true })
+    }
+
+    @Test
+    fun `IPv6 baseline is unknown when the VPN is not confirmed disconnected`() = runTest {
+        val host = FakeHost(stickyError = true)
+        host.transportState.value = TransportState.Error("stuck")
+        host.context = { context("WIFI", globalIpv6 = false) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == null })
+    }
+
+    @Test
+    fun `IPv6 baseline is unknown, not NO_IPV6, without an ordinary network`() = runTest {
+        val host = FakeHost()
+        host.context = { JSONObject().put("activeNetwork", JSONObject.NULL) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == null })
+        assertEquals(LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.LOOKUP_FAILED), LeakChecks.classifyIpv6(leakBaselines.first(), HttpProbeResult("IPv6", LeakChecks.IPV6_ONLY_URL, false, null, 1, null, 0, null, false, "x", failureKind = ProbeFailureKind.UNKNOWN_HOST)))
+    }
+
+    @Test
+    fun `IPv6 baseline from a direct network without IPv6 reaches the leak check as false`() = runTest {
+        val host = FakeHost()
+        host.context = { context("CELLULAR", globalIpv6 = false) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == false })
     }
 }

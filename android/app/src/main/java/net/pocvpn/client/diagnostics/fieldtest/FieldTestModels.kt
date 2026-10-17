@@ -211,7 +211,7 @@ internal fun FieldTestReport.summaryLines(): List<String> {
                 r.throughput?.let { append(", bulk ${throughputText(it)}") }
                 val stalls = (r.probes + r.stability + listOfNotNull(r.throughput)).mapNotNull { it.stalledAtBytes }
                 if (stalls.isNotEmpty()) append(", STALL at ${stalls.joinToString("/")} B")
-                r.leaks?.optString("verdict")?.let { append(", leaks $it") }
+                r.leaks?.let { append(", leaks ${LeakChecks.summaryText(it)}") }
                 r.coreMeasurements?.let { m -> append(", core ${m.joinToString(" ") { c -> "${c.url.substringAfter("//").substringBefore('/')}=${if (c.ok) "${c.delayMs}ms" else "FAIL"}" }}") }
             }
         }
