@@ -109,6 +109,21 @@ object LeakChecks {
     }
 
     /**
+     * B54 Scope B - a copy of [leaks] whose typed results no longer count:
+     * every check that ran becomes INCONCLUSIVE/SESSION_CHANGED. A NOT_RUN
+     * check stays as it was; the historical keys are left untouched.
+     */
+    fun invalidatedBySessionChange(leaks: JSONObject): JSONObject {
+        val o = JSONObject(leaks.toString())
+        listOf("dns", "ipv6").forEach { check ->
+            if (storedResult(o, "${check}Result") != LeakCheckResult.NOT_RUN) {
+                o.put("${check}Result", LeakCheckResult.INCONCLUSIVE.name).put("${check}Reason", LeakCheckReason.SESSION_CHANGED.name)
+            }
+        }
+        return o
+    }
+
+    /**
      * Reads a Scope A result back from a report's `leaks` object. Null means
      * UNKNOWN: a report from before Scope A (no such key) or a value this
      * build does not know - never a no-leak result.
@@ -161,6 +176,9 @@ enum class LeakCheckReason {
 
     /** No VPN network was available, so the lookup was not bound to the tunnel. */
     NO_VPN_NETWORK,
+
+    /** B54 Scope B - the session left Connected or was replaced while the check ran. */
+    SESSION_CHANGED,
     NO_IPV6_ON_NETWORK,
 
     /** No direct-resolver baseline to compare with. */

@@ -144,4 +144,17 @@ class LeakCheckResultTest {
         assertNull(baselineHasGlobalIpv6(JSONObject().put("activeNetwork", JSONObject.NULL)))
         assertNull(baselineHasGlobalIpv6(JSONObject()))
     }
+
+    @Test fun `a session change makes every check that ran inconclusive and leaves NOT_RUN and history alone`() {
+        val original = LeakChecks.report(true, lookup("104.23.222.38"), baseline, false, null)
+        val o = LeakChecks.invalidatedBySessionChange(original)
+        assertEquals("INCONCLUSIVE", o.getString("dnsResult"))
+        assertEquals("SESSION_CHANGED", o.getString("dnsReason"))
+        assertEquals("NOT_RUN", o.getString("ipv6Result"))
+        assertEquals("NO_IPV6_ON_NETWORK", o.getString("ipv6Reason"))
+        assertEquals(original.getString("verdict"), o.getString("verdict"))
+        assertEquals(original.getBoolean("dnsLeakSuspected"), o.getBoolean("dnsLeakSuspected"))
+        // The original object is not modified.
+        assertEquals("NO_LEAK_DETECTED", original.getString("dnsResult"))
+    }
 }
