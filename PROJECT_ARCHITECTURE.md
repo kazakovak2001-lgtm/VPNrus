@@ -402,6 +402,39 @@ NetworkProfiler
   gatewayTunnelIp together, never host alone, never inferred from current UI
   selection). A response matching no known gateway, or a DIFFERENT gateway than the
   one requested, is rejected outright - never accepted-but-ignored.
+- **Managed AWG identity binding (hard invariant, Phase B).** A stored tunnel IP
+  alone NEVER authorizes managed AWG. `ManagedAwgBindingStore` keeps a per-gateway
+  map `ProductionGatewayId -> fingerprint` (SHA-256 of the raw managed public key,
+  first 16 hex), written ONLY by the activation commit - never by startup,
+  migration, recovery or connect (no adoption). Managed AWG for a gateway is
+  allowed only when that gateway's binding equals the fingerprint of the public
+  key DERIVED from the existing private key the tunnel will use
+  (`ClientKeyRepository.getExistingPrivateKeyForTunnel`, never creates a key).
+  Missing/unreadable/stale binding, missing/corrupt key or a mismatched key pair
+  fails closed; PRIVATE, Xray and Hysteria2 are not gated.
+- **Single enforcement point**: `VpnController.buildTransportConfig` (managed
+  `AMNEZIA_WG` branch) runs `ManagedAwgIdentityGuard.requireEligiblePrivateKeyLocked`
+  and builds the AwgConfig in the same critical section. It also re-reads the
+  gateway's CURRENT tunnel IP (`ClientTunnelIdentityStore`) and refuses
+  (`TUNNEL_IDENTITY_CHANGED`) if it is missing or differs from the config's
+  `clientTunnelIp` (the config may have been snapshotted before the lock).
+- **Activation commit** (`MainViewModel.commitManagedActivationLocally`, HTTP
+  request outside the lock, short `NonCancellable` local section): key used by
+  the request must still be current, else no local write; then the gateway's OLD
+  binding is removed (abort on failure), then profile + tunnel IP, then the new
+  binding LAST. No server/local atomicity: any failure leaves that gateway
+  unbound until a successful activation. Existing installs therefore need a new
+  activation (and, with `max_devices=1`, a new credential) before managed AWG.
+- **Identity mutation** (debug regeneration) only via
+  `VpnController.runManagedIdentityMutation`: refused unless that controller is
+  idle (`Disconnected`, no cached config); all bindings are deleted BEFORE the key
+  is replaced, and the key is untouched if that fails.
+- **Lock order**: `connectMutex` (per `VpnController`) -> L
+  (`ManagedIdentityLifecycle`, inside `ManagedAwgIdentityGuard`) -> binding-store
+  lock -> managed key repository mutex; code holding L never takes
+  `connectMutex`. The guard is built per `MainViewModel.Factory.create()` call,
+  so these locks serialize ONE ViewModel/controller only - they do not
+  coordinate several concurrent `MainActivity` instances.
 
 ## Xray/TLS Connected confirmation (hard invariant, B33)
 
