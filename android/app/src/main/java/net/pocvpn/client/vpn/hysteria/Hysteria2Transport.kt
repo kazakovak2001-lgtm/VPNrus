@@ -59,6 +59,7 @@ class Hysteria2Transport(
 
     private val state = MutableStateFlow<TransportState>(TransportState.Disconnected)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val probe = Hysteria2TunnelProbe()
     private var observerJob: Job? = null
     @Volatile private var currentSessionId = 0L
 
@@ -128,6 +129,17 @@ class Hysteria2Transport(
      * session of ours runs or the child streams no stats.
      */
     override suspend fun dataPlaneCounters(): TransportStats = Hysteria2VpnService.dataPlaneCounters(currentSessionId)
+
+    /**
+     * H2-GATE Gap A (S1) - the in-tunnel probe through the CURRENT session's
+     * authenticated loopback SOCKS to the gateway. A session that is no
+     * longer RUNNING has no target, so the answer is false - never another
+     * session's result.
+     */
+    override suspend fun confirmSessionDataPath(): Boolean {
+        val target = Hysteria2VpnService.probeTarget(currentSessionId) ?: return false
+        return probe.confirm(target.socksAddress, target.socksUsername, target.socksPassword, target.host) is Hysteria2TunnelProbeResult.Confirmed
+    }
 
     private companion object {
         val nextSessionId = AtomicLong(0)

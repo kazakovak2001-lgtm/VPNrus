@@ -3699,10 +3699,29 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   pid and fails closed (wrong pid, non-increasing seq, falling counters,
   stream end -> `Unsupported`; >3.5 s quiet -> `Unavailable`, no sample).
   `Hysteria2VpnService.dataPlaneCounters(sessionId)` serves only the
-  RUNNING session. Policy: the 65 s payload-only stall window; idle windows
-  re-arm while unverified; a stall ends the session via the existing
-  `DataPlaneNoTraffic` path. A child without the marker can never reach
-  Protected. Other transports' Protected semantics are unchanged.
+  RUNNING session. A child without the marker can never reach Protected.
+  Other transports' Protected semantics are unchanged.
+- Hysteria2 data-plane monitor (H2-GATE Gap A, `vpn/Hysteria2DataPlaneMonitor.kt`
+  driven by `VpnController.runHysteria2DataPlaneMonitor`, one long-lived
+  sampler per session/generation; Gap B relaunches it after an automatic
+  reconnect). Promotion (initial and after a revoke) = `evaluate` VERIFIED
+  over the current epoch's samples AND an rx advance in the newest sample;
+  the first sample of an epoch is a baseline. No S1 probe runs before the
+  first promotion; S1 (`VpnTransport.confirmSessionDataPath`, session-scoped
+  `Hysteria2VpnService.probeTarget`) never promotes. While Protected: tx
+  without rx for the 10 s verification window revokes at once; 60 s without
+  an rx advance or S1 success starts one IDLE probe whose success keeps
+  Protected only with live counters; `Unavailable` revokes; `Unsupported`
+  revokes and stops the monitor (session stays non-Protected, no teardown).
+  A revoke starts a new epoch and a recovery episode (<= 3 serialized
+  probes, 120 s - both provisional); successes never restore, two
+  consecutive failures or a failed last probe at the episode end tear down
+  through `failDeadDataPlane`, otherwise the session holds non-Protected.
+  The existing NO_PAYLOAD/STALLED verdict still tears down. Every
+  promote/revoke/teardown checks one ownership predicate (monitor job,
+  reconnect generation, `connectedEpoch`, transport, Connected) under
+  `connectMutex` -> `reconnectOwnershipLock`; `setState` runs under
+  `reconnectOwnershipLock`, so every `_state` writer serializes with it.
 - Live (2026-09-28): Stockholm runs both units (official pinned v2.12.3);
   manifest v6 (`prod-manifest-key-2026-09-14`) carries the only HYSTERIA2
   binding, `16.170.208.231:443`, SNI `origin-sthlm.aknova.pp.ua`, `NONE`;

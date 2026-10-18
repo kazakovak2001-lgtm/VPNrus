@@ -478,6 +478,7 @@ class Hysteria2VpnService : VpnService() {
                         Log.i(TAG, "hysteria2 session started: tun2socksPid=${tun2socksResult.pid} quicConnected=${hysteriaRuntime.quicConnected}")
                         // H2-GATE (S2): counters become readable for THIS session only.
                         dataPlaneSource = DataPlaneSource(sessionId, tun2socksRuntime::dataPlaneCounters)
+                        probeTarget = ProbeTarget(sessionId, socksAddr, localSocks.username, localSocks.password, host)
                         publish(sessionId, Hysteria2RuntimePhase.RUNNING)
                     } else {
                         Log.w(TAG, "session $sessionId superseded during startup - tearing down the just-started children")
@@ -620,8 +621,25 @@ class Hysteria2VpnService : VpnService() {
         @Volatile internal var dataPlaneSource: DataPlaneSource? = null
 
         internal fun clearDataPlaneSource(sessionId: Long) {
-            synchronized(this) { if (dataPlaneSource?.sessionId == sessionId) dataPlaneSource = null }
+            synchronized(this) {
+                if (dataPlaneSource?.sessionId == sessionId) dataPlaneSource = null
+                if (probeTarget?.sessionId == sessionId) probeTarget = null
+            }
         }
+
+        /** H2-GATE Gap A (S1) - where the RUNNING session's in-tunnel probe goes; in process memory only, never logged. */
+        internal class ProbeTarget(
+            val sessionId: Long,
+            val socksAddress: String,
+            val socksUsername: String,
+            val socksPassword: String,
+            val host: String,
+        )
+
+        @Volatile internal var probeTarget: ProbeTarget? = null
+
+        /** The probe target of [sessionId] only; null for any other (stale or newer) session or none. */
+        internal fun probeTarget(sessionId: Long): ProbeTarget? = probeTarget?.takeIf { it.sessionId == sessionId }
 
         /**
          * The tun2socks child's payload counters for [sessionId] only.

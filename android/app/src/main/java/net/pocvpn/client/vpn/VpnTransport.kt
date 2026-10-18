@@ -54,6 +54,15 @@ interface VpnTransport {
      * exit", never general Internet health. Default [IndependentEgressProbeResult.UNAVAILABLE].
      */
     suspend fun probeIndependentEgress(): IndependentEgressProbeResult = IndependentEgressProbeResult.UNAVAILABLE
+
+    /**
+     * H2-GATE Gap A (S1) - one bounded probe of THIS session's own
+     * transport path to its gateway. true = answered, false = failed or not
+     * this session any more, null (default) = the transport has no such
+     * probe. It never proves TUN forwarding, so it can never by itself make a
+     * session Protected.
+     */
+    suspend fun confirmSessionDataPath(): Boolean? = null
 }
 
 enum class IndependentEgressProbeResult {

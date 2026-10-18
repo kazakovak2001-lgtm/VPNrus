@@ -98,6 +98,29 @@ class FakeVpnTransport(
 
     override suspend fun dataPlaneCounters(): TransportStats = dataPlaneProvider?.invoke() ?: stats()
 
+    // H2-GATE Gap A - what confirmSessionDataPath() (S1) answers; null keeps
+    // the interface default (no probe). Counts calls and concurrency so tests
+    // can prove probes never overlap.
+    var sessionProbe: (suspend () -> Boolean?)? = null
+    var sessionProbeCalls = 0
+        private set
+    var sessionProbesInFlight = 0
+        private set
+    var maxSessionProbesInFlight = 0
+        private set
+
+    override suspend fun confirmSessionDataPath(): Boolean? {
+        val probe = sessionProbe ?: return null
+        sessionProbeCalls++
+        sessionProbesInFlight++
+        maxSessionProbesInFlight = maxOf(maxSessionProbesInFlight, sessionProbesInFlight)
+        try {
+            return probe()
+        } finally {
+            sessionProbesInFlight--
+        }
+    }
+
     // B-WL7 M1 - what probeIndependentEgress() answers; null = UNAVAILABLE,
     // the default every existing transport (and test) has.
     var egressProber: (suspend () -> IndependentEgressProbeResult)? = null

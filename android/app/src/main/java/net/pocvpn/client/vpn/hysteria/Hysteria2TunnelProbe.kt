@@ -9,6 +9,7 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -39,6 +40,7 @@ internal sealed interface Hysteria2TunnelProbeResult {
 internal class Hysteria2TunnelProbe(
     private val timeoutMillis: Long = TUNNEL_PROBE_TIMEOUT_MS,
     private val tlsWrap: (Socket, String, Int) -> Socket = ::verifiedTls,
+    private val socketFactory: () -> Socket = ::Socket,
 ) {
     private val probeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -53,7 +55,7 @@ internal class Hysteria2TunnelProbe(
         val (socksHost, socksPort) = parseLoopbackSocksAddress(socksAddress)
             ?.let { it.substringBeforeLast(':') to it.substringAfterLast(':').toInt() }
             ?: return Hysteria2TunnelProbeResult.Failed("invalid local socks address")
-        val socket = Socket()
+        val socket = socketFactory()
         val work = probeScope.async {
             try {
                 socket.soTimeout = timeoutMillis.toInt()
@@ -77,10 +79,19 @@ internal class Hysteria2TunnelProbe(
                 runCatching { socket.close() }
             }
         }
-        return withTimeoutOrNull(timeoutMillis) { work.await() } ?: run {
+        return try {
+            withTimeoutOrNull(timeoutMillis) { work.await() } ?: run {
+                runCatching { socket.close() }
+                work.cancel()
+                Hysteria2TunnelProbeResult.Failed("timeout")
+            }
+        } catch (e: CancellationException) {
+            // H2-GATE Gap A - the caller (a cancelled monitor) gives up: close
+            // the socket now so the blocked I/O ends instead of lingering
+            // until soTimeout.
             runCatching { socket.close() }
             work.cancel()
-            Hysteria2TunnelProbeResult.Failed("timeout")
+            throw e
         }
     }
 
