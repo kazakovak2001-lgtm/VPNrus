@@ -80,6 +80,8 @@ fun VpnSessionHealth.toHomeStatusText(): String = when (this) {
     is VpnSessionHealth.Idle -> "Disconnected"
     is VpnSessionHealth.InProgress -> "Connecting…"
     is VpnSessionHealth.DirectProtected -> "Protected"
+    // H2-GATE (Hysteria2 only): tunnel up, real traffic not yet proven - never "Protected".
+    is VpnSessionHealth.DataPlaneVerifying -> "Verifying connection…"
     is VpnSessionHealth.RelayHandshake -> "Connecting…"
     is VpnSessionHealth.RelayProtected -> "Protected"
     is VpnSessionHealth.Reconnecting -> "Reconnecting…"
@@ -89,7 +91,9 @@ fun VpnSessionHealth.toHomeStatusText(): String = when (this) {
 /** [VpnSessionHealth] counterpart of [TransportState.toHomeVisualState] - see that function's own docs for the grouping rationale, unchanged here. */
 fun VpnSessionHealth.toHomeVisualState(): HomeVisualState = when (this) {
     is VpnSessionHealth.Idle -> HomeVisualState.DISCONNECTED
-    is VpnSessionHealth.InProgress, is VpnSessionHealth.RelayHandshake, is VpnSessionHealth.Reconnecting -> HomeVisualState.IN_PROGRESS
+    is VpnSessionHealth.InProgress, is VpnSessionHealth.RelayHandshake, is VpnSessionHealth.Reconnecting,
+    is VpnSessionHealth.DataPlaneVerifying,
+    -> HomeVisualState.IN_PROGRESS
     is VpnSessionHealth.DirectProtected, is VpnSessionHealth.RelayProtected -> HomeVisualState.CONNECTED
     is VpnSessionHealth.Failed -> HomeVisualState.FAILED
 }

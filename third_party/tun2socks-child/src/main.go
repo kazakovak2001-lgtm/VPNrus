@@ -149,6 +149,10 @@ type ackResponse struct {
 	// Android side refuses a successful ack without it, so a stale
 	// pre-hardening binary can never run anonymous SOCKS5 unnoticed.
 	SocksAuth bool `json:"socksAuth,omitempty"`
+	// NOVA H2-GATE: capability marker - this child streams data-plane
+	// counters on a third control connection (dataplane_stats.go). A child
+	// without it gives the parent no counters, never fabricated ones.
+	Stats bool `json:"stats,omitempty"`
 }
 
 func main() {
@@ -186,7 +190,7 @@ func main() {
 	}
 
 	log.Print(startedLogLine(os.Getpid(), hdr))
-	if err := sendAck(controlPath, ackResponse{OK: true, PID: os.Getpid(), SocksAuth: true}); err != nil {
+	if err := sendAck(controlPath, ackResponse{OK: true, PID: os.Getpid(), SocksAuth: true, Stats: true}); err != nil {
 		// The engine is running but the ack couldn't be delivered - the
 		// parent will treat this as a start failure and may retry/kill us;
 		// fail closed by shutting the engine back down rather than leaving
@@ -196,7 +200,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	statsStop := make(chan struct{})
+	go runStatsReporter(controlPath, os.Getpid(), statsStop)
+
 	waitForStopSignal()
+	close(statsStop)
 	log.Printf("B46_3B_CHILD_STOPPING: pid=%d", os.Getpid())
 	if err := engine.Stop(); err != nil {
 		log.Printf("B46_3B_CHILD_STOP_ERROR: %v", err)

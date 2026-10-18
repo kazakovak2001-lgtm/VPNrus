@@ -5,6 +5,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -398,8 +400,74 @@ class VpnController(
     private val _sessionHealth = MutableStateFlow<VpnSessionHealth>(VpnSessionHealth.Idle)
     val sessionHealth: StateFlow<VpnSessionHealth> = _sessionHealth.asStateFlow()
 
+    // H2-GATE - the transport and reconnect generation whose CURRENT session
+    // earned a B-WL7 VERIFIED (see [markDataPlaneVerified]). Cleared by every
+    // non-Connected state, so a new session or a reconnect must earn it again.
+    @Volatile private var dataPlaneVerifiedTransport: VpnTransport? = null
+    @Volatile private var dataPlaneVerifiedGeneration = -1L
+    @Volatile private var dataPlaneVerifiedConnectedEpoch = -1L
+
+    // H2-GATE Gap A - bumped (under reconnectOwnershipLock, in setState) on
+    // every transition OUT of Connected, so the value seen while a session is
+    // Connected - and when its monitor is launched, which can be just before
+    // the Connected write - identifies that one Connected period. A monitor or
+    // verification from an earlier period can never match a later one, even
+    // within the same reconnect generation.
+    private var connectedEpoch = 0L
+
     private fun recomputeSessionHealth() {
-        _sessionHealth.value = computeSessionHealth(_state.value, pendingAttemptContext, _relayStage.value)
+        val proofPending = requiresDataPlaneProof(_currentTransportKind.value) && !isDataPlaneVerifiedForActiveSession()
+        _sessionHealth.value = computeSessionHealth(_state.value, pendingAttemptContext, _relayStage.value, proofPending)
+    }
+
+    private fun isDataPlaneVerifiedForActiveSession(): Boolean = synchronized(reconnectOwnershipLock) {
+        dataPlaneVerifiedTransport === activeTransport && dataPlaneVerifiedGeneration == reconnectGeneration &&
+            dataPlaneVerifiedConnectedEpoch == connectedEpoch
+    }
+
+    /**
+     * H2-GATE Gap A - the one ownership predicate for every monitor action.
+     * Caller holds reconnectOwnershipLock (and connectMutex); every `_state`
+     * writer goes through [setState] under the same lock, so the check and
+     * the non-suspending write that follows it are atomic.
+     */
+    private fun ownsSessionLocked(job: Job?, transport: VpnTransport, generation: Long, epoch: Long): Boolean =
+        job != null && progressObservationJob === job && reconnectGeneration == generation && connectedEpoch == epoch &&
+            activeTransport === transport && _state.value is TransportState.Connected
+
+    /**
+     * H2-GATE - records a fresh VERIFIED for the session [launchLiveProgressObservation]
+     * sampled, only if it is still that same Connected session (same checks,
+     * same lock as [failDeadDataPlane]). Only kinds in [requiresDataPlaneProof]
+     * read it; every other transport's health is unchanged.
+     */
+    private suspend fun markDataPlaneVerified(job: Job?, transport: VpnTransport, ownedGeneration: Long, ownedEpoch: Long): Boolean =
+        connectMutex.withLock {
+            synchronized(reconnectOwnershipLock) {
+                if (!ownsSessionLocked(job, transport, ownedGeneration, ownedEpoch)) return@withLock false
+                dataPlaneVerifiedTransport = transport
+                dataPlaneVerifiedGeneration = ownedGeneration
+                dataPlaneVerifiedConnectedEpoch = ownedEpoch
+                recomputeSessionHealth()
+                true
+            }
+        }
+
+    /** H2-GATE Gap A - withdraws Protected for the owned session only (same predicate and lock as [markDataPlaneVerified]). */
+    private suspend fun markDataPlaneUnverified(job: Job?, transport: VpnTransport, ownedGeneration: Long, ownedEpoch: Long): Boolean =
+        connectMutex.withLock {
+            synchronized(reconnectOwnershipLock) {
+                if (!ownsSessionLocked(job, transport, ownedGeneration, ownedEpoch)) return@withLock false
+                clearDataPlaneVerificationLocked()
+                recomputeSessionHealth()
+                true
+            }
+        }
+
+    private fun clearDataPlaneVerificationLocked() {
+        dataPlaneVerifiedTransport = null
+        dataPlaneVerifiedGeneration = -1L
+        dataPlaneVerifiedConnectedEpoch = -1L
     }
 
     /**
@@ -433,7 +501,14 @@ class VpnController(
      * assignment that sets the visible error state, never a separate/
      * possibly-missed step.
      */
-    private fun setState(newState: TransportState) {
+    private fun setState(newState: TransportState) = synchronized(reconnectOwnershipLock) {
+        // H2-GATE Gap A - every _state writer (collector, preflight, permission
+        // callback, connect/disconnect, reconnect, teardown) serializes here
+        // against the monitor's check-then-write in markDataPlaneVerified/Unverified.
+        if (newState !is TransportState.Connected) {
+            if (_state.value is TransportState.Connected) connectedEpoch++
+            clearDataPlaneVerificationLocked()
+        }
         _state.value = newState
         _currentTransportKind.value = if (isRunningTransportState(newState)) pendingConnectKind else null
         recomputeSessionHealth()
@@ -537,6 +612,14 @@ class VpnController(
     /** Test-only observation seam - no production code path reads this; buildTransportConfig reads [pendingConnectTransportBinding] directly. Exists only so lifecycle tests can prove the field is cleared on every terminal teardown path without making the field itself public. */
     internal val pendingConnectTransportBindingForTest: net.pocvpn.client.reachability.EndpointTransportBinding?
         get() = pendingConnectTransportBinding
+
+    /** Test-only seams (H2-GATE Gap B): how many samplers were actually started, the current sampler job and generation, and a direct generation-bound launch. */
+    @Volatile internal var observationLaunchesForTest = 0
+        private set
+    internal val progressObservationJobForTest: Job? get() = synchronized(reconnectOwnershipLock) { progressObservationJob }
+    internal val reconnectGenerationForTest: Long get() = synchronized(reconnectOwnershipLock) { reconnectGeneration }
+    internal fun launchObservationForTest(endpointId: EndpointId, transport: VpnTransport, expectedGeneration: Long) =
+        launchLiveProgressObservation(endpointId, transport, recordWithoutSamples = false, expectedGeneration = expectedGeneration)
 
     /**
      * Test-only concurrency seam for the failDeadDataPlane() vs. automatic-
@@ -1894,7 +1977,12 @@ class VpnController(
      * fresh sample, NOT_REACHED, UNAVAILABLE, an exception or a timeout keep
      * the verdict. The gate is not repeated after the window ends.
      */
-    private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport, recordWithoutSamples: Boolean = true) {
+    private fun launchLiveProgressObservation(
+        endpointId: EndpointId,
+        transport: VpnTransport,
+        recordWithoutSamples: Boolean = true,
+        expectedGeneration: Long? = null,
+    ) {
         val store = transportObservationStore
         // Same synchronized(reconnectOwnershipLock) discipline startReconnect()
         // already uses for reconnectJob - never a bare, unsynchronized
@@ -1903,6 +1991,11 @@ class VpnController(
         // SAME lock, from a call path that does not always hold connectMutex
         // yet - see cancelReconnectForExplicitConnect's own call site).
         synchronized(reconnectOwnershipLock) {
+            // H2-GATE (Gap B) - a launch made for a specific reconnect
+            // generation is void once a newer generation exists: checked
+            // BEFORE the cancel below, so it can never cancel or replace the
+            // newer generation's sampler.
+            if (expectedGeneration != null && expectedGeneration != reconnectGeneration) return
             progressObservationJob?.cancel()
             // Snapshotted here, under the SAME lock that assigns
             // progressObservationJob below - the generation this attempt
@@ -1916,6 +2009,16 @@ class VpnController(
             // action, closes a gap the pre-existing _state/activeTransport
             // check alone could not.
             val ownedGeneration = reconnectGeneration
+            observationLaunchesForTest++
+            if (requiresDataPlaneProof(transport.kind)) {
+                // H2-GATE Gap A - Hysteria2 gets the long-lived data-plane
+                // monitor instead of the one-window check below.
+                val ownedEpoch = connectedEpoch
+                progressObservationJob = scope.launch {
+                    runHysteria2DataPlaneMonitor(endpointId, transport, ownedGeneration, ownedEpoch, currentCoroutineContext()[Job])
+                }
+                return
+            }
             progressObservationJob = scope.launch {
                 // Keyed on the sampled transport's own kind - the one place both lifecycle paths build a policy.
                 val policy = TrafficProgressPolicy.forTransport(transport.kind)
@@ -1982,7 +2085,7 @@ class VpnController(
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }
                 val action = if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
-                    if (failDeadDataPlane(endpointId, transport, verdict, ownedGeneration)) {
+                    if (failDeadDataPlane(endpointId, transport, verdict.toString(), ownedGeneration)) {
                         net.pocvpn.client.smartconnect.DataPlaneCheckAction.TORN_DOWN
                     } else {
                         net.pocvpn.client.smartconnect.DataPlaneCheckAction.STALE_IGNORED
@@ -1994,6 +2097,105 @@ class VpnController(
             }
         }
     }
+
+    /**
+     * H2-GATE Gap A - drives [Hysteria2DataPlaneMonitor] for one Hysteria2
+     * session: one stats sample per [HANDSHAKE_POLL_INTERVAL_MS] (nominal
+     * time, the same convention as the B-WL7 check), S1 probes as child
+     * coroutines whose results come back through a channel and are consumed
+     * after the sample of the same tick (fresh S2 evidence wins), and every
+     * promote/revoke/teardown under [ownsSessionLocked]. Ends when the
+     * monitor finishes, an action is refused (no longer this session) or the
+     * job is cancelled - cancelling the job cancels a probe in flight.
+     */
+    private suspend fun runHysteria2DataPlaneMonitor(
+        endpointId: EndpointId,
+        transport: VpnTransport,
+        ownedGeneration: Long,
+        ownedEpoch: Long,
+        owner: Job?,
+    ) = coroutineScope {
+        val policy = TrafficProgressPolicy.forTransport(transport.kind)
+        val monitor = Hysteria2DataPlaneMonitor(policy)
+        val results = Channel<Hysteria2ProbeResult>(Channel.UNLIMITED)
+        var probeJob: Job? = null
+        var recorded = false
+        var pollIndex = 0L
+
+        suspend fun execute(actions: List<Hysteria2DataPlaneMonitor.Action>): Boolean {
+            for (action in actions) {
+                when (action) {
+                    Hysteria2DataPlaneMonitor.Action.Promote -> {
+                        if (!recorded) {
+                            recorded = true
+                            transportObservationStore?.let {
+                                recordLiveProgressObservation(it, endpointId, transport, monitor.epochSamples, TrafficProgressVerdict.VERIFIED)
+                            }
+                        }
+                        logHysteria2Monitor(transport, policy, monitor, "PROMOTED")
+                        if (!markDataPlaneVerified(owner, transport, ownedGeneration, ownedEpoch)) return false
+                    }
+                    Hysteria2DataPlaneMonitor.Action.Revoke -> {
+                        logHysteria2Monitor(transport, policy, monitor, "REVOKED")
+                        if (!markDataPlaneUnverified(owner, transport, ownedGeneration, ownedEpoch)) return false
+                    }
+                    is Hysteria2DataPlaneMonitor.Action.Teardown -> {
+                        logHysteria2Monitor(transport, policy, monitor, "TEARDOWN ${action.reason}")
+                        failDeadDataPlane(endpointId, transport, action.reason, ownedGeneration, owner, ownedEpoch)
+                        return false
+                    }
+                    is Hysteria2DataPlaneMonitor.Action.StartProbe -> {
+                        probeJob?.cancel()
+                        probeJob = launch {
+                            val ok = try {
+                                transport.confirmSessionDataPath() == true
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                false
+                            }
+                            results.send(Hysteria2ProbeResult(action.requestId, action.epoch, ok))
+                        }
+                    }
+                    Hysteria2DataPlaneMonitor.Action.CancelProbe -> {
+                        probeJob?.cancel()
+                        probeJob = null
+                    }
+                    Hysteria2DataPlaneMonitor.Action.Stop -> {
+                        logHysteria2Monitor(transport, policy, monitor, "STOPPED (counters unsupported)")
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+
+        try {
+            loop@ while (true) {
+                val now = pollIndex * HANDSHAKE_POLL_INTERVAL_MS
+                if (!execute(monitor.onSample(transport.dataPlaneCounters(), now))) break@loop
+                while (true) {
+                    val result = results.tryReceive().getOrNull() ?: break
+                    if (!execute(monitor.onProbeResult(result.requestId, result.epoch, result.success, now))) break@loop
+                }
+                if (monitor.finished) break@loop
+                delay(HANDSHAKE_POLL_INTERVAL_MS)
+                pollIndex++
+            }
+        } finally {
+            probeJob?.cancel()
+            results.close()
+        }
+    }
+
+    private fun logHysteria2Monitor(transport: VpnTransport, policy: TrafficProgressPolicy, monitor: Hysteria2DataPlaneMonitor, event: String) {
+        val line = "H2 data-plane monitor: $event state=${monitor.state} epoch=${monitor.epoch} " +
+            TrafficProgressDiagnostics.line(transport.kind, policy, monitor.epochSamples, monitor.lastVerdict, 0, 0, TrafficProgressCheckEnd.DECISIVE_VERDICT)
+        lastDataPlaneCheckDiagnostic = line
+        android.util.Log.i("VpnController", line)
+    }
+
+    private data class Hysteria2ProbeResult(val requestId: Long, val epoch: Long, val success: Boolean)
 
     /**
      * Ends the session [launchLiveProgressObservation] sampled, only if it is
@@ -2020,14 +2222,29 @@ class VpnController(
      * operation's own asynchronous work runs, regardless of scheduling order.
      */
     /** True only when it really tore the session down; false = no longer this check's session, nothing touched. */
-    private suspend fun failDeadDataPlane(endpointId: EndpointId, transport: VpnTransport, verdict: TrafficProgressVerdict, ownedGeneration: Long): Boolean {
-        val self = currentCoroutineContext()[Job]
+    private suspend fun failDeadDataPlane(
+        endpointId: EndpointId,
+        transport: VpnTransport,
+        reason: String,
+        ownedGeneration: Long,
+        owner: Job? = null,
+        ownedEpoch: Long? = null,
+    ): Boolean {
+        val self = owner ?: currentCoroutineContext()[Job]
         synchronized(reconnectOwnershipLock) {
             if (progressObservationJob !== self) return false
             progressObservationJob = null
         }
         return connectMutex.withLock {
-            if (_state.value !is TransportState.Connected || activeTransport !== transport || !isCurrentReconnect(ownedGeneration)) return@withLock false
+            val owned = synchronized(reconnectOwnershipLock) {
+                _state.value is TransportState.Connected && activeTransport === transport && reconnectGeneration == ownedGeneration &&
+                    (ownedEpoch == null || connectedEpoch == ownedEpoch)
+            }
+            if (!owned) return@withLock false
+            // The check above and teardownActiveAttemptLocked() cannot be one
+            // critical section (teardown suspends); a reconnect bumping the
+            // generation in between restarts this transport anyway after
+            // waiting for connectMutex (pre-existing, benign).
             teardownActiveAttemptLocked()
             // The handshake already recorded this path as a success; the
             // later truth is that it carried no data, so Auto ranks it down.
@@ -2035,7 +2252,7 @@ class VpnController(
             diagnostics.recordError(VpnError.DataPlaneNoTraffic)
             setState(
                 TransportState.Error(
-                    "Connected, but no data passes through the tunnel ($verdict)",
+                    "Connected, but no data passes through the tunnel ($reason)",
                     failureKind = TransportFailureKind.REMOTE_UNCONFIRMED,
                 ),
             )
@@ -2167,12 +2384,13 @@ class VpnController(
             progressObservationJob?.cancel()
             progressObservationJob = null
             val generation = ++reconnectGeneration
+            recomputeSessionHealth()
             reconnectJob = scope.launch { reconnectLoop(generation, restartImmediately) }
         }
     }
 
     private fun publishReconnectIncidentStarted(restartsTransport: Boolean): Long {
-        val generation = synchronized(reconnectOwnershipLock) { ++reconnectGeneration }
+        val generation = synchronized(reconnectOwnershipLock) { (++reconnectGeneration).also { recomputeSessionHealth() } }
         runCatching {
             onReconnectIncident?.invoke(
                 ReconnectIncidentEvent.Started(
@@ -2263,6 +2481,21 @@ class VpnController(
             if (recovered) {
                 recordCurrentStats()
                 if (!setReconnectState(generation, TransportState.Connected)) return
+                // H2-GATE (Gap B) - a restarted Hysteria2 session is a NEW
+                // child/session (new Hysteria2Transport sessionId): it gets
+                // its own S2 sampler, owned by THIS generation. The
+                // state-driven path never fires here (pendingStateOutcome was
+                // consumed by the original attempt), and Protected was
+                // cleared by Reconnecting, so without this the session would
+                // stay DataPlaneVerifying for good.
+                if (requiresDataPlaneProof(activeTransport.kind)) {
+                    launchLiveProgressObservation(
+                        endpointId = pendingConnectEndpointId,
+                        transport = activeTransport,
+                        recordWithoutSamples = false,
+                        expectedGeneration = generation,
+                    )
+                }
                 diagnostics.updateReconnectAttempts(0)
                 runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Succeeded(generation)) }
                 // B8I1 - OUTCOME OWNERSHIP: deliberately does NOT call
@@ -2335,6 +2568,7 @@ class VpnController(
             if (reconnectJob?.isActive != true) return@synchronized null
             val oldGeneration = reconnectGeneration
             reconnectGeneration++
+            recomputeSessionHealth()
             reconnectJob?.cancel()
             reconnectJob = null
             progressObservationJob?.cancel()
@@ -2352,6 +2586,7 @@ class VpnController(
         val cancelledGeneration = synchronized(reconnectOwnershipLock) {
             val oldGeneration = reconnectGeneration
             reconnectGeneration++
+            recomputeSessionHealth()
             reconnectJob?.cancel()
             reconnectJob = null
             progressObservationJob?.cancel()

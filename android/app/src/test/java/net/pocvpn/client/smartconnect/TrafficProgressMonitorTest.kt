@@ -115,8 +115,14 @@ class TrafficProgressMonitorTest {
     }
 
     @Test
+    fun `Hysteria2 payload-only counters get the same 65s stall window as Xray`() {
+        assertEquals(65_000L, TrafficProgressPolicy.forTransport(TransportKind.HYSTERIA2).stallWindowMillis)
+    }
+
+    @Test
     fun `AWG and every other transport keep the 20s stall window`() {
-        for (kind in TransportKind.values().filterNot { it == TransportKind.XRAY_REALITY || it == TransportKind.TLS_TCP || it == TransportKind.XRAY_XHTTP }) {
+        val payloadOnly = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP, TransportKind.HYSTERIA2)
+        for (kind in TransportKind.values().filterNot { it in payloadOnly }) {
             assertEquals(kind.name, 20_000L, TrafficProgressPolicy.forTransport(kind).stallWindowMillis)
         }
         assertEquals(TrafficProgressPolicy(), TrafficProgressPolicy.forTransport(TransportKind.AMNEZIA_WG))
@@ -250,7 +256,7 @@ class TrafficProgressMonitorTest {
             line,
         )
         val empty = TrafficProgressDiagnostics.line(
-            TransportKind.HYSTERIA2, TrafficProgressPolicy.forTransport(TransportKind.HYSTERIA2), emptyList(),
+            TransportKind.AMNEZIA_WG, TrafficProgressPolicy.forTransport(TransportKind.AMNEZIA_WG), emptyList(),
             TrafficProgressVerdict.VERIFYING, polls = 1, maxPolls = 60, end = TrafficProgressCheckEnd.COUNTERS_UNSUPPORTED,
         )
         assertTrue(empty, empty.endsWith("rx=null tx=null stallWindowMs=20000 verificationWindowMs=10000 silentForMs=null polls=1 maxPolls=60 end=COUNTERS_UNSUPPORTED"))

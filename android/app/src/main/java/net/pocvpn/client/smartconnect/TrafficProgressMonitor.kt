@@ -52,9 +52,14 @@ data class TrafficProgressPolicy(
 
         private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
 
-        /** Policy for the ACTIVE transport [kind]: Xray family gets [XRAY_STALL_WINDOW_MILLIS], everything else (AWG included) the defaults. */
+        // H2-GATE - the tun2socks child's counters are relayed payload only
+        // (no TCP ACKs), the same M1 counter shape as Xray's VLESS totals, so
+        // Hysteria2 gets the same longer stall window.
+        private val PAYLOAD_ONLY_COUNTERS = XRAY_FAMILY + TransportKind.HYSTERIA2
+
+        /** Policy for the ACTIVE transport [kind]: payload-only counters (Xray family, Hysteria2) get [XRAY_STALL_WINDOW_MILLIS], everything else (AWG included) the defaults. */
         fun forTransport(kind: TransportKind): TrafficProgressPolicy =
-            if (kind in XRAY_FAMILY) TrafficProgressPolicy(stallWindowMillis = XRAY_STALL_WINDOW_MILLIS) else TrafficProgressPolicy()
+            if (kind in PAYLOAD_ONLY_COUNTERS) TrafficProgressPolicy(stallWindowMillis = XRAY_STALL_WINDOW_MILLIS) else TrafficProgressPolicy()
     }
 }
 

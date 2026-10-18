@@ -32,15 +32,19 @@ internal fun parseTun2SocksChildAck(raw: String): Hysteria2Tun2SocksChildAck =
                 Hysteria2Tun2SocksChildAck.Failed(obj.optString("error", "child reported failure with no reason"))
             !obj.optBoolean("socksAuth", false) ->
                 Hysteria2Tun2SocksChildAck.Failed("child does not support authenticated local socks (pre-B46-4A binary)")
-            else -> Hysteria2Tun2SocksChildAck.Ok(pid = obj.optInt("pid", -1))
+            else -> Hysteria2Tun2SocksChildAck.Ok(pid = obj.optInt("pid", -1), streamsStats = obj.optBoolean("stats", false))
         }
     } catch (t: Throwable) {
         Hysteria2Tun2SocksChildAck.Failed("malformed ack json ${raw.take(200)}: ${t.message}")
     }
 
 sealed interface Hysteria2Tun2SocksChildAck {
-    /** [pid] is the child's own `os.Getpid()`, reported over the wire (see the Go side's own doc on why). */
-    data class Ok(val pid: Int) : Hysteria2Tun2SocksChildAck
+    /**
+     * [pid] is the child's own `os.Getpid()`, reported over the wire (see the Go side's own doc on why).
+     * H2-GATE: [streamsStats] is the child's `"stats": true` capability marker - false for an older
+     * child, which then provides no data-plane counters (never fabricated ones).
+     */
+    data class Ok(val pid: Int, val streamsStats: Boolean = false) : Hysteria2Tun2SocksChildAck
     data class Failed(val reason: String) : Hysteria2Tun2SocksChildAck
 }
 
@@ -74,6 +78,17 @@ interface Hysteria2Tun2SocksChildControlChannel {
         timeoutMillis: Long,
     ): Hysteria2Tun2SocksChildAck
 
+    /**
+     * H2-GATE - accepts the child's THIRD connection (its stats stream) within
+     * [timeoutMillis] and feeds each line to [tracker] until the stream ends
+     * or [close] runs; [Hysteria2DataPlaneStatsTracker.streamEnded] is called
+     * on every exit path, including never connecting. Never blocks the caller.
+     * Default: no stream (test doubles), which the tracker never sees as data.
+     */
+    fun startStatsReader(tracker: Hysteria2DataPlaneStatsTracker, timeoutMillis: Long) {
+        tracker.streamEnded()
+    }
+
     fun close()
 }
 
@@ -91,6 +106,7 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
     private var bindSocket: LocalSocket? = null
     private var serverSocket: LocalServerSocket? = null
     private var boundPath: File? = null
+    @Volatile private var statsPeer: LocalSocket? = null
 
     override fun bind(socketPath: File) {
         check(serverSocket == null) { "control channel already bound - call close() first" }
@@ -195,12 +211,50 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
         return accepted
     }
 
+    override fun startStatsReader(tracker: Hysteria2DataPlaneStatsTracker, timeoutMillis: Long) {
+        val server = serverSocket ?: return tracker.streamEnded()
+        thread(name = "tun2socks-child-stats", isDaemon = true) {
+            val peer = acceptWithTimeout(server, timeoutMillis)
+            if (peer == null) {
+                tracker.streamEnded()
+                return@thread
+            }
+            statsPeer = peer
+            try {
+                val reader = peer.inputStream.bufferedReader(Charsets.UTF_8)
+                while (true) {
+                    val line = readBoundedLine(reader, Hysteria2DataPlaneStatsTracker.MAX_LINE_LENGTH) ?: break
+                    tracker.accept(line)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "stats stream ended: ${t.javaClass.simpleName}")
+            } finally {
+                tracker.streamEnded()
+                runCatching { peer.close() }
+            }
+        }
+    }
+
     override fun close() {
+        runCatching { statsPeer?.close() }
+        statsPeer = null
         runCatching { serverSocket?.close() }
         runCatching { bindSocket?.close() }
         serverSocket = null
         bindSocket = null
         boundPath?.delete()
         boundPath = null
+    }
+}
+
+/** Reads one '\n'-terminated line of at most [maxLength] chars; null on EOF. A longer line is an error, never truncated into a valid one. */
+internal fun readBoundedLine(reader: java.io.Reader, maxLength: Int): String? {
+    val line = StringBuilder()
+    while (true) {
+        val c = reader.read()
+        if (c < 0) return if (line.isEmpty()) null else throw IOException("stats stream ended mid-line")
+        if (c == '\n'.code) return line.toString()
+        if (line.length >= maxLength) throw IOException("stats line too long")
+        line.append(c.toChar())
     }
 }

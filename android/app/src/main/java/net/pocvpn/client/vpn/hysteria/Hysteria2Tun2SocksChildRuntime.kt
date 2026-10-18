@@ -1,8 +1,10 @@
 package net.pocvpn.client.vpn.hysteria
 
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
+import net.pocvpn.client.transport.TransportStats
 
 private const val TAG = "Hysteria2Tun2SocksChildRuntime"
 private const val DEFAULT_ACK_TIMEOUT_MILLIS = 5_000L
@@ -98,10 +100,15 @@ class Hysteria2Tun2SocksChildRuntime(
     private val ackTimeoutMillis: Long = DEFAULT_ACK_TIMEOUT_MILLIS,
     private val gracefulStopTimeoutMillis: Long = DEFAULT_GRACEFUL_STOP_TIMEOUT_MILLIS,
     private val forceStopWaitMillis: Long = DEFAULT_FORCE_STOP_WAIT_MILLIS,
+    private val nowMillis: () -> Long = { SystemClock.elapsedRealtime() },
 ) {
     private val stateLock = Any()
     private var process: Hysteria2Tun2SocksChildProcess? = null
     private var childPid: Int? = null
+
+    // H2-GATE (S2) - the CURRENT child's stats tracker; null whenever no
+    // session is running, so a stopped/dead child can never report counters.
+    private var statsTracker: Hysteria2DataPlaneStatsTracker? = null
 
     /**
      * `true` whenever there is no active session for which a terminal
@@ -130,6 +137,13 @@ class Hysteria2Tun2SocksChildRuntime(
     val pid: Int? get() = synchronized(stateLock) { childPid }
 
     fun isRunning(): Boolean = synchronized(stateLock) { process?.isAlive() == true }
+
+    /**
+     * H2-GATE (S2) - the running child's TUN<->SOCKS payload counters (see
+     * [Hysteria2DataPlaneStatsTracker] for the fail-closed rules).
+     * [TransportStats.Unsupported] when no child runs or it streams no stats.
+     */
+    fun dataPlaneCounters(): TransportStats = synchronized(stateLock) { statsTracker }?.snapshot() ?: TransportStats.Unsupported
 
     /**
      * [dupTunFd] must already be a duplicate of the VpnService's TUN fd -
@@ -199,11 +213,16 @@ class Hysteria2Tun2SocksChildRuntime(
         val ack = controlChannel.sendStartRequestAndAwaitAck(dupTunFd, mtu, socksAddr, socksUsername, socksPassword, ackTimeoutMillis)
         return when (ack) {
             is Hysteria2Tun2SocksChildAck.Ok -> {
+                // H2-GATE: a child without the stats marker gets no tracker,
+                // so dataPlaneCounters() stays Unsupported for its session.
+                val tracker = if (ack.streamsStats) Hysteria2DataPlaneStatsTracker(ack.pid, nowMillis) else null
                 synchronized(stateLock) {
                     process = launched
                     childPid = ack.pid
+                    statsTracker = tracker
                     terminalClaimed = false
                 }
+                tracker?.let { controlChannel.startStatsReader(it, ackTimeoutMillis) }
                 // Registered AFTER the session is visible in `process`/
                 // `childPid` - if the child somehow exits between the ack
                 // and this line (vanishingly unlikely, but not provably
@@ -255,6 +274,7 @@ class Hysteria2Tun2SocksChildRuntime(
             terminalClaimed = true
             process = null
             childPid = null
+            statsTracker = null
         }
         stopLaunchedProcess(current!!)
         controlChannel.close()
@@ -279,6 +299,7 @@ class Hysteria2Tun2SocksChildRuntime(
                 terminalClaimed = true
                 process = null
                 childPid = null
+                statsTracker = null
                 true
             }
         }

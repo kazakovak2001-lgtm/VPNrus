@@ -3560,7 +3560,7 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   Direct non-AWG attempt's first Connected (after B33), so relayed attempts
   keep only the relay watchdog. No answer / another session / no Started
   mirror = `Unavailable` (no sample); a transport without counts
-  (Hysteria2) breaks at once and, for this caller, records no observation.
+  (`Unsupported`) breaks at once and, for this caller, records no observation.
   Manual pinned Xray ends in Error with no substitute; Auto advances.
   Device (OPPO, 2026-10-09): healthy REALITY (11 runs) and TLS (1 run)
   sessions reached `VERIFIED` with rx/tx growing both ways and were never
@@ -3686,7 +3686,42 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   `Hysteria2TunnelProbe` (B33 counterpart): verified HTTPS GET of the
   binding host's `/v1/tunnel-probe` through the child's loopback SOCKS5,
   bounded 6 s, before tun2socks starts. Failure publishes FAILED with
-  `Hysteria2RuntimeError.RemoteUnconfirmed`; no post-connect gate yet.
+  `Hysteria2RuntimeError.RemoteUnconfirmed`. This probe never touches the
+  TUN -> tun2socks leg (the app UID is excluded from its own VPN).
+- Protected (H2-GATE): Connected maps to `VpnSessionHealth.DataPlaneVerifying`
+  (`requiresDataPlaneProof`, HYSTERIA2 only), never `DirectProtected`, until a
+  fresh B-WL7 `VERIFIED` for that same session and reconnect generation.
+  Evidence is the tun2socks child's own TUN<->SOCKS payload counters
+  (`novasocks5` conns after the handshake + decoded UDP payload, no ACKs):
+  after an ack with `"stats": true` the child streams one counters-only
+  JSON line per second on a third connection to the same app-private
+  control socket; `Hysteria2DataPlaneStatsTracker` binds it to the acked
+  pid and fails closed (wrong pid, non-increasing seq, falling counters,
+  stream end -> `Unsupported`; >3.5 s quiet -> `Unavailable`, no sample).
+  `Hysteria2VpnService.dataPlaneCounters(sessionId)` serves only the
+  RUNNING session. A child without the marker can never reach Protected.
+  Other transports' Protected semantics are unchanged.
+- Hysteria2 data-plane monitor (H2-GATE Gap A, `vpn/Hysteria2DataPlaneMonitor.kt`
+  driven by `VpnController.runHysteria2DataPlaneMonitor`, one long-lived
+  sampler per session/generation; Gap B relaunches it after an automatic
+  reconnect). Promotion (initial and after a revoke) = `evaluate` VERIFIED
+  over the current epoch's samples AND an rx advance in the newest sample;
+  the first sample of an epoch is a baseline. No S1 probe runs before the
+  first promotion; S1 (`VpnTransport.confirmSessionDataPath`, session-scoped
+  `Hysteria2VpnService.probeTarget`) never promotes. While Protected: tx
+  without rx for the 10 s verification window revokes at once; 60 s without
+  an rx advance or S1 success starts one IDLE probe whose success keeps
+  Protected only with live counters; `Unavailable` revokes; `Unsupported`
+  revokes and stops the monitor (session stays non-Protected, no teardown).
+  A revoke starts a new epoch and a recovery episode (<= 3 serialized
+  probes, 120 s - both provisional); successes never restore, two
+  consecutive failures or a failed last probe at the episode end tear down
+  through `failDeadDataPlane`, otherwise the session holds non-Protected.
+  The existing NO_PAYLOAD/STALLED verdict still tears down. Every
+  promote/revoke/teardown checks one ownership predicate (monitor job,
+  reconnect generation, `connectedEpoch`, transport, Connected) under
+  `connectMutex` -> `reconnectOwnershipLock`; `setState` runs under
+  `reconnectOwnershipLock`, so every `_state` writer serializes with it.
 - Live (2026-09-28): Stockholm runs both units (official pinned v2.12.3);
   manifest v6 (`prod-manifest-key-2026-09-14`) carries the only HYSTERIA2
   binding, `16.170.208.231:443`, SNI `origin-sthlm.aknova.pp.ua`, `NONE`;
