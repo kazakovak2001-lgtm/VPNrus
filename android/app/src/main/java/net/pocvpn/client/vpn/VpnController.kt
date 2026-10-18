@@ -571,6 +571,14 @@ class VpnController(
     internal val pendingConnectTransportBindingForTest: net.pocvpn.client.reachability.EndpointTransportBinding?
         get() = pendingConnectTransportBinding
 
+    /** Test-only seams (H2-GATE Gap B): how many samplers were actually started, the current sampler job and generation, and a direct generation-bound launch. */
+    @Volatile internal var observationLaunchesForTest = 0
+        private set
+    internal val progressObservationJobForTest: Job? get() = synchronized(reconnectOwnershipLock) { progressObservationJob }
+    internal val reconnectGenerationForTest: Long get() = synchronized(reconnectOwnershipLock) { reconnectGeneration }
+    internal fun launchObservationForTest(endpointId: EndpointId, transport: VpnTransport, expectedGeneration: Long) =
+        launchLiveProgressObservation(endpointId, transport, recordWithoutSamples = false, expectedGeneration = expectedGeneration)
+
     /**
      * Test-only concurrency seam for the failDeadDataPlane() vs. automatic-
      * reconnect race (see VpnControllerLiveProgressObservationTest's "stale
@@ -1933,6 +1941,7 @@ class VpnController(
         recordWithoutSamples: Boolean = true,
         continuationOfGeneration: Long? = null,
         continuationOfJob: Job? = null,
+        expectedGeneration: Long? = null,
     ) {
         val store = transportObservationStore
         // Same synchronized(reconnectOwnershipLock) discipline startReconnect()
@@ -1950,6 +1959,11 @@ class VpnController(
             ) {
                 return
             }
+            // H2-GATE (Gap B) - a launch made for a specific reconnect
+            // generation is void once a newer generation exists: checked
+            // BEFORE the cancel below, so it can never cancel or replace the
+            // newer generation's sampler.
+            if (expectedGeneration != null && expectedGeneration != reconnectGeneration) return
             progressObservationJob?.cancel()
             // Snapshotted here, under the SAME lock that assigns
             // progressObservationJob below - the generation this attempt
@@ -1963,6 +1977,7 @@ class VpnController(
             // action, closes a gap the pre-existing _state/activeTransport
             // check alone could not.
             val ownedGeneration = reconnectGeneration
+            observationLaunchesForTest++
             progressObservationJob = scope.launch {
                 // Keyed on the sampled transport's own kind - the one place both lifecycle paths build a policy.
                 val policy = TrafficProgressPolicy.forTransport(transport.kind)
@@ -2329,6 +2344,21 @@ class VpnController(
             if (recovered) {
                 recordCurrentStats()
                 if (!setReconnectState(generation, TransportState.Connected)) return
+                // H2-GATE (Gap B) - a restarted Hysteria2 session is a NEW
+                // child/session (new Hysteria2Transport sessionId): it gets
+                // its own S2 sampler, owned by THIS generation. The
+                // state-driven path never fires here (pendingStateOutcome was
+                // consumed by the original attempt), and Protected was
+                // cleared by Reconnecting, so without this the session would
+                // stay DataPlaneVerifying for good.
+                if (requiresDataPlaneProof(activeTransport.kind)) {
+                    launchLiveProgressObservation(
+                        endpointId = pendingConnectEndpointId,
+                        transport = activeTransport,
+                        recordWithoutSamples = false,
+                        expectedGeneration = generation,
+                    )
+                }
                 diagnostics.updateReconnectAttempts(0)
                 runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Succeeded(generation)) }
                 // B8I1 - OUTCOME OWNERSHIP: deliberately does NOT call
