@@ -33,6 +33,9 @@ object AutoGatewayFailoverPolicy {
             // healthy, so requirement 8 does not apply.
             is VpnError.DataPlaneNoTraffic -> true
             is VpnError.BackendStartFailure -> true
+            // Managed AWG refused only for reactivation - this candidate cannot
+            // run, the next one may. Any other ConfigurationMappingFailure stays false.
+            is VpnError.ConfigurationMappingFailure -> net.pocvpn.client.identity.ManagedAwgEligibility.isReactivationRefusal(error)
             // An async, post-Connected retry-exhaustion signal for an
             // attempt that already succeeded once - never the outcome of
             // THIS (the just-executed, still-establishing) attempt. Once a

@@ -1105,9 +1105,12 @@ class VpnController(
                     // buildTransportConfig may now suspend on L - never turn cancellation into a config error.
                     throw e
                 } catch (e: net.pocvpn.client.identity.ManagedAwgNotEligibleException) {
-                    // Fail closed for managed AWG only: no transport is started, so the
-                    // existing Error-driven failover (e.g. to Xray) stays available.
-                    diagnostics.recordError(VpnError.ConfigurationMappingFailure("MANAGED_AWG_${e.reason.name}"))
+                    // Fail closed for managed AWG only: no transport is started and no
+                    // outcome/path history is recorded (this is not network evidence).
+                    // Only REACTIVATION_REQUIRED is eligible for Auto failover (see
+                    // ManagedAwgEligibility.isReactivationRefusal); a pinned/forced AWG
+                    // attempt and every other refusal reason stop here.
+                    diagnostics.recordError(VpnError.ConfigurationMappingFailure(net.pocvpn.client.identity.ManagedAwgEligibility.refusalDetail(e.reason)))
                     setState(TransportState.Error("Managed AWG identity not activated for this gateway (${e.reason.name})"))
                     return false
                 } catch (e: Exception) {

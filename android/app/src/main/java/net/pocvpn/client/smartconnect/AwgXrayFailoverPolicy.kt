@@ -61,7 +61,8 @@ object AwgXrayFailoverPolicy {
         // never a catch-all "any Error". Every other VpnError
         // doConnectAttempt can produce (GatewayConfigurationMissing,
         // InvalidGatewayConfiguration, SplitTunnelingNoAppsSelected,
-        // ConfigurationMappingFailure, PermissionDenied, AlreadyInProgress) -
+        // ConfigurationMappingFailure except the managed AWG reactivation
+        // refusal below, PermissionDenied, AlreadyInProgress) -
         // and every rejectPreflight() error (NoCandidateAvailable,
         // UnsupportedTransportSelected) - represents a preflight/local-
         // configuration/permission problem, never a real connection
@@ -71,6 +72,10 @@ object AwgXrayFailoverPolicy {
             // AWG handshake up, data plane dead (see VpnError.DataPlaneNoTraffic).
             is VpnError.DataPlaneNoTraffic -> true
             is VpnError.BackendStartFailure -> true
+            // The one ConfigurationMappingFailure that is eligible: managed AWG
+            // refused only because this key needs reactivation (no tunnel was
+            // started). Every other ConfigurationMappingFailure stays false.
+            is VpnError.ConfigurationMappingFailure -> net.pocvpn.client.identity.ManagedAwgEligibility.isReactivationRefusal(awgError)
             // Recorded only by VpnController.reconnectLoop() - an async,
             // post-Connected retry-exhaustion signal for an attempt that
             // already succeeded once, never the outcome of THIS (the

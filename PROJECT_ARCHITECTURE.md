@@ -418,6 +418,11 @@ NetworkProfiler
   gateway's CURRENT tunnel IP (`ClientTunnelIdentityStore`) and refuses
   (`TUNNEL_IDENTITY_CHANGED`) if it is missing or differs from the config's
   `clientTunnelIp` (the config may have been snapshotted before the lock).
+  A refusal records `ConfigurationMappingFailure("MANAGED_AWG_<reason>")` and no
+  outcome/path history. Only `REACTIVATION_REQUIRED` is failover-eligible
+  (`ManagedAwgEligibility.isReactivationRefusal`, used by both
+  `AwgXrayFailoverPolicy` and `AutoGatewayFailoverPolicy`); a pinned/forced AWG
+  and every other refusal reason stop with no fallback.
 - **Activation commit** (`MainViewModel.commitManagedActivationLocally`, HTTP
   request outside the lock, short `NonCancellable` local section): key used by
   the request must still be current, else no local write; then the gateway's OLD

@@ -1,5 +1,6 @@
 package net.pocvpn.client.identity
 
+import net.pocvpn.client.diagnostics.VpnError
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 
@@ -57,4 +58,18 @@ object ManagedAwgEligibility {
     }
 
     fun isEligible(reason: ManagedAwgEligibilityReason): Boolean = reason == ManagedAwgEligibilityReason.AWG_ACTIVE
+
+    /** The [VpnError.ConfigurationMappingFailure] detail VpnController records when managed AWG is refused. */
+    fun refusalDetail(reason: ManagedAwgEligibilityReason): String = "MANAGED_AWG_${reason.name}"
+
+    /**
+     * True only for the [ManagedAwgEligibilityReason.REACTIVATION_REQUIRED]
+     * refusal: a local authorization gap, not a network or trust failure, so an
+     * automatic (non-pinned) selection may move on to another transport. Every
+     * other refusal reason and every other configuration failure stays
+     * ineligible for fallback.
+     */
+    fun isReactivationRefusal(error: VpnError?): Boolean =
+        error is VpnError.ConfigurationMappingFailure &&
+            error.detail == refusalDetail(ManagedAwgEligibilityReason.REACTIVATION_REQUIRED)
 }
