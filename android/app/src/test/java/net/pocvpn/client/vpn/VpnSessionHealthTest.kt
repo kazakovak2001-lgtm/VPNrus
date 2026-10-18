@@ -112,4 +112,24 @@ private val profile = IngressClientProfile(
             )
         }
     }
+    @Test
+    fun `H2-GATE - a Direct Connected session pending data-plane proof is DataPlaneVerifying, not Protected`() {
+        assertEquals(
+            VpnSessionHealth.DataPlaneVerifying,
+            computeSessionHealth(TransportState.Connected, VpnAttemptContext.Direct, null, dataPlaneProofPending = true),
+        )
+        assertEquals(
+            VpnSessionHealth.DirectProtected,
+            computeSessionHealth(TransportState.Connected, VpnAttemptContext.Direct, null, dataPlaneProofPending = false),
+        )
+        assertEquals(VpnSessionHealth.Idle, computeSessionHealth(TransportState.Disconnected, VpnAttemptContext.Direct, null, dataPlaneProofPending = true))
+    }
+
+    @Test
+    fun `H2-GATE - only Hysteria2 requires data-plane proof`() {
+        for (kind in TransportKind.values()) {
+            assertEquals(kind.name, kind == TransportKind.HYSTERIA2, requiresDataPlaneProof(kind))
+        }
+        assertEquals(false, requiresDataPlaneProof(null))
+    }
 }

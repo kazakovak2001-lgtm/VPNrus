@@ -25,6 +25,7 @@ import net.pocvpn.client.identity.Hysteria2CredentialRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.RestrictionClass
 import net.pocvpn.client.smartconnect.RoutingDecisionEngine
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.config.VpnDnsPolicy
 import net.pocvpn.client.vpn.policy.RoutingMode
 
@@ -116,6 +117,10 @@ internal data class Hysteria2ServiceStatus(
  * ([Hysteria2TunnelProbe], the B33 counterpart) AND the tun2socks child has
  * itself started (a real SCM_RIGHTS TUN-fd handoff ack) - never merely "TUN
  * established" or "a child process object exists".
+ * RUNNING is Connected, NOT Protected (H2-GATE): the probe never touches the
+ * TUN -> tun2socks leg, so `VpnController` holds the session at
+ * `VpnSessionHealth.DataPlaneVerifying` until the tun2socks child's own
+ * counters ([dataPlaneCounters]) give a fresh B-WL7 VERIFIED.
  *
  * ROUTING: this slice wires FULL_VPN only (see `TransportConfig.Hysteria2`'s
  * own doc) - any other requested [RoutingMode] fails closed
@@ -471,6 +476,8 @@ class Hysteria2VpnService : VpnService() {
                     // running unowned.
                     if (tryMarkRunning(sessionId)) {
                         Log.i(TAG, "hysteria2 session started: tun2socksPid=${tun2socksResult.pid} quicConnected=${hysteriaRuntime.quicConnected}")
+                        // H2-GATE (S2): counters become readable for THIS session only.
+                        dataPlaneSource = DataPlaneSource(sessionId, tun2socksRuntime::dataPlaneCounters)
                         publish(sessionId, Hysteria2RuntimePhase.RUNNING)
                     } else {
                         Log.w(TAG, "session $sessionId superseded during startup - tearing down the just-started children")
@@ -528,6 +535,7 @@ class Hysteria2VpnService : VpnService() {
             return
         }
         Log.w(TAG, "$which child exited unexpectedly: code=$exitCode - tearing down the whole session")
+        clearDataPlaneSource(claimedSessionId)
         tun2socksRuntime.stop()
         hysteriaRuntime.stop()
         closeTunFd()
@@ -543,6 +551,7 @@ class Hysteria2VpnService : VpnService() {
             stopSelf()
             return
         }
+        clearDataPlaneSource(claimedSessionId)
         publish(claimedSessionId, Hysteria2RuntimePhase.STOPPING)
         sessionWorkMutex.withLock {
             tun2socksRuntime.stop()
@@ -603,5 +612,25 @@ class Hysteria2VpnService : VpnService() {
 
         /** Observed by [Hysteria2Transport] - process-wide, since only one instance may exist at a time (mirrors `ShadowsocksVpnService.status`). */
         internal val status: StateFlow<Hysteria2ServiceStatus?> = _status.asStateFlow()
+
+        internal class DataPlaneSource(val sessionId: Long, val counters: () -> TransportStats)
+
+        // H2-GATE (S2) - set only together with RUNNING, cleared the moment a
+        // terminal transition is claimed; same process-wide scope as [status].
+        @Volatile internal var dataPlaneSource: DataPlaneSource? = null
+
+        internal fun clearDataPlaneSource(sessionId: Long) {
+            synchronized(this) { if (dataPlaneSource?.sessionId == sessionId) dataPlaneSource = null }
+        }
+
+        /**
+         * The tun2socks child's payload counters for [sessionId] only.
+         * Another (stale or newer) session, or no running session, reads
+         * [TransportStats.Unsupported] - never another session's bytes.
+         */
+        internal fun dataPlaneCounters(sessionId: Long): TransportStats {
+            val source = dataPlaneSource
+            return if (source != null && source.sessionId == sessionId) source.counters() else TransportStats.Unsupported
+        }
     }
 }

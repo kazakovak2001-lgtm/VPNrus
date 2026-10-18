@@ -122,7 +122,11 @@ func (ss *novaSocks5) DialContext(ctx context.Context, metadata *M.Metadata) (c 
 	}()
 
 	_, err = socks5.ClientHandshake(c, serializeSocksAddr(metadata), socks5.CmdConnect, ss.socksUser())
-	return
+	if err != nil {
+		return
+	}
+	// NOVA H2-GATE: count payload only, after the handshake.
+	return &countingConn{Conn: c}, nil
 }
 
 func (ss *novaSocks5) DialUDP(*M.Metadata) (_ net.PacketConn, err error) {
@@ -209,7 +213,12 @@ func (pc *novaPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	if err != nil {
 		return n, err
 	}
-	return pc.PacketConn.WriteTo(packet, pc.rAddr)
+	if _, err = pc.PacketConn.WriteTo(packet, pc.rAddr); err != nil {
+		return 0, err
+	}
+	// NOVA H2-GATE: count the datagram payload, not the SOCKS UDP header.
+	dataPlaneTxBytes.Add(int64(len(b)))
+	return len(b), nil
 }
 
 // isFromRelay reports whether a datagram's real network source is the
@@ -242,7 +251,10 @@ func (pc *novaPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 
 		// due to DecodeUDPPacket is mutable, record addr length
 		copy(b, payload)
-		return n - len(addr) - 3, udpAddr, nil
+		payloadLen := n - len(addr) - 3
+		// NOVA H2-GATE: count only relay-validated, decoded payload.
+		dataPlaneRxBytes.Add(int64(payloadLen))
+		return payloadLen, udpAddr, nil
 	}
 }
 

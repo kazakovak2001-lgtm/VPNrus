@@ -398,8 +398,37 @@ class VpnController(
     private val _sessionHealth = MutableStateFlow<VpnSessionHealth>(VpnSessionHealth.Idle)
     val sessionHealth: StateFlow<VpnSessionHealth> = _sessionHealth.asStateFlow()
 
+    // H2-GATE - the transport and reconnect generation whose CURRENT session
+    // earned a B-WL7 VERIFIED (see [markDataPlaneVerified]). Cleared by every
+    // non-Connected state, so a new session or a reconnect must earn it again.
+    @Volatile private var dataPlaneVerifiedTransport: VpnTransport? = null
+    @Volatile private var dataPlaneVerifiedGeneration = -1L
+
     private fun recomputeSessionHealth() {
-        _sessionHealth.value = computeSessionHealth(_state.value, pendingAttemptContext, _relayStage.value)
+        val proofPending = requiresDataPlaneProof(_currentTransportKind.value) && !isDataPlaneVerifiedForActiveSession()
+        _sessionHealth.value = computeSessionHealth(_state.value, pendingAttemptContext, _relayStage.value, proofPending)
+    }
+
+    private fun isDataPlaneVerifiedForActiveSession(): Boolean =
+        dataPlaneVerifiedTransport === activeTransport && isCurrentReconnect(dataPlaneVerifiedGeneration)
+
+    /**
+     * H2-GATE - records a fresh VERIFIED for the session [launchLiveProgressObservation]
+     * sampled, only if it is still that same Connected session (same checks,
+     * same lock as [failDeadDataPlane]). Only kinds in [requiresDataPlaneProof]
+     * read it; every other transport's health is unchanged.
+     */
+    private suspend fun markDataPlaneVerified(transport: VpnTransport, ownedGeneration: Long): Boolean = connectMutex.withLock {
+        if (_state.value !is TransportState.Connected || activeTransport !== transport || !isCurrentReconnect(ownedGeneration)) return@withLock false
+        dataPlaneVerifiedTransport = transport
+        dataPlaneVerifiedGeneration = ownedGeneration
+        recomputeSessionHealth()
+        true
+    }
+
+    /** H2-GATE - whether an unverified proof-requiring session is still the one [ownedGeneration] observed, so sampling may continue. */
+    private suspend fun isStillObservedSession(transport: VpnTransport, ownedGeneration: Long): Boolean = connectMutex.withLock {
+        _state.value is TransportState.Connected && activeTransport === transport && isCurrentReconnect(ownedGeneration)
     }
 
     /**
@@ -434,6 +463,10 @@ class VpnController(
      * possibly-missed step.
      */
     private fun setState(newState: TransportState) {
+        if (newState !is TransportState.Connected) {
+            dataPlaneVerifiedTransport = null
+            dataPlaneVerifiedGeneration = -1L
+        }
         _state.value = newState
         _currentTransportKind.value = if (isRunningTransportState(newState)) pendingConnectKind else null
         recomputeSessionHealth()
@@ -1894,7 +1927,13 @@ class VpnController(
      * fresh sample, NOT_REACHED, UNAVAILABLE, an exception or a timeout keep
      * the verdict. The gate is not repeated after the window ends.
      */
-    private fun launchLiveProgressObservation(endpointId: EndpointId, transport: VpnTransport, recordWithoutSamples: Boolean = true) {
+    private fun launchLiveProgressObservation(
+        endpointId: EndpointId,
+        transport: VpnTransport,
+        recordWithoutSamples: Boolean = true,
+        continuationOfGeneration: Long? = null,
+        continuationOfJob: Job? = null,
+    ) {
         val store = transportObservationStore
         // Same synchronized(reconnectOwnershipLock) discipline startReconnect()
         // already uses for reconnectJob - never a bare, unsynchronized
@@ -1903,6 +1942,14 @@ class VpnController(
         // SAME lock, from a call path that does not always hold connectMutex
         // yet - see cancelReconnectForExplicitConnect's own call site).
         synchronized(reconnectOwnershipLock) {
+            // H2-GATE - a continuation window may only replace ITSELF, in the
+            // generation that started observing: a reconnect or a newer
+            // observation in between ends the chain without touching it.
+            if (continuationOfGeneration != null &&
+                (continuationOfGeneration != reconnectGeneration || progressObservationJob !== continuationOfJob)
+            ) {
+                return
+            }
             progressObservationJob?.cancel()
             // Snapshotted here, under the SAME lock that assigns
             // progressObservationJob below - the generation this attempt
@@ -1978,7 +2025,8 @@ class VpnController(
                 val diagnosticLine = TrafficProgressDiagnostics.line(transport.kind, policy, samples, verdict, polls, maxPolls, end, egressProbe)
                 lastDataPlaneCheckDiagnostic = diagnosticLine
                 android.util.Log.i("VpnController", diagnosticLine)
-                if (recordWithoutSamples || samples.isNotEmpty()) {
+                // H2-GATE: a continuation window adds no second observation for the same attempt.
+                if (continuationOfGeneration == null && (recordWithoutSamples || samples.isNotEmpty())) {
                     store?.let { recordLiveProgressObservation(it, endpointId, transport, samples, verdict) }
                 }
                 val action = if (verdict == TrafficProgressVerdict.NO_PAYLOAD || verdict == TrafficProgressVerdict.STALLED_AFTER_INITIAL_PAYLOAD) {
@@ -1988,9 +2036,27 @@ class VpnController(
                         net.pocvpn.client.smartconnect.DataPlaneCheckAction.STALE_IGNORED
                     }
                 } else {
+                    // H2-GATE: only a VERIFIED verdict can lift a proof-requiring session to Protected.
+                    if (verdict == TrafficProgressVerdict.VERIFIED && requiresDataPlaneProof(transport.kind)) {
+                        markDataPlaneVerified(transport, ownedGeneration)
+                    }
                     net.pocvpn.client.smartconnect.DataPlaneCheckAction.PRESERVED
                 }
                 checkId?.let { dataPlaneCheckLog?.recordAction(it, action) }
+                // H2-GATE: an idle (IDLE ends the window as DECISIVE_VERDICT) or
+                // still-verifying proof-requiring session is neither Protected
+                // nor failed - sample another bounded window while it is still
+                // the same session. Unsupported/broken counters
+                // (COUNTERS_UNSUPPORTED) end sampling: never Protected.
+                if (requiresDataPlaneProof(transport.kind) && end != TrafficProgressCheckEnd.COUNTERS_UNSUPPORTED &&
+                    (verdict == TrafficProgressVerdict.VERIFYING || verdict == TrafficProgressVerdict.IDLE) &&
+                    isStillObservedSession(transport, ownedGeneration)
+                ) {
+                    launchLiveProgressObservation(
+                        endpointId, transport, recordWithoutSamples = false,
+                        continuationOfGeneration = ownedGeneration, continuationOfJob = currentCoroutineContext()[Job],
+                    )
+                }
             }
         }
     }

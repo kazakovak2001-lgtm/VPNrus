@@ -34,6 +34,19 @@ public `proxy.RegisterProtocol` API; no upstream file is modified.
 - The success ack carries `"socksAuth": true`; the app refuses a success ack
   without it, so a pre-hardening child can never run unauthenticated.
 
+## H2-GATE data-plane counters (2026-10-18)
+
+- `src/dataplane_stats.go` (Nova): payload counters on the `novasocks5`
+  connections - TCP bytes after the SOCKS handshake, decoded UDP payload
+  after relay-source validation; SOCKS framing and TCP ACKs are not counted.
+- The success ack adds `"stats": true`. The child then dials the same control
+  socket a third time and writes one counters-only line per second:
+  `{"type":"stats","pid":..,"seq":..,"tx":..,"rx":..}` - no addresses, no
+  credentials. If the parent never accepts it, reporting stops.
+- Android parent: `Hysteria2DataPlaneStatsTracker` (fail-closed). An app with
+  this change and an OLD child (no marker) shows Hysteria2 as never
+  Protected - it does not fall back to treating Connected as Protected.
+
 Must ship together with the matching `hysteria2-child`: the hardened Hysteria
 side refuses the `0.0.0.0:0` declaration an old tun2socks sends.
 
@@ -58,6 +71,11 @@ be LF (`.gitattributes`; the script refuses CRLF).
 | SHA-256 (`libnovatun2sockschild.so`) | `15f95403a415035cba5226c297bf3818d99baadff40197d4ef83c478c8e2c381` |
 | Reproducibility | identical on 2 Windows builds and 1 Linux (WSL) build |
 | In APK (after AGP strip) | `bac1d93c8fa703635cf6ee8020d20ce24437707283c70b1f7d5f83a3b5448dc2` (debug and release) |
+
+H2-GATE artifact (branch `feat/hysteria2-post-connect-gate`, not released):
+`b6d5081d187c544bf1b1655e322c7c185782eeaf9472257434dec8762e3c2d02`, reproduced
+identically on windows/amd64 and linux/amd64 (WSL); the B46-4A artifact above
+was re-reproduced byte-for-byte from `b22abe6` sources on the same host first.
 
 Superseded pre-hardening artifact: `3ee51b0bbfec55f3b1f05c7b55057110fda1d9b64187822b6efeb9621349621f`
 (reproduced byte-for-byte from the B46-3B source before this change).

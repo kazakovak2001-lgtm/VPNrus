@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.transport.TransportCapabilities
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.transport.TransportStats
 import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.UnderlyingNetworkRecovery
 import net.pocvpn.client.vpn.VpnTransport
@@ -59,6 +60,7 @@ class Hysteria2Transport(
     private val state = MutableStateFlow<TransportState>(TransportState.Disconnected)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var observerJob: Job? = null
+    @Volatile private var currentSessionId = 0L
 
     override fun preparePermissionIntent(): Intent? = VpnService.prepare(context)
 
@@ -71,6 +73,7 @@ class Hysteria2Transport(
         }
 
         val sessionId = nextSessionId.incrementAndGet()
+        currentSessionId = sessionId
         observerJob?.cancel()
         observerJob = scope.launch {
             Hysteria2VpnService.status.collect { status ->
@@ -117,6 +120,14 @@ class Hysteria2Transport(
     }
 
     override fun observeState(): Flow<TransportState> = state.asStateFlow()
+
+    /**
+     * H2-GATE (S2) - the tun2socks child's TUN<->SOCKS payload counters for
+     * this transport's CURRENT session, the only Hysteria2 signal that covers
+     * the TUN leg; VpnController's B-WL7 gate samples it. Unsupported when no
+     * session of ours runs or the child streams no stats.
+     */
+    override suspend fun dataPlaneCounters(): TransportStats = Hysteria2VpnService.dataPlaneCounters(currentSessionId)
 
     private companion object {
         val nextSessionId = AtomicLong(0)
