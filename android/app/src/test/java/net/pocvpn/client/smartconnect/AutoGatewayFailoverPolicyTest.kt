@@ -1,6 +1,8 @@
 package net.pocvpn.client.smartconnect
 
 import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.identity.ManagedAwgEligibility
+import net.pocvpn.client.identity.ManagedAwgEligibilityReason
 import net.pocvpn.client.vpn.TransportState
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -21,6 +23,22 @@ class AutoGatewayFailoverPolicyTest {
     @Test
     fun `Error with ReconnectExhausted is never eligible - that is a post-success async signal, not this attempt`() {
         assertFalse(AutoGatewayFailoverPolicy.isEligibleForNextCandidate(TransportState.Error("x"), VpnError.ReconnectExhausted))
+    }
+
+    @Test
+    fun `managed AWG reactivation refusal advances to the next candidate`() {
+        val refusal = VpnError.ConfigurationMappingFailure(ManagedAwgEligibility.refusalDetail(ManagedAwgEligibilityReason.REACTIVATION_REQUIRED))
+        assertTrue(AutoGatewayFailoverPolicy.isEligibleForNextCandidate(TransportState.Error("refused"), refusal))
+    }
+
+    @Test
+    fun `other configuration mapping failures never advance`() {
+        val details = ManagedAwgEligibilityReason.entries
+            .filter { it != ManagedAwgEligibilityReason.REACTIVATION_REQUIRED }
+            .map { ManagedAwgEligibility.refusalDetail(it) } + listOf("IdentityCorruptedException", "REACTIVATION_REQUIRED")
+        details.forEach { detail ->
+            assertFalse(detail, AutoGatewayFailoverPolicy.isEligibleForNextCandidate(TransportState.Error("x"), VpnError.ConfigurationMappingFailure(detail)))
+        }
     }
 
     @Test

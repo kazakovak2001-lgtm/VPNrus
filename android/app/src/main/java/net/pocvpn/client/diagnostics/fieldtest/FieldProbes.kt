@@ -26,12 +26,25 @@ import javax.net.ssl.HttpsURLConnection
  * probes).
  */
 
+/**
+ * B54 Scope A - what kind of exception ended a probe, decided by exception
+ * TYPE (never by message text). Null when the probe did not throw.
+ */
+enum class ProbeFailureKind { TIMEOUT, UNKNOWN_HOST, OTHER }
+
+internal fun failureKindOf(e: Throwable): ProbeFailureKind = when (e) {
+    is SocketTimeoutException -> ProbeFailureKind.TIMEOUT
+    is java.net.UnknownHostException -> ProbeFailureKind.UNKNOWN_HOST
+    else -> ProbeFailureKind.OTHER
+}
+
 data class DnsProbeResult(
     val host: String,
     val ok: Boolean,
     val addresses: List<String>,
     val elapsedMs: Long,
     val error: String?,
+    val failureKind: ProbeFailureKind? = null,
 )
 
 data class TcpProbeResult(
@@ -58,6 +71,7 @@ data class HttpProbeResult(
     val error: String?,
     /** Parsed key=value lines of a Cloudflare `/cdn-cgi/trace` body (filtered by the caller). */
     val trace: Map<String, String> = emptyMap(),
+    val failureKind: ProbeFailureKind? = null,
 )
 
 /** One short, non-secret description of a failure: exception class + first line of the message. */
@@ -78,7 +92,7 @@ object FieldProbes {
             val addresses = network?.getAllByName(host) ?: InetAddress.getAllByName(host)
             DnsProbeResult(host, true, addresses.mapNotNull { it.hostAddress }.distinct(), elapsedSince(start), null)
         } catch (e: Exception) {
-            DnsProbeResult(host, false, emptyList(), elapsedSince(start), describeError(e))
+            DnsProbeResult(host, false, emptyList(), elapsedSince(start), describeError(e), failureKindOf(e))
         }
     }
 
@@ -189,6 +203,7 @@ object FieldProbes {
                 stalledAtBytes = if (status != null && e is SocketTimeoutException) bytes else null,
                 bodyComplete = false,
                 error = describeError(e),
+                failureKind = failureKindOf(e),
             )
         } finally {
             connection?.disconnect()

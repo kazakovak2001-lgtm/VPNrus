@@ -305,6 +305,10 @@ class VpnController(
     // in-memory log so the field report carries it independently of logcat.
     // Recording only: it never feeds back into the check, teardown or failover.
     private val dataPlaneCheckLog: net.pocvpn.client.smartconnect.DataPlaneCheckLog? = null,
+    // Phase B step 2 - the SAME guard instance MainViewModel holds (shared lock
+    // L + binding store). Null keeps the pre-Phase-B managed AWG behavior
+    // (tests/legacy wiring only; production always passes it).
+    private val managedAwgIdentityGuard: net.pocvpn.client.identity.ManagedAwgIdentityGuard? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -1097,6 +1101,18 @@ class VpnController(
                 val routingMode = routingModeStore.read()
                 val transportConfig = try {
                     buildTransportConfig(kind, config, appRoutingLists, routingMode)
+                } catch (e: CancellationException) {
+                    // buildTransportConfig may now suspend on L - never turn cancellation into a config error.
+                    throw e
+                } catch (e: net.pocvpn.client.identity.ManagedAwgNotEligibleException) {
+                    // Fail closed for managed AWG only: no transport is started and no
+                    // outcome/path history is recorded (this is not network evidence).
+                    // Only REACTIVATION_REQUIRED is eligible for Auto failover (see
+                    // ManagedAwgEligibility.isReactivationRefusal); a pinned/forced AWG
+                    // attempt and every other refusal reason stop here.
+                    diagnostics.recordError(VpnError.ConfigurationMappingFailure(net.pocvpn.client.identity.ManagedAwgEligibility.refusalDetail(e.reason)))
+                    setState(TransportState.Error("Managed AWG identity not activated for this gateway (${e.reason.name})"))
+                    return false
                 } catch (e: Exception) {
                     diagnostics.recordError(VpnError.ConfigurationMappingFailure(e.javaClass.simpleName))
                     setState(TransportState.Error("Failed to build tunnel configuration"))
@@ -1295,6 +1311,49 @@ class VpnController(
      * [resolveAdaptiveAllowedIps] already uses - see that shared function's
      * own docs for why this is not a second routing engine.
      */
+    /**
+     * Phase B step 2 - the ONLY way to mutate the managed identity while a guard
+     * is wired: needs connectMutex (never waited for - a busy controller is
+     * refused), a fully idle controller, then L. Order: connectMutex -> L.
+     * "Idle" = Disconnected AND no cached activeTransportConfig, so no session,
+     * reconnect or cached config can outlive an identity change (AWG recovers
+     * IN_PLACE on the live tunnel and never rebuilds its config on reconnect).
+     */
+    suspend fun <T> runManagedIdentityMutation(block: suspend () -> T): ManagedIdentityMutationResult<T> {
+        val guard = managedAwgIdentityGuard ?: return ManagedIdentityMutationResult.Unsupported
+        if (!connectMutex.tryLock()) return ManagedIdentityMutationResult.Busy
+        try {
+            if (_state.value !is TransportState.Disconnected || activeTransportConfig != null) {
+                return ManagedIdentityMutationResult.Busy
+            }
+            return ManagedIdentityMutationResult.Completed(guard.lifecycle.withLock { block() })
+        } finally {
+            connectMutex.unlock()
+        }
+    }
+
+    /** The same AwgConfig shape for managed and PRIVATE attempts; only the key source differs. */
+    private fun awgConfigFor(
+        privateKeyBase64: String,
+        config: GatewayConfiguration.Configured,
+        appRoutingLists: AppRoutingLists,
+        routingMode: RoutingMode,
+    ): AwgConfig = AwgConfig(
+        privateKeyBase64 = privateKeyBase64,
+        localAddresses = listOf("${config.clientTunnelIp}/32"),
+        dnsServers = config.dnsServers,
+        profile = config.profile,
+        includedApplications = appRoutingLists.includedApplications,
+        excludedApplications = appRoutingLists.excludedApplications,
+        peer = AwgPeer(
+            publicKeyBase64 = config.serverPublicKeyBase64,
+            endpointHost = config.endpointHost,
+            endpointPort = config.endpointPort,
+            allowedIps = resolveAdaptiveAllowedIps(config.allowedIps, routingMode),
+            persistentKeepaliveSeconds = config.persistentKeepaliveSeconds,
+        ),
+    )
+
     private suspend fun buildTransportConfig(
         kind: TransportKind,
         config: GatewayConfiguration.Configured,
@@ -1309,23 +1368,24 @@ class VpnController(
                 // PrivateGatewayKeyRepositoryFactory's own docs); every
                 // AUTO/MANUAL_MANAGED attempt has this null and is
                 // byte-for-byte unaffected.
-                val privateKey = (pendingConnectPrivateKeyRepository ?: clientKeyRepository).getPrivateKeyForTunnel()
-                val awgConfig = AwgConfig(
-                    privateKeyBase64 = privateKey,
-                    localAddresses = listOf("${config.clientTunnelIp}/32"),
-                    dnsServers = config.dnsServers,
-                    profile = config.profile,
-                    includedApplications = appRoutingLists.includedApplications,
-                    excludedApplications = appRoutingLists.excludedApplications,
-                    peer = AwgPeer(
-                        publicKeyBase64 = config.serverPublicKeyBase64,
-                        endpointHost = config.endpointHost,
-                        endpointPort = config.endpointPort,
-                        allowedIps = resolveAdaptiveAllowedIps(config.allowedIps, routingMode),
-                        persistentKeepaliveSeconds = config.persistentKeepaliveSeconds,
-                    ),
-                )
-                TransportConfig.Awg(awgConfig)
+                val privateGatewayKeys = pendingConnectPrivateKeyRepository
+                val guard = managedAwgIdentityGuard
+                if (privateGatewayKeys == null && guard != null) {
+                    // Phase B step 2 - managed AWG: eligibility, the non-creating
+                    // key read and the config build all happen under L (we
+                    // already hold connectMutex: connectMutex -> L). L is
+                    // released before any tunnel handshake; an identity
+                    // mutation also needs connectMutex, so it cannot run
+                    // between this build and the transport start.
+                    guard.lifecycle.withLock {
+                        val gatewayId = net.pocvpn.client.identity.ManagedAwgIdentityGuard.gatewayIdFor(pendingConnectEndpointId)
+                        val verifiedPrivateKey = guard.requireEligiblePrivateKeyLocked(gatewayId, clientKeyRepository, config.clientTunnelIp)
+                        TransportConfig.Awg(awgConfigFor(verifiedPrivateKey, config, appRoutingLists, routingMode))
+                    }
+                } else {
+                    val privateKey = (privateGatewayKeys ?: clientKeyRepository).getPrivateKeyForTunnel()
+                    TransportConfig.Awg(awgConfigFor(privateKey, config, appRoutingLists, routingMode))
+                }
             }
             TransportKind.XRAY_REALITY -> {
                 // B13 (audit item 5 fix) - resolved by the CURRENT attempt's
@@ -2363,3 +2423,12 @@ internal fun isFreshHandshake(handshakeEpochMillis: Long?, attemptStartEpochMill
  */
 internal fun isRunningTransportState(state: TransportState): Boolean =
     state is TransportState.Connected || state is TransportState.Reconnecting
+
+/** Phase B step 2 - outcome of [VpnController.runManagedIdentityMutation]. */
+sealed class ManagedIdentityMutationResult<out T> {
+    data class Completed<T>(val value: T) : ManagedIdentityMutationResult<T>()
+    /** A connect/reconnect holds connectMutex or a session is not fully torn down - nothing was mutated. */
+    object Busy : ManagedIdentityMutationResult<Nothing>()
+    /** No guard wired (tests/legacy) - the caller keeps its pre-Phase-B behavior. */
+    object Unsupported : ManagedIdentityMutationResult<Nothing>()
+}

@@ -1,6 +1,8 @@
 package net.pocvpn.client.smartconnect
 
 import net.pocvpn.client.diagnostics.VpnError
+import net.pocvpn.client.identity.ManagedAwgEligibility
+import net.pocvpn.client.identity.ManagedAwgEligibilityReason
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.transport.UserTransportPreference
 import net.pocvpn.client.vpn.TransportState
@@ -110,6 +112,40 @@ class AwgXrayFailoverPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun `managed AWG reactivation refusal is eligible under Auto`() {
+        assertTrue(eligible(awgState = TransportState.Error("refused"), awgError = reactivationRefusal()))
+    }
+
+    @Test
+    fun `managed AWG reactivation refusal never falls back for a pinned or forced AWG`() {
+        assertFalse(
+            eligible(
+                preference = UserTransportPreference.Manual(TransportKind.AMNEZIA_WG),
+                awgState = TransportState.Error("refused"),
+                awgError = reactivationRefusal(),
+            ),
+        )
+    }
+
+    @Test
+    fun `every other managed AWG refusal reason stays ineligible`() {
+        ManagedAwgEligibilityReason.entries
+            .filter { it != ManagedAwgEligibilityReason.REACTIVATION_REQUIRED }
+            .forEach { reason ->
+                assertFalse(
+                    reason.name,
+                    eligible(
+                        awgState = TransportState.Error("refused"),
+                        awgError = VpnError.ConfigurationMappingFailure(ManagedAwgEligibility.refusalDetail(reason)),
+                    ),
+                )
+            }
+    }
+
+    private fun reactivationRefusal() =
+        VpnError.ConfigurationMappingFailure(ManagedAwgEligibility.refusalDetail(ManagedAwgEligibilityReason.REACTIVATION_REQUIRED))
 
     @Test
     fun `permission denied is never eligible`() {

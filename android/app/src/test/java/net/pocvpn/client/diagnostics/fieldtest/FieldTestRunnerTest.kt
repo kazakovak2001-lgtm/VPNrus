@@ -56,7 +56,7 @@ class FieldTestRunnerTest {
      * Fake app: connect() lands in Connected for REALITY/AUTO, Error for AWG,
      * and stays Disconnected (refused, lastError set) for XHTTP.
      */
-    private inner class FakeHost(
+    private open inner class FakeHost(
         private val provisioned: Set<ProductionGatewayId> = setOf(ProductionGatewayId.GERMANY, ProductionGatewayId.STOCKHOLM),
         private val permission: Boolean = true,
         // Like the real controller: disconnect() of an idle transport leaves Error in place.
@@ -106,8 +106,18 @@ class FieldTestRunnerTest {
         override fun latestDiagnosticSession(): JSONObject? = JSONObject().put("selectedPathKind", "DIRECT")
         override fun appState() = JSONObject().put("state", "x")
         override fun supportBundle(): JSONObject? = JSONObject().put("schemaVersion", 1)
-        override fun networkContext() = JSONObject().put("summary", "WIFI, operator Test (25001, ru)")
+        var context: (TransportState) -> JSONObject = { JSONObject().put("summary", "WIFI, operator Test (25001, ru)") }
+        override fun networkContext() = context(transportState.value)
         override fun vpnNetwork(): Network? = null
+        /** B54 Scope B - a VPN network is "visible" while Connected; [vpnHandle] identifies it. */
+        var vpnVisible = true
+        var vpnHandle = 1L
+        /** Runs before an in-tunnel https probe: (target label, url). Lets a test change the session mid-probe. */
+        var beforeInTunnelProbe: suspend (String, String) -> Unit = { _, _ -> }
+        /** Labels of runs that sent an in-tunnel (Connected-state) https probe. */
+        val inTunnelProbeRuns = mutableListOf<String>()
+        override fun vpnBinding(): VpnProbeBinding? =
+            if (vpnVisible && transportState.value is TransportState.Connected) VpnProbeBinding(null, vpnHandle) else null
         override fun appInfo() = JSONObject().put("gitCommit", "abc")
         override fun deviceInfo() = JSONObject().put("model", "test")
         override suspend fun refreshManifestOutcome(): String? = "Refreshed(v6)"
@@ -121,6 +131,14 @@ class FieldTestRunnerTest {
             if (coreAnswers) urls.map { net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement(it, 42, null) } else null
     }
 
+    /** IPv6 baseline the runner handed to each leak check, in call order. */
+    private val leakBaselines = mutableListOf<Boolean?>()
+
+    private fun context(vararg transports: String, globalIpv6: Boolean) = JSONObject().put(
+        "activeNetwork",
+        JSONObject().put("transports", org.json.JSONArray(transports.toList())).put("notVpn", "VPN" !in transports).put("hasGlobalIpv6", globalIpv6),
+    )
+
     private fun okProbe(label: String, url: String, maxBytes: Long, trace: Map<String, String> = emptyMap()) =
         HttpProbeResult(label, url, true, 200, 10, 5, maxBytes, null, true, null, trace)
 
@@ -130,8 +148,12 @@ class FieldTestRunnerTest {
         tcp = { l, h, p, _ -> TcpProbeResult(l, h, p, true, 5, null) },
         censorship = { _ -> CensorshipReport(emptyList(), mapOf("8.8.8.8:53" to false), mapOf("cloudflare" to true), listOf("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED")) },
         api = { origins -> org.json.JSONArray().apply { origins.forEach { put(JSONObject().put("origin", it).put("path", "/v1/activate").put("verdict", "API_REACHABLE").put("httpStatus", 400)) } } },
-        leaks = { _, direct -> JSONObject().put("verdict", if (direct.isEmpty()) "NO_LEAK_OBSERVED" else "NO_LEAK_OBSERVED") },
+        leaks = { _, direct, v6 -> leakBaselines += v6; JSONObject().put("verdict", if (direct.isEmpty()) "NO_LEAK_OBSERVED" else "NO_LEAK_OBSERVED") },
         https = { label, url, _, maxBytes, parseTrace ->
+            if (host.transportState.value is TransportState.Connected) {
+                host.applied?.label?.let { host.inTunnelProbeRuns += it }
+                host.beforeInTunnelProbe(host.applied?.label.orEmpty(), url)
+            }
             val inTunnel = host.transportState.value is TransportState.Connected
             when {
                 inTunnel && host.currentTransportKind.value == TransportKind.HYSTERIA2 ->
@@ -414,5 +436,202 @@ class FieldTestRunnerTest {
         assertEquals("COMPLETED", item.getString("status"))
         assertEquals(65_000L, item.getLong("stallWindowMs"))
         assertEquals("DECISIVE_VERDICT", item.getString("end"))
+    }
+
+    @Test
+    fun `IPv6 baseline is read after the active VPN is disconnected, not through it`() = runTest {
+        val host = FakeHost()
+        host.transportState.value = TransportState.Connected
+        // Through the VPN no global IPv6 is visible; the ordinary network underneath has it.
+        host.context = { state -> if (state is TransportState.Connected) context("WIFI", "VPN", globalIpv6 = false) else context("WIFI", globalIpv6 = true) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == true })
+    }
+
+    @Test
+    fun `IPv6 baseline is unknown when the VPN is not confirmed disconnected`() = runTest {
+        val host = FakeHost(stickyError = true)
+        host.transportState.value = TransportState.Error("stuck")
+        host.context = { context("WIFI", globalIpv6 = false) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == null })
+    }
+
+    @Test
+    fun `IPv6 baseline is unknown, not NO_IPV6, without an ordinary network`() = runTest {
+        val host = FakeHost()
+        host.context = { JSONObject().put("activeNetwork", JSONObject.NULL) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == null })
+        assertEquals(LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.LOOKUP_FAILED), LeakChecks.classifyIpv6(leakBaselines.first(), HttpProbeResult("IPv6", LeakChecks.IPV6_ONLY_URL, false, null, 1, null, 0, null, false, "x", failureKind = ProbeFailureKind.UNKNOWN_HOST)))
+    }
+
+    @Test
+    fun `IPv6 baseline from a direct network without IPv6 reaches the leak check as false`() = runTest {
+        val host = FakeHost()
+        host.context = { context("CELLULAR", globalIpv6 = false) }
+        runner(host).run { }
+        assertTrue(leakBaselines.isNotEmpty())
+        assertTrue(leakBaselines.all { it == false })
+    }
+
+    // --- B54 Scope B: probe binding and session validity ---
+
+    @Test
+    fun `a stable session keeps its VPN-bound results and a real exit mismatch`() = runTest {
+        val byLabel = runner(FakeHost()).run { }.runs.associateBy { it.target.label }
+        val germany = byLabel.getValue("GERMANY / AMNEZIA_WG")
+        assertEquals(FieldRunOutcome.DATA_PLANE_OK, germany.outcome)
+        assertEquals(ProbeContext(ProbeBinding.VPN_NETWORK, sessionStable = true, invalidated = false), germany.probeContext)
+        // Valid context, exit really differs from Stockholm -> still EXIT_MISMATCH.
+        val stockholm = byLabel.getValue("STOCKHOLM / AMNEZIA_WG")
+        assertEquals(FieldRunOutcome.EXIT_MISMATCH, stockholm.outcome)
+        assertEquals("152.70.43.1", stockholm.exitIp)
+        assertEquals(ProbeBinding.XRAY_OUTBOUND, byLabel.getValue("GERMANY / XRAY_REALITY").probeContext!!.binding)
+    }
+
+    @Test
+    fun `no VPN network - no VPN-bound probe is sent and nothing falls back to the default network`() = runTest {
+        val host = FakeHost()
+        host.vpnVisible = false
+        val awg = runner(host).run { }.runs.first { it.target.label == "GERMANY / AMNEZIA_WG" }
+        assertTrue(host.inTunnelProbeRuns.isEmpty())
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, awg.outcome)
+        assertEquals(ProbeContext(ProbeBinding.NONE, sessionStable = null, invalidated = true), awg.probeContext)
+        assertTrue(awg.probes.isEmpty())
+        assertNull(awg.exitIp)
+        assertNull(awg.leaks)
+        assertNull(awg.dns)
+    }
+
+    @Test
+    fun `VPN gone before the probes start - VPN-bound probes are not run`() = runTest {
+        val host = object : FakeHost() {
+            override fun vpnBinding(): VpnProbeBinding? {
+                transportState.value = TransportState.Disconnected
+                return null
+            }
+        }
+        val awg = runner(host).run { }.runs.first { it.target.label == "GERMANY / AMNEZIA_WG" }
+        assertFalse("GERMANY / AMNEZIA_WG" in host.inTunnelProbeRuns)
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, awg.outcome)
+        assertEquals(ProbeBinding.NONE, awg.probeContext!!.binding)
+    }
+
+    @Test
+    fun `VPN disconnecting during the probes invalidates the run - no EXIT_MISMATCH, no exit IP`() = runTest {
+        val host = FakeHost()
+        host.beforeInTunnelProbe = { label, url ->
+            if (label == "STOCKHOLM / AMNEZIA_WG" && url == FieldTestTargets.BULK_TUNNEL) host.transportState.value = TransportState.Disconnected
+        }
+        val run = runner(host).run { }.runs.first { it.target.label == "STOCKHOLM / AMNEZIA_WG" }
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, run.outcome)
+        assertNull(run.exitIp)
+        assertNull(run.exitColo)
+        assertEquals(ProbeContext(ProbeBinding.VPN_NETWORK, sessionStable = false, invalidated = true), run.probeContext)
+        assertEquals("INCONCLUSIVE", run.leaks!!.getString("dnsResult"))
+        assertEquals("SESSION_CHANGED", run.leaks!!.getString("dnsReason"))
+        assertTrue(run.notes.any { "VPN-bound results invalidated" in it })
+    }
+
+    @Test
+    fun `a new VPN network during the probes (reconnect) invalidates the run`() = runTest {
+        val host = FakeHost()
+        host.beforeInTunnelProbe = { label, url ->
+            if (label == "STOCKHOLM / AMNEZIA_WG" && url == FieldTestTargets.BULK_TUNNEL) host.vpnHandle = 2L
+        }
+        val run = runner(host).run { }.runs.first { it.target.label == "STOCKHOLM / AMNEZIA_WG" }
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, run.outcome)
+        assertNull(run.exitIp)
+        assertEquals(false, run.probeContext!!.sessionStable)
+    }
+
+    @Test
+    fun `direct probes stay on the default network and in-tunnel probes only run while Connected`() = runTest {
+        val host = FakeHost()
+        val report = runner(host).run { }
+        assertTrue(report.direct != null)
+        assertTrue(report.runs.filter { it.outcome == FieldRunOutcome.SKIPPED || it.outcome == FieldRunOutcome.CONNECT_FAILED }.all { it.probeContext == null })
+        assertTrue(host.inTunnelProbeRuns.toSet().all { label -> report.runs.first { it.target.label == label }.probeContext?.binding == ProbeBinding.VPN_NETWORK })
+    }
+
+    @Test
+    fun `probe context is serialized and absent context stays null`() = runTest {
+        val json = runner(FakeHost()).run { }.toJson()
+        val runs = json.getJSONArray("runs")
+        val awg = (0 until runs.length()).map { runs.getJSONObject(it) }.first { it.getString("label") == "GERMANY / AMNEZIA_WG" }
+        assertEquals("VPN_NETWORK", awg.getJSONObject("probeContext").getString("binding"))
+        assertTrue(awg.getJSONObject("probeContext").getBoolean("sessionStable"))
+        val skipped = (0 until runs.length()).map { runs.getJSONObject(it) }.first { it.getString("outcome") == "SKIPPED" }
+        assertTrue(skipped.isNull("probeContext"))
+    }
+
+    // --- B54 Scope B: a drop while the probes run, observed through transportState ---
+
+    /** Drops the session for [label] just before probe [url]: Reconnecting, then Connected again on [newHandle]. */
+    private fun FakeHost.flapBefore(label: String, url: String, newHandle: Long) {
+        beforeInTunnelProbe = { l, u ->
+            if (l == label && u == url) {
+                transportState.value = TransportState.Reconnecting(1)
+                kotlinx.coroutines.delay(100) // a real reconnect takes time; the state is observable meanwhile
+                vpnHandle = newHandle
+                transportState.value = TransportState.Connected
+            }
+        }
+    }
+
+    @Test
+    fun `a drop that reconnects on the same network handle invalidates the run`() = runTest {
+        val host = FakeHost()
+        host.flapBefore("STOCKHOLM / AMNEZIA_WG", FieldTestTargets.BULK_TUNNEL, newHandle = 1L)
+        val run = runner(host).run { }.runs.first { it.target.label == "STOCKHOLM / AMNEZIA_WG" }
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, run.outcome)
+        assertNull(run.exitIp)
+        assertNull(run.exitColo)
+        assertNull(run.exitLoc)
+        assertEquals(ProbeContext(ProbeBinding.VPN_NETWORK, sessionStable = false, invalidated = true), run.probeContext)
+    }
+
+    @Test
+    fun `a drop that reconnects on a new network handle invalidates the run`() = runTest {
+        val host = FakeHost()
+        host.flapBefore("STOCKHOLM / AMNEZIA_WG", FieldTestTargets.BULK_TUNNEL, newHandle = 2L)
+        val run = runner(host).run { }.runs.first { it.target.label == "STOCKHOLM / AMNEZIA_WG" }
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, run.outcome)
+        assertNull(run.exitIp)
+    }
+
+    @Test
+    fun `a drop before the last probe still invalidates the run`() = runTest {
+        val host = FakeHost()
+        // "Cloudflare trace after hold" is the last https probe of a run.
+        var traces = 0
+        host.beforeInTunnelProbe = { l, u ->
+            if (l == "GERMANY / AMNEZIA_WG" && u == FieldTestTargets.CLOUDFLARE_TRACE && ++traces == 2) {
+                host.transportState.value = TransportState.Reconnecting(1)
+                kotlinx.coroutines.delay(100)
+                host.transportState.value = TransportState.Connected
+            }
+        }
+        val run = runner(host).run { }.runs.first { it.target.label == "GERMANY / AMNEZIA_WG" }
+        assertEquals(2, traces)
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, run.outcome)
+        assertNull(run.exitIp)
+        assertEquals("SESSION_CHANGED", run.leaks!!.getString("dnsReason"))
+    }
+
+    @Test
+    fun `without a drop the session stays valid and a real exit mismatch is kept`() = runTest {
+        val host = FakeHost()
+        // A probe that only takes time, with no state change.
+        host.beforeInTunnelProbe = { _, _ -> kotlinx.coroutines.delay(100) }
+        val byLabel = runner(host).run { }.runs.associateBy { it.target.label }
+        assertEquals(FieldRunOutcome.DATA_PLANE_OK, byLabel.getValue("GERMANY / AMNEZIA_WG").outcome)
+        assertEquals(true, byLabel.getValue("GERMANY / AMNEZIA_WG").probeContext!!.sessionStable)
+        assertEquals(FieldRunOutcome.EXIT_MISMATCH, byLabel.getValue("STOCKHOLM / AMNEZIA_WG").outcome)
+        assertEquals("152.70.43.1", byLabel.getValue("STOCKHOLM / AMNEZIA_WG").exitIp)
     }
 }

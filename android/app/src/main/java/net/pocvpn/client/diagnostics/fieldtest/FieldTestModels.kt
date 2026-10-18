@@ -46,6 +46,12 @@ enum class FieldRunOutcome {
     CONNECTED_NO_DATA,
     /** In-tunnel traffic exited from an address that is not this gateway. */
     EXIT_MISMATCH,
+    /**
+     * B54 Scope B - Connected, but the VPN-bound probes cannot be attributed
+     * to this session: no VPN network was visible, or the session left
+     * Connected / was replaced while they ran. No data-plane conclusion.
+     */
+    MEASUREMENT_INVALIDATED,
     CONNECT_FAILED,
     HANDSHAKE_FAILED,
     CONNECT_TIMEOUT,
@@ -80,7 +86,29 @@ data class FieldTransportRun(
     val leaks: JSONObject? = null,
     /** Xray-family runs: measurements by the Xray core through its own tunnel. */
     val coreMeasurements: List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? = null,
+    /** B54 Scope B - where this run's in-tunnel probes were bound and whether they still count. Null when none ran. */
+    val probeContext: ProbeContext? = null,
 )
+
+/** B54 Scope B - the network an in-tunnel probe was sent on. */
+enum class ProbeBinding {
+    /** Bound to the captured VPN network of this run. */
+    VPN_NETWORK,
+
+    /** Measured by the Xray core through its own outbound (the app is outside the Xray tunnel). */
+    XRAY_OUTBOUND,
+
+    /** No VPN network was available, so no VPN-bound probe was sent. */
+    NONE,
+}
+
+/**
+ * [sessionStable] - the session was still Connected on the same VPN network
+ * after the probes (null when not checked). It shows the context did not
+ * change, not the path every packet took. [invalidated] - the VPN-bound
+ * results of this run do not count.
+ */
+data class ProbeContext(val binding: ProbeBinding, val sessionStable: Boolean?, val invalidated: Boolean)
 
 /** Byte range in which a freeze is reported as the suspected throttling pattern. */
 internal val STALL_SUSPECT_RANGE = 8L * 1024..64L * 1024
@@ -211,7 +239,7 @@ internal fun FieldTestReport.summaryLines(): List<String> {
                 r.throughput?.let { append(", bulk ${throughputText(it)}") }
                 val stalls = (r.probes + r.stability + listOfNotNull(r.throughput)).mapNotNull { it.stalledAtBytes }
                 if (stalls.isNotEmpty()) append(", STALL at ${stalls.joinToString("/")} B")
-                r.leaks?.optString("verdict")?.let { append(", leaks $it") }
+                r.leaks?.let { append(", leaks ${LeakChecks.summaryText(it)}") }
                 r.coreMeasurements?.let { m -> append(", core ${m.joinToString(" ") { c -> "${c.url.substringAfter("//").substringBefore('/')}=${if (c.ok) "${c.delayMs}ms" else "FAIL"}" }}") }
             }
         }
@@ -304,6 +332,9 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("leaks", leaks ?: JSONObject.NULL)
     .put("coreMeasurements", coreMeasurements?.let { list ->
         JSONArray().apply { list.forEach { put(JSONObject().put("url", it.url).put("delayMs", it.delayMs).put("ok", it.ok).put("error", it.error ?: JSONObject.NULL)) } }
+    } ?: JSONObject.NULL)
+    .put("probeContext", probeContext?.let {
+        JSONObject().put("binding", it.binding.name).put("sessionStable", it.sessionStable ?: JSONObject.NULL).put("invalidated", it.invalidated)
     } ?: JSONObject.NULL)
 
 internal fun DnsProbeResult.toJson(): JSONObject = JSONObject()

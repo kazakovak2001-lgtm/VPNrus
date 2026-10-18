@@ -679,6 +679,10 @@ class MainViewModel(
     // dedicated field-test deployment may override this at the Factory.
     private val zeroTouchTargetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId =
         net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY,
+    // Phase B step 2 - ONE guard (shared lifecycle lock L + binding store),
+    // passed unchanged into this ViewModel's VpnController below. Null keeps the
+    // pre-Phase-B behavior (tests/legacy only); the Factory always passes one.
+    private val managedAwgIdentityGuard: net.pocvpn.client.identity.ManagedAwgIdentityGuard? = null,
 ) : ViewModel() {
     // A debug UI force is intentionally a one-shot input. Keep the marker
     // separate from userTransportPreference so constructor-injected Manual
@@ -1090,6 +1094,7 @@ class MainViewModel(
         },
         onReconnectIncident = { event -> recordReconnectIncidentEvent(event) },
         dataPlaneCheckLog = dataPlaneCheckLog,
+        managedAwgIdentityGuard = managedAwgIdentityGuard,
     )
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
@@ -2132,7 +2137,10 @@ class MainViewModel(
 
     init {
         viewModelScope.launch {
-            _publicKey.value = clientKeyRepository.getPublicKey()
+            // Phase B step 2 - first-run key creation happens under L. A new key
+            // is never bound here, so it cannot authorize managed AWG by itself.
+            _publicKey.value = managedAwgIdentityGuard?.lifecycle?.withLock { clientKeyRepository.getPublicKey() }
+                ?: clientKeyRepository.getPublicKey()
         }
         restorePersistedProfile()
         // B8I7 - one-time startup check: does a real Xray profile already
@@ -2606,39 +2614,15 @@ class MainViewModel(
                         // above, which is exactly why a mismatching response
                         // is rejected rather than silently accepted-but-
                         // ignored.
-                        gatewayConfigOverride?.apply(
-                            endpointHost = result.endpointHost,
-                            endpointPort = result.endpointPort,
-                            serverPublicKey = result.gatewayPublicKey,
-                            clientTunnelIp = result.clientTunnelIp,
-                            gatewayTunnelIp = result.gatewayTunnelIp,
-                        )
-                        // B8B3C - durably persist ONLY the five non-secret
-                        // gateway fields, exactly what was just applied above.
-                        // No token (never in scope here - see provisionDevice's
-                        // own token handling), no private key (ProfileStore has
-                        // no field for one at all - see its own docs).
-                        profileStore?.write(
-                            PersistedProfile(
-                                endpointHost = result.endpointHost,
-                                endpointPort = result.endpointPort,
-                                gatewayPublicKey = result.gatewayPublicKey,
-                                clientTunnelIp = result.clientTunnelIp,
-                                gatewayTunnelIp = result.gatewayTunnelIp,
+                        // Phase B step 2 - override/profile/tunnel IP and (last) the AWG binding are
+                        // committed together in commitManagedActivationLocally (under L, NonCancellable).
+                        val commit = commitManagedActivationLocally(targetGatewayId, key, result)
+                        lastManagedActivationCommitOutcome = commit
+                        if (commit == ManagedActivationCommitOutcome.KEY_CHANGED_DURING_ACTIVATION) {
+                            ProvisioningUiState.Error(
+                                "KEY_CHANGED_DURING_ACTIVATION: the device identity changed while activation was in flight - nothing was applied",
                             )
-                        )
-                        // B13 consolidated review fix (finding 1) - THE
-                        // canonical per-device client tunnel identity write:
-                        // result.clientTunnelIp is real, per-device evidence
-                        // for EXACTLY targetGatewayId - never any other
-                        // gateway (matchGatewayId already proved the
-                        // response is unambiguously about this one, and the
-                        // B14 check above additionally proved it equals
-                        // targetGatewayId specifically - using targetGatewayId
-                        // here, not the nullable matchedGatewayId, needs no
-                        // extra null-handling and is byte-for-byte the same
-                        // value at this point).
-                        clientTunnelIdentityStore?.write(targetGatewayId, result.clientTunnelIp)
+                        } else {
                         // B13 consolidated review fix (finding 2) - a fresh
                         // identity write can change readiness for the
                         // CURRENTLY selected gateway (e.g. Stockholm was
@@ -2764,7 +2748,14 @@ class MainViewModel(
                                 hysteria2AvailableEndpoints.update { it + targetEndpointId }
                             }
                         }
-                        ProvisioningUiState.Success(result)
+                        if (commit == ManagedActivationCommitOutcome.SERVER_ACCEPTED_LOCAL_COMMIT_FAILED) {
+                            ProvisioningUiState.Error(
+                                "SERVER_ACCEPTED_LOCAL_COMMIT_FAILED: activation was accepted but this device could not record it - activate again to use AWG",
+                            )
+                        } else {
+                            ProvisioningUiState.Success(result)
+                        }
+                        }
                     }
                 }
                 is ProvisioningResult.Unauthorized -> ProvisioningUiState.Unauthorized
@@ -4976,9 +4967,119 @@ class MainViewModel(
     }
 
     fun regenerateIdentity() {
-        viewModelScope.launch {
+        viewModelScope.launch { regenerateManagedIdentity() }
+    }
+
+    /**
+     * Phase B step 2 - with a guard wired, the managed identity is replaced only
+     * through [VpnController.runManagedIdentityMutation] (connectMutex -> L),
+     * and every AWG binding is deleted BEFORE the key is cleared. If the
+     * bindings cannot be deleted the key is left untouched. No guard keeps the
+     * pre-Phase-B behavior.
+     */
+    /** Test/diagnostic visibility of the last activation's local commit outcome. */
+    @Volatile
+    internal var lastManagedActivationCommitOutcome: ManagedActivationCommitOutcome? = null
+        private set
+
+    /**
+     * Phase B step 2 - local commit AFTER the server accepted [requestPublicKey].
+     * No network I/O here. There is no atomicity between the server and local
+     * storage: the binding is written LAST, so any interruption leaves managed AWG
+     * blocked (a retry with the same credential is server-side idempotent for an
+     * unchanged key). NonCancellable only covers these short local writes.
+     */
+    private suspend fun commitManagedActivationLocally(
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+        requestPublicKey: String,
+        result: ProvisioningResult.Success,
+    ): ManagedActivationCommitOutcome {
+        val guard = managedAwgIdentityGuard
+        if (guard == null) {
+            writeActivatedProfileLocally(targetGatewayId, result)
+            return ManagedActivationCommitOutcome.COMMITTED
+        }
+        return withContext(kotlinx.coroutines.NonCancellable) {
+            guard.lifecycle.withLock {
+                val requestFingerprint = try {
+                    net.pocvpn.client.identity.ManagedAwgKeyFingerprint.of(requestPublicKey)
+                } catch (e: IllegalArgumentException) {
+                    return@withLock ManagedActivationCommitOutcome.KEY_CHANGED_DURING_ACTIVATION
+                }
+                val current = clientKeyRepository.peekPublicKey()
+                val currentFingerprint = (current as? net.pocvpn.client.identity.ManagedKeyPeek.Present)?.let {
+                    runCatching { net.pocvpn.client.identity.ManagedAwgKeyFingerprint.of(it.publicKeyBase64) }.getOrNull()
+                }
+                if (currentFingerprint != requestFingerprint) {
+                    return@withLock ManagedActivationCommitOutcome.KEY_CHANGED_DURING_ACTIVATION
+                }
+                // A-1 - invalidate this gateway's OLD binding first, so every failure
+                // below (profile, tunnel IP or new binding) leaves AWG ineligible here.
+                // If it cannot be confirmed removed, nothing new is written.
+                if (guard.bindingStore.removeGateway(targetGatewayId) !is net.pocvpn.client.identity.ManagedAwgBindingRemoveResult.Removed) {
+                    return@withLock ManagedActivationCommitOutcome.SERVER_ACCEPTED_LOCAL_COMMIT_FAILED
+                }
+                try {
+                    writeActivatedProfileLocally(targetGatewayId, result)
+                } catch (e: java.io.IOException) {
+                    return@withLock ManagedActivationCommitOutcome.SERVER_ACCEPTED_LOCAL_COMMIT_FAILED
+                } catch (e: IllegalArgumentException) {
+                    return@withLock ManagedActivationCommitOutcome.SERVER_ACCEPTED_LOCAL_COMMIT_FAILED
+                }
+                // Binding LAST - lock order L -> binding-store lock -> repository mutex.
+                when (guard.bindingStore.updateGateway(targetGatewayId, requestFingerprint) { clientKeyRepository.peekPublicKey() }) {
+                    net.pocvpn.client.identity.ManagedAwgBindingUpdateResult.Updated -> ManagedActivationCommitOutcome.COMMITTED
+                    else -> ManagedActivationCommitOutcome.SERVER_ACCEPTED_LOCAL_COMMIT_FAILED
+                }
+            }
+        }
+    }
+
+    /** The pre-Phase-B local writes, unchanged and in the same order. */
+    private fun writeActivatedProfileLocally(
+        targetGatewayId: net.pocvpn.client.vpn.config.ProductionGatewayId,
+        result: ProvisioningResult.Success,
+    ) {
+        gatewayConfigOverride?.apply(
+            endpointHost = result.endpointHost,
+            endpointPort = result.endpointPort,
+            serverPublicKey = result.gatewayPublicKey,
+            clientTunnelIp = result.clientTunnelIp,
+            gatewayTunnelIp = result.gatewayTunnelIp,
+        )
+        // B8B3C - only the five non-secret gateway fields; no token, no private key.
+        profileStore?.write(
+            PersistedProfile(
+                endpointHost = result.endpointHost,
+                endpointPort = result.endpointPort,
+                gatewayPublicKey = result.gatewayPublicKey,
+                clientTunnelIp = result.clientTunnelIp,
+                gatewayTunnelIp = result.gatewayTunnelIp,
+            )
+        )
+        // B13 - the canonical per-device tunnel identity for EXACTLY targetGatewayId.
+        clientTunnelIdentityStore?.write(targetGatewayId, result.clientTunnelIp)
+    }
+
+    internal suspend fun regenerateManagedIdentity(): ManagedIdentityRegenerationResult {
+        val guard = managedAwgIdentityGuard
+        if (guard == null) {
             clientKeyRepository.clearIdentity()
             _publicKey.value = clientKeyRepository.getOrCreateIdentity().publicKeyBase64
+            return ManagedIdentityRegenerationResult.REGENERATED
+        }
+        val mutation = controller.runManagedIdentityMutation {
+            if (guard.bindingStore.deleteAll() !is net.pocvpn.client.identity.ManagedAwgBindingDeleteResult.Deleted) {
+                return@runManagedIdentityMutation ManagedIdentityRegenerationResult.BINDING_INVALIDATION_FAILED
+            }
+            clientKeyRepository.clearIdentity()
+            _publicKey.value = clientKeyRepository.getOrCreateIdentity().publicKeyBase64
+            ManagedIdentityRegenerationResult.REGENERATED
+        }
+        return when (mutation) {
+            is net.pocvpn.client.vpn.ManagedIdentityMutationResult.Completed -> mutation.value
+            net.pocvpn.client.vpn.ManagedIdentityMutationResult.Busy -> ManagedIdentityRegenerationResult.BUSY
+            net.pocvpn.client.vpn.ManagedIdentityMutationResult.Unsupported -> ManagedIdentityRegenerationResult.BUSY
         }
     }
 
@@ -5200,6 +5301,13 @@ class MainViewModel(
                 profileStore = profileStore,
                 appRoutingPolicyStore = appRoutingPolicyStore,
                 routingModeStore = routingModeStore,
+                // Phase B step 2 - exactly one lifecycle lock + binding store per
+                // process ViewModel; never a second independent instance.
+                managedAwgIdentityGuard = net.pocvpn.client.identity.ManagedAwgIdentityGuard(
+                    lifecycle = net.pocvpn.client.identity.ManagedIdentityLifecycle(),
+                    bindingStore = net.pocvpn.client.identity.FileManagedAwgBindingStore(context.noBackupFilesDir),
+                    currentTunnelIp = clientTunnelIdentityStore::read,
+                ),
                 installedPackageChecker = AndroidInstalledPackageChecker(context),
                 networkProfiler = NetworkProfiler(context),
                 connectionOutcomeStore = connectionOutcomeStore,
@@ -5391,4 +5499,22 @@ class MainViewModel(
             ) as T
         }
     }
+}
+
+/** Phase B step 2 - outcome of [MainViewModel.regenerateManagedIdentity]. */
+enum class ManagedIdentityRegenerationResult {
+    REGENERATED,
+    /** A connection attempt or session holds the identity - nothing changed. */
+    BUSY,
+    /** Bindings could not be deleted - the managed key was NOT touched. */
+    BINDING_INVALIDATION_FAILED,
+}
+
+/** Phase B step 2 - local commit outcome after the server ACCEPTED an activation. */
+enum class ManagedActivationCommitOutcome {
+    COMMITTED,
+    /** The managed key changed while the request was in flight - nothing local was written. */
+    KEY_CHANGED_DURING_ACTIVATION,
+    /** Profile/tunnel IP written but the binding was not - managed AWG stays blocked. */
+    SERVER_ACCEPTED_LOCAL_COMMIT_FAILED,
 }

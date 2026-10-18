@@ -25,17 +25,121 @@ object LeakChecks {
 
     suspend fun resolverIdentity(network: Network?): DnsProbeResult = FieldProbes.dns(RESOLVER_WHOAMI, network)
 
-    suspend fun inTunnel(vpn: Network?, directResolver: List<String>): JSONObject {
+    /**
+     * [baselineHasGlobalIpv6] - whether the network seen before the test had
+     * a global IPv6 address (null = not known). When it is known to be
+     * false the IPv6 request is not made at all: its result could not mean
+     * anything, and B54 Scope A reports that as NOT_RUN instead.
+     */
+    suspend fun inTunnel(vpn: Network?, directResolver: List<String>, baselineHasGlobalIpv6: Boolean?): JSONObject {
         val resolver = resolverIdentity(vpn)
-        val v6Default = FieldProbes.https("IPv6-only (app default network)", IPV6_ONLY_URL, null, maxBytes = 256)
+        val v6Default = if (baselineHasGlobalIpv6 == false) {
+            null
+        } else {
+            FieldProbes.https("IPv6-only (app default network)", IPV6_ONLY_URL, null, maxBytes = 256)
+        }
+        return report(vpnBound = vpn != null, resolver, directResolver, baselineHasGlobalIpv6, v6Default)
+    }
+
+    /**
+     * Pure: the `leaks` JSON. The historical keys (`dnsLeakSuspected`,
+     * `ipv6EgressWhileConnected`, `ipv6Error`, `verdict`) keep their exact
+     * pre-Scope-A meaning - including `NO_LEAK_OBSERVED` for a failed
+     * measurement - so older consumers and report comparisons are unchanged.
+     * The B54 Scope A keys (`dnsResult`/`dnsReason`, `ipv6Result`/`ipv6Reason`,
+     * `dnsEvidence`) are the ones that tell a failed measurement apart.
+     */
+    internal fun report(
+        vpnBound: Boolean,
+        resolver: DnsProbeResult,
+        directResolver: List<String>,
+        baselineHasGlobalIpv6: Boolean?,
+        v6Default: HttpProbeResult?,
+    ): JSONObject {
+        val dns = classifyDns(vpnBound, resolver, directResolver)
+        val ipv6 = classifyIpv6(baselineHasGlobalIpv6, v6Default)
         val o = JSONObject()
             .put("resolverViaVpn", JSONArray(resolver.addresses))
             .put("resolverDirect", JSONArray(directResolver))
             .put("dnsLeakSuspected", resolver.ok && directResolver.isNotEmpty() && resolver.addresses.any { it in directResolver })
-            .put("ipv6EgressWhileConnected", v6Default.httpStatus != null)
-            .put("ipv6Error", v6Default.error ?: JSONObject.NULL)
+            .put("ipv6EgressWhileConnected", v6Default?.httpStatus != null)
+            .put("ipv6Error", v6Default?.error ?: JSONObject.NULL)
         o.put("verdict", leakVerdict(o.getBoolean("dnsLeakSuspected"), o.getBoolean("ipv6EgressWhileConnected")))
+        o.put("dnsResult", dns.result.name).put("dnsReason", dns.reason?.name ?: JSONObject.NULL)
+        // A VPN-bound lookup shows which socket the query used, not the path
+        // every packet took - the strongest DNS claim this check can carry.
+        o.put("dnsEvidence", if (vpnBound) DNS_EVIDENCE_SOCKET_BINDING else JSONObject.NULL)
+        o.put("ipv6Result", ipv6.result.name).put("ipv6Reason", ipv6.reason?.name ?: JSONObject.NULL)
         return o
+    }
+
+    const val DNS_EVIDENCE_SOCKET_BINDING = "VPN_NETWORK_SOCKET_BINDING_ONLY"
+
+    /**
+     * B54 Scope A - DNS: a leak or no-leak result needs a working lookup
+     * bound to the VPN network AND a direct-resolver baseline. Anything
+     * less is INCONCLUSIVE, never "no leak".
+     */
+    internal fun classifyDns(vpnBound: Boolean, resolver: DnsProbeResult, directResolver: List<String>): LeakCheck = when {
+        !vpnBound -> LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.NO_VPN_NETWORK)
+        !resolver.ok -> LeakCheck(LeakCheckResult.INCONCLUSIVE, reasonFor(resolver.failureKind))
+        resolver.addresses.isEmpty() -> LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.LOOKUP_FAILED)
+        directResolver.isEmpty() -> LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.NO_BASELINE)
+        resolver.addresses.any { it in directResolver } -> LeakCheck(LeakCheckResult.LEAK_DETECTED, null)
+        else -> LeakCheck(LeakCheckResult.NO_LEAK_DETECTED, null)
+    }
+
+    /**
+     * B54 Scope A - IPv6: the probe runs unbound on the default network and
+     * never reads the address it reached, so it can prove neither a leak
+     * nor its absence. Every result it ran for is INCONCLUSIVE; only a
+     * baseline network without global IPv6 skips it (NOT_RUN).
+     */
+    internal fun classifyIpv6(baselineHasGlobalIpv6: Boolean?, probe: HttpProbeResult?): LeakCheck = when {
+        baselineHasGlobalIpv6 == false -> LeakCheck(LeakCheckResult.NOT_RUN, LeakCheckReason.NO_IPV6_ON_NETWORK)
+        probe == null -> LeakCheck(LeakCheckResult.NOT_RUN, null)
+        probe.httpStatus != null -> LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.EGRESS_NOT_VERIFIED)
+        else -> LeakCheck(LeakCheckResult.INCONCLUSIVE, reasonFor(probe.failureKind))
+    }
+
+    private fun reasonFor(kind: ProbeFailureKind?): LeakCheckReason = when (kind) {
+        ProbeFailureKind.TIMEOUT -> LeakCheckReason.TIMEOUT
+        ProbeFailureKind.UNKNOWN_HOST -> LeakCheckReason.LOOKUP_FAILED
+        ProbeFailureKind.OTHER, null -> LeakCheckReason.REQUEST_FAILED
+    }
+
+    /**
+     * B54 Scope B - a copy of [leaks] whose typed results no longer count:
+     * every check that ran becomes INCONCLUSIVE/SESSION_CHANGED. A NOT_RUN
+     * check stays as it was; the historical keys are left untouched.
+     */
+    fun invalidatedBySessionChange(leaks: JSONObject): JSONObject {
+        val o = JSONObject(leaks.toString())
+        listOf("dns", "ipv6").forEach { check ->
+            if (storedResult(o, "${check}Result") != LeakCheckResult.NOT_RUN) {
+                o.put("${check}Result", LeakCheckResult.INCONCLUSIVE.name).put("${check}Reason", LeakCheckReason.SESSION_CHANGED.name)
+            }
+        }
+        return o
+    }
+
+    /**
+     * Reads a Scope A result back from a report's `leaks` object. Null means
+     * UNKNOWN: a report from before Scope A (no such key) or a value this
+     * build does not know - never a no-leak result.
+     */
+    fun storedResult(leaks: JSONObject?, key: String): LeakCheckResult? {
+        val name = leaks?.optString(key, "").orEmpty()
+        return LeakCheckResult.entries.firstOrNull { it.name == name }
+    }
+
+    /** Summary text: the historical verdict, plus the Scope A results when the report has them. */
+    fun summaryText(leaks: JSONObject): String {
+        val dns = storedResult(leaks, "dnsResult") ?: return leaks.optString("verdict")
+        val ipv6 = storedResult(leaks, "ipv6Result")
+        fun part(result: LeakCheckResult?, reasonKey: String) =
+            (result?.name ?: "UNKNOWN") + (leaks.optString(reasonKey, "").takeIf { it.isNotEmpty() && it != "null" }?.let { "/$it" } ?: "")
+        return "${leaks.optString("verdict")} (DNS ${part(dns, "dnsReason")}, IPv6 ${part(ipv6, "ipv6Reason")})"
     }
 
     internal fun leakVerdict(dnsLeak: Boolean, ipv6Egress: Boolean): String = when {
@@ -45,6 +149,46 @@ object LeakChecks {
         else -> "NO_LEAK_OBSERVED"
     }
 }
+
+/** B54 Scope A - outcome of one leak check. */
+enum class LeakCheckResult {
+    /** The measurement worked and found evidence of a leak. */
+    LEAK_DETECTED,
+
+    /** The measurement worked, a baseline existed and no leak evidence was found. */
+    NO_LEAK_DETECTED,
+
+    /** The measurement ran but proves neither a leak nor its absence. */
+    INCONCLUSIVE,
+
+    /** The measurement was not made. */
+    NOT_RUN,
+}
+
+/** B54 Scope A - why a check is INCONCLUSIVE or NOT_RUN. Closed list, never exception text. */
+enum class LeakCheckReason {
+    /** The lookup failed (unknown host) or returned no address. */
+    LOOKUP_FAILED,
+    TIMEOUT,
+
+    /** The request failed for a reason other than a lookup failure or timeout. */
+    REQUEST_FAILED,
+
+    /** No VPN network was available, so the lookup was not bound to the tunnel. */
+    NO_VPN_NETWORK,
+
+    /** B54 Scope B - the session left Connected or was replaced while the check ran. */
+    SESSION_CHANGED,
+    NO_IPV6_ON_NETWORK,
+
+    /** No direct-resolver baseline to compare with. */
+    NO_BASELINE,
+
+    /** The request got an answer, but the address it reached was not read or checked. */
+    EGRESS_NOT_VERIFIED,
+}
+
+data class LeakCheck(val result: LeakCheckResult, val reason: LeakCheckReason?)
 
 /**
  * Activation/profile API reachability without side effects: the same

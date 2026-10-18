@@ -2001,6 +2001,87 @@ class MainViewModelTest {
         assertTrue(viewModel.transportState.value is TransportState.Connected)
     }
 
+    // --- managed AWG REACTIVATION_REQUIRED refusal (empty binding store) ---
+
+    private class RefusalEnv(dir: java.io.File) {
+        val awg = FakeVpnTransport()
+        val xray = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val diagnostics = DiagnosticsStore()
+        val outcomes = net.pocvpn.client.vpn.FakeConnectionOutcomeStore()
+        val repo = net.pocvpn.client.identity.AwgClientKeyRepository(
+            net.pocvpn.client.identity.FileIdentityStore(dir),
+            net.pocvpn.client.identity.FakeAesGcmKeyEncryptor(),
+        )
+        val tunnels = net.pocvpn.client.vpn.config.FileClientTunnelIdentityStore(dir)
+        val guard = net.pocvpn.client.identity.ManagedAwgIdentityGuard(
+            net.pocvpn.client.identity.ManagedIdentityLifecycle(),
+            net.pocvpn.client.identity.FileManagedAwgBindingStore(dir),
+            tunnels::read,
+        )
+    }
+
+    private fun refusalViewModel(env: RefusalEnv) = MainViewModel(
+        clientKeyRepository = env.repo,
+        transport = env.awg,
+        gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+        reconnectManager = FakeReconnectManager(),
+        diagnosticsStore = env.diagnostics,
+        initialNetworkProfile = USABLE_WIFI,
+        xrayTransport = env.xray,
+        xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+        connectionOutcomeStore = env.outcomes,
+        managedAwgIdentityGuard = env.guard,
+    ).also { testDispatcher.scheduler.runCurrent() }
+
+    private val reactivationRefusal = VpnError.ConfigurationMappingFailure(
+        net.pocvpn.client.identity.ManagedAwgEligibility.refusalDetail(net.pocvpn.client.identity.ManagedAwgEligibilityReason.REACTIVATION_REQUIRED),
+    )
+
+    @Test
+    fun `Auto - managed AWG reactivation refusal falls back to Xray without recording AWG as a failed path`() = runTest {
+        val env = RefusalEnv(tmp.newFolder())
+        val viewModel = refusalViewModel(env)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, env.awg.connectCallCount)
+        assertEquals(1, env.xray.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+        // The refusal is not network evidence: no AWG outcome is recorded.
+        assertTrue(env.outcomes.recent().none { it.transport == TransportKind.AMNEZIA_WG })
+    }
+
+    @Test
+    fun `Auto - a failing Xray fallback after the refusal never ends Connected`() = runTest {
+        val env = RefusalEnv(tmp.newFolder())
+        env.xray.failConnectWith = RuntimeException("xray backend failed")
+        val viewModel = refusalViewModel(env)
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, env.awg.connectCallCount)
+        assertEquals(1, env.xray.connectCallCount)
+        assertFalse(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `forced or pinned AWG - reactivation refusal stops without fallback and the one-shot force resets`() = runTest {
+        val env = RefusalEnv(tmp.newFolder())
+        val viewModel = refusalViewModel(env)
+        viewModel.debugSetTransportPreference(UserTransportPreference.Manual(TransportKind.AMNEZIA_WG))
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, env.awg.connectCallCount)
+        assertEquals(0, env.xray.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+        assertEquals(reactivationRefusal, env.diagnostics.snapshot.value.lastError)
+        assertEquals(UserTransportPreference.Auto, viewModel.transportPreference)
+    }
+
     @Test
     fun `B8K6A stale async AWG failure after disconnect is ignored`() = runTest {
         val awgTransport = FakeVpnTransport()
