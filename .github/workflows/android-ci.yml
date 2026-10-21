@@ -1,0 +1,83 @@
+name: android-ci
+
+on:
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'third_party/**'
+      - '.github/workflows/android-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'third_party/**'
+      - '.github/workflows/android-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: Android build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Validate required Android native artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar"
+            "android/app/libs/libv2ray-androidlibxraylite-c634d1b-nova-b35xhttp1.aar"
+          )
+
+          missing=0
+          for path in "${required[@]}"; do
+            if [[ ! -f "$path" ]]; then
+              echo "Missing required Android artifact: $path"
+              missing=1
+            fi
+          done
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo ""
+            echo "The repository requires pinned local AAR artifacts before Android builds can run."
+            echo "Generate them locally with the project scripts in third_party/ and place them in android/app/libs/."
+            echo "This workflow intentionally fails early so CI does not silently build against an incomplete environment."
+            exit 1
+          fi
+
+      - name: Gradle dependency cache
+        working-directory: android
+        run: ./gradlew --version
+
+      - name: Run unit tests
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --no-daemon
+
+      - name: Assemble debug APK
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload debug APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
