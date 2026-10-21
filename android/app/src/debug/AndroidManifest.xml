@@ -60,5 +60,22 @@
             android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
             android:exported="true"
             android:label="Shadowsocks Adapter Validation (debug, not production)" />
+
+        <!-- M1 - isolated, debug-only GeoIP/Geosite database-loading
+             experiment (cases E0..E6). Runs ONE case inside the `:xray`
+             process through the production LibXrayCoreRuntime with a fixed
+             blackhole-only config (no inbound, no tun, tunFd 0, no network
+             API). Never wired into any transport or VpnController path;
+             absent from release builds like the entries above.
+             exported=true + android.permission.DUMP for the same
+             `adb shell am start` reason B13 documented on
+             XrayDiagnosticsActivity (ordinary apps cannot call it). -->
+        <activity
+            android:name="net.pocvpn.client.debug.geoexp.GeoDbExperimentActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":xray"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 </manifest>
