@@ -8,8 +8,9 @@ import android.system.Os
 import android.util.Log
 import java.io.File
 import java.io.IOException
-import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import org.json.JSONObject
 
@@ -182,29 +183,21 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
     /**
      * `android.net.LocalServerSocket` has no built-in per-call accept
      * timeout, so this runs `accept()` on a background thread and bounds
-     * the WAIT for its result rather than the `accept()` call itself. On a
-     * genuine timeout the background thread is deliberately left running
-     * (a daemon thread, so it never blocks JVM shutdown) - the server
-     * socket itself is NOT closed here because it may still be needed for
-     * a second `acceptWithTimeout` call in the same session (the ack
-     * connection). Whatever this abandoned `accept()` eventually returns
-     * (a real late connection, or an `IOException` once [close] finally
-     * runs) is discarded - nothing reads `resultQueue` again after this
-     * function has already returned a value once.
+     * the WAIT for its result rather than the `accept()` call itself (see
+     * [awaitHandoff]). On a genuine timeout the background thread is
+     * deliberately left running (a daemon thread, so it never blocks JVM
+     * shutdown) - the server socket itself is NOT closed here because it may
+     * still be needed for a later `acceptWithTimeout` call in the same
+     * session. A connection that this abandoned `accept()` returns late is
+     * closed, never leaked.
      */
     private fun acceptWithTimeout(server: LocalServerSocket, timeoutMillis: Long): LocalSocket? {
-        val resultQueue = SynchronousQueue<LocalSocket?>()
-        thread(name = "tun2socks-child-control-accept", isDaemon = true) {
-            val result = try {
-                server.accept()
-            } catch (t: IOException) {
-                null
-            }
-            // offer(), not put(): if nobody is polling any more (the caller
-            // already timed out and returned), this must not block forever.
-            resultQueue.offer(result)
-        }
-        val accepted = resultQueue.poll(timeoutMillis, TimeUnit.MILLISECONDS)
+        val accepted = awaitHandoff(
+            timeoutMillis = timeoutMillis,
+            threadName = "tun2socks-child-control-accept",
+            produce = { server.accept() },
+            discardLate = { late -> runCatching { late.close() } },
+        )
         if (accepted == null) {
             Log.w(TAG, "acceptWithTimeout: no connection within ${timeoutMillis}ms")
         }
@@ -245,6 +238,59 @@ class RealHysteria2Hysteria2Tun2SocksChildControlChannel : Hysteria2Tun2SocksChi
         boundPath?.delete()
         boundPath = null
     }
+}
+
+private val NO_RESULT = Any()
+
+/**
+ * Runs [produce] on a daemon thread and waits at most [timeoutMillis] for its
+ * result; null on timeout or when [produce] throws [IOException].
+ *
+ * The result is handed over through a one-slot queue, so a [produce] that
+ * returns before this thread starts waiting is still delivered. (The earlier
+ * `SynchronousQueue.offer()` dropped exactly that case: the tun2socks child
+ * dials its stats connection right after the ack, `accept()` returned before
+ * `poll()` ran, and the gate never received counters. Its `offer(null)` on an
+ * `IOException` also threw.) A result that arrives after the timeout goes to
+ * [discardLate] exactly once. [beforeWait] is a test seam that runs between
+ * starting the thread and waiting.
+ */
+internal fun <T : Any> awaitHandoff(
+    timeoutMillis: Long,
+    threadName: String,
+    produce: () -> T,
+    discardLate: (T) -> Unit,
+    beforeWait: () -> Unit = {},
+): T? {
+    val slot = LinkedBlockingQueue<Any>(1)
+    val abandoned = AtomicBoolean(false)
+    thread(name = threadName, isDaemon = true) {
+        val result: Any = try {
+            produce()
+        } catch (_: IOException) {
+            NO_RESULT
+        }
+        slot.offer(result)
+        // The waiter gave up before or while we offered: whoever removes the
+        // value first (here or the waiter's own drain below) discards it.
+        if (abandoned.get() && result !== NO_RESULT && slot.remove(result)) {
+            @Suppress("UNCHECKED_CAST")
+            discardLate(result as T)
+        }
+    }
+    beforeWait()
+    val got = slot.poll(timeoutMillis, TimeUnit.MILLISECONDS)
+    if (got == null) {
+        abandoned.set(true)
+        val late = slot.poll()
+        if (late != null && late !== NO_RESULT) {
+            @Suppress("UNCHECKED_CAST")
+            discardLate(late as T)
+        }
+        return null
+    }
+    @Suppress("UNCHECKED_CAST")
+    return if (got === NO_RESULT) null else got as T
 }
 
 /** Reads one '\n'-terminated line of at most [maxLength] chars; null on EOF. A longer line is an error, never truncated into a valid one. */
