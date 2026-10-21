@@ -1,0 +1,179 @@
+name: android-ci
+
+on:
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'third_party/**'
+      - '.github/workflows/android-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'third_party/**'
+      - '.github/workflows/android-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Toolchain pins taken from the build scripts and from the locally built AARs,
+  # not "latest". See third_party/build-tunnel-wsl.sh and third_party/xray/VERSION.
+  AWG_NDK_VERSION: '26.1.10909125'
+  AWG_CMAKE_VERSION: '3.22.1'
+  # The local Xray AAR's libgojni.so carries a go1.26.0 build stamp
+  # (VERSION only requires 1.26). The AWG Makefile fetches its own Go.
+  XRAY_GO_VERSION: '1.26.0'
+  AWG_AAR: android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar
+  XRAY_AAR: android/app/libs/libv2ray-androidlibxraylite-c634d1b-nova-b35xhttp1.aar
+  # SHA-256 of the AARs currently used for local/device builds. Compared and
+  # reported below; a mismatch is a warning until CI reproducibility is proven.
+  AWG_AAR_LOCAL_SHA256: 2d5a241094bca8943eecadce746d77b51a335cf5adbc5f916767e20829165ee5
+  XRAY_AAR_LOCAL_SHA256: 078578b99aa419d197fda35474ef49742329b8762f3073e40d1c0f54a2149084
+
+jobs:
+  android-build:
+    name: Android build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # 17 for the pinned native builds (both scripts expect a JDK 17),
+      # 21 (installed last, so the default JAVA_HOME) for the app build.
+      - name: Set up JDK 17 and 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+          cache: gradle
+
+      - name: Set up Go ${{ env.XRAY_GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.XRAY_GO_VERSION }}
+          cache: false
+
+      - name: Restore pinned native AARs
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.AWG_AAR }}
+            ${{ env.XRAY_AAR }}
+          key: native-aars-v1-ndk${{ env.AWG_NDK_VERSION }}-cmake${{ env.AWG_CMAKE_VERSION }}-go${{ env.XRAY_GO_VERSION }}-${{ hashFiles('third_party/build-tunnel-wsl.sh', 'third_party/xray/build-xray-wsl.sh', 'third_party/xray/VERSION', 'third_party/xray/patches/**') }}
+
+      - name: Install pinned NDK and CMake
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" --install "ndk;${AWG_NDK_VERSION}" "cmake;${AWG_CMAKE_VERSION}" > /dev/null
+          test -d "$ANDROID_HOME/ndk/${AWG_NDK_VERSION}"
+          test -x "$ANDROID_HOME/cmake/${AWG_CMAKE_VERSION}/bin/cmake"
+
+      - name: Build pinned AmneziaWG tunnel AAR
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          NOVA_BUILD_ROOT: ${{ runner.temp }}/native-build
+          # GOTOOLCHAIN=auto as on the local build host: the AWG Makefile puts its
+          # own Go 1.24.2 on PATH and amneziawg-go's go.mod then selects go1.25.0.
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          export NOVA_ANDROID_HOME="$ANDROID_HOME"
+          export NOVA_JAVA_HOME="$JAVA_HOME_17_X64"
+          bash third_party/build-tunnel-wsl.sh
+          # android/**/libs/ is gitignored, so a clean checkout has no libs dir.
+          mkdir -p "$(dirname "$AWG_AAR")"
+          cp "$NOVA_BUILD_ROOT/amneziawg-android/tunnel/build/outputs/aar/tunnel-debug.aar" "$AWG_AAR"
+
+      - name: Build pinned Xray AAR
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          NOVA_BUILD_ROOT: ${{ runner.temp }}/native-build
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          export NOVA_ANDROID_HOME="$ANDROID_HOME"
+          export NOVA_JAVA_HOME="$JAVA_HOME_17_X64"
+          # The runner image points ANDROID_NDK_HOME at its own default NDK.
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/${AWG_NDK_VERSION}"
+          bash third_party/xray/build-xray-wsl.sh
+          mkdir -p "$(dirname "$XRAY_AAR")"
+          cp "$NOVA_BUILD_ROOT/androidlibxraylite/libv2ray.aar" "$XRAY_AAR"
+
+      - name: Verify native AAR contents and report checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          check() {
+            local aar="$1"; shift
+            for entry in classes.jar "$@"; do
+              unzip -l "$aar" "$entry" > /dev/null || { echo "::error::$aar has no $entry"; exit 1; }
+            done
+          }
+          check "$AWG_AAR" jni/arm64-v8a/libwg-go.so jni/arm64-v8a/libwg.so jni/arm64-v8a/libwg-quick.so
+          check "$XRAY_AAR" jni/arm64-v8a/libgojni.so
+
+          {
+            echo "### Native AARs (cache hit: ${{ steps.native-cache.outputs.cache-hit == 'true' }})"
+            echo '| AAR | CI SHA-256 | local SHA-256 | match |'
+            echo '|---|---|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          report() {
+            local aar="$1" expected="$2" actual
+            actual=$(sha256sum "$aar" | cut -d' ' -f1)
+            local match=yes
+            if [[ "$actual" != "$expected" ]]; then
+              match=no
+              echo "::warning::$aar SHA-256 $actual differs from the local build $expected"
+            fi
+            echo "| $(basename "$aar") | \`$actual\` | \`$expected\` | $match |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          report "$AWG_AAR" "$AWG_AAR_LOCAL_SHA256"
+          report "$XRAY_AAR" "$XRAY_AAR_LOCAL_SHA256"
+
+      # Uploaded before the Gradle steps so the AARs stay inspectable if tests fail.
+      - name: Upload native AARs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-native-aars
+          path: |
+            ${{ env.AWG_AAR }}
+            ${{ env.XRAY_AAR }}
+          if-no-files-found: error
+          retention-days: 7
+
+      # android/gradlew is committed without the executable bit (mode 100644).
+      - name: Run unit tests
+        working-directory: android
+        run: bash ./gradlew :app:testDebugUnitTest --no-daemon
+
+      - name: Assemble debug APK
+        working-directory: android
+        run: bash ./gradlew :app:assembleDebug --no-daemon
+
+      # Note: gitignored jniLibs (sslocal, tun2socks/hysteria children) are not
+      # built here, so this APK is a CI build check, not a field-test build.
+      - name: Upload debug APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

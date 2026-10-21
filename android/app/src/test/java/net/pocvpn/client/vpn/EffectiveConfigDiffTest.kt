@@ -12,6 +12,7 @@ import net.pocvpn.client.vpn.config.PocAwgProfile
 import org.amnezia.awg.crypto.KeyPair
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Test
 
 /**
@@ -174,7 +175,11 @@ class EffectiveConfigDiffTest {
         // WSL-local "10.77.0.0/24" override is gone from this worktree's
         // gateway-dev.properties, not just demonstrated against a fake source.
         val source = MutableGatewayConfigSource(BuildConfigGatewaySource)
-        val configured = DefaultGatewayConfigurationRepository(source).get() as GatewayConfiguration.Configured
+        val result = DefaultGatewayConfigurationRepository(source).get()
+        // Without the gitignored gateway-dev.properties (e.g. CI) every BuildConfig gateway
+        // field is "" and the repository reports Missing - nothing compiled in to check.
+        assumeFalse("gateway-dev.properties absent: no compiled-in gateway config", result is GatewayConfiguration.Missing)
+        val configured = result as GatewayConfiguration.Configured
         assertEquals(listOf("0.0.0.0/0", "::/0"), configured.allowedIps)
     }
 
