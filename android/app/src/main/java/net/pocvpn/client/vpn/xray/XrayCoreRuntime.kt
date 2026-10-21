@@ -74,7 +74,15 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
         if (!envInitialized.compareAndSet(false, true)) return
         try {
             go.Seq.setContext(context.applicationContext)
-            val assetDir = java.io.File(context.noBackupFilesDir, "xray-assets").apply { mkdirs() }
+            val assetRoot = java.io.File(context.noBackupFilesDir, "xray-assets").apply { mkdirs() }
+            // Phase A - the bundled geoip.dat/geosite.dat must exist as real files for the pinned Xray
+            // (see GeoDataStager). Runs once per process, before the first core of this process exists,
+            // and never throws or fails the start: on any problem the directory is the plain
+            // `xray-assets` root, i.e. exactly what this call used before.
+            val assetDir = GeoDataBootstrap.resolveAssetDirectory(
+                assetRoot,
+                context.assets.asGeoAssetSource(),
+            ) { line -> android.util.Log.i("GeoData", line) }
             // deviceId personalizes XUDP session base keys only (an anti-fingerprinting
             // refinement, not connection-critical, not a credential) - this adapter shell
             // does not implement v2rayNG's per-device derivation yet, so this is left
