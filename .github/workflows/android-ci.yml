@@ -99,7 +99,7 @@ jobs:
           bash third_party/build-tunnel-wsl.sh
           # android/**/libs/ is gitignored, so a clean checkout has no libs dir.
           mkdir -p "$(dirname "$AWG_AAR")"
-          cp"$NOVA_BUILD_ROOT/amneziawg-android/tunnel/build/outputs/aar/tunnel-debug.aar" "$AWG_AAR"
+          cp "$NOVA_BUILD_ROOT/amneziawg-android/tunnel/build/outputs/aar/tunnel-debug.aar" "$AWG_AAR"
 
       - name: Build pinned Xray AAR
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -115,7 +115,7 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/${AWG_NDK_VERSION}"
           bash third_party/xray/build-xray-wsl.sh
           mkdir -p "$(dirname "$XRAY_AAR")"
-          cp"$NOVA_BUILD_ROOT/androidlibxraylite/libv2ray.aar" "$XRAY_AAR"
+          cp "$NOVA_BUILD_ROOT/androidlibxraylite/libv2ray.aar" "$XRAY_AAR"
 
       - name: Verify native AAR contents and report checksums
         shell: bash
