@@ -1324,6 +1324,122 @@ class MainViewModelTest {
         assertTrue(viewModel.transportState.value is TransportState.HandshakeFailed)
     }
 
+    // --- REALITY -> TLS_TCP: one same-gateway hop after the AWG -> REALITY fallback ---
+
+    private fun failingRealityTransport() = FakeVpnTransport(kind = TransportKind.XRAY_REALITY).apply {
+        reportErrorAfterConnect = "remote handshake not confirmed"
+    }
+
+    private fun awgRealityTlsViewModel(
+        awgTransport: FakeVpnTransport,
+        realityTransport: FakeVpnTransport,
+        tlsTransport: FakeVpnTransport?,
+        preference: UserTransportPreference = UserTransportPreference.Auto,
+    ) = MainViewModel(
+        clientKeyRepository = FakeClientKeyRepository(),
+        transport = awgTransport,
+        gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+        reconnectManager = FakeReconnectManager(),
+        diagnosticsStore = DiagnosticsStore(),
+        initialNetworkProfile = USABLE_WIFI,
+        xrayTransport = realityTransport,
+        xrayProfileRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests()),
+        xrayTlsTransport = tlsTransport,
+        xrayTlsProfileRepository = tlsTransport?.let {
+            net.pocvpn.client.vpn.FakeXrayTlsProfileRepository(SAMPLE_XRAY_TLS_PROFILE_SUCCESS.toXrayTlsProfile())
+        },
+        userTransportPreference = preference,
+    )
+
+    private fun MainViewModel.connectAndSettle() {
+        connect()
+        testDispatcher.scheduler.advanceTimeBy(10_000)
+        testDispatcher.scheduler.runCurrent()
+    }
+
+    @Test
+    fun `AWG fails, REALITY fallback fails, TLS_TCP available - exactly one TLS_TCP attempt on the same gateway`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val realityTransport = failingRealityTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val viewModel = awgRealityTlsViewModel(awgTransport, realityTransport, tlsTransport)
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connectAndSettle()
+
+        assertEquals(1, awgTransport.connectCallCount)
+        assertEquals(1, realityTransport.connectCallCount)
+        // Each failed attempt is detached before the next one starts.
+        assertEquals(1, awgTransport.disconnectCallCount)
+        assertEquals(1, realityTransport.disconnectCallCount)
+        assertEquals(1, tlsTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+        assertEquals(net.pocvpn.client.vpn.config.ProductionGatewayId.GERMANY, viewModel.activeGatewayId.value)
+    }
+
+    @Test
+    fun `AWG fails, REALITY fallback connects - TLS_TCP never starts`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val realityTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val viewModel = awgRealityTlsViewModel(awgTransport, realityTransport, tlsTransport)
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connectAndSettle()
+
+        assertEquals(1, realityTransport.connectCallCount)
+        assertEquals(0, tlsTransport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `AWG, REALITY and TLS_TCP all fail - surfaced truthfully with no further hop or bounce back to AWG`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val realityTransport = failingRealityTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP).apply {
+            reportErrorAfterConnect = "remote handshake not confirmed"
+        }
+        val viewModel = awgRealityTlsViewModel(awgTransport, realityTransport, tlsTransport)
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connectAndSettle()
+
+        assertEquals(1, awgTransport.connectCallCount)
+        assertEquals(1, realityTransport.connectCallCount)
+        assertEquals(1, tlsTransport.connectCallCount)
+        assertFalse(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `AWG fails, REALITY fallback fails, no TLS_TCP profile - no further hop`() = runTest {
+        val awgTransport = FakeVpnTransport().apply { handshakeAvailable = false }
+        val realityTransport = failingRealityTransport()
+        val viewModel = awgRealityTlsViewModel(awgTransport, realityTransport, tlsTransport = null)
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connectAndSettle()
+
+        assertEquals(1, realityTransport.connectCallCount)
+        assertEquals(0, realityTransport.disconnectCallCount)
+        assertFalse(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `Manual XRAY_REALITY plus REALITY failure - no TLS_TCP fallback`() = runTest {
+        val realityTransport = failingRealityTransport()
+        val tlsTransport = FakeVpnTransport(kind = TransportKind.TLS_TCP)
+        val viewModel = awgRealityTlsViewModel(
+            FakeVpnTransport(), realityTransport, tlsTransport, UserTransportPreference.Manual(TransportKind.XRAY_REALITY),
+        )
+        testDispatcher.scheduler.runCurrent()
+
+        viewModel.connectAndSettle()
+
+        assertEquals(1, realityTransport.connectCallCount)
+        assertEquals(0, tlsTransport.connectCallCount)
+        assertFalse(viewModel.transportState.value is TransportState.Connected)
+    }
+
     @Test
     fun `Manual Xray - Xray starts directly, AWG never starts`() = runTest {
         val awgTransport = FakeVpnTransport()
