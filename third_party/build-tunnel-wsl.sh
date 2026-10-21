@@ -7,15 +7,21 @@
 #
 # Pinned revision: v3.1.20260814 (5c16489e2cd9ed3a0a7a27c7445bba5238132f86) - AWG 3.1 generation.
 # Do not float to master - always pin to this exact tag/commit until deliberately re-audited.
+#
+# Optional overrides (used by .github/workflows/android-ci.yml; unset = the WSL defaults below):
+#   NOVA_BUILD_ROOT    disposable clone root      (default: ~/build)
+#   NOVA_ANDROID_HOME  Android SDK with ndk/26.1.10909125 and cmake/3.22.1 (default: ~/android-sdk)
+#   NOVA_JAVA_HOME     JDK 17                     (default: /usr/lib/jvm/java-17-openjdk-amd64)
 set -euo pipefail
 
-WORK=~/build/amneziawg-android
-ANDROID_HOME=~/android-sdk
+BUILD_ROOT="${NOVA_BUILD_ROOT:-$HOME/build}"
+WORK="$BUILD_ROOT/amneziawg-android"
+ANDROID_HOME="${NOVA_ANDROID_HOME:-$HOME/android-sdk}"
 PIN_TAG="v3.1.20260814"
 PIN_SHA="5c16489e2cd9ed3a0a7a27c7445bba5238132f86"
 
 if [ ! -d "$WORK" ]; then
-    mkdir -p ~/build
+    mkdir -p "$BUILD_ROOT"
     git clone --recurse-submodules https://github.com/amnezia-vpn/amneziawg-android.git "$WORK"
 fi
 
@@ -36,7 +42,7 @@ ndk.dir=$ANDROID_HOME/ndk/26.1.10909125
 cmake.dir=$ANDROID_HOME/cmake/3.22.1
 EOF
 
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export JAVA_HOME="${NOVA_JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 ./gradlew :tunnel:assembleDebug --console=plain
 
 OUT="$WORK/tunnel/build/outputs/aar/tunnel-debug.aar"

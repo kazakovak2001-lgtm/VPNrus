@@ -8,18 +8,25 @@
 #
 # Pinned revision: see VERSION in this directory. Do not float to main -
 # always pin to an exact commit until deliberately re-audited (B8K0).
+#
+# Optional overrides (used by .github/workflows/android-ci.yml; unset = the WSL defaults below):
+#   NOVA_BUILD_ROOT    disposable clone root      (default: ~/build)
+#   NOVA_ANDROID_HOME  Android SDK                (default: ~/android-sdk)
+#   NOVA_JAVA_HOME     JDK 17                     (default: /usr/lib/jvm/java-17-openjdk-amd64)
+# gomobile takes the NDK from ANDROID_NDK_HOME when set, else the newest one under the SDK.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=VERSION
 source "$HERE/VERSION"
 
-WORK=~/build/androidlibxraylite
-CORE_WORK=~/build/xray-core-nova
-ANDROID_HOME=~/android-sdk
+BUILD_ROOT="${NOVA_BUILD_ROOT:-$HOME/build}"
+WORK="$BUILD_ROOT/androidlibxraylite"
+CORE_WORK="$BUILD_ROOT/xray-core-nova"
+ANDROID_HOME="${NOVA_ANDROID_HOME:-$HOME/android-sdk}"
 PATCH_FILE="$HERE/$XRAY_CORE_PATCH_0001"
 
-mkdir -p ~/build
+mkdir -p "$BUILD_ROOT"
 
 if [ ! -d "$CORE_WORK/.git" ]; then
     git clone "$XRAY_CORE_REPO" "$CORE_WORK"
@@ -61,7 +68,7 @@ if [ "$actual_sha" != "$WRAPPER_COMMIT" ]; then
     exit 1
 fi
 
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export JAVA_HOME="${NOVA_JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 export ANDROID_HOME="$ANDROID_HOME"
 export PATH="$(go env GOPATH)/bin:$PATH"
 
