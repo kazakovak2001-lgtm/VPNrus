@@ -7,6 +7,7 @@ import net.pocvpn.client.reachability.EndpointId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class Shadowsocks2022CredentialRepositoryTest {
@@ -178,6 +179,12 @@ class Shadowsocks2022CredentialRepositoryTest {
 
     @Test
     fun `a failed replacement does not delete the old credential first - old credential survives the failure`() = runBlocking {
+        // FileChannel locks are mandatory only on Windows; on Linux/macOS they are advisory and
+        // Files.move replaces the locked file anyway, so this way of forcing the failure doesn't exist there.
+        assumeTrue(
+            "exclusive file locks block Files.move only on Windows",
+            System.getProperty("os.name").orEmpty().startsWith("Windows"),
+        )
         // Deterministic, non-invasive way to force Files.move's ATOMIC_MOVE+REPLACE_EXISTING to fail
         // without inventing a fault-injection filesystem abstraction: hold an exclusive lock on the
         // destination file (a real, practical failure mode - e.g. another process/AV scanner has it
