@@ -148,17 +148,8 @@ jobs:
           report "$AWG_AAR" "$AWG_AAR_LOCAL_SHA256"
           report "$XRAY_AAR" "$XRAY_AAR_LOCAL_SHA256"
 
-      # android/gradlew is committed without the executable bit (mode 100644).
-      - name: Run unit tests
-        working-directory: android
-        run: bash ./gradlew :app:testDebugUnitTest --no-daemon
-
-      - name: Assemble debug APK
-        working-directory: android
-        run: bash ./gradlew :app:assembleDebug --no-daemon
-
+      # Uploaded before the Gradle steps so the AARs stay inspectable if tests fail.
       - name: Upload native AARs
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: android-native-aars
@@ -167,6 +158,15 @@ jobs:
             ${{ env.XRAY_AAR }}
           if-no-files-found: error
           retention-days: 7
+
+      # android/gradlew is committed without the executable bit (mode 100644).
+      - name: Run unit tests
+        working-directory: android
+        run: bash ./gradlew :app:testDebugUnitTest --no-daemon
+
+      - name: Assemble debug APK
+        working-directory: android
+        run: bash ./gradlew :app:assembleDebug --no-daemon
 
       # Note: gitignored jniLibs (sslocal, tun2socks/hysteria children) are not
       # built here, so this APK is a CI build check, not a field-test build.
