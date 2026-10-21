@@ -46,6 +46,11 @@ class FakeVpnTransport(
         private set
     var connectGate: CompletableDeferred<Unit>? = null
     var failConnectWith: Throwable? = null
+
+    // Non-null: connect() returns normally and the transport then reports
+    // Error(reason) through observeState() - how a real Xray transport
+    // surfaces a failed start (e.g. an unconfirmed remote handshake).
+    var reportErrorAfterConnect: String? = null
     var lastConfig: TransportConfig? = null
 
     // B8B3D - controls what stats() reports. Defaults to a fresh handshake
@@ -73,6 +78,10 @@ class FakeVpnTransport(
         stateFlow.value = TransportState.Connecting
         connectGate?.await()
         failConnectWith?.let { throw it }
+        reportErrorAfterConnect?.let {
+            stateFlow.value = TransportState.Error(it)
+            return
+        }
         stateFlow.value = TransportState.Connected
     }
 

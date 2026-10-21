@@ -18,8 +18,11 @@ NetworkProfiler
   -> TransportOrchestrator
 ```
 
-- `SmartConnectDecisionEngine`/`AwgXrayFailoverPolicy` still operate WITHIN one
-  gateway only (transport choice/intra-gateway AWG->Xray failover) - unchanged by B16.
+- `SmartConnectDecisionEngine`/`AwgXrayFailoverPolicy`/`RealityTlsFailoverPolicy`
+  operate WITHIN one gateway only (transport choice/intra-gateway failover) -
+  unchanged by B16. Manual-gateway chain, each hop one-shot and only for an
+  unpinned transport: AWG -> Xray (REALITY or XHTTP), then REALITY -> TLS_TCP
+  on the same endpoint; never back to AWG, nothing after TLS_TCP.
 - **B16 - automatic multi-GATEWAY selection/failover is real, above that
   boundary**: `AutoGatewaySelector` (`smartconnect/AutoGatewaySelector.kt`)
   promotes the SAME `ReachabilityEngine`/`PathCandidateBuilder`/`PathScorer`

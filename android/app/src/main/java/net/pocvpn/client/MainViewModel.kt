@@ -4539,10 +4539,12 @@ class MainViewModel(
      * bounce between XHTTP and REALITY either: this function is still
      * called from exactly the same one collector site, at most once per
      * AWG attempt, and does not itself re-arm [armFailoverWatch] for the
-     * Xray attempt it starts, so a SUBSEQUENT failure of that Xray attempt
-     * surfaces its own terminal state with no further automatic hop - the
-     * SAME one-shot property this function already had before B66.18, now
-     * just reused for two possible targets instead of one).
+     * Xray attempt it starts. Its caller re-arms only a REALITY target, and
+     * only for the one-shot REALITY -> TLS_TCP hop
+     * ([net.pocvpn.client.smartconnect.RealityTlsFailoverPolicy]); a failed
+     * XHTTP target, or a failed TLS_TCP after that hop, surfaces its own
+     * terminal state with no further automatic hop and never bounces back
+     * to AWG).
      *
      * B66.18 - [targetKind] is [TransportKind.XRAY_REALITY] or
      * [TransportKind.XRAY_XHTTP] (never anything else - see
@@ -4559,7 +4561,7 @@ class MainViewModel(
         orchestrator: TransportOrchestrator,
         endpointId: net.pocvpn.client.reachability.EndpointId,
         targetKind: TransportKind,
-    ) {
+    ): Boolean {
         val eligible = AwgXrayFailoverPolicy.isEligibleForXrayFallback(
             initialKind = initialKind,
             preference = preference,
@@ -4567,10 +4569,24 @@ class MainViewModel(
             awgError = diagnosticsStore.snapshot.value.lastError,
             xrayAvailable = registry.descriptorFor(targetKind)?.status == TransportStatus.AVAILABLE,
         )
-        if (!eligible) return
+        if (!eligible) return false
 
-        when (
-            val xrayResolution = orchestrator.resolve(
+        return switchToFallbackKind(orchestrator, endpointId, targetKind)
+    }
+
+    /**
+     * The one "detach the failed attempt, start [targetKind] on the SAME
+     * endpoint" step shared by the AWG -> Xray and REALITY -> TLS_TCP hops.
+     * Callers decide eligibility first; this never re-arms
+     * [armFailoverWatch], so every hop stays one-shot.
+     */
+    private suspend fun switchToFallbackKind(
+        orchestrator: TransportOrchestrator,
+        endpointId: net.pocvpn.client.reachability.EndpointId,
+        targetKind: TransportKind,
+    ): Boolean {
+        return when (
+            val fallbackResolution = orchestrator.resolve(
                 TransportSelectionDecision.SelectTransport(targetKind),
                 endpointId,
                 endpointTransportBinding = trustedTransportBindingFor(endpointId, targetKind),
@@ -4580,14 +4596,15 @@ class MainViewModel(
                 supportDiagnosticsRecorder?.recordAttemptFailed()
                 controller.disconnect()
                 supportDiagnosticsRecorder?.recordCandidateAttemptStarted(
-                    net.pocvpn.client.diagnostics.support.PathKind.DIRECT, xrayResolution.kind,
-                    net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(xrayResolution.endpointId),
+                    net.pocvpn.client.diagnostics.support.PathKind.DIRECT, fallbackResolution.kind,
+                    net.pocvpn.client.diagnostics.support.AttemptEndpointIdentity.Direct(fallbackResolution.endpointId),
                 )
-                controller.connect(xrayResolution)
+                controller.connect(fallbackResolution)
+                true
             }
-            // Defensive only: xrayAvailable already guarantees the registry
-            // has a real, resolvable descriptor for targetKind at this point.
-            is TransportOrchestrator.Resolution.NotSelectable -> Unit
+            // Defensive only: callers already require targetKind AVAILABLE
+            // in this attempt's registry.
+            is TransportOrchestrator.Resolution.NotSelectable -> false
         }
     }
 
@@ -4850,6 +4867,24 @@ class MainViewModel(
                     attemptCombined(autoContext.combinedAttempts, autoContext.combinedAttemptedKeys)
                     return@collect
                 }
+                // A failed Direct REALITY attempt gets one TLS_TCP attempt on
+                // the same gateway (see RealityTlsFailoverPolicy). Checked
+                // before the AWG -> Xray branch, which never applies to an
+                // initial XRAY_REALITY attempt.
+                val tlsFallbackEligible = net.pocvpn.client.smartconnect.RealityTlsFailoverPolicy.isEligibleForTlsFallback(
+                    initialKind = attempt.initialKind,
+                    preference = attempt.preference,
+                    realityState = state,
+                    realityError = diagnosticsStore.snapshot.value.lastError,
+                    tlsAvailable = attempt.registry.descriptorFor(TransportKind.TLS_TCP)?.status == TransportStatus.AVAILABLE,
+                )
+                if (tlsFallbackEligible) {
+                    pendingFailoverAttempt = null
+                    switchToFallbackKind(attempt.orchestrator, attempt.endpointId, TransportKind.TLS_TCP)
+                    failoverObserverJob?.cancel()
+                    failoverObserverJob = null
+                    return@collect
+                }
                 // B66.18 - decide WHICH Xray kind to fail over to BEFORE
                 // gating eligibility on it, so a genuinely UDP/AWG-filtered
                 // network with a real Direct EXIT XHTTP profile (and no
@@ -4908,7 +4943,7 @@ class MainViewModel(
                 )
                 if (!eligible) return@collect
                 pendingFailoverAttempt = null
-                maybeFailoverToXray(
+                val switched = maybeFailoverToXray(
                     initialKind = attempt.initialKind,
                     preference = attempt.preference,
                     registry = attempt.registry,
@@ -4918,6 +4953,21 @@ class MainViewModel(
                 )
                 failoverObserverJob?.cancel()
                 failoverObserverJob = null
+                // The REALITY attempt AWG just fell back to gets its own
+                // one-shot watch, so it can still take the REALITY -> TLS_TCP
+                // hop above. The chain ends at AWG -> REALITY -> TLS_TCP:
+                // an initial XRAY_REALITY never re-enters the AWG branch.
+                if (switched && xrayTarget == TransportKind.XRAY_REALITY) {
+                    val realityAttempt = PendingFailoverAttempt(
+                        initialKind = TransportKind.XRAY_REALITY,
+                        preference = attempt.preference,
+                        registry = attempt.registry,
+                        orchestrator = attempt.orchestrator,
+                        endpointId = attempt.endpointId,
+                    )
+                    pendingFailoverAttempt = realityAttempt
+                    armFailoverWatch(realityAttempt)
+                }
             }
         }
     }
