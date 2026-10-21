@@ -148,13 +148,14 @@ jobs:
           report "$AWG_AAR" "$AWG_AAR_LOCAL_SHA256"
           report "$XRAY_AAR" "$XRAY_AAR_LOCAL_SHA256"
 
+      # android/gradlew is committed without the executable bit (mode 100644).
       - name: Run unit tests
         working-directory: android
-        run: ./gradlew :app:testDebugUnitTest --no-daemon
+        run: bash ./gradlew :app:testDebugUnitTest --no-daemon
 
       - name: Assemble debug APK
         working-directory: android
-        run: ./gradlew :app:assembleDebug --no-daemon
+        run: bash ./gradlew :app:assembleDebug --no-daemon
 
       - name: Upload native AARs
         if: success()
