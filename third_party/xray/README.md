@@ -18,6 +18,13 @@ No generated binary (`.aar`) is committed here, matching this repo's existing
 `.gitignore` policy for `android/**/libs/` - the built artifact is copied into
 `android/app/libs/` locally, exactly like the AmneziaWG AAR already is.
 
+Reference build: `.github/workflows/android-ci.yml` builds this AAR with the
+same script and fails unless its SHA-256 equals `XRAY_AAR_SHA256` there.
+Gomobile's Go build info embeds the absolute `go mod edit -replace` paths, so a
+WSL build under `~/build` gets a different hash with the same Go code. For a
+local AAR that matches the reference, download the `android-native-aars`
+artifact from a green `android-ci` run on `main`.
+
 ## Why Xray-core (not sing-box), briefly
 
 sing-box/libbox has a more turnkey Android TUN-integration story (a

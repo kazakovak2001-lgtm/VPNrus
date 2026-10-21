@@ -30,10 +30,12 @@ env:
   XRAY_GO_VERSION: '1.26.0'
   AWG_AAR: android/app/libs/amneziawg-tunnel-v3.1.20260814-debug.aar
   XRAY_AAR: android/app/libs/libv2ray-androidlibxraylite-c634d1b-nova-b35xhttp1.aar
-  # SHA-256 of the AARs currently used for local/device builds. Compared and
-  # reported below; a mismatch is a warning until CI reproducibility is proven.
-  AWG_AAR_LOCAL_SHA256: 2d5a241094bca8943eecadce746d77b51a335cf5adbc5f916767e20829165ee5
-  XRAY_AAR_LOCAL_SHA256: 078578b99aa419d197fda35474ef49742329b8762f3073e40d1c0f54a2149084
+  # Reference SHA-256 of the pinned AARs; a mismatch fails the job. AWG matches
+  # the WSL build bit for bit. Xray is the CI build (identical across runs): its
+  # Go build info embeds the absolute go.mod replace paths, so builds from other
+  # roots differ. A deliberate pin/script/toolchain bump must update these.
+  AWG_AAR_SHA256: 2d5a241094bca8943eecadce746d77b51a335cf5adbc5f916767e20829165ee5
+  XRAY_AAR_SHA256: 832dc038e3e8c50c91d9be6a8a6d9867075a6ded3b61129089257ab47a1ed28d
 
 jobs:
   android-build:
@@ -132,21 +134,24 @@ jobs:
 
           {
             echo "### Native AARs (cache hit: ${{ steps.native-cache.outputs.cache-hit == 'true' }})"
-            echo '| AAR | CI SHA-256 | local SHA-256 | match |'
+            echo '| AAR | built SHA-256 | reference SHA-256 | match |'
             echo '|---|---|---|---|'
           } >> "$GITHUB_STEP_SUMMARY"
+          mismatch=0
           report() {
             local aar="$1" expected="$2" actual
             actual=$(sha256sum "$aar" | cut -d' ' -f1)
             local match=yes
             if [[ "$actual" != "$expected" ]]; then
               match=no
-              echo "::warning::$aar SHA-256 $actual differs from the local build $expected"
+              mismatch=1
+              echo "::error::$aar SHA-256 $actual differs from the reference $expected"
             fi
             echo "| $(basename "$aar") | \`$actual\` | \`$expected\` | $match |" >> "$GITHUB_STEP_SUMMARY"
           }
-          report "$AWG_AAR" "$AWG_AAR_LOCAL_SHA256"
-          report "$XRAY_AAR" "$XRAY_AAR_LOCAL_SHA256"
+          report "$AWG_AAR" "$AWG_AAR_SHA256"
+          report "$XRAY_AAR" "$XRAY_AAR_SHA256"
+          exit "$mismatch"
 
       # Uploaded before the Gradle steps so the AARs stay inspectable if tests fail.
       - name: Upload native AARs
