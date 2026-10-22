@@ -30,12 +30,49 @@ import javax.net.ssl.HttpsURLConnection
  * B54 Scope A - what kind of exception ended a probe, decided by exception
  * TYPE (never by message text). Null when the probe did not throw.
  */
-enum class ProbeFailureKind { TIMEOUT, UNKNOWN_HOST, OTHER }
+enum class ProbeFailureKind {
+    TIMEOUT,
+    UNKNOWN_HOST,
 
-internal fun failureKindOf(e: Throwable): ProbeFailureKind = when (e) {
-    is SocketTimeoutException -> ProbeFailureKind.TIMEOUT
-    is java.net.UnknownHostException -> ProbeFailureKind.UNKNOWN_HOST
+    /** R1-S2 - a TLS-layer failure (certificate validation included); validation is never relaxed to avoid it. */
+    TLS,
+
+    /**
+     * R1-S2 - the OS refused the connect with ENETUNREACH/EHOSTUNREACH,
+     * read from the errno carried in the exception's cause chain. Never
+     * inferred from message text; absent when the platform attaches no errno.
+     */
+    NO_ROUTE,
+    OTHER,
+}
+
+/** The OS error numbers that mean "no route to the network/host", from the platform constants. */
+private fun platformNoRouteErrnos(): Set<Int> =
+    setOf(android.system.OsConstants.ENETUNREACH, android.system.OsConstants.EHOSTUNREACH)
+
+private fun platformErrnoOf(t: Throwable): Int? = (t as? android.system.ErrnoException)?.errno
+
+internal fun failureKindOf(
+    e: Throwable,
+    errnoOf: (Throwable) -> Int? = ::platformErrnoOf,
+    noRouteErrnos: () -> Set<Int> = ::platformNoRouteErrnos,
+): ProbeFailureKind = when {
+    e is SocketTimeoutException -> ProbeFailureKind.TIMEOUT
+    e is java.net.UnknownHostException -> ProbeFailureKind.UNKNOWN_HOST
+    causeChain(e).any { it is javax.net.ssl.SSLException } -> ProbeFailureKind.TLS
+    causeChain(e).any { t -> errnoOf(t)?.let { it in noRouteErrnos() } == true } -> ProbeFailureKind.NO_ROUTE
     else -> ProbeFailureKind.OTHER
+}
+
+/** [e] and its causes, bounded so a cyclic chain cannot loop. */
+private fun causeChain(e: Throwable): List<Throwable> {
+    val out = ArrayList<Throwable>(4)
+    var cur: Throwable? = e
+    while (cur != null && out.size < 6 && out.none { it === cur }) {
+        out += cur
+        cur = cur.cause
+    }
+    return out
 }
 
 data class DnsProbeResult(

@@ -634,4 +634,118 @@ class FieldTestRunnerTest {
         assertEquals(FieldRunOutcome.EXIT_MISMATCH, byLabel.getValue("STOCKHOLM / AMNEZIA_WG").outcome)
         assertEquals("152.70.43.1", byLabel.getValue("STOCKHOLM / AMNEZIA_WG").exitIp)
     }
+
+    // --- R1-S2: reachability, tunnel path and egress are separate verdicts ---
+
+    private fun FieldTestReport.runByLabel(label: String) = runs.first { it.target.label == label }
+
+    @Test
+    fun `an in-tunnel run compares the exit with the physical address read before connecting`() = runTest {
+        val v = runner(FakeHost()).run { }.runByLabel("GERMANY / AMNEZIA_WG").pathVerdict!!
+        assertEquals(ReachabilityResult.REACHABLE, v.reachability)
+        assertEquals(TunnelPathResult.CONFIRMED, v.tunnelPath)
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, v.egress)
+        assertEquals(PathEvidence.SOCKET_BOUND_AND_EGRESS_DIFFERS, v.evidence)
+        assertEquals(SessionValidity.STABLE, v.session)
+    }
+
+    @Test
+    fun `the path verdict is serialized as names and the physical address never reaches the report`() = runTest {
+        val json = runner(FakeHost()).run { }.toJson()
+        val runs = json.getJSONArray("runs")
+        val awg = (0 until runs.length()).map { runs.getJSONObject(it) }.first { it.getString("label") == "GERMANY / AMNEZIA_WG" }
+        val verdict = awg.getJSONObject("pathVerdict")
+        assertEquals("CONFIRMED", verdict.getString("tunnelPath"))
+        assertEquals("DIFFERS_FROM_PHYSICAL", verdict.getString("egress"))
+        assertFalse(json.toString().contains("198.51.100.7"))
+        val skipped = (0 until runs.length()).map { runs.getJSONObject(it) }.first { it.getString("outcome") == "SKIPPED" }
+        assertTrue(skipped.isNull("pathVerdict"))
+    }
+
+    @Test
+    fun `without an independent physical address HTTPS works but the egress stays inconclusive`() = runTest {
+        val host = FakeHost()
+        val base = fakeProbes(host)
+        // The direct trace (VPN off) fails; every in-tunnel probe still answers.
+        val probes = FieldProbeSet(
+            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks,
+            https = { label, url, network, maxBytes, parseTrace ->
+                if (parseTrace && host.transportState.value !is TransportState.Connected) {
+                    HttpProbeResult(label, url, false, null, 1, null, 0, null, false, "IOException: down")
+                } else {
+                    base.https(label, url, network, maxBytes, parseTrace)
+                }
+            },
+        )
+        val run = runner(host, probes).run { }.runByLabel("GERMANY / AMNEZIA_WG")
+        // The data plane answered - that is a different fact from a verified egress.
+        assertEquals(FieldRunOutcome.DATA_PLANE_OK, run.outcome)
+        val v = run.pathVerdict!!
+        assertEquals(ReachabilityResult.REACHABLE, v.reachability)
+        assertEquals(TunnelPathResult.INCONCLUSIVE, v.tunnelPath)
+        assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+        assertEquals(PathReason.NO_REFERENCE, v.egressReason)
+    }
+
+    @Test
+    fun `a transport change during the probes voids the results`() = runTest {
+        val host = FakeHost()
+        host.beforeInTunnelProbe = { label, url ->
+            if (label == "GERMANY / AMNEZIA_WG" && url == FieldTestTargets.BULK_TUNNEL) host.currentTransportKind.value = TransportKind.XRAY_REALITY
+        }
+        val run = runner(host).run { }.runByLabel("GERMANY / AMNEZIA_WG")
+        assertEquals(FieldRunOutcome.MEASUREMENT_INVALIDATED, run.outcome)
+        assertNull(run.exitIp)
+        assertEquals(false, run.probeContext!!.sessionStable)
+        val v = run.pathVerdict!!
+        assertEquals(SessionValidity.CHANGED, v.session)
+        assertEquals(PathReason.SESSION_CHANGED, v.egressReason)
+        assertEquals(TunnelPathResult.INCONCLUSIVE, v.tunnelPath)
+        assertEquals(ReachabilityResult.INCONCLUSIVE, v.reachability)
+    }
+
+    @Test
+    fun `a session that drops while probing voids the path verdict as well`() = runTest {
+        val host = FakeHost()
+        host.beforeInTunnelProbe = { label, url ->
+            if (label == "STOCKHOLM / AMNEZIA_WG" && url == FieldTestTargets.BULK_TUNNEL) host.vpnHandle = 2L
+        }
+        val v = runner(host).run { }.runByLabel("STOCKHOLM / AMNEZIA_WG").pathVerdict!!
+        assertEquals(PathReason.SESSION_CHANGED, v.tunnelReason)
+        assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+    }
+
+    @Test
+    fun `an Xray core run claims reachability only`() = runTest {
+        val v = runner(FakeHost()).run { }.runByLabel("GERMANY / XRAY_REALITY").pathVerdict!!
+        assertEquals(ReachabilityResult.REACHABLE, v.reachability)
+        assertEquals(ReachabilityVia.XRAY_CORE_OUTBOUND, v.reachabilityVia)
+        assertEquals(TunnelPathResult.INCONCLUSIVE, v.tunnelPath)
+        assertEquals(PathReason.CORE_MEASUREMENT_ONLY, v.tunnelReason)
+        assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+    }
+
+    @Test
+    fun `a VPN that excludes the app cannot confirm its own path`() = runTest {
+        val v = runner(FakeHost()).run { }.runByLabel("STOCKHOLM / HYSTERIA2").pathVerdict!!
+        assertEquals(PathReason.APP_EXCLUDED, v.reachabilityReason)
+        assertEquals(TunnelPathResult.INCONCLUSIVE, v.tunnelPath)
+        assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+    }
+
+    @Test
+    fun `no VPN network means no path verdict beyond not-bound`() = runTest {
+        val host = FakeHost()
+        host.vpnVisible = false
+        val v = runner(host).run { }.runByLabel("GERMANY / AMNEZIA_WG").pathVerdict!!
+        assertEquals(PathReason.NOT_VPN_BOUND, v.reachabilityReason)
+        assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+    }
+
+    @Test
+    fun `a run that never connected carries no path verdict`() = runTest {
+        val run = runner(FakeHost()).run { }.runByLabel("GERMANY / TLS_TCP")
+        assertEquals(FieldRunOutcome.CONNECT_FAILED, run.outcome)
+        assertNull(run.pathVerdict)
+    }
 }

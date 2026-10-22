@@ -99,13 +99,19 @@ object LeakChecks {
         baselineHasGlobalIpv6 == false -> LeakCheck(LeakCheckResult.NOT_RUN, LeakCheckReason.NO_IPV6_ON_NETWORK)
         probe == null -> LeakCheck(LeakCheckResult.NOT_RUN, null)
         probe.httpStatus != null -> LeakCheck(LeakCheckResult.INCONCLUSIVE, LeakCheckReason.EGRESS_NOT_VERIFIED)
+        // R1-S2 - the one concrete "blocked locally" proof: the OS refused the IPv6 connect with a
+        // no-route errno, on a network that was known to have global IPv6. A timeout, a lookup
+        // failure, a TLS failure or a refusal without an errno prove nothing of the kind.
+        probe.failureKind == ProbeFailureKind.NO_ROUTE && baselineHasGlobalIpv6 == true ->
+            LeakCheck(LeakCheckResult.NO_LEAK_DETECTED, LeakCheckReason.ROUTE_UNREACHABLE)
         else -> LeakCheck(LeakCheckResult.INCONCLUSIVE, reasonFor(probe.failureKind))
     }
 
     private fun reasonFor(kind: ProbeFailureKind?): LeakCheckReason = when (kind) {
         ProbeFailureKind.TIMEOUT -> LeakCheckReason.TIMEOUT
         ProbeFailureKind.UNKNOWN_HOST -> LeakCheckReason.LOOKUP_FAILED
-        ProbeFailureKind.OTHER, null -> LeakCheckReason.REQUEST_FAILED
+        ProbeFailureKind.NO_ROUTE -> LeakCheckReason.ROUTE_UNREACHABLE
+        ProbeFailureKind.TLS, ProbeFailureKind.OTHER, null -> LeakCheckReason.REQUEST_FAILED
     }
 
     /**
@@ -186,6 +192,9 @@ enum class LeakCheckReason {
 
     /** The request got an answer, but the address it reached was not read or checked. */
     EGRESS_NOT_VERIFIED,
+
+    /** R1-S2 - the OS refused the connect with a no-route errno (read from the exception's errno, not its text). */
+    ROUTE_UNREACHABLE,
 }
 
 data class LeakCheck(val result: LeakCheckResult, val reason: LeakCheckReason?)

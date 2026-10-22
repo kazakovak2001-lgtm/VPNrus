@@ -88,6 +88,11 @@ data class FieldTransportRun(
     val coreMeasurements: List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? = null,
     /** B54 Scope B - where this run's in-tunnel probes were bound and whether they still count. Null when none ran. */
     val probeContext: ProbeContext? = null,
+    /**
+     * R1-S2 - reachability, tunnel path and egress judged separately (see [PathVerification]).
+     * Null when the run never connected. Holds names only, never an address.
+     */
+    val pathVerdict: PathVerdict? = null,
 )
 
 /** B54 Scope B - the network an in-tunnel probe was sent on. */
@@ -336,6 +341,7 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("probeContext", probeContext?.let {
         JSONObject().put("binding", it.binding.name).put("sessionStable", it.sessionStable ?: JSONObject.NULL).put("invalidated", it.invalidated)
     } ?: JSONObject.NULL)
+    .put("pathVerdict", pathVerdict?.toJson() ?: JSONObject.NULL)
 
 internal fun DnsProbeResult.toJson(): JSONObject = JSONObject()
     .put("host", host).put("ok", ok).put("addresses", JSONArray(addresses))
