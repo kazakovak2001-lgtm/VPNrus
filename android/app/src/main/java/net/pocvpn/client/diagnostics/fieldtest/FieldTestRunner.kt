@@ -494,9 +494,12 @@ class FieldTestRunner(
         FieldTestTargets.DIRECT_HTTP.forEach { (label, url) -> http += probes.https(label, url, null, 64 * 1024, false) }
         // The device's own public IP is deliberately dropped from the REPORT; loc/colo say which
         // country/edge saw us. R1-S2: it is first kept in memory as the independent physical
-        // reference the in-tunnel egress is compared with - the VPN is confirmed Disconnected here.
+        // reference the in-tunnel egress is compared with, only while confirmed Disconnected.
+        val disconnectedBeforeTrace = host.transportState.value is TransportState.Disconnected
         val directTrace = probes.https("Cloudflare trace", FieldTestTargets.CLOUDFLARE_TRACE, null, 4 * 1024, true)
-        physicalReference = directTrace.takeIf { it.httpStatus != null }?.trace?.get("ip")
+        physicalReference = directTrace.takeIf {
+            disconnectedBeforeTrace && host.transportState.value is TransportState.Disconnected && it.httpStatus != null
+        }?.trace?.get("ip")
             ?.let { PhysicalReference(it, clock()) }
         http += directTrace.copy(trace = directTrace.trace - "ip")
         http += probes.https("Cloudflare 256KB (throttling check)", FieldTestTargets.BULK_DIRECT, null, 262_144, false)
@@ -612,16 +615,20 @@ class FieldTestRunner(
         // B54 Scope B - the one VPN network every VPN-bound probe of this run uses.
         var bound: VpnProbeBinding? = null
         var probeContext: ProbeContext? = null
-        // R1-S2 - the transport the probes were bound under; a different one at the end voids them.
+        // R1-S2 - the transport measured; a different one at the end voids the results.
         var kindAtBind: TransportKind? = null
         var pathVerdict: PathVerdict? = null
         // B54 Scope B - set when the session leaves Connected at any point while the
-        // VPN-bound probes run (a drop that recovers on the same network included).
+        // probes run (a drop that recovers on the same network included).
         var leftConnectedDuringProbes = false
         var sessionWatcher: kotlinx.coroutines.Job? = null
         val coreMeasured = connected && host.currentTransportKind.value in XRAY_FAMILY
         coroutineScope {
             if (coreMeasured) {
+                kindAtBind = host.currentTransportKind.value
+                sessionWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                    host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                }
                 health = withTimeoutOrNull(timings.healthGraceMs) {
                     host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
                 } ?: host.sessionHealth.value
@@ -632,15 +639,19 @@ class FieldTestRunner(
                 core = host.measureViaXrayCore(urls)
                 notes += "app is excluded from the Xray tunnel by design; data plane measured by the Xray core (latency only - no bulk download, exit IP or leak check)"
                 if (core == null) notes += "the Xray process did not answer the measurement request"
-                probeContext = ProbeContext(ProbeBinding.XRAY_OUTBOUND, sessionStable = null, invalidated = false)
                 delay(timings.stabilityHoldMs)
                 host.measureViaXrayCore(listOf(FieldTestTargets.CONNECTIVITY_204))?.let { later -> core = core.orEmpty() + later.map { it.copy(url = it.url + " (after hold)") } }
+                val stable = !leftConnectedDuringProbes &&
+                    host.transportState.value is TransportState.Connected &&
+                    host.currentTransportKind.value == kindAtBind
+                probeContext = ProbeContext(ProbeBinding.XRAY_OUTBOUND, sessionStable = stable, invalidated = !stable)
                 // R1-S2 - the core measures through its OWN outbound, not through the TUN: it can
                 // show reachability, never which path an app packet takes or what its egress is.
                 pathVerdict = PathVerification.evaluate(
                     PathInput(
                         via = ReachabilityVia.XRAY_CORE_OUTBOUND, probe = null, coreAnyOk = core?.any { it.ok },
                         reference = physicalReference, nowEpochMillis = clock(),
+                        session = if (stable) SessionValidity.STABLE else SessionValidity.CHANGED,
                     ),
                 )
             } else if (connected) {

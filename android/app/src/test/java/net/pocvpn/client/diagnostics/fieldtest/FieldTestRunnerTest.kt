@@ -688,6 +688,42 @@ class FieldTestRunnerTest {
     }
 
     @Test
+    fun `a disconnect that leaves the transport connected cannot supply a physical reference`() = runTest {
+        val host = object : FakeHost() {
+            override fun disconnect() { }
+        }
+        host.transportState.value = TransportState.Connected
+        val v = runner(host).run { }.runByLabel("GERMANY / AMNEZIA_WG").pathVerdict!!
+        assertEquals(ReachabilityResult.REACHABLE, v.reachability)
+        assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+        assertEquals(PathReason.NO_REFERENCE, v.egressReason)
+    }
+
+    @Test
+    fun `the physical trace requires Disconnected both before and after the request`() = runTest {
+        for (disconnectedBefore in listOf(false, true)) {
+            val host = object : FakeHost() {
+                override fun disconnect() { }
+            }
+            host.transportState.value = if (disconnectedBefore) TransportState.Disconnected else TransportState.Reconnecting(1)
+            val base = fakeProbes(host)
+            val probes = FieldProbeSet(
+                dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks,
+                https = { label, url, network, maxBytes, parseTrace ->
+                    val result = base.https(label, url, network, maxBytes, parseTrace)
+                    if (label == "Cloudflare trace") {
+                        host.transportState.value = if (disconnectedBefore) TransportState.Reconnecting(1) else TransportState.Disconnected
+                    }
+                    result
+                },
+            )
+            val v = runner(host, probes).run { }.runByLabel("GERMANY / AMNEZIA_WG").pathVerdict!!
+            assertEquals(PathReason.NO_REFERENCE, v.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+        }
+    }
+
+    @Test
     fun `a transport change during the probes voids the results`() = runTest {
         val host = FakeHost()
         host.beforeInTunnelProbe = { label, url ->
@@ -723,6 +759,72 @@ class FieldTestRunnerTest {
         assertEquals(TunnelPathResult.INCONCLUSIVE, v.tunnelPath)
         assertEquals(PathReason.CORE_MEASUREMENT_ONLY, v.tunnelReason)
         assertEquals(EgressResult.INCONCLUSIVE, v.egress)
+        assertEquals(SessionValidity.STABLE, v.session)
+    }
+
+    private fun assertCoreSessionChanged(run: FieldTransportRun) {
+        assertTrue(run.coreMeasurements!!.any { it.ok })
+        assertEquals(ProbeContext(ProbeBinding.XRAY_OUTBOUND, sessionStable = false, invalidated = true), run.probeContext)
+        val v = run.pathVerdict!!
+        assertEquals(SessionValidity.CHANGED, v.session)
+        assertEquals(ReachabilityResult.INCONCLUSIVE, v.reachability)
+        assertEquals(PathReason.SESSION_CHANGED, v.reachabilityReason)
+        assertEquals(PathReason.SESSION_CHANGED, v.tunnelReason)
+        assertEquals(PathReason.SESSION_CHANGED, v.egressReason)
+    }
+
+    @Test
+    fun `an Xray core session that drops and recovers during measurement is invalidated`() = runTest {
+        val host = object : FakeHost() {
+            override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
+                val result = super.measureViaXrayCore(urls)
+                transportState.value = TransportState.Reconnecting(1)
+                kotlinx.coroutines.delay(1)
+                transportState.value = TransportState.Connected
+                return result
+            }
+        }
+        assertCoreSessionChanged(runner(host).run { }.runByLabel("GERMANY / XRAY_REALITY"))
+    }
+
+    @Test
+    fun `an Xray core session that drops during the hold is invalidated`() = runTest {
+        val host = object : FakeHost() {
+            override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
+                if (urls.size > 1) launch {
+                    kotlinx.coroutines.delay(1)
+                    transportState.value = TransportState.Reconnecting(1)
+                    kotlinx.coroutines.delay(1)
+                    transportState.value = TransportState.Connected
+                }
+                return super.measureViaXrayCore(urls)
+            }
+        }
+        assertCoreSessionChanged(runner(host).run { }.runByLabel("GERMANY / XRAY_REALITY"))
+    }
+
+    @Test
+    fun `an Xray core session disconnected at evaluation is invalidated`() = runTest {
+        val host = object : FakeHost() {
+            override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
+                val result = super.measureViaXrayCore(urls)
+                if (urls.size == 1) transportState.value = TransportState.Disconnected
+                return result
+            }
+        }
+        assertCoreSessionChanged(runner(host).run { }.runByLabel("GERMANY / XRAY_REALITY"))
+    }
+
+    @Test
+    fun `a transport change during Xray core measurements invalidates the verdict`() = runTest {
+        val host = object : FakeHost() {
+            override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
+                val result = super.measureViaXrayCore(urls)
+                currentTransportKind.value = TransportKind.XRAY_XHTTP
+                return result
+            }
+        }
+        assertCoreSessionChanged(runner(host).run { }.runByLabel("GERMANY / XRAY_REALITY"))
     }
 
     @Test
