@@ -201,13 +201,15 @@ object PathVerification {
         if (age < 0 || age > MAX_REFERENCE_AGE_MS) return withheld(PathReason.REFERENCE_STALE)
         val observed = input.observedExitIp ?: return withheld(PathReason.NO_OBSERVED_IP)
 
-        val referenceFamily = familyOf(reference.ip)
-        val observedFamily = familyOf(observed)
-        if (referenceFamily == Family.INVALID) return withheld(PathReason.REFERENCE_INVALID)
-        if (observedFamily == Family.INVALID) return withheld(PathReason.OBSERVED_INVALID)
-        if (referenceFamily != observedFamily) return withheld(PathReason.FAMILY_MISMATCH)
+        // Canonicalize to validated binary content BEFORE comparing. The same
+        // address can arrive as different text (compressed vs. full IPv6, mixed
+        // case, an IPv4-mapped tail) and must never be reported as a difference;
+        // conversely an ambiguous or invalid literal is never silently accepted.
+        val referenceBytes = canonicalBytes(reference.ip) ?: return withheld(PathReason.REFERENCE_INVALID)
+        val observedBytes = canonicalBytes(observed) ?: return withheld(PathReason.OBSERVED_INVALID)
+        if (referenceBytes.size != observedBytes.size) return withheld(PathReason.FAMILY_MISMATCH)
 
-        return if (normalize(reference.ip) == normalize(observed)) {
+        return if (referenceBytes.contentEquals(observedBytes)) {
             PathVerdict(
                 reach, null, ReachabilityVia.VPN_BOUND_SOCKET,
                 TunnelPathResult.VIOLATED, null, PathEvidence.EGRESS_SAME_AS_PHYSICAL,
@@ -236,26 +238,107 @@ object PathVerification {
         else -> ReachabilityResult.INCONCLUSIVE to PathReason.REQUEST_FAILED
     }
 
-    private enum class Family { V4, V6, INVALID }
-
-    private val IPV4 = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
-
-    /** Text-only classification: no resolver is involved, so a literal can never trigger a lookup. */
-    private fun familyOf(ip: String): Family {
+    /**
+     * Validated binary content of an IP literal, or null when the literal is
+     * malformed, ambiguous, or in a reserved range. Text-only classification is
+     * not enough: the same address can arrive as different text (compressed
+     * vs. full IPv6, mixed case, an IPv4-mapped tail) and must never be
+     * reported as a difference, while an ambiguous literal is never silently
+     * accepted.
+     *
+     * No DNS lookup is performed: only IP literals are handled here.
+     */
+    private fun canonicalBytes(ip: String): ByteArray? {
         val v4 = IPV4.matchEntire(ip)
         if (v4 != null) {
             val o = v4.groupValues.drop(1).map { it.toInt() }
-            return if (o.all { it in 0..255 } && !isReservedV4(o)) Family.V4 else Family.INVALID
+            if (!o.all { it in 0..255 }) return null
+            if (isReservedV4(o)) return null
+            return byteArrayOf(o[0].toByte(), o[1].toByte(), o[2].toByte(), o[3].toByte())
         }
-        // A public IPv6 address always has at least two colons and only hex digits and colons.
-        return if (ip.count { it == ':' } >= 2 && ip.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' } && !isReservedV6(ip)) {
-            Family.V6
-        } else {
-            Family.INVALID
-        }
+        return canonicalV6(ip)
     }
 
-    private fun normalize(ip: String): String = ip.lowercase()
+    /** 16-byte canonical IPv6 content, or null when the literal is not a valid public IPv6 address. */
+    private fun canonicalV6(ip: String): ByteArray? {
+        val bytes = parseV6(ip) ?: return null
+        if (isReservedV6(bytes)) return null
+        return bytes
+    }
+
+    /**
+     * Parses an IPv6 literal into 16 bytes, or returns null when it is malformed.
+     * Handles the full form, the compressed form, and the embedded-IPv4 tail
+     * (`::ffff:192.0.2.1`). Leading zeros in an IPv4 octet are rejected: they
+     * are ambiguous in some contexts and are not a defined canonical form.
+     */
+    private fun parseV6(ip: String): ByteArray? {
+        if (ip.count { it == ':' } < 2) return null
+        if (ip.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' && it != ':' && it != '.' }) return null
+
+        val lower = ip.lowercase()
+        if (lower.count { it == ':' } > 7) return null
+        if (lower.startsWith("::ffff:")) {
+            val tail = lower.removePrefix("::ffff:")
+            val v4 = IPV4.matchEntire(tail)
+            if (v4 != null) {
+                val o = v4.groupValues.drop(1).map { it.toInt() }
+                if (!o.all { it in 0..255 }) return null
+                // The embedded IPv4 is still subject to the same reserved-range
+                // policy as a bare IPv4 literal: a private, loopback or
+                // unspecified tail must not be accepted just because it was
+                // written inside an IPv6 wrapper.
+                if (isReservedV4(o)) return null
+                // An IPv4-mapped address is 0:0:0:0:0:ffff:a.b.c.d - the two bytes
+                // before the embedded IPv4 must be 0xff,0xff. Anything else is not
+                // a mapped address and is rejected here rather than silently kept.
+                return byteArrayOf(
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1,
+                    o[0].toByte(), o[1].toByte(), o[2].toByte(), o[3].toByte(),
+                )
+            }
+            return null
+        }
+
+        val parts = lower.split(':')
+        if (parts.size > 8) return null
+        val out = ByteArray(16)
+        var idx = 0
+        var seenEmpty = false
+        for (part in parts) {
+            if (part.isEmpty()) {
+                if (seenEmpty) return null // more than one compression point
+                seenEmpty = true
+                continue
+            }
+            if (part.length > 4) return null
+            val value = part.toIntOrNull(16) ?: return null
+            if (value !in 0..0xFFFF) return null
+            out[idx++] = (value shr 8).toByte()
+            out[idx++] = (value and 0xFF).toByte()
+        }
+        if (idx > 16) return null
+        if (!seenEmpty && idx != 16) return null
+        return out
+    }
+
+    /** 16-byte canonical IPv6 content, or null when the literal is not a valid public IPv6 address. */
+    private fun isReservedV6(bytes: ByteArray): Boolean = when (bytes[0].toInt() and 0xFF) {
+        0x00 -> {
+            // :: (unspecified) and ::1 (loopback): the leading 15 bytes are zero,
+            // regardless of how the literal was written. The byte check works on
+            // content, so the compressed form, the full form and any mix of the
+            // two are all caught here.
+            val leadingZeros = (0 until 15).all { bytes[it].toInt() and 0xFF == 0 }
+            leadingZeros && (bytes[15].toInt() and 0xFF) <= 0x01
+        }
+        0xfe -> (bytes[1].toInt() and 0xC0) == 0x80 // fe80:: link-local
+        0xfc, 0xfd -> true // unique local
+        0xff -> true // multicast
+        else -> false
+    }
+
+    private val IPV4 = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
 
     /** Addresses a public echo service can never legitimately report. */
     private fun isReservedV4(o: List<Int>): Boolean = when {
@@ -265,10 +348,5 @@ object PathVerification {
         o[0] == 172 && o[1] in 16..31 -> true
         o[0] == 192 && o[1] == 168 -> true
         else -> false
-    }
-
-    private fun isReservedV6(ip: String): Boolean {
-        val s = ip.lowercase()
-        return s == "::" || s == "::1" || s.startsWith("fe80:") || s.startsWith("fc") || s.startsWith("fd") || s.startsWith("ff")
     }
 }

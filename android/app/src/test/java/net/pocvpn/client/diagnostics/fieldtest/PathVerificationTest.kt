@@ -263,4 +263,124 @@ class PathVerificationTest {
         val answered = HttpProbeResult("IPv6", LeakChecks.IPV6_ONLY_URL, true, 200, 5, null, 10, null, true, null)
         assertEquals(LeakCheckResult.INCONCLUSIVE, LeakChecks.classifyIpv6(true, answered).result)
     }
+
+    // --- canonicalization: the same address must never be reported as a difference ---
+
+    @Test fun `two textually different IPv6 forms of the same address are not a difference`() {
+        val full = "2a02:8308:010e:8400:d4b5:2f7f:019c:5d65"
+        val compressed = "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65"
+        val upper = "2A02:8308:10E:8400:D4B5:2F7F:19C:5D65"
+        val v1 = eval(input(reference = reference(full), observed = full))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v1.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v1.tunnelPath)
+        val v2 = eval(input(reference = reference(compressed), observed = upper))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v2.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v2.tunnelPath)
+        val v3 = eval(input(reference = reference(full), observed = compressed))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v3.egress)
+    }
+
+    @Test fun `two genuinely different public IPv6 addresses are a difference`() {
+        val a = "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65"
+        val b = "2606:4700:4700:1111::1111"
+        val v = eval(input(reference = reference(a), observed = b))
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, v.egress)
+        assertEquals(TunnelPathResult.CONFIRMED, v.tunnelPath)
+    }
+
+    @Test fun `mixed-case IPv6 forms compare by content, not text`() {
+        val v = eval(input(reference = reference("2A02:8308:10E:8400:D4B5:2F7F:19C:5D65"), observed = "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v.tunnelPath)
+    }
+
+    @Test fun `an IPv4-mapped IPv6 tail compares by content`() {
+        val mapped = "::ffff:198.51.100.7"
+        val v = eval(input(reference = reference(mapped), observed = "0:0:0:0:0:ffff:c633:6407"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v.tunnelPath)
+    }
+
+    // --- invalid and ambiguous literals are never silently accepted ---
+
+    @Test fun `an invalid IPv6 literal is invalid, never compared`() {
+        listOf(
+            "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65:1",
+            "2a02:8308:10e:::8400",
+            "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65g",
+            "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65:1:2",
+            ":::",
+            "2a02:8308:10e:8400:d4b5:2f7f:19c:5d65::",
+        ).forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+        }
+    }
+
+    @Test fun `an IPv4 literal with leading zeros is invalid, never silently compared`() {
+        listOf("0192.168.1.1", "192.168.001.1", "192.168.1.00", "00.0.0.1", "10.0.0.01").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+        }
+    }
+
+    @Test fun `an out-of-range IPv4 octet is invalid`() {
+        listOf("256.1.1.1", "1.300.1.1", "1.1.1.255.1").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+        }
+    }
+
+    @Test fun `link-local, multicast and loopback IPv6 are reserved`() {
+        listOf("fe80::1", "ff00::1", "::1").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+        }
+    }
+
+    // --- reserved ranges caught on byte content, not on one written form ---
+
+    @Test fun `unspecified IPv6 is reserved in every written form`() {
+        listOf("::", "0:0:0:0:0:0:0:0:0", "::0", "0::0").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+        }
+    }
+
+    @Test fun `an IPv4-mapped IPv6 tail with a reserved IPv4 is invalid`() {
+        listOf("::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:192.168.1.1").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+        }
+    }
+
+    @Test fun `a public IPv4-mapped IPv6 tail is still accepted`() {
+        val mapped = "::ffff:198.51.100.7"
+        val v = eval(input(reference = reference(mapped), observed = "0:0:0:0:0:ffff:c633:6407"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v.tunnelPath)
+    }
+
+    @Test fun `a normal IPv4 match and difference still work`() {
+        val same = eval(input(reference = reference("198.51.100.7"), observed = "198.51.100.7"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, same.egress)
+        assertEquals(TunnelPathResult.VIOLATED, same.tunnelPath)
+        val diff = eval(input(reference = reference("198.51.100.7"), observed = "152.70.43.1"))
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, diff.egress)
+        assertEquals(TunnelPathResult.CONFIRMED, diff.tunnelPath)
+    }
 }
