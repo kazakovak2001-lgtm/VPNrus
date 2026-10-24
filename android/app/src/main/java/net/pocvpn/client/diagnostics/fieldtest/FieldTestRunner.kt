@@ -621,13 +621,20 @@ class FieldTestRunner(
         // B54 Scope B - set when the session leaves Connected at any point while the
         // probes run (a drop that recovers on the same network included).
         var leftConnectedDuringProbes = false
+        // R1-S2 - set when transport kind changes during measurement, even if it later returns.
+        var transportKindChanged = false
         var sessionWatcher: kotlinx.coroutines.Job? = null
         val coreMeasured = connected && host.currentTransportKind.value in XRAY_FAMILY
         coroutineScope {
             if (coreMeasured) {
                 kindAtBind = host.currentTransportKind.value
                 sessionWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
-                    host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                    launch {
+                        host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                    }
+                    launch {
+                        host.currentTransportKind.collect { if (it != kindAtBind) transportKindChanged = true }
+                    }
                 }
                 health = withTimeoutOrNull(timings.healthGraceMs) {
                     host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
@@ -641,7 +648,7 @@ class FieldTestRunner(
                 if (core == null) notes += "the Xray process did not answer the measurement request"
                 delay(timings.stabilityHoldMs)
                 host.measureViaXrayCore(listOf(FieldTestTargets.CONNECTIVITY_204))?.let { later -> core = core.orEmpty() + later.map { it.copy(url = it.url + " (after hold)") } }
-                val stable = !leftConnectedDuringProbes &&
+                val stable = !leftConnectedDuringProbes && !transportKindChanged &&
                     host.transportState.value is TransportState.Connected &&
                     host.currentTransportKind.value == kindAtBind
                 probeContext = ProbeContext(ProbeBinding.XRAY_OUTBOUND, sessionStable = stable, invalidated = !stable)
@@ -666,7 +673,12 @@ class FieldTestRunner(
                     // Same observation pattern as the connect-phase watcher above: the
                     // controller's own state flow, read-only - no polling, no control.
                     sessionWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
-                        host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                        launch {
+                            host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                        }
+                        launch {
+                            host.currentTransportKind.collect { if (it != kindAtBind) transportKindChanged = true }
+                        }
                     }
                 }
                 if (bound == null) {
@@ -706,7 +718,7 @@ class FieldTestRunner(
                 // still Connected and still the same VPN network instance.
                 // R1-S2 - a different active transport at the end voids the results too: they
                 // must not be credited to a transport that was not the one measured.
-                val stable = !leftConnectedDuringProbes &&
+                val stable = !leftConnectedDuringProbes && !transportKindChanged &&
                     host.transportState.value is TransportState.Connected &&
                     host.vpnBinding()?.handle == boundForProbes.handle &&
                     host.currentTransportKind.value == kindAtBind

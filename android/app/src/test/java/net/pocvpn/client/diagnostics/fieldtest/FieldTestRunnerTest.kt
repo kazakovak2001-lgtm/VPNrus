@@ -741,6 +741,21 @@ class FieldTestRunnerTest {
     }
 
     @Test
+    fun `a VPN transport kind change that recovers during probes is still invalidated`() = runTest {
+        val host = FakeHost()
+        host.beforeInTunnelProbe = { label, url ->
+            if (label == "GERMANY / AMNEZIA_WG" && url == FieldTestTargets.BULK_TUNNEL) {
+                host.currentTransportKind.value = TransportKind.TLS_TCP
+                kotlinx.coroutines.delay(1)
+                host.currentTransportKind.value = TransportKind.HYSTERIA2
+            }
+        }
+        val v = runner(host).run { }.runByLabel("GERMANY / AMNEZIA_WG").pathVerdict!!
+        assertEquals(SessionValidity.CHANGED, v.session)
+        assertEquals(PathReason.SESSION_CHANGED, v.reachabilityReason)
+    }
+
+    @Test
     fun `a session that drops while probing voids the path verdict as well`() = runTest {
         val host = FakeHost()
         host.beforeInTunnelProbe = { label, url ->
@@ -760,6 +775,29 @@ class FieldTestRunnerTest {
         assertEquals(PathReason.CORE_MEASUREMENT_ONLY, v.tunnelReason)
         assertEquals(EgressResult.INCONCLUSIVE, v.egress)
         assertEquals(SessionValidity.STABLE, v.session)
+    }
+
+    @Test
+    fun `an Xray core run with a kind that changes and recovers is still invalidated`() = runTest {
+        val host = object : FakeHost() {
+            override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
+                val result = super.measureViaXrayCore(urls)
+                currentTransportKind.value = TransportKind.TLS_TCP
+                kotlinx.coroutines.delay(1)
+                currentTransportKind.value = TransportKind.XRAY_REALITY
+                return result
+            }
+        }
+        val v = runner(host).run { }.runByLabel("GERMANY / XRAY_REALITY").pathVerdict!!
+        assertEquals(SessionValidity.CHANGED, v.session)
+        assertEquals(PathReason.SESSION_CHANGED, v.reachabilityReason)
+    }
+
+    @Test
+    fun `a stable Xray core run keeps STABLE session validity`() = runTest {
+        val v = runner(FakeHost()).run { }.runByLabel("GERMANY / XRAY_REALITY").pathVerdict!!
+        assertEquals(SessionValidity.STABLE, v.session)
+    }
     }
 
     private fun assertCoreSessionChanged(run: FieldTransportRun) {
@@ -821,6 +859,20 @@ class FieldTestRunnerTest {
             override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
                 val result = super.measureViaXrayCore(urls)
                 currentTransportKind.value = TransportKind.XRAY_XHTTP
+                return result
+            }
+        }
+        assertCoreSessionChanged(runner(host).run { }.runByLabel("GERMANY / XRAY_REALITY"))
+    }
+
+    @Test
+    fun `an Xray core session that changes kind and recovers is still invalidated`() = runTest {
+        val host = object : FakeHost() {
+            override suspend fun measureViaXrayCore(urls: List<String>): List<net.pocvpn.client.vpn.xray.XrayProcessBridge.CoreMeasurement>? {
+                val result = super.measureViaXrayCore(urls)
+                currentTransportKind.value = TransportKind.TLS_TCP
+                kotlinx.coroutines.delay(1)
+                currentTransportKind.value = TransportKind.XRAY_REALITY
                 return result
             }
         }
