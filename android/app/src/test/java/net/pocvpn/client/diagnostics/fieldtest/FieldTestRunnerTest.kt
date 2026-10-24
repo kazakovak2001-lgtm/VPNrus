@@ -798,7 +798,6 @@ class FieldTestRunnerTest {
         val v = runner(FakeHost()).run { }.runByLabel("GERMANY / XRAY_REALITY").pathVerdict!!
         assertEquals(SessionValidity.STABLE, v.session)
     }
-    }
 
     private fun assertCoreSessionChanged(run: FieldTransportRun) {
         assertTrue(run.coreMeasurements!!.any { it.ok })

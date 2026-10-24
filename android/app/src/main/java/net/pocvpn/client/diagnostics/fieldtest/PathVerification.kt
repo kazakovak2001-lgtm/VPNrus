@@ -302,6 +302,14 @@ object PathVerification {
         // (e.g. ":::" or "a:::b"), is two compression points and invalid.
         val parts = lower.split(':')
         if (parts.size > 8) return null
+        // Solitary leading or trailing colon (e.g. ":1:2:3" or "1:2:3:") is invalid:
+        // it is neither a valid compression point nor a valid group separator.
+        if (parts.isNotEmpty() && parts[0].isEmpty() && parts.size > 1 && parts[1].isNotEmpty()) return null
+        if (parts.isNotEmpty() && parts.last().isEmpty() && parts.size > 1 && parts[parts.size - 2].isNotEmpty()) return null
+        // Solitary leading or trailing colon (e.g. ":1:2:3" or "1:2:3:") is invalid:
+        // it is neither a valid compression point nor a valid group separator.
+        if (parts.isNotEmpty() && parts[0].isEmpty() && parts.size > 1 && parts[1].isNotEmpty()) return null
+        if (parts.isNotEmpty() && parts.last().isEmpty() && parts.size > 1 && parts[parts.size - 2].isNotEmpty()) return null
         val allEmpty = parts.all { it.isEmpty() }
         if (!allEmpty) {
             var runLen = 0
@@ -365,7 +373,7 @@ object PathVerification {
                 // must not be accepted just because it was written inside an
                 // IPv6 wrapper, regardless of the wrapper's written form.
                 if (isReservedV4(o)) return null
-                if (idx + 2 > 16) return null
+                if (idx + 4 > 16) return null
                 out[idx++] = o[0].toByte()
                 out[idx++] = o[1].toByte()
                 out[idx++] = o[2].toByte()
