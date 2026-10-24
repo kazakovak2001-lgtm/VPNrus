@@ -271,6 +271,11 @@ object PathVerification {
      * Handles the full form, the compressed form, and the embedded-IPv4 tail
      * (`::ffff:192.0.2.1`). Leading zeros in an IPv4 octet are rejected: they
      * are ambiguous in some contexts and are not a defined canonical form.
+     *
+     * The `::` compression is expanded by counting existing groups, computing
+     * how many zero groups are needed to reach 16 total, and shifting existing
+     * groups to the right to make space. The resulting 16-byte output is always
+     * deterministic regardless of how the literal was written.
      */
     private fun parseV6(ip: String): ByteArray? {
         if (ip.count { it == ':' } < 2) return null
@@ -282,7 +287,14 @@ object PathVerification {
             val tail = lower.removePrefix("::ffff:")
             val v4 = IPV4.matchEntire(tail)
             if (v4 != null) {
-                val o = v4.groupValues.drop(1).map { it.toInt() }
+                // Capture original IPv4 octet strings for leading-zero validation
+                val rawOctetStrings = v4.groupValues.drop(1)
+                // Validate IPv4 octets for leading zeros: "0" is allowed,
+                // but "01", "002", etc. are invalid.
+                for (raw in rawOctetStrings) {
+                    if (!validateIPv4Octet(raw)) return null
+                }
+                val o = rawOctetStrings.map { it.toInt() }
                 if (!o.all { it in 0..255 }) return null
                 // The embedded IPv4 is still subject to the same reserved-range
                 // policy as a bare IPv4 literal: a private, loopback or
@@ -305,10 +317,13 @@ object PathVerification {
         val out = ByteArray(16)
         var idx = 0
         var seenEmpty = false
-        for (part in parts) {
+        var emptyIndex = 0
+        for (i in parts.indices) {
+            val part = parts[i]
             if (part.isEmpty()) {
                 if (seenEmpty) return null // more than one compression point
                 seenEmpty = true
+                emptyIndex = i
                 continue
             }
             if (part.length > 4) return null
@@ -319,6 +334,26 @@ object PathVerification {
         }
         if (idx > 16) return null
         if (!seenEmpty && idx != 16) return null
+        // Expand compression: fill zero groups at the empty position
+        if (seenEmpty) {
+            // Number of groups already filled = idx / 2
+            val groupsFilled = idx / 2
+            // Total IPv6 groups = 8, so zero groups needed = 8 - groupsFilled
+            val zeroGroupsNeeded = 8 - groupsFilled
+            // Calculate where to start inserting zero groups
+            // emptyIndex is the position of :: in the parts list
+            val insertPos = emptyIndex * 2
+            // Shift existing groups to the right to make space
+            for (i in (idx - 1) downTo insertPos) {
+                out[i + zeroGroupsNeeded * 2] = out[i]
+            }
+            // Fill zero groups with 0x00
+            for (g in 0 until zeroGroupsNeeded) {
+                out[insertPos + g * 2] = 0
+                out[insertPos + g * 2 + 1] = 0
+            }
+            idx += zeroGroupsNeeded * 2
+        }
         return out
     }
 
@@ -348,5 +383,22 @@ object PathVerification {
         o[0] == 172 && o[1] in 16..31 -> true
         o[0] == 192 && o[1] == 168 -> true
         else -> false
+    }
+
+    /**
+     * Validates an IPv4 octet string for leading zeros.
+     * The value "0" is allowed as a special case; "01", "002", etc. are invalid
+     * because they are ambiguous representations and not a defined canonical form.
+     */
+    private fun validateIPv4Octet(octetStr: String): Boolean {
+        // Reject empty octet strings
+        if (octetStr.isEmpty()) return false
+
+        // Leading zeros are invalid except the single digit "0"
+        return if (octetStr.startsWith("0")) {
+            octetStr == "0"
+        } else {
+            true
+        }
     }
 }

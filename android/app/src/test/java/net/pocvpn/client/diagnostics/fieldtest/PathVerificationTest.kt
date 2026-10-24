@@ -368,11 +368,83 @@ class PathVerificationTest {
         }
     }
 
+    @Test fun `an IPv4-mapped IPv6 tail with reserved IPv4 is invalid`() {
+        listOf("::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:192.168.1.1").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+        }
+    }
+
     @Test fun `a public IPv4-mapped IPv6 tail is still accepted`() {
         val mapped = "::ffff:198.51.100.7"
         val v = eval(input(reference = reference(mapped), observed = "0:0:0:0:0:ffff:c633:6407"))
         assertEquals(EgressResult.SAME_AS_PHYSICAL, v.egress)
         assertEquals(TunnelPathResult.VIOLATED, v.tunnelPath)
+    }
+
+    // --- IPv6 compression validation ---
+
+    @Test fun `full and compressed IPv6 forms of the same address have identical binary representation`() {
+        val full = "2001:4860:0000:0000:0000:0000:0000:0001"
+        val compressed = "2001:4860::1"
+        val v1 = eval(input(reference = reference(full), observed = full))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v1.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v1.tunnelPath)
+        val v2 = eval(input(reference = reference(compressed), observed = compressed))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v2.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v2.tunnelPath)
+        // Cross compare should also match
+        val v3 = eval(input(reference = reference(full), observed = compressed))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v3.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v3.tunnelPath)
+    }
+
+    @Test fun `multiple zero groups with mixed representations are expanded correctly`() {
+        val a = "2001:db8::1"
+        val b = "2001:db8:0:0:0:0:0:1"  // equivalent address
+        val v1 = eval(input(reference = reference(a), observed = b))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, v1.egress)
+        assertEquals(TunnelPathResult.VIOLATED, v1.tunnelPath)
+
+        // Different address: 2001:db8::1 vs 2001:db8:0:0:0:0:0:2
+        val c = "2001:db8:0:0:0:0:0:2"
+        val v2 = eval(input(reference = reference(a), observed = c))
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, v2.egress)
+        assertEquals(TunnelPathResult.CONFIRMED, v2.tunnelPath)
+    }
+
+    @Test fun `different IPv6 addresses with compression are still differences`() {
+        val a = "2001:db8::1"
+        val b = "2001:db8::2"
+        val v = eval(input(reference = reference(a), observed = b))
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, v.egress)
+        assertEquals(TunnelPathResult.CONFIRMED, v.tunnelPath)
+    }
+
+    @Test fun `invalid compressed IPv6 with multiple double-colon occurrences`() {
+        listOf("2001::db8::1", "2001::db8:::1", "::db8::1::2").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+        }
+    }
+
+    @Test fun `IPv4 with leading zeros is invalid in IPv4-mapped tail`() {
+        listOf("::ffff:001.2.3.4", "::ffff:1.002.3.4", "::ffff:0.0.00.1").forEach { bad ->
+            val ref = eval(input(reference = reference(bad)))
+            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+            val obs = eval(input(observed = bad))
+            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+        }
     }
 
     @Test fun `a normal IPv4 match and difference still work`() {
