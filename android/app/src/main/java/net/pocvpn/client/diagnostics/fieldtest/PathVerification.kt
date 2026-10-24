@@ -306,10 +306,6 @@ object PathVerification {
         // it is neither a valid compression point nor a valid group separator.
         if (parts.isNotEmpty() && parts[0].isEmpty() && parts.size > 1 && parts[1].isNotEmpty()) return null
         if (parts.isNotEmpty() && parts.last().isEmpty() && parts.size > 1 && parts[parts.size - 2].isNotEmpty()) return null
-        // Solitary leading or trailing colon (e.g. ":1:2:3" or "1:2:3:") is invalid:
-        // it is neither a valid compression point nor a valid group separator.
-        if (parts.isNotEmpty() && parts[0].isEmpty() && parts.size > 1 && parts[1].isNotEmpty()) return null
-        if (parts.isNotEmpty() && parts.last().isEmpty() && parts.size > 1 && parts[parts.size - 2].isNotEmpty()) return null
         val allEmpty = parts.all { it.isEmpty() }
         if (!allEmpty) {
             var runLen = 0
