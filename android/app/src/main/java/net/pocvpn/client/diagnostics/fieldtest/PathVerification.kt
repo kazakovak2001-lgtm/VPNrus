@@ -251,7 +251,13 @@ object PathVerification {
     private fun canonicalBytes(ip: String): ByteArray? {
         val v4 = IPV4.matchEntire(ip)
         if (v4 != null) {
-            val o = v4.groupValues.drop(1).map { it.toInt() }
+            val rawOctetStrings = v4.groupValues.drop(1)
+            // Validate IPv4 octets for leading zeros: "0" is allowed,
+            // but "01", "002", etc. are invalid.
+            for (raw in rawOctetStrings) {
+                if (!validateIPv4Octet(raw)) return null
+            }
+            val o = rawOctetStrings.map { it.toInt() }
             if (!o.all { it in 0..255 }) return null
             if (isReservedV4(o)) return null
             return byteArrayOf(o[0].toByte(), o[1].toByte(), o[2].toByte(), o[3].toByte())
@@ -263,6 +269,9 @@ object PathVerification {
     private fun canonicalV6(ip: String): ByteArray? {
         val bytes = parseV6(ip) ?: return null
         if (isReservedV6(bytes)) return null
+        // The IPv4 reserved policy applies to the decoded last four bytes, so the
+        // same address cannot get a different verdict when written in hex.
+        if (isIPv4Mapped(bytes) && isReservedV4(bytes.drop(12).map { it.toInt() and 0xFF })) return null
         return bytes
     }
 
@@ -278,42 +287,53 @@ object PathVerification {
      * deterministic regardless of how the literal was written.
      */
     private fun parseV6(ip: String): ByteArray? {
+        // An IPv6 literal has at least two colons: "::" and "::1" are the
+        // shortest valid forms, and a bare "1" or "1:2" is not an IPv6 literal.
         if (ip.count { it == ':' } < 2) return null
         if (ip.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' && it != ':' && it != '.' }) return null
 
         val lower = ip.lowercase()
         if (lower.count { it == ':' } > 7) return null
-        if (lower.startsWith("::ffff:")) {
-            val tail = lower.removePrefix("::ffff:")
-            val v4 = IPV4.matchEntire(tail)
-            if (v4 != null) {
-                // Capture original IPv4 octet strings for leading-zero validation
-                val rawOctetStrings = v4.groupValues.drop(1)
-                // Validate IPv4 octets for leading zeros: "0" is allowed,
-                // but "01", "002", etc. are invalid.
-                for (raw in rawOctetStrings) {
-                    if (!validateIPv4Octet(raw)) return null
-                }
-                val o = rawOctetStrings.map { it.toInt() }
-                if (!o.all { it in 0..255 }) return null
-                // The embedded IPv4 is still subject to the same reserved-range
-                // policy as a bare IPv4 literal: a private, loopback or
-                // unspecified tail must not be accepted just because it was
-                // written inside an IPv6 wrapper.
-                if (isReservedV4(o)) return null
-                // An IPv4-mapped address is 0:0:0:0:0:ffff:a.b.c.d - the two bytes
-                // before the embedded IPv4 must be 0xff,0xff. Anything else is not
-                // a mapped address and is rejected here rather than silently kept.
-                return byteArrayOf(
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1,
-                    o[0].toByte(), o[1].toByte(), o[2].toByte(), o[3].toByte(),
-                )
-            }
-            return null
-        }
 
+        // Split into groups. A leading or trailing "::" yields two adjacent empty
+        // elements; an internal "::" yields one. A run of empty elements is a
+        // single compression point only when it is at an edge (length 2) or
+        // internal (length 1). A run of 3+, or a run of 2 that is internal
+        // (e.g. ":::" or "a:::b"), is two compression points and invalid.
         val parts = lower.split(':')
         if (parts.size > 8) return null
+        val allEmpty = parts.all { it.isEmpty() }
+        if (!allEmpty) {
+            var runLen = 0
+            var maxRun = 0
+            var runs = 0
+            var maxRunAtEdge = false
+            for (i in parts.indices) {
+                if (parts[i].isEmpty()) {
+                    if (runLen == 0) runs++
+                    runLen++
+                    if (runLen > maxRun) {
+                        maxRun = runLen
+                        maxRunAtEdge = (i - runLen + 1 == 0 || i == parts.size - 1)
+                    }
+                } else {
+                    runLen = 0
+                }
+            }
+            if (runs > 1) return null
+            if (maxRun > 2) return null
+            if (maxRun == 2 && !maxRunAtEdge) return null
+        }
+
+        // An embedded-IPv4 tail is the last group and contains a dot.
+        val hasV4Tail = parts.last().contains('.')
+        val groupCount = if (hasV4Tail) parts.size - 1 else parts.size
+        // With a compression point, the number of explicit groups must be < 8;
+        // without one, it must be exactly 8.
+        val emptyCount = parts.count { it.isEmpty() }
+        if (emptyCount == 0 && groupCount != 8) return null
+        if (emptyCount >= 1 && groupCount >= 8) return null
+
         val out = ByteArray(16)
         var idx = 0
         var seenEmpty = false
@@ -321,9 +341,35 @@ object PathVerification {
         for (i in parts.indices) {
             val part = parts[i]
             if (part.isEmpty()) {
-                if (seenEmpty) return null // more than one compression point
+                if (seenEmpty) {
+                    // The second of the two adjacent empty elements: the
+                    // compression point is already recorded at emptyIndex.
+                    continue
+                }
                 seenEmpty = true
                 emptyIndex = i
+                continue
+            }
+            if (i == parts.size - 1 && hasV4Tail) {
+                // The last group is an embedded IPv4 literal; parse it into two bytes.
+                val v4 = IPV4.matchEntire(part)
+                if (v4 == null) return null
+                val rawOctetStrings = v4.groupValues.drop(1)
+                for (raw in rawOctetStrings) {
+                    if (!validateIPv4Octet(raw)) return null
+                }
+                val o = rawOctetStrings.map { it.toInt() }
+                if (!o.all { it in 0..255 }) return null
+                // The embedded IPv4 is subject to the same reserved-range policy
+                // as a bare IPv4 literal: a private, loopback or unspecified tail
+                // must not be accepted just because it was written inside an
+                // IPv6 wrapper, regardless of the wrapper's written form.
+                if (isReservedV4(o)) return null
+                if (idx + 2 > 16) return null
+                out[idx++] = o[0].toByte()
+                out[idx++] = o[1].toByte()
+                out[idx++] = o[2].toByte()
+                out[idx++] = o[3].toByte()
                 continue
             }
             if (part.length > 4) return null
@@ -372,6 +418,12 @@ object PathVerification {
         0xff -> true // multicast
         else -> false
     }
+
+    /** IPv4-mapped by content: ten zero bytes then 0xffff. Independent of the written form. */
+    private fun isIPv4Mapped(bytes: ByteArray): Boolean =
+        (0 until 10).all { (bytes[it].toInt() and 0xFF) == 0 } &&
+            (bytes[10].toInt() and 0xFF) == 0xFF &&
+            (bytes[11].toInt() and 0xFF) == 0xFF
 
     private val IPV4 = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
 

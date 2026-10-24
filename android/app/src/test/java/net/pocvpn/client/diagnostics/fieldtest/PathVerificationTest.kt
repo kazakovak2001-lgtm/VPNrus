@@ -368,15 +368,45 @@ class PathVerificationTest {
         }
     }
 
-    @Test fun `an IPv4-mapped IPv6 tail with reserved IPv4 is invalid`() {
-        listOf("::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:192.168.1.1").forEach { bad ->
-            val ref = eval(input(reference = reference(bad)))
-            assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
-            assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
-            val obs = eval(input(observed = bad))
-            assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
-            assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+    // The same address written as a dotted tail and as two hex groups must reach the
+    // same verdict: the reserved policy is decided on the decoded bytes, not on the text.
+    @Test fun `an IPv4-mapped IPv6 address is reserved by decoded bytes in every written form`() {
+        listOf(
+            "::ffff:10.0.0.1" to "0:0:0:0:0:ffff:a00:1",
+            "::ffff:192.168.1.1" to "0:0:0:0:0:ffff:c0a8:101",
+            "::ffff:127.0.0.1" to "0:0:0:0:0:ffff:7f00:1",
+            "::ffff:0.0.0.0" to "0:0:0:0:0:ffff:0:0",
+            "::ffff:169.254.1.1" to "0:0:0:0:0:ffff:a9fe:101",
+            "::ffff:172.20.1.1" to "0:0:0:0:0:ffff:ac14:101",
+            "::ffff:100.64.3.4" to "0:0:0:0:0:ffff:6440:304",
+        ).forEach { (dotted, hex) ->
+            listOf(dotted, hex).forEach { bad ->
+                val ref = eval(input(reference = reference(bad)))
+                assertEquals("reference $bad", PathReason.REFERENCE_INVALID, ref.egressReason)
+                assertEquals(EgressResult.INCONCLUSIVE, ref.egress)
+                assertEquals(TunnelPathResult.INCONCLUSIVE, ref.tunnelPath)
+                val obs = eval(input(observed = bad))
+                assertEquals("observed $bad", PathReason.OBSERVED_INVALID, obs.egressReason)
+                assertEquals(EgressResult.INCONCLUSIVE, obs.egress)
+            }
         }
+    }
+
+    // 198.51.100.0/24 is the TEST-NET-2 documentation range (RFC 5737). The existing
+    // policy does not classify it as reserved, so both forms stay accepted - the
+    // point of this test is that they agree, not that the range is public.
+    @Test fun `an IPv4-mapped documentation address has the same verdict in both written forms`() {
+        val dotted = eval(input(reference = reference("::ffff:198.51.100.7"), observed = "::ffff:198.51.100.7"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, dotted.egress)
+        val hex = eval(input(reference = reference("0:0:0:0:0:ffff:c633:6407"), observed = "0:0:0:0:0:ffff:c633:6407"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, hex.egress)
+        val cross = eval(input(reference = reference("::ffff:198.51.100.7"), observed = "0:0:0:0:0:ffff:c633:6407"))
+        assertEquals(EgressResult.SAME_AS_PHYSICAL, cross.egress)
+        assertEquals(TunnelPathResult.VIOLATED, cross.tunnelPath)
+        // and a genuinely different mapped address is still a difference
+        val diff = eval(input(reference = reference("::ffff:198.51.100.7"), observed = "0:0:0:0:0:ffff:c633:6408"))
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, diff.egress)
+        assertEquals(TunnelPathResult.CONFIRMED, diff.tunnelPath)
     }
 
     @Test fun `a public IPv4-mapped IPv6 tail is still accepted`() {
