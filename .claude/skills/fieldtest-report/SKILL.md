@@ -30,7 +30,7 @@ Classify every finding into exactly one of these categories:
 | ----------------- | ----------------------------------------------------------------------------- |
 | `CONFIRMED`       | Directly observed in the source logs; backed by a concrete record.            |
 | `ESTIMATE`        | Reasoned inference from available evidence, but not directly observed.       |
-| `MISSING`         | No evidence exists; the item was never measured or recorded.                 |
+| `MISSING`         | No supporting evidence in the supplied artifacts; measurement status unknown. |
 | `CONTRADICTED`    | Source records conflict with each other or with a known baseline.            |
 
 Distinguish `ESTIMATE` from `CONFIRMED` explicitly. Never present an estimate
@@ -62,18 +62,19 @@ logs.
 FIELD TEST REPORT
 
 Source: <path or artifact set>
-Classification: CONFIRMED | ESTIMATE | MISSING | CONTRADICTED
 
-Confirmed:
+Each finding carries exactly one label, given by the section it is listed in:
+
+Confirmed (CONFIRMED):
 - ...
 
-Estimates:
+Estimates (ESTIMATE):
 - ...
 
-Missing evidence:
+Missing evidence (MISSING):
 - ...
 
-Contradictions:
+Contradictions (CONTRADICTED):
 - ...
 
 Notes:

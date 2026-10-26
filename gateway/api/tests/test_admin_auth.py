@@ -110,12 +110,8 @@ class AdminAuthenticatorSessionTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.secret_path = _write_secret_file(self._tmp.name)
         self.clock = FakeClock(start=1000.0)
-        # Patch time.time to our fake clock for deterministic expiry checks.
-        self._real_time = time.time
-        import builtins
-        builtins.time = self.clock
-        self.addCleanup(lambda: setattr(__import__("builtins"), "time", self._real_time))
-        # Patch monotonic too since AdminAuthenticator uses it internally.
+        # AdminAuthenticator's session clock and limiter both use
+        # time.monotonic - patch only that.
         self._real_mono = time.monotonic
         import time as time_module
         time_module.monotonic = self.clock

@@ -196,14 +196,9 @@ class AuthFailureLimiterTests(unittest.TestCase):
             window_seconds=60.0,
             clock=clock,
         )
-        allowed_count = [0]
-        lock = threading.Lock()
-
         def worker(src: str, acct: str, iterations: int) -> None:
             for _ in range(iterations):
                 limiter.record_auth_failure(src, acct)
-                with lock:
-                    allowed_count[0] += 1
 
         threads = []
         for i in range(20):
@@ -215,11 +210,15 @@ class AuthFailureLimiterTests(unittest.TestCase):
         for t in threads:
             t.join()
 
-        # At most 20 * 50 = 1000 recorded, but capped by limits.
-        # The important invariant: allowed_count matches what we expect
-        # from the deterministic clock (no sleeps).
-        # Here we just verify no crash and some count.
-        self.assertGreater(allowed_count[0], 0)
+        # Fixed clock, no window boundary, far below max_entries: every
+        # increment must be visible in the limiter's own counters.
+        sources = {k: c for k, (_s, c) in limiter._source_windows.items()}
+        accounts = {k: c for k, (_s, c) in limiter._account_windows.items()}
+        self.assertEqual(len(sources), 20)
+        self.assertTrue(all(c == 50 for c in sources.values()), sources)
+        self.assertEqual(len(accounts), 10)
+        self.assertTrue(all(c == 100 for c in accounts.values()), accounts)
+        self.assertEqual(limiter._global_windows[limiter._global_key][1], 1000)
 
     # -----------------------------------------------------------------
     # 7. Capacity exhaustion and bounded policy
