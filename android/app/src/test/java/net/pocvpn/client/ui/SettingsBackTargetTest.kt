@@ -20,6 +20,11 @@ class SettingsBackTargetTest {
     }
 
     @Test
+    fun `back from GeoData returns to Settings, not Home`() {
+        assertEquals(SettingsRoute.Settings, settingsBackTarget(SettingsRoute.GeoData))
+    }
+
+    @Test
     fun `back from Settings returns to Home, not Activity-finish`() {
         assertNull(settingsBackTarget(SettingsRoute.Settings))
     }

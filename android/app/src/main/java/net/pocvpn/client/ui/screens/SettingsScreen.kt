@@ -68,6 +68,8 @@ fun SettingsScreen(
     onNetworkCheckClick: () -> Unit = {},
     // Opens Android's VPN settings (Always-on + Block connections without VPN).
     onOpenVpnSettingsClick: () -> Unit = {},
+    // Settings -> GeoData; the row is shown only when a handler is supplied.
+    onGeoDataClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     // B30A - physical-validation fix: this Column has no bound on its
@@ -261,6 +263,33 @@ fun SettingsScreen(
         )
         androidx.compose.material3.TextButton(onClick = onOpenVpnSettingsClick, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.settings_always_on_open))
+        }
+
+        if (onGeoDataClick != null) {
+            Spacer(modifier = Modifier.height(28.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(16.dp))
+                    .clickable(onClick = onGeoDataClick)
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.settings_geodata_row_title),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_geodata_row_subtitle),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ChevronRightGlyph(tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+            }
         }
 
         Spacer(modifier = Modifier.height(28.dp))
