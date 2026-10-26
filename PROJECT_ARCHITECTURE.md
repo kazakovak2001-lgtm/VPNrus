@@ -3978,3 +3978,15 @@ and `RoutingDecisionEngine` are byte-for-byte unmodified.
   falls back to Disconnected after a bounded wait (same rule as
   Shadowsocks/Hysteria2) - an idle transport can no longer wedge the
   controller in Disconnecting.
+
+## GeoData datasets (Settings -> GeoData, 2026-10-26)
+
+- Layout under `noBackupFilesDir/xray-assets`: `geo-<id>/` (`geoip.dat`, `geosite.dat`, `.geo-dataset.json` marker; `<id>` = SHA-256-derived, content-addressed,
+  never rewritten in place), `.geo-active.json` (atomic pointer: active + previous id), `.geo-effective` (dataset id the `:xray` core was last pointed at),
+  `.geo-staging.lock` / `.geo-update.lock`, `.geo-download/` (temp). Old downloaded datasets are pruned except the active, the previous and the `.geo-effective` one;
+  the bundled dataset, quarantine dirs, foreign dirs and symlinks are never touched.
+- `LibXrayCoreRuntime.ensureCoreEnvInitialized` (`:xray`) gives `initCoreEnv` the verified active downloaded dataset, else the bundled one, else the plain root
+  (= pre-feature behavior). It never fails a start because of geo data. A changed pointer is re-applied only while the core is NOT running (no hot reload).
+  There is no automatic rollback to the previous download: the fallback is the bundled databases.
+- Updates run in the MAIN process (`GeoDataViewModel`/`GeoDataUpdater`); the core runs in `:xray`; cross-process safety is file locks + the atomic pointer.
+- Downloads bypass the VPN (the app is `addDisallowedApplication`'d) and are https-only; the renderer, TUN, routing and `RoutingMode` are untouched.

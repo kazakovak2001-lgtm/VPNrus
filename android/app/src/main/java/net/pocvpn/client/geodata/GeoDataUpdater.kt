@@ -77,8 +77,9 @@ data class GeoDataStatus(
  * - Both files of an update are validated before either is activated. With only one URL configured the other
  *   file is carried over from the currently active dataset (or the bundled one), so the activated pair is always complete.
  * - Concurrent updates (also from another process) are refused via a lock file; they cannot interleave.
- * - The previously active dataset is kept (one rollback step) and never pruned while it could still be read by
- *   a running core; only older downloaded datasets are removed.
+ * - The previously active dataset is kept on disk and, like the dataset a running core was started with, never
+ *   pruned; only older downloaded datasets are removed. There is NO automatic rollback to it: if the active
+ *   dataset is ever unusable the fallback is the bundled databases (the pointer's `previous` is bookkeeping for pruning).
  */
 class GeoDataUpdater(
     private val root: File,

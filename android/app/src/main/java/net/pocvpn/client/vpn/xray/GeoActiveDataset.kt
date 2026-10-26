@@ -16,7 +16,7 @@ data class GeoDatasetInfo(
     val files: List<GeoFileInfo>,
 )
 
-/** `previous` is the dataset that was active before `active`; it is kept on disk so the last working pair can be restored. */
+/** `previous` is the dataset that was active before `active`; it is only kept on disk (not pruned) - nothing reads it to roll back. */
 data class GeoActivePointer(val active: String, val previous: String?, val activatedAtMillis: Long)
 
 /**

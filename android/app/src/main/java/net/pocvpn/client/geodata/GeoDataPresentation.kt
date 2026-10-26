@@ -16,6 +16,10 @@ object GeoDataPresentation {
         "New databases are picked up when the VPN core starts next (the next Xray connection). " +
             "A connection that is already running keeps using the databases it started with."
 
+    const val OUTSIDE_VPN_NOTICE =
+        "Downloads are made by the app itself, outside the VPN tunnel, so the server you enter sees your real " +
+            "network address. Only use addresses you trust."
+
     const val USAGE_NOTICE =
         "Routing rules do not use these databases yet; they are stored and kept ready for the core."
 

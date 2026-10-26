@@ -130,6 +130,12 @@ fun GeoDataScreen(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = GeoDataPresentation.OUTSIDE_VPN_NOTICE,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(modifier = Modifier.height(12.dp))
         UrlField(
             label = stringResource(R.string.geodata_geoip_url_label),

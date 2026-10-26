@@ -276,6 +276,12 @@ class GeoDataViewModelAndPresentationTest {
     }
 
     @Test
+    fun `the screen tells the user that downloads bypass the vpn tunnel`() {
+        assertTrue(GeoDataPresentation.OUTSIDE_VPN_NOTICE.contains("outside the VPN"))
+        assertFalse(GeoDataPresentation.OUTSIDE_VPN_NOTICE.contains("http"))
+    }
+
+    @Test
     fun `byte formatting`() {
         assertEquals("512 B", GeoDataPresentation.formatBytes(512))
         assertEquals("1.5 KB", GeoDataPresentation.formatBytes(1536))

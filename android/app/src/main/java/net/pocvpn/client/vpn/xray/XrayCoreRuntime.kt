@@ -90,7 +90,13 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
                 android.util.Log.i("GeoData", line)
             }
             geoDirs = provider
-            val assetDir = provider.resolveInitial().directory
+            // Geo data must never block a VPN start: any unexpected failure here means the plain root.
+            val assetDir = try {
+                provider.resolveInitial().directory
+            } catch (t: Throwable) {
+                android.util.Log.w("GeoData", "geo data: resolve failed (${t.javaClass.simpleName}); using plain asset root")
+                assetRoot
+            }
             // deviceId personalizes XUDP session base keys only (an anti-fingerprinting
             // refinement, not connection-critical, not a credential) - this adapter shell
             // does not implement v2rayNG's per-device derivation yet, so this is left
