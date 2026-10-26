@@ -242,10 +242,18 @@ class FieldTestRunner(
 ) {
     private val log = mutableListOf<String>()
 
+    /**
+     * R1-S2 - the device's own public address, read OUTSIDE the tunnel by the
+     * direct probes of this very run. In memory only: the report keeps the
+     * resulting names, never the address (see [PathVerdict]).
+     */
+    private var physicalReference: PhysicalReference? = null
+
     suspend fun run(onProgress: (FieldTestProgress) -> Unit): FieldTestReport = run(FieldTestMode.FULL, 0, onProgress)
 
     suspend fun run(mode: FieldTestMode, monitorDurationMs: Long, onProgress: (FieldTestProgress) -> Unit): FieldTestReport {
         val startedAt = clock()
+        physicalReference = null
         val manifest = host.trustedManifest()
         val attempts = if (mode == FieldTestMode.FULL) {
             planAttempts(ProductionGatewayId.entries.toList(), relayIngressIds(manifest))
@@ -322,7 +330,8 @@ class FieldTestRunner(
                     runs += run
                     val leakText = run.leaks?.let { " leaks=${LeakChecks.summaryText(it)}" } ?: ""
                     val why = run.errorMessage?.let { " ($it)" } ?: run.skipReason?.let { " ($it)" } ?: ""
-                    progress("VPN runs", "  -> ${run.outcome}${run.exitIp?.let { " exit $it" } ?: ""}$leakText$why")
+                    val pathText = run.pathVerdict?.let { " path[${it.summaryText()}]" } ?: ""
+                    progress("VPN runs", "  -> ${run.outcome}${run.exitIp?.let { " exit $it" } ?: ""}$pathText$leakText$why")
                     if (run.outcome != FieldRunOutcome.SKIPPED) delay(timings.betweenRunsMs)
                 }
             }
@@ -483,9 +492,16 @@ class FieldTestRunner(
 
         val http = mutableListOf<HttpProbeResult>()
         FieldTestTargets.DIRECT_HTTP.forEach { (label, url) -> http += probes.https(label, url, null, 64 * 1024, false) }
-        // The device's own public IP is deliberately dropped; loc/colo say which country/edge saw us.
-        http += probes.https("Cloudflare trace", FieldTestTargets.CLOUDFLARE_TRACE, null, 4 * 1024, true)
-            .let { it.copy(trace = it.trace - "ip") }
+        // The device's own public IP is deliberately dropped from the REPORT; loc/colo say which
+        // country/edge saw us. R1-S2: it is first kept in memory as the independent physical
+        // reference the in-tunnel egress is compared with, only while confirmed Disconnected.
+        val disconnectedBeforeTrace = host.transportState.value is TransportState.Disconnected
+        val directTrace = probes.https("Cloudflare trace", FieldTestTargets.CLOUDFLARE_TRACE, null, 4 * 1024, true)
+        physicalReference = directTrace.takeIf {
+            disconnectedBeforeTrace && host.transportState.value is TransportState.Disconnected && it.httpStatus != null
+        }?.trace?.get("ip")
+            ?.let { PhysicalReference(it, clock()) }
+        http += directTrace.copy(trace = directTrace.trace - "ip")
         http += probes.https("Cloudflare 256KB (throttling check)", FieldTestTargets.BULK_DIRECT, null, 262_144, false)
 
         val tcp = mutableListOf<TcpProbeResult>()
@@ -599,13 +615,27 @@ class FieldTestRunner(
         // B54 Scope B - the one VPN network every VPN-bound probe of this run uses.
         var bound: VpnProbeBinding? = null
         var probeContext: ProbeContext? = null
+        // R1-S2 - the transport measured; a different one at the end voids the results.
+        var kindAtBind: TransportKind? = null
+        var pathVerdict: PathVerdict? = null
         // B54 Scope B - set when the session leaves Connected at any point while the
-        // VPN-bound probes run (a drop that recovers on the same network included).
+        // probes run (a drop that recovers on the same network included).
         var leftConnectedDuringProbes = false
+        // R1-S2 - set when transport kind changes during measurement, even if it later returns.
+        var transportKindChanged = false
         var sessionWatcher: kotlinx.coroutines.Job? = null
         val coreMeasured = connected && host.currentTransportKind.value in XRAY_FAMILY
         coroutineScope {
             if (coreMeasured) {
+                kindAtBind = host.currentTransportKind.value
+                sessionWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                    launch {
+                        host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                    }
+                    launch {
+                        host.currentTransportKind.collect { if (it != kindAtBind) transportKindChanged = true }
+                    }
+                }
                 health = withTimeoutOrNull(timings.healthGraceMs) {
                     host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
                 } ?: host.sessionHealth.value
@@ -616,26 +646,45 @@ class FieldTestRunner(
                 core = host.measureViaXrayCore(urls)
                 notes += "app is excluded from the Xray tunnel by design; data plane measured by the Xray core (latency only - no bulk download, exit IP or leak check)"
                 if (core == null) notes += "the Xray process did not answer the measurement request"
-                probeContext = ProbeContext(ProbeBinding.XRAY_OUTBOUND, sessionStable = null, invalidated = false)
                 delay(timings.stabilityHoldMs)
                 host.measureViaXrayCore(listOf(FieldTestTargets.CONNECTIVITY_204))?.let { later -> core = core.orEmpty() + later.map { it.copy(url = it.url + " (after hold)") } }
+                val stable = !leftConnectedDuringProbes && !transportKindChanged &&
+                    host.transportState.value is TransportState.Connected &&
+                    host.currentTransportKind.value == kindAtBind
+                probeContext = ProbeContext(ProbeBinding.XRAY_OUTBOUND, sessionStable = stable, invalidated = !stable)
+                // R1-S2 - the core measures through its OWN outbound, not through the TUN: it can
+                // show reachability, never which path an app packet takes or what its egress is.
+                pathVerdict = PathVerification.evaluate(
+                    PathInput(
+                        via = ReachabilityVia.XRAY_CORE_OUTBOUND, probe = null, coreAnyOk = core?.any { it.ok },
+                        reference = physicalReference, nowEpochMillis = clock(),
+                        session = if (stable) SessionValidity.STABLE else SessionValidity.CHANGED,
+                    ),
+                )
             } else if (connected) {
                 health = withTimeoutOrNull(timings.healthGraceMs) {
                     host.sessionHealth.first { it is VpnSessionHealth.DirectProtected || it is VpnSessionHealth.RelayProtected || it is VpnSessionHealth.Failed }
                 } ?: host.sessionHealth.value
                 delay(timings.settleMs)
                 bound = if (host.transportState.value is TransportState.Connected) host.vpnBinding() else null
+                kindAtBind = host.currentTransportKind.value
                 val vpn = bound?.network
                 if (bound != null) {
                     // Same observation pattern as the connect-phase watcher above: the
                     // controller's own state flow, read-only - no polling, no control.
                     sessionWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
-                        host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                        launch {
+                            host.transportState.collect { s -> if (s !is TransportState.Connected) leftConnectedDuringProbes = true }
+                        }
+                        launch {
+                            host.currentTransportKind.collect { if (it != kindAtBind) transportKindChanged = true }
+                        }
                     }
                 }
                 if (bound == null) {
                     notes += "$NO_VPN_NETWORK_NOTE - VPN-bound probes not run (state ${host.transportState.value.label()})"
                     probeContext = ProbeContext(ProbeBinding.NONE, sessionStable = null, invalidated = true)
+                    pathVerdict = PathVerification.evaluate(PathInput(via = ReachabilityVia.NONE, probe = null, reference = physicalReference, nowEpochMillis = clock()))
                 } else {
                     dns = probes.dns(FieldTestTargets.TUNNEL_DNS, vpn)
                     val first = probes.https(FieldTestTargets.TUNNEL_HTTP.first().first, FieldTestTargets.TUNNEL_HTTP.first().second, vpn, 64 * 1024, false)
@@ -644,6 +693,9 @@ class FieldTestRunner(
                         appExcluded = true
                         notes += "this VPN excludes the Nova app (binding to the VPN network: EPERM); connection confirmed by the transport, data plane not measurable from the app - verify with a browser"
                         probeContext = ProbeContext(ProbeBinding.VPN_NETWORK, sessionStable = null, invalidated = false)
+                        pathVerdict = PathVerification.evaluate(
+                            PathInput(via = ReachabilityVia.NONE, probe = first, appExcluded = true, reference = physicalReference, nowEpochMillis = clock()),
+                        )
                     }
                 }
             }
@@ -653,7 +705,8 @@ class FieldTestRunner(
                 FieldTestTargets.TUNNEL_HTTP.drop(1).forEach { (label, url) -> probeResults += probes.https(label, url, vpn, 64 * 1024, false) }
                 val trace = probes.https("Cloudflare trace (exit)", FieldTestTargets.CLOUDFLARE_TRACE, vpn, 4 * 1024, true)
                 probeResults += trace
-                exitIp = trace.trace["ip"]
+                val observedExitIp = trace.trace["ip"]
+                exitIp = observedExitIp
                 exitColo = trace.trace["colo"]
                 exitLoc = trace.trace["loc"]
                 throughput = probes.https("Bulk 1MB", FieldTestTargets.BULK_TUNNEL, vpn, 1_048_576, false)
@@ -663,10 +716,20 @@ class FieldTestRunner(
                 leaks = probes.leaks(vpn, directResolver, baselineHasGlobalIpv6)
                 // B54 Scope B - the results only count for the session they were bound to:
                 // still Connected and still the same VPN network instance.
-                val stable = !leftConnectedDuringProbes &&
+                // R1-S2 - a different active transport at the end voids the results too: they
+                // must not be credited to a transport that was not the one measured.
+                val stable = !leftConnectedDuringProbes && !transportKindChanged &&
                     host.transportState.value is TransportState.Connected &&
-                    host.vpnBinding()?.handle == boundForProbes.handle
+                    host.vpnBinding()?.handle == boundForProbes.handle &&
+                    host.currentTransportKind.value == kindAtBind
                 probeContext = ProbeContext(ProbeBinding.VPN_NETWORK, sessionStable = stable, invalidated = !stable)
+                pathVerdict = PathVerification.evaluate(
+                    PathInput(
+                        via = ReachabilityVia.VPN_BOUND_SOCKET, probe = trace, observedExitIp = observedExitIp,
+                        reference = physicalReference, nowEpochMillis = clock(),
+                        session = if (stable) SessionValidity.STABLE else SessionValidity.CHANGED,
+                    ),
+                )
                 if (!stable) {
                     notes += "session left Connected or changed during probes (${host.transportState.value.label()}) - VPN-bound results invalidated"
                     exitIp = null
@@ -719,6 +782,7 @@ class FieldTestRunner(
             leaks = leaks,
             coreMeasurements = core,
             probeContext = probeContext,
+            pathVerdict = pathVerdict,
         )
     }
 
