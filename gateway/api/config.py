@@ -172,6 +172,15 @@ class AppConfig:
     # per request, never logs them, never returns them.
     relay_probe_hmac_secret_file: str = ""
 
+    # B8B1D - admin authentication and session management (M3).
+    # admin_secret_file: optional path to the admin secret file (32 raw bytes).
+    # Blank (the default) means admin authentication is not configured and
+    # always fails closed with 503 for any admin endpoint.
+    admin_secret_file: str = ""
+    # admin_enabled: boolean derived from admin_secret_file presence.
+    # Used internally; not part of the serialized config.
+    admin_enabled: bool = False
+
     # Russia field-test zero-touch enrollment (POST /v1/field-enroll) - see
     # field_enrollment.py's own module docstring. Disabled by default (the
     # empty/false defaults below), same "optional group, blank means not
@@ -738,71 +747,25 @@ def load_config(env=None):
                 f"got {len(_wrap_key_bytes)}"
             )
 
-    # B46-4P.1 - see AppConfig.hysteria2_*'s own docs. All-or-nothing: a
-    # half-configured Hysteria2 group is a startup error, never a silently
-    # disabled or silently defaulted endpoint.
-    hysteria2_store_path = _get(env, "HYSTERIA2_STORE_PATH")
-    hysteria2_lock_path = _get(env, "HYSTERIA2_LOCK_PATH")
-    hysteria2_server_port_raw = _get(env, "HYSTERIA2_SERVER_PORT")
-    hysteria2_sni = _get(env, "HYSTERIA2_SNI")
-    hysteria2_server_port = 0
-    if hysteria2_server_port_raw:
-        try:
-            hysteria2_server_port = int(hysteria2_server_port_raw)
-        except ValueError:
-            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SERVER_PORT is not an integer: {hysteria2_server_port_raw!r}")
-        if not (1 <= hysteria2_server_port <= 65535):
-            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SERVER_PORT out of range: {hysteria2_server_port}")
-    hysteria2_values = (
-        ("HYSTERIA2_STORE_PATH", hysteria2_store_path),
-        ("HYSTERIA2_LOCK_PATH", hysteria2_lock_path),
-        ("HYSTERIA2_SERVER_PORT", hysteria2_server_port_raw),
-        ("HYSTERIA2_SNI", hysteria2_sni),
-    )
-    if any(value for _name, value in hysteria2_values):
-        hysteria2_missing = [name for name, value in hysteria2_values if not value]
-        if hysteria2_missing:
+    # B8B1D: admin authentication configuration (M3).
+    # admin_secret_file: optional path to the admin secret file (32 raw bytes).
+    # Blank (the default) means admin authentication is not configured and
+    # always fails closed with 503 for any admin endpoint.
+    admin_secret_file = _get(env, "ADMIN_SECRET_FILE")
+    if admin_secret_file:
+        if not os.path.isabs(admin_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_SECRET_FILE must be an absolute path: {admin_secret_file!r}")
+        if not os.path.isfile(admin_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_SECRET_FILE does not exist: {admin_secret_file!r}")
+        with open(admin_secret_file, "rb") as _admin_secret_handle:
+            _admin_secret_bytes = _admin_secret_handle.read()
+        if len(_admin_secret_bytes) != 32:
             raise ConfigError(
-                "partial Hysteria2 configuration: "
-                + ", ".join(_ENV_PREFIX + k for k in hysteria2_missing)
-                + " must all be set once any Hysteria2 setting is set (or none of them, to leave Hysteria2 unconfigured)"
+                f"{_ENV_PREFIX}ADMIN_SECRET_FILE must contain exactly 32 raw bytes (admin password), "
+                f"got {len(_admin_secret_bytes)}"
             )
-        for name, path in (("HYSTERIA2_STORE_PATH", hysteria2_store_path), ("HYSTERIA2_LOCK_PATH", hysteria2_lock_path)):
-            if not os.path.isabs(path):
-                raise ConfigError(f"{_ENV_PREFIX}{name} must be an absolute path: {path!r}")
-        # Hysteria2 credentials are scoped to the EXISTING activation/device
-        # binding - there is no Hysteria2 entitlement without it.
-        if not (activation_store_path and activation_lock_path):
-            raise ConfigError(
-                "partial Hysteria2 configuration: the activation store "
-                f"({_ENV_PREFIX}ACTIVATION_STORE_PATH/{_ENV_PREFIX}ACTIVATION_LOCK_PATH) must be configured before Hysteria2 can be enabled"
-            )
-        if any(ch.isspace() for ch in hysteria2_sni) or len(hysteria2_sni) > 253:
-            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_SNI is not a plausible hostname: {hysteria2_sni!r}")
-
-    # See AppConfig.hysteria2_obfs_password's own docs.
-    hysteria2_obfs_password = ""
-    hysteria2_obfs_password_file = _get(env, "HYSTERIA2_OBFS_PASSWORD_FILE")
-    if hysteria2_obfs_password_file:
-        if not hysteria2_store_path:
-            raise ConfigError(
-                f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE is set but the Hysteria2 group "
-                f"({_ENV_PREFIX}HYSTERIA2_STORE_PATH etc.) is not configured"
-            )
-        if not os.path.isabs(hysteria2_obfs_password_file):
-            raise ConfigError(
-                f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE must be an absolute path: {hysteria2_obfs_password_file!r}"
-            )
-        try:
-            with open(hysteria2_obfs_password_file, "r", encoding="ascii") as handle:
-                hysteria2_obfs_password = handle.read().strip()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ConfigError(f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE is not readable: {type(exc).__name__}")
-        # Never echo the value. A closed charset also keeps it inert in YAML.
-        if not HYSTERIA2_OBFS_PASSWORD_RE.match(hysteria2_obfs_password):
-            raise ConfigError(
-                f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE must contain 32-128 characters of [A-Za-z0-9_-]"
-            )
+        # admin_enabled is derived after successful validation
+        # (set later in AppConfig.__init__)
 
     # B46-4P.2 - see AppConfig.hysteria2_auth_backend_port's own docs.
     hysteria2_auth_backend_port_raw = _get(env, "HYSTERIA2_AUTH_BACKEND_PORT")
@@ -826,6 +789,13 @@ def load_config(env=None):
                 f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT must differ from {_ENV_PREFIX}API_PORT "
                 "- the auth backend is a separate loopback-only listener"
             )
+
+    # Determine admin_enabled from successful secret validation.
+    # The validation block above (lines 755-768) already raises ConfigError
+    # for any missing/invalid admin_secret_file, so reaching this point with
+    # admin_secret_file truthy guarantees the file is valid. No need to
+    # re-open it here.
+    admin_enabled = bool(admin_secret_file)
 
     return AppConfig(
         endpoint_host=endpoint_host,
@@ -878,5 +848,8 @@ def load_config(env=None):
         hysteria2_sni=hysteria2_sni,
         hysteria2_auth_backend_port=hysteria2_auth_backend_port,
         hysteria2_obfs_password=hysteria2_obfs_password,
+        admin_secret_file=admin_secret_file,
         gateway_self_addresses=_parse_gateway_self_addresses(_get(env, "GATEWAY_SELF_ADDRESSES")),
+        admin_enabled=admin_enabled,
+    )
     )

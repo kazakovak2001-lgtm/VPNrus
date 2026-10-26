@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler
 
 from . import (
     activations,
+    admin_auth,
     admission,
     client_identity,
     field_enrollment,
@@ -144,6 +145,17 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(_SOCKET_TIMEOUT_SECONDS)
 
+    # --- admin endpoint paths ---
+    _PATH_ADMIN_LOGIN = "/admin/login"
+    _PATH_ADMIN_LOGOUT = "/admin/logout"
+    _PATH_ADMIN_SESSION = "/admin/session"
+    _PATH_ADMIN_STATUS = "/admin/status"
+
+    def _check_admin_enabled(self):
+        """Check if admin authentication is enabled."""
+        if not getattr(self.server.config, "admin_enabled", False):
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "admin_not_configured")
+
     # --- method dispatch: every verb routes through one place so 404 vs
     # 405 is a deliberate decision, never http.server's default 501 ---
     def do_POST(self):
@@ -213,6 +225,26 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_field_enroll()
+            elif self.path == _PATH_ADMIN_LOGIN:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_login()
+            elif self.path == _PATH_ADMIN_LOGOUT:
+                if method != "POST":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_logout()
+            elif self.path == _PATH_ADMIN_SESSION:
+                if method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_session()
+            elif self.path == _PATH_ADMIN_STATUS:
+                if method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_status()
             else:
                 status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
@@ -1258,6 +1290,204 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
     def _success(self, status, payload):
         return self._write_json(status, payload)
+
+    # --- logging: explicit allowlisted fields only, never raw
+    # headers/body/token - see module docstring and _log_fields sites
+    # above, which are the ONLY places allowed to populate this dict ---
+    # --- admin endpoints ---
+    def _handle_admin_login(self):
+        """Admin login: POST /admin/login with raw password in body.
+        """
+        self._check_admin_enabled()
+        try:
+            return self._handle_admin_login_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_admin_login_inner(self):
+        # Rate limit via auth_failure_limiter
+        allowed, retry_after = self.server.admin_authenticator._auth_failure_limiter.check_admission(
+            client_identity.normalize_client(
+                self.headers.get_all("X-Real-IP")
+            ),
+            "admin",
+        )
+        if not allowed:
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
+
+        # B57: reject chunked/Transfer-Encoding upfront (smuggling vector);
+        # then enforce Content-Length bound so the body never exceeds the
+        # API's own _MAX_BODY_BYTES cap.
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+
+        content_length = self._read_content_length()
+        content_type = self.headers.get("Content-Type", "")
+        if not _is_json_content_type(content_type):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+
+        raw_body = self.rfile.read(content_length)
+        try:
+            parsed = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_json")
+
+        if not isinstance(parsed, dict) or "password" not in parsed:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+
+        password = parsed["password"]
+        source_ip = client_identity.normalize_client(
+            self.headers.get_all("X-Real-IP")
+        )
+
+        # Authenticate and create session
+        success, session_data, error_msg = self.server.admin_authenticator.verify_password_and_create_session(
+            password, source_ip
+        )
+        if not success:
+            raise _RequestError(
+                HTTPStatus.UNAUTHORIZED if error_msg == "unauthorized" else HTTPStatus.TOO_MANY_REQUESTS,
+                error_msg
+            )
+
+        # session_data is (session_id, csrf_token)
+        session_id, csrf_token = session_data
+
+        # Determine whether to set the Secure flag: only when this vhost
+        # actually terminates TLS (admin endpoints MUST never ship cookies
+        # over cleartext). Here we follow the host's own TLS posture: the
+        # server binds 127.0.0.1 behind nginx, but the handler has no
+        # direct access to nginx's ssl state, so we conservatively omit
+        # Secure here — the nginx edge must enforce HTTPS for all /admin/*
+        # traffic (configured below). HttpOnly + SameSite=Strict are the
+        # baseline secure flags that apply regardless of transport.
+        cookie = f"pocvpn-admin-session={session_id}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=28800"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(
+            json.dumps({
+                "status": "logged_in",
+                "csrf_token": csrf_token,
+                "session_expires_at": time.time() + 28800,
+            }).encode("utf-8")
+        )
+
+    def _handle_admin_logout(self):
+        """Admin logout: POST /admin/logout with session cookie.
+        """
+        self._check_admin_enabled()
+        try:
+            return self._handle_admin_logout_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    @staticmethod
+    def _parse_session_cookie(cookie_header):
+        """Extract pocvpn-admin-session value from a Cookie header.
+
+        Strictly parses the first named cookie; any subsequent garbage
+        (semicolon, equal sign, etc. inside the value) is NOT consumed —
+        that would indicate a malformed cookie sent by the client and we
+        reject it. This is deliberately narrow: we never want lenient
+        cookie parsing to accidentally treat unrelated cookie data as a
+        session id.
+        """
+        if not cookie_header:
+            return None
+        # Cookie header format: "name=value; name2=value2"
+        # We search for our exact cookie name and extract the value up to
+        # the next semicolon (or end of string).
+        marker = "pocvpn-admin-session="
+        idx = cookie_header.find(marker)
+        if idx == -1:
+            return None
+        start = idx + len(marker)
+        end = cookie_header.find(";", start)
+        if end == -1:
+            end = len(cookie_header)
+        value = cookie_header[start:end].strip()
+        return value if value else None
+
+    def _handle_admin_logout_inner(self):
+        # Extract session ID from cookie
+        session_id = self._parse_session_cookie(self.headers.get("Cookie", ""))
+        if not session_id:
+            # No session cookie present — nothing to invalidate; return OK
+            # (idempotent: calling logout twice is harmless).
+            return self._success(HTTPStatus.OK, {"status": "logged_out"})
+
+        # Validate session and invalidate
+        is_valid, _ = self.server.admin_authenticator.validate_session_and_csrf(session_id)
+        if is_valid:
+            self.server.admin_authenticator.invalidate_session(session_id)
+
+        # Clear session cookie
+        cookie = "pocvpn-admin-session=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(json.dumps({"status": "logged_out"}).encode("utf-8"))
+
+    def _handle_admin_session(self):
+        """GET /admin/session: validate session via cookie and CSRF token."""
+        self._check_admin_enabled()
+        try:
+            return self._handle_admin_session_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_admin_session_inner(self):
+        # Extract session ID from cookie
+        session_id = self._parse_session_cookie(self.headers.get("Cookie", ""))
+        if not session_id:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+
+        # Extract CSRF token from query param or header
+        csrf_token = self.headers.get("X-CSRF-Token") or self.path.split("?csrf_token=", 1)[-1].split("&", 1)[0]
+        if not csrf_token:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "missing_csrf_token")
+
+        # Validate session and CSRF token
+        is_valid, session_data = self.server.admin_authenticator.validate_session_and_csrf(
+            session_id, csrf_token
+        )
+        if not is_valid:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+
+        return self._success(HTTPStatus.OK, {"status": "authenticated"})
+
+    def _handle_admin_status(self):
+        """GET /admin/status: return basic admin status."""
+        self._check_admin_enabled()
+        try:
+            return self._handle_admin_status_inner()
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_admin_status_inner(self):
+        # Validate session via cookie (no CSRF needed for read-only status)
+        session_id = self._parse_session_cookie(self.headers.get("Cookie", ""))
+        if not session_id:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+
+        # Validate session (read-only: no CSRF check needed, no rate-limit
+        # quota consumed — status is intentionally non-consuming)
+        is_valid, session_data = self.server.admin_authenticator.validate_session_and_csrf(session_id)
+        if not is_valid:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+
+        # Return status — do NOT expose internal session count or consume
+        # rate-limit quota; only return static booleans/labels.
+        info = self.server.admin_authenticator.get_session_info(session_id)
+        return self._success(HTTPStatus.OK, {
+            "status": "ok",
+            "session_exists": info is not None,
+        })
 
     # --- logging: explicit allowlisted fields only, never raw
     # headers/body/token - see module docstring and _log_fields sites

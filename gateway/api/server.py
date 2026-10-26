@@ -14,6 +14,8 @@ from http.server import ThreadingHTTPServer
 from . import config as config_module
 from . import ingress_config as ingress_config_module
 from . import admission, ratelimit
+from . import admin_auth
+from . import admin_ratelimit
 from .handler import ProvisioningRequestHandler
 
 _BIND_HOST = "127.0.0.1"
@@ -94,6 +96,24 @@ class ProvisioningServer(ThreadingHTTPServer):
         )
         self.field_enrollment_global_limiter = ratelimit.RateLimiter(
             _FIELD_ENROLLMENT_GLOBAL_RATE_LIMIT, _FIELD_ENROLLMENT_GLOBAL_RATE_WINDOW_SECONDS, clock=time.monotonic
+        )
+        # M3: admin authentication and rate limiting support — gated on
+        # admin_enabled so that deployments without ADMIN_SECRET_FILE do not
+        # fail at startup (AdminAuthenticator raises ConfigError when the
+        # secret file is blank/missing). handler.py's _check_admin_enabled
+        # then returns 503 for every admin endpoint when these are None.
+        self.admin_authenticator = (
+            admin_auth.AdminAuthenticator(app_config.admin_secret_file)
+            if app_config.admin_enabled else None
+        )
+        self.admin_rate_limiter = (
+            admin_ratelimit.AdminRateLimiter(
+                per_account_max=30,
+                global_max=300,
+                window_seconds=600.0,
+                clock=time.monotonic,
+            )
+            if app_config.admin_enabled else None
         )
 
 
