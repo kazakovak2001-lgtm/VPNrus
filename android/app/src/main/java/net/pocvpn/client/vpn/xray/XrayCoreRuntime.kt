@@ -70,11 +70,27 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
         libv2ray.Libv2ray.newCoreController(NoopCoreCallbackHandler)
     }
 
+    /** Chooses the geo asset directory (user-activated dataset, else the bundled one, else the plain root). */
+    @Volatile
+    private var geoDirs: GeoAssetDirProvider? = null
+
     override fun ensureCoreEnvInitialized(context: Context) {
-        if (!envInitialized.compareAndSet(false, true)) return
+        if (!envInitialized.compareAndSet(false, true)) {
+            refreshGeoAssetDirectory()
+            return
+        }
         try {
             go.Seq.setContext(context.applicationContext)
-            val assetDir = java.io.File(context.noBackupFilesDir, "xray-assets").apply { mkdirs() }
+            val assetRoot = java.io.File(context.noBackupFilesDir, "xray-assets").apply { mkdirs() }
+            // Settings -> GeoData: the directory handed to the core is a verified `geo-<id>` dataset
+            // directory holding geoip.dat and geosite.dat at its top level (the user-activated one, else
+            // the one staged from the APK's bundled assets). It never throws and never fails the start:
+            // on any problem the directory is the plain `xray-assets` root, i.e. what this call used before.
+            val provider = GeoAssetDirProvider(assetRoot, context.assets.asGeoAssetSource()) { line ->
+                android.util.Log.i("GeoData", line)
+            }
+            geoDirs = provider
+            val assetDir = provider.resolveInitial().directory
             // deviceId personalizes XUDP session base keys only (an anti-fingerprinting
             // refinement, not connection-critical, not a credential) - this adapter shell
             // does not implement v2rayNG's per-device derivation yet, so this is left
@@ -83,6 +99,22 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
         } catch (t: Throwable) {
             envInitialized.set(false)
             throw t
+        }
+    }
+
+    /**
+     * Later starts in the same process: when the user activated a different dataset since the last start and
+     * the core is NOT running, point the core environment at it before the next `startLoop`. A running core is
+     * never re-pointed (there is no hot reload). Best effort: any failure keeps the directory already in use.
+     */
+    private fun refreshGeoAssetDirectory() {
+        val provider = geoDirs ?: return
+        try {
+            if (controller.isRunning) return
+            val changed = provider.changedResolution() ?: return
+            libv2ray.Libv2ray.initCoreEnv(changed.directory.absolutePath, "")
+        } catch (t: Throwable) {
+            android.util.Log.w("GeoData", "geo data: could not refresh asset directory (${t.javaClass.simpleName})")
         }
     }
 

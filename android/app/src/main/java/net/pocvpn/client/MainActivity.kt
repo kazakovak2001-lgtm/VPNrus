@@ -39,6 +39,7 @@ import net.pocvpn.client.ui.theme.NovaVpnTheme
 class MainActivity : AppCompatActivity() {
 
     private lateinit var viewModel: MainViewModel
+    private lateinit var geoDataViewModel: net.pocvpn.client.geodata.GeoDataViewModel
 
     private val vpnPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -79,6 +80,10 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewModel = ViewModelProvider(this, MainViewModel.Factory(applicationContext))[MainViewModel::class.java]
+        geoDataViewModel = ViewModelProvider(
+            this,
+            net.pocvpn.client.geodata.GeoDataViewModel.Factory(applicationContext),
+        )[net.pocvpn.client.geodata.GeoDataViewModel::class.java]
         handleActivationAppLinkIntent(intent)
 
         setContent {
@@ -89,6 +94,7 @@ class MainActivity : AppCompatActivity() {
                     onRequestVpnPermission = { intent: Intent -> vpnPermissionLauncher.launch(intent) },
                     isZeroTouchEnrollmentBuild = BuildConfig.FIELD_ENROLLMENT_ENABLED,
                     onLaunchActivationFilePicker = { mimeTypes -> activationFileLauncher.launch(mimeTypes) },
+                    geoDataViewModel = geoDataViewModel,
                 )
             }
         }

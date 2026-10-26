@@ -34,6 +34,7 @@ import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
 import net.pocvpn.client.ui.screens.FieldTestDialog
+import net.pocvpn.client.ui.screens.GeoDataScreen
 import net.pocvpn.client.ui.screens.HomeScreen
 import net.pocvpn.client.ui.screens.SettingsScreen
 import net.pocvpn.client.vpn.AlwaysOnDetectionState
@@ -54,7 +55,7 @@ import net.pocvpn.client.vpn.policy.AppRoutingPolicy
  * navigation-compose dependency added for two screens, consistent with
  * DiagnosticsDialog's existing plain-boolean-toggle approach.
  */
-internal enum class SettingsRoute { Settings, AppSelector }
+internal enum class SettingsRoute { Settings, AppSelector, GeoData }
 
 private const val UI_HINT_PREFS = "nova_ui_hints"
 private const val LOCKDOWN_HINT_DISMISSED = "lockdown_hint_dismissed"
@@ -79,7 +80,7 @@ private fun openAndroidVpnSettings(context: android.content.Context) {
  * unit-testable without a Compose test harness.
  */
 internal fun settingsBackTarget(current: SettingsRoute?): SettingsRoute? = when (current) {
-    SettingsRoute.AppSelector -> SettingsRoute.Settings
+    SettingsRoute.AppSelector, SettingsRoute.GeoData -> SettingsRoute.Settings
     SettingsRoute.Settings, null -> null
 }
 
@@ -109,6 +110,8 @@ fun AppRoot(
     // to a no-op so every pre-existing preview/test caller of AppRoot stays
     // unaffected.
     onLaunchActivationFilePicker: (Array<String>) -> Unit = {},
+    // Settings -> GeoData. Null (previews/tests) simply hides the Settings entry.
+    geoDataViewModel: net.pocvpn.client.geodata.GeoDataViewModel? = null,
 ) {
     val profileSource by viewModel.profileSource.collectAsStateWithLifecycle()
     val transportState by viewModel.transportState.collectAsStateWithLifecycle()
@@ -305,6 +308,20 @@ fun AppRoot(
                     },
                     onBack = { settingsRoute = SettingsRoute.Settings },
                 )
+                settingsRoute == SettingsRoute.GeoData && geoDataViewModel != null -> {
+                    val geoState by geoDataViewModel.state.collectAsStateWithLifecycle()
+                    LaunchedEffect(Unit) { geoDataViewModel.refreshStatus() }
+                    GeoDataScreen(
+                        state = geoState,
+                        onGeoipChanged = geoDataViewModel::onGeoipInputChanged,
+                        onGeositeChanged = geoDataViewModel::onGeositeInputChanged,
+                        onSave = { geoDataViewModel.save() },
+                        onUpdate = geoDataViewModel::startUpdate,
+                        onCancel = geoDataViewModel::cancelUpdate,
+                        onUseBundled = geoDataViewModel::useBundled,
+                        onBack = { settingsRoute = SettingsRoute.Settings },
+                    )
+                }
                 // B8H - "Settings -> Split tunneling". Saving here NEVER
                 // touches the transport/tunnel (see MainViewModel
                 // .updateAppRoutingPolicy's own docs) - showReconnectNotice
@@ -336,6 +353,11 @@ fun AppRoot(
                     onClearDiagnosticsClick = { viewModel.clearDiagnosticSessions() },
                     onNetworkCheckClick = { showFieldTest = true },
                     onOpenVpnSettingsClick = { openAndroidVpnSettings(context) },
+                    onGeoDataClick = if (geoDataViewModel != null) {
+                        { settingsRoute = SettingsRoute.GeoData }
+                    } else {
+                        null
+                    },
                 )
                 else -> HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),

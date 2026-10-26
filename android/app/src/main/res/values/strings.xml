@@ -168,4 +168,24 @@
     <string name="diagnostics_save_locally">Save diagnostics locally (debug only)</string>
     <string name="diagnostics_save_locally_status">Local diagnostics save: %1$s</string>
     <string name="diagnostics_public_key_copied">Public key copied</string>
+
+    <!-- Settings / GeoData -->
+    <string name="geodata_title">GeoData</string>
+    <string name="settings_geodata_row_title">GeoData</string>
+    <string name="settings_geodata_row_subtitle">geoip.dat and geosite.dat: status, sources, updates</string>
+    <string name="geodata_explanation">GeoIP and Geosite databases used by the Xray core. You can download newer versions from your own https:// addresses without updating the app.</string>
+    <string name="geodata_status_title">In use</string>
+    <string name="geodata_status_loading">Reading the databases...</string>
+    <string name="geodata_urls_title">Sources</string>
+    <string name="geodata_urls_helper">Each file has its own address. Leave one empty to keep the current file of that kind.</string>
+    <string name="geodata_geoip_url_label">geoip.dat address</string>
+    <string name="geodata_geosite_url_label">geosite.dat address</string>
+    <string name="geodata_save">Save addresses</string>
+    <string name="geodata_save_failed">The addresses could not be saved.</string>
+    <string name="geodata_update_title">Update</string>
+    <string name="geodata_update_button">Download and update</string>
+    <string name="geodata_starting">Starting...</string>
+    <string name="geodata_cancelling">Cancelling...</string>
+    <string name="geodata_cancel">Cancel</string>
+    <string name="geodata_use_bundled">Use built-in databases</string>
 </resources>
