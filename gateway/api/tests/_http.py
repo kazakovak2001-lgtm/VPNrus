@@ -212,3 +212,48 @@ def get_relay_health(port, token=None, method="GET", extra_headers=None):
     if extra_headers:
         headers.update(extra_headers)
     return raw_request(port, method, "/v1/relay-health", headers, b"")
+
+
+def post_admin_login(port, password, extra_headers=None):
+    """POST /admin/login: raw password in JSON body (B8B1D M3)."""
+    body = json.dumps({"password": password}).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "POST", "/admin/login", headers, body)
+
+
+def post_admin_logout(port, cookie=None, extra_headers=None):
+    """POST /admin/logout: session cookie (B8B1D M3)."""
+    headers = {}
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "POST", "/admin/logout", headers, b"")
+
+
+def get_admin_session(port, cookie=None, csrf_token=None, extra_headers=None):
+    """GET /admin/session: validate session via cookie + CSRF (B8B1D M3)."""
+    headers = {}
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    if csrf_token is not None:
+        headers["X-CSRF-Token"] = csrf_token
+    path = "/admin/session"
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "GET", path, headers, b"")
+
+
+def get_admin_status(port, cookie=None, extra_headers=None):
+    """GET /admin/status: read-only status check (B8B1D M3)."""
+    headers = {}
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    if extra_headers:
+        headers.update(extra_headers)
+    return raw_request(port, "GET", "/admin/status", headers, b"")

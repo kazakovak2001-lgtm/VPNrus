@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from . import client_identity
+from . import admin_auth, client_identity
 from .wgkey import is_valid_wg_public_key
 
 HYSTERIA2_OBFS_PASSWORD_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
@@ -171,6 +171,16 @@ class AppConfig:
     # A FILE PATH only - this process reads its contents transiently, once
     # per request, never logs them, never returns them.
     relay_probe_hmac_secret_file: str = ""
+
+    # B8B1D - admin authentication and session management (M3).
+    # admin_secret_file: optional path to the admin secret file (the admin
+    # password: 32 printable ASCII chars, see admin_auth.read_admin_secret).
+    # Blank (the default) means admin authentication is not configured and
+    # always fails closed with 503 for any admin endpoint.
+    admin_secret_file: str = ""
+    # admin_enabled: boolean derived from admin_secret_file presence.
+    # Used internally; not part of the serialized config.
+    admin_enabled: bool = False
 
     # Russia field-test zero-touch enrollment (POST /v1/field-enroll) - see
     # field_enrollment.py's own module docstring. Disabled by default (the
@@ -804,6 +814,21 @@ def load_config(env=None):
                 f"{_ENV_PREFIX}HYSTERIA2_OBFS_PASSWORD_FILE must contain 32-128 characters of [A-Za-z0-9_-]"
             )
 
+
+    # B8B1D: admin authentication configuration (M3).
+    # admin_secret_file: optional path to the admin secret file - see
+    # admin_auth.read_admin_secret, the single validator for its format.
+    # Blank (the default) means admin authentication is not configured and
+    # always fails closed with 503 for any admin endpoint.
+    admin_secret_file = _get(env, "ADMIN_SECRET_FILE")
+    if admin_secret_file:
+        if not os.path.isabs(admin_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_SECRET_FILE must be an absolute path: {admin_secret_file!r}")
+        try:
+            admin_auth.read_admin_secret(admin_secret_file)
+        except admin_auth.ConfigError as exc:
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_SECRET_FILE: {exc}")
+
     # B46-4P.2 - see AppConfig.hysteria2_auth_backend_port's own docs.
     hysteria2_auth_backend_port_raw = _get(env, "HYSTERIA2_AUTH_BACKEND_PORT")
     hysteria2_auth_backend_port = 0
@@ -826,6 +851,13 @@ def load_config(env=None):
                 f"{_ENV_PREFIX}HYSTERIA2_AUTH_BACKEND_PORT must differ from {_ENV_PREFIX}API_PORT "
                 "- the auth backend is a separate loopback-only listener"
             )
+
+    # Determine admin_enabled from successful secret validation.
+    # The ADMIN_SECRET_FILE validation above already raises ConfigError
+    # for any missing/invalid admin_secret_file, so reaching this point with
+    # admin_secret_file truthy guarantees the file is valid. No need to
+    # re-open it here.
+    admin_enabled = bool(admin_secret_file)
 
     return AppConfig(
         endpoint_host=endpoint_host,
@@ -878,5 +910,7 @@ def load_config(env=None):
         hysteria2_sni=hysteria2_sni,
         hysteria2_auth_backend_port=hysteria2_auth_backend_port,
         hysteria2_obfs_password=hysteria2_obfs_password,
+        admin_secret_file=admin_secret_file,
         gateway_self_addresses=_parse_gateway_self_addresses(_get(env, "GATEWAY_SELF_ADDRESSES")),
+        admin_enabled=admin_enabled,
     )
