@@ -332,6 +332,7 @@ class GeoDataUpdaterTest {
         // the :xray process starts its core on the first dataset and records that
         val provider = GeoAssetDirProvider(root, bundled)
         assertEquals(first.datasetId, provider.resolveInitial().datasetId)
+        provider.markApplied()
         // two further updates happen while that core keeps running
         for (n in 2..3) {
             http.serve(ipUrl, GeoTestData.geoip("CN", "N$n"))
@@ -389,6 +390,8 @@ class GeoDataUpdaterTest {
         val provider = GeoAssetDirProvider(root, bundled)
         val first = provider.resolveInitial()
         assertEquals(GeoDataOrigin.BUNDLED, first.origin)
+        assertNull("a proposal alone is not recorded as handed to the core", GeoAssetDirProvider.readEffectiveId(root))
+        provider.markApplied()
         assertEquals(first.datasetId, GeoAssetDirProvider.readEffectiveId(root))
         assertNull("nothing changed yet", provider.changedResolution())
 
@@ -397,9 +400,29 @@ class GeoDataUpdaterTest {
         val changed = provider.changedResolution()!!
         assertEquals(GeoDataOrigin.DOWNLOADED, changed.origin)
         assertEquals(updated.datasetId, changed.datasetId)
+        assertEquals("not recorded until the core environment was really updated", first.datasetId, GeoAssetDirProvider.readEffectiveId(root))
+        provider.markApplied()
         assertEquals(updated.datasetId, GeoAssetDirProvider.readEffectiveId(root))
         assertEquals(updated.datasetId, updater().status().coreDatasetId)
         assertNull("asking again without a change is a no-op", provider.changedResolution())
+    }
+
+    @Test
+    fun `a refresh whose initCoreEnv failed is neither recorded nor forgotten`() {
+        newRoot()
+        val provider = GeoAssetDirProvider(root, bundled)
+        val first = provider.resolveInitial()
+        provider.markApplied()
+        serveV2()
+        val updated = updater().update(settings) as GeoUpdateResult.Updated
+        // the runtime got a proposal but initCoreEnv threw, so markApplied is never called
+        assertEquals(updated.datasetId, provider.changedResolution()!!.datasetId)
+        assertEquals(first.datasetId, GeoAssetDirProvider.readEffectiveId(root))
+        // the next start proposes it again
+        assertEquals(updated.datasetId, provider.changedResolution()!!.datasetId)
+        provider.markApplied()
+        assertEquals(updated.datasetId, GeoAssetDirProvider.readEffectiveId(root))
+        assertNull(provider.changedResolution())
     }
 
     @Test
@@ -407,6 +430,7 @@ class GeoDataUpdaterTest {
         newRoot()
         val provider = GeoAssetDirProvider(root, bundled)
         val first = provider.resolveInitial()
+        provider.markApplied()
         http.status(ipUrl, 503)
         http.status(siteUrl, 503)
         updater().update(settings)

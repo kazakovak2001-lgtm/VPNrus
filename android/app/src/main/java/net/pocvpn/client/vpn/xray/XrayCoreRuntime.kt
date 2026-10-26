@@ -102,6 +102,7 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
             // does not implement v2rayNG's per-device derivation yet, so this is left
             // empty rather than fabricating an unverified algorithm.
             libv2ray.Libv2ray.initCoreEnv(assetDir.absolutePath, "")
+            provider.markApplied()
         } catch (t: Throwable) {
             envInitialized.set(false)
             throw t
@@ -119,6 +120,7 @@ class LibXrayCoreRuntime : XrayCoreRuntime {
             if (controller.isRunning) return
             val changed = provider.changedResolution() ?: return
             libv2ray.Libv2ray.initCoreEnv(changed.directory.absolutePath, "")
+            provider.markApplied()
         } catch (t: Throwable) {
             android.util.Log.w("GeoData", "geo data: could not refresh asset directory (${t.javaClass.simpleName})")
         }

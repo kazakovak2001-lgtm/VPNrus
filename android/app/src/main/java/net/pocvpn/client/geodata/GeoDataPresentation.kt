@@ -119,7 +119,7 @@ object GeoDataPresentation {
     fun describeCoreUsage(status: GeoDataStatus): String? {
         val active = status.datasetId ?: return null
         val core = status.coreDatasetId ?: return "Not used by the VPN core yet - it picks them up at the next Xray connection."
-        return if (core == active) "In use by the VPN core." else "The VPN core is still on the previous databases; it switches at the next Xray connection."
+        return if (core == active) "Handed to the VPN core at its last start." else "The VPN core was last started with the previous databases; it switches at the next Xray connection."
     }
 
     fun formatBytes(bytes: Long): String = when {

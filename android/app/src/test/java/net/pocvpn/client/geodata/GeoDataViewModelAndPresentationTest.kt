@@ -267,9 +267,9 @@ class GeoDataViewModelAndPresentationTest {
 
         val downloaded = bundled.copy(origin = GeoDataOrigin.DOWNLOADED, activatedAtMillis = 1_700_000_000_000L, coreDatasetId = "aaaaaaaaaaaaaaaa")
         assertTrue(GeoDataPresentation.describeOrigin(downloaded).startsWith("Downloaded databases (activated"))
-        assertEquals("In use by the VPN core.", GeoDataPresentation.describeCoreUsage(downloaded))
+        assertEquals("Handed to the VPN core at its last start.", GeoDataPresentation.describeCoreUsage(downloaded))
         val behind = downloaded.copy(coreDatasetId = "bbbbbbbbbbbbbbbb")
-        assertTrue(GeoDataPresentation.describeCoreUsage(behind)!!.contains("still on the previous"))
+        assertTrue(GeoDataPresentation.describeCoreUsage(behind)!!.contains("last started with the previous"))
         assertNull(GeoDataPresentation.describeCoreUsage(bundled.copy(datasetId = null)))
         assertNotNull(GeoDataPresentation.RESTART_NOTICE)
         assertTrue(GeoDataPresentation.RESTART_NOTICE.contains("already running"))
