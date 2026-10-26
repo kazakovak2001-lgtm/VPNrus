@@ -73,7 +73,7 @@ data class GeoDataStatus(
  * Safety properties (each is covered by a unit test):
  * - Nothing in use is ever written: downloads go to a temp directory, the new pair is published as a new
  *   content-addressed `geo-<id>` directory by [GeoDataStager], and only then does the pointer flip (atomic rename).
- *   Any failure before the flip leaves the previous pointer, and so the previous working databases, in place.
+ *   Any failure before the flip leaves the pointer, and so the currently active databases, unchanged.
  * - Both files of an update are validated before either is activated. With only one URL configured the other
  *   file is carried over from the currently active dataset (or the bundled one), so the activated pair is always complete.
  * - Concurrent updates (also from another process) are refused via a lock file; they cannot interleave.
@@ -199,7 +199,7 @@ class GeoDataUpdater(
         try {
             GeoActiveDataset.writePointer(root, pointer)
         } catch (e: IOException) {
-            return GeoUpdateResult.Failed(GeoUpdateFailureKind.ACTIVATION_FAILED, detail = "The new databases could not be activated; the previous ones are unchanged.")
+            return GeoUpdateResult.Failed(GeoUpdateFailureKind.ACTIVATION_FAILED, detail = "The new databases could not be activated; the currently active ones are unchanged.")
         }
         // Also keep the dataset the running VPN core was started with: two quick updates must not remove the
         // directory a still-running core was pointed at.
