@@ -50,15 +50,25 @@ Hashová shoda s vydáním `202503262212`:
 
 Soubory stažené při auditu měly lokálně spočtené SHA-256 shodné s hodnotami v bodě 1.
 
-## 3. Stav stagingu (neslučovat s dodaným stavem)
+## 3. Stav stagingu a stahování v aplikaci
 
-Runtime staging (`GeoDataStager`) existuje pouze na nezmergované větvi `feature/geo-phase-a-bundled-assets`, HEAD `75c4cd35fac0667c3ccd69ecdc226cbbf0725f50`. **Není součástí `main` ani produkčního buildu.**
+Stav k merge commitu `053f053` (PR #190 „GeoData settings and updater“, `main`): runtime staging (`GeoDataStager`) a Settings -> GeoData **jsou součástí `main`**. Tento dokument je psán proti tomuto stavu. Dřívější experimentální větev `feature/geo-phase-a-bundled-assets` už není relevantní zdroj.
 
-Plánovaná cesta po případném sloučení příslušné změny:
+Cesta přibalených databází:
 
-AAR assets → APK assets → `GeoDataStager` → `noBackupFilesDir/xray-assets/geo-<id>`
+AAR assets → APK assets → `GeoDataStager` → `noBackupFilesDir/xray-assets/geo-<id>` → adresář předaný `Libv2ray.initCoreEnv` v procesu `:xray`
 
-Do té doby není tvrzení o stagingu dodanou vlastností produktu.
+Cesta databází stažených uživatelem (Settings -> GeoData):
+
+URL zadaná uživatelem (https) → dočasné stažení → strukturální validace → nový `geo-<id>` (marker `user-download`) → pointer `.geo-active.json` → stejný `initCoreEnv` při příštím startu jádra
+
+Vlastnosti důležité pro licence a distribuci (podloženo kódem a dokumentací `docs/ROADMAP.md` a `PROJECT_ARCHITECTURE.md`, ne právním posouzením):
+
+- Aplikace **nemá žádné výchozí URL** a sama nic nestahuje. Stahuje jen na výslovnou akci uživatele z adresy, kterou uživatel zadal. Zdroj a jeho licence u stažených databází tedy určuje uživatel, ne tento dokument. Právní povinnosti projektu VPNrus vyplývající z toho, že funkci nabízí, **nebyly posouzeny** (UNKNOWN — legal confirmation required).
+- Přibalené databáze (body 1 a 2) se distribuují v AAR/APK i bez této funkce. Jejich licenční stav (body 4 až 9) se tím nemění.
+- Stažení provádí aplikace sama mimo VPN tunel; zdroj tedy vidí skutečnou síťovou adresu uživatele (uvedeno i v UI).
+- Aktualizace pointeru je atomická a při selhání zůstávají dosavadní databáze; staré stažené datasety se po aktualizaci mažou (kromě aktivního, předchozího a toho, se kterým naposledy startovalo jádro). To je technická vlastnost, ne odpověď na otázku povinnosti zničit starší verze podle EULA MaxMind (bod 4.3).
+- Jádro zatím databáze při routování nepoužívá (renderer nevydává žádná pravidla `geoip:`/`geosite:`). Běh na zařízení v minulosti ověřil jen předání správného adresáře jádru při startu a samostatný experiment (mimo `main`) načtení databází jádrem; funkčnost není licenční důkaz.
 
 ## 4. `geoip.dat`: vstupy a licence
 
