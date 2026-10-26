@@ -610,7 +610,7 @@ class FieldTestRunnerTest {
         // "Cloudflare trace after hold" is the last https probe of a run.
         var traces = 0
         host.beforeInTunnelProbe = { l, u ->
-            if (l == "GERMANY / AMNEZIA_WG" && u == FieldTestTargets.CLOUDFLARE_TRACE && ++traces == 2) {
+            if (l == "GERMANY / AMNEZIA_WG" && u == FieldTestTargets.CLOUDFLARE_TRACE_IPV4 && ++traces == 2) {
                 host.transportState.value = TransportState.Reconnecting(1)
                 kotlinx.coroutines.delay(100)
                 host.transportState.value = TransportState.Connected
@@ -647,6 +647,27 @@ class FieldTestRunnerTest {
         assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, v.egress)
         assertEquals(PathEvidence.SOCKET_BOUND_AND_EGRESS_DIFFERS, v.evidence)
         assertEquals(SessionValidity.STABLE, v.session)
+    }
+
+    @Test
+    fun `on a dual-stack network the reference and the exit are both read over IPv4`() = runTest {
+        val host = FakeHost()
+        val base = fakeProbes(host)
+        val traceUrls = mutableListOf<Pair<String, String>>()
+        val probes = FieldProbeSet(
+            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks,
+            https = { label, url, network, maxBytes, parseTrace ->
+                if (parseTrace) traceUrls += label to url
+                val result = base.https(label, url, network, maxBytes, parseTrace)
+                // The hostname trace answers over IPv6 on a dual-stack network; only the IP literal is IPv4.
+                if (parseTrace && url == FieldTestTargets.CLOUDFLARE_TRACE) result.copy(trace = result.trace + ("ip" to "2001:db8::7")) else result
+            },
+        )
+        val v = runner(host, probes).run { }.runByLabel("GERMANY / AMNEZIA_WG").pathVerdict!!
+        assertEquals(FieldTestTargets.CLOUDFLARE_TRACE_IPV4, traceUrls.first { it.first == "Cloudflare trace" }.second)
+        assertEquals(FieldTestTargets.CLOUDFLARE_TRACE_IPV4, traceUrls.first { it.first == "Cloudflare trace (exit)" }.second)
+        assertEquals(EgressResult.DIFFERS_FROM_PHYSICAL, v.egress)
+        assertEquals(TunnelPathResult.CONFIRMED, v.tunnelPath)
     }
 
     @Test

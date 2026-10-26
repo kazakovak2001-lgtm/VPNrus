@@ -107,6 +107,12 @@ data class FieldTestTimings(
 object FieldTestTargets {
     const val CONNECTIVITY_204 = "https://connectivitycheck.gstatic.com/generate_204"
     const val CLOUDFLARE_TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
+    /**
+     * IPv4-only trace (an IP literal, so no AAAA). The physical reference and the in-tunnel exit
+     * are both read here: on a dual-stack network the hostname trace answers over IPv6 while the
+     * tunnel exits over IPv4, and two families can never be compared (FAMILY_MISMATCH).
+     */
+    const val CLOUDFLARE_TRACE_IPV4 = "https://1.1.1.1/cdn-cgi/trace"
     const val BULK_DIRECT = "https://speed.cloudflare.com/__down?bytes=262144"
     const val BULK_TUNNEL = "https://speed.cloudflare.com/__down?bytes=1048576"
 
@@ -496,7 +502,7 @@ class FieldTestRunner(
         // country/edge saw us. R1-S2: it is first kept in memory as the independent physical
         // reference the in-tunnel egress is compared with, only while confirmed Disconnected.
         val disconnectedBeforeTrace = host.transportState.value is TransportState.Disconnected
-        val directTrace = probes.https("Cloudflare trace", FieldTestTargets.CLOUDFLARE_TRACE, null, 4 * 1024, true)
+        val directTrace = probes.https("Cloudflare trace", FieldTestTargets.CLOUDFLARE_TRACE_IPV4, null, 4 * 1024, true)
         physicalReference = directTrace.takeIf {
             disconnectedBeforeTrace && host.transportState.value is TransportState.Disconnected && it.httpStatus != null
         }?.trace?.get("ip")
@@ -703,7 +709,7 @@ class FieldTestRunner(
             if (connected && !coreMeasured && !appExcluded && boundForProbes != null) {
                 val vpn = boundForProbes.network
                 FieldTestTargets.TUNNEL_HTTP.drop(1).forEach { (label, url) -> probeResults += probes.https(label, url, vpn, 64 * 1024, false) }
-                val trace = probes.https("Cloudflare trace (exit)", FieldTestTargets.CLOUDFLARE_TRACE, vpn, 4 * 1024, true)
+                val trace = probes.https("Cloudflare trace (exit)", FieldTestTargets.CLOUDFLARE_TRACE_IPV4, vpn, 4 * 1024, true)
                 probeResults += trace
                 val observedExitIp = trace.trace["ip"]
                 exitIp = observedExitIp
@@ -712,7 +718,7 @@ class FieldTestRunner(
                 throughput = probes.https("Bulk 1MB", FieldTestTargets.BULK_TUNNEL, vpn, 1_048_576, false)
                 delay(timings.stabilityHoldMs)
                 stability += probes.https("Google 204 after hold", FieldTestTargets.CONNECTIVITY_204, vpn, 4 * 1024, false)
-                stability += probes.https("Cloudflare trace after hold", FieldTestTargets.CLOUDFLARE_TRACE, vpn, 4 * 1024, true)
+                stability += probes.https("Cloudflare trace after hold", FieldTestTargets.CLOUDFLARE_TRACE_IPV4, vpn, 4 * 1024, true)
                 leaks = probes.leaks(vpn, directResolver, baselineHasGlobalIpv6)
                 // B54 Scope B - the results only count for the session they were bound to:
                 // still Connected and still the same VPN network instance.
