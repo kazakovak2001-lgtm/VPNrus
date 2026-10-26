@@ -77,6 +77,10 @@ _PATH_MANIFEST = "/v1/manifest"
 _PATH_RELAY_HEALTH = "/v1/relay-health"
 _PATH_FIELD_ENROLL = "/v1/field-enroll"
 _PATH_HYSTERIA_PROFILE = "/v1/hysteria-profile"
+_PATH_ADMIN_LOGIN = "/admin/login"
+_PATH_ADMIN_LOGOUT = "/admin/logout"
+_PATH_ADMIN_SESSION = "/admin/session"
+_PATH_ADMIN_STATUS = "/admin/status"
 
 # B26 (task B) - the same TransportKind.name strings Android's TransportKind
 # enum uses (see transport/TransportKind.kt - no custom toString(), so
@@ -145,15 +149,10 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(_SOCKET_TIMEOUT_SECONDS)
 
-    # --- admin endpoint paths ---
-    _PATH_ADMIN_LOGIN = "/admin/login"
-    _PATH_ADMIN_LOGOUT = "/admin/logout"
-    _PATH_ADMIN_SESSION = "/admin/session"
-    _PATH_ADMIN_STATUS = "/admin/status"
-
     def _check_admin_enabled(self):
-        """Check if admin authentication is enabled."""
-        if not getattr(self.server.config, "admin_enabled", False):
+        """Fail closed (503) unless admin auth is configured. Called inside
+        each admin handler's try so the 503 reaches the client as-is."""
+        if not getattr(self.server.config, "admin_enabled", False) or self.server.admin_authenticator is None:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "admin_not_configured")
 
     # --- method dispatch: every verb routes through one place so 404 vs
@@ -1298,8 +1297,8 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
     def _handle_admin_login(self):
         """Admin login: POST /admin/login with raw password in body.
         """
-        self._check_admin_enabled()
         try:
+            self._check_admin_enabled()
             return self._handle_admin_login_inner()
         except _RequestError as exc:
             return self._error(exc.status, exc.error_code)
@@ -1345,23 +1344,21 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             password, source_ip
         )
         if not success:
-            raise _RequestError(
-                HTTPStatus.UNAUTHORIZED if error_msg == "unauthorized" else HTTPStatus.TOO_MANY_REQUESTS,
-                error_msg
-            )
+            # Fixed codes only (admin_auth returns exactly these three).
+            status = {
+                "unauthorized": HTTPStatus.UNAUTHORIZED,
+                "invalid_password": HTTPStatus.BAD_REQUEST,
+            }.get(error_msg, HTTPStatus.TOO_MANY_REQUESTS)
+            raise _RequestError(status, error_msg if status != HTTPStatus.TOO_MANY_REQUESTS else "rate_limited")
 
         # session_data is (session_id, csrf_token)
         session_id, csrf_token = session_data
 
-        # Determine whether to set the Secure flag: only when this vhost
-        # actually terminates TLS (admin endpoints MUST never ship cookies
-        # over cleartext). Here we follow the host's own TLS posture: the
-        # server binds 127.0.0.1 behind nginx, but the handler has no
-        # direct access to nginx's ssl state, so we conservatively omit
-        # Secure here — the nginx edge must enforce HTTPS for all /admin/*
-        # traffic (configured below). HttpOnly + SameSite=Strict are the
-        # baseline secure flags that apply regardless of transport.
-        cookie = f"pocvpn-admin-session={session_id}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=28800"
+        # Always Secure: /admin/* is only routed by the TLS vhost
+        # (nginx-pocvpn.conf, loopback/SSH-tunnel only), so the browser must
+        # never send this cookie over cleartext (e.g. a forced http:// hit
+        # on the port-80 server).
+        cookie = f"pocvpn-admin-session={session_id}; Path=/admin; Secure; HttpOnly; SameSite=Strict; Max-Age=28800"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
         self.send_header("Set-Cookie", cookie)
@@ -1374,12 +1371,13 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 "session_expires_at": time.time() + 28800,
             }).encode("utf-8")
         )
+        return HTTPStatus.OK
 
     def _handle_admin_logout(self):
         """Admin logout: POST /admin/logout with session cookie.
         """
-        self._check_admin_enabled()
         try:
+            self._check_admin_enabled()
             return self._handle_admin_logout_inner()
         except _RequestError as exc:
             return self._error(exc.status, exc.error_code)
@@ -1425,18 +1423,19 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             self.server.admin_authenticator.invalidate_session(session_id)
 
         # Clear session cookie
-        cookie = "pocvpn-admin-session=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0"
+        cookie = "pocvpn-admin-session=; Path=/admin; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
         self.send_header("Set-Cookie", cookie)
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(json.dumps({"status": "logged_out"}).encode("utf-8"))
+        return HTTPStatus.OK
 
     def _handle_admin_session(self):
         """GET /admin/session: validate session via cookie and CSRF token."""
-        self._check_admin_enabled()
         try:
+            self._check_admin_enabled()
             return self._handle_admin_session_inner()
         except _RequestError as exc:
             return self._error(exc.status, exc.error_code)
@@ -1447,8 +1446,9 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         if not session_id:
             raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
 
-        # Extract CSRF token from query param or header
-        csrf_token = self.headers.get("X-CSRF-Token") or self.path.split("?csrf_token=", 1)[-1].split("&", 1)[0]
+        # CSRF token from the X-CSRF-Token header only - never the URL,
+        # which would land in nginx access logs.
+        csrf_token = self.headers.get("X-CSRF-Token")
         if not csrf_token:
             raise _RequestError(HTTPStatus.BAD_REQUEST, "missing_csrf_token")
 
@@ -1463,8 +1463,8 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_admin_status(self):
         """GET /admin/status: return basic admin status."""
-        self._check_admin_enabled()
         try:
+            self._check_admin_enabled()
             return self._handle_admin_status_inner()
         except _RequestError as exc:
             return self._error(exc.status, exc.error_code)

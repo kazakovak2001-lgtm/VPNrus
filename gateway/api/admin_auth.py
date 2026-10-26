@@ -4,7 +4,8 @@ Provides password verification, session management with expiration,
 CSRF tokens, rate limiting, and secure cookie handling.
 
 Security features:
-- File-based secret (32 raw bytes)
+- File-based secret: the admin password itself, exactly 32 printable
+  ASCII characters (one trailing newline tolerated) - see read_admin_secret
 - HMAC password verification
 - Server-side session store with expiration
 - HttpOnly, SameSite=Strict cookies
@@ -26,6 +27,49 @@ from .auth_ratelimit import AuthFailureLimiter
 class ConfigError(Exception):
     """Raised for configuration errors."""
     pass
+
+
+ADMIN_SECRET_LENGTH = 32
+
+
+def read_admin_secret(path: str) -> bytes:
+    """Read and validate the admin secret file - the single validator used
+    by both config.load_config (startup) and AdminAuthenticator.
+
+    Format: the admin password itself, exactly ADMIN_SECRET_LENGTH printable
+    ASCII characters (0x21-0x7e). One trailing newline (LF or CRLF) is
+    tolerated so `head -c 32 ... > file; echo >> file` style files work;
+    nothing else is stripped. Error messages never include file content.
+
+    Raises:
+        ValueError: path is not absolute.
+        ConfigError: blank path, missing/unreadable file, wrong length or
+            non-printable content.
+    """
+    import os
+
+    if not path:
+        raise ConfigError("Admin secret file not configured")
+    if not os.path.isabs(path):
+        raise ValueError(f"admin secret file must be absolute: {path}")
+    if not os.path.isfile(path):
+        raise ConfigError(f"admin secret file does not exist: {path}")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise ConfigError(f"admin secret file cannot be read: {type(exc).__name__}")
+    if raw.endswith(b"\r\n"):
+        raw = raw[:-2]
+    elif raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if len(raw) != ADMIN_SECRET_LENGTH:
+        raise ConfigError(
+            f"admin secret file must contain exactly {ADMIN_SECRET_LENGTH} bytes, got {len(raw)}"
+        )
+    if any(b < 0x21 or b > 0x7E for b in raw):
+        raise ConfigError("admin secret file must contain only printable ASCII characters")
+    return raw
 
 
 class AdminAuthenticator:
@@ -68,41 +112,9 @@ class AdminAuthenticator:
         self._csrf_token_cache: Dict[str, str] = {}
 
     def _load_secret_hash(self) -> bytes:
-        """Load and validate the admin secret file.
-
-        Returns:
-            The raw secret bytes as a hex-encoded SHA256 hash.
-
-        Raises:
-            ConfigError: If the file is missing, unreadable, or invalid.
-        """
-        import os
-
-        if not self._secret_file:
-            raise ConfigError("Admin secret file not configured")
-
-        if not os.path.isabs(self._secret_file):
-            raise ValueError(f"admin secret file must be absolute: {self._secret_file}")
-
-        if not os.path.isfile(self._secret_file):
-            raise ConfigError(f"admin secret file does not exist: {self._secret_file}")
-
-        if not os.access(self._secret_file, os.R_OK):
-            raise ConfigError(f"admin secret file not readable: {self._secret_file}")
-
-        try:
-            with open(self._secret_file, "rb") as f:
-                raw_secret = f.read().strip()
-        except OSError as e:
-            raise ConfigError(f"admin secret file cannot be read: {e}")
-
-        if len(raw_secret) != 32:
-            raise ConfigError(
-                f"admin secret file must contain exactly 32 bytes, got {len(raw_secret)}"
-            )
-
-        # SHA256 hash of the secret
-        return hashlib.sha256(raw_secret).digest()
+        """Load the admin secret (see read_admin_secret) and return its
+        SHA-256 digest; the plaintext is never kept on the instance."""
+        return hashlib.sha256(read_admin_secret(self._secret_file)).digest()
 
     def _create_session(self, source_ip: str) -> Tuple[str, str]:
         """Create a new admin session.
@@ -117,13 +129,13 @@ class AdminAuthenticator:
         csrf_token = secrets.token_urlsafe(32)
 
         with self._sessions_lock:
-            expires_at = time.time() + 28800  # 8 hours
+            expires_at = time.monotonic() + 28800  # 8 hours
             self._sessions[session_id] = {
-                "created_at": time.time(),
+                "created_at": time.monotonic(),
                 "expires_at": expires_at,
                 "source_ip": source_ip,
                 "csrf_token": csrf_token,
-                "last_seen": time.time(),
+                "last_seen": time.monotonic(),
             }
             self._csrf_token_cache[session_id] = csrf_token
 
@@ -131,7 +143,7 @@ class AdminAuthenticator:
 
     def _cleanup_expired_sessions(self) -> None:
         """Remove expired sessions from the session store."""
-        now = time.time()
+        now = time.monotonic()
         with self._sessions_lock:
             expired_ids = [
                 sid for sid, data in self._sessions.items()
@@ -156,19 +168,31 @@ class AdminAuthenticator:
             A tuple of (success, (session_id, csrf_token), error_message).
         """
         # Rate limit check first (fail-closed)
-        allowed, retry_after = self._auth_failure_limiter.check_admission(
+        allowed, _retry_after = self._auth_failure_limiter.check_admission(
             source_ip, "admin"
         )
         if not allowed:
-            return False, None, f"rate_limited, try again after {retry_after:.1f}s"
+            return False, None, "rate_limited"
 
-        # Verify password via HMAC comparison
-        password_hash = hashlib.sha256(password.encode()).digest()
+        # A non-string / empty / oversized / unencodable password is a
+        # failed attempt like any other - it is counted, never a free probe.
+        try:
+            if not isinstance(password, str) or not password or len(password) > 1024:
+                raise ValueError
+            password_bytes = password.encode("utf-8")
+        except (ValueError, UnicodeEncodeError):
+            self._auth_failure_limiter.record_auth_failure(source_ip, "admin")
+            return False, None, "invalid_password"
+
+        # Verify password via constant-time digest comparison
+        password_hash = hashlib.sha256(password_bytes).digest()
         if not hmac.compare_digest(password_hash, self._secret_hash):
             self._auth_failure_limiter.record_auth_failure(source_ip, "admin")
             return False, None, "unauthorized"
 
-        # Password is valid, create session
+        # Verified success: clear the shared account counter (atomic under
+        # the limiter's own lock; per-source and global counters are kept).
+        self._auth_failure_limiter.reset_account_failures("admin")
         session_id, csrf_token = self._create_session(source_ip)
         return True, (session_id, csrf_token), None
 
@@ -193,7 +217,7 @@ class AdminAuthenticator:
             if not session_data:
                 return False, None
 
-            session_data["last_seen"] = time.time()
+            session_data["last_seen"] = time.monotonic()
 
             # Validate CSRF token if provided
             if csrf_token is not None:
@@ -257,7 +281,7 @@ class AdminAuthenticator:
         Returns:
             Dictionary with current counter values.
         """
-        now = time.time()
+        now = time.monotonic()
         with self._auth_failure_limiter._lock:
             return {
                 "per_source_windows": len(self._auth_failure_limiter._source_windows),
@@ -265,128 +289,3 @@ class AdminAuthenticator:
                 "global_windows": len(self._auth_failure_limiter._global_windows),
                 "sessions": len(self._sessions),
             }
-
-
-class AuthFailureLimiter:
-    """Tracks verified authentication failures separately from admission."""
-
-    def __init__(
-        self,
-        per_source_max: int,
-        per_account_max: int,
-        global_max: int,
-        window_seconds: float,
-        clock,
-        max_entries: int = 10_000,
-    ) -> None:
-        self._per_source_max = per_source_max
-        self._per_account_max = per_account_max
-        self._global_max = global_max
-        self._window_seconds = float(window_seconds)
-        self._clock = clock
-        self._max_entries = max_entries
-
-        self._lock = threading.Lock()
-        self._source_windows: Dict[str, Tuple[float, int]] = {}
-        self._account_windows: Dict[str, Tuple[float, int]] = {}
-        self._global_key = "_global_auth_"
-        self._global_windows: Dict[str, Tuple[float, int]] = {
-            self._global_key: (0.0, 0)
-        }
-
-    def check_admission(self, source_key: str, account_key: str) -> Tuple[bool, Optional[float]]:
-        """May a source attempt authentication?"""
-        if not isinstance(source_key, str) or not isinstance(account_key, str):
-            return False, None
-
-        norm_src = self._normalize(source_key)
-        norm_acct = self._normalize(account_key)
-
-        now = self._clock()
-        with self._lock:
-            self._prune(now)
-
-            src_start, src_count = self._source_windows.get(norm_src, (now, 0))
-            if now - src_start >= self._window_seconds:
-                src_start, src_count = now, 0
-            src_would_exceed = src_count + 1 > self._per_source_max
-
-            acct_start, acct_count = self._account_windows.get(norm_acct, (now, 0))
-            if now - acct_start >= self._window_seconds:
-                acct_start, acct_count = now, 0
-            acct_would_exceed = acct_count + 1 > self._per_account_max
-
-            glob_start, glob_count = self._global_windows[self._global_key]
-            if now - glob_start >= self._window_seconds:
-                glob_start, glob_count = now, 0
-            glob_would_exceed = glob_count + 1 > self._global_max
-
-            if src_would_exceed or acct_would_exceed or glob_would_exceed:
-                retry_after = max(
-                    max(0.0, self._window_seconds - (now - src_start)) if src_would_exceed else 0.0,
-                    max(0.0, self._window_seconds - (now - acct_start)) if acct_would_exceed else 0.0,
-                    max(0.0, self._window_seconds - (now - glob_start)) if glob_would_exceed else 0.0,
-                )
-                return False, retry_after
-
-            return True, None
-
-    def record_auth_failure(self, source_key: str, account_key: str) -> None:
-        """Record a verified authentication failure."""
-        if not isinstance(source_key, str) or not isinstance(account_key, str):
-            return
-
-        norm_src = self._normalize(source_key)
-        norm_acct = self._normalize(account_key)
-
-        now = self._clock()
-        with self._lock:
-            source_full = len(self._source_windows) >= self._max_entries and norm_src not in self._source_windows
-            account_full = len(self._account_windows) >= self._max_entries and norm_acct not in self._account_windows
-
-            if source_full or account_full:
-                glob_start, glob_count = self._global_windows[self._global_key]
-                if now - glob_start >= self._window_seconds:
-                    glob_start, glob_count = now, 0
-                self._global_windows[self._global_key] = (glob_start, glob_count + 1)
-                return
-
-            src_start, src_count = self._source_windows.get(norm_src, (now, 0))
-            if now - src_start >= self._window_seconds:
-                src_start, src_count = now, 0
-
-            acct_start, acct_count = self._account_windows.get(norm_acct, (now, 0))
-            if now - acct_start >= self._window_seconds:
-                acct_start, acct_count = now, 0
-
-            glob_start, glob_count = self._global_windows[self._global_key]
-            if now - glob_start >= self._window_seconds:
-                glob_start, glob_count = now, 0
-
-            self._source_windows[norm_src] = (src_start, src_count + 1)
-            self._account_windows[norm_acct] = (acct_start, acct_count + 1)
-            self._global_windows[self._global_key] = (glob_start, glob_count + 1)
-
-    def reset_account_failures(self, account_key: str) -> None:
-        """Reset the per-account auth_failure counter after a successful login."""
-        if not isinstance(account_key, str):
-            return
-
-        norm_acct = self._normalize(account_key)
-        now = self._clock()
-        with self._lock:
-            acct_start, acct_count = self._account_windows.get(norm_acct, (now, 0))
-            self._account_windows[norm_acct] = (now, 0)
-
-    def _prune(self, now: float) -> None:
-        """Remove stale entries."""
-        stale_after = self._window_seconds * 2
-        self._source_windows = {k: v for k, v in self._source_windows.items() if now - v[0] < stale_after}
-        self._account_windows = {k: v for k, v in self._account_windows.items() if now - v[0] < stale_after}
-
-    @staticmethod
-    def _normalize(raw_key: str) -> str:
-        """Normalize a key."""
-        if not isinstance(raw_key, str):
-            raise TypeError("key must be a string")
-        return raw_key.strip().lower()

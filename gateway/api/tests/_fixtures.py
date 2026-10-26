@@ -166,8 +166,8 @@ def make_app_config(
         field_enrollment_index_lock_path=field_enrollment_index_lock_path,
         field_enrollment_wrap_key_file=field_enrollment_wrap_key_file,
         admin_secret_file=admin_secret_file,
+        admin_enabled=bool(admin_secret_file),
     )
-}
 
 
 def make_relay_probe_hmac_secret_file(tmp_dir, name="relay-probe-hmac-secret.bin", content=None):

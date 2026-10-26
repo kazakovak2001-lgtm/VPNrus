@@ -173,8 +173,7 @@ class AuthFailureLimiter:
         A denied result here is an admission refusal, NOT a failed login.
         The result is NOT recorded anywhere.
 
-        The *retry_after* value is derived only from the blocking limit(s),
-        exactly as ``AdminRateLimiter.combined_allow`` does.
+        The *retry_after* value is derived only from the blocking limit(s).
         """
         if not isinstance(source_key, str):
             raise TypeError("source_key must be a string")

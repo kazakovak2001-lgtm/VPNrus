@@ -33,7 +33,7 @@ from api.auth_ratelimit import AuthFailureLimiter
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_secret_file(tmp_dir, name="admin-secret.bin", content=b"\xab" * 32):
+def _write_secret_file(tmp_dir, name="admin-secret.bin", content=b"x" * 32):
     path = os.path.join(tmp_dir, name)
     with open(path, "wb") as handle:
         handle.write(content)
@@ -227,15 +227,35 @@ class AdminAuthRateLimitTests(unittest.TestCase):
 
     def test_successful_login_resets_account_failures(self):
         auth = self._make_auth()
-        # Fail 5 times.
-        for _ in range(5):
+        # 29 failures spread over sources (per-source max is 10), so the
+        # shared "admin" account (max 30) is one failure from lockout.
+        for i in range(29):
+            auth.verify_password_and_create_session("wrong", f"10.0.0.{i // 9}")
+        ok, _, _ = auth.verify_password_and_create_session("x" * 32, "10.0.1.1")
+        self.assertTrue(ok)
+        # Account counter was reset: two more failures do not lock it.
+        for _ in range(2):
+            auth.verify_password_and_create_session("wrong", "10.0.2.1")
+        ok, _, err = auth.verify_password_and_create_session("x" * 32, "10.0.3.1")
+        self.assertTrue(ok, err)
+
+    def test_authenticator_uses_shared_limiter_class(self):
+        auth = self._make_auth()
+        self.assertIs(type(auth._auth_failure_limiter), AuthFailureLimiter)
+        self.assertIs(admin_auth.AuthFailureLimiter, AuthFailureLimiter)
+
+    def test_invalid_password_type_is_counted_failure(self):
+        auth = self._make_auth()
+        for bad in (1, None, ["x"], "", "a" * 2000, "\ud800"):
+            ok, data, err = auth.verify_password_and_create_session(bad, "1.2.3.4")
+            self.assertFalse(ok)
+            self.assertIsNone(data)
+            self.assertEqual(err, "invalid_password")
+        # 6 counted failures + 4 wrong passwords = per-source max (10).
+        for _ in range(4):
             auth.verify_password_and_create_session("wrong", "1.2.3.4")
-        # Succeed — this also calls reset_account_failures internally?
-        # Actually our code does NOT call reset here; the endpoint should.
-        # Verify that subsequent wrong passwords still count against source.
-        # (The endpoint will handle reset after success; this test just
-        #  confirms the limiter semantics, not endpoint wiring.)
-        pass  # endpoint-level test below covers this.
+        _, _, err = auth.verify_password_and_create_session("x" * 32, "1.2.3.4")
+        self.assertEqual(err, "rate_limited")
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +317,7 @@ class AdminEndpointEnabledTests(unittest.TestCase):
         script = os.path.join(self._tmp.name, "prov.sh")
         with open(script, "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env bash\nexit 0\n")
-        secret_path = _write_secret_file(self._tmp.name, content=b"\xcd" * 32)
+        secret_path = _write_secret_file(self._tmp.name)
         cfg = make_app_config(
             self._tmp.name, script,
             admin_secret_file=secret_path,
@@ -332,7 +352,7 @@ class AdminEndpointEnabledTests(unittest.TestCase):
         self.assertGreater(data["session_expires_at"], 0.0)
 
     def test_login_wrong_password(self):
-        status, headers, body, _ = self._login(extra_headers={"X-Forwarded-For": "1.2.3.4"})
+        status, headers, body = post_admin_login(self.server.port, "wrong-password", {"X-Forwarded-For": "1.2.3.4"})
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(body)["error"], "unauthorized")
 
@@ -421,9 +441,10 @@ class AdminEndpointEnabledTests(unittest.TestCase):
     def test_logout_invalidates_session(self):
         status, headers, body, sc = self._login()
         sid = self._extract_session(sc)
+        csrf = self._extract_csrf_from_body(body)
         self.assertIsNotNone(sid)
         # Logout.
-        status, headers, body, clear_sc = post_admin_logout(
+        status, headers, body = post_admin_logout(
             self.server.port, cookie=f"pocvpn-admin-session={sid}"
         )
         self.assertEqual(status, 200)
@@ -431,7 +452,7 @@ class AdminEndpointEnabledTests(unittest.TestCase):
         status, headers, body = get_admin_session(
             self.server.port,
             cookie=f"pocvpn-admin-session={sid}",
-            csrf_token=self._extract_csrf_from_body(body),
+            csrf_token=csrf,
         )
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(body)["error"], "unauthorized")
@@ -445,9 +466,9 @@ class AdminEndpointEnabledTests(unittest.TestCase):
     def test_wrong_password_consumes_rate_limit_quota(self):
         """Wrong password should increment the brute-force counter."""
         for i in range(10):
-            status, _, _, _ = self._login()
+            status, _, _ = post_admin_login(self.server.port, "wrong-password")
             self.assertEqual(status, 401)
-        # 11th attempt should be rate-limited.
+        # 11th attempt (even with the right password) is rate-limited.
         status, _, body, _ = self._login()
         self.assertEqual(status, 429)
         self.assertEqual(json.loads(body)["error"], "rate_limited")
@@ -455,9 +476,46 @@ class AdminEndpointEnabledTests(unittest.TestCase):
     def test_logout_clears_cookie(self):
         status, headers, body, sc = self._login()
         sid = self._extract_session(sc)
-        post_admin_logout(self.server.port, cookie=f"pocvpn-admin-session={sid}")
-        # The response should set Max-Age=0.
-        self.assertIn("Max-Age=0", sc)
+        status, out_headers, _ = post_admin_logout(self.server.port, cookie=f"pocvpn-admin-session={sid}")
+        self.assertEqual(status, 200)
+        cleared = out_headers.get("set-cookie", "")
+        self.assertIn("Max-Age=0", cleared)
+        self.assertIn("Secure", cleared)
+
+    def test_login_cookie_flags(self):
+        status, _, _, sc = self._login()
+        self.assertEqual(status, 200)
+        for flag in ("Secure", "HttpOnly", "SameSite=Strict", "Path=/admin"):
+            self.assertIn(flag, sc)
+
+    def test_login_non_string_password_is_400(self):
+        from _http import send_raw_lines
+        for payload in ({"password": 1}, {"password": None}, {"password": ""}):
+            raw = json.dumps(payload).encode()
+            status, _, body_out, _ = send_raw_lines(
+                self.server.port, "POST", "/admin/login",
+                ["Content-Type: application/json", f"Content-Length: {len(raw)}"],
+                raw,
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(body_out)["error"], "invalid_password")
+
+    def test_session_csrf_query_param_not_accepted(self):
+        status, _, body, sc = self._login()
+        sid = self._extract_session(sc)
+        csrf = self._extract_csrf_from_body(body)
+        from _http import raw_request
+        status, _, _ = raw_request(
+            self.server.port, "GET", f"/admin/session?csrf_token={csrf}",
+            {"Cookie": f"pocvpn-admin-session={sid}"}, b"",
+        )
+        self.assertEqual(status, 404)
+
+    def test_unknown_path_still_404(self):
+        from _http import raw_request
+        status, _, body = raw_request(self.server.port, "GET", "/nope", {}, b"")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)["error"], "not_found")
 
     def test_login_non_json_content_type_rejected(self):
         from _http import send_raw_lines
@@ -480,6 +538,87 @@ class AdminEndpointEnabledTests(unittest.TestCase):
         )
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(body_out)["error"], "payload_too_large")
+
+
+def _minimal_env(tmp_dir, admin_secret_path):
+    import base64
+    script = os.path.join(tmp_dir, "provision-peer.sh")
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write("#!/usr/bin/env bash" + chr(10) + "exit 0" + chr(10))
+    return {
+        "POCVPN_API_ENDPOINT_HOST": "203.0.113.1",
+        "POCVPN_API_ENDPOINT_PORT": "51820",
+        "POCVPN_API_GATEWAY_PUBLIC_KEY": base64.b64encode(bytes([2]) * 32).decode("ascii"),
+        "POCVPN_API_GATEWAY_TUNNEL_IP": "10.77.0.1",
+        "POCVPN_API_TOKEN_STORE_PATH": os.path.join(tmp_dir, "enrollment-tokens.json"),
+        "POCVPN_API_PROVISION_SCRIPT_PATH": script,
+        "POCVPN_API_SUBPROCESS_TIMEOUT_SECONDS": "5",
+        "POCVPN_API_API_PORT": "8765",
+        "POCVPN_API_ADMIN_SECRET_FILE": admin_secret_path,
+    }
+
+
+class AdminSecretFormatTests(unittest.TestCase):
+    """read_admin_secret is the single validator for config and authenticator."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_trailing_newline_tolerated(self):
+        for content in (b"x" * 32 + b"\n", b"x" * 32 + b"\r\n"):
+            path = _write_secret_file(self._tmp.name, content=content)
+            self.assertEqual(admin_auth.read_admin_secret(path), b"x" * 32)
+
+    def test_non_printable_rejected(self):
+        for content in (b"\xab" * 32, b" " * 32, b"x" * 31 + b"\t"):
+            path = _write_secret_file(self._tmp.name, content=content)
+            with self.assertRaises(admin_auth.ConfigError):
+                admin_auth.read_admin_secret(path)
+
+    def test_config_and_authenticator_agree(self):
+        for content, valid in ((b"x" * 32 + b"\n", True), (b"\xab" * 32, False), (b" x" * 16, False)):
+            path = _write_secret_file(self._tmp.name, content=content)
+            try:
+                admin_auth.AdminAuthenticator(path)
+                auth_ok = True
+            except admin_auth.ConfigError:
+                auth_ok = False
+            try:
+                config_module.load_config(_minimal_env(self._tmp.name, path))
+                config_ok = True
+            except config_module.ConfigError as exc:
+                self.assertIn("ADMIN_SECRET_FILE", str(exc))
+                config_ok = False
+            self.assertEqual(auth_ok, valid)
+            self.assertEqual(config_ok, valid)
+
+    def test_error_never_contains_secret(self):
+        path = _write_secret_file(self._tmp.name, content=b"S3cretValue" * 4)
+        with self.assertRaises(admin_auth.ConfigError) as ctx:
+            admin_auth.read_admin_secret(path)
+        self.assertNotIn("S3cret", str(ctx.exception))
+
+
+class AdminNginxEdgeTests(unittest.TestCase):
+    """The admin edge is loopback-only and declared exactly once."""
+
+    def setUp(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "..", "..", "edge", "nginx-pocvpn.conf"), encoding="utf-8") as f:
+            self.conf = f.read()
+
+    def test_no_duplicate_exact_locations(self):
+        import re
+        locs = re.findall(r"^\s*location\s+=\s+(\S+)\s*\{", self.conf, re.M)
+        self.assertEqual(len(locs), len(set(locs)), sorted(locs))
+
+    def test_admin_locations_loopback_only(self):
+        import re
+        for path in ("/admin/login", "/admin/logout", "/admin/session", "/admin/status"):
+            m = re.search(r"location = %s \{\s*allow 127\.0\.0\.1;\s*allow ::1;\s*deny all;" % re.escape(path), self.conf)
+            self.assertIsNotNone(m, path)
+        self.assertNotRegex(self.conf, r"set_real_ip_from|real_ip_header")
 
 
 class CookieParsingEdgeCases(unittest.TestCase):

@@ -15,7 +15,6 @@ from . import config as config_module
 from . import ingress_config as ingress_config_module
 from . import admission, ratelimit
 from . import admin_auth
-from . import admin_ratelimit
 from .handler import ProvisioningRequestHandler
 
 _BIND_HOST = "127.0.0.1"
@@ -104,15 +103,6 @@ class ProvisioningServer(ThreadingHTTPServer):
         # then returns 503 for every admin endpoint when these are None.
         self.admin_authenticator = (
             admin_auth.AdminAuthenticator(app_config.admin_secret_file)
-            if app_config.admin_enabled else None
-        )
-        self.admin_rate_limiter = (
-            admin_ratelimit.AdminRateLimiter(
-                per_account_max=30,
-                global_max=300,
-                window_seconds=600.0,
-                clock=time.monotonic,
-            )
             if app_config.admin_enabled else None
         )
 

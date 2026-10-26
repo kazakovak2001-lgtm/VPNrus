@@ -244,8 +244,6 @@ def get_admin_session(port, cookie=None, csrf_token=None, extra_headers=None):
     if csrf_token is not None:
         headers["X-CSRF-Token"] = csrf_token
     path = "/admin/session"
-    if csrf_token is not None:
-        path += f"?csrf_token={csrf_token}"
     if extra_headers:
         headers.update(extra_headers)
     return raw_request(port, "GET", path, headers, b"")
