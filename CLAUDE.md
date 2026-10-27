@@ -14,7 +14,7 @@ Do not reread the whole repository or the whole ROADMAP for every slice. Follow 
 6. **Reuse session context** - if a file was already read earlier in the current session and hasn't changed, don't reread it; work from what's already in context.
 7. **No repeated architecture-agent smoke tests** - this environment cannot dispatch `.claude/agents/vpn-architecture.md` as a real isolated subagent (no Agent/Task tool exposed here). Do not re-attempt to verify that mechanically on every turn - apply the agent's rules directly in-session (see below) and say so once, not per-slice.
 8. **One consolidated review pass** - collect all findings from a review pass into ONE list; do not run a serial one-issue-at-a-time micro-audit loop (find one thing, fix, re-review, find another, repeat).
-9. **`PROJECT_ARCHITECTURE.md` hygiene** - short, factual, invariants and current boundaries only - no historical narrative (that belongs in ROADMAP). Update it in the same commit as whatever change made it stale.
+9. **`PROJECT_ARCHITECTURE.md` hygiene** - short, factual, invariants and current boundaries only - no historical narrative (that belongs in ROADMAP). Update it in the same commit as whatever change made it stale. Long per-area detail (FOUNDATION write-ups, review follow-ups) lives in `docs/architecture/*.md`, linked from its index; read one only when the slice touches that area. A new section longer than ~100 lines goes there, with a one-line index entry.
 
 ## Mandatory: the `vpn-architecture` review discipline
 
