@@ -1132,7 +1132,7 @@ owner (Claude's SSH to production is denied as "Production Reads").
 
 ```
 cd /opt/pocvpn/gateway && sha256sum api/xray_config_renderer.py api/config.py api/handler.py api/xray_activation.py
-ss -tlnp | grep -E ':(2096|2053|2083|443)\b'
+sudo ss -tlnp | grep -E ':(2096|2053|2083|443)\b'
 sudo grep -c '^POCVPN_API_XRAY_' /etc/pocvpn/api.env
 systemctl is-active pocvpn-api nova-xray nova-xray-reconcile.timer
 ```
@@ -1149,11 +1149,11 @@ the changed files, then compile-check.
 
 ```
 cd /opt/pocvpn/gateway
-TS=$(date -u +%Y%m%dT%H%M%SZ)
+TS=$(date -u +%Y%m%dT%H%M%SZ); echo "TS=$TS"   # record it: steps 3, 6 and the rollback reuse it
 for f in api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py; do sudo cp -p "$f" "$f.backup-rx-$TS"; done
 # copy the four files from main 21e7078 into place (root:root 0644), then:
-sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py
-sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py \
+  && sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
 ```
 
 Check: `/v1/manifest` still 200; `/v1/xray-profile` with
@@ -1173,6 +1173,7 @@ so the security group is the only gate. Until step 4 nothing listens on
 ### 3. Enable the inbound in `api.env`
 
 ```
+: "${TS:?set TS to the value recorded in step 1}"
 sudo cp -p /etc/pocvpn/api.env /etc/pocvpn/api.env.backup-rx-$TS
 printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=2096\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' | sudo tee -a /etc/pocvpn/api.env >/dev/null
 sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
@@ -1202,7 +1203,7 @@ The privileged path (`nova-xray-reload` -> `xray-activate.sh`) runs
 a candidate the pinned core rejects is never published. Then:
 
 ```
-ss -tlnp | grep -E ':(2096|2053|2083)\b'            # nova-xray on all three
+sudo ss -tlnp | grep -E ':(2096|2053|2083)\b'       # nova-xray on all three
 sudo grep -c 'nova-vless-reality-xhttp-in' /etc/nova-xray/config.json   # 1 (XRAY_LIVE_CONFIG in xray.env)
 sudo grep -c '"privateKey"' /etc/nova-xray/config.json                  # 2: both REALITY inbounds
 ```
@@ -1251,6 +1252,7 @@ the JSON without `_DRAFT`, commit both. Install on BOTH gateways (each serves
 `/v1/manifest`):
 
 ```
+: "${TS:?set TS to the value recorded in step 1}"
 sudo cp -p /etc/pocvpn/endpoint-manifest.bin /etc/pocvpn/endpoint-manifest.bin.v8-backup-$TS
 sudo install -o root -g pocvpn-api -m 0640 endpoint-manifest-2026-10-27-v9.bin /etc/pocvpn/endpoint-manifest.bin
 curl -s https://16.170.208.231/v1/manifest -k | sha256sum   # equals the new .bin on both hosts
