@@ -1399,6 +1399,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
         # session_data is (session_id, csrf_token)
         session_id, csrf_token = session_data
+        role = (self.server.admin_authenticator.get_session_info(session_id) or {}).get("role", "viewer")
 
         # Always Secure: /admin/* is only routed by the TLS vhost
         # (nginx-pocvpn.conf, loopback/SSH-tunnel only), so the browser must
@@ -1413,6 +1414,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(
             json.dumps({
                 "status": "logged_in",
+                "role": role,
                 "csrf_token": csrf_token,
                 "session_expires_at": time.time() + 28800,
             }).encode("utf-8")
@@ -1466,7 +1468,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # Logout mutates server-side session state: same CSRF + same-origin
         # requirements as every other state-changing admin request. An
         # unknown/expired session is rejected (401) by the same check.
-        self._admin_session_or_raise(mutating=True, need_store=False)
+        self._admin_session_or_raise(mutating=True, need_store=False, require_admin=False)
         self.server.admin_authenticator.invalidate_session(session_id)
 
         # Clear session cookie
@@ -1534,10 +1536,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         return self._success(HTTPStatus.OK, {
             "status": "ok",
             "session_exists": info is not None,
+            "role": (info or {}).get("role"),
         })
 
     # --- admin activation (device) management ---
-    def _admin_session_or_raise(self, mutating, need_store=True, limiter=None):
+    def _admin_session_or_raise(self, mutating, need_store=True, limiter=None, require_admin=None):
         """Returns the validated session id. Read endpoints need only the
         session cookie (like /admin/status); mutating ones also need the
         X-CSRF-Token header and a same-origin Origin header."""
@@ -1554,11 +1557,18 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             host = self.headers.get("Host")
             if not origin or not host or origin.split("://", 1)[-1] != host:
                 raise _RequestError(HTTPStatus.FORBIDDEN, "origin_mismatch")
-            is_valid, _ = auth.validate_session_and_csrf(session_id, csrf_token)
+            is_valid, session_data = auth.validate_session_and_csrf(session_id, csrf_token)
         else:
-            is_valid, _ = auth.validate_session_and_csrf(session_id)
+            is_valid, session_data = auth.validate_session_and_csrf(session_id)
         if not is_valid:
             raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        # Role gate: every state-changing activation operation needs the
+        # admin role; the read-only viewer role may list, view and log out.
+        # Checked after authentication/CSRF/Origin and before the limiter
+        # and any store access.
+        self._admin_role = (session_data or {}).get("role", "viewer")
+        if (mutating if require_admin is None else require_admin) and self._admin_role != "admin":
+            raise _RequestError(HTTPStatus.FORBIDDEN, "forbidden")
         # Per-session throttle (per process, in memory - not a distributed
         # limiter). Keyed by the authenticated session id, never by a
         # client-supplied forwarding header. Checked after authentication
@@ -1594,6 +1604,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             "action": action,
             "activation_id": activation_id,
             "outcome": outcome,
+            "role": getattr(self, "_admin_role", "unknown"),
             "client": client_identity.normalize_client(self.headers.get_all("X-Real-IP")),
         })
         with open(path, "a", encoding="utf-8") as fh:

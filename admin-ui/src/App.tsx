@@ -18,6 +18,7 @@ const MESSAGES: Record<string, string> = {
   not_extendable_revoked: "A revoked activation cannot be extended.",
   not_extendable_not_expiring: "This activation never expires, so there is nothing to extend.",
   rate_limited: "Too many requests. Wait a moment and try again.",
+  forbidden: "Your role (viewer) does not allow this action.",
   not_found: "Not found.",
 };
 const msg = (e: unknown) =>
@@ -87,6 +88,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [sessionOk, setSessionOk] = useState<boolean | null>(null);
+  const [role, setRole] = useState<"admin" | "viewer" | null>(null);
   const [searchInput, setSearchInput] = useState("");
   const [query, setQuery] = useState<api.ListQuery>({ q: "", status: "", limit: PAGE_SIZE, offset: 0 });
   // One-time credential of a just-created activation. Kept in component
@@ -103,7 +105,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
 
   const load = useCallback(() => {
     setError(null);
-    api.status().then((s) => setSessionOk(s.session_exists), fail);
+    api.status().then((s) => { setSessionOk(s.session_exists); setRole(s.role); }, fail);
     api.listActivations(query).then(setPage, fail);
   }, [fail, query]);
 
@@ -209,12 +211,13 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
       )}
 
       <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <Stat label="API session" value={sessionOk === null ? "…" : sessionOk ? "Authenticated" : "Unknown"} />
+        <Stat label="API session" value={sessionOk === null ? "…" : sessionOk ? `Authenticated${role ? ` (${role})` : ""}` : "Unknown"} />
         <Stat label="Matching activations" value={page ? String(total) : "…"} />
         <Stat label="Active (this page)" value={items ? String(active) : "…"} />
         <Stat label="Bound devices (this page)" value={items ? String(devices) : "…"} />
       </section>
 
+      {role === "admin" && (
       <section className="bg-white rounded-xl shadow p-4">
         <h2 className="font-medium mb-3">Create activation</h2>
         <form onSubmit={doCreate} className="flex flex-wrap items-end gap-3 text-sm">
@@ -231,6 +234,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
           <button className="rounded bg-slate-900 text-white px-3 py-1.5">Create</button>
         </form>
       </section>
+      )}
 
       <section className="bg-white rounded-xl shadow overflow-hidden">
         <div className="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-3">
@@ -265,7 +269,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-left text-slate-500">
-                <tr><th className="px-4 py-2">ID</th><th>Status</th><th>Devices</th><th>Expires</th><th /></tr>
+                <tr><th className="px-4 py-2">ID</th><th>Status</th><th>Devices</th><th>Expires</th>{role === "admin" && <th />}</tr>
               </thead>
               <tbody>
                 {items.map((a) => (
@@ -278,12 +282,14 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
                     <td><Badge value={a.entitlement} /></td>
                     <td>{a.devices.length} / {a.max_devices}</td>
                     <td>{a.expires_at ? new Date(a.expires_at).toLocaleDateString() : "never"}</td>
+                    {role === "admin" && (
                     <td className="px-4 text-right">
                       <button
                         disabled={a.status === "REVOKED"} onClick={() => doRevoke(a.activation_id)}
                         className="rounded border border-red-300 text-red-700 px-2 py-1 disabled:opacity-40"
                       >Revoke</button>
                     </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -331,6 +337,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
               )}
             </dd>
           </dl>
+          {role === "admin" && (
           <form
             onSubmit={(e) => { e.preventDefault(); void doExtend(sel.activation_id); }}
             className="flex flex-wrap items-end gap-2 text-sm"
@@ -346,6 +353,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
             >Extend</button>
             {sel.expires_at === null && <span className="text-slate-500">Never expires - nothing to extend.</span>}
           </form>
+          )}
           <p className="text-xs text-slate-500">
             Not available: unbinding a single device (an issued gateway key would stay valid, so only revoking the
             whole activation is a real cut-off), traffic stats, administrator/viewer roles (one shared admin password).

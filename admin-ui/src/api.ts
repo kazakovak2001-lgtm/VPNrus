@@ -60,7 +60,8 @@ export async function logout(): Promise<void> {
   }
 }
 
-export const status = () => call<{ status: string; session_exists: boolean }>("GET", "/admin/status");
+export const status = () =>
+  call<{ status: string; session_exists: boolean; role: "admin" | "viewer" | null }>("GET", "/admin/status");
 export interface ListQuery {
   q: string;
   status: string;

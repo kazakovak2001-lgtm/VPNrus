@@ -114,7 +114,7 @@ class ProvisioningServer(ThreadingHTTPServer):
             _ADMIN_MUTATION_RATE_LIMIT, _ADMIN_RATE_WINDOW_SECONDS, clock=time.monotonic
         )
         self.admin_authenticator = (
-            admin_auth.AdminAuthenticator(app_config.admin_secret_file)
+            admin_auth.AdminAuthenticator(app_config.admin_secret_file, app_config.admin_viewer_secret_file)
             if app_config.admin_enabled else None
         )
 

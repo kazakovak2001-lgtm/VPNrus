@@ -28,13 +28,21 @@ React + TypeScript + Vite + Tailwind client for the `pocvpn-api` `/admin/*` endp
 - All mutations require session + CSRF + same-origin and share the mutation rate limit; each is audited
   (`create`, `extend`, `revoke`) by activation id only.
 
+## Roles
+`admin` (the admin secret) can do everything. An optional second secret
+(`POCVPN_API_ADMIN_VIEWER_SECRET_FILE`, same 32-char format, must differ from the admin secret and requires
+`POCVPN_API_ADMIN_SECRET_FILE`) logs in as read-only `viewer`: list, detail and logout only; every create,
+extend and revoke returns 403 `forbidden` after the CSRF/Origin checks. The role is stored in the server-side
+session, never taken from the client, and is recorded in the audit log. These are two shared secrets, not
+per-person accounts. Locally, create `<state-dir>/viewer-secret` to enable the viewer in the dev launcher.
+
 ## Device unbind - decision
 Not implemented on purpose. Unbinding a device frees a slot but does not remove the WireGuard/Xray
 credential already provisioned on the gateway, so the device would keep working. Until gateway-side
 removal exists, the only real cut-off is revoking the whole activation.
 
 ## Not implemented
-Admin/viewer roles (single shared password), per-device unbind, traffic stats,
+Per-person accounts (roles use two shared secrets), per-device unbind, traffic stats,
 production deployment (UI is not served by nginx yet).
 
 ## Rate limits
