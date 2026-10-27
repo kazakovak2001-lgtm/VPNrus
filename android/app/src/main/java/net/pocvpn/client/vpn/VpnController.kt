@@ -2611,6 +2611,13 @@ class VpnController(
     private suspend fun restartActiveTransportForNetworkChange(generation: Long): Boolean = connectMutex.withLock {
         if (!isCurrentReconnect(generation) || userInitiatedDisconnect) return@withLock false
         hasTouchedTransport = true
+        // TEST-ONLY phone build: while this adb-created marker exists, every
+        // network-change restart tears the session down and fails (dead path).
+        if (java.io.File("/storage/emulated/0/Android/data/net.pocvpn.client/files/test-dead-path").exists()) {
+            android.util.Log.w("NovaTestDeadPath", "restart for network change forced to fail, generation=$generation")
+            activeTransport.disconnect()
+            return@withLock false
+        }
         activeTransport.disconnect()
         val stoppedState = activeTransport.observeState().first {
             it is TransportState.Disconnected || it is TransportState.Error
