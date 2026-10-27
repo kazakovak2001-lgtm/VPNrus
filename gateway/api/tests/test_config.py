@@ -335,6 +335,50 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config_module.ConfigError):
             config_module.load_config(env=env)
 
+    # --- REALITY + XHTTP: optional, all-or-nothing, reuses REALITY ---
+
+    def _valid_reality_xhttp_env(self):
+        env = self._valid_xhttp_env()
+        env.update({
+            "POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT": "8443",
+            "POCVPN_API_XRAY_REALITY_XHTTP_PATH": "/nova-rx/",
+        })
+        return env
+
+    def test_reality_xhttp_unset_is_fine_and_defaults_to_off(self):
+        cfg = config_module.load_config(env=self._valid_xhttp_env())
+        self.assertEqual((cfg.xray_reality_xhttp_server_port, cfg.xray_reality_xhttp_path), (0, ""))
+
+    def test_reality_xhttp_complete_group_loads(self):
+        cfg = config_module.load_config(env=self._valid_reality_xhttp_env())
+        self.assertEqual((cfg.xray_reality_xhttp_server_port, cfg.xray_reality_xhttp_path), (8443, "/nova-rx/"))
+
+    def test_reality_xhttp_invalid_values_raise(self):
+        cases = {
+            "port only": {"POCVPN_API_XRAY_REALITY_XHTTP_PATH": None},
+            "path only": {"POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT": None},
+            "port not integer": {"POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT": "x"},
+            "port out of range": {"POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT": "70000"},
+            "path without leading slash": {"POCVPN_API_XRAY_REALITY_XHTTP_PATH": "nova-rx/"},
+            "path without trailing slash": {"POCVPN_API_XRAY_REALITY_XHTTP_PATH": "/nova-rx"},
+            "clash with xhttp port": {"POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT": "2099"},
+        }
+        for name, changes in cases.items():
+            env = self._valid_reality_xhttp_env()
+            for key, value in changes.items():
+                if value is None:
+                    del env[key]
+                else:
+                    env[key] = value
+            with self.subTest(name), self.assertRaises(config_module.ConfigError):
+                config_module.load_config(env=env)
+
+    def test_reality_xhttp_clash_with_reality_port_raises(self):
+        env = self._valid_reality_xhttp_env()
+        env["POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT"] = env["POCVPN_API_XRAY_SERVER_PORT"]
+        with self.assertRaises(config_module.ConfigError):
+            config_module.load_config(env=env)
+
     # --- B35: XHTTP/CDN fallback's own optional completeness group ---
 
     def _valid_xhttp_env(self):

@@ -92,6 +92,7 @@ _TRANSPORT_KIND_NAMES = {
     "reality": "XRAY_REALITY",
     "tls": "TLS_TCP",
     "xhttp": "XRAY_XHTTP",
+    "reality-xhttp": "XRAY_REALITY_XHTTP",
 }
 _MAX_BODY_BYTES = 1024
 _MAX_MANIFEST_BYTES = 1_000_000
@@ -503,7 +504,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # value, same optional/defaulted body shape, no new parsing
         # mechanism.
         public_key, transport = self._parse_and_validate_xray_profile_body(
-            raw_body, allowed_transports=("reality", "tls", "xhttp"),
+            raw_body, allowed_transports=("reality", "tls", "xhttp", "reality-xhttp"),
         )
         self._log_fields["pubkey_prefix"] = public_key[:8]
         self._log_fields["xray_transport"] = transport
@@ -514,6 +515,8 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             cfg.xray_xhttp_server_port and cfg.xray_xhttp_client_host and cfg.xray_xhttp_client_port
         ):
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_xhttp_not_configured")
+        if transport == "reality-xhttp" and not cfg.xray_reality_xhttp_server_port:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "xray_reality_xhttp_not_configured")
 
         credential_digest = activations.credential_digest(credential)
         self._log_fields["activation_digest"] = credential_digest[:8]
@@ -619,6 +622,23 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 "mode": "packet-up",
                 "uplink_http_method": "POST",
                 "fingerprint": cfg.xray_tls_fingerprint,
+            }
+        elif transport == "reality-xhttp":
+            # Direct to this host's public REALITY+XHTTP inbound: the same
+            # REALITY client fields as "reality" (public key, short id,
+            # camouflage server name, fingerprint) plus the XHTTP path/mode.
+            # No `flow` - XTLS Vision is not valid over XHTTP.
+            payload = {
+                "server_address": cfg.endpoint_host,
+                "server_port": cfg.xray_reality_xhttp_server_port,
+                "uuid": identity_outcome.vless_uuid,
+                "server_name": cfg.xray_server_name,
+                "fingerprint": cfg.xray_fingerprint,
+                "reality_public_key": cfg.xray_reality_public_key,
+                "short_id": cfg.xray_short_id,
+                "xhttp_path": cfg.xray_reality_xhttp_path,
+                "mode": "packet-up",
+                "uplink_http_method": "POST",
             }
         elif transport == "tls":
             # B8O2 - TLS needs materially fewer fields than REALITY (no
