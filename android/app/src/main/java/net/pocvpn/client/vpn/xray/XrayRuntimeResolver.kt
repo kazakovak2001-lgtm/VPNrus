@@ -31,6 +31,12 @@ sealed class XrayXhttpRuntimeResolution {
     data class Rejected(val reason: String) : XrayXhttpRuntimeResolution()
 }
 
+/** The REALITY + XHTTP counterpart of [XrayRuntimeResolution]. Never carries the uuid in [Rejected]'s reason. */
+sealed class XrayRealityXhttpRuntimeResolution {
+    data class Ready(val config: XrayVlessRealityXhttpConfig, val renderedConfig: String) : XrayRealityXhttpRuntimeResolution()
+    data class Rejected(val reason: String) : XrayRealityXhttpRuntimeResolution()
+}
+
 /**
  * B8K4C - the ONE place a stored [net.pocvpn.client.identity.XrayProfile]
  * becomes (or is rejected as) a runtime-ready Xray core config: load -> fail
@@ -105,6 +111,29 @@ object XrayRuntimeResolver {
                 XrayXhttpRuntimeResolution.Rejected("stored Xray XHTTP profile failed validation: ${validation.errors.size} error(s)")
             is XrayXhttpConfigValidationResult.Valid ->
                 XrayXhttpRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
+        }
+    }
+
+    /** REALITY + XHTTP: the same load -> fail closed -> map -> validate -> render chain. */
+    suspend fun resolveRealityXhttp(
+        repository: net.pocvpn.client.identity.XrayRealityXhttpProfileRepository,
+    ): XrayRealityXhttpRuntimeResolution {
+        val profile = try {
+            repository.getProfileOrNull()
+        } catch (t: Throwable) {
+            return XrayRealityXhttpRuntimeResolution.Rejected("failed to load Xray REALITY+XHTTP profile: ${t.javaClass.simpleName}")
+        } ?: return XrayRealityXhttpRuntimeResolution.Rejected("no Xray REALITY+XHTTP profile configured")
+
+        val config = profile.toXrayVlessRealityXhttpConfig()
+            ?: return XrayRealityXhttpRuntimeResolution.Rejected(
+                "stored Xray REALITY+XHTTP profile's mode/uplinkHttpMethod did not match a known wire value",
+            )
+
+        return when (val validation = validateXrayVlessRealityXhttpConfig(config)) {
+            is XrayRealityXhttpValidationResult.Invalid ->
+                XrayRealityXhttpRuntimeResolution.Rejected("stored Xray REALITY+XHTTP profile failed validation")
+            is XrayRealityXhttpValidationResult.Valid ->
+                XrayRealityXhttpRuntimeResolution.Ready(validation.config, XrayConfigRenderer.render(validation.config))
         }
     }
 }

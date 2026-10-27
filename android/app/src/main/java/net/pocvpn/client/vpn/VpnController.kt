@@ -307,6 +307,11 @@ class VpnController(
     // this wiring only decides whether THIS controller can build a
     // TransportConfig for HYSTERIA2 at all.
     private val hysteria2Transport: VpnTransport? = null,
+    // REALITY + XHTTP - endpoint-scoped profile lookup, same additive
+    // null-by-default seam as [xrayXhttpProfileRepositoryResolver]: with
+    // none wired, XRAY_REALITY_XHTTP is not a supported kind and an attempt
+    // fails closed with [XrayProfileNotReadyException].
+    private val xrayRealityXhttpProfileRepositoryFor: ((net.pocvpn.client.reachability.EndpointId) -> net.pocvpn.client.identity.XrayRealityXhttpProfileRepository?)? = null,
     // B-WL7 report - additive, defaults to null (no recording). When wired,
     // every post-connect data-plane check is also kept in this bounded
     // in-memory log so the field report carries it independently of logcat.
@@ -383,6 +388,7 @@ class VpnController(
         // build a TransportConfig.Hysteria2 (see buildTransportConfig's own
         // `when`) when a real Hysteria2Transport was actually wired.
         if (hysteria2Transport != null) add(TransportKind.HYSTERIA2)
+        if (xrayRealityXhttpProfileRepositoryFor != null) add(TransportKind.XRAY_REALITY_XHTTP)
     }
 
     // B8O3 - the kind CURRENTLY ACTUALLY RUNNING (see [isRunningTransportState]
@@ -787,6 +793,7 @@ class VpnController(
                     (
                         newTransport.kind == TransportKind.XRAY_REALITY || newTransport.kind == TransportKind.TLS_TCP ||
                             newTransport.kind == TransportKind.XRAY_XHTTP ||
+                            newTransport.kind == TransportKind.XRAY_REALITY_XHTTP ||
                             // B45B-4 - same reasoning: ShadowsocksTransport's own
                             // observeState() only reports Error after
                             // ShadowsocksVpnService's own real fail-closed checks
@@ -1629,6 +1636,28 @@ class VpnController(
                                 relayExitProbeHost = null,
                             )
                     }
+                }
+            }
+
+            TransportKind.XRAY_REALITY_XHTTP -> {
+                // Direct only: no relay path exists for this kind, so a
+                // relayed attempt naming it is a wiring error, not a fallback.
+                if (pendingAttemptContext is VpnAttemptContext.Relayed) {
+                    throw XrayProfileNotReadyException("XRAY_REALITY_XHTTP has no relay path")
+                }
+                val repositoryFor = xrayRealityXhttpProfileRepositoryFor
+                    ?: throw XrayProfileNotReadyException("Xray REALITY+XHTTP profile repository not wired")
+                val repository = repositoryFor(pendingConnectEndpointId)
+                    ?: throw XrayProfileNotReadyException("no Xray REALITY+XHTTP profile repository configured for endpoint ${pendingConnectEndpointId.value}")
+                when (val resolution = net.pocvpn.client.vpn.xray.XrayRuntimeResolver.resolveRealityXhttp(repository)) {
+                    is net.pocvpn.client.vpn.xray.XrayRealityXhttpRuntimeResolution.Rejected ->
+                        throw XrayProfileNotReadyException(resolution.reason)
+                    is net.pocvpn.client.vpn.xray.XrayRealityXhttpRuntimeResolution.Ready ->
+                        TransportConfig.XrayRealityXhttp(
+                            config = resolution.config,
+                            endpointId = pendingConnectEndpointId,
+                            routingMode = routingMode,
+                        )
                 }
             }
 

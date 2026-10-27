@@ -126,6 +126,18 @@ sealed class TransportConfig {
      * on a mismatch) - it is not secret itself (it names an algorithm, e.g.
      * `2022-blake3-aes-256-gcm`, never key material).
      */
+    /**
+     * VLESS over XHTTP secured by REALITY, Direct only (no relay path). The
+     * `:xray` process re-reads the endpoint-scoped encrypted profile itself,
+     * so [config] is the main-process pre-flight result and never crosses
+     * the process boundary.
+     */
+    data class XrayRealityXhttp(
+        val config: net.pocvpn.client.vpn.xray.XrayVlessRealityXhttpConfig,
+        val endpointId: EndpointId,
+        val routingMode: RoutingMode = RoutingMode.FULL_VPN,
+    ) : TransportConfig()
+
     data class Shadowsocks(
         val endpointId: EndpointId,
         val host: String,

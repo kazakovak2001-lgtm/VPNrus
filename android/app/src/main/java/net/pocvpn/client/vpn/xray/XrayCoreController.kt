@@ -209,6 +209,9 @@ class XrayCoreController(
     // than throwing - the same fail-closed shape as a missing REALITY
     // profile, never a crash.
     private val tlsRepository: XrayTlsProfileRepository? = null,
+    // Same additive, null-by-default shape as [tlsRepository]: with none
+    // wired, requestStart(XRAY_REALITY_XHTTP) rejects instead of throwing.
+    private val realityXhttpRepository: net.pocvpn.client.identity.XrayRealityXhttpProfileRepository? = null,
     // B33 review fix (round 2, blocker) - a scope the bounded remote-
     // confirmation probe's BLOCKING native call runs on, deliberately NOT
     // derived from the calling coroutine (see confirmRemoteConnectivity's
@@ -347,6 +350,22 @@ class XrayCoreController(
                                 buildXrayVpnPlan(validated.config, novaPackageId, routingMode),
                                 XrayConfigRenderer.render(validated.config),
                                 validated.config.server,
+                            )
+                    }
+                }
+                TransportKind.XRAY_REALITY_XHTTP -> {
+                    // Resolved here from this process's own read of the
+                    // endpoint-scoped encrypted profile, like REALITY/TLS -
+                    // never handed over from the main process.
+                    val realityXhttpRepo = realityXhttpRepository
+                        ?: return XrayCoreStartOutcome.Rejected("Xray REALITY+XHTTP profile repository not wired")
+                    when (val resolution = XrayRuntimeResolver.resolveRealityXhttp(realityXhttpRepo)) {
+                        is XrayRealityXhttpRuntimeResolution.Rejected -> return XrayCoreStartOutcome.Rejected(resolution.reason)
+                        is XrayRealityXhttpRuntimeResolution.Ready ->
+                            ReadyToStart(
+                                buildXrayVpnPlan(resolution.config.realityPart(), novaPackageId, routingMode),
+                                resolution.renderedConfig,
+                                resolution.config.server,
                             )
                     }
                 }

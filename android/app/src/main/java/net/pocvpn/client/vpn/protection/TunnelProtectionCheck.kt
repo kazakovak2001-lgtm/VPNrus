@@ -87,6 +87,7 @@ object TunnelProtectionCheck {
         is TransportConfig.Xray -> config.config.dnsServers
         is TransportConfig.XrayXhttp -> config.config.dnsServers
         is TransportConfig.XrayTls -> config.config.dnsServers
+        is TransportConfig.XrayRealityXhttp -> config.config.dnsServers
         is TransportConfig.Shadowsocks, is TransportConfig.Hysteria2, null -> VpnDnsPolicy.servers
     }
 
