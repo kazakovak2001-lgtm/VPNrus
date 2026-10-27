@@ -441,8 +441,34 @@ NetworkProfiler
   (`ManagedIdentityLifecycle`, inside `ManagedAwgIdentityGuard`) -> binding-store
   lock -> managed key repository mutex; code holding L never takes
   `connectMutex`. The guard is built per `MainViewModel.Factory.create()` call,
-  so these locks serialize ONE ViewModel/controller only - they do not
-  coordinate several concurrent `MainActivity` instances.
+  which runs once per main process (see VPN session ownership below), so these
+  locks serialize the one controller that every `MainActivity` shares.
+
+## VPN session ownership (hard invariant)
+
+- **One owner per main process.** `NovaVpnApplication` is a
+  `ViewModelStoreOwner`; `MainActivity.sessionViewModel` takes `MainViewModel`
+  from that store, never from the Activity's own. So there is exactly one
+  `MainViewModel` -> one `VpnController` -> one set of transports (one
+  `GoBackend`) per main process. The store is never cleared in production, so
+  `MainViewModel.onCleared`/`VpnController.shutdown` run only in tests.
+- **UI state source.** Every `MainActivity` renders `MainViewModel.transportState`
+  (= `VpnController.state`) of that one instance. A second instance (explicit
+  intent, App Link) or one created after the previous finished (Back) reads the
+  controller that owns the running session, not a new one starting
+  `Disconnected`. The controller still has no "adopt a tunnel it did not start"
+  path: what it shows is only what this process' controller started.
+- **Process end.** The owner ends with the main process. AWG
+  (`GoBackend$VpnService`), Shadowsocks and Hysteria2 services run in that
+  process; `NovaXrayVpnService` runs in `:xray`, and an `:xray` left by a dead
+  main process is stopped at the next main-process start
+  (`XrayProcessBridge.stopOrphanedXrayProcess`).
+- `MainActivity` keeps the default launch mode, so several instances can still
+  exist in a task; they share one session owner. Each instance has its own
+  Compose UI collecting `MainViewModel.events`.
+- Proof: `SessionViewModelOwnerTest` (JVM, fake transport) and
+  `ActivityRecreationInstrumentedTest` (device/emulator: two concurrent
+  instances and finish+relaunch share one `MainViewModel`).
 
 ## Xray/TLS Connected confirmation (hard invariant, B33)
 
