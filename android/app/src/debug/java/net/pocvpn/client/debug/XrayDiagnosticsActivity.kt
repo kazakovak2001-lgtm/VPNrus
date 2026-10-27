@@ -1,22 +1,33 @@
 package net.pocvpn.client.debug
 
 import android.os.Bundle
+import android.os.SystemClock
+import android.util.Log
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.identity.XrayProfile
 import net.pocvpn.client.identity.XrayProfileRepositoryFactory
 import net.pocvpn.client.identity.XrayTlsProfile
 import net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory
 import net.pocvpn.client.reachability.EndpointId
 import net.pocvpn.client.smartconnect.ProductionGateway
+import net.pocvpn.client.vpn.IndependentEgressProbeResult
+import net.pocvpn.client.vpn.TransportState
 import net.pocvpn.client.vpn.VlessRealityTransport
 import net.pocvpn.client.vpn.VlessTlsTransport
+import net.pocvpn.client.vpn.VpnTransport
 import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.xray.IndependentEgressTargets
+import net.pocvpn.client.vpn.xray.XrayRuntimeEvent
+import net.pocvpn.client.vpn.xray.XrayRuntimeState
 import net.pocvpn.client.vpn.xray.toXrayVlessRealityConfig
 import net.pocvpn.client.vpn.xray.toXrayVlessTlsConfig
 
@@ -78,7 +89,8 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
                             statusText.text = "No Xray TLS profile configured for ${endpointId.value} - refusing to start."
                             return@launch
                         }
-                        VlessTlsTransport(applicationContext).connect(TransportConfig.XrayTls(profile.toXrayVlessTlsConfig(), endpointId = endpointId))
+                        VlessTlsTransport(applicationContext).also { startedTransport = it; startedEndpointId = endpointId }
+                            .connect(TransportConfig.XrayTls(profile.toXrayVlessTlsConfig(), endpointId = endpointId))
                     } else {
                         val repository = XrayProfileRepositoryFactory.create(applicationContext, endpointId)
                         val profile = repository.getProfileOrNull()
@@ -86,7 +98,8 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
                             statusText.text = "No Xray profile configured for ${endpointId.value} - refusing to start."
                             return@launch
                         }
-                        VlessRealityTransport(applicationContext).connect(TransportConfig.Xray(profile.toXrayVlessRealityConfig(), endpointId = endpointId))
+                        VlessRealityTransport(applicationContext).also { startedTransport = it; startedEndpointId = endpointId }
+                            .connect(TransportConfig.Xray(profile.toXrayVlessRealityConfig(), endpointId = endpointId))
                     }
                     statusText.text = "Start requested (endpoint=${endpointId.value}, kind=$kind) - see logcat NovaXrayVpnService for real lifecycle detail."
                 }
@@ -98,6 +111,8 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
             text = "Stop Xray test tunnel"
             setOnClickListener {
                 lifecycleScope.launch {
+                    startedTransport = null
+                    startedEndpointId = null
                     if (kind == "tls") VlessTlsTransport(applicationContext).disconnect() else VlessRealityTransport(applicationContext).disconnect()
                     statusText.text = "Stop requested - see logcat NovaXrayVpnService for real lifecycle detail."
                 }
@@ -105,7 +120,18 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
         }
         root.addView(stopButton)
 
+        // B-WL7 M1 test hook - see [runEgressProbe]. Same DUMP-gated, debug-only activity; no new component.
+        val probeButton = Button(this).apply {
+            text = "Probe independent egress (debug)"
+            setOnClickListener { lifecycleScope.launch { runEgressProbe() } }
+        }
+        root.addView(probeButton)
+
         setContentView(root)
+
+        if (intent.getBooleanExtra(EXTRA_PROBE_EGRESS, false)) {
+            lifecycleScope.launch { runEgressProbe() }
+        }
 
         if (intent.getBooleanExtra(EXTRA_SAVE_PROFILE, false)) {
             lifecycleScope.launch {
@@ -169,9 +195,109 @@ class XrayDiagnosticsActivity : AppCompatActivity() {
         startButton.isEnabled = hasProfile
     }
 
+    /**
+     * B-WL7 M1 test hook - asks the transport THIS activity started for one
+     * [VpnTransport.probeIndependentEgress] (the same production entry point
+     * VpnController uses: existing IPC, existing `:xray` 6 s / bridge 8 s
+     * bounds) and shows the result. Diagnostic only: this session runs
+     * outside VpnController, so no data-plane gate, failover or reconnect
+     * reads this result or the probe's bytes. REACHED means only that the
+     * target answered through this core; it is NOT proof the request left
+     * through the first gateway's egress (that needs the target's access log).
+     */
+    private suspend fun runEgressProbe() {
+        val transport = startedTransport
+        val endpoint = startedEndpointId
+        val targets = IndependentEgressTargets.forSession(endpoint)
+        val connected = transport != null && transport.observeState().first() is TransportState.Connected
+        val preflight = EgressProbeHookGate.preflight(connected, probeInFlight, XrayRuntimeState.events.value, targets)
+        if (preflight is EgressProbeHookGate.Preflight.Refused) {
+            report("egress probe refused: ${preflight.reason}")
+            return
+        }
+        val ready = preflight as EgressProbeHookGate.Preflight.Ready
+        probeInFlight = true
+        try {
+            report("egress probe running: coreSessionAtStart=${ready.sessionId} target=${ready.target} ...")
+            val startedAt = SystemClock.elapsedRealtime()
+            var error: Throwable? = null
+            val result = try {
+                withTimeoutOrNull(EgressProbeHookGate.CALLER_TIMEOUT_MS) { transport!!.probeIndependentEgress() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                error = t
+                null
+            }
+            val elapsedMs = SystemClock.elapsedRealtime() - startedAt
+            val outcome = EgressProbeHookGate.classify(ready.sessionId, XrayRuntimeState.events.value, result, error)
+            report(
+                "egress probe: endpoint=${endpoint?.value} ${EgressProbeHookGate.sessionLabel(ready.sessionId, outcome)} target=${ready.target} " +
+                    "outcome=$outcome elapsedMs=$elapsedMs (REACHED != proof of first-gateway egress)",
+            )
+        } finally {
+            probeInFlight = false
+        }
+    }
+
+    /** Non-secret only: endpoint id, session id, public gateway IP, enum outcome, elapsed time. */
+    private fun report(line: String) {
+        statusText.text = line
+        Log.i(EGRESS_PROBE_LOG_TAG, line)
+    }
+
     companion object {
         const val EXTRA_ENDPOINT_ID = "endpointId"
         const val EXTRA_KIND = "kind"
         const val EXTRA_SAVE_PROFILE = "saveProfile"
+        const val EXTRA_PROBE_EGRESS = "probeEgress"
+        private const val EGRESS_PROBE_LOG_TAG = "XrayDiagEgressProbe"
+
+        // Process-wide so a later `am start --ez probeEgress true` (a new
+        // activity instance) still probes the transport the Start button started.
+        @Volatile private var startedTransport: VpnTransport? = null
+        @Volatile private var startedEndpointId: EndpointId? = null
+        @Volatile private var probeInFlight = false
     }
+}
+
+/** Pure decisions of the [XrayDiagnosticsActivity] egress-probe hook (JVM-tested). */
+internal object EgressProbeHookGate {
+
+    /** Same bound as VpnController.INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS (private there). */
+    const val CALLER_TIMEOUT_MS = 10_000L
+
+    sealed class Preflight {
+        data class Ready(val sessionId: Long, val target: String) : Preflight()
+        data class Refused(val reason: String) : Preflight()
+    }
+
+    enum class Outcome { REACHED, NOT_REACHED, UNAVAILABLE, TIMEOUT, ERROR, STALE_SESSION }
+
+    fun preflight(transportConnected: Boolean, inFlight: Boolean, currentEvent: XrayRuntimeEvent?, targets: List<String>): Preflight = when {
+        inFlight -> Preflight.Refused("a probe is already running")
+        !transportConnected -> Preflight.Refused("no Connected session started from this screen")
+        currentEvent !is XrayRuntimeEvent.Started -> Preflight.Refused("the Xray core is not Started")
+        targets.isEmpty() -> Preflight.Refused("no independent catalog target for this endpoint")
+        else -> Preflight.Ready(currentEvent.sessionId, targets.first())
+    }
+
+    /** A result only counts for the session that was Started before AND is still Started after the probe. */
+    fun classify(sessionBefore: Long, eventAfter: XrayRuntimeEvent?, result: IndependentEgressProbeResult?, error: Throwable?): Outcome = when {
+        eventAfter !is XrayRuntimeEvent.Started || eventAfter.sessionId != sessionBefore -> Outcome.STALE_SESSION
+        error != null -> Outcome.ERROR
+        result == null -> Outcome.TIMEOUT
+        else -> Outcome.valueOf(result.name)
+    }
+
+    /**
+     * The preflight id is the core's CURRENT Started session, not necessarily
+     * the one this screen's transport owns (its id is private to the
+     * transport). Only REACHED proves they are the same: the bridge answers
+     * REACHED solely for the transport's own Started session, and [classify]
+     * already required that same id before and after. Any other outcome may
+     * come from the transport's own (older) session, so no id is claimed.
+     */
+    fun sessionLabel(coreSessionAtStart: Long, outcome: Outcome): String =
+        if (outcome == Outcome.REACHED) "session=$coreSessionAtStart" else "session=unattributed coreSessionAtStart=$coreSessionAtStart"
 }
