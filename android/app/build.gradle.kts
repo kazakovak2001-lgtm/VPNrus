@@ -178,6 +178,9 @@ android {
 
     buildTypes {
         debug {
+            // GEO-RUNTIME-EXPERIMENT ONLY (never committed): isolated package + data dir so the
+            // experiment cannot touch the installed net.pocvpn.client profile/data.
+            applicationIdSuffix = ".geoexp"
             // B17/B20 - explicit for reviewability: debug builds (including
             // the physical-device validation build) fetch the real
             // production origins by default, same value release ships

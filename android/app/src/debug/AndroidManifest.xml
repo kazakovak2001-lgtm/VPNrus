@@ -60,5 +60,20 @@
             android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
             android:exported="true"
             android:label="Shadowsocks Adapter Validation (debug, not production)" />
+
+        <!-- GEO-RUNTIME-EXPERIMENT E0-E6 - TEST ONLY, debug source set, never committed.
+             Runs through the production LibXrayCoreRuntime with fixed blackhole-only configs. -->
+        <activity
+            android:name="net.pocvpn.client.debug.geort.GeoRuntimeExperimentActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":xray"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <service
+            android:name="net.pocvpn.client.debug.geort.GeoRuntimeVpnService"
+            android:exported="false"
+            android:process=":xray"
+            android:permission="android.permission.BIND_VPN_SERVICE" />
     </application>
 </manifest>
