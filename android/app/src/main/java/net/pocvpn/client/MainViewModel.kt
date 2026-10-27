@@ -686,6 +686,10 @@ class MainViewModel(
     // passed unchanged into this ViewModel's VpnController below. Null keeps the
     // pre-Phase-B behavior (tests/legacy only); the Factory always passes one.
     private val managedAwgIdentityGuard: net.pocvpn.client.identity.ManagedAwgIdentityGuard? = null,
+    // Live speed indicator - null (tests/legacy) means no indicator at all;
+    // the Factory passes the real notification sink + screen-state flow.
+    private val trafficIndicatorSink: net.pocvpn.client.vpn.traffic.VpnTrafficIndicatorSink? = null,
+    private val screenInteractive: kotlinx.coroutines.flow.Flow<Boolean> = kotlinx.coroutines.flow.flowOf(true),
 ) : ViewModel() {
     // A debug UI force is intentionally a one-shot input. Keep the marker
     // separate from userTransportPreference so constructor-injected Manual
@@ -1099,6 +1103,18 @@ class MainViewModel(
         dataPlaneCheckLog = dataPlaneCheckLog,
         managedAwgIdentityGuard = managedAwgIdentityGuard,
     )
+
+    // Live speed indicator - observation only (see VpnTrafficIndicator's own
+    // docs); started once here, stopped in onCleared together with the controller.
+    private val trafficIndicator = trafficIndicatorSink?.let { sink ->
+        net.pocvpn.client.vpn.traffic.VpnTrafficIndicator(
+            state = controller.state,
+            counters = { controller.liveTrafficCounters() },
+            sink = sink,
+            elapsedRealtimeMillis = android.os.SystemClock::elapsedRealtime,
+            interactive = screenInteractive,
+        ).also { it.start(viewModelScope) }
+    }
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
     // profile is CONFIRMED to exist FOR THAT ENDPOINT: checked once at
@@ -5139,6 +5155,9 @@ class MainViewModel(
     // Production never clears the application-level store, so this runs only
     // when that store is cleared explicitly (tests) - not when an Activity finishes.
     override fun onCleared() {
+        // Before shutdown: the controller below stops observing the tunnel, so
+        // a speed shown after this point could no longer be trusted.
+        trafficIndicator?.stop()
         controller.shutdown()
         // B8I - no leak: unregisters the SAME ConnectivityManager callback
         // start() registered above (see NetworkProfiler.stop's own docs).
@@ -5551,6 +5570,8 @@ class MainViewModel(
                 // for-byte unaffected otherwise.
                 fieldCredentialStore = net.pocvpn.client.provisioning.FieldCredentialStoreFactory.create(context),
                 zeroTouchEnrollmentEnabled = BuildConfig.FIELD_ENROLLMENT_ENABLED,
+                trafficIndicatorSink = net.pocvpn.client.vpn.traffic.VpnTrafficNotifier(context),
+                screenInteractive = net.pocvpn.client.vpn.traffic.screenInteractiveFlow(context),
             ) as T
         }
     }

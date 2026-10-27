@@ -371,6 +371,28 @@ class VpnController(
     private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
     val state: StateFlow<TransportState> = _state.asStateFlow()
 
+    /**
+     * Live speed indicator - the active session's cumulative tunnel byte
+     * counters ([VpnTransport.liveTrafficCounters]: the same totals the B-WL7
+     * check reads, through a read that is safe to poll; payload/tunnel bytes
+     * only, never device-wide), or Unavailable
+     * while no session is Connected or the read fails. Read-only: never
+     * changes state, verification or reconnect ownership.
+     */
+    suspend fun liveTrafficCounters(): TransportStats {
+        val transport = synchronized(reconnectOwnershipLock) {
+            if (_state.value !is TransportState.Connected) return TransportStats.Unavailable
+            activeTransport
+        }
+        return try {
+            transport.liveTrafficCounters()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            TransportStats.Unavailable
+        }
+    }
+
     // B25 (task A) - the real, typed session identity THIS attempt (or the
     // most recent one) carries - see [VpnAttemptContext]'s own docs. Same
     // "pinned once at connect(), reset on disconnect()" lifecycle as
