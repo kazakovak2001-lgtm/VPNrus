@@ -131,7 +131,7 @@ class MainActivity : AppCompatActivity() {
             NovaVpnTheme {
                 AppRoot(
                     viewModel = viewModel,
-                    isDebugBuild = BuildConfig.DEBUG,
+                    isDebugBuild = true, // TEST-ONLY combo build: full field test in release
                     onRequestVpnPermission = { intent: Intent -> vpnPermissionLauncher.launch(intent) },
                     isZeroTouchEnrollmentBuild = BuildConfig.FIELD_ENROLLMENT_ENABLED,
                     onLaunchActivationFilePicker = { mimeTypes -> activationFileLauncher.launch(mimeTypes) },
