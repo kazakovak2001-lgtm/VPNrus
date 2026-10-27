@@ -28,6 +28,7 @@ independent credential/token system.
 import hmac
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -1607,8 +1608,18 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             "role": getattr(self, "_admin_role", "unknown"),
             "client": client_identity.normalize_client(self.headers.get_all("X-Real-IP")),
         })
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        # Created 0600 (ids, role and client address); an older, looser
+        # file is tightened on first use.
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            try:
+                if os.fstat(fd).st_mode & 0o077:
+                    os.fchmod(fd, 0o600)
+            except OSError:
+                logger.error("admin_audit_chmod_failed")
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
 
     def _parse_admin_list_query(self):
         """Strict ?q=&status=&limit=&offset= parsing; anything unexpected is

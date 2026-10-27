@@ -123,12 +123,53 @@ class AdminRoleTests(unittest.TestCase):
         self.assertEqual(self._req("POST", "/admin/logout", self._mut(sid, csrf))[0], 200)
         self.assertEqual(self._req("GET", "/admin/activations", {"Cookie": f"pocvpn-admin-session={sid}"})[0], 401)
 
+    def test_audit_log_is_created_0600_and_loose_file_is_tightened(self):
+        audit = self.store + ".admin-audit.log"
+        _, sid, csrf, _ = self._login(ADMIN_PW)
+        self.assertEqual(self._json_post(f"/admin/activations/{_ID}/extend", sid, csrf, {"days": 1})[0], 200)
+        self.assertEqual(os.stat(audit).st_mode & 0o777, 0o600)
+        os.chmod(audit, 0o644)
+        self.assertEqual(self._json_post(f"/admin/activations/{_ID}/extend", sid, csrf, {"days": 1})[0], 200)
+        self.assertEqual(os.stat(audit).st_mode & 0o777, 0o600)
+        with open(audit, encoding="utf-8") as fh:
+            self.assertEqual(len(fh.readlines()), 2)
+
     def test_admin_still_mutates_and_audit_records_role(self):
         _, sid, csrf, _ = self._login(ADMIN_PW)
         status, _, _ = self._json_post(f"/admin/activations/{_ID}/extend", sid, csrf, {"days": 5})
         self.assertEqual(status, 200)
         with open(self.store + ".admin-audit.log", encoding="utf-8") as f:
             self.assertEqual([json.loads(l)["role"] for l in f], ["admin"])
+
+
+class AccountCounterResetTests(unittest.TestCase):
+    """Only a verified ADMIN login clears the shared account failure counter."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        d = self._tmp.name
+        self.auth = admin_auth.AdminAuthenticator(
+            _write_secret(d, "admin", ADMIN_PW), _write_secret(d, "viewer", VIEWER_PW))
+        # per_source_max=10, per_account_max=30: bring the account counter to 29.
+        for src, n in (("10.0.0.1/32", 10), ("10.0.0.2/32", 10), ("10.0.0.3/32", 9)):
+            for _ in range(n):
+                self.auth.verify_password_and_create_session("wrong" * 4, src)
+
+    def _wrong(self, src):
+        return self.auth.verify_password_and_create_session("wrong" * 4, src)[2]
+
+    def test_viewer_login_does_not_reset_account_counter(self):
+        ok, _, _ = self.auth.verify_password_and_create_session(VIEWER_PW, "10.7.7.7/32")
+        self.assertTrue(ok)
+        self.assertEqual(self._wrong("10.6.6.6/32"), "unauthorized")  # 30th failure
+        self.assertEqual(self._wrong("10.6.6.5/32"), "rate_limited")  # account now locked
+
+    def test_admin_login_still_resets_account_counter(self):
+        ok, _, _ = self.auth.verify_password_and_create_session(ADMIN_PW, "10.7.7.7/32")
+        self.assertTrue(ok)
+        self.assertEqual(self._wrong("10.6.6.6/32"), "unauthorized")
+        self.assertEqual(self._wrong("10.6.6.5/32"), "unauthorized")
 
 
 class AdminViewerSecretConfigTests(unittest.TestCase):

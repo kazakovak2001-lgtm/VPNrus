@@ -202,9 +202,13 @@ class AdminAuthenticator:
             self._auth_failure_limiter.record_auth_failure(source_ip, "admin")
             return False, None, "unauthorized"
 
-        # Verified success: clear the shared account counter (atomic under
-        # the limiter's own lock; per-source and global counters are kept).
-        self._auth_failure_limiter.reset_account_failures("admin")
+        # Verified ADMIN success clears the shared account counter (atomic
+        # under the limiter's own lock; per-source and global counters are
+        # kept). A viewer login must not: holding the lower-privilege
+        # credential would otherwise let someone keep the account counter
+        # below its threshold while guessing the admin secret.
+        if is_admin:
+            self._auth_failure_limiter.reset_account_failures("admin")
         session_id, csrf_token = self._create_session(source_ip, "admin" if is_admin else "viewer")
         return True, (session_id, csrf_token), None
 
