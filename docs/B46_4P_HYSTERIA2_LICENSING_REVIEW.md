@@ -131,9 +131,11 @@ Evidence:                 core/v2/server exposes a small, clean, dependency-ligh
                            own "no quic:/masquerade:/acl:/outbounds: block"
                            minimalism decision already made independently of
                            this licensing question).
-Confidence:                Reasonably high, but NOT yet proven by an actual
-                           build - this is a structural/API-level feasibility
-                           finding, not a working prototype. app/cmd/server.go's
+Confidence:                Confirmed by an actual build this pass - see
+                           section 7A below and the dedicated
+                           B46_4P_HYSTERIA2_SERVER_ONLY_PROTOTYPE.md - not
+                           merely a structural/API-level assessment
+                           anymore. app/cmd/server.go's
                            own 1874 lines are overwhelmingly CLI/config-parsing/
                            ACME/masquerade/DNS-provider glue that Nova's own
                            minimal architecture does not need at all - a
@@ -150,6 +152,51 @@ Upstream-supported:        NO - this would be entirely Nova-authored code agains
 ```
 
 This mirrors a methodology this project has **already successfully executed once**: B46-2C built a "minimal Hysteria2 SOCKS5-only client" directly against `core/v2/client` + `app/internal/socks5`, deliberately bypassing the full `hysteria` CLI and its own `app/internal/tun` import, and proved via four independent methods (`go list -deps`, `go version -m`, `go tool nm` on both host and Android-arm64 builds, and a binary `strings` scan) that the resulting artifact contained zero `sing-tun`/`app/internal/tun` symbols. The identical methodology, applied to `core/v2/server` instead of `core/v2/client`, is the concrete technical path for Option B below - not a novel, unproven idea for this project, but a repeat of a pattern it has already carried out and verified once.
+
+## 7A. Server-only prototype evidence
+
+A from-scratch server-only build was actually attempted this pass (not
+just assessed for feasibility as in section 7 above). Full evidence,
+comparison tables, and limitations are in the dedicated document
+[`B46_4P_HYSTERIA2_SERVER_ONLY_PROTOTYPE.md`](B46_4P_HYSTERIA2_SERVER_ONLY_PROTOTYPE.md);
+summary:
+
+```text
+Source API:      github.com/apernet/hysteria/core/v2/server (MIT), the
+                  exact public API named in section 7 (NewServer/Serve/Close)
+Prototype path:  tools/hysteria-server-prototype/
+Build command:   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
+                 -o hysteria-server-prototype-linux-amd64 .
+Go version:      go1.26.0 linux/amd64
+Binary SHA256:   1184c06bc808002fd3d0b92b5d6e990a9cca112783603d24081bbd718d45e768
+Module graph:    14 compiled-in deps (go version -m, exhaustive) - ZERO
+                 GPL/AGPL/LGPL/MPL entries; see the dedicated doc's
+                 section 7 for the full per-module license inventory
+GPL status:      sing-tun ABSENT, sagernet/sing ABSENT - confirmed by
+                 go version -m, strings, go tool nm, AND go list -deps
+                 (four independent methods, all agreeing), cross-checked
+                 against a same-pass download of the official binary
+                 (which DOES contain both)
+Runtime result:  starts, listens on 127.0.0.1 (ephemeral port), serves,
+                 shuts down cleanly (exit 0) - loopback-only, throwaway
+                 self-signed test cert, randomly generated test password;
+                 no production host/port/cert/credential involved
+Limitations:     no real Hysteria2 client handshake was attempted; no
+                 auth/TLS/UDP-proxy correctness proof; no ACME/config-
+                 file/deployment-wiring; not a drop-in CLI replacement
+```
+
+**This confirms section 7's feasibility assessment with an actual working
+build**, upgrading Option B's status from "TECHNICALLY INVESTIGATE" to
+"TECHNICALLY VERIFIED, ENGINEERING COST STILL TO BE INCURRED FOR
+PRODUCTION" (auth-backend integration, ACME/cert wiring, config parsing,
+and deployment plumbing remain unbuilt - see the dedicated document's
+section 12). It does **not** change any answer to the open legal
+questions in section 8 below, which remain entirely for the repository
+owner/legal to resolve - a GPL-free module graph for one Nova-authored
+prototype binary is a technical fact about that one binary, not a legal
+conclusion about Hysteria2 licensing in general or about whether Option A
+is acceptable as-is.
 
 ## 8. Open legal questions
 
@@ -184,7 +231,7 @@ NEW Nova-authored main package
   (never imports app/cmd, app/internal/tun, sing-tun, or sagernet/sing,
    at source or binary level)
 ```
-Status: `TECHNICALLY INVESTIGATE` (feasibility argued above, not yet prototyped). Real engineering cost: a new, Nova-maintained Go program (order-of-magnitude comparable to B46-2C's own minimal client, which this project has already built once), its own test suite, its own build/pin/release process (would need its OWN `gateway/hysteria/VERSION`-style pinning, but pinned to the SAME upstream commit's `core`/`extras` modules, not a release binary), and ongoing maintenance burden of tracking upstream `core/v2/server` API changes independently (a real, standing cost, though bounded - `core/v2/server`'s own public API is small and has an incentive to stay stable since upstream's own CLI depends on it too).
+Status: `TECHNICALLY VERIFIED` this pass by an actual working prototype - see section 7A and `B46_4P_HYSTERIA2_SERVER_ONLY_PROTOTYPE.md` (`tools/hysteria-server-prototype/`: builds, module graph confirmed GPL-free by four methods, starts/listens/serves/shuts down cleanly on loopback). Remaining engineering cost for a PRODUCTION version (not yet incurred): a real auth-backend integration (this prototype uses a single fixed test password, not `hysteria_auth_backend.py`'s `auth.type: http` design), ACME/cert-file wiring beyond a throwaway self-signed test cert, config-file parsing, its own test suite, its own build/pin/release process (would need its OWN `gateway/hysteria/VERSION`-style pinning, but pinned to the SAME upstream commit's `core`/`extras` modules, not a release binary), and ongoing maintenance burden of tracking upstream `core/v2/server` API changes independently (a real, standing cost, though bounded - `core/v2/server`'s own public API is small and has an incentive to stay stable since upstream's own CLI depends on it too).
 
 **Option C — official server-only artifact**
 Status: `VERIFY` → **verified this pass: does not exist.** No official binary, Docker image, or package variant excludes `client`/`tun`/`sing-tun` in any release channel upstream provides (see section 6).

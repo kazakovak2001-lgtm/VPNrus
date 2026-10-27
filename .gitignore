@@ -77,6 +77,15 @@ android/app/src/debug/jniLibs/arm64-v8a/libsslocal_spike.so
 # filename so the two are never confused. Not meant to ever be committed, for
 # the same "large binary artifact, reproducible from a pinned source" reason
 # as libsslocal_spike.so above.
+
+# B46-4P - server-only Hysteria2 prototype binary (see
+# tools/hysteria-server-prototype/README.md and
+# docs/B46_4P_HYSTERIA2_SERVER_ONLY_PROTOTYPE.md). Reproducible from the
+# pinned upstream commit in go.mod/go.sum - same "don't commit a large
+# reproducible binary" convention as above. Not an official artifact, not
+# production code, not deployed anywhere.
+tools/hysteria-server-prototype/hysteria-server-prototype*
+tools/hysteria-server-prototype/*.log
 android/app/src/debug/jniLibs/arm64-v8a/libsslocal.so
 
 # B45A data-plane validation (round 6, see
