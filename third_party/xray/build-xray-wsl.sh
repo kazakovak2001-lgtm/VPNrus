@@ -89,6 +89,11 @@ gomobile init
 go mod tidy -v
 go mod verify
 
+# 16 KB page-size support (Android 15+ devices, Google Play requirement):
+# gomobile links libgojni.so through cgo's external linker, whose default
+# LOAD alignment is 4 KB. Align every segment to 16 KB instead.
+export CGO_LDFLAGS="${CGO_LDFLAGS:-} -Wl,-z,max-page-size=16384"
+
 gomobile bind -v \
     -androidapi "$ANDROID_API_LEVEL" \
     -trimpath \

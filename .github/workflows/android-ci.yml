@@ -132,6 +132,22 @@ jobs:
           check "$AWG_AAR" jni/arm64-v8a/libwg-go.so jni/arm64-v8a/libwg.so jni/arm64-v8a/libwg-quick.so
           check "$XRAY_AAR" jni/arm64-v8a/libgojni.so
 
+          # 16 KB page-size support: every LOAD segment of every 64-bit .so
+          # must be aligned to at least 16 KB (0x4000).
+          so_dir="$RUNNER_TEMP/aar-so"
+          for aar in "$AWG_AAR" "$XRAY_AAR"; do
+            rm -rf "$so_dir"; mkdir -p "$so_dir"
+            unzip -q "$aar" 'jni/arm64-v8a/*.so' 'jni/x86_64/*.so' -d "$so_dir"
+            for so in "$so_dir"/jni/*/*.so; do
+              while read -r align; do
+                if (( align < 0x4000 )); then
+                  echo "::error::$(basename "$aar"): ${so#"$so_dir"/} LOAD alignment $align < 16 KB"
+                  exit 1
+                fi
+              done < <(readelf -lW "$so" | awk '$1 == "LOAD" { print $NF }')
+            done
+          done
+
           {
             echo "### Native AARs (cache hit: ${{ steps.native-cache.outputs.cache-hit == 'true' }})"
             echo '| AAR | built SHA-256 | reference SHA-256 | match |'
