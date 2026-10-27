@@ -67,6 +67,10 @@ _FIELD_ENROLLMENT_GLOBAL_RATE_LIMIT = 5
 _FIELD_ENROLLMENT_GLOBAL_RATE_WINDOW_SECONDS = 60.0
 
 
+_ADMIN_READ_RATE_LIMIT = 120
+_ADMIN_MUTATION_RATE_LIMIT = 30
+_ADMIN_RATE_WINDOW_SECONDS = 60.0
+
 class ProvisioningServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -101,6 +105,14 @@ class ProvisioningServer(ThreadingHTTPServer):
         # fail at startup (AdminAuthenticator raises ConfigError when the
         # secret file is blank/missing). handler.py's _check_admin_enabled
         # then returns 503 for every admin endpoint when these are None.
+        # Admin activation endpoints: per-process, per-session fixed-window
+        # limits (reads: list/detail; mutations: revoke). Not distributed.
+        self.admin_read_limiter = ratelimit.RateLimiter(
+            _ADMIN_READ_RATE_LIMIT, _ADMIN_RATE_WINDOW_SECONDS, clock=time.monotonic
+        )
+        self.admin_mutation_limiter = ratelimit.RateLimiter(
+            _ADMIN_MUTATION_RATE_LIMIT, _ADMIN_RATE_WINDOW_SECONDS, clock=time.monotonic
+        )
         self.admin_authenticator = (
             admin_auth.AdminAuthenticator(app_config.admin_secret_file)
             if app_config.admin_enabled else None
