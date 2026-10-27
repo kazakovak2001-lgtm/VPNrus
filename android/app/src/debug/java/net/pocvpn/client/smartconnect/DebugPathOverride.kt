@@ -24,6 +24,9 @@ package net.pocvpn.client.smartconnect
  */
 object DebugPathOverride {
 
+    /** True here: [forceRelayedVia] really pins the next Auto connect. */
+    const val isAvailable: Boolean = true
+
     private sealed class Mode {
         object Auto : Mode()
         /** Any Relayed attempt; or only those entering through [ingressEndpointId]. */

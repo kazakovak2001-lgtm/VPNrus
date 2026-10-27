@@ -63,6 +63,8 @@ class FieldTestRunnerTest {
         private val stickyError: Boolean = false,
         private val signedManifest: EndpointManifest = manifest(),
         private val ingressActivation: String = "unknown",
+        // Release: DebugPathOverride.isAvailable is false.
+        private val relayForcing: Boolean = true,
     ) : FieldTestHost {
         override val transportState = MutableStateFlow<TransportState>(TransportState.Disconnected)
         override val sessionHealth = MutableStateFlow<VpnSessionHealth>(VpnSessionHealth.Idle)
@@ -102,6 +104,7 @@ class FieldTestRunnerTest {
         override fun transportScores() = mapOf(TransportKind.XRAY_REALITY to 10)
         override fun lastErrorText() = lastError
         override fun lastForcedRelayKeys(): List<String>? = null
+        override fun relayPathForcingAvailable() = relayForcing
         override suspend fun relayIngressActivation(ingressId: String) = ingressActivation
         override fun latestDiagnosticSession(): JSONObject? = JSONObject().put("selectedPathKind", "DIRECT")
         override fun appState() = JSONObject().put("state", "x")
@@ -366,6 +369,41 @@ class FieldTestRunnerTest {
         assertTrue(m.getString("probeSuccess").startsWith("10/"))
         assertTrue(m.getJSONArray("events").toString().contains("state Connected"))
         assertTrue(host.transportState.value is TransportState.Disconnected)
+    }
+
+    @Test
+    fun `without relay forcing (release) a relay run is skipped, never connected or reported as relay`() = runTest {
+        val ingress = EndpointDescriptor(
+            id = EndpointId("stockholm-ingress-1"), roles = setOf(EndpointRole.INGRESS), region = "SE", provider = "test",
+            transports = listOf(EndpointTransportBinding(TransportKind.XRAY_REALITY, "16.170.208.231", 2093)),
+            relayTo = EndpointId("frankfurt"),
+        )
+        val host = FakeHost(signedManifest = manifestWith(ingress = ingress), relayForcing = false)
+        val report = runner(host).run { }
+        val relay = report.runs.single { it.target.relayIngress == "stockholm-ingress-1" }
+
+        assertEquals(FieldRunOutcome.SKIPPED, relay.outcome)
+        assertEquals(RELAY_FORCING_UNAVAILABLE, relay.skipReason)
+        assertTrue(relay.target.label !in host.connects)
+        assertTrue(relay.exitIp == null && relay.probeContext == null)
+        // The rest of the full run still happens: Smart Connect and the pinned gateways are attempted.
+        assertTrue(FieldAttemptTarget(null, null).label in host.connects)
+        assertTrue(report.runs.any { it.target.gateway != null && it.outcome != FieldRunOutcome.SKIPPED })
+    }
+
+    @Test
+    fun `with relay forcing (debug) the relay run is attempted`() = runTest {
+        val ingress = EndpointDescriptor(
+            id = EndpointId("stockholm-ingress-1"), roles = setOf(EndpointRole.INGRESS), region = "SE", provider = "test",
+            transports = listOf(EndpointTransportBinding(TransportKind.XRAY_REALITY, "16.170.208.231", 2093)),
+            relayTo = EndpointId("frankfurt"),
+        )
+        val host = FakeHost(signedManifest = manifestWith(ingress = ingress), relayForcing = true)
+        val report = runner(host).run { }
+        val relay = report.runs.single { it.target.relayIngress == "stockholm-ingress-1" }
+
+        assertTrue(relay.outcome != FieldRunOutcome.SKIPPED)
+        assertTrue(relay.target.label in host.connects)
     }
 
     @Test

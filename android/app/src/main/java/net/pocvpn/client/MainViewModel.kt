@@ -3946,6 +3946,7 @@ class MainViewModel(
         override fun transportScores() = this@MainViewModel.transportScores()
         override fun lastErrorText(): String? = diagnostics.value.lastError?.displayText()
         override fun lastForcedRelayKeys(): List<String>? = net.pocvpn.client.smartconnect.DebugPathOverride.lastAppliedAttemptKeys()
+        override fun relayPathForcingAvailable(): Boolean = net.pocvpn.client.smartconnect.DebugPathOverride.isAvailable
         override suspend fun relayIngressActivation(ingressId: String): String {
             val store = ingressProfileStore ?: return "unknown (no ingress profile store wired)"
             return try {

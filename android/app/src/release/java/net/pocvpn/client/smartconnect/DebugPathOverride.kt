@@ -8,6 +8,9 @@ package net.pocvpn.client.smartconnect
  * instance), there is no status line, no action, and nothing can switch it on.
  */
 object DebugPathOverride {
+    /** False here: [forceRelayedVia] does nothing, so a caller must not label a run as relay-forced. */
+    const val isAvailable: Boolean = false
+
     fun applyAndConsume(
         attempts: List<AutoGatewaySelector.AutoConnectAttempt>,
     ): List<AutoGatewaySelector.AutoConnectAttempt> = attempts

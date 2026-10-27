@@ -42,6 +42,12 @@ interface FieldTestHost {
     fun lastErrorText(): String?
     /** Attempt keys a forced relay run actually kept (null when no forced run happened). */
     fun lastForcedRelayKeys(): List<String>?
+    /**
+     * Whether this build can really pin the next connect to a relay path
+     * (DebugPathOverride.isAvailable). False in release: a relay run would be
+     * a plain Auto connect, so it is skipped instead of being reported as relay.
+     */
+    fun relayPathForcingAvailable(): Boolean
     /** Whether this device holds an activated profile for relay ingress [ingressId] (read-only). */
     suspend fun relayIngressActivation(ingressId: String): String = "unknown"
     fun latestDiagnosticSession(): JSONObject?
@@ -192,6 +198,9 @@ val FIELD_TEST_TRANSPORTS = listOf(
 /** Pure: API origins to check - every IP-literal host in the manifest, then the control-plane hostname. */
 internal fun apiOrigins(manifest: EndpointManifest?): List<String> =
     (expectedExitIps(manifest, null).sorted() + FieldTestTargets.CONTROL_PLANE_HOST).distinct()
+
+/** Skip reason of a relay run in a build that cannot force the relay path. */
+internal const val RELAY_FORCING_UNAVAILABLE = "relay path forcing is available only in the debug build"
 
 /**
  * Pure: the attempt list for a run. Every gateway x transport, then one run
@@ -552,6 +561,9 @@ class FieldTestRunner(
             if (descriptor == null || !descriptor.supports(target.transport)) {
                 return FieldTransportRun(target, startedAt, FieldRunOutcome.SKIPPED, skipReason = "not offered by the signed manifest for this gateway")
             }
+        }
+        if (target.relayIngress != null && !host.relayPathForcingAvailable()) {
+            return FieldTransportRun(target, startedAt, FieldRunOutcome.SKIPPED, skipReason = RELAY_FORCING_UNAVAILABLE)
         }
         host.applyTarget(target)?.let { reason ->
             return FieldTransportRun(target, startedAt, FieldRunOutcome.SKIPPED, skipReason = reason)
