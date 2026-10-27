@@ -1267,7 +1267,7 @@ done
 <!-- rx-block:inventory-compare -->
 
 ```
-awk '{ f = $2; sub(/^api\//, "", f) }
+out=$(awk '{ f = $2; sub(/^api\//, "", f) }
      FILENAME == ARGV[1] { t[f] = $1; next }
      FILENAME == ARGV[2] { o[f] = $1; next }
      { l[f] = $1 }
@@ -1281,7 +1281,8 @@ awk '{ f = $2; sub(/^api\//, "", f) }
          else { print "UNEXPECTED   " f; bad = 1 }
        }
        print (bad ? "INVENTORY: BLOCK" : "INVENTORY: OK"); exit bad
-     }' rx-target.sha256 rx-known-old.sha256 rx-live.sha256 | sort
+     }' rx-target.sha256 rx-known-old.sha256 rx-live.sha256); rc=$?
+printf '%s\n' "$out" | sort; [ "$rc" -eq 0 ]   # exit status = awk's: non-zero on BLOCK
 ```
 
 Allowed: `current` (already the target), `known-old` (exactly the
@@ -1674,7 +1675,9 @@ rx_ts_ok && rx_sha_ok "${SHA9:-}" && rx_sha_ok "${SHA10:-}" && {
   echo "$SHA10  $HOME/endpoint-manifest-v10.bin" | sha256sum -c - &&
   sudo install -o root -g pocvpn-api -m 0640 "$HOME/endpoint-manifest-v10.bin" "$MD/endpoint-manifest-v10-rollback.bin" &&
   echo "$SHA10  $MD/endpoint-manifest-v10-rollback.bin" | sudo sha256sum -c - &&
-  sudo cp -p "$MD/endpoint-manifest.bin" "$MD/endpoint-manifest.bin.v8-backup-$TS" &&
+  { sudo test -e "$MD/endpoint-manifest.bin.v8-backup-$TS" ||
+    { ! echo "$SHA9  $MD/endpoint-manifest.bin" | sudo sha256sum -c --status - &&
+      sudo cp -p "$MD/endpoint-manifest.bin" "$MD/endpoint-manifest.bin.v8-backup-$TS"; }; } &&
   sudo install -o root -g pocvpn-api -m 0640 "$HOME/endpoint-manifest-v9.bin" "$MD/endpoint-manifest.bin.rx-tmp-$TS" &&
   sudo mv -f "$MD/endpoint-manifest.bin.rx-tmp-$TS" "$MD/endpoint-manifest.bin" &&
   [ "$(sudo stat -c '%U:%G %a' "$MD/endpoint-manifest.bin")" = "root:pocvpn-api 640" ] &&
@@ -1684,7 +1687,9 @@ rx_ts_ok && rx_sha_ok "${SHA9:-}" && rx_sha_ok "${SHA10:-}" && {
 ```
 
 Any failed check stops the block; the served file changes only at the
-`mv` (atomic rename). `pocvpn-api` reads it per request (no restart).
+`mv` (atomic rename). The v8 backup is written once: a rerun with the
+same `TS` keeps the existing `v8-backup-$TS`, and with no backup yet the
+block refuses to back up a served file that already is v9. `pocvpn-api` reads it per request (no restart).
 Then, from the owner's PC, for EACH gateway's public address:
 
 ```

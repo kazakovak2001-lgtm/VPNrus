@@ -472,6 +472,21 @@ class RxRolloutBlocksTest(unittest.TestCase):
         self.assertIn("v10 served", self._run("rollback-manifest", TS=_TS, SHA10=sha10))
         self.assertEqual(self._read(served, "rb"), b"v10")
 
+    def test_manifest_install_rerun_keeps_the_original_v8_backup(self):
+        served, sha9, sha10 = self._manifests()
+        backup = os.path.join(self.etc, f"endpoint-manifest.bin.v8-backup-{_TS}")
+        self.assertIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
+        self._write(os.path.join(self.home, "endpoint-manifest-v9.bin"), b"v9", "wb")
+        self._write(os.path.join(self.home, "endpoint-manifest-v10.bin"), b"v10", "wb")
+        self.assertIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
+        self.assertEqual(self._read(backup, "rb"), b"v8")
+
+    def test_manifest_install_refuses_to_back_up_a_served_v9_as_v8(self):
+        served, sha9, sha10 = self._manifests()
+        self._write(served, b"v9", "wb")
+        self.assertNotIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
+        self.assertFalse(os.path.exists(os.path.join(self.etc, f"endpoint-manifest.bin.v8-backup-{_TS}")))
+
     def test_manifest_install_reports_failure_on_a_wrong_owner(self):
         _, sha9, sha10 = self._manifests()
         out = self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10, RX_FAKE_OWNER="pocvpn-api:pocvpn-api")
@@ -506,7 +521,7 @@ class RxRolloutBlocksTest(unittest.TestCase):
     def _inventory(self, target, known_old, live):
         for name, rows in (("rx-target", target), ("rx-known-old", known_old), ("rx-live", live)):
             self._write(os.path.join(self.root, f"{name}.sha256"), "".join(f"{h}  api/{f}\n" for f, h in rows.items()))
-        return self._run("inventory-compare", helpers=False, cwd=self.root)
+        return self._run("inventory-compare", helpers=False, cwd=self.root, extra='echo "RC=$?"')
 
     def test_inventory_classifies_names_and_hashes(self):
         a, b, c = "a" * 64, "b" * 64, "c" * 64
@@ -517,12 +532,14 @@ class RxRolloutBlocksTest(unittest.TestCase):
         self.assertIn("new          admin_auth.py", out)
         self.assertIn("current      wgkey.py", out)
         self.assertIn("INVENTORY: OK", out)
+        self.assertIn("RC=0", out)
         for live, marker in (({"config.py": b, "wgkey.py": a, "extra.py": a}, "SERVER-ONLY  extra.py"),
                              ({"config.py": c, "wgkey.py": a}, "UNEXPECTED   config.py"),
                              ({"config.py": b}, "MISSING      wgkey.py")):
             out = self._inventory(target, known_old, live)
             self.assertIn(marker, out)
             self.assertIn("INVENTORY: BLOCK", out)
+            self.assertIn("RC=1", out)  # the block's exit status reports BLOCK, not sort's
 
 
 if __name__ == "__main__":
