@@ -265,7 +265,15 @@ class NovaXrayVpnService : VpnService() {
 
     // Main-process death watch (XrayProcessBridge): a plain binder whose
     // death tells the main process that this `:xray` process is gone.
-    private val watchBinder = android.os.Binder()
+    // Also answers the live speed indicator's counter read (see XrayLiveTraffic) -
+    // the same fold as ACTION_QUERY_TRAFFIC, without a start command.
+    private val watchBinder = XrayLiveTrafficBinder {
+        if (coreRuntime.isRunning) {
+            try { trafficCounters.add(coreRuntime.queryAllOutboundTrafficStats()) } catch (t: Throwable) { null }
+        } else {
+            null
+        }
+    }
 
     override fun onBind(intent: Intent?): android.os.IBinder? =
         if (intent?.action == XrayProcessBridge.ACTION_WATCH) watchBinder else super.onBind(intent)

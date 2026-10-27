@@ -169,6 +169,9 @@ class VlessXhttpTransport(
 
     override suspend fun dataPlaneCounters(): TransportStats = XrayProcessBridge.dataPlaneStats(context, activeSessionId)
 
+    // Live speed indicator - binder read, never a startService (see XrayLiveTraffic).
+    override suspend fun liveTrafficCounters(): TransportStats = XrayProcessBridge.liveTrafficStats(activeSessionId)
+
     // B-WL7 M1 - the gateway this session exits through, so the egress probe targets a DIFFERENT one.
     @Volatile private var activeEndpointId: net.pocvpn.client.reachability.EndpointId? = null
 
