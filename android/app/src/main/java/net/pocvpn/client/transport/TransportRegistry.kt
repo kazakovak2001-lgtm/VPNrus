@@ -89,6 +89,14 @@ class TransportRegistry private constructor(
                     status = TransportStatus.NOT_IMPLEMENTED,
                     capabilities = TransportCapabilities.notImplemented(),
                 ),
+                // Profile/config/renderer foundation only so far; no
+                // transport, factory or per-endpoint eligibility yet, so
+                // never selectable or executable through this registry.
+                TransportDescriptor(
+                    kind = TransportKind.XRAY_REALITY_XHTTP,
+                    status = TransportStatus.NOT_IMPLEMENTED,
+                    capabilities = TransportCapabilities.notImplemented(),
+                ),
             ),
         )
     }

@@ -103,3 +103,26 @@ fun XrayXhttpProfile.toXrayVlessXhttpConfig(): XrayVlessXhttpConfig? {
         paddingMaxBytes = null,
     )
 }
+
+/**
+ * A stored [net.pocvpn.client.identity.XrayRealityXhttpProfile] becomes the
+ * renderable [XrayVlessRealityXhttpConfig]; null (fail closed) when the
+ * stored mode or uplink method is not a value this build knows - same rule
+ * as [toXrayVlessXhttpConfig].
+ */
+fun net.pocvpn.client.identity.XrayRealityXhttpProfile.toXrayVlessRealityXhttpConfig(): XrayVlessRealityXhttpConfig? {
+    val resolvedMode = XrayXhttpMode.entries.firstOrNull { it.wireValue == mode } ?: return null
+    val resolvedUplinkHttpMethod = XrayXhttpUplinkHttpMethod.entries.firstOrNull { it.wireValue == uplinkHttpMethod } ?: return null
+    return XrayVlessRealityXhttpConfig(
+        server = server,
+        serverPort = serverPort,
+        uuid = uuid,
+        serverName = serverName,
+        fingerprint = fingerprint,
+        realityPublicKey = realityPublicKey,
+        shortId = shortId,
+        xhttpPath = xhttpPath,
+        mode = resolvedMode,
+        uplinkHttpMethod = resolvedUplinkHttpMethod,
+    )
+}

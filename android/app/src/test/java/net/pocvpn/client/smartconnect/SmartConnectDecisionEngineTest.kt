@@ -96,6 +96,7 @@ class SmartConnectDecisionEngineTest {
                 TransportKind.TLS_TCP,
                 TransportKind.SHADOWSOCKS_2022,
                 TransportKind.HYSTERIA2,
+                TransportKind.XRAY_REALITY_XHTTP,
             ),
             SmartConnectDecisionEngine.PREFERRED_ORDER,
         )

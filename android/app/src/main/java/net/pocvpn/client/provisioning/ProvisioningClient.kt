@@ -151,6 +151,18 @@ object ProvisioningClient {
         executeXrayXhttpProfile(buildXrayXhttpProfileRequest(publicKey, bearerToken, endpointHost))
 
     /**
+     * POST /v1/xray-profile with `{"transport": "reality-xhttp"}`: the same
+     * endpoint, credential and identity as the other Xray transports, for
+     * the gateway's direct REALITY + XHTTP inbound. Always per-endpoint.
+     */
+    fun fetchXrayRealityXhttpProfile(publicKey: String, bearerToken: String, endpointHost: String): XrayRealityXhttpProfileResult =
+        executeGeneric(
+            buildXrayRealityXhttpProfileRequest(publicKey, bearerToken, endpointHost),
+            XrayRealityXhttpProfileResult::NetworkError,
+            ::mapXrayRealityXhttpProfileResponse,
+        )
+
+    /**
      * B46-4A - POST /v1/hysteria-profile: SAME existing activation credential
      * and SAME existing device public key as [fetchXrayProfile] - no new
      * identity, no new credential system (per task's own "provisioning
@@ -491,6 +503,13 @@ object ProvisioningClient {
             url = "https://$endpointHost/v1/xray-profile",
             headers = authHeaders(bearerToken),
             body = buildXrayXhttpRequestBody(publicKey),
+        )
+
+    internal fun buildXrayRealityXhttpProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
+        OutgoingRequest(
+            url = "https://$endpointHost/v1/xray-profile",
+            headers = authHeaders(bearerToken),
+            body = JSONObject().put("public_key", publicKey).put("transport", "reality-xhttp").toString(),
         )
 
     internal fun buildHysteria2ProfileRequest(publicKey: String, bearerToken: String, endpointHost: String): OutgoingRequest =
@@ -867,6 +886,77 @@ object ProvisioningClient {
             mode = mode,
             uplinkHttpMethod = uplinkHttpMethod,
             fingerprint = fingerprint,
+        )
+    }
+
+    /** Same status mapping as [mapXrayXhttpProfileResponse]. */
+    internal fun mapXrayRealityXhttpProfileResponse(status: Int, rawBody: String): XrayRealityXhttpProfileResult = when (status) {
+        200, 201 -> parseXrayRealityXhttpProfileSuccessBody(rawBody)
+        401 -> XrayRealityXhttpProfileResult.Unauthorized
+        403 -> when (errorCode(rawBody)) {
+            "revoked" -> XrayRealityXhttpProfileResult.Revoked
+            "device_not_bound" -> XrayRealityXhttpProfileResult.DeviceNotBound
+            else -> XrayRealityXhttpProfileResult.Unauthorized
+        }
+        503 -> XrayRealityXhttpProfileResult.ServiceUnavailable
+        else -> XrayRealityXhttpProfileResult.NetworkError("unexpected HTTP status $status")
+    }
+
+    /**
+     * REALITY field checks of [parseXrayProfileSuccessBody] (minus `flow`,
+     * which the server never sends for this transport) plus the XHTTP
+     * path/mode/method checks of [parseXrayXhttpProfileSuccessBody]. Same
+     * rule: rejection reasons name the field, never its value.
+     */
+    private fun parseXrayRealityXhttpProfileSuccessBody(raw: String): XrayRealityXhttpProfileResult {
+        val json = try {
+            JSONObject(raw)
+        } catch (e: JSONException) {
+            return XrayRealityXhttpProfileResult.MalformedResponse("response body is not valid JSON")
+        }
+        fun malformed(reason: String) = XrayRealityXhttpProfileResult.MalformedResponse(reason)
+
+        val serverAddress = json.optString("server_address", "")
+        val serverPort = json.optInt("server_port", -1)
+        val uuid = json.optString("uuid", "")
+        val serverName = json.optString("server_name", "")
+        val fingerprint = json.optString("fingerprint", "")
+        val realityPublicKey = json.optString("reality_public_key", "")
+        val shortId = json.optString("short_id", "")
+        val xhttpPath = json.optString("xhttp_path", "")
+        val mode = json.optString("mode", "")
+        val uplinkHttpMethod = json.optString("uplink_http_method", "")
+
+        if (serverAddress.isBlank()) return malformed("server_address missing or blank")
+        if (serverPort !in 1..65535) return malformed("server_port missing or out of range")
+        if (!UUID_REGEX.matches(uuid)) return malformed("uuid missing or not a well-formed UUID")
+        if (serverName.isBlank()) return malformed("server_name missing or blank")
+        if (fingerprint.isBlank()) return malformed("fingerprint missing or blank")
+        if (!REALITY_KEY_REGEX.matches(realityPublicKey)) {
+            return malformed("reality_public_key missing or not a well-formed public key")
+        }
+        if (!SHORT_ID_REGEX.matches(shortId)) return malformed("short_id missing or not well-formed hex")
+        if (!xhttpPath.startsWith("/") || !xhttpPath.endsWith("/")) {
+            return malformed("xhttp_path missing or not of the form /.../")
+        }
+        if (net.pocvpn.client.vpn.xray.XrayXhttpMode.entries.none { it.wireValue == mode }) {
+            return malformed("mode is not a recognized value")
+        }
+        if (net.pocvpn.client.vpn.xray.XrayXhttpUplinkHttpMethod.entries.none { it.wireValue == uplinkHttpMethod }) {
+            return malformed("uplink_http_method is not a recognized value")
+        }
+
+        return XrayRealityXhttpProfileResult.Success(
+            serverAddress = serverAddress,
+            serverPort = serverPort,
+            uuid = uuid,
+            serverName = serverName,
+            fingerprint = fingerprint,
+            realityPublicKey = realityPublicKey,
+            shortId = shortId,
+            xhttpPath = xhttpPath,
+            mode = mode,
+            uplinkHttpMethod = uplinkHttpMethod,
         )
     }
 

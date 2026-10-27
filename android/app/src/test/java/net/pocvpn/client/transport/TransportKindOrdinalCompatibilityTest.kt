@@ -33,9 +33,37 @@ class TransportKindOrdinalCompatibilityTest {
     }
 
     @Test
-    fun `HYSTERIA2 is appended at the end, after every pre-existing constant`() {
+    fun `HYSTERIA2 keeps ordinal 6`() {
         assertEquals(6, TransportKind.HYSTERIA2.ordinal)
-        assertEquals(TransportKind.entries.size - 1, TransportKind.HYSTERIA2.ordinal)
+    }
+
+    @Test
+    fun `XRAY_REALITY_XHTTP is appended at the end with ordinal 7`() {
+        assertEquals(7, TransportKind.XRAY_REALITY_XHTTP.ordinal)
+        assertEquals(TransportKind.entries.size - 1, TransportKind.XRAY_REALITY_XHTTP.ordinal)
+    }
+
+    @Test
+    fun `a binding using XRAY_REALITY_XHTTP round-trips through the canonicalizer`() {
+        val manifest = EndpointManifest(
+            manifestVersion = 1,
+            issuedAtEpochMillis = 1_000_000L,
+            expiresAtEpochMillis = 2_000_000L,
+            signingKeyId = "key-1",
+            endpoints = listOf(
+                EndpointDescriptor(
+                    id = EndpointId("stockholm"),
+                    roles = setOf(EndpointRole.GATEWAY, EndpointRole.EXIT),
+                    region = "Sweden / Stockholm",
+                    provider = "aws",
+                    transports = listOf(
+                        EndpointTransportBinding(TransportKind.XRAY_REALITY_XHTTP, "16.170.208.231", 8443),
+                    ),
+                ),
+            ),
+        )
+        val decoded = ManifestCanonicalizer.decode(ManifestCanonicalizer.canonicalBytes(manifest))
+        assertEquals(TransportKind.XRAY_REALITY_XHTTP, decoded.endpoints.single().transports.single().kind)
     }
 
     @Test
@@ -49,6 +77,7 @@ class TransportKindOrdinalCompatibilityTest {
                 TransportKind.XRAY_XHTTP,
                 TransportKind.SHADOWSOCKS_2022,
                 TransportKind.HYSTERIA2,
+                TransportKind.XRAY_REALITY_XHTTP,
             ),
             TransportKind.entries,
         )
