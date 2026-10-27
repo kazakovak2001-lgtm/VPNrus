@@ -1413,7 +1413,7 @@ it; every other binding is unchanged.
 
 ### 7. Clients
 
-- Build a new field APK from `main` (>= `21e7078`, `versionCode` 5).
+- Build a new field APK from `main` (>= `21e7078`; `versionCode` >= 3, `0.1.0-beta2`).
 - On the device: install, let the manifest refresh, then **re-activate
   Stockholm** - the REALITY+XHTTP profile is fetched only during activation
   and only when the trusted manifest offers the binding.
