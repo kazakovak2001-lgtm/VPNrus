@@ -113,14 +113,16 @@ android {
         // since this field was created. versionCode must only ever
         // increase for future updates; versionName follows this project's
         // existing "-poc" suffix convention with a "-beta1" successor.
+        // 0.1.0-beta2 / 3: first signed build with FULL + MONITOR field test
+        // modes in release (PR #214), distinct from the 3d6908b beta1 APK.
         // versionCode is also read by CdnClientCapabilityPolicy's dormant
         // (no live provider profile deployed - B27 is PLANNED-tier)
         // `clientVersionCode < minimumClientVersionCode` gate - increasing
         // it can only ever help that comparison, never hurt it, so this
         // bump is safe there too (see docs/NOVA_VPN_BETA_CUT.md section 7
         // for the full check).
-        versionCode = 2
-        versionName = "0.1.0-beta1"
+        versionCode = 3
+        versionName = "0.1.0-beta2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GIT_COMMIT", "\"$gitCommit\"")
