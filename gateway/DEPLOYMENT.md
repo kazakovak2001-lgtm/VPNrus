@@ -1128,6 +1128,26 @@ owner (Claude's SSH to production is denied as "Production Reads").
 | Manifest signing key | `prod-manifest-key-2026-09-01` | Same as v7: the `2026-09-14` key lives only in the WSL distro, which does not mount (`F:` absent, 2026-10-27). The 09-01 key is the bootstrap anchor every build trusts. |
 | Restart window | Low-traffic time | Step 4 restarts `nova-xray`, dropping every REALITY/TLS session on Stockholm for a few seconds (clients reconnect). AWG and Hysteria2 are not touched. |
 
+### Backup timestamp `TS` (all steps)
+
+Step 1 creates ONE UTC timestamp `TS` (`YYYYMMDDTHHMMSSZ`); every backup in
+steps 1, 3 and 6 (on both gateways) and every rollback restore uses that
+same value, so the rollback finds exactly the rollout's backups. Write it
+down when step 1 prints it. A new SSH session does not inherit it: start
+every later session (including the Frankfurt session in step 6) with
+
+```
+export TS=<value printed in step 1>
+```
+
+Never generate a new one after step 1. Each block that backs up or
+restores starts with the guard below and is ONE compound command
+(`case ... && { ...; }`), so an unset or malformed `TS` stops the whole
+block before anything changes - unlike `: "${TS:?}"`, which in an
+interactive shell aborts only its own line. Inside the braces commands are
+chained with `&&`, so a failed backup also stops the block. Works in bash
+and POSIX `sh`.
+
 ### 0. Read-only precheck (on Stockholm)
 
 ```
@@ -1149,9 +1169,15 @@ the changed files, then compile-check.
 
 ```
 cd /opt/pocvpn/gateway
-TS=$(date -u +%Y%m%dT%H%M%SZ); echo "TS=$TS"   # record it: steps 3, 6 and the rollback reuse it
-for f in api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py; do sudo cp -p "$f" "$f.backup-rx-$TS"; done
-# copy the four files from main 21e7078 into place (root:root 0644), then:
+TS=$(date -u +%Y%m%dT%H%M%SZ); export TS   # the ONLY place TS is generated
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  sudo cp -p api/config.py "api/config.py.backup-rx-$TS" &&
+  sudo cp -p api/handler.py "api/handler.py.backup-rx-$TS" &&
+  sudo cp -p api/xray_activation.py "api/xray_activation.py.backup-rx-$TS" &&
+  sudo cp -p api/xray_config_renderer.py "api/xray_config_renderer.py.backup-rx-$TS" &&
+  echo "backups done - record TS"
+}
+# only after "backups done": copy the four files from main 21e7078 into place (root:root 0644), then:
 sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py \
   && sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
 ```
@@ -1173,10 +1199,11 @@ so the security group is the only gate. Until step 4 nothing listens on
 ### 3. Enable the inbound in `api.env`
 
 ```
-: "${TS:?set TS to the value recorded in step 1}"
-sudo cp -p /etc/pocvpn/api.env /etc/pocvpn/api.env.backup-rx-$TS
-printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=2096\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' | sudo tee -a /etc/pocvpn/api.env >/dev/null
-sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  sudo cp -p /etc/pocvpn/api.env "/etc/pocvpn/api.env.backup-rx-$TS" &&
+  printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=2096\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' | sudo tee -a /etc/pocvpn/api.env >/dev/null &&
+  sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+}
 ```
 
 `config.py` fails closed at start if the group is partial, the path is
@@ -1247,15 +1274,68 @@ On Windows no permission check is possible - protect it with NTFS ACLs.
 `--private-key-file -` reads the key from stdin instead
 (`... --private-key-file - < <path-to-09-01-key-file>`).
 
-Verify it against the app-embedded anchor before install (as for v7), rename
-the JSON without `_DRAFT`, commit both. Install on BOTH gateways (each serves
-`/v1/manifest`):
+**6a. Verify on the owner's PC** (repository root) that the signature
+checks out against the public key the Android app embeds
+(`EmbeddedBootstrapManifest.BOOTSTRAP_PUBLIC_KEY_BASE64`, read from the
+source, never typed) and that the signed bytes are exactly the reviewed
+JSON. This is what makes the artifact production-valid; a matching SHA-256
+later only proves the copy is intact:
 
 ```
-: "${TS:?set TS to the value recorded in step 1}"
-sudo cp -p /etc/pocvpn/endpoint-manifest.bin /etc/pocvpn/endpoint-manifest.bin.v8-backup-$TS
-sudo install -o root -g pocvpn-api -m 0640 endpoint-manifest-2026-10-27-v9.bin /etc/pocvpn/endpoint-manifest.bin
-curl -s https://16.170.208.231/v1/manifest -k | sha256sum   # equals the new .bin on both hosts
+python -I - gateway/tools/endpoint-manifest-2026-10-27-v9.bin \
+  gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json <<'EOF'
+import base64, re, struct, sys
+sys.path.insert(0, "gateway/tools")
+import manifest_signing as ms
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+art, src = sys.argv[1], sys.argv[2]
+kt = open("android/app/src/main/java/net/pocvpn/client/reachability/EmbeddedBootstrapManifest.kt").read()
+pub = base64.b64decode(re.search(r'BOOTSTRAP_PUBLIC_KEY_BASE64 = "([^"]+)"', kt).group(1))
+b = open(art, "rb").read()
+fmt, n = struct.unpack(">ii", b[:8]); canonical = b[8:8 + n]
+(sl,) = struct.unpack(">i", b[8 + n:12 + n]); sig = b[12 + n:12 + n + sl]
+assert fmt == ms.FORMAT_VERSION and len(sig) == 64 and len(b) == 12 + n + sl, "bad container"
+assert canonical == ms.canonical_bytes(ms.load_manifest_json(src)), "artifact != reviewed JSON"
+Ed25519PublicKey.from_public_bytes(pub).verify(sig, canonical)  # raises InvalidSignature
+print("OK: signed by the app-embedded 09-01 anchor, content == reviewed JSON")
+EOF
+sha256sum gateway/tools/endpoint-manifest-2026-10-27-v9.bin   # record as SHA
+```
+
+Do the same for the rollback v10 (its `.bin` and JSON). Then rename the v9
+JSON without `_DRAFT` and commit JSON + `.bin` (both public).
+
+**6b. Transfer** only the signed `.bin` - never the key, never any other
+file - from the owner's PC to each gateway's admin home directory, over
+the same SSH access used for every other step (`<admin>@<gateway>` is that
+login; this document assumes it, it does not define it):
+
+```
+scp gateway/tools/endpoint-manifest-2026-10-27-v9.bin <admin>@<gateway>:endpoint-manifest-v9.bin
+```
+
+**6c. Install on EACH gateway** (Stockholm, then Frankfurt; both serve
+`/v1/manifest`), in a session started with `export TS=<step 1 value>` and
+`export SHA=<hash from 6a>`. The `.bin` is public data, so its hash may be
+printed:
+
+```
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && [ "$(printf %s "${SHA:-}" | tr -cd 0-9a-f | wc -c)" -eq 64 ] && [ ${#SHA} -eq 64 ] && {
+  echo "$SHA  $HOME/endpoint-manifest-v9.bin" | sha256sum -c - &&
+  sudo cp -p /etc/pocvpn/endpoint-manifest.bin "/etc/pocvpn/endpoint-manifest.bin.v8-backup-$TS" &&
+  sudo install -o root -g pocvpn-api -m 0640 "$HOME/endpoint-manifest-v9.bin" /etc/pocvpn/endpoint-manifest.bin &&
+  [ "$(sudo stat -c '%U:%G %a' /etc/pocvpn/endpoint-manifest.bin)" = "root:pocvpn-api 640" ] &&
+  echo "$SHA  /etc/pocvpn/endpoint-manifest.bin" | sudo sha256sum -c - &&
+  rm "$HOME/endpoint-manifest-v9.bin" && echo "installed"
+}
+```
+
+Any failed check stops the block; nothing on the host changes before the
+backup line. `pocvpn-api` reads the file per request (no restart). Then,
+from the owner's PC, for EACH gateway's public address:
+
+```
+curl -sk https://<gateway-ip>/v1/manifest | sha256sum   # must equal SHA on both hosts
 ```
 
 `ManifestForwardCompatibilityTest` must still pass with the new `.bin`
@@ -1276,11 +1356,22 @@ it; every other binding is unchanged.
 
 ### Rollback
 
+Every restore uses the rollout's `TS` (`export TS=<step 1 value>`) behind
+the same guard, so it can only restore the backups this rollout made:
+
+```
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  sudo test -f "/etc/pocvpn/api.env.backup-rx-$TS" &&
+  sudo cp -p "/etc/pocvpn/api.env.backup-rx-$TS" /etc/pocvpn/api.env &&
+  sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+}
+```
+
 - **A - before step 6** (no client can see it): restore
-  `api.env.backup-rx-<TS>`, restart `pocvpn-api`, run
+  `api.env.backup-rx-$TS` (block above), restart `pocvpn-api`, run
   `nova-xray-reconcile.service` (renders without the fourth inbound,
   restarts `nova-xray`), close TCP 2096 in the security group. Restore the
-  `api/*.py.backup-rx-<TS>` files only if step 1 itself misbehaved.
+  `api/*.py.backup-rx-$TS` files only if step 1 itself misbehaved.
 - **B - after step 6**: reinstalling the v8 `.bin` is NOT enough - a device
   that already adopted v9 rejects any lower `manifestVersion`
   (`EndpointManifestRepository`: `ROLLBACK_OR_NOT_NEWER`) and keeps
