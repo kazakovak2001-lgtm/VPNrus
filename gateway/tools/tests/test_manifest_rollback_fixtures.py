@@ -35,6 +35,12 @@ class ManifestRollbackFixturesTest(unittest.TestCase):
         self.assertGreaterEqual(j["v10"]["expiresAtEpochMillis"], j["v9"]["expiresAtEpochMillis"])
         self.assertEqual(j["v10"]["signingKeyId"], j["v9"]["signingKeyId"])
 
+    def test_committed_v10_rollback_json_is_exactly_the_derivation(self):
+        # The production v10 is signed from this file; the TEST-key chain
+        # test covers exactly its content only while the two stay equal.
+        path = os.path.join(os.path.dirname(fx.V9_JSON), "production_manifest_2026-10-27_v10_ROLLBACK_DRAFT.json")
+        self.assertEqual(fx._load(path), fx.fixture_json()["v10"])
+
 
 if __name__ == "__main__":
     unittest.main()
