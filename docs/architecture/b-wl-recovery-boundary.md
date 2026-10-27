@@ -24,7 +24,9 @@
   behavior-evidence pipeline" section below for the concrete mechanism. No
   second classifier or second `RestrictionClass`-like enum was introduced;
   existing naming/semantics are unchanged.
-- **`TransportKind.XRAY_XHTTP`** (VLESS+REALITY+XHTTP/TCP-443) is a real,
+- **`TransportKind.XRAY_XHTTP`** (VLESS + XHTTP over **TLS**, TCP/443 - not
+  REALITY: the client renders `security: tls` and the server's XHTTP inbound
+  is loopback-only behind nginx/Cloudflare TLS; corrected 2026-10-27) is a real,
   live, EXIT-role-capable transport (B35 CDN-relay origin work, plus this
   branch's own B59-B64 Direct-EXIT-XHTTP plumbing, confirmed wired into
   `MainViewModel.buildTransportRegistry`'s transport registry surfacing and
