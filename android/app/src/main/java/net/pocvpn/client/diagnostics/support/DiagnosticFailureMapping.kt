@@ -46,8 +46,26 @@ fun mapRelayFailureCategoryToFailureReason(category: RelayFailureCategory): Diag
     RelayFailureCategory.PROFILE_NOT_PROVISIONED -> DiagnosticFailureReason.INGRESS_PROFILE_REQUIRED
     RelayFailureCategory.PROFILE_MISMATCH -> DiagnosticFailureReason.INGRESS_PROFILE_MISMATCH
     RelayFailureCategory.PROFILE_EXPIRED -> DiagnosticFailureReason.INGRESS_PROFILE_REQUIRED
-    RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED -> DiagnosticFailureReason.CONTROL_PLANE_UNREACHABLE
+    // A client-side capability gap (no transport builder for the plan, no
+    // probe URL in the profile), not a control-plane outcome: labelling it
+    // CONTROL_PLANE_UNREACHABLE made a bundle blame the control plane. Same
+    // reason as VpnError.UnsupportedTransportSelected.
+    RelayFailureCategory.EXECUTION_NOT_IMPLEMENTED -> DiagnosticFailureReason.INTERNAL_ERROR
 }
+
+/**
+ * Auto found no candidate at all. When the manifest repository is wired but
+ * holds no trusted manifest (neither last-known-good nor embedded
+ * bootstrap), the cause is the bootstrap stage, so the bundle says
+ * MANIFEST_UNAVAILABLE instead of the generic NO_CANDIDATE. Without a wired
+ * repository (legacy/test construction) nothing is known about the manifest.
+ */
+fun mapNoCandidateToFailureReason(manifestRepositoryWired: Boolean, trustedSource: ManifestSource?): DiagnosticFailureReason =
+    if (manifestRepositoryWired && trustedSource == null) {
+        DiagnosticFailureReason.MANIFEST_UNAVAILABLE
+    } else {
+        mapVpnErrorToFailureReason(VpnError.NoCandidateAvailable)
+    }
 
 /** A failed ingress handshake does not reveal which CDN/origin hop failed. */
 fun mapRelayFailureForPath(
