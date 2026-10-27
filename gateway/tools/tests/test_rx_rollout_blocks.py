@@ -73,9 +73,17 @@ echo "systemctl $*" >> "$RX_LOG"
 case "$*" in
   *is-active*nova-xray-reconcile*) [ -n "$RX_RECONCILE_ACTIVE" ] && exit 0; exit 3 ;;
   "show -p MainPID --value nova-xray") echo "${RX_XRAY_PID:-0}" ;;
+  "show -p ExecStart --value nova-xray") echo "{ path=$RX_XRAY_EXECSTART ; argv[]=$RX_XRAY_EXECSTART run -config /x ; }" ;;
   is-active*) echo active ;;
 esac
 exit 0
+""",
+    # Models the kernel's /proc/<pid>/exe magic link: readlink reports the
+    # PATH the process was started from (RX_FAKE_EXE_PATH) while reading the
+    # link returns the RUNNING image (here a regular file holding its bytes).
+    "readlink": """#!/bin/sh
+if [ "$1" = -f ] && [ -n "$RX_FAKE_EXE_PATH" ] && [ "$2" = "$PROC/$RX_XRAY_PID/exe" ]; then echo "$RX_FAKE_EXE_PATH"; exit 0; fi
+exec /usr/bin/readlink "$@"
 """,
     "ss": """#!/bin/sh
 [ -n "$RX_SS_OUT" ] && printf '%s\\n' "$RX_SS_OUT"
@@ -128,6 +136,15 @@ class RxRolloutBlocksTest(unittest.TestCase):
             "POCVPN_API_API_PORT": "8765",
         }.items()))
         os.chmod(self.envf, 0o640)
+        # Xray binary identity: XRAY_BIN_PATH in xray.env and a fake /proc/<MainPID>/exe.
+        self.xray_bin = os.path.join(r, "xray-pinned", "xray")
+        os.makedirs(os.path.dirname(self.xray_bin))
+        self._write(self.xray_bin, "pinned-xray\n")
+        self.xenv = os.path.join(r, "xray.env")
+        self._write(self.xenv, f"XRAY_STAGING_CONFIG=/x\nXRAY_BIN_PATH={self.xray_bin}\nXRAY_SERVICE_NAME=nova-xray\n")
+        self.proc = os.path.join(r, "proc")
+        os.makedirs(os.path.join(self.proc, "4242"))
+        os.symlink(self.xray_bin, os.path.join(self.proc, "4242", "exe"))
 
     # --- helpers -------------------------------------------------------
 
@@ -144,6 +161,7 @@ class RxRolloutBlocksTest(unittest.TestCase):
         full_env = {
             "PATH": f"{self.bin}:/usr/bin:/bin", "HOME": self.home, "RX_LOG": self.log,
             "GW": self.gw, "ENVF": self.envf, "MD": self.etc, "LC_ALL": "C",
+            "XENV": self.xenv, "PROC": self.proc, "RX_XRAY_PID": "4242", "RX_XRAY_EXECSTART": self.xray_bin,
         }
         full_env.update(env)
         r = subprocess.run(["bash", "-c", script], env=full_env, cwd=cwd, capture_output=True, text=True, timeout=120)
@@ -354,7 +372,7 @@ class RxRolloutBlocksTest(unittest.TestCase):
         self.assertEqual(self._log().count("systemctl restart pocvpn-api"), 1)
 
     def test_rollback_a4_documents_the_reconcile_pause(self):
-        text = open(_DEPLOYMENT_MD, encoding="utf-8").read().replace("\r\n", "\n")
+        text = self._read(_DEPLOYMENT_MD).replace("\r\n", "\n")
         rollback = text[text.index("### Rollback\n", text.index("## REALITY + XHTTP on Stockholm")):]
         a4 = " ".join(rollback[rollback.index("  4. the API block below"):rollback.index("- **B - after step 6**")].split())
         for phrase in ("separately approved `PRODUCTION MUTATION` (`sudo systemctl stop nova-xray-reconcile.timer`)",
@@ -500,6 +518,79 @@ class RxRolloutBlocksTest(unittest.TestCase):
         self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha9)
         self.assertEqual(self._read(served, "rb"), b"v8")
         self.assertFalse(os.path.exists(os.path.join(self.etc, "endpoint-manifest-v10-rollback.bin")))
+
+    # --- 0c xray binary identity (read-only) -------------------------------
+
+    def _xray_check(self, **kw):
+        return self._run(extra="rx_xray_bin_ok && echo PASS", **kw)
+
+    def test_xray_binary_identity_passes_only_for_the_running_binary(self):
+        self.assertIn("PASS", self._xray_check())
+        # a symlinked XRAY_BIN_PATH resolving to the running binary is the same binary
+        link = os.path.join(self.root, "xray-link")
+        os.symlink(self.xray_bin, link)
+        self._write(self.xenv, f"XRAY_BIN_PATH={link}\nXRAY_SERVICE_NAME=nova-xray\n")
+        self.assertIn("PASS", self._xray_check())
+
+    def test_xray_binary_identity_blocks_a_unit_that_would_restart_another_binary(self):
+        # running image matches, but the unit's ExecStart (what the restart execs) does not
+        other = os.path.join(self.root, "usr-local-bin-xray")
+        self._write(other, "older-xray\n")
+        out = self._xray_check(RX_XRAY_EXECSTART=other)
+        self.assertIn("xray binary mismatch", out)
+        self.assertNotIn("PASS", out)
+        self.assertNotIn("PASS", self._xray_check(RX_XRAY_EXECSTART=""))
+
+    def test_xray_binary_identity_blocks_a_binary_replaced_on_disk_after_start(self):
+        # Same path as the running process (magic-link model), different bytes:
+        # the running image is the old binary, the file at that path is new.
+        exe = os.path.join(self.proc, "4242", "exe")
+        os.remove(exe)
+        self._write(exe, "old-running-image\n")
+        out = self._xray_check(RX_FAKE_EXE_PATH=self.xray_bin)
+        self.assertIn("changed on disk since nova-xray started - BLOCK", out)
+        self.assertNotIn("PASS", out)
+        self._write(exe, "pinned-xray\n")  # same bytes again: passes
+        self.assertIn("PASS", self._xray_check(RX_FAKE_EXE_PATH=self.xray_bin))
+
+    def test_xray_binary_identity_blocks_a_different_running_binary(self):
+        other = os.path.join(self.root, "usr-local-bin-xray")
+        self._write(other, "older-xray\n")
+        os.remove(os.path.join(self.proc, "4242", "exe"))
+        os.symlink(other, os.path.join(self.proc, "4242", "exe"))
+        out = self._xray_check()
+        self.assertIn("xray binary mismatch", out)
+        self.assertIn("BLOCK", out)
+        self.assertNotIn("PASS", out)
+
+    def test_xray_binary_identity_blocks_missing_or_invalid_data(self):
+        for pid in ("0", "", "abc"):
+            self.assertIn("MainPID invalid", self._xray_check(RX_XRAY_PID=pid))
+        self.assertNotIn("PASS", self._xray_check(RX_XRAY_PID="999"))  # no such process image
+        self._write(self.xenv, "XRAY_STAGING_CONFIG=/x\n")
+        self.assertIn("XRAY_BIN_PATH unset or missing", self._xray_check())
+        self._write(self.xenv, f"XRAY_BIN_PATH={self.root}/does-not-exist\n")
+        self.assertIn("XRAY_BIN_PATH unset or missing", self._xray_check())
+        self.assertIn("XRAY_BIN_PATH unset or missing", self._xray_check(XENV=os.path.join(self.root, "nope.env")))
+        self._write(self.xenv, f"XRAY_BIN_PATH={self.xray_bin}\n")  # XRAY_SERVICE_NAME unset
+        self.assertIn("XRAY_SERVICE_NAME unset", self._xray_check())
+
+    def test_env_set_refuses_on_an_xray_binary_mismatch(self):
+        self._stub_api()
+        before = self._read(self.envf)
+        os.remove(os.path.join(self.proc, "4242", "exe"))
+        other = os.path.join(self.root, "usr-local-bin-xray")
+        self._write(other, "older-xray\n")
+        os.symlink(other, os.path.join(self.proc, "4242", "exe"))
+        self.assertIn("xray binary mismatch", self._run("env-set", TS=_TS, XPORT="2096"))
+        self.assertEqual(self._read(self.envf), before)
+        self.assertFalse(os.path.exists(f"{self.envf}.backup-rx-{_TS}"))
+        self.assertNotIn("restart", self._log())
+
+    def test_step4_trigger_is_guarded_by_the_binary_check(self):
+        text = self._read(_DEPLOYMENT_MD).replace("\r\n", "\n")
+        self.assertIn("rx_xray_bin_ok && sudo systemctl start nova-xray-reconcile.service", text)
+        self.assertIn("rx_ts_ok && rx_port_ok && rx_xray_bin_ok && {", self.blocks["env-set"])
 
     # --- 0a port owner (read-only) -----------------------------------------
 

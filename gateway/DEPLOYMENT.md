@@ -1150,6 +1150,7 @@ export XPORT=<step 0> TS=<step 1b> RXSHA=<step 1a>    # SHA9/SHA10 from step 6a 
 
 ```
 GW=${GW:-/opt/pocvpn/gateway}; ENVF=${ENVF:-/etc/pocvpn/api.env}; MD=${MD:-/etc/pocvpn}
+XENV=${XENV:-$GW/config/xray.env}; PROC=${PROC:-/proc}
 rx_ts_ok() { case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; return 1 ;; esac; }
 rx_port_ok() { case "${XPORT:-}" in *[!0-9]*|"") echo "XPORT unset/invalid - STOP" >&2; return 1 ;; esac; [ "$XPORT" -ge 1 ] && [ "$XPORT" -le 65535 ] && echo "XPORT=$XPORT"; }
 rx_sha_ok() { case "$1" in *[!0-9a-f]*|"") echo "sha256 unset/invalid - STOP" >&2; return 1 ;; esac; [ ${#1} -eq 64 ]; }
@@ -1186,6 +1187,30 @@ rx_port_owner() {
             echo "TCP $XPORT: listener missing or not nova-xray (MainPID ${pid:-?}) - STOP: ${l:-none}" >&2; return 1 ;;
   esac; return 1
 }
+# READ-ONLY. True only if the binary xray-activate.sh runs `xray run -test` with
+# (XRAY_BIN_PATH in $XENV) is the binary of the service it restarts
+# (XRAY_SERVICE_NAME in $XENV): same canonical path as the running image
+# (/proc/<MainPID>/exe) AND as the unit's ExecStart (what the restart execs),
+# and the same bytes as the running image.
+rx_xray_bin_ok() {
+  want=$(sudo sed -n 's/^XRAY_BIN_PATH=//p' "$XENV" | tail -n 1)
+  svc=$(sudo sed -n 's/^XRAY_SERVICE_NAME=//p' "$XENV" | tail -n 1)
+  if [ -z "$want" ] || [ -z "$svc" ] || ! sudo test -f "$want"; then
+    echo "XRAY_BIN_PATH unset or missing (or XRAY_SERVICE_NAME unset) in $XENV - BLOCK" >&2; return 1
+  fi
+  pid=$(sudo systemctl show -p MainPID --value "$svc")
+  case "$pid" in ""|0|*[!0-9]*) echo "$svc MainPID invalid (${pid:-none}) - BLOCK" >&2; return 1 ;; esac
+  ex=$(sudo systemctl show -p ExecStart --value "$svc" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+  w=$(sudo readlink -f "$want"); r=$(sudo readlink -f "$PROC/$pid/exe"); e=$([ -n "$ex" ] && sudo readlink -f "$ex")
+  if [ -z "$w" ] || [ "$w" != "$r" ] || [ "$w" != "$e" ]; then
+    echo "xray binary mismatch: $svc runs ${r:-?} (ExecStart ${e:-?}), xray-activate tests with ${w:-?} - BLOCK" >&2; return 1
+  fi
+  hw=$(sudo sha256sum "$w" | cut -c1-64); hr=$(sudo sha256sum "$PROC/$pid/exe" | cut -c1-64)
+  if [ -z "$hw" ] || [ "$hw" != "$hr" ]; then
+    echo "xray binary $w changed on disk since nova-xray started - BLOCK" >&2; return 1
+  fi
+  echo "xray binary OK: $svc runs and restarts $r = XRAY_BIN_PATH"
+}
 ```
 
 Every block that changes something is ONE compound command
@@ -1205,7 +1230,7 @@ ownership change is needed). Bash and POSIX `sh` both accept every block.
 
 | Class | Meaning | Steps / blocks |
 |---|---|---|
-| `READ-ONLY` | observes only | step 0 (all of it), `rx_port_owner`, `rx_reconcile_paused`, the local `inventory-compare` block, 6a, step 4's `ss`/`grep -c` checks, 5 |
+| `READ-ONLY` | observes only | step 0 (all of it), `rx_port_owner`, `rx_reconcile_paused`, `rx_xray_bin_ok`, the local `inventory-compare` block, 6a, step 4's `ss`/`grep -c` checks, 5 |
 | `TEMPORARY SERVER WRITE` | creates and removes temporary files or a transient unit; nothing served or configured changes | `rx_check_api` (temporary `/opt/pocvpn/rx-check.*` + a transient `systemd-run` unit), 1b (`~/rx-api-21e7078`, `/opt/pocvpn/rx-stage-$TS`), the `scp` uploads (1a, 6b) |
 | `PRODUCTION MUTATION` | changes code, config, services, listeners, AWS or what is served | 1c, pausing/resuming `nova-xray-reconcile.timer`, 2 (AWS), 3, 4, 6c, every rollback block |
 
@@ -1307,6 +1332,7 @@ sudo grep -cE '^POCVPN_API_XRAY_(SERVER_PORT|DEST|SERVER_NAME|SHORT_ID|REALITY_P
 systemctl is-active pocvpn-api pocvpn-hysteria-auth nova-xray nova-xray-reconcile.timer
 systemctl list-timers nova-xray-reconcile.timer --no-pager
 journalctl -u nova-xray-reconcile -n 5 --no-pager
+rx_xray_bin_ok
 ```
 
 Expected / blocks:
@@ -1324,7 +1350,17 @@ Expected / blocks:
 - XHTTP key count `0`; REALITY group count `5` (XHTTP reuses it) -
   otherwise block;
 - all four units `active`; the last reconcile run `converged` - otherwise
-  block until explained.
+  block until explained;
+- `rx_xray_bin_ok` prints `xray binary OK`: the binary `xray-activate.sh`
+  validates with (`XRAY_BIN_PATH` in `/opt/pocvpn/gateway/config/xray.env`)
+  must be the one the service it restarts (`XRAY_SERVICE_NAME`, there
+  `nova-xray`) runs now (canonical path and bytes of
+  `/proc/<MainPID>/exe`) and will exec on that restart (canonical path of
+  the unit's `ExecStart`). A missing value or file, an invalid PID, a
+  different path or changed bytes block: otherwise step 4 would validate
+  the XHTTP config with one Xray version and start it with another. The
+  rollout does not fix this; the owner decides how to align the two. Steps
+  3 and 4 re-run the check and refuse to continue on a mismatch.
 
 Stop if anything blocks. If `$XPORT` must change, the owner picks a port
 outside the excluded ones in the decisions table, sets `XPORT`, reruns
@@ -1505,7 +1541,7 @@ closed on a partial group, a malformed path or a port clash).
 <!-- rx-block:env-set -->
 
 ```
-rx_ts_ok && rx_port_ok && {
+rx_ts_ok && rx_port_ok && rx_xray_bin_ok && {
   want=$(printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=%s\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/' "$XPORT") &&
   { have=$(sudo grep -E '^POCVPN_API_XRAY_REALITY_XHTTP_' "$ENVF"); [ $? -le 1 ]; } &&
   if [ "$have" = "$want" ]; then echo "api.env already has exactly these lines - unchanged"
@@ -1532,7 +1568,7 @@ would pick the change up at its next tick on its own, so step 3 already
 opens the restart window; trigger it deliberately instead of waiting:
 
 ```
-sudo systemctl start nova-xray-reconcile.service
+rx_xray_bin_ok && sudo systemctl start nova-xray-reconcile.service
 journalctl -u nova-xray-reconcile -n 20 --no-pager
 ```
 
@@ -1541,8 +1577,18 @@ canonical state`. `convergence FAILED` leaves the running config untouched
 (rollback A).
 
 The privileged path (`nova-xray-reload` -> `xray-activate.sh`) runs
-`xray -test` on the candidate before publishing and restarting `nova-xray`;
-a candidate the pinned core rejects is never published. Then:
+`xray run -test` with `XRAY_BIN_PATH` on the candidate before publishing
+and restarting `nova-xray` (and restarts the previous config if the new
+one does not come up). The test is meaningful only while `rx_xray_bin_ok`
+holds - the tested binary is the one running and the one the unit
+restarts, as of the moment of the check; a binary or unit changed after
+that check is not covered, so run nothing else on the host in between.
+With a different binary a candidate that passes the test can still be
+rejected by the core `nova-xray` restarts with, dropping the REALITY/TLS
+sessions on the host until the rollback restart. Hence the check in step 0c, in step 3's block and in front of
+the trigger above. Note that `nova-xray-reconcile.timer`, resumed after
+1c, renders on its own after step 3 - the check in step 3's block is what
+stops the XHTTP lines from being written on a mismatch. Then:
 
 ```
 rx_port_owner nova-xray                       # READ-ONLY: only nova-xray's MainPID listens on $XPORT
