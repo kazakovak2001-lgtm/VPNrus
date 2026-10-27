@@ -35,7 +35,7 @@ env:
   # Go build info embeds the absolute go.mod replace paths, so builds from other
   # roots differ. A deliberate pin/script/toolchain bump must update these.
   AWG_AAR_SHA256: 2d5a241094bca8943eecadce746d77b51a335cf5adbc5f916767e20829165ee5
-  XRAY_AAR_SHA256: 832dc038e3e8c50c91d9be6a8a6d9867075a6ded3b61129089257ab47a1ed28d
+  XRAY_AAR_SHA256: c087a56cec25165ada57c23e07dc94eed0c0be5d10e94a1a6022d713adb33e53
 
 jobs:
   android-build:
@@ -131,6 +131,22 @@ jobs:
           }
           check "$AWG_AAR" jni/arm64-v8a/libwg-go.so jni/arm64-v8a/libwg.so jni/arm64-v8a/libwg-quick.so
           check "$XRAY_AAR" jni/arm64-v8a/libgojni.so
+
+          # 16 KB page-size support: every LOAD segment of every 64-bit .so
+          # must be aligned to at least 16 KB (0x4000).
+          so_dir="$RUNNER_TEMP/aar-so"
+          for aar in "$AWG_AAR" "$XRAY_AAR"; do
+            rm -rf "$so_dir"; mkdir -p "$so_dir"
+            unzip -q "$aar" 'jni/arm64-v8a/*.so' 'jni/x86_64/*.so' -d "$so_dir"
+            for so in "$so_dir"/jni/*/*.so; do
+              while read -r align; do
+                if (( align < 0x4000 )); then
+                  echo "::error::$(basename "$aar"): ${so#"$so_dir"/} LOAD alignment $align < 16 KB"
+                  exit 1
+                fi
+              done < <(readelf -lW "$so" | awk '$1 == "LOAD" { print $NF }')
+            done
+          done
 
           {
             echo "### Native AARs (cache hit: ${{ steps.native-cache.outputs.cache-hit == 'true' }})"
