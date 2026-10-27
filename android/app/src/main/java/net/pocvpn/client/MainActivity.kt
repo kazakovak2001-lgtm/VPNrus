@@ -7,6 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -79,7 +80,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        viewModel = ViewModelProvider(this, MainViewModel.Factory(applicationContext))[MainViewModel::class.java]
+        viewModel = sessionViewModel(application as ViewModelStoreOwner, applicationContext)
         geoDataViewModel = ViewModelProvider(
             this,
             net.pocvpn.client.geodata.GeoDataViewModel.Factory(applicationContext),
@@ -118,5 +119,18 @@ class MainActivity : AppCompatActivity() {
         val uri = intent.data ?: return
         val resolution = ActivationInputResolver.resolveAppLinkUrl(uri.toString())
         viewModel.submitActivationInput(resolution)
+    }
+
+    internal companion object {
+        /**
+         * The session's MainViewModel, from the process-wide owner
+         * ([NovaVpnApplication.viewModelStore]) - never this Activity's own
+         * store, so every MainActivity instance shares one VpnController.
+         */
+        internal fun sessionViewModel(
+            owner: ViewModelStoreOwner,
+            appContext: android.content.Context,
+            factory: ViewModelProvider.Factory = MainViewModel.Factory(appContext),
+        ): MainViewModel = ViewModelProvider(owner, factory)[MainViewModel::class.java]
     }
 }

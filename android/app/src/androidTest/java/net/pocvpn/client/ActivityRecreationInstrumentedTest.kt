@@ -1,6 +1,5 @@
 package net.pocvpn.client
 
-import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import net.pocvpn.client.vpn.TransportState
@@ -24,7 +23,7 @@ import org.junit.runner.RunWith
 class ActivityRecreationInstrumentedTest {
 
     private fun currentViewModel(activity: MainActivity): MainViewModel =
-        ViewModelProvider(activity, MainViewModel.Factory(activity.applicationContext))[MainViewModel::class.java]
+        MainActivity.sessionViewModel(activity.application as androidx.lifecycle.ViewModelStoreOwner, activity.applicationContext)
 
     @Test
     fun recreate_preservesSameViewModelInstance_andPublicKey() {
@@ -96,6 +95,64 @@ class ActivityRecreationInstrumentedTest {
                 grantedAfter,
             )
         }
+    }
+
+    /** A second MainActivity (explicit intent) must read the session's ViewModel, not build its own. */
+    @Test
+    fun secondActivityInstance_sharesTheSameViewModel() {
+        ActivityScenario.launch(MainActivity::class.java).use { first ->
+            waitForPublicKey(first)
+            val (firstActivity, firstViewModel) = first.withActivity { it to currentViewModel(it) }
+            // The field case (`am start -n …/.MainActivity`): an explicit
+            // NEW_TASK intent stacks a second instance on top of the first.
+            // ActivityScenario.launch and Instrumentation.startActivitySync
+            // both clear the first one instead (CLEAR_TOP), so start it as
+            // adb does and find it among the resumed activities.
+            val instrumentation = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+            instrumentation.targetContext.startActivity(
+                android.content.Intent(instrumentation.targetContext, MainActivity::class.java)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+            val secondActivity = awaitResumedMainActivityOtherThan(firstActivity)
+            try {
+                assertTrue("a second MainActivity object", firstActivity !== secondActivity)
+                assertTrue("the first MainActivity is still alive", !firstActivity.isDestroyed)
+                val secondViewModel = currentViewModel(secondActivity)
+                assertSame(firstViewModel, secondViewModel)
+                assertSame(firstViewModel.transportState, secondViewModel.transportState)
+            } finally {
+                instrumentation.runOnMainSync { secondActivity.finish() }
+            }
+        }
+    }
+
+    /** Finishing MainActivity (Back) no longer drops the session owner while the process lives. */
+    @Test
+    fun finishedThenRelaunchedActivity_sharesTheSameViewModel() {
+        val before = ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            waitForPublicKey(scenario)
+            scenario.withActivity { currentViewModel(it) }
+        }
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            assertSame(before, scenario.withActivity { currentViewModel(it) })
+        }
+    }
+
+    private fun awaitResumedMainActivityOtherThan(existing: MainActivity, timeoutMs: Long = 10_000): MainActivity {
+        val instrumentation = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            var found: MainActivity? = null
+            instrumentation.runOnMainSync {
+                found = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance()
+                    .getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED)
+                    .filterIsInstance<MainActivity>()
+                    .firstOrNull { it !== existing }
+            }
+            found?.let { return it }
+            Thread.sleep(50)
+        }
+        throw AssertionError("timed out waiting for a second MainActivity")
     }
 
     private fun waitForPublicKey(scenario: ActivityScenario<MainActivity>, timeoutMs: Long = 5_000) {

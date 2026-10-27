@@ -235,6 +235,9 @@ private data class CombinedAutoRankingSnapshot(
  * Thin state holder above VpnController - MainActivity observes this instead
  * of owning tunnel/connection state itself, so Activity recreation (rotation,
  * process death+restore of the Activity only) doesn't lose or duplicate it.
+ * Owned by the process-wide [NovaVpnApplication.viewModelStore] (see
+ * MainActivity.sessionViewModel), not by any one Activity: every MainActivity
+ * instance shares this one instance and its one VpnController.
  * VpnController is built here (not in the Factory) because it needs
  * viewModelScope, which only exists once this ViewModel instance exists.
  */
@@ -5133,6 +5136,8 @@ class MainViewModel(
         }
     }
 
+    // Production never clears the application-level store, so this runs only
+    // when that store is cleared explicitly (tests) - not when an Activity finishes.
     override fun onCleared() {
         controller.shutdown()
         // B8I - no leak: unregisters the SAME ConnectivityManager callback

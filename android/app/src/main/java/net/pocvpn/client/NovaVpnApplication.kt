@@ -1,6 +1,8 @@
 package net.pocvpn.client
 
 import android.app.Application
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import net.pocvpn.client.vpn.AlwaysOnVpnState
 import org.amnezia.awg.backend.GoBackend
 
@@ -14,10 +16,21 @@ import org.amnezia.awg.backend.GoBackend
  * its own GoBackend instance exactly as before; GoBackend.setAlwaysOnCallback
  * is a static registration independent of any particular instance).
  */
-class NovaVpnApplication : Application() {
+class NovaVpnApplication : Application(), ViewModelStoreOwner {
     private companion object {
         const val XHTTP_HANDOFF_KEY_ALIAS = "nova_xhttp_session_handoff_key"
     }
+
+    /**
+     * The ONE owner of the VPN session in the main process: MainActivity takes
+     * its MainViewModel (-> VpnController -> transports -> GoBackend) from this
+     * store, never from its own, so a second MainActivity (explicit intent, App
+     * Link) or one created after the previous one finished reads the controller
+     * that owns the running tunnel instead of building a new one that starts
+     * Disconnected. Never cleared: it ends with this process. Only the main
+     * process ever asks for it (`:xray` has no Activity).
+     */
+    override val viewModelStore: ViewModelStore = ViewModelStore()
 
 
     override fun onCreate() {
