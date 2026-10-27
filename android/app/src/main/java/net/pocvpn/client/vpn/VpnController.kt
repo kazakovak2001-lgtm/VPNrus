@@ -94,7 +94,12 @@ sealed interface ReconnectIncidentEvent {
     ) : ReconnectIncidentEvent
 
     data class Succeeded(override val generation: Long) : ReconnectIncidentEvent
-    data class Failed(override val generation: Long) : ReconnectIncidentEvent
+    /**
+     * [recoveryExhausted] is true only when the automatic recovery cycle ran
+     * out of attempts (ReconnectExhausted); false for an async transport
+     * Error on a Connected session that never entered recovery.
+     */
+    data class Failed(override val generation: Long, val recoveryExhausted: Boolean = false) : ReconnectIncidentEvent
     data class Disconnected(override val generation: Long) : ReconnectIncidentEvent
 }
 
@@ -311,6 +316,14 @@ class VpnController(
     // L + binding store). Null keeps the pre-Phase-B managed AWG behavior
     // (tests/legacy wiring only; production always passes it).
     private val managedAwgIdentityGuard: net.pocvpn.client.identity.ManagedAwgIdentityGuard? = null,
+    // Smart Connect re-evaluation after a network change - how many same-path
+    // restarts a RESTART_SESSION transport gets after a Wi-Fi <-> mobile
+    // change before the cycle ends with ReconnectExhausted. Read once per
+    // reconnect cycle; clamped to 1..ReconnectBackoff.MAX_ATTEMPTS. The
+    // default keeps the full budget, so every existing caller is unaffected;
+    // MainViewModel shortens it in Auto, where the exhaustion then triggers a
+    // fresh candidate selection. A plain network loss keeps the full budget.
+    private val networkChangeReconnectAttempts: () -> Int = { ReconnectBackoff.MAX_ATTEMPTS },
     // B-WL7 layer 3a - additive, both default to null (no check). When wired,
     // each Connected session's VPN network (routes, DNS, IPv6) is read once
     // from the system and evaluated by TunnelProtectionCheck. Recording only:
@@ -2495,6 +2508,13 @@ class VpnController(
     private suspend fun reconnectLoop(generation: Long, restartImmediately: Boolean) {
         var attempt = 0
         val reconnectionThresholdEpochMillis = System.currentTimeMillis()
+        // restartImmediately is set only by handleUnderlyingNetworkChanged.
+        val maxAttempts = if (restartImmediately) {
+            runCatching(networkChangeReconnectAttempts).getOrDefault(ReconnectBackoff.MAX_ATTEMPTS)
+                .coerceIn(1, ReconnectBackoff.MAX_ATTEMPTS)
+        } else {
+            ReconnectBackoff.MAX_ATTEMPTS
+        }
         runCatching {
             onReconnectIncident?.invoke(
                 ReconnectIncidentEvent.Started(
@@ -2512,7 +2532,7 @@ class VpnController(
             diagnostics.updateReconnectAttempts(attempt)
             if (!setReconnectState(generation, TransportState.Reconnecting(attempt))) return
 
-            if (attempt > ReconnectBackoff.MAX_ATTEMPTS) {
+            if (attempt > maxAttempts) {
                 if (!setReconnectState(generation, TransportState.Error("Reconnect attempts exhausted"))) return
                 diagnostics.recordError(VpnError.ReconnectExhausted)
                 // B8I - ONE outcome for the whole exhausted recovery cycle,
@@ -2528,7 +2548,7 @@ class VpnController(
                     recordPathHistory(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                     recordTransportBehaviorObservation(success = false, kind = pendingConnectKind, endpointId = pendingConnectEndpointId, nowEpochMillis = System.currentTimeMillis())
                 }
-                runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Failed(generation)) }
+                runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Failed(generation, recoveryExhausted = true)) }
                 return
             }
 
