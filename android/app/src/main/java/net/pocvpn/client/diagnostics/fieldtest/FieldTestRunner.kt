@@ -64,6 +64,8 @@ interface FieldTestHost {
     suspend fun logs(): List<String>
     /** B-WL7 checks kept in memory (see DataPlaneCheckLog); null when not wired - the report then omits the section. */
     fun dataPlaneChecks(): JSONObject? = null
+    /** B-WL7 layer 3a checks kept in memory (see TunnelProtectionLog); null when not wired - the report then omits the section. */
+    fun protectionChecks(): JSONObject? = null
     /**
      * Xray-family sessions exclude the Nova app from their own tunnel, so the
      * app cannot probe through them; the `:xray` process measures with the
@@ -378,6 +380,7 @@ class FieldTestRunner(
             crashes = host.crashes(),
             logs = logs,
             dataPlaneChecks = dataPlaneChecks,
+            protectionChecks = host.protectionChecks(),
         )
         abort?.let { log += "ABORTED: $it" }
         // QUICK during a normal session: give the user the connection back.

@@ -686,6 +686,10 @@ class MainViewModel(
     // passed unchanged into this ViewModel's VpnController below. Null keeps the
     // pre-Phase-B behavior (tests/legacy only); the Factory always passes one.
     private val managedAwgIdentityGuard: net.pocvpn.client.identity.ManagedAwgIdentityGuard? = null,
+    // B-WL7 layer 3a - reads the system's view of this app's VPN network after
+    // Connected. Null (tests/legacy) means no protection check at all; the
+    // Factory passes AndroidTunnelLinkReader.
+    private val tunnelLinkReader: (suspend () -> net.pocvpn.client.vpn.protection.TunnelLinkSnapshot?)? = null,
 ) : ViewModel() {
     // A debug UI force is intentionally a one-shot input. Keep the marker
     // separate from userTransportPreference so constructor-injected Manual
@@ -1048,6 +1052,9 @@ class MainViewModel(
     // check into and the field report reads (independent of logcat retention).
     private val dataPlaneCheckLog = net.pocvpn.client.smartconnect.DataPlaneCheckLog()
 
+    // B-WL7 layer 3a - same pattern: VpnController writes, the field report reads.
+    private val tunnelProtectionLog = net.pocvpn.client.vpn.protection.TunnelProtectionLog()
+
     private val controller = VpnController(
         transport = transport,
         clientKeyRepository = clientKeyRepository,
@@ -1110,6 +1117,8 @@ class MainViewModel(
                 net.pocvpn.client.vpn.ReconnectBackoff.MAX_ATTEMPTS
             }
         },
+        tunnelLinkReader = tunnelLinkReader,
+        tunnelProtectionLog = tunnelProtectionLog,
     )
 
     /**
@@ -3898,6 +3907,7 @@ class MainViewModel(
         override fun crashes() = net.pocvpn.client.diagnostics.fieldtest.CrashRecorder.recent(context)
         override suspend fun logs() = net.pocvpn.client.diagnostics.fieldtest.FieldLogs.collect()
         override fun dataPlaneChecks() = net.pocvpn.client.smartconnect.DataPlaneCheckLog.reportJson(dataPlaneCheckLog.snapshot())
+        override fun protectionChecks() = net.pocvpn.client.vpn.protection.TunnelProtectionLog.reportJson(tunnelProtectionLog.snapshot())
         override fun activeNetworkSummary() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.activeSummary(context)
         override suspend fun measureViaXrayCore(urls: List<String>) =
             net.pocvpn.client.vpn.xray.XrayProcessBridge.measureThroughCore(context, urls)
@@ -5600,6 +5610,7 @@ class MainViewModel(
                 // for-byte unaffected otherwise.
                 fieldCredentialStore = net.pocvpn.client.provisioning.FieldCredentialStoreFactory.create(context),
                 zeroTouchEnrollmentEnabled = BuildConfig.FIELD_ENROLLMENT_ENABLED,
+                tunnelLinkReader = net.pocvpn.client.vpn.protection.AndroidTunnelLinkReader(context).let { reader -> { reader.read() } },
             ) as T
         }
     }
