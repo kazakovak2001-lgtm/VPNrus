@@ -1140,7 +1140,14 @@ every later session (including the Frankfurt session in step 6) with
 export TS=<value printed in step 1>
 ```
 
-Never generate a new one after step 1. Each block that backs up or
+Never generate a new one after step 1.
+
+The public XHTTP port is a second rollout parameter, `XPORT`, fixed once
+in step 0 (default **2096**, see the decisions table) and used unchanged
+by every later step: the `api.env` value (step 3), the security-group rule
+(step 2), the listener checks (steps 4/5), the manifest binding (step 6)
+and rollback A. Start every later session with `export XPORT=<step 0
+value>` as well; blocks that use it stop if it is unset or not a port. Each block that backs up or
 restores starts with the guard below and is ONE compound command
 (`case ... && { ...; }`), so an unset or malformed `TS` stops the whole
 block before anything changes - unlike `: "${TS:?}"`, which in an
@@ -1151,16 +1158,19 @@ and POSIX `sh`.
 ### 0. Read-only precheck (on Stockholm)
 
 ```
+export XPORT=2096   # default; change ONLY here if 2096 is taken, then keep it for all steps
 cd /opt/pocvpn/gateway && sha256sum api/xray_config_renderer.py api/config.py api/handler.py api/xray_activation.py
-sudo ss -tlnp | grep -E ':(2096|2053|2083|443)\b'
+sudo ss -tlnp | grep -E ":(${XPORT}|2053|2083|443)\b"
 sudo grep -c '^POCVPN_API_XRAY_' /etc/pocvpn/api.env
 systemctl is-active pocvpn-api nova-xray nova-xray-reconcile.timer
 ```
 
-Expected: nothing listens on 2096; REALITY on 2053 and TLS on 2083 are
+Expected: nothing listens on `$XPORT`; REALITY on 2053 and TLS on 2083 are
 `nova-xray`; the four `api/*.py` hashes are recorded so step 1 can be
-compared and rolled back. Stop if 2096 is taken and pick another free port
-(it is then also the port in the manifest).
+compared and rolled back. If `$XPORT` is taken, stop, pick another free
+port outside the excluded ones in the decisions table, set `XPORT` to it,
+rerun this check, and record the value: every later step (security group,
+`api.env`, checks, manifest, rollback) then uses that port, never 2096.
 
 ### 1. Update `gateway/api` to `main` `21e7078`
 
@@ -1246,17 +1256,18 @@ evaluation and answers 401 for an invalid credential.)
 
 ### 2. AWS security group (separate approval)
 
-Security group `launch-wizard-1`: **inbound TCP 2096, source 0.0.0.0/0,
+Security group `launch-wizard-1`: **inbound TCP `$XPORT` (step 0 value), source 0.0.0.0/0,
 Stockholm instance, "Nova REALITY+XHTTP"**. The OS firewall is accept-all,
 so the security group is the only gate. Until step 4 nothing listens on
-2096, so opening it first is harmless.
+`$XPORT`, so opening it first is harmless.
 
 ### 3. Enable the inbound in `api.env`
 
 ```
 case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  case "${XPORT:-}" in *[!0-9]*|"") false ;; *) [ "$XPORT" -ge 1 ] && [ "$XPORT" -le 65535 ] ;; esac && echo "XPORT=$XPORT" &&
   sudo cp -p /etc/pocvpn/api.env "/etc/pocvpn/api.env.backup-rx-$TS" &&
-  printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=2096\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' | sudo tee -a /etc/pocvpn/api.env >/dev/null &&
+  printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=%s\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' "$XPORT" | sudo tee -a /etc/pocvpn/api.env >/dev/null &&
   sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
 }
 ```
@@ -1285,7 +1296,7 @@ The privileged path (`nova-xray-reload` -> `xray-activate.sh`) runs
 a candidate the pinned core rejects is never published. Then:
 
 ```
-sudo ss -tlnp | grep -E ':(2096|2053|2083)\b'       # nova-xray on all three
+sudo ss -tlnp | grep -E ":(${XPORT}|2053|2083)\b"    # nova-xray on all three
 sudo grep -c 'nova-vless-reality-xhttp-in' /etc/nova-xray/config.json   # 1 (XRAY_LIVE_CONFIG in xray.env)
 sudo grep -c '"privateKey"' /etc/nova-xray/config.json                  # 2: both REALITY inbounds
 ```
@@ -1297,7 +1308,7 @@ Never print the config itself - it contains the REALITY private key.
 From the owner's PC (outside AWS):
 
 ```
-nc -vz 16.170.208.231 2096
+nc -vz 16.170.208.231 "$XPORT"   # XPORT = step 0 value
 ```
 
 TCP connect must succeed; a TLS client without the REALITY key only sees
@@ -1308,8 +1319,11 @@ the camouflage site's handshake, which is expected.
 Draft: `gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json` - v8
 plus ONE Stockholm binding `{"kindOrdinal": 7, "host": "16.170.208.231",
 "port": 2096}`, `manifestVersion: 9`, `signingKeyId:
-prod-manifest-key-2026-09-01`. If step 0 forced another port, change it
-here first.
+prod-manifest-key-2026-09-01`. The binding's `port` MUST equal `XPORT`: if
+step 0 chose another port, change it in the draft JSON first (and the
+`2096` expectations in `RealityXhttpManifestRollbackChainTest` / the
+regenerated `manifest_rollback_fixtures.py` fixtures with it), before
+signing.
 
 On the owner's PC, offline. The tool reads the key itself from its file
 (must be mode 600 on POSIX), so it never appears in argv, the process list,
@@ -1425,7 +1439,7 @@ case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][
 - **A - before step 6** (no client can see it): restore
   `api.env.backup-rx-$TS` (block above), restart `pocvpn-api`, run
   `nova-xray-reconcile.service` (renders without the fourth inbound,
-  restarts `nova-xray`), close TCP 2096 in the security group. Restore the
+  restarts `nova-xray`), close TCP `$XPORT` (step 0 value) in the security group. Restore the
   `api/*.py.backup-rx-$TS` files only if step 1 itself misbehaved.
 - **B - after step 6**: reinstalling the v8 `.bin` is NOT enough - a device
   that already adopted v9 rejects any lower `manifestVersion`
