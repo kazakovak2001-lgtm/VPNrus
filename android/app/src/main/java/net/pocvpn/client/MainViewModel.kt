@@ -3790,6 +3790,10 @@ class MainViewModel(
 
         override fun applyTarget(target: net.pocvpn.client.diagnostics.fieldtest.FieldAttemptTarget): String? {
             if (transportState.value.blocksGatewaySelection()) return "a session is still active"
+            // Release has no relay override: without this the run would be a plain Auto connect labelled as relay.
+            if (target.relayIngress != null && !net.pocvpn.client.smartconnect.DebugPathOverride.isAvailable) {
+                return "relay path forcing is available only in the debug build"
+            }
             val gateway = target.gateway
             net.pocvpn.client.smartconnect.DebugPathOverride.clear()
             target.relayIngress?.let { net.pocvpn.client.smartconnect.DebugPathOverride.forceRelayedVia(it) }

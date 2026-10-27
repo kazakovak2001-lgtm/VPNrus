@@ -651,7 +651,8 @@ fun AppRoot(
         }
         FieldTestDialog(
             progress = fieldTestProgress,
-            allModes = isDebugBuild,
+            allModes = true,
+            canSaveLocally = isDebugBuild,
             onStart = { mode, minutes ->
                 fieldTestSaveStatus = null
                 viewModel.startFieldTest(context, mode, minutes) { currentDiagnosticsLines.value() }

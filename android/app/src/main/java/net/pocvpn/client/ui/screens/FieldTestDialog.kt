@@ -27,17 +27,20 @@ import net.pocvpn.client.diagnostics.fieldtest.FieldTestMode
 import net.pocvpn.client.diagnostics.fieldtest.FieldTestProgress
 
 /**
- * Field test - debug-only (opened from the isDebugBuild-gated Diagnostics
- * dialog). Shows the live log of [net.pocvpn.client.diagnostics.fieldtest
- * .FieldTestRunner] and, once a report exists, lets the tester share it
- * (share sheet, chosen by the tester) or keep a local copy. Never uploads
- * anything by itself. Same single-scroll-region layout as DiagnosticsDialog.
+ * Field test - opened from Settings "Network check" (both build types) and
+ * from the debug-only Diagnostics dialog. Shows the live log of
+ * [net.pocvpn.client.diagnostics.fieldtest.FieldTestRunner] and, once a
+ * report exists, lets the tester share it (share sheet, chosen by the
+ * tester) or, in debug, keep a local copy. Never uploads anything by itself.
+ * Same single-scroll-region layout as DiagnosticsDialog.
  */
 @Composable
 fun FieldTestDialog(
     progress: FieldTestProgress?,
-    /** Debug build: full test + monitor modes; release: the quick network check only. */
+    /** Full test + monitor modes next to the quick network check. */
     allModes: Boolean,
+    /** Debug build only: LocalDiagnosticsExporter is a no-op in release. */
+    canSaveLocally: Boolean,
     onStart: (FieldTestMode, Int) -> Unit,
     onCancel: () -> Unit,
     onShareJson: () -> Unit,
@@ -136,7 +139,7 @@ fun FieldTestDialog(
                         TextButton(onClick = onShareSummary, modifier = Modifier.fillMaxWidth()) {
                             Text(stringResource(R.string.field_test_share_summary))
                         }
-                        if (allModes) {
+                        if (canSaveLocally) {
                             TextButton(onClick = onSaveLocally, modifier = Modifier.fillMaxWidth()) {
                                 Text(stringResource(R.string.field_test_save))
                             }
