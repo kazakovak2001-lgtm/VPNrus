@@ -1,7 +1,10 @@
 package net.pocvpn.client.vpn.protection
 
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.config.TransportConfig
+import net.pocvpn.client.vpn.config.VpnDnsPolicy
 import net.pocvpn.client.vpn.policy.Ipv4RouteExclusion
+import net.pocvpn.client.vpn.xray.XrayVlessRealityConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -110,5 +113,24 @@ class TunnelProtectionCheckTest {
         assertEquals("XRAY_REALITY", item.getString("transport"))
         assertEquals("BLOCKED", item.getString("ipv6"))
         assertEquals("EMPTY", TunnelProtectionLog.reportJson(emptyList()).getString("status"))
+    }
+
+    @Test
+    fun `expected DNS follows the transport's own config, not one global list`() {
+        val reality = XrayVlessRealityConfig(
+            server = "152.70.43.1", serverPort = 443, uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+            flow = "xtls-rprx-vision", serverName = "www.microsoft.com", fingerprint = "chrome",
+            realityPublicKey = "A".repeat(43), shortId = "a1b2c3d4",
+        )
+        assertEquals(XrayVlessRealityConfig.DEFAULT_DNS_SERVERS, TunnelProtectionCheck.expectedDns(TransportConfig.Xray(reality)))
+        assertEquals(VpnDnsPolicy.servers, TunnelProtectionCheck.expectedDns(null))
+    }
+
+    @Test
+    fun `Xray's own DNS list is VERIFIED against that list - the field false positive`() {
+        val xrayDns = XrayVlessRealityConfig.DEFAULT_DNS_SERVERS
+        val r = TunnelProtectionCheck.evaluate(TunnelLinkSnapshot(listOf("0.0.0.0/0", "::/0"), xrayDns, true), xrayDns)
+        assertEquals(TunnelProtectionStatus.VERIFIED, r.status)
+        assertTrue(r.findings.isEmpty())
     }
 }

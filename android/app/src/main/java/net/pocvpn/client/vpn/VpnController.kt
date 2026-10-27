@@ -2000,6 +2000,8 @@ class VpnController(
     private fun launchProtectionCheck(kind: TransportKind, generation: Long) {
         val reader = tunnelLinkReader ?: return
         val log = tunnelProtectionLog ?: return
+        // Snapshotted now: the DNS this session's transport actually installed.
+        val expectedDns = net.pocvpn.client.vpn.protection.TunnelProtectionCheck.expectedDns(activeTransportConfig)
         protectionCheckJob?.cancel()
         protectionCheckJob = scope.launch {
             var reads = 0
@@ -2019,7 +2021,7 @@ class VpnController(
                     null
                 }
             }
-            log.record(kind, net.pocvpn.client.vpn.protection.TunnelProtectionCheck.evaluate(snapshot), reads, generation)
+            log.record(kind, net.pocvpn.client.vpn.protection.TunnelProtectionCheck.evaluate(snapshot, expectedDns), reads, generation)
         }
     }
 

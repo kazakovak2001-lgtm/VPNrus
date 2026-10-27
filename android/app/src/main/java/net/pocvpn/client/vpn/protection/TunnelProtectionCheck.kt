@@ -1,6 +1,7 @@
 package net.pocvpn.client.vpn.protection
 
 import net.pocvpn.client.transport.TransportKind
+import net.pocvpn.client.vpn.config.TransportConfig
 import net.pocvpn.client.vpn.config.VpnDnsPolicy
 import net.pocvpn.client.vpn.policy.Ipv4RouteExclusion
 import org.json.JSONArray
@@ -74,6 +75,20 @@ object TunnelProtectionCheck {
     val PUBLIC_IPV6_SAMPLES = listOf(
         "2001:4860:4860::8888", "2606:4700:4700::1111", "2a02:6b8::feed:0ff", "2c0f:fb50:4003::1", "3fff:ffff::1",
     )
+
+    /**
+     * The DNS servers the session's own transport handed to
+     * VpnService.Builder.addDnsServer: Xray-family services install their
+     * config's list (XrayVpnBuilderPlan), AWG its interface config's; the
+     * rest use VpnDnsPolicy. Null (no cached config) falls back to the policy.
+     */
+    fun expectedDns(config: TransportConfig?): List<String> = when (config) {
+        is TransportConfig.Awg -> config.config.dnsServers
+        is TransportConfig.Xray -> config.config.dnsServers
+        is TransportConfig.XrayXhttp -> config.config.dnsServers
+        is TransportConfig.XrayTls -> config.config.dnsServers
+        is TransportConfig.Shadowsocks, is TransportConfig.Hysteria2, null -> VpnDnsPolicy.servers
+    }
 
     fun evaluate(snapshot: TunnelLinkSnapshot?, expectedDns: List<String> = VpnDnsPolicy.servers): TunnelProtectionResult {
         if (snapshot == null) return TunnelProtectionResult(TunnelProtectionStatus.NOT_VERIFIABLE, emptyList(), null)

@@ -22,6 +22,7 @@ import net.pocvpn.client.vpn.protection.TunnelLinkSnapshot
 import net.pocvpn.client.vpn.protection.TunnelProtectionFinding
 import net.pocvpn.client.vpn.protection.TunnelProtectionLog
 import net.pocvpn.client.vpn.protection.TunnelProtectionStatus
+import net.pocvpn.client.vpn.xray.XrayVlessRealityConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -99,12 +100,22 @@ class VpnControllerProtectionCheckTest {
 
     @Test
     fun `a Connected session records one VERIFIED check for its transport`() = runTest {
-        val h = harness { TunnelLinkSnapshot(listOf("0.0.0.0/0"), listOf("1.1.1.1", "1.0.0.1"), false) }
+        // The DNS the Xray service actually installs (its config's list), not VpnDnsPolicy's.
+        val h = harness { TunnelLinkSnapshot(listOf("0.0.0.0/0"), XrayVlessRealityConfig.DEFAULT_DNS_SERVERS, false) }
         connect(h)
         val r = h.log.snapshot().single()
         assertEquals(TransportKind.XRAY_REALITY, r.transport)
         assertEquals(TunnelProtectionStatus.VERIFIED, r.result.status)
         assertEquals(1, r.reads)
+    }
+
+    @Test
+    fun `an Xray session whose system DNS is not its own config's list is flagged`() = runTest {
+        val h = harness { TunnelLinkSnapshot(listOf("0.0.0.0/0"), listOf("1.1.1.1", "1.0.0.1"), false) }
+        connect(h)
+        val r = h.log.snapshot().single()
+        assertEquals(TunnelProtectionStatus.LEAK_SUSPECTED, r.result.status)
+        assertEquals(listOf(TunnelProtectionFinding.DNS_SERVERS_UNEXPECTED), r.result.findings)
     }
 
     @Test
@@ -120,7 +131,7 @@ class VpnControllerProtectionCheckTest {
     @Test
     fun `a late link snapshot is retried, and none at all is NOT_VERIFIABLE after the bounded reads`() = runTest {
         var calls = 0
-        val late = harness { if (++calls < 2) null else TunnelLinkSnapshot(listOf("0.0.0.0/0"), listOf("1.1.1.1", "1.0.0.1"), false) }
+        val late = harness { if (++calls < 2) null else TunnelLinkSnapshot(listOf("0.0.0.0/0"), XrayVlessRealityConfig.DEFAULT_DNS_SERVERS, false) }
         connect(late)
         advanceTimeBy(1_500)
         runCurrent()
