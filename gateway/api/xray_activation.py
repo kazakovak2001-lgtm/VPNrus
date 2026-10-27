@@ -126,6 +126,18 @@ def build_xhttp_config(app_config):
     )
 
 
+def build_reality_xhttp_config(app_config):
+    """REALITY + XHTTP counterpart of [build_xhttp_config]. Reads no secret
+    itself: the REALITY key comes from [build_reality_config]'s own config,
+    which the renderer reuses. Returns None when not configured."""
+    if not app_config.xray_reality_xhttp_server_port:
+        return None
+    return xray_config_renderer.RealityXhttpServerConfig(
+        listen_port=app_config.xray_reality_xhttp_server_port,
+        path=app_config.xray_reality_xhttp_path,
+    )
+
+
 def _read_last_activated_hash(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -162,6 +174,7 @@ def _render_candidate(app_config, now):
     reality = build_reality_config(app_config)
     tls = build_tls_config(app_config)
     xhttp = build_xhttp_config(app_config)
+    reality_xhttp = build_reality_xhttp_config(app_config)
     activations_data = activations.read_store_shared(app_config.activation_store_path, app_config.activation_lock_path)
     xray_data = xray_provisioning.read_store_shared(app_config.xray_store_path, app_config.xray_lock_path)
     # B26 (task G) - a genuinely separate trust domain from activations_data
@@ -170,7 +183,7 @@ def _render_candidate(app_config, now):
     static_clients = relay_identity_store.load_static_clients(app_config.static_relay_clients_file)
     config_dict = xray_config_renderer.render_server_config(
         activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=app_config.xray_flow,
-        static_clients=static_clients, now=now,
+        static_clients=static_clients, now=now, reality_xhttp=reality_xhttp,
     )
     canonical_text = json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     sha256_hex = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()

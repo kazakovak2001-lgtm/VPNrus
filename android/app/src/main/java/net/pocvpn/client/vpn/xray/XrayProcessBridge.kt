@@ -245,6 +245,21 @@ object XrayProcessBridge {
         return dataPlaneStatsFor(sessionId, queryTrafficCounters(context))
     }
 
+    /**
+     * Live speed indicator - [sessionId]'s totals through the death watch's
+     * existing binder ([XrayLiveTraffic]); never startService. Unavailable
+     * until that binding is connected, and once the session is not Started.
+     */
+    internal suspend fun liveTrafficStats(
+        sessionId: Long?,
+        binderFor: (Long) -> IBinder? = { id -> watcher?.binderFor(id) },
+    ): TransportStats {
+        if (sessionId == null || !isStartedSession(sessionId)) return TransportStats.Unavailable
+        val binder = binderFor(sessionId) ?: return TransportStats.Unavailable
+        val totals = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { XrayLiveTraffic.query(binder) }
+        return dataPlaneStatsFor(sessionId, totals)
+    }
+
     internal fun dataPlaneStatsFor(sessionId: Long?, totals: XrayTrafficCounters.Totals?): TransportStats =
         if (sessionId == null || totals == null || totals.sessionId != sessionId) {
             TransportStats.Unavailable
@@ -483,6 +498,10 @@ internal class XrayProcessWatcher(
 
     /** The session currently watched, if any. */
     internal val watching: Long? get() = watchedSession
+
+    /** Live speed indicator - the connected service binder, only while [sessionId] is the watched session. Never binds. */
+    @Synchronized
+    internal fun binderFor(sessionId: Long): IBinder? = if (watchedSession == sessionId) binder else null
 
     /** Only events of the watched session end the watch: a late terminal event of an older session must not unwatch a newer one. */
     @Synchronized
