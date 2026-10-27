@@ -1095,10 +1095,53 @@ class MainViewModel(
         onTransportAttemptStarting = { endpointId, kind ->
             supportDiagnosticsRecorder?.recordTransportAttemptStarted(endpointId, kind)
         },
-        onReconnectIncident = { event -> recordReconnectIncidentEvent(event) },
+        onReconnectIncident = { event ->
+            recordReconnectIncidentEvent(event)
+            reselectAfterExhaustedRecovery(event)
+        },
         dataPlaneCheckLog = dataPlaneCheckLog,
         managedAwgIdentityGuard = managedAwgIdentityGuard,
+        // Auto: a dead path after a network change is given up after a few
+        // same-path restarts, then reselectAfterExhaustedRecovery picks again.
+        networkChangeReconnectAttempts = {
+            if (gatewaySelectionMode.value == net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO) {
+                AUTO_NETWORK_CHANGE_RECONNECT_ATTEMPTS
+            } else {
+                net.pocvpn.client.vpn.ReconnectBackoff.MAX_ATTEMPTS
+            }
+        },
     )
+
+    /**
+     * Smart Connect re-evaluation after a network change (ROADMAP Smart
+     * Connect plan item 4). When a session's automatic recovery is exhausted
+     * - the restarted path did not come back on the new network - Auto runs
+     * ONE ordinary candidate selection, exactly as if the user pressed
+     * Connect: the failed path is already recorded as a failure in path
+     * history, so ranking demotes it, and every existing gate (eligibility,
+     * restriction evidence, MAX_ATTEMPTS, a pinned transport) applies
+     * unchanged. A healthy tunnel is never touched (this runs only after
+     * ReconnectExhausted), MANUAL_MANAGED / PRIVATE never reselect, and a
+     * failed reselection ends like any Auto attempt - it is not a
+     * ReconnectIncidentEvent, so it cannot trigger another one.
+     */
+    private fun reselectAfterExhaustedRecovery(event: net.pocvpn.client.vpn.ReconnectIncidentEvent) {
+        // The event flag, not diagnostics' lastError: an async transport-state
+        // observer may record another error after ReconnectExhausted.
+        if (event !is net.pocvpn.client.vpn.ReconnectIncidentEvent.Failed || !event.recoveryExhausted) return
+        if (gatewaySelectionMode.value != net.pocvpn.client.vpn.config.GatewaySelectionMode.AUTO) return
+        reselectionsAfterExhaustedRecoveryForTest++
+        connect()
+    }
+
+    internal var reselectionsAfterExhaustedRecoveryForTest = 0
+        private set
+
+    private companion object {
+        // 1 immediate restart + 2 backed-off ones (about 1 s and 2 s, plus
+        // jitter) before Auto reselects - instead of the full ~2 min budget.
+        const val AUTO_NETWORK_CHANGE_RECONNECT_ATTEMPTS = 3
+    }
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray
     // profile is CONFIRMED to exist FOR THAT ENDPOINT: checked once at

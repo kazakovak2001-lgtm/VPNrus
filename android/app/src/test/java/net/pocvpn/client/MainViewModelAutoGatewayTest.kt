@@ -270,11 +270,12 @@ class MainViewModelAutoGatewayTest {
         manifestRepository: EndpointManifestRepository? = manifestRepositoryNaming("frankfurt", "stockholm"),
         selectionModeStore: GatewaySelectionModeStore = FakeGatewaySelectionModeStore(),
         connectionOutcomeStore: net.pocvpn.client.smartconnect.ConnectionOutcomeStore? = null,
+        reconnectManager: FakeReconnectManager = FakeReconnectManager(),
     ) = MainViewModel(
         clientKeyRepository = FakeClientKeyRepository(),
         transport = transport,
         gatewayConfigurationRepository = FakeGatewayConfigurationRepository(configuredGateway()),
-        reconnectManager = FakeReconnectManager(),
+        reconnectManager = reconnectManager,
         diagnosticsStore = DiagnosticsStore(),
         selectedGatewayStore = selectedGatewayStore,
         clientTunnelIdentityStore = identityStore,
@@ -633,6 +634,70 @@ class MainViewModelAutoGatewayTest {
         assertEquals(1, transport.connectCallCount)
         assertTrue(viewModel.transportState.value is TransportState.Connected)
         assertEquals(1, viewModel.autoGatewayDiagnostics.value?.attempted?.size)
+    }
+
+    // --- Smart Connect: re-evaluation after an exhausted recovery ---
+
+    private fun kotlinx.coroutines.test.TestScope.loseNetworkUntilRecoveryIsExhausted(transport: FakeVpnTransport, reconnectManager: FakeReconnectManager) {
+        transport.handshakeAvailable = false // the recovered path never comes back
+        reconnectManager.triggerNetworkLost()
+        reconnectManager.triggerNetworkAvailable()
+        testDispatcher.scheduler.advanceTimeBy(400_000) // past the full backoff budget
+        testDispatcher.scheduler.runCurrent()
+    }
+
+    @Test
+    fun `auto mode - an exhausted recovery runs exactly one fresh candidate selection`() = runTest {
+        val transport = FakeVpnTransport()
+        val reconnectManager = FakeReconnectManager()
+        val viewModel = newViewModel(transport, FakeGatewayAutoModeStore(initial = true), reconnectManager = reconnectManager)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+        val connectsBefore = transport.connectCallCount
+
+        loseNetworkUntilRecoveryIsExhausted(transport, reconnectManager)
+
+        assertEquals(1, viewModel.reselectionsAfterExhaustedRecoveryForTest)
+        assertTrue("a fresh Auto selection dialed again", transport.connectCallCount > connectsBefore)
+    }
+
+    @Test
+    fun `manual mode - an exhausted recovery never reselects`() = runTest {
+        val transport = FakeVpnTransport()
+        val reconnectManager = FakeReconnectManager()
+        val viewModel = newViewModel(
+            transport,
+            selectedGatewayStore = FakeSelectedGatewayStore(initial = ProductionGatewayId.GERMANY),
+            reconnectManager = reconnectManager,
+        )
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+        val connectsBefore = transport.connectCallCount
+
+        loseNetworkUntilRecoveryIsExhausted(transport, reconnectManager)
+
+        assertEquals(0, viewModel.reselectionsAfterExhaustedRecoveryForTest)
+        assertEquals(connectsBefore, transport.connectCallCount)
+        assertTrue(viewModel.transportState.value is TransportState.Error)
+    }
+
+    @Test
+    fun `auto mode - a user disconnect during recovery never reselects`() = runTest {
+        val transport = FakeVpnTransport()
+        val reconnectManager = FakeReconnectManager()
+        val viewModel = newViewModel(transport, FakeGatewayAutoModeStore(initial = true), reconnectManager = reconnectManager)
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        transport.handshakeAvailable = false
+        reconnectManager.triggerNetworkLost()
+        testDispatcher.scheduler.runCurrent()
+        viewModel.disconnect()
+        testDispatcher.scheduler.advanceTimeBy(400_000)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(0, viewModel.reselectionsAfterExhaustedRecoveryForTest)
     }
 
     // --- B16 consolidated review fix (Blocker 1): pinned candidate config is immutable for the attempt ---
