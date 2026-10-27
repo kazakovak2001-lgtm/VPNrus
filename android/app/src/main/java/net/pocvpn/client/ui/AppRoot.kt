@@ -673,8 +673,9 @@ fun AppRoot(
             onSaveLocally = {
                 fieldTestSaveStatus = runCatching {
                     val json = viewModel.fieldTestReportJson() ?: return@runCatching "no report yet"
-                    val file = net.pocvpn.client.diagnostics.support.LocalDiagnosticsExporter
-                        .exportFieldTest(context.filesDir, System.currentTimeMillis(), json)
+                    // TEST-ONLY combo build: app-specific external dir, readable via adb.
+                    val file = java.io.File(context.getExternalFilesDir(null), "field-test-${System.currentTimeMillis()}.json")
+                        .also { it.writeText(json) }
                     if (file != null) "${file.absolutePath} (${json.length}B)" else "unavailable (release build)"
                 }.getOrElse { "failed: ${it.message}" }
             },
