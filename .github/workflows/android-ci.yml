@@ -35,7 +35,7 @@ env:
   # Go build info embeds the absolute go.mod replace paths, so builds from other
   # roots differ. A deliberate pin/script/toolchain bump must update these.
   AWG_AAR_SHA256: 2d5a241094bca8943eecadce746d77b51a335cf5adbc5f916767e20829165ee5
-  XRAY_AAR_SHA256: 832dc038e3e8c50c91d9be6a8a6d9867075a6ded3b61129089257ab47a1ed28d
+  XRAY_AAR_SHA256: c087a56cec25165ada57c23e07dc94eed0c0be5d10e94a1a6022d713adb33e53
 
 jobs:
   android-build:
