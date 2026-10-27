@@ -1110,6 +1110,172 @@ protection rejects a lower version). Devices re-activate Stockholm again.
 - Not yet done: device re-activation (step 6) and a real Hysteria2
   connect from CZ/RU (step 7).
 
+## REALITY + XHTTP on Stockholm - PREPARED, NOT DEPLOYED
+
+Code: gateway #210, client #211/#212 (`main` `21e7078`). Off by default:
+nothing changes on the host until the env group below is set, and no
+client can select `XRAY_REALITY_XHTTP` until a trusted manifest offers the
+binding. Every step below needs explicit owner approval and is run by the
+owner (Claude's SSH to production is denied as "Production Reads").
+
+### Decisions to confirm before step 1
+
+| Decision | Proposal | Why |
+|---|---|---|
+| Host | Stockholm `16.170.208.231` | REALITY reached Stockholm from one RU home Wi-Fi on 2026-10-08 (`DATA_PLANE_CORE_CONFIRMED`); Frankfurt REALITY failed there. |
+| Public TCP port | **2096** | Not 443 (nginx), not 8443-8445/2100 (loopback services), not 2053/2083 (REALITY/TLS), not 2093 (reserved ingress), per the 2026-09-27 audit. Same family as 2053/2083, one of which worked from RU. TCP 443 via an nginx stream SNI split (as prepared for Frankfurt) is a later, separate step if field results justify it. |
+| XHTTP path | `/nova-rx/` (or any random `/<16 hex>/`) | Must start and end with `/`; not secret. |
+| Manifest signing key | `prod-manifest-key-2026-09-01` | Same as v7: the `2026-09-14` key lives only in the WSL distro, which does not mount (`F:` absent, 2026-10-27). The 09-01 key is the bootstrap anchor every build trusts. |
+| Restart window | Low-traffic time | Step 4 restarts `nova-xray`, dropping every REALITY/TLS session on Stockholm for a few seconds (clients reconnect). AWG and Hysteria2 are not touched. |
+
+### 0. Read-only precheck (on Stockholm)
+
+```
+cd /opt/pocvpn/gateway && sha256sum api/xray_config_renderer.py api/config.py api/handler.py api/xray_activation.py
+ss -tlnp | grep -E ':(2096|2053|2083|443)\b'
+sudo grep -c '^POCVPN_API_XRAY_' /etc/pocvpn/api.env
+systemctl is-active pocvpn-api nova-xray nova-xray-reconcile.timer
+```
+
+Expected: nothing listens on 2096; REALITY on 2053 and TLS on 2083 are
+`nova-xray`; the four `api/*.py` hashes are recorded so step 1 can be
+compared and rolled back. Stop if 2096 is taken and pick another free port
+(it is then also the port in the manifest).
+
+### 1. Update `gateway/api` to `main` `21e7078`
+
+Same method as the 2026-10-08 Salamander rollout: back up and replace only
+the changed files, then compile-check.
+
+```
+cd /opt/pocvpn/gateway
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+for f in api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py; do sudo cp -p "$f" "$f.backup-rx-$TS"; done
+# copy the four files from main 21e7078 into place (root:root 0644), then:
+sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py
+sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+```
+
+Check: `/v1/manifest` still 200; `/v1/xray-profile` with
+`{"transport":"reality-xhttp"}` and any bearer value answers **503
+`xray_reality_xhttp_not_configured`** - the transport check runs before the
+credential is evaluated, so this proves the new code is live while the
+inbound is still off. (After step 3 the same request reaches credential
+evaluation and answers 401 for an invalid credential.)
+
+### 2. AWS security group (separate approval)
+
+Security group `launch-wizard-1`: **inbound TCP 2096, source 0.0.0.0/0,
+Stockholm instance, "Nova REALITY+XHTTP"**. The OS firewall is accept-all,
+so the security group is the only gate. Until step 4 nothing listens on
+2096, so opening it first is harmless.
+
+### 3. Enable the inbound in `api.env`
+
+```
+sudo cp -p /etc/pocvpn/api.env /etc/pocvpn/api.env.backup-rx-$TS
+printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=2096\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' | sudo tee -a /etc/pocvpn/api.env >/dev/null
+sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+```
+
+`config.py` fails closed at start if the group is partial, the path is
+malformed or the port clashes with REALITY/TLS/XHTTP - `pocvpn-api` would
+then not start: restore the backup and restart (rollback A).
+
+### 4. Render, validate and activate the Xray config
+
+The fourth inbound appears in the next render. `nova-xray-reconcile.timer`
+would pick the change up at its next tick on its own, so step 3 already
+opens the restart window; trigger it deliberately instead of waiting:
+
+```
+sudo systemctl start nova-xray-reconcile.service
+journalctl -u nova-xray-reconcile -n 20 --no-pager
+```
+
+Expected: `xray_reconcile: converged - running Xray now reflects current
+canonical state`. `convergence FAILED` leaves the running config untouched
+(rollback A).
+
+The privileged path (`nova-xray-reload` -> `xray-activate.sh`) runs
+`xray -test` on the candidate before publishing and restarting `nova-xray`;
+a candidate the pinned core rejects is never published. Then:
+
+```
+ss -tlnp | grep -E ':(2096|2053|2083)\b'            # nova-xray on all three
+sudo grep -c 'nova-vless-reality-xhttp-in' /etc/nova-xray/config.json   # 1 (XRAY_LIVE_CONFIG in xray.env)
+sudo grep -c '"privateKey"' /etc/nova-xray/config.json                  # 2: both REALITY inbounds
+```
+
+Never print the config itself - it contains the REALITY private key.
+
+### 5. Server-side smoke test (before any client sees it)
+
+From the owner's PC (outside AWS):
+
+```
+nc -vz 16.170.208.231 2096
+```
+
+TCP connect must succeed; a TLS client without the REALITY key only sees
+the camouflage site's handshake, which is expected.
+
+### 6. Sign and publish manifest v9
+
+Draft: `gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json` - v8
+plus ONE Stockholm binding `{"kindOrdinal": 7, "host": "16.170.208.231",
+"port": 2096}`, `manifestVersion: 9`, `signingKeyId:
+prod-manifest-key-2026-09-01`. If step 0 forced another port, change it
+here first.
+
+On the owner's PC, offline (the key never goes into shell history: read it
+from its file):
+
+```
+python -I gateway/tools/manifest_signing.py sign-and-package \
+  --manifest gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json \
+  --private-key-b64 "$(cat <path-to-09-01-key-file>)" \
+  --out gateway/tools/endpoint-manifest-2026-10-27-v9.bin
+```
+
+Verify it against the app-embedded anchor before install (as for v7), rename
+the JSON without `_DRAFT`, commit both. Install on BOTH gateways (each serves
+`/v1/manifest`):
+
+```
+sudo cp -p /etc/pocvpn/endpoint-manifest.bin /etc/pocvpn/endpoint-manifest.bin.v8-backup-$TS
+sudo install -o root -g pocvpn-api -m 0640 endpoint-manifest-2026-10-27-v9.bin /etc/pocvpn/endpoint-manifest.bin
+curl -s https://16.170.208.231/v1/manifest -k | sha256sum   # equals the new .bin on both hosts
+```
+
+`ManifestForwardCompatibilityTest` must still pass with the new `.bin`
+committed. Builds older than #211 keep the new binding opaque and never dial
+it; every other binding is unchanged.
+
+### 7. Clients
+
+- Build a new field APK from `main` (>= `21e7078`, `versionCode` 5).
+- On the device: install, let the manifest refresh, then **re-activate
+  Stockholm** - the REALITY+XHTTP profile is fetched only during activation
+  and only when the trusted manifest offers the binding.
+- Debug build: Diagnostics -> "Force XRAY_REALITY_XHTTP on next connect" ->
+  connect to Stockholm; the full field test now includes the
+  `STOCKHOLM / XRAY_REALITY_XHTTP` run.
+- CZ baseline first (Wi-Fi + cellular must reach `DATA_PLANE_CORE_CONFIRMED`),
+  then the RU comparison against AWG / REALITY / TLS on the same network.
+
+### Rollback
+
+- **A - before step 6** (no client can see it): restore
+  `api.env.backup-rx-<TS>`, restart `pocvpn-api`, run
+  `nova-xray-reconcile.service` (renders without the fourth inbound,
+  restarts `nova-xray`), close TCP 2096 in the security group. Restore the
+  `api/*.py.backup-rx-<TS>` files only if step 1 itself misbehaved.
+- **B - after step 6**: reinstall `endpoint-manifest.bin.v8-backup-<TS>` on
+  both gateways first (clients stop offering the kind at their next manifest
+  refresh), then rollback A. A device still holding v9 sees the inbound gone
+  and fails that one attempt closed; it never affects other transports.
+
 ## REALITY Frankfurt on TCP/443 (SNI split) - PREPARED, NOT DEPLOYED
 
 Why: RU field evidence (2026-10-08, home Wi-Fi): Frankfurt TCP 2053/2083/28388
