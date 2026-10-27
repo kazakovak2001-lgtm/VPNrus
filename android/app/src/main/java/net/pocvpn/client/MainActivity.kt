@@ -1,16 +1,24 @@
 package net.pocvpn.client
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import net.pocvpn.client.vpn.TransportState
 import kotlinx.coroutines.withContext
 import net.pocvpn.client.activation.ActivationInput
 import net.pocvpn.client.activation.ActivationInputRejectionReason
@@ -78,9 +86,41 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    /**
+     * Live speed indicator - POST_NOTIFICATIONS (API 33+) is asked for only
+     * after a VPN session first reaches Connected, at most once per Activity
+     * instance (Android itself stops showing the dialog after repeated
+     * denials). A denial only means no speed notification; the VPN is unaffected.
+     */
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private var notificationPermissionAsked = false
+
+    private fun requestNotificationPermissionOnFirstConnect() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.transportState.first { it is TransportState.Connected }
+                if (!notificationPermissionAsked &&
+                    ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    notificationPermissionAsked = true
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_NOTIFICATION_PERMISSION_ASKED, notificationPermissionAsked)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        notificationPermissionAsked = savedInstanceState?.getBoolean(KEY_NOTIFICATION_PERMISSION_ASKED) ?: false
         viewModel = sessionViewModel(application as ViewModelStoreOwner, applicationContext)
+        requestNotificationPermissionOnFirstConnect()
         geoDataViewModel = ViewModelProvider(
             this,
             net.pocvpn.client.geodata.GeoDataViewModel.Factory(applicationContext),
@@ -122,6 +162,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     internal companion object {
+        private const val KEY_NOTIFICATION_PERMISSION_ASKED = "notification_permission_asked"
+
         /**
          * The session's MainViewModel, from the process-wide owner
          * ([NovaVpnApplication.viewModelStore]) - never this Activity's own

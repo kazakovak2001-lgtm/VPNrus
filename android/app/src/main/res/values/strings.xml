@@ -188,4 +188,11 @@
     <string name="geodata_cancelling">Cancelling...</string>
     <string name="geodata_cancel">Cancel</string>
     <string name="geodata_use_bundled">Use built-in databases</string>
+
+    <!-- Live speed indicator - see net.pocvpn.client.vpn.traffic.VpnTrafficNotifier. -->
+    <string name="traffic_notification_title">VPN connected</string>
+    <string name="traffic_notification_measuring">Measuring speed…</string>
+    <string name="traffic_notification_unavailable">Speed not available for this connection</string>
+    <string name="traffic_notification_channel_name">VPN speed</string>
+    <string name="traffic_notification_channel_description">Live download and upload speed of the VPN tunnel while connected</string>
 </resources>

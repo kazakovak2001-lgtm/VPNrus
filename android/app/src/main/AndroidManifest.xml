@@ -3,6 +3,10 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Live speed indicator - required on API 33+ to post the VPN speed
+         notification (net.pocvpn.client.vpn.traffic.VpnTrafficNotifier);
+         requested at runtime only once a VPN session is Connected. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- B8H - makes launchable apps visible to queryIntentActivities() under
          Android 11+ package-visibility filtering, WITHOUT the much broader

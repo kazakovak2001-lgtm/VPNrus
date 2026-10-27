@@ -45,6 +45,14 @@ interface VpnTransport {
     suspend fun dataPlaneCounters(): TransportStats = TransportStats.Unsupported
 
     /**
+     * Live speed indicator - the same cumulative counters as
+     * [dataPlaneCounters], read about once per second for display only. A
+     * transport whose [dataPlaneCounters] is not side-effect free at that
+     * rate (Xray: a startService per read) overrides this with one that is.
+     */
+    suspend fun liveTrafficCounters(): TransportStats = dataPlaneCounters()
+
+    /**
      * B-WL7 - one bounded request through THIS session's tunnel to a
      * destination outside the current gateway, asked by VpnController at
      * most once per attempt and only when [dataPlaneCounters] alone would
