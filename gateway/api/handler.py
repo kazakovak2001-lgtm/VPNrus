@@ -31,7 +31,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
@@ -81,6 +81,8 @@ _PATH_ADMIN_LOGIN = "/admin/login"
 _PATH_ADMIN_LOGOUT = "/admin/logout"
 _PATH_ADMIN_SESSION = "/admin/session"
 _PATH_ADMIN_STATUS = "/admin/status"
+_PATH_ADMIN_ACTIVATIONS = "/admin/activations"
+_ADMIN_ACTIVATION_PATH_RE = re.compile(r"^/admin/activations/([0-9a-f]{32})(/revoke)?$")
 
 # B26 (task B) - the same TransportKind.name strings Android's TransportKind
 # enum uses (see transport/TransportKind.kt - no custom toString(), so
@@ -245,6 +247,23 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_admin_status()
+            elif self.path == _PATH_ADMIN_ACTIVATIONS:
+                if method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_activations(None)
+            elif _ADMIN_ACTIVATION_PATH_RE.match(self.path):
+                match = _ADMIN_ACTIVATION_PATH_RE.match(self.path)
+                activation_id, action = match.group(1), match.group(2)
+                if action == "/revoke":
+                    if method != "POST":
+                        status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                    else:
+                        status_code = self._handle_admin_revoke(activation_id)
+                elif method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_activations(activation_id)
             else:
                 status_code = self._error(HTTPStatus.NOT_FOUND, "not_found")
         except Exception:
@@ -1437,10 +1456,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             # (idempotent: calling logout twice is harmless).
             return self._success(HTTPStatus.OK, {"status": "logged_out"})
 
-        # Validate session and invalidate
-        is_valid, _ = self.server.admin_authenticator.validate_session_and_csrf(session_id)
-        if is_valid:
-            self.server.admin_authenticator.invalidate_session(session_id)
+        # Logout mutates server-side session state: same CSRF + same-origin
+        # requirements as every other state-changing admin request. An
+        # unknown/expired session is rejected (401) by the same check.
+        self._admin_session_or_raise(mutating=True, need_store=False)
+        self.server.admin_authenticator.invalidate_session(session_id)
 
         # Clear session cookie
         cookie = "pocvpn-admin-session=; Path=/admin; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
@@ -1508,6 +1528,108 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             "status": "ok",
             "session_exists": info is not None,
         })
+
+    # --- admin activation (device) management ---
+    def _admin_session_or_raise(self, mutating, need_store=True):
+        """Returns the validated session id. Read endpoints need only the
+        session cookie (like /admin/status); mutating ones also need the
+        X-CSRF-Token header and a same-origin Origin header."""
+        self._check_admin_enabled()
+        auth = self.server.admin_authenticator
+        session_id = self._parse_session_cookie(self.headers.get("Cookie", ""))
+        if not session_id:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if mutating:
+            csrf_token = self.headers.get("X-CSRF-Token")
+            if not csrf_token:
+                raise _RequestError(HTTPStatus.BAD_REQUEST, "missing_csrf_token")
+            origin = self.headers.get("Origin")
+            host = self.headers.get("Host")
+            if not origin or not host or origin.split("://", 1)[-1] != host:
+                raise _RequestError(HTTPStatus.FORBIDDEN, "origin_mismatch")
+            is_valid, _ = auth.validate_session_and_csrf(session_id, csrf_token)
+        else:
+            is_valid, _ = auth.validate_session_and_csrf(session_id)
+        if not is_valid:
+            raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        if need_store and not self.server.config.activation_store_path:
+            raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_store_not_configured")
+        return session_id
+
+    @staticmethod
+    def _admin_activation_view(record, now):
+        # Never includes the credential (only its digest is stored, and the
+        # digest is not exposed either).
+        return {
+            "activation_id": record["activation_id"],
+            "status": record["status"],
+            "entitlement": activations.entitlement_state(record, now),
+            "max_devices": record["max_devices"],
+            "created_at": record["created_at"],
+            "expires_at": record["expires_at"],
+            "devices": [
+                {"public_key": d["public_key"], "state": d["state"]}
+                for d in record["bound_devices"]
+            ],
+        }
+
+    def _admin_audit(self, action, activation_id, outcome):
+        path = self.server.config.activation_store_path + ".admin-audit.log"
+        line = json.dumps({
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "action": action,
+            "activation_id": activation_id,
+            "outcome": outcome,
+            "client": client_identity.normalize_client(self.headers.get_all("X-Real-IP")),
+        })
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def _handle_admin_activations(self, activation_id):
+        try:
+            self._admin_session_or_raise(mutating=False)
+            cfg = self.server.config
+            now = datetime.now(tz=timezone.utc)
+            try:
+                if activation_id is None:
+                    records = activations.list_all(cfg.activation_store_path, cfg.activation_lock_path)
+                    return self._success(HTTPStatus.OK, {
+                        "activations": [self._admin_activation_view(r, now) for r in records],
+                    })
+                record = activations.find_by_activation_id(
+                    cfg.activation_store_path, cfg.activation_lock_path, activation_id
+                )
+            except activations.ActivationStoreError:
+                raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+            if record is None:
+                raise _RequestError(HTTPStatus.NOT_FOUND, "not_found")
+            return self._success(HTTPStatus.OK, self._admin_activation_view(record, now))
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_admin_revoke(self, activation_id):
+        try:
+            self._admin_session_or_raise(mutating=True)
+            cfg = self.server.config
+            try:
+                changed = activations.revoke_activation(
+                    cfg.activation_store_path, cfg.activation_lock_path, activation_id
+                )
+            except KeyError:
+                raise _RequestError(HTTPStatus.NOT_FOUND, "not_found")
+            except activations.StoreWriteError:
+                raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "store_write_failed")
+            except activations.ActivationStoreError:
+                raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+            # Audit AFTER the state change; a failure to write the audit
+            # line is logged but the revoke itself already happened.
+            try:
+                self._admin_audit("revoke", activation_id, "revoked" if changed else "already_revoked")
+            except OSError:
+                logger.error("admin_audit_write_failed")
+            return self._success(HTTPStatus.OK, {"status": "revoked" if changed else "already_revoked"})
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
 
     # --- logging: explicit allowlisted fields only, never raw
     # headers/body/token - see module docstring and _log_fields sites

@@ -441,7 +441,8 @@ class AdminEndpointEnabledTests(unittest.TestCase):
         self.assertIsNotNone(sid)
         # Logout.
         status, headers, body = post_admin_logout(
-            self.server.port, cookie=f"pocvpn-admin-session={sid}"
+            self.server.port, cookie=f"pocvpn-admin-session={sid}",
+            extra_headers=self._mut(csrf),
         )
         self.assertEqual(status, 200)
         # Session should now be invalid.
@@ -452,6 +453,40 @@ class AdminEndpointEnabledTests(unittest.TestCase):
         )
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(body)["error"], "unauthorized")
+
+    def _mut(self, csrf, origin=None):
+        return {
+            "Content-Length": "0",
+            "X-CSRF-Token": csrf,
+            "Origin": origin or f"http://127.0.0.1:{self.server.port}",
+        }
+
+    def test_logout_rejects_missing_or_bad_csrf_and_origin(self):
+        status, headers, body, sc = self._login()
+        sid = self._extract_session(sc)
+        csrf = self._extract_csrf_from_body(body)
+        cookie = f"pocvpn-admin-session={sid}"
+        port = self.server.port
+        s, _, b = post_admin_logout(port, cookie=cookie, extra_headers={"Content-Length": "0"})
+        self.assertEqual((s, json.loads(b)["error"]), (400, "missing_csrf_token"))
+        s, _, b = post_admin_logout(port, cookie=cookie, extra_headers=self._mut("wrong"))
+        self.assertEqual(s, 401)
+        s, _, b = post_admin_logout(port, cookie=cookie, extra_headers=self._mut(csrf, "http://evil.example"))
+        self.assertEqual((s, json.loads(b)["error"]), (403, "origin_mismatch"))
+        h = self._mut(csrf)
+        del h["Origin"]
+        s, _, b = post_admin_logout(port, cookie=cookie, extra_headers=h)
+        self.assertEqual(s, 403)
+        # The session survived every rejected attempt, then logs out cleanly
+        # and cannot be reused.
+        s, _, _ = get_admin_status(port, cookie=cookie)
+        self.assertEqual(s, 200)
+        s, _, _ = post_admin_logout(port, cookie=cookie, extra_headers=self._mut(csrf))
+        self.assertEqual(s, 200)
+        s, _, _ = post_admin_logout(port, cookie=cookie, extra_headers=self._mut(csrf))
+        self.assertEqual(s, 401)
+        s, _, _ = get_admin_status(port, cookie=cookie)
+        self.assertEqual(s, 401)
 
     def test_logout_idempotent(self):
         """Logout with no cookie is OK (idempotent)."""
@@ -472,7 +507,9 @@ class AdminEndpointEnabledTests(unittest.TestCase):
     def test_logout_clears_cookie(self):
         status, headers, body, sc = self._login()
         sid = self._extract_session(sc)
-        status, out_headers, _ = post_admin_logout(self.server.port, cookie=f"pocvpn-admin-session={sid}")
+        csrf = self._extract_csrf_from_body(body)
+        status, out_headers, _ = post_admin_logout(
+            self.server.port, cookie=f"pocvpn-admin-session={sid}", extra_headers=self._mut(csrf))
         self.assertEqual(status, 200)
         cleared = out_headers.get("set-cookie", "")
         self.assertIn("Max-Age=0", cleared)
