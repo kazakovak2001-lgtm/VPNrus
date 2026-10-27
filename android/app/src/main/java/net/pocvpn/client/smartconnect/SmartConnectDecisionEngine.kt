@@ -44,6 +44,12 @@ object SmartConnectDecisionEngine {
         // HYSTERIA2 - lowest priority, never reorders an earlier entry,
         // never makes HYSTERIA2 win merely by existing.
         TransportKind.HYSTERIA2,
+        // Same discipline, appended LAST: XRAY_REALITY_XHTTP stays
+        // NOT_IMPLEMENTED in TransportRegistry until its own profile wiring
+        // exists, so this entry only keeps PREFERRED_ORDER exhaustive. Even
+        // once available it is chosen here only when every transport above
+        // is unavailable, or when the user pins it via Manual.
+        TransportKind.XRAY_REALITY_XHTTP,
     )
 
     fun decide(

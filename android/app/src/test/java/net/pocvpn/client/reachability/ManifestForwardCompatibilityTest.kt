@@ -112,7 +112,10 @@ class ManifestForwardCompatibilityTest {
     @Test
     fun `TransportKind ordinals are append-only wire ids`() {
         assertEquals(
-            listOf("AMNEZIA_WG", "XRAY_REALITY", "QUIC", "TLS_TCP", "XRAY_XHTTP", "SHADOWSOCKS_2022", "HYSTERIA2"),
+            listOf(
+                "AMNEZIA_WG", "XRAY_REALITY", "QUIC", "TLS_TCP", "XRAY_XHTTP", "SHADOWSOCKS_2022", "HYSTERIA2",
+                "XRAY_REALITY_XHTTP",
+            ),
             TransportKind.entries.map { it.name },
         )
     }

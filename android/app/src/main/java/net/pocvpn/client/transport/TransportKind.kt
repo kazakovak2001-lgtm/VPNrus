@@ -51,4 +51,17 @@ enum class TransportKind {
      * child eligibility all hold (see `MainViewModel.isHysteria2AvailableFor`).
      */
     HYSTERIA2,
+
+    /**
+     * VLESS over Xray XHTTP secured by REALITY, reached directly on the
+     * gateway's own public port (gateway `RealityXhttpServerConfig`, profile
+     * transport "reality-xhttp"). Distinct from [XRAY_XHTTP], which is XHTTP
+     * over TLS behind nginx/Cloudflare and always presents a Nova `*.pp.ua`
+     * SNI; REALITY presents a camouflage SNI instead. A separate kind rather
+     * than an XRAY_XHTTP variant so that an older build decodes a manifest
+     * binding for it as opaque and never dials it as XHTTP over TLS.
+     * APPENDED (ordinal 7) for the same signed-manifest reason as
+     * [HYSTERIA2]. Not an Auto candidate until RU field evidence exists.
+     */
+    XRAY_REALITY_XHTTP,
 }

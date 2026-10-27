@@ -62,7 +62,7 @@ class XrayTrafficCountersTest {
     @Test
     fun `every renderer tag is counted as tunnel traffic`() {
         assertEquals(
-            setOf("nova-vless-reality-out", "nova-vless-tls-out", "nova-vless-xhttp-out"),
+            setOf("nova-vless-reality-out", "nova-vless-tls-out", "nova-vless-xhttp-out", "nova-vless-reality-xhttp-out"),
             XrayConfigRenderer.TUNNEL_OUTBOUND_TAGS,
         )
     }
