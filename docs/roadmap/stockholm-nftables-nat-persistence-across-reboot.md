@@ -1,0 +1,11 @@
+# Stockholm nftables NAT persistence across reboot
+
+<!-- Moved verbatim from docs/ROADMAP.md (2026-10-27): the full table row. -->
+
+## Claim
+
+Stockholm nftables NAT persistence across reboot
+
+## Status
+
+**VERIFIED** (2026-09-27) - original problem: `gateway/provision.sh` rendered and live-applied `/etc/nftables.pocvpn.conf` (forward + MASQUERADE for the AWG subnet) during provisioning, but never made it survive a reboot (`nftables.service` was never enabled, and its own default `/etc/nftables.conf` doesn't reference our file) - a real reboot on Stockholm (2026-09-20) silently dropped the whole ruleset while `awg-poc.service` came back up fine on its own, masking the loss: AWG handshakes kept succeeding but the data plane was one-way (peer RX frozen at handshake-only bytes despite real TX). Root-caused via live SSH read-only diagnostics (`awg show`, `nft list ruleset`, `iptables -t nat`, and a synchronized `tcpdump` on both `awg0` and `ens5` during a real phone request) - not a hypothesis. Fix (`gateway/provision.sh`): an idempotent `include "/etc/nftables.pocvpn.conf";` line appended to `/etc/nftables.conf` (guarded by `grep -qxF`, never duplicated) plus `systemctl enable --now nftables` - the stock Debian/Ubuntu `nftables.service`, no new/parallel firewall mechanism, `awg-poc.service` and the rendered ruleset itself both unchanged. This is not source/static verification only - persistence was physically proven with a real, controlled reboot of the Stockholm host and a fresh post-reboot Android E2E: new boot time `2026-09-27 13:01:05`; `nft list ruleset` showed the AWG forward + `ip saddr 10.77.0.0/24 oifname "ens5" masquerade` rules present automatically, with zero manual `nft -f` after boot; `awg-poc.service` enabled+active and `net.ipv4.ip_forward=1` unaffected. Physical post-reboot pass on the same real device (ADB-connected `net.pocvpn.client` debug build): AWG handshake PASS, DNS PASS, HTTPS PASS, exit IP `16.170.208.231` (Stockholm's real address, vs. the device's real baseline IP), RX/TX diagnostics showed real bidirectional flow (RX now dominant, not frozen), and disconnect/reconnect PASS with the exit IP re-confirmed. AWG peer set, public key, obfuscation profile (`jc`/`jmin`/`jmax`/`s1`/`s2`/`h1`-`h4`), and routing table were confirmed byte-for-byte unchanged before and after - only the nftables/NAT layer was touched.

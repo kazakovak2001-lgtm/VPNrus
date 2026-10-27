@@ -284,10 +284,13 @@ class DocumentationTruthTests(unittest.TestCase):
     FILES = (
         os.path.join(_GATEWAY_DIR, "api", "admission.py"),
         os.path.join(_GATEWAY_DIR, "DEPLOYMENT.md"),
-        os.path.join(_REPO_DIR, "docs", "ROADMAP.md"),
+        # The B57 ROADMAP row's full text (moved out of docs/ROADMAP.md's table).
+        os.path.join(_REPO_DIR, "docs", "roadmap", "b57-control-plane-edge-behind-cloudflare-b57-5a-5d-5e.md"),
         os.path.join(_REPO_DIR, "docs", "B57_5E_STAGING_VERIFICATION.md"),
         os.path.join(_REPO_DIR, "PROJECT_ARCHITECTURE.md"),
     )
+    # Checked for forbidden claims only: the table keeps just a short summary.
+    SUMMARY_FILES = (os.path.join(_REPO_DIR, "docs", "ROADMAP.md"),)
     FORBIDDEN = (
         "cannot take the activation reserve",
         "can never take the activation",
@@ -296,7 +299,7 @@ class DocumentationTruthTests(unittest.TestCase):
     )
 
     def test_no_guaranteed_reserve_claim(self):
-        for path in self.FILES:
+        for path in self.FILES + self.SUMMARY_FILES:
             with open(path, encoding="utf-8") as handle:
                 text = " ".join(handle.read().split()).lower()
             for phrase in self.FORBIDDEN:

@@ -311,6 +311,12 @@ class VpnController(
     // L + binding store). Null keeps the pre-Phase-B managed AWG behavior
     // (tests/legacy wiring only; production always passes it).
     private val managedAwgIdentityGuard: net.pocvpn.client.identity.ManagedAwgIdentityGuard? = null,
+    // B-WL7 layer 3a - additive, both default to null (no check). When wired,
+    // each Connected session's VPN network (routes, DNS, IPv6) is read once
+    // from the system and evaluated by TunnelProtectionCheck. Recording only:
+    // the result never ends a session, changes state or feeds failover.
+    private val tunnelLinkReader: (suspend () -> net.pocvpn.client.vpn.protection.TunnelLinkSnapshot?)? = null,
+    private val tunnelProtectionLog: net.pocvpn.client.vpn.protection.TunnelProtectionLog? = null,
 ) {
     private companion object {
         // B8B3D - "small bounded startup window" per the task's own wording.
@@ -320,7 +326,15 @@ class VpnController(
         // B-WL7 M1 - caller-side bound on VpnTransport.probeIndependentEgress()
         // (Xray: the 6 s in-core probe plus IPC); no answer in time = CALLER_TIMEOUT.
         const val INDEPENDENT_EGRESS_PROBE_TIMEOUT_MS = 10_000L
+
+        // B-WL7 layer 3a - the system publishes the VPN network's link
+        // properties asynchronously after establish(); read up to this many
+        // times, this far apart, before recording NOT_VERIFIABLE.
+        const val PROTECTION_CHECK_READS = 3
+        const val PROTECTION_CHECK_READ_INTERVAL_MS = 1_000L
     }
+
+    private var protectionCheckJob: Job? = null
 
     // B8I5/B8I6/B8O2 - the kinds this controller instance can actually build
     // a TransportConfig for (see buildTransportConfig's own `when`) -
@@ -1999,6 +2013,40 @@ class VpnController(
      * fresh sample, NOT_REACHED, UNAVAILABLE, an exception or a timeout keep
      * the verdict. The gate is not repeated after the window ends.
      */
+    /**
+     * B-WL7 layer 3a. Called under reconnectOwnershipLock from
+     * [launchLiveProgressObservation], i.e. once per Connected session on
+     * every lifecycle path; a newer launch cancels an older unfinished one.
+     * Records only - see the tunnelLinkReader param.
+     */
+    private fun launchProtectionCheck(kind: TransportKind, generation: Long) {
+        val reader = tunnelLinkReader ?: return
+        val log = tunnelProtectionLog ?: return
+        // Snapshotted now: the DNS this session's transport actually installed.
+        val expectedDns = net.pocvpn.client.vpn.protection.TunnelProtectionCheck.expectedDns(activeTransportConfig)
+        protectionCheckJob?.cancel()
+        protectionCheckJob = scope.launch {
+            var reads = 0
+            var snapshot: net.pocvpn.client.vpn.protection.TunnelLinkSnapshot? = null
+            while (snapshot == null && reads < PROTECTION_CHECK_READS) {
+                // Every read, the first included, waits: the caller holds
+                // reconnectOwnershipLock (Main.immediate would otherwise run
+                // the system call under it) and the system publishes the
+                // network's link properties only after establish().
+                delay(PROTECTION_CHECK_READ_INTERVAL_MS)
+                reads++
+                snapshot = try {
+                    reader()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            log.record(kind, net.pocvpn.client.vpn.protection.TunnelProtectionCheck.evaluate(snapshot, expectedDns), reads, generation)
+        }
+    }
+
     private fun launchLiveProgressObservation(
         endpointId: EndpointId,
         transport: VpnTransport,
@@ -2018,6 +2066,7 @@ class VpnController(
             // BEFORE the cancel below, so it can never cancel or replace the
             // newer generation's sampler.
             if (expectedGeneration != null && expectedGeneration != reconnectGeneration) return
+            launchProtectionCheck(transport.kind, reconnectGeneration)
             progressObservationJob?.cancel()
             // Snapshotted here, under the SAME lock that assigns
             // progressObservationJob below - the generation this attempt
@@ -2405,6 +2454,8 @@ class VpnController(
             // session.
             progressObservationJob?.cancel()
             progressObservationJob = null
+            protectionCheckJob?.cancel()
+            protectionCheckJob = null
             val generation = ++reconnectGeneration
             recomputeSessionHealth()
             reconnectJob = scope.launch { reconnectLoop(generation, restartImmediately) }
@@ -2595,6 +2646,8 @@ class VpnController(
             reconnectJob = null
             progressObservationJob?.cancel()
             progressObservationJob = null
+            protectionCheckJob?.cancel()
+            protectionCheckJob = null
             oldGeneration
         }
         if (cancelledGeneration != null) {
@@ -2613,6 +2666,8 @@ class VpnController(
             reconnectJob = null
             progressObservationJob?.cancel()
             progressObservationJob = null
+            protectionCheckJob?.cancel()
+            protectionCheckJob = null
             oldGeneration
         }
         runCatching { onReconnectIncident?.invoke(ReconnectIncidentEvent.Disconnected(cancelledGeneration)) }
@@ -2629,7 +2684,10 @@ class VpnController(
     fun shutdown() {
         reconnectManager.stop()
         reconnectJob?.cancel()
-        synchronized(reconnectOwnershipLock) { progressObservationJob?.cancel() }
+        synchronized(reconnectOwnershipLock) {
+            progressObservationJob?.cancel()
+            protectionCheckJob?.cancel()
+        }
         activeObserverJob?.cancel()
     }
 }
