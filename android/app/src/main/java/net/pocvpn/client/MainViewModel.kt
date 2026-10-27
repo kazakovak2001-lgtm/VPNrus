@@ -3893,7 +3893,10 @@ class MainViewModel(
         // re-deriving their own snapshot on their own next read) diagnostics
         // - never a second, independently-timed stabilizedRestrictionClass() call here.
         val snapshot = buildCombinedAutoRankingSnapshot()
-        val attempts = snapshot.attempts
+        // B57 - build-type-scoped: the release DebugPathOverride returns
+        // snapshot.attempts unchanged; the debug one can keep only the
+        // Relayed attempts for one forced connect (see its own docs).
+        val attempts = net.pocvpn.client.smartconnect.DebugPathOverride.applyAndConsume(snapshot.attempts)
         // B29 (task G) - the diagnostic session's own raw/stabilized fields
         // come from THIS SAME snapshot (snapshot.restrictionClass is the
         // stabilized value that just decided `attempts` above) - never a
