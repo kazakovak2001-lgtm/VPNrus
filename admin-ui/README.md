@@ -21,3 +21,8 @@ React + TypeScript + Vite + Tailwind client for the `pocvpn-api` `/admin/*` endp
 ## Not implemented
 Admin/viewer roles (single shared password), per-device revocation, traffic stats,
 production deployment (UI is not served by nginx yet).
+
+## Rate limits
+`GET /admin/activations[/<id>]`: 120 requests / 60 s per session; `POST .../revoke`: 30 / 60 s per
+session (HTTP 429 `rate_limited`). The limiter is in-memory and per process (not distributed),
+keyed by the authenticated session, not by client-supplied forwarding headers.

@@ -5,11 +5,13 @@ import type { Activation } from "./api";
 const MESSAGES: Record<string, string> = {
   unauthorized: "Session expired or invalid. Please sign in again.",
   invalid_password: "Password format is invalid (32 printable characters expected).",
-  rate_limited: "Too many attempts. Wait a while and try again.",
   admin_not_configured: "Admin authentication is not configured on the server.",
   activation_store_not_configured: "The activation store is not configured on the server.",
   origin_mismatch: "Request rejected: origin mismatch.",
   store_write_failed: "The server could not write the activation store.",
+  store_commit_uncertain:
+    "The server could not confirm whether the revocation was saved. The list was refreshed - check the activation status before trying again.",
+  rate_limited: "Too many requests. Wait a moment and try again.",
   not_found: "Not found.",
 };
 const msg = (e: unknown) =>
@@ -89,6 +91,17 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     api.listActivations().then((r) => setItems(r.activations), fail);
   }, [fail]);
 
+  // Reconcile with the server after a failed revoke without clearing the
+  // revoke error; a refresh failure is appended to it, not substituted.
+  const refreshAfterFailure = useCallback(async (original: unknown) => {
+    try {
+      setItems((await api.listActivations()).activations);
+    } catch (refreshErr) {
+      if (refreshErr instanceof api.ApiError && refreshErr.status === 401) onLogout();
+      setError(`${msg(original)} Refreshing the list also failed: ${msg(refreshErr)}`);
+    }
+  }, [onLogout]);
+
   useEffect(load, [load]);
 
   const doRevoke = async (id: string) => {
@@ -99,6 +112,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
       load();
     } catch (e) {
       fail(e);
+      if (!(e instanceof api.ApiError && e.status === 401)) await refreshAfterFailure(e);
     }
   };
 

@@ -1530,7 +1530,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         })
 
     # --- admin activation (device) management ---
-    def _admin_session_or_raise(self, mutating, need_store=True):
+    def _admin_session_or_raise(self, mutating, need_store=True, limiter=None):
         """Returns the validated session id. Read endpoints need only the
         session cookie (like /admin/status); mutating ones also need the
         X-CSRF-Token header and a same-origin Origin header."""
@@ -1552,6 +1552,13 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             is_valid, _ = auth.validate_session_and_csrf(session_id)
         if not is_valid:
             raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        # Per-session throttle (per process, in memory - not a distributed
+        # limiter). Keyed by the authenticated session id, never by a
+        # client-supplied forwarding header. Checked after authentication
+        # and CSRF/Origin, before any store access, so a rejected request
+        # never reads or mutates the store.
+        if limiter is not None and not getattr(self.server, limiter).allow(session_id):
+            raise _RequestError(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited")
         if need_store and not self.server.config.activation_store_path:
             raise _RequestError(HTTPStatus.SERVICE_UNAVAILABLE, "activation_store_not_configured")
         return session_id
@@ -1587,7 +1594,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_admin_activations(self, activation_id):
         try:
-            self._admin_session_or_raise(mutating=False)
+            self._admin_session_or_raise(mutating=False, limiter="admin_read_limiter")
             cfg = self.server.config
             now = datetime.now(tz=timezone.utc)
             try:
@@ -1609,7 +1616,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_admin_revoke(self, activation_id):
         try:
-            self._admin_session_or_raise(mutating=True)
+            self._admin_session_or_raise(mutating=True, limiter="admin_mutation_limiter")
             cfg = self.server.config
             try:
                 changed = activations.revoke_activation(
@@ -1617,6 +1624,15 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 )
             except KeyError:
                 raise _RequestError(HTTPStatus.NOT_FOUND, "not_found")
+            except activations.StoreCommitUncertainError:
+                # Must precede StoreWriteError (its parent): the new store
+                # content may already be visible, so this is neither a
+                # definite success nor a definite failure.
+                try:
+                    self._admin_audit("revoke", activation_id, "commit_uncertain")
+                except OSError:
+                    logger.error("admin_audit_write_failed")
+                raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "store_commit_uncertain")
             except activations.StoreWriteError:
                 raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "store_write_failed")
             except activations.ActivationStoreError:

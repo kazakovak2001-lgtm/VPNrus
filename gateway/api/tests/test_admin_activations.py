@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _GATEWAY_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
@@ -14,6 +15,8 @@ for _path in (_GATEWAY_DIR, _THIS_DIR):
 
 from _fixtures import RunningServer, make_activation_store, make_app_config, make_public_key
 from _http import raw_request
+from api import activations as activations_module
+from api import ratelimit
 
 _ID = "a" * 32
 _ID2 = "b" * 32
@@ -131,6 +134,85 @@ class AdminActivationTests(unittest.TestCase):
         sid, csrf = self._login()
         status, _, _ = self._req("POST", "/admin/activations/" + "c" * 32 + "/revoke", self._mut_headers(sid, csrf))
         self.assertEqual(status, 404)
+
+
+    # --- M1: uncertain store commits ---
+    def _revoke_with_error(self, exc):
+        sid, csrf = self._login()
+        path = f"/admin/activations/{_ID}/revoke"
+        with mock.patch.object(activations_module, "revoke_activation", side_effect=exc):
+            status, _, body = self._req("POST", path, self._mut_headers(sid, csrf))
+        return status, json.loads(body)["error"]
+
+    def test_uncertain_commit_has_distinct_error_code_and_audit(self):
+        # StoreCommitUncertainError subclasses StoreWriteError; the handler
+        # must classify it first rather than as a definite write failure.
+        self.assertTrue(issubclass(
+            activations_module.StoreCommitUncertainError, activations_module.StoreWriteError))
+        status, code = self._revoke_with_error(activations_module.StoreCommitUncertainError("x"))
+        self.assertEqual((status, code), (500, "store_commit_uncertain"))
+        with open(self.store + ".admin-audit.log", encoding="utf-8") as f:
+            self.assertEqual([json.loads(l)["outcome"] for l in f], ["commit_uncertain"])
+
+    def test_definite_write_failure_keeps_existing_code(self):
+        status, code = self._revoke_with_error(activations_module.StoreWriteError("x"))
+        self.assertEqual((status, code), (500, "store_write_failed"))
+        self.assertFalse(os.path.exists(self.store + ".admin-audit.log"))
+
+    # --- M2: per-session rate limits ---
+    def _limit(self, attr, n):
+        setattr(self.server.srv, attr, ratelimit.RateLimiter(n, 60.0, clock=lambda: 0.0))
+
+    def test_read_limit_covers_list_and_detail_without_store_reads(self):
+        self._limit("admin_read_limiter", 2)
+        sid, _ = self._login()
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        self.assertEqual(self._req("GET", "/admin/activations", h)[0], 200)
+        self.assertEqual(self._req("GET", f"/admin/activations/{_ID}", h)[0], 200)
+        with mock.patch.object(activations_module, "list_all") as la,                 mock.patch.object(activations_module, "find_by_activation_id") as fb:
+            s1, _, b1 = self._req("GET", "/admin/activations", h)
+            s2, _, _ = self._req("GET", f"/admin/activations/{_ID}", h)
+            la.assert_not_called()
+            fb.assert_not_called()
+        self.assertEqual((s1, json.loads(b1)["error"], s2), (429, "rate_limited", 429))
+
+    def test_mutation_limit_blocks_revoke_without_mutating(self):
+        self._limit("admin_mutation_limiter", 1)
+        sid, csrf = self._login()
+        h = self._mut_headers(sid, csrf)
+        self.assertEqual(self._req("POST", f"/admin/activations/{_ID2}/revoke", h)[0], 200)
+        status, _, body = self._req("POST", f"/admin/activations/{_ID}/revoke", h)
+        self.assertEqual((status, json.loads(body)["error"]), (429, "rate_limited"))
+        with open(self.store, encoding="utf-8") as f:
+            statuses = {r["activation_id"]: r["status"] for r in json.load(f).values()}
+        self.assertEqual(statuses[_ID], "ACTIVE")
+
+    def test_unauthenticated_cannot_consume_or_bypass_limits(self):
+        self._limit("admin_read_limiter", 1)
+        for _ in range(3):
+            self.assertEqual(self._req("GET", "/admin/activations")[0], 401)
+        sid, _ = self._login()
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        self.assertEqual(self._req("GET", "/admin/activations", h)[0], 200)
+
+    def test_limits_are_per_session_and_independent_of_client_headers(self):
+        self._limit("admin_read_limiter", 1)
+        sid1, _ = self._login()
+        sid2, _ = self._login()
+        # Spoofed X-Real-IP / X-Forwarded-For must not select a fresh bucket.
+        spoof = {"X-Real-IP": "203.0.113.9", "X-Forwarded-For": "203.0.113.9"}
+        h1 = {"Cookie": f"pocvpn-admin-session={sid1}", **spoof}
+        self.assertEqual(self._req("GET", "/admin/activations", h1)[0], 200)
+        spoof2 = {"X-Real-IP": "203.0.113.10"}
+        self.assertEqual(self._req("GET", "/admin/activations", {**h1, **spoof2})[0], 429)
+        self.assertEqual(
+            self._req("GET", "/admin/activations", {"Cookie": f"pocvpn-admin-session={sid2}"})[0], 200)
+
+    def test_default_limits_do_not_hinder_normal_use(self):
+        sid, csrf = self._login()
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        for _ in range(10):
+            self.assertEqual(self._req("GET", "/admin/activations", h)[0], 200)
 
 
 if __name__ == "__main__":
