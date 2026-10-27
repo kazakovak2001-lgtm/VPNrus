@@ -17,6 +17,12 @@ local.properties
 *.keystore
 !debug.keystore
 
+# Post-Beta Shadowsocks native-packaging slice - release signing scaffolding
+# (same pattern as the Beta branch, ported here since this slice needs a
+# signed release build for physical validation; main had no signing
+# mechanism yet). Real keystore never committed.
+android/app/keystore.properties
+
 # Python bytecode cache (never intentional - regenerated on any test run)
 __pycache__/
 *.pyc

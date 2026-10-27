@@ -1,0 +1,29 @@
+(Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) AND (Apache-2.0 OR ISC) AND Apache-2.0 AND BSD-3-Clause AND ISC AND MIT (1): aws-lc-sys
+(Apache-2.0 OR ISC) AND ISC (1): aws-lc-rs
+(Apache-2.0 OR MIT) AND Apache-2.0 (1): moka
+(Apache-2.0 OR MIT) AND Unicode-3.0 (1): unicode-ident
+0BSD (3): managed, mock_instant, smoltcp
+0BSD OR Apache-2.0 OR MIT (1): adler2
+Apache-2.0 (2): rpassword, rtoolbox
+Apache-2.0 AND ISC (1): ring
+Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR CC0-1.0 (1): blake3
+Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT (5): linux-raw-sys, rustix, wasi, wasip2, wit-bindgen
+Apache-2.0 OR BSD-2-Clause OR MIT (2): zerocopy, zerocopy-derive
+Apache-2.0 OR BSD-3-Clause (1): sendfd
+Apache-2.0 OR BSL-1.0 (1): ryu
+Apache-2.0 OR CC0-1.0 OR MIT-0 (1): constant_time_eq
+Apache-2.0 OR ISC OR MIT (2): rustls, rustls-native-certs
+Apache-2.0 OR LGPL-2.1-or-later OR MIT (2): r-efi, r-efi
+Apache-2.0 OR MIT (239): aead, aes, aes-gcm, android_system_properties, anstream, anstyle, anstyle-parse, anstyle-query, anstyle-wincon, anyhow, arc-swap, arrayvec, async-channel, async-task, async-trait, atomic-waker, base64, bitflags, bitflags, block-buffer, blocking, bumpalo, byte_string, camellia, cfg-if, chacha20, chacha20poly1305, chrono, cipher, clap, clap_builder, clap_lex, cmov, colorchoice, concurrent-queue, const-oid, core-foundation, core-foundation, core-foundation-sys, cpubits, cpufeatures, crc32fast, critical-section, crossbeam-channel, crossbeam-epoch, crossbeam-utils, crypto-common, ctr, ctutils, defmt, defmt-macros, defmt-parser, deranged, destructure_traitobject, digest, directories, dirs-sys, displaydoc, dynosaur, dynosaur_derive, either, equivalent, errno, etherparse, event-listener, event-listener-strategy, fastrand, flate2, fnv, form_urlencoded, futures, futures-channel, futures-core, futures-executor, futures-io, futures-lite, futures-macro, futures-sink, futures-task, futures-util, getrandom, getrandom, getrandom, ghash, hash32, hashbrown, heapless, hickory-net, hickory-proto, hickory-resolver, hkdf, hmac, http, httparse, httpdate, humantime, hybrid-array, iana-time-zone, iana-time-zone-haiku, idna, idna_adapter, indexmap, inout, ipconfig, ipnet, is_terminal_polyfill, itoa, jni, jni-macros, jni-sys, jni-sys-macros, js-sys, lazy_static, libc, lock_api, log, log-mdc, log4rs, md-5, mime, ndk-context, notify-types, num-conv, num-traits, num_threads, once_cell, once_cell_polyfill, openssl-probe, parking, parking_lot, parking_lot_core, percent-encoding, pin-project, pin-project-internal, pin-project-lite, piper, poly1305, polyval, portable-atomic, powerfmt, ppv-lite86, prefix-trie, proc-macro2, qrcode, quote, rand, rand, rand_chacha, rand_core, rand_core, regex, regex-automata, regex-syntax, resolv-conf, rustls-pki-types, rustversion, scopeguard, sealed, security-framework, security-framework-sys, serde, serde_core, serde_derive, serde_json, serde_urlencoded, serde_yaml, sha1, signal-hook-registry, simd_cesu8, simdutf8, smallvec, socket2, stable_deref_trait, symlink, syn, syn, sysexits, system-configuration, system-configuration-sys, tagptr, terminal_size, thiserror, thiserror-impl, thread-id, thread_local, time, time-core, time-macros, tokio-rustls, trait-variant, typenum, ucd-trie, unicode-segmentation, unicode-xid, universal-hash, url, utf8_iter, utf8parse, uuid, wasm-bindgen, wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared, widestring, winapi, winapi-i686-pc-windows-gnu, winapi-x86_64-pc-windows-gnu, windows-core, windows-implement, windows-interface, windows-link, windows-registry, windows-result, windows-strings, windows-sys, windows-sys, windows-sys, windows-targets, windows-targets, windows_aarch64_gnullvm, windows_aarch64_gnullvm, windows_aarch64_msvc, windows_aarch64_msvc, windows_i686_gnu, windows_i686_gnu, windows_i686_gnullvm, windows_i686_gnullvm, windows_i686_msvc, windows_i686_msvc, windows_x86_64_gnu, windows_x86_64_gnu, windows_x86_64_gnullvm, windows_x86_64_gnullvm, windows_x86_64_msvc, windows_x86_64_msvc, xdg, zeroize, zstd-safe, zstd-sys
+Apache-2.0 OR MIT OR Zlib (3): miniz_oxide, tinyvec, tinyvec_macros
+BSD-3-Clause (3): alloc-no-stdlib, alloc-stdlib, subtle
+BSD-3-Clause AND MIT (1): brotli
+BSD-3-Clause OR MIT (2): brotli-decompressor, lru_time_cache
+CC0-1.0 (1): notify
+CDLA-Permissive-2.0 (1): webpki-roots
+ISC (6): inotify, inotify-sys, libloading, rustls-webpki, untrusted, untrusted
+MIT (55): build-time, bytes, combine, data-encoding, derive_more, derive_more-impl, fsevent-sys, h2, http-body, http-body-util, hyper, iprange, json5, kqueue, kqueue-sys, libredox, matchers, mio, nix, nu-ansi-term, ordered-float, redox_syscall, redox_users, schannel, serde-value, shadowsocks, shadowsocks-crypto, shadowsocks-rust, shadowsocks-service, sharded-slab, simd-adler32, slab, spin, strsim, synstructure, syslog-tracing, tokio, tokio-macros, tokio-tfo, tokio-util, tracing, tracing-appender, tracing-attributes, tracing-core, tracing-log, tracing-subscriber, try-lock, typemap-ors, unsafe-any-ors, unsafe-libyaml, valuable, want, wintun-bindings, zmij, zstd
+MIT OR Unlicense (6): aho-corasick, byteorder, memchr, same-file, walkdir, winapi-util
+MPL-2.0 (1): option-ext
+Unicode-3.0 (18): icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data, icu_properties, icu_properties_data, icu_provider, litemap, potential_utf, tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie, zerovec, zerovec-derive
+WTFPL (1): tun

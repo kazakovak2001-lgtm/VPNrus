@@ -14,6 +14,27 @@ val gatewayDevProperties = Properties().apply {
 }
 fun gatewayDevProp(key: String): String = gatewayDevProperties.getProperty(key, "")
 
+// Post-Beta Shadowsocks native-packaging slice - release signing
+// scaffolding (ported from the Beta branch's own identical mechanism;
+// `main` had none yet). Gitignored, never committed. Falls back to
+// unsigned release if neither source is present - no regression to a
+// plain checkout.
+val keystorePropertiesFile = file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) keystorePropertiesFile.inputStream().use { load(it) }
+}
+fun releaseSigningProp(key: String, envVar: String): String? =
+    keystoreProperties.getProperty(key)?.takeIf { it.isNotBlank() }
+        ?: System.getenv(envVar)?.takeIf { it.isNotBlank() }
+
+val releaseStoreFilePath = releaseSigningProp("storeFile", "NOVA_RELEASE_STORE_FILE")
+val releaseStorePassword = releaseSigningProp("storePassword", "NOVA_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = releaseSigningProp("keyAlias", "NOVA_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = releaseSigningProp("keyPassword", "NOVA_RELEASE_KEY_PASSWORD")
+val hasReleaseSigningConfig = listOf(
+    releaseStoreFilePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword,
+).all { it != null }
+
 // B45A data-plane validation (round 6) - a SEPARATE, debug-only, gitignored
 // local properties file carrying the disposable Frankfurt test server's
 // endpoint/credential (see docs/B45A_SHADOWSOCKS_RUST_SPIKE.md Section 30).
@@ -95,6 +116,17 @@ android {
         buildConfigField("String", "MANIFEST_URLS", "\"${resolveManifestUrls()}\"")
     }
 
+    signingConfigs {
+        if (hasReleaseSigningConfig) {
+            create("release") {
+                storeFile = file(releaseStoreFilePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // B17/B20 - explicit for reviewability: debug builds (including
@@ -118,6 +150,9 @@ android {
         }
         release {
             isMinifyEnabled = false
+            if (hasReleaseSigningConfig) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             // B17/B20 - explicit, not derived from any gitignored developer
             // file - a release build always points at the real production
             // origins.
