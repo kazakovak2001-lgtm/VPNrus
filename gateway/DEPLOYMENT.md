@@ -1228,15 +1228,23 @@ plus ONE Stockholm binding `{"kindOrdinal": 7, "host": "16.170.208.231",
 prod-manifest-key-2026-09-01`. If step 0 forced another port, change it
 here first.
 
-On the owner's PC, offline (the key never goes into shell history: read it
-from its file):
+On the owner's PC, offline. The tool reads the key itself from its file
+(must be mode 600 on POSIX), so it never appears in argv, the process list,
+shell history or output. Do NOT use the legacy `--private-key-b64` form
+(argv is readable by other local processes):
 
 ```
 python -I gateway/tools/manifest_signing.py sign-and-package \
   --manifest gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json \
-  --private-key-b64 "$(cat <path-to-09-01-key-file>)" \
+  --private-key-file <path-to-09-01-key-file> \
   --out gateway/tools/endpoint-manifest-2026-10-27-v9.bin
 ```
+
+Under WSL keep the key file on the Linux filesystem (e.g. `~/...`, mode
+600): on `/mnt/c` the mode cannot be set and the tool refuses the file.
+On Windows no permission check is possible - protect it with NTFS ACLs.
+`--private-key-file -` reads the key from stdin instead
+(`... --private-key-file - < <path-to-09-01-key-file>`).
 
 Verify it against the app-embedded anchor before install (as for v7), rename
 the JSON without `_DRAFT`, commit both. Install on BOTH gateways (each serves
@@ -1271,10 +1279,21 @@ it; every other binding is unchanged.
   `nova-xray-reconcile.service` (renders without the fourth inbound,
   restarts `nova-xray`), close TCP 2096 in the security group. Restore the
   `api/*.py.backup-rx-<TS>` files only if step 1 itself misbehaved.
-- **B - after step 6**: reinstall `endpoint-manifest.bin.v8-backup-<TS>` on
-  both gateways first (clients stop offering the kind at their next manifest
-  refresh), then rollback A. A device still holding v9 sees the inbound gone
-  and fails that one attempt closed; it never affects other transports.
+- **B - after step 6**: reinstalling the v8 `.bin` is NOT enough - a device
+  that already adopted v9 rejects any lower `manifestVersion`
+  (`EndpointManifestRepository`: `ROLLBACK_OR_NOT_NEWER`) and keeps
+  offering kind 7. Before step 6, also prepare (sign offline with
+  `--private-key-file`, do not install) a **v10 = v8 endpoints with
+  `manifestVersion: 10`, the same `signingKeyId` as v9
+  (`prod-manifest-key-2026-09-01`), a fresh `issuedAtEpochMillis` and an
+  `expiresAtEpochMillis` no earlier than v9's** (exactly the derivation in
+  `gateway/tools/tests/manifest_rollback_fixtures.py`; the client-side
+  chain v8 -> v9 -> v8 rejected -> v10 -> v9 rejected is covered by
+  `RealityXhttpManifestRollbackChainTest`, with a TEST key only). To roll back: install v10 on both gateways
+  first (clients drop the kind at their next manifest refresh), then
+  rollback A. Reinstalling the v8 backup only helps hosts/devices that
+  never fetched v9. A device still holding v9 sees the inbound gone and
+  fails that one attempt closed; it never affects other transports.
 
 ## REALITY Frankfurt on TCP/443 (SNI split) - PREPARED, NOT DEPLOYED
 

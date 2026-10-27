@@ -23,6 +23,8 @@ import argparse
 import base64
 import dataclasses
 import json
+import os
+import stat
 import struct
 import sys
 import time
@@ -164,6 +166,44 @@ def load_manifest_json(path: str) -> Manifest:
     )
 
 
+def _add_private_key_args(cmd: argparse.ArgumentParser) -> None:
+    group = cmd.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--private-key-file",
+        help="Path to a file holding the base64 raw Ed25519 private key (32 bytes), "
+        "or '-' to read it from stdin. Preferred: the key never appears in argv.",
+    )
+    group.add_argument(
+        "--private-key-b64",
+        help="DEPRECATED - base64 key as an argument; visible in the process list "
+        "and shell history. Use --private-key-file instead.",
+    )
+
+
+def load_private_key(args: argparse.Namespace) -> Ed25519PrivateKey:
+    """Reads the signing key from --private-key-file (or stdin) or the legacy
+    --private-key-b64. Error messages never echo key material."""
+    try:
+        if args.private_key_file is None:
+            raw = args.private_key_b64.encode("ascii")
+        elif args.private_key_file == "-":
+            raw = sys.stdin.buffer.read()
+        else:
+            # fstat the opened descriptor, not the path: no stat/open race.
+            with open(args.private_key_file, "rb") as f:
+                if os.name == "posix" and os.fstat(f.fileno()).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    raise SystemExit("private key file must not be group/other-accessible (chmod 600)")
+                raw = f.read()
+        priv_bytes = base64.b64decode(b"".join(raw.split()), validate=True)
+    except OSError as e:
+        raise SystemExit(f"cannot read private key file: {type(e).__name__}") from None
+    except (ValueError, UnicodeError):
+        raise SystemExit("private key is not valid base64") from None
+    if len(priv_bytes) != 32:
+        raise SystemExit("private key must decode to exactly 32 bytes")
+    return Ed25519PrivateKey.from_private_bytes(priv_bytes)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -173,14 +213,14 @@ def main() -> int:
 
     sign_cmd = sub.add_parser("sign", help="Sign a manifest JSON file")
     sign_cmd.add_argument("--manifest", required=True, help="Path to manifest JSON")
-    sign_cmd.add_argument("--private-key-b64", required=True, help="Base64 raw Ed25519 private key (32 bytes)")
+    _add_private_key_args(sign_cmd)
 
     package_cmd = sub.add_parser(
         "sign-and-package",
         help="B12 - sign a manifest JSON file AND write the binary artifact ready for AppConfig.manifest_path",
     )
     package_cmd.add_argument("--manifest", required=True, help="Path to manifest JSON")
-    package_cmd.add_argument("--private-key-b64", required=True, help="Base64 raw Ed25519 private key (32 bytes)")
+    _add_private_key_args(package_cmd)
     package_cmd.add_argument("--out", required=True, help="Output path for the binary artifact (e.g. endpoint-manifest.bin)")
 
     args = parser.parse_args()
@@ -206,8 +246,7 @@ def main() -> int:
 
     if args.command == "sign":
         manifest = load_manifest_json(args.manifest)
-        priv_bytes = base64.b64decode(args.private_key_b64)
-        priv = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        priv = load_private_key(args)
         signature = sign(manifest, priv)
         print(json.dumps({
             "manifestVersion": manifest.manifest_version,
@@ -218,8 +257,7 @@ def main() -> int:
 
     if args.command == "sign-and-package":
         manifest = load_manifest_json(args.manifest)
-        priv_bytes = base64.b64decode(args.private_key_b64)
-        priv = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        priv = load_private_key(args)
         canonical = canonical_bytes(manifest)
         signature = sign(manifest, priv)
         artifact = pack_signed_manifest(canonical, signature)
