@@ -140,6 +140,15 @@ class AppConfig:
     xray_xhttp_client_host: str = ""
     xray_xhttp_client_port: int = 0
 
+    # VLESS over XHTTP secured by REALITY - a fourth inbound reached directly
+    # on a public port (see xray_config_renderer.RealityXhttpServerConfig).
+    # Reuses the REALITY group's key/dest/server name/short id and the
+    # endpoint host, so only its own port and path are configured here.
+    # Zero/blank (the default) means POST /v1/xray-profile never offers
+    # "reality-xhttp" and the inbound is not rendered.
+    xray_reality_xhttp_server_port: int = 0
+    xray_reality_xhttp_path: str = ""
+
     # B12 - GET /v1/manifest: serves an ALREADY-SIGNED EndpointManifest
     # artifact (see gateway/tools/manifest_signing.py's `sign-and-package`
     # subcommand, run OFFLINE) verbatim, as raw bytes. Blank (the default)
@@ -664,6 +673,52 @@ def load_config(env=None):
     # startup-time validation, which would otherwise make every pre-B60
     # XHTTP-server-port-only deployment fail closed at startup.
 
+    # REALITY + XHTTP - same all-or-nothing, fail-closed-at-startup
+    # discipline as the XHTTP group above. It reuses REALITY's own key
+    # material, so REALITY must be configured too.
+    xray_reality_xhttp_server_port_raw = _get(env, "XRAY_REALITY_XHTTP_SERVER_PORT")
+    xray_reality_xhttp_server_port = 0
+    if xray_reality_xhttp_server_port_raw:
+        try:
+            xray_reality_xhttp_server_port = int(xray_reality_xhttp_server_port_raw)
+        except ValueError:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_REALITY_XHTTP_SERVER_PORT is not an integer: {xray_reality_xhttp_server_port_raw!r}"
+            )
+        if not (1 <= xray_reality_xhttp_server_port <= 65535):
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_REALITY_XHTTP_SERVER_PORT out of range: {xray_reality_xhttp_server_port}"
+            )
+
+    xray_reality_xhttp_path = _get(env, "XRAY_REALITY_XHTTP_PATH")
+
+    if bool(xray_reality_xhttp_server_port) != bool(xray_reality_xhttp_path):
+        raise ConfigError(
+            "partial Xray REALITY+XHTTP configuration: "
+            f"{_ENV_PREFIX}XRAY_REALITY_XHTTP_SERVER_PORT and {_ENV_PREFIX}XRAY_REALITY_XHTTP_PATH "
+            "must both be set (or neither)"
+        )
+
+    if xray_reality_xhttp_server_port:
+        if not (xray_reality_xhttp_path.startswith("/") and xray_reality_xhttp_path.endswith("/")):
+            raise ConfigError(f"{_ENV_PREFIX}XRAY_REALITY_XHTTP_PATH must start and end with '/'")
+        if not xray_server_port:
+            raise ConfigError(
+                "partial Xray REALITY+XHTTP configuration: it reuses the REALITY key material, "
+                f"so {_ENV_PREFIX}XRAY_SERVER_PORT (the REALITY group) must be configured too"
+            )
+        if xray_reality_xhttp_server_port in {
+            p for p in (xray_server_port, xray_tls_server_port, xray_xhttp_server_port) if p
+        }:
+            raise ConfigError(
+                f"{_ENV_PREFIX}XRAY_REALITY_XHTTP_SERVER_PORT must differ from every other Xray inbound port"
+            )
+        if not xray_activation_wrapper_path:
+            raise ConfigError(
+                "partial Xray REALITY+XHTTP configuration: the shared Xray activation boundary "
+                f"({_ENV_PREFIX}XRAY_ACTIVATION_WRAPPER_PATH etc.) must be configured first"
+            )
+
     # B12 - see AppConfig.manifest_path's own docs. When set, held to the
     # same "absolute and actually a file" bar as every other file-path
     # config value above (provision_script_path, xray_tls_cert_file, ...) -
@@ -896,6 +951,8 @@ def load_config(env=None):
         xray_xhttp_path=xray_xhttp_path,
         xray_xhttp_client_host=xray_xhttp_client_host,
         xray_xhttp_client_port=xray_xhttp_client_port,
+        xray_reality_xhttp_server_port=xray_reality_xhttp_server_port,
+        xray_reality_xhttp_path=xray_reality_xhttp_path,
         manifest_path=manifest_path,
         static_relay_clients_file=static_relay_clients_file,
         relay_probe_hmac_secret_file=relay_probe_hmac_secret_file,

@@ -128,6 +128,25 @@ class XhttpServerConfig:
 
 
 @dataclass(frozen=True)
+class RealityXhttpServerConfig:
+    """VLESS over XHTTP secured by REALITY - a FOURTH, independent inbound
+    (alongside, never instead of, REALITY/TLS/XHTTP). Unlike
+    [XhttpServerConfig] it is reached DIRECTLY on a public port: REALITY
+    presents the camouflage [RealityServerConfig.server_names] SNI, so it
+    needs no Nova domain or certificate (the `*.pp.ua` SNI that XHTTP over
+    TLS must present is filtered on RU networks). It reuses the REALITY
+    inbound's own dest/serverNames/privateKey/shortIds - one REALITY key
+    pair per host, never a second one - and only adds its own port and
+    XHTTP path. [mode] is fixed to the one proven client/server contract,
+    same reasoning as [XhttpServerConfig.mode]."""
+
+    listen_port: int
+    path: str
+    inbound_tag: str = "nova-vless-reality-xhttp-in"
+    mode: str = "packet-up"
+
+
+@dataclass(frozen=True)
 class RenderedClient:
     activation_id: str
     device_public_key: str
@@ -157,6 +176,17 @@ def _validate_xhttp_server_config(xhttp):
         raise XrayConfigRenderError("xhttp path must end with '/'")
     if xhttp.mode != "packet-up":
         raise XrayConfigRenderError(f"unsupported xhttp mode: {xhttp.mode!r} (only 'packet-up' is a proven contract)")
+
+
+def _validate_reality_xhttp_server_config(reality_xhttp, reality, other_ports):
+    if not (1 <= reality_xhttp.listen_port <= 65535):
+        raise XrayConfigRenderError(f"invalid reality_xhttp listen_port: {reality_xhttp.listen_port}")
+    if reality_xhttp.listen_port in {reality.listen_port, *other_ports}:
+        raise XrayConfigRenderError("reality_xhttp listen_port must differ from every other inbound's port")
+    if not reality_xhttp.path or not reality_xhttp.path.startswith("/") or not reality_xhttp.path.endswith("/"):
+        raise XrayConfigRenderError("reality_xhttp path must start and end with '/'")
+    if reality_xhttp.mode != "packet-up":
+        raise XrayConfigRenderError(f"unsupported reality_xhttp mode: {reality_xhttp.mode!r}")
 
 
 def _validate_reality_server_config(reality):
@@ -336,13 +366,46 @@ def _render_xhttp_inbound(clients, xhttp):
     }
 
 
+def _render_reality_xhttp_inbound(clients, reality, reality_xhttp):
+    """Same active client set as every other inbound ([_active_clients]), so
+    entitlement and revocation apply unchanged. No `flow`: XTLS Vision is a
+    raw-TCP optimization and is not valid over XHTTP. Public listen address,
+    like REALITY/TLS - REALITY itself is the client-facing security layer
+    here, there is no reverse proxy in front."""
+    return {
+        "tag": reality_xhttp.inbound_tag,
+        "listen": "0.0.0.0",
+        "port": reality_xhttp.listen_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": _vless_clients(clients, flow=None),
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": reality.dest,
+                "serverNames": list(reality.server_names),
+                "privateKey": reality.private_key,
+                "shortIds": list(reality.short_ids),
+            },
+            "xhttpSettings": {
+                "path": reality_xhttp.path,
+                "mode": reality_xhttp.mode,
+            },
+        },
+    }
+
+
 def _validate_static_clients(static_clients):
     for client in static_clients:
         if not _UUID_RE.match(client.vless_uuid):
             raise XrayConfigRenderError(f"static client has a malformed vless_uuid: {client.vless_uuid!r}")
 
 
-def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=(), now=None):
+def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=(), now=None, reality_xhttp=None):
     """Pure function: (parsed activations store, parsed xray identity
     store, RealityServerConfig, optional TlsServerConfig) -> the full Xray
     server config dict, ready for json.dumps. Deterministic - same inputs
@@ -378,6 +441,10 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
         _validate_tls_server_config(tls)
     if xhttp is not None:
         _validate_xhttp_server_config(xhttp)
+    if reality_xhttp is not None:
+        _validate_reality_xhttp_server_config(
+            reality_xhttp, reality, [c.listen_port for c in (tls, xhttp) if c is not None],
+        )
     _validate_static_clients(static_clients)
 
     clients = _active_clients(activations_data, xray_data, now) + list(static_clients)
@@ -387,6 +454,8 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
         inbounds.append(_render_tls_inbound(clients, tls))
     if xhttp is not None:
         inbounds.append(_render_xhttp_inbound(clients, xhttp))
+    if reality_xhttp is not None:
+        inbounds.append(_render_reality_xhttp_inbound(clients, reality, reality_xhttp))
 
     # Exit Target ACL (exit_target_policy.py), two independent layers:
     # 1. routing: literal-IP destinations in blocked space -> blackhole.
@@ -417,11 +486,13 @@ def render_server_config(activations_data, xray_data, reality, tls=None, xhttp=N
     }
 
 
-def render_server_config_redacted(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=(), now=None):
+def render_server_config_redacted(activations_data, xray_data, reality, tls=None, xhttp=None, flow="", static_clients=(), now=None, reality_xhttp=None):
     """Same as render_server_config but with privateKey replaced by a
     fixed placeholder - the only form of the rendered config that may
     ever be logged, diffed in an error message, or otherwise surfaced
-    outside the config file itself. TLS's and XHTTP's own inbounds carry no
+    outside the config file itself. Every inbound carrying realitySettings
+    is redacted (REALITY and REALITY+XHTTP share the same private key), not
+    just the first. TLS's and XHTTP's own inbounds carry no
     secret value at all (cert_file/key_file are non-secret file paths, and
     XHTTP holds no cert material at all - see [XhttpServerConfig]'s own
     docs), so nothing else needs redacting there.
@@ -432,8 +503,12 @@ def render_server_config_redacted(activations_data, xray_data, reality, tls=None
     log/diagnostic dump)."""
     full = render_server_config(
         activations_data, xray_data, reality, tls=tls, xhttp=xhttp, flow=flow, static_clients=static_clients, now=now,
+        reality_xhttp=reality_xhttp,
     )
-    full["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "<redacted>"
+    for inbound in full["inbounds"]:
+        reality_settings = inbound["streamSettings"].get("realitySettings")
+        if reality_settings is not None:
+            reality_settings["privateKey"] = "<redacted>"
     static_uuids = {client.vless_uuid for client in static_clients}
     if static_uuids:
         for inbound in full["inbounds"]:
