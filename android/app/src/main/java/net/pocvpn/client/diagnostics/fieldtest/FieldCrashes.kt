@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.app.ApplicationExitInfo
 import android.content.Context
 import android.os.Build
+import androidx.annotation.RequiresApi
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -33,6 +34,8 @@ object ExitReasons {
         return out
     }
 
+    // Only reached from collect(), after its API 30 check.
+    @RequiresApi(Build.VERSION_CODES.R)
     private fun describe(info: ApplicationExitInfo): JSONObject {
         val o = JSONObject()
             .put("timestampEpochMillis", info.timestamp)
