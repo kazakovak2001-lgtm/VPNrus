@@ -1110,6 +1110,353 @@ protection rejects a lower version). Devices re-activate Stockholm again.
 - Not yet done: device re-activation (step 6) and a real Hysteria2
   connect from CZ/RU (step 7).
 
+## REALITY + XHTTP on Stockholm - PREPARED, NOT DEPLOYED
+
+Code: gateway #210, client #211/#212 (`main` `21e7078`). Off by default:
+nothing changes on the host until the env group below is set, and no
+client can select `XRAY_REALITY_XHTTP` until a trusted manifest offers the
+binding. Every step below needs explicit owner approval and is run by the
+owner (Claude's SSH to production is denied as "Production Reads").
+
+### Decisions to confirm before step 1
+
+| Decision | Proposal | Why |
+|---|---|---|
+| Host | Stockholm `16.170.208.231` | REALITY reached Stockholm from one RU home Wi-Fi on 2026-10-08 (`DATA_PLANE_CORE_CONFIRMED`); Frankfurt REALITY failed there. |
+| Public TCP port | **2096** | Not 443 (nginx), not 8443-8445/2100 (loopback services), not 2053/2083 (REALITY/TLS), not 2093 (reserved ingress), per the 2026-09-27 audit. Same family as 2053/2083, one of which worked from RU. TCP 443 via an nginx stream SNI split (as prepared for Frankfurt) is a later, separate step if field results justify it. |
+| XHTTP path | `/nova-rx/` (or any random `/<16 hex>/`) | Must start and end with `/`; not secret. |
+| Manifest signing key | `prod-manifest-key-2026-09-01` | Same as v7: the `2026-09-14` key lives only in the WSL distro, which does not mount (`F:` absent, 2026-10-27). The 09-01 key is the bootstrap anchor every build trusts. |
+| Restart window | Low-traffic time | Step 4 restarts `nova-xray`, dropping every REALITY/TLS session on Stockholm for a few seconds (clients reconnect). AWG and Hysteria2 are not touched. |
+
+### Backup timestamp `TS` (all steps)
+
+Step 1 creates ONE UTC timestamp `TS` (`YYYYMMDDTHHMMSSZ`); every backup in
+steps 1, 3 and 6 (on both gateways) and every rollback restore uses that
+same value, so the rollback finds exactly the rollout's backups. Write it
+down when step 1 prints it. A new SSH session does not inherit it: start
+every later session (including the Frankfurt session in step 6) with
+
+```
+export TS=<value printed in step 1>
+```
+
+Never generate a new one after step 1.
+
+The public XHTTP port is a second rollout parameter, `XPORT`, fixed once
+in step 0 (default **2096**, see the decisions table) and used unchanged
+by every later step: the `api.env` value (step 3), the security-group rule
+(step 2), the listener checks (steps 4/5), the manifest binding (step 6)
+and rollback A. Start every later session with `export XPORT=<step 0
+value>` as well; blocks that use it stop if it is unset or not a port. Each block that backs up or
+restores starts with the guard below and is ONE compound command
+(`case ... && { ...; }`), so an unset or malformed `TS` stops the whole
+block before anything changes - unlike `: "${TS:?}"`, which in an
+interactive shell aborts only its own line. Inside the braces commands are
+chained with `&&`, so a failed backup also stops the block. Works in bash
+and POSIX `sh`.
+
+### 0. Read-only precheck (on Stockholm)
+
+```
+export XPORT=2096   # default; change ONLY here if 2096 is taken, then keep it for all steps
+cd /opt/pocvpn/gateway && sha256sum api/xray_config_renderer.py api/config.py api/handler.py api/xray_activation.py
+sudo ss -tlnp | grep -E ":(${XPORT}|2053|2083|443)\b"
+sudo grep -c '^POCVPN_API_XRAY_' /etc/pocvpn/api.env
+systemctl is-active pocvpn-api nova-xray nova-xray-reconcile.timer
+```
+
+Expected: nothing listens on `$XPORT`; REALITY on 2053 and TLS on 2083 are
+`nova-xray`; the four `api/*.py` hashes are recorded so step 1 can be
+compared and rolled back. If `$XPORT` is taken, stop, pick another free
+port outside the excluded ones in the decisions table, set `XPORT` to it,
+rerun this check, and record the value: every later step (security group,
+`api.env`, checks, manifest, rollback) then uses that port, never 2096.
+
+### 1. Update `gateway/api` to `main` `21e7078`
+
+Same method as the 2026-10-08 Salamander rollout: back up and replace only
+the changed files, then compile-check.
+
+**1a. Package the four files on the owner's PC** (PowerShell, repository
+root). `git archive` takes them byte-exact from the commit itself, so the
+local branch, working tree and line-ending settings do not matter:
+
+```
+git cat-file -e 21e70783c63cb021c2fd606492b2d09268e56d53^{commit}
+git archive --format=tar -o rx-api-21e7078.tar 21e70783c63cb021c2fd606492b2d09268e56d53 gateway/api/config.py gateway/api/handler.py gateway/api/xray_activation.py gateway/api/xray_config_renderer.py
+(Get-FileHash -Algorithm SHA256 rx-api-21e7078.tar).Hash.ToLower()   # record as RXSHA
+scp rx-api-21e7078.tar <admin>@<gateway>:rx-api-21e7078.tar
+```
+
+`<admin>@<gateway>` is the Stockholm login, as in 6b. The archive holds
+only public source code, no secrets.
+
+**1b. On Stockholm: verify and stage** in a fresh temporary directory,
+before anything live changes (`export RXSHA=<hash from 1a>` first). The
+block stops unless the hash matches and the archive holds exactly the four
+expected files, each non-empty:
+
+```
+case "${RXSHA:-}" in *[!0-9a-f]*|"") false ;; *) [ ${#RXSHA} -eq 64 ] ;; esac && {
+  RX="$HOME/rx-api-21e7078" &&
+  echo "$RXSHA  $HOME/rx-api-21e7078.tar" | sha256sum -c - &&
+  [ "$(tar -tf "$HOME/rx-api-21e7078.tar" | grep -v '/$' | sort | tr '\n' ' ')" = "gateway/api/config.py gateway/api/handler.py gateway/api/xray_activation.py gateway/api/xray_config_renderer.py " ] &&
+  mkdir "$RX" &&
+  tar -xf "$HOME/rx-api-21e7078.tar" -C "$RX" &&
+  test -s "$RX/gateway/api/config.py" && test -s "$RX/gateway/api/handler.py" &&
+  test -s "$RX/gateway/api/xray_activation.py" && test -s "$RX/gateway/api/xray_config_renderer.py" &&
+  echo "staged OK in $RX"
+}
+```
+
+`mkdir` (no `-p`) fails if an earlier attempt left the directory: inspect
+and remove it deliberately, then rerun.
+
+**1c. Back up, install, compile-check, restart** - only after "staged OK".
+The backup block is unchanged; the install block re-checks `TS`, the
+staged files and the backups, installs as `root:root 0644`, and restarts
+`pocvpn-api` only if `py_compile` passed:
+
+```
+cd /opt/pocvpn/gateway
+TS=$(date -u +%Y%m%dT%H%M%SZ); export TS   # the ONLY place TS is generated
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  sudo cp -p api/config.py "api/config.py.backup-rx-$TS" &&
+  sudo cp -p api/handler.py "api/handler.py.backup-rx-$TS" &&
+  sudo cp -p api/xray_activation.py "api/xray_activation.py.backup-rx-$TS" &&
+  sudo cp -p api/xray_config_renderer.py "api/xray_config_renderer.py.backup-rx-$TS" &&
+  echo "backups done - record TS"
+}
+# only after "backups done":
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  RX="$HOME/rx-api-21e7078/gateway/api" &&
+  test -s "$RX/config.py" && sudo test -f "api/config.py.backup-rx-$TS" &&
+  test -s "$RX/handler.py" && sudo test -f "api/handler.py.backup-rx-$TS" &&
+  test -s "$RX/xray_activation.py" && sudo test -f "api/xray_activation.py.backup-rx-$TS" &&
+  test -s "$RX/xray_config_renderer.py" && sudo test -f "api/xray_config_renderer.py.backup-rx-$TS" &&
+  sudo install -o root -g root -m 0644 "$RX/config.py" api/config.py &&
+  sudo install -o root -g root -m 0644 "$RX/handler.py" api/handler.py &&
+  sudo install -o root -g root -m 0644 "$RX/xray_activation.py" api/xray_activation.py &&
+  sudo install -o root -g root -m 0644 "$RX/xray_config_renderer.py" api/xray_config_renderer.py &&
+  sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py &&
+  sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+}
+```
+
+If `py_compile` fails, nothing was restarted: restore the four
+`api/*.py.backup-rx-$TS` files (rollback A) before doing anything else.
+Remove `~/rx-api-21e7078*` once step 1 is confirmed.
+
+Check: `/v1/manifest` still 200; `/v1/xray-profile` with
+`{"transport":"reality-xhttp"}` and any bearer value answers **503
+`xray_reality_xhttp_not_configured`** - the transport check runs before the
+credential is evaluated, so this proves the new code is live while the
+inbound is still off. (After step 3 the same request reaches credential
+evaluation and answers 401 for an invalid credential.)
+
+### 2. AWS security group (separate approval)
+
+Security group `launch-wizard-1`: **inbound TCP `$XPORT` (step 0 value), source 0.0.0.0/0,
+Stockholm instance, "Nova REALITY+XHTTP"**. The OS firewall is accept-all,
+so the security group is the only gate. Until step 4 nothing listens on
+`$XPORT`, so opening it first is harmless.
+
+### 3. Enable the inbound in `api.env`
+
+```
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  case "${XPORT:-}" in *[!0-9]*|"") false ;; *) [ "$XPORT" -ge 1 ] && [ "$XPORT" -le 65535 ] ;; esac && echo "XPORT=$XPORT" &&
+  sudo cp -p /etc/pocvpn/api.env "/etc/pocvpn/api.env.backup-rx-$TS" &&
+  printf 'POCVPN_API_XRAY_REALITY_XHTTP_SERVER_PORT=%s\nPOCVPN_API_XRAY_REALITY_XHTTP_PATH=/nova-rx/\n' "$XPORT" | sudo tee -a /etc/pocvpn/api.env >/dev/null &&
+  sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+}
+```
+
+`config.py` fails closed at start if the group is partial, the path is
+malformed or the port clashes with REALITY/TLS/XHTTP - `pocvpn-api` would
+then not start: restore the backup and restart (rollback A).
+
+### 4. Render, validate and activate the Xray config
+
+The fourth inbound appears in the next render. `nova-xray-reconcile.timer`
+would pick the change up at its next tick on its own, so step 3 already
+opens the restart window; trigger it deliberately instead of waiting:
+
+```
+sudo systemctl start nova-xray-reconcile.service
+journalctl -u nova-xray-reconcile -n 20 --no-pager
+```
+
+Expected: `xray_reconcile: converged - running Xray now reflects current
+canonical state`. `convergence FAILED` leaves the running config untouched
+(rollback A).
+
+The privileged path (`nova-xray-reload` -> `xray-activate.sh`) runs
+`xray -test` on the candidate before publishing and restarting `nova-xray`;
+a candidate the pinned core rejects is never published. Then:
+
+```
+sudo ss -tlnp | grep -E ":(${XPORT}|2053|2083)\b"    # nova-xray on all three
+sudo grep -c 'nova-vless-reality-xhttp-in' /etc/nova-xray/config.json   # 1 (XRAY_LIVE_CONFIG in xray.env)
+sudo grep -c '"privateKey"' /etc/nova-xray/config.json                  # 2: both REALITY inbounds
+```
+
+Never print the config itself - it contains the REALITY private key.
+
+### 5. Server-side smoke test (before any client sees it)
+
+From the owner's PC (outside AWS):
+
+```
+nc -vz 16.170.208.231 "$XPORT"   # XPORT = step 0 value
+```
+
+TCP connect must succeed; a TLS client without the REALITY key only sees
+the camouflage site's handshake, which is expected.
+
+### 6. Sign and publish manifest v9
+
+Draft: `gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json` - v8
+plus ONE Stockholm binding `{"kindOrdinal": 7, "host": "16.170.208.231",
+"port": 2096}`, `manifestVersion: 9`, `signingKeyId:
+prod-manifest-key-2026-09-01`. The binding's `port` MUST equal `XPORT`: if
+step 0 chose another port, change it in the draft JSON first (and the
+`2096` expectations in `RealityXhttpManifestRollbackChainTest` / the
+regenerated `manifest_rollback_fixtures.py` fixtures with it), before
+signing.
+
+On the owner's PC, offline. The tool reads the key itself from its file
+(must be mode 600 on POSIX), so it never appears in argv, the process list,
+shell history or output. Do NOT use the legacy `--private-key-b64` form
+(argv is readable by other local processes):
+
+```
+python -I gateway/tools/manifest_signing.py sign-and-package \
+  --manifest gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json \
+  --private-key-file <path-to-09-01-key-file> \
+  --out gateway/tools/endpoint-manifest-2026-10-27-v9.bin
+```
+
+Under WSL keep the key file on the Linux filesystem (e.g. `~/...`, mode
+600): on `/mnt/c` the mode cannot be set and the tool refuses the file.
+On Windows no permission check is possible - protect it with NTFS ACLs.
+`--private-key-file -` reads the key from stdin instead
+(`... --private-key-file - < <path-to-09-01-key-file>`).
+
+**6a. Verify on the owner's PC** (repository root) that the signature
+checks out against the public key the Android app embeds
+(`EmbeddedBootstrapManifest.BOOTSTRAP_PUBLIC_KEY_BASE64`, read from the
+source, never typed) and that the signed bytes are exactly the reviewed
+JSON. This is what makes the artifact production-valid; a matching SHA-256
+later only proves the copy is intact:
+
+```
+python -I - gateway/tools/endpoint-manifest-2026-10-27-v9.bin \
+  gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json <<'EOF'
+import base64, re, struct, sys
+sys.path.insert(0, "gateway/tools")
+import manifest_signing as ms
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+art, src = sys.argv[1], sys.argv[2]
+kt = open("android/app/src/main/java/net/pocvpn/client/reachability/EmbeddedBootstrapManifest.kt").read()
+pub = base64.b64decode(re.search(r'BOOTSTRAP_PUBLIC_KEY_BASE64 = "([^"]+)"', kt).group(1))
+b = open(art, "rb").read()
+fmt, n = struct.unpack(">ii", b[:8]); canonical = b[8:8 + n]
+(sl,) = struct.unpack(">i", b[8 + n:12 + n]); sig = b[12 + n:12 + n + sl]
+assert fmt == ms.FORMAT_VERSION and len(sig) == 64 and len(b) == 12 + n + sl, "bad container"
+assert canonical == ms.canonical_bytes(ms.load_manifest_json(src)), "artifact != reviewed JSON"
+Ed25519PublicKey.from_public_bytes(pub).verify(sig, canonical)  # raises InvalidSignature
+print("OK: signed by the app-embedded 09-01 anchor, content == reviewed JSON")
+EOF
+sha256sum gateway/tools/endpoint-manifest-2026-10-27-v9.bin   # record as SHA
+```
+
+Do the same for the rollback v10 (its `.bin` and JSON). Then rename the v9
+JSON without `_DRAFT` and commit JSON + `.bin` (both public).
+
+**6b. Transfer** only the signed `.bin` - never the key, never any other
+file - from the owner's PC to each gateway's admin home directory, over
+the same SSH access used for every other step (`<admin>@<gateway>` is that
+login; this document assumes it, it does not define it):
+
+```
+scp gateway/tools/endpoint-manifest-2026-10-27-v9.bin <admin>@<gateway>:endpoint-manifest-v9.bin
+```
+
+**6c. Install on EACH gateway** (Stockholm, then Frankfurt; both serve
+`/v1/manifest`), in a session started with `export TS=<step 1 value>` and
+`export SHA=<hash from 6a>`. The `.bin` is public data, so its hash may be
+printed:
+
+```
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && [ "$(printf %s "${SHA:-}" | tr -cd 0-9a-f | wc -c)" -eq 64 ] && [ ${#SHA} -eq 64 ] && {
+  echo "$SHA  $HOME/endpoint-manifest-v9.bin" | sha256sum -c - &&
+  sudo cp -p /etc/pocvpn/endpoint-manifest.bin "/etc/pocvpn/endpoint-manifest.bin.v8-backup-$TS" &&
+  sudo install -o root -g pocvpn-api -m 0640 "$HOME/endpoint-manifest-v9.bin" /etc/pocvpn/endpoint-manifest.bin &&
+  [ "$(sudo stat -c '%U:%G %a' /etc/pocvpn/endpoint-manifest.bin)" = "root:pocvpn-api 640" ] &&
+  echo "$SHA  /etc/pocvpn/endpoint-manifest.bin" | sudo sha256sum -c - &&
+  rm "$HOME/endpoint-manifest-v9.bin" && echo "installed"
+}
+```
+
+Any failed check stops the block; nothing on the host changes before the
+backup line. `pocvpn-api` reads the file per request (no restart). Then,
+from the owner's PC, for EACH gateway's public address:
+
+```
+curl -sk https://<gateway-ip>/v1/manifest | sha256sum   # must equal SHA on both hosts
+```
+
+`ManifestForwardCompatibilityTest` must still pass with the new `.bin`
+committed. Builds older than #211 keep the new binding opaque and never dial
+it; every other binding is unchanged.
+
+### 7. Clients
+
+- Build a new field APK from `main` (>= `21e7078`, `versionCode` 5).
+- On the device: install, let the manifest refresh, then **re-activate
+  Stockholm** - the REALITY+XHTTP profile is fetched only during activation
+  and only when the trusted manifest offers the binding.
+- Debug build: Diagnostics -> "Force XRAY_REALITY_XHTTP on next connect" ->
+  connect to Stockholm; the full field test now includes the
+  `STOCKHOLM / XRAY_REALITY_XHTTP` run.
+- CZ baseline first (Wi-Fi + cellular must reach `DATA_PLANE_CORE_CONFIRMED`),
+  then the RU comparison against AWG / REALITY / TLS on the same network.
+
+### Rollback
+
+Every restore uses the rollout's `TS` (`export TS=<step 1 value>`) behind
+the same guard, so it can only restore the backups this rollout made:
+
+```
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  sudo test -f "/etc/pocvpn/api.env.backup-rx-$TS" &&
+  sudo cp -p "/etc/pocvpn/api.env.backup-rx-$TS" /etc/pocvpn/api.env &&
+  sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+}
+```
+
+- **A - before step 6** (no client can see it): restore
+  `api.env.backup-rx-$TS` (block above), restart `pocvpn-api`, run
+  `nova-xray-reconcile.service` (renders without the fourth inbound,
+  restarts `nova-xray`), close TCP `$XPORT` (step 0 value) in the security group. Restore the
+  `api/*.py.backup-rx-$TS` files only if step 1 itself misbehaved.
+- **B - after step 6**: reinstalling the v8 `.bin` is NOT enough - a device
+  that already adopted v9 rejects any lower `manifestVersion`
+  (`EndpointManifestRepository`: `ROLLBACK_OR_NOT_NEWER`) and keeps
+  offering kind 7. Before step 6, also prepare (sign offline with
+  `--private-key-file`, do not install) a **v10 = v8 endpoints with
+  `manifestVersion: 10`, the same `signingKeyId` as v9
+  (`prod-manifest-key-2026-09-01`), a fresh `issuedAtEpochMillis` and an
+  `expiresAtEpochMillis` no earlier than v9's** (exactly the derivation in
+  `gateway/tools/tests/manifest_rollback_fixtures.py`; the client-side
+  chain v8 -> v9 -> v8 rejected -> v10 -> v9 rejected is covered by
+  `RealityXhttpManifestRollbackChainTest`, with a TEST key only). To roll back: install v10 on both gateways
+  first (clients drop the kind at their next manifest refresh), then
+  rollback A. Reinstalling the v8 backup only helps hosts/devices that
+  never fetched v9. A device still holding v9 sees the inbound gone and
+  fails that one attempt closed; it never affects other transports.
+
 ## REALITY Frankfurt on TCP/443 (SNI split) - PREPARED, NOT DEPLOYED
 
 Why: RU field evidence (2026-10-08, home Wi-Fi): Frankfurt TCP 2053/2083/28388
