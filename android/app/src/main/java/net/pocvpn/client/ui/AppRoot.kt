@@ -34,6 +34,7 @@ import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
 import net.pocvpn.client.ui.screens.FieldTestDialog
+import net.pocvpn.client.ui.screens.FieldTestOptions
 import net.pocvpn.client.ui.screens.GeoDataScreen
 import net.pocvpn.client.ui.screens.HomeScreen
 import net.pocvpn.client.ui.screens.SettingsScreen
@@ -649,9 +650,11 @@ fun AppRoot(
                 null
             }.getOrElse { "share failed: ${it.javaClass.simpleName}: ${it.message}" }
         }
+        val fieldTestOptions = FieldTestOptions.forBuild(isDebugBuild)
         FieldTestDialog(
             progress = fieldTestProgress,
-            allModes = isDebugBuild,
+            allModes = fieldTestOptions.allModes,
+            canSaveLocally = fieldTestOptions.canSaveLocally,
             onStart = { mode, minutes ->
                 fieldTestSaveStatus = null
                 viewModel.startFieldTest(context, mode, minutes) { currentDiagnosticsLines.value() }
