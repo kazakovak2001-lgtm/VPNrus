@@ -106,6 +106,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
 
   const doRevoke = async (id: string) => {
     if (!window.confirm(`Revoke activation ${id}? Bound devices lose access. This cannot be undone here.`)) return;
+    setNotice(null);
     try {
       const r = await api.revoke(id);
       setNotice(r.status === "revoked" ? "Activation revoked." : "Activation was already revoked.");
