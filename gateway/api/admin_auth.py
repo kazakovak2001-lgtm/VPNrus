@@ -80,7 +80,7 @@ class AdminAuthenticator:
     management.
     """
 
-    def __init__(self, secret_file: str) -> None:
+    def __init__(self, secret_file: str, viewer_secret_file: str = "") -> None:
         """Initialize the admin authenticator.
 
         Args:
@@ -92,6 +92,14 @@ class AdminAuthenticator:
         """
         self._secret_file = secret_file
         self._secret_hash = self._load_secret_hash()
+        # Optional second credential for the read-only "viewer" role. It
+        # must differ from the admin secret, otherwise the role a login
+        # receives would be ambiguous.
+        self._viewer_hash = None
+        if viewer_secret_file:
+            self._viewer_hash = hashlib.sha256(read_admin_secret(viewer_secret_file)).digest()
+            if hmac.compare_digest(self._viewer_hash, self._secret_hash):
+                raise ConfigError("admin viewer secret must differ from the admin secret")
 
         # In-memory session store: session_id -> session_data
         self._sessions: Dict[str, Dict] = {}
@@ -116,7 +124,7 @@ class AdminAuthenticator:
         SHA-256 digest; the plaintext is never kept on the instance."""
         return hashlib.sha256(read_admin_secret(self._secret_file)).digest()
 
-    def _create_session(self, source_ip: str) -> Tuple[str, str]:
+    def _create_session(self, source_ip: str, role: str = "admin") -> Tuple[str, str]:
         """Create a new admin session.
 
         Args:
@@ -134,6 +142,7 @@ class AdminAuthenticator:
                 "created_at": time.monotonic(),
                 "expires_at": expires_at,
                 "source_ip": source_ip,
+                "role": role,
                 "csrf_token": csrf_token,
                 "last_seen": time.monotonic(),
             }
@@ -186,14 +195,21 @@ class AdminAuthenticator:
 
         # Verify password via constant-time digest comparison
         password_hash = hashlib.sha256(password_bytes).digest()
-        if not hmac.compare_digest(password_hash, self._secret_hash):
+        # Both comparisons always run (no short-circuit on the first match).
+        is_admin = hmac.compare_digest(password_hash, self._secret_hash)
+        is_viewer = self._viewer_hash is not None and hmac.compare_digest(password_hash, self._viewer_hash)
+        if not (is_admin or is_viewer):
             self._auth_failure_limiter.record_auth_failure(source_ip, "admin")
             return False, None, "unauthorized"
 
-        # Verified success: clear the shared account counter (atomic under
-        # the limiter's own lock; per-source and global counters are kept).
-        self._auth_failure_limiter.reset_account_failures("admin")
-        session_id, csrf_token = self._create_session(source_ip)
+        # Verified ADMIN success clears the shared account counter (atomic
+        # under the limiter's own lock; per-source and global counters are
+        # kept). A viewer login must not: holding the lower-privilege
+        # credential would otherwise let someone keep the account counter
+        # below its threshold while guessing the admin secret.
+        if is_admin:
+            self._auth_failure_limiter.reset_account_failures("admin")
+        session_id, csrf_token = self._create_session(source_ip, "admin" if is_admin else "viewer")
         return True, (session_id, csrf_token), None
 
     def validate_session_and_csrf(

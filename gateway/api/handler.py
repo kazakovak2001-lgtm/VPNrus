@@ -28,12 +28,14 @@ independent credential/token system.
 import hmac
 import json
 import logging
+import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs
 
 from . import (
     activations,
@@ -82,7 +84,7 @@ _PATH_ADMIN_LOGOUT = "/admin/logout"
 _PATH_ADMIN_SESSION = "/admin/session"
 _PATH_ADMIN_STATUS = "/admin/status"
 _PATH_ADMIN_ACTIVATIONS = "/admin/activations"
-_ADMIN_ACTIVATION_PATH_RE = re.compile(r"^/admin/activations/([0-9a-f]{32})(/revoke)?$")
+_ADMIN_ACTIVATION_PATH_RE = re.compile(r"^/admin/activations/([0-9a-f]{32})(/revoke|/extend)?$")
 
 # B26 (task B) - the same TransportKind.name strings Android's TransportKind
 # enum uses (see transport/TransportKind.kt - no custom toString(), so
@@ -247,19 +249,23 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_admin_status()
-            elif self.path == _PATH_ADMIN_ACTIVATIONS:
-                if method != "GET":
-                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
-                else:
+            elif self.path.split("?", 1)[0] == _PATH_ADMIN_ACTIVATIONS:
+                if method == "GET":
                     status_code = self._handle_admin_activations(None)
+                elif method == "POST":
+                    status_code = self._handle_admin_create()
+                else:
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
             elif _ADMIN_ACTIVATION_PATH_RE.match(self.path):
                 match = _ADMIN_ACTIVATION_PATH_RE.match(self.path)
                 activation_id, action = match.group(1), match.group(2)
-                if action == "/revoke":
+                if action in ("/revoke", "/extend"):
                     if method != "POST":
                         status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
-                    else:
+                    elif action == "/revoke":
                         status_code = self._handle_admin_revoke(activation_id)
+                    else:
+                        status_code = self._handle_admin_extend(activation_id)
                 elif method != "GET":
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
@@ -1286,10 +1292,12 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         return public_key, transport
 
     # --- response helpers ---
-    def _write_json(self, status, payload):
+    def _write_json(self, status, payload, extra_headers=()):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
+        for name, value in extra_headers:
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -1392,6 +1400,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
 
         # session_data is (session_id, csrf_token)
         session_id, csrf_token = session_data
+        role = (self.server.admin_authenticator.get_session_info(session_id) or {}).get("role", "viewer")
 
         # Always Secure: /admin/* is only routed by the TLS vhost
         # (nginx-pocvpn.conf, loopback/SSH-tunnel only), so the browser must
@@ -1406,6 +1415,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(
             json.dumps({
                 "status": "logged_in",
+                "role": role,
                 "csrf_token": csrf_token,
                 "session_expires_at": time.time() + 28800,
             }).encode("utf-8")
@@ -1459,7 +1469,7 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # Logout mutates server-side session state: same CSRF + same-origin
         # requirements as every other state-changing admin request. An
         # unknown/expired session is rejected (401) by the same check.
-        self._admin_session_or_raise(mutating=True, need_store=False)
+        self._admin_session_or_raise(mutating=True, need_store=False, require_admin=False)
         self.server.admin_authenticator.invalidate_session(session_id)
 
         # Clear session cookie
@@ -1527,10 +1537,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         return self._success(HTTPStatus.OK, {
             "status": "ok",
             "session_exists": info is not None,
+            "role": (info or {}).get("role"),
         })
 
     # --- admin activation (device) management ---
-    def _admin_session_or_raise(self, mutating, need_store=True, limiter=None):
+    def _admin_session_or_raise(self, mutating, need_store=True, limiter=None, require_admin=None):
         """Returns the validated session id. Read endpoints need only the
         session cookie (like /admin/status); mutating ones also need the
         X-CSRF-Token header and a same-origin Origin header."""
@@ -1547,11 +1558,18 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             host = self.headers.get("Host")
             if not origin or not host or origin.split("://", 1)[-1] != host:
                 raise _RequestError(HTTPStatus.FORBIDDEN, "origin_mismatch")
-            is_valid, _ = auth.validate_session_and_csrf(session_id, csrf_token)
+            is_valid, session_data = auth.validate_session_and_csrf(session_id, csrf_token)
         else:
-            is_valid, _ = auth.validate_session_and_csrf(session_id)
+            is_valid, session_data = auth.validate_session_and_csrf(session_id)
         if not is_valid:
             raise _RequestError(HTTPStatus.UNAUTHORIZED, "unauthorized")
+        # Role gate: every state-changing activation operation needs the
+        # admin role; the read-only viewer role may list, view and log out.
+        # Checked after authentication/CSRF/Origin and before the limiter
+        # and any store access.
+        self._admin_role = (session_data or {}).get("role", "viewer")
+        if (mutating if require_admin is None else require_admin) and self._admin_role != "admin":
+            raise _RequestError(HTTPStatus.FORBIDDEN, "forbidden")
         # Per-session throttle (per process, in memory - not a distributed
         # limiter). Keyed by the authenticated session id, never by a
         # client-supplied forwarding header. Checked after authentication
@@ -1587,10 +1605,135 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             "action": action,
             "activation_id": activation_id,
             "outcome": outcome,
+            "role": getattr(self, "_admin_role", "unknown"),
             "client": client_identity.normalize_client(self.headers.get_all("X-Real-IP")),
         })
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        # Created 0600 (ids, role and client address); an older, looser
+        # file is tightened on first use.
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            try:
+                if os.fstat(fd).st_mode & 0o077:
+                    os.fchmod(fd, 0o600)
+            except OSError:
+                logger.error("admin_audit_chmod_failed")
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+
+    def _parse_admin_list_query(self):
+        """Strict ?q=&status=&limit=&offset= parsing; anything unexpected is
+        a 400, never silently ignored. q is a lowercase-hex substring of the
+        activation id (the only identifier the panel exposes)."""
+        raw = self.path.split("?", 1)[1] if "?" in self.path else ""
+        try:
+            params = parse_qs(raw, keep_blank_values=True, strict_parsing=bool(raw), max_num_fields=8)
+        except ValueError:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_query")
+        if set(params) - {"q", "status", "limit", "offset"} or any(len(v) != 1 for v in params.values()):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_query")
+        q = params.get("q", [""])[0].strip().lower()
+        if len(q) > 32 or not re.fullmatch(r"[0-9a-f]*", q):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_query")
+        status = params.get("status", [""])[0]
+        if status not in ("", "ACTIVE", "REVOKED", "EXPIRED"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_query")
+        try:
+            limit = int(params.get("limit", ["25"])[0])
+            offset = int(params.get("offset", ["0"])[0])
+        except ValueError:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_query")
+        if not 1 <= limit <= 100 or offset < 0:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_query")
+        return {"q": q, "status": status, "limit": limit, "offset": offset}
+
+    def _admin_read_json_object(self):
+        if self.headers.get_all("Transfer-Encoding"):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_request")
+        content_length = self._read_content_length()
+        if not _is_json_content_type(self.headers.get("Content-Type", "")):
+            raise _RequestError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+        try:
+            parsed = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_json")
+        if not isinstance(parsed, dict):
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+        return parsed
+
+    @staticmethod
+    def _admin_int_field(body, name, low, high, allow_null=False):
+        value = body.get(name)
+        if value is None and allow_null and name in body:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+            raise _RequestError(HTTPStatus.BAD_REQUEST, "invalid_" + name)
+        return value
+
+    @staticmethod
+    def _admin_store_error(exc):
+        """Maps store write failures exactly as revoke does. The uncertain
+        commit case must precede its parent StoreWriteError."""
+        if isinstance(exc, activations.StoreCommitUncertainError):
+            return _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "store_commit_uncertain")
+        if isinstance(exc, activations.StoreWriteError):
+            return _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "store_write_failed")
+        return _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+    def _handle_admin_create(self):
+        try:
+            self._admin_session_or_raise(mutating=True, limiter="admin_mutation_limiter")
+            body = self._admin_read_json_object()
+            if set(body) - {"max_devices", "expires_in_days"}:
+                raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+            max_devices = self._admin_int_field(body, "max_devices", 1, 100)
+            expires_in_days = self._admin_int_field(body, "expires_in_days", 1, 3650, allow_null=True)
+            cfg = self.server.config
+            try:
+                activation_id, credential = activations.issue_activation(
+                    cfg.activation_store_path, cfg.activation_lock_path, max_devices, expires_in_days
+                )
+            except (activations.StoreWriteError, activations.ActivationStoreError) as exc:
+                raise self._admin_store_error(exc)
+            # The credential is returned exactly once, here, and is never
+            # logged or audited (audit records only the activation id).
+            try:
+                self._admin_audit("create", activation_id, "created")
+            except OSError:
+                logger.error("admin_audit_write_failed")
+            return self._write_json(
+                HTTPStatus.CREATED,
+                {"activation_id": activation_id, "credential": credential},
+                extra_headers=(("Cache-Control", "no-store"), ("Pragma", "no-cache")),
+            )
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_admin_extend(self, activation_id):
+        try:
+            self._admin_session_or_raise(mutating=True, limiter="admin_mutation_limiter")
+            body = self._admin_read_json_object()
+            if set(body) - {"days"}:
+                raise _RequestError(HTTPStatus.BAD_REQUEST, "malformed_request")
+            days = self._admin_int_field(body, "days", 1, 3650)
+            cfg = self.server.config
+            try:
+                new_expires_at = activations.extend_activation(
+                    cfg.activation_store_path, cfg.activation_lock_path, activation_id, days
+                )
+            except KeyError:
+                raise _RequestError(HTTPStatus.NOT_FOUND, "not_found")
+            except activations.ActivationNotExtendableError as exc:
+                raise _RequestError(HTTPStatus.CONFLICT, "not_extendable_" + exc.reason)
+            except (activations.StoreWriteError, activations.ActivationStoreError) as exc:
+                raise self._admin_store_error(exc)
+            try:
+                self._admin_audit("extend", activation_id, "extended")
+            except OSError:
+                logger.error("admin_audit_write_failed")
+            return self._success(HTTPStatus.OK, {"expires_at": new_expires_at})
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
 
     def _handle_admin_activations(self, activation_id):
         try:
@@ -1599,9 +1742,19 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             now = datetime.now(tz=timezone.utc)
             try:
                 if activation_id is None:
+                    query = self._parse_admin_list_query()
                     records = activations.list_all(cfg.activation_store_path, cfg.activation_lock_path)
+                    views = [self._admin_activation_view(r, now) for r in records]
+                    if query["q"]:
+                        views = [v for v in views if query["q"] in v["activation_id"]]
+                    if query["status"]:
+                        views = [v for v in views if v["entitlement"] == query["status"]]
+                    start = query["offset"]
                     return self._success(HTTPStatus.OK, {
-                        "activations": [self._admin_activation_view(r, now) for r in records],
+                        "activations": views[start:start + query["limit"]],
+                        "total": len(views),
+                        "limit": query["limit"],
+                        "offset": start,
                     })
                 record = activations.find_by_activation_id(
                     cfg.activation_store_path, cfg.activation_lock_path, activation_id

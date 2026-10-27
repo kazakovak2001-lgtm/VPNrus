@@ -215,5 +215,160 @@ class AdminActivationTests(unittest.TestCase):
             self.assertEqual(self._req("GET", "/admin/activations", h)[0], 200)
 
 
+    # --- create / extend / list query ---
+    def _post_json(self, path, sid, csrf, payload, origin=None):
+        body = json.dumps(payload).encode()
+        h = self._mut_headers(sid, csrf, origin)
+        h["Content-Type"] = "application/json"
+        h["Content-Length"] = str(len(body))
+        return self._req("POST", path, h, body)
+
+    def _create(self, sid, csrf, max_devices=2, days=30):
+        status, headers, body = self._post_json(
+            "/admin/activations", sid, csrf, {"max_devices": max_devices, "expires_in_days": days})
+        self.assertEqual(status, 201)
+        return headers, json.loads(body)
+
+    def test_create_returns_credential_once_and_never_logs_it(self):
+        sid, csrf = self._login()
+        headers, data = self._create(sid, csrf)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(len(data["activation_id"]), 32)
+        credential = data["credential"]
+        self.assertTrue(len(credential) >= 20)
+        # Stored only as a digest, listed without the credential, audited by id only.
+        with open(self.store, encoding="utf-8") as f:
+            self.assertNotIn(credential, f.read())
+        with open(self.store + ".admin-audit.log", encoding="utf-8") as f:
+            audit = f.read()
+        self.assertNotIn(credential, audit)
+        self.assertIn('"action": "create"', audit)
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        status, _, body = self._req("GET", "/admin/activations/" + data["activation_id"], h)
+        self.assertEqual(status, 200)
+        self.assertNotIn(credential.encode(), body)
+        self.assertEqual(json.loads(body)["entitlement"], "ACTIVE")
+
+    def test_create_requires_session_csrf_origin_and_valid_body(self):
+        sid, csrf = self._login()
+        status, _, _ = self._post_json("/admin/activations", "nosession", csrf, {"max_devices": 1, "expires_in_days": 1})
+        self.assertEqual(status, 401)
+        status, _, _ = self._post_json("/admin/activations", sid, "wrong", {"max_devices": 1, "expires_in_days": 1})
+        self.assertEqual(status, 401)
+        status, _, body = self._post_json(
+            "/admin/activations", sid, csrf, {"max_devices": 1, "expires_in_days": 1}, origin="http://evil.example")
+        self.assertEqual((status, json.loads(body)["error"]), (403, "origin_mismatch"))
+        for payload, code in [
+            ({"max_devices": 0, "expires_in_days": 1}, "invalid_max_devices"),
+            ({"max_devices": True, "expires_in_days": 1}, "invalid_max_devices"),
+            ({"max_devices": 101, "expires_in_days": 1}, "invalid_max_devices"),
+            ({"max_devices": 1}, "invalid_expires_in_days"),
+            ({"max_devices": 1, "expires_in_days": 0}, "invalid_expires_in_days"),
+            ({"max_devices": 1, "expires_in_days": "7"}, "invalid_expires_in_days"),
+            ({"max_devices": 1, "expires_in_days": 1, "status": "ACTIVE"}, "malformed_request"),
+        ]:
+            status, _, body = self._post_json("/admin/activations", sid, csrf, payload)
+            self.assertEqual((status, json.loads(body)["error"]), (400, code), payload)
+        # Nothing was created by any rejected request.
+        with open(self.store, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)), 2)
+
+    def test_create_non_expiring_allowed_with_explicit_null(self):
+        sid, csrf = self._login()
+        status, _, body = self._post_json("/admin/activations", sid, csrf, {"max_devices": 1, "expires_in_days": None})
+        self.assertEqual(status, 201)
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        _, _, detail = self._req("GET", "/admin/activations/" + json.loads(body)["activation_id"], h)
+        self.assertIsNone(json.loads(detail)["expires_at"])
+
+    def test_create_uncertain_commit_and_write_failure_codes(self):
+        sid, csrf = self._login()
+        for exc, code in [
+            (activations_module.StoreCommitUncertainError("x"), "store_commit_uncertain"),
+            (activations_module.StoreWriteError("x"), "store_write_failed"),
+        ]:
+            with mock.patch.object(activations_module, "issue_activation", side_effect=exc):
+                status, _, body = self._post_json(
+                    "/admin/activations", sid, csrf, {"max_devices": 1, "expires_in_days": 1})
+            self.assertEqual((status, json.loads(body)["error"]), (500, code))
+
+    def test_extend_adds_days_and_audits(self):
+        sid, csrf = self._login()
+        _, created = self._create(sid, csrf, days=10)
+        aid = created["activation_id"]
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        _, _, before = self._req("GET", "/admin/activations/" + aid, h)
+        status, _, body = self._post_json(f"/admin/activations/{aid}/extend", sid, csrf, {"days": 5})
+        self.assertEqual(status, 200)
+        _, _, after = self._req("GET", "/admin/activations/" + aid, h)
+        from datetime import datetime
+        delta = datetime.fromisoformat(json.loads(after)["expires_at"]) - datetime.fromisoformat(json.loads(before)["expires_at"])
+        self.assertEqual(delta.days, 5)
+        self.assertEqual(json.loads(body)["expires_at"], json.loads(after)["expires_at"])
+        with open(self.store + ".admin-audit.log", encoding="utf-8") as f:
+            self.assertIn('"action": "extend"', f.read())
+
+    def test_extend_refuses_revoked_non_expiring_unknown_and_bad_days(self):
+        sid, csrf = self._login()
+        _, created = self._create(sid, csrf, days=10)
+        aid = created["activation_id"]
+        self._req("POST", f"/admin/activations/{aid}/revoke", self._mut_headers(sid, csrf) | {"Content-Length": "0"})
+        status, _, body = self._post_json(f"/admin/activations/{aid}/extend", sid, csrf, {"days": 5})
+        self.assertEqual((status, json.loads(body)["error"]), (409, "not_extendable_revoked"))
+        status, _, body = self._post_json(f"/admin/activations/{_ID}/extend", sid, csrf, {"days": 5})
+        self.assertEqual((status, json.loads(body)["error"]), (409, "not_extendable_not_expiring"))
+        status, _, _ = self._post_json("/admin/activations/" + "c" * 32 + "/extend", sid, csrf, {"days": 5})
+        self.assertEqual(status, 404)
+        _, created2 = self._create(sid, csrf, days=10)
+        for payload in ({"days": 0}, {"days": 3651}, {"days": "5"}, {"days": 1, "x": 1}, {}):
+            status, _, _ = self._post_json(f"/admin/activations/{created2['activation_id']}/extend", sid, csrf, payload)
+            self.assertEqual(status, 400, payload)
+
+    def test_extend_from_now_when_already_expired(self):
+        from datetime import datetime, timedelta, timezone
+        past = datetime(2025, 1, 1, tzinfo=timezone.utc).isoformat()
+        rec = _record("e" * 32)
+        rec["expires_at"] = past
+        make_activation_store(self.store, self.lock, [("cred-exp", rec)])
+        os.chmod(self.store, 0o600)
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        new = activations_module.extend_activation(self.store, self.lock, "e" * 32, 7, now=now)
+        self.assertEqual(datetime.fromisoformat(new), now + timedelta(days=7))
+
+    def test_list_filters_and_pagination(self):
+        sid, csrf = self._login()
+        for _ in range(3):
+            self._create(sid, csrf)
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+
+        def get(query):
+            status, _, body = self._req("GET", "/admin/activations" + query, h)
+            return status, json.loads(body)
+
+        status, data = get("")
+        self.assertEqual((status, data["total"], len(data["activations"])), (200, 5, 5))
+        status, data = get("?limit=2&offset=0")
+        self.assertEqual((len(data["activations"]), data["total"], data["limit"], data["offset"]), (2, 5, 2, 0))
+        status, page2 = get("?limit=2&offset=2")
+        self.assertNotEqual(data["activations"][0]["activation_id"], page2["activation_id"] if "activation_id" in page2 else page2["activations"][0]["activation_id"])
+        status, data = get("?status=REVOKED")
+        self.assertEqual([a["activation_id"] for a in data["activations"]], [_ID2])
+        status, data = get("?q=" + _ID[:6])
+        self.assertEqual([a["activation_id"] for a in data["activations"]], [_ID])
+        status, data = get("?q=ffffffffffffffff")
+        self.assertEqual((data["total"], data["activations"]), (0, []))
+        for bad in ("?limit=0", "?limit=101", "?offset=-1", "?limit=x", "?status=bogus", "?q=NOTHEX!", "?foo=1", "?limit=1&limit=2"):
+            self.assertEqual(get(bad)[0], 400, bad)
+
+    def test_new_endpoints_share_the_mutation_limiter(self):
+        self._limit("admin_mutation_limiter", 1)
+        sid, csrf = self._login()
+        self._create(sid, csrf)
+        status, _, body = self._post_json("/admin/activations", sid, csrf, {"max_devices": 1, "expires_in_days": 1})
+        self.assertEqual((status, json.loads(body)["error"]), (429, "rate_limited"))
+        with open(self.store, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

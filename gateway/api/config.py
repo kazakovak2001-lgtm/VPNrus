@@ -187,6 +187,10 @@ class AppConfig:
     # Blank (the default) means admin authentication is not configured and
     # always fails closed with 503 for any admin endpoint.
     admin_secret_file: str = ""
+    # admin_viewer_secret_file: optional second secret (same format) that
+    # logs in as the read-only "viewer" role. Requires admin_secret_file and
+    # must differ from it.
+    admin_viewer_secret_file: str = ""
     # admin_enabled: boolean derived from admin_secret_file presence.
     # Used internally; not part of the serialized config.
     admin_enabled: bool = False
@@ -884,6 +888,19 @@ def load_config(env=None):
         except admin_auth.ConfigError as exc:
             raise ConfigError(f"{_ENV_PREFIX}ADMIN_SECRET_FILE: {exc}")
 
+    admin_viewer_secret_file = _get(env, "ADMIN_VIEWER_SECRET_FILE")
+    if admin_viewer_secret_file:
+        if not admin_secret_file:
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_VIEWER_SECRET_FILE requires {_ENV_PREFIX}ADMIN_SECRET_FILE")
+        if not os.path.isabs(admin_viewer_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_VIEWER_SECRET_FILE must be an absolute path: {admin_viewer_secret_file!r}")
+        try:
+            viewer_secret = admin_auth.read_admin_secret(admin_viewer_secret_file)
+        except admin_auth.ConfigError as exc:
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_VIEWER_SECRET_FILE: {exc}")
+        if viewer_secret == admin_auth.read_admin_secret(admin_secret_file):
+            raise ConfigError(f"{_ENV_PREFIX}ADMIN_VIEWER_SECRET_FILE must differ from {_ENV_PREFIX}ADMIN_SECRET_FILE")
+
     # B46-4P.2 - see AppConfig.hysteria2_auth_backend_port's own docs.
     hysteria2_auth_backend_port_raw = _get(env, "HYSTERIA2_AUTH_BACKEND_PORT")
     hysteria2_auth_backend_port = 0
@@ -968,6 +985,7 @@ def load_config(env=None):
         hysteria2_auth_backend_port=hysteria2_auth_backend_port,
         hysteria2_obfs_password=hysteria2_obfs_password,
         admin_secret_file=admin_secret_file,
+        admin_viewer_secret_file=admin_viewer_secret_file,
         gateway_self_addresses=_parse_gateway_self_addresses(_get(env, "GATEWAY_SELF_ADDRESSES")),
         admin_enabled=admin_enabled,
     )

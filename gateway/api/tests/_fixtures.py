@@ -119,6 +119,7 @@ def make_app_config(
     field_enrollment_index_lock_path="",
     field_enrollment_wrap_key_file="",
     admin_secret_file="",
+    admin_viewer_secret_file="",
 ):
     token_store_path = os.path.join(tmp_dir, "enrollment-tokens.json")
     token_lock_path = os.path.join(tmp_dir, ".tokens.lock")
@@ -169,6 +170,7 @@ def make_app_config(
         field_enrollment_index_lock_path=field_enrollment_index_lock_path,
         field_enrollment_wrap_key_file=field_enrollment_wrap_key_file,
         admin_secret_file=admin_secret_file,
+        admin_viewer_secret_file=admin_viewer_secret_file,
         admin_enabled=bool(admin_secret_file),
     )
 

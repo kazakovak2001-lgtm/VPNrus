@@ -1092,6 +1092,49 @@ def revoke_activation(store_path, lock_path, activation_id):
             return True
 
 
+class ActivationNotExtendableError(Exception):
+    """extend_activation refused for a definite, non-error reason: `reason`
+    is "revoked" (never silently un-expire a revoked activation) or
+    "not_expiring" (nothing to extend)."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def extend_activation(store_path, lock_path, activation_id, days, now=None):
+    """Push an expiring, non-revoked activation's expires_at `days` later,
+    counted from max(current expiry, now) so extending an already-expired
+    activation yields a future date. Same lock order as revoke_activation
+    (per-activation lock, then the global store lock, re-validated).
+    Returns the new expires_at ISO string. KeyError if unknown."""
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
+        raise ValueError("days must be a positive integer")
+    now = now or datetime.now(timezone.utc)
+
+    data = read_store_shared(store_path, lock_path)
+    digest = next((d for d, r in data.items() if r["activation_id"] == activation_id), None)
+    if digest is None:
+        raise KeyError(f"no activation found with activation_id {activation_id}")
+
+    with per_activation_lock(store_path, digest):
+        with _exclusive_lock(lock_path, create=False):
+            data = _read_and_validate_under_lock(store_path)
+            record = data.get(digest)
+            if record is None:
+                raise KeyError(f"no activation found with activation_id {activation_id}")
+            if record["status"] == REVOKED:
+                raise ActivationNotExtendableError("revoked")
+            if record["expires_at"] is None:
+                raise ActivationNotExtendableError("not_expiring")
+            from datetime import timedelta
+            base = max(parse_expires_at(record["expires_at"]), now)
+            new_expires_at = (base + timedelta(days=days)).isoformat()
+            data[digest] = {**record, "expires_at": new_expires_at}
+            _atomic_write_store_or_raise(store_path, data)
+            return new_expires_at
+
+
 def find_by_activation_id(store_path, lock_path, activation_id):
     data = read_store_shared(store_path, lock_path)
     for record in data.values():

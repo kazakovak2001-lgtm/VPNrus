@@ -60,7 +60,38 @@ export async function logout(): Promise<void> {
   }
 }
 
-export const status = () => call<{ status: string; session_exists: boolean }>("GET", "/admin/status");
-export const listActivations = () => call<{ activations: Activation[] }>("GET", "/admin/activations");
+export const status = () =>
+  call<{ status: string; session_exists: boolean; role: "admin" | "viewer" | null }>("GET", "/admin/status");
+export interface ListQuery {
+  q: string;
+  status: string;
+  limit: number;
+  offset: number;
+}
+
+export interface ListResult {
+  activations: Activation[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export const listActivations = (query: ListQuery) => {
+  const params = new URLSearchParams({ limit: String(query.limit), offset: String(query.offset) });
+  if (query.q) params.set("q", query.q);
+  if (query.status) params.set("status", query.status);
+  return call<ListResult>("GET", `/admin/activations?${params.toString()}`);
+};
+
 export const revoke = (id: string) =>
   call<{ status: string }>("POST", `/admin/activations/${id}/revoke`, undefined, true);
+
+// The credential in the response is shown to the administrator exactly once
+// and must not be persisted anywhere (no storage, no logging).
+export const createActivation = (maxDevices: number, expiresInDays: number | null) =>
+  call<{ activation_id: string; credential: string }>(
+    "POST", "/admin/activations", { max_devices: maxDevices, expires_in_days: expiresInDays }, true,
+  );
+
+export const extendActivation = (id: string, days: number) =>
+  call<{ expires_at: string }>("POST", `/admin/activations/${id}/extend`, { days }, true);

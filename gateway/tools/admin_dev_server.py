@@ -35,6 +35,7 @@ def main():
         with os.fdopen(fd, "w") as fh:
             fh.write("".join(secrets.choice(alphabet) for _ in range(32)) + "\n")
 
+    viewer_path = os.path.join(state, "viewer-secret")
     store = os.path.join(state, "activations.json")
     lock = store + ".lock"
     if not os.path.exists(store):
@@ -50,6 +51,8 @@ def main():
         provision_script_path="/bin/false", subprocess_timeout_seconds=5.0,
         api_port=args.port, activation_store_path=store, activation_lock_path=lock,
         admin_secret_file=secret_path, admin_enabled=True,
+        # Optional read-only role: create <state-dir>/viewer-secret (same format) to enable it.
+        admin_viewer_secret_file=viewer_path if os.path.exists(viewer_path) else "",
     )
     srv = server.build_server(cfg)
     print(f"admin dev API on http://127.0.0.1:{args.port}  (password file: {secret_path})")
