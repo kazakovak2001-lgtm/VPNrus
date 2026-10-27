@@ -57,6 +57,25 @@ class RequestSummaryTests(unittest.TestCase):
         self.assertEqual(s["latency_seconds"], "unavailable")
         self.assertEqual(s["error_rate_5xx"], 0.5)
 
+    def test_by_endpoint_uses_only_known_api_paths(self):
+        lines = CP_LINES + [
+            '2026-10-27T11:54:00+00:00 cp.example "GET /wp-login.php?x=1" 404 10 0.001',
+            '2026-10-27T11:54:30+00:00 cp.example "GET /v1/manifest?token=abc" 401 10 0.002',
+        ]
+        s = cr.summarize_requests(lines, cr.parse_cp_log_line, SINCE, 900)
+        self.assertEqual(s["by_endpoint"]["/v1/manifest"], {"requests": 3, "200": 1, "502": 1, "401": 1})
+        self.assertEqual(s["by_endpoint"]["/v1/activate"], {"requests": 2, "200": 1, "429": 1})
+        self.assertEqual(s["by_endpoint"]["other"], {"requests": 1, "404": 1})
+        self.assertNotIn("wp-login", json.dumps(s))
+
+    def test_combined_by_endpoint_and_malformed_request_line(self):
+        lines = COMBINED_LINES + [
+            '192.0.2.1 - - [27/Oct/2026:11:57:00 +0000] "\\x16\\x03\\x01" 400 0 "-" "-"',
+        ]
+        s = cr.summarize_requests(lines, cr.parse_combined_line, SINCE, 900)
+        self.assertEqual(s["by_endpoint"]["/v1/manifest"], {"requests": 1, "200": 1})
+        self.assertEqual(s["by_endpoint"]["other"], {"requests": 2, "503": 1, "400": 1})
+
     def test_empty_window_reports_none_not_zero_error_rate(self):
         s = cr.summarize_requests([], cr.parse_cp_log_line, SINCE, 900)
         self.assertEqual(s["requests"], 0)
@@ -72,7 +91,7 @@ class AwgAndHostTests(unittest.TestCase):
     def test_awg_dump_counts_only_recent_handshakes_as_active(self):
         s = cr.parse_awg_dump(AWG_DUMP, int(NOW.timestamp()))
         self.assertEqual((s["peers_configured"], s["peers_active"]), (3, 1))
-        self.assertEqual((s["rx_bytes_total"], s["tx_bytes_total"]), (1010, 2020))
+        self.assertEqual((s["rx_bytes_since_interface_up"], s["tx_bytes_since_interface_up"]), (1010, 2020))
 
     def test_meminfo_and_loadavg(self):
         mem = cr.parse_meminfo("MemTotal: 2048000 kB\nMemFree: 1 kB\nMemAvailable: 512000 kB\n")
@@ -106,7 +125,8 @@ class ReportTests(unittest.TestCase):
             with open(comb, "w", encoding="utf-8") as h:
                 h.write("\n".join(COMBINED_LINES))
             text = json.dumps(cr.build_report(self._args(cp_log=[cp], combined_log=[comb]), now=NOW))
-        for secret in ("203.0.113.7", "198.51.100.9", "SECRET", "/v1/manifest", "PRIVKEY", "peerA"):
+        # Fixed public API path names may appear; anything request-specific may not.
+        for secret in ("203.0.113.7", "198.51.100.9", "SECRET", "?t=", '"/x"', "PRIVKEY", "peerA"):
             self.assertNotIn(secret, text)
 
     def test_missing_sources_are_unavailable_not_zero(self):

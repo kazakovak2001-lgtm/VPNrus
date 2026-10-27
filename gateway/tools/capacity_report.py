@@ -37,16 +37,35 @@ import sys
 
 AWG_ACTIVE_SECONDS = 180  # WireGuard re-handshakes every 2 min while traffic flows
 
+# The gateway's own API paths (gateway/edge nginx `location =` blocks). Any
+# other path - scanners, typos, probes - is reported only as "other", so a
+# request path never reaches the output.
+KNOWN_ENDPOINTS = (
+    "/v1/activate",
+    "/v1/field-enroll",
+    "/v1/hysteria-profile",
+    "/v1/ingress-profile",
+    "/v1/manifest",
+    "/v1/peers",
+    "/v1/tunnel-probe",
+    "/v1/xray-profile",
+)
+
 _CP_LOG = re.compile(
-    r'^(?P<time>\S+) \S+ "(?P<method>\S+) [^"]*" (?P<status>\d{3}) \d+ (?P<rt>[\d.]+)$'
+    r'^(?P<time>\S+) \S+ "\S+ (?P<uri>[^" ]*)[^"]*" (?P<status>\d{3}) \d+ (?P<rt>[\d.]+)$'
 )
 _COMBINED = re.compile(
-    r'^\S+ \S+ \S+ \[(?P<time>[^\]]+)\] "[^"]*" (?P<status>\d{3}) '
+    r'^\S+ \S+ \S+ \[(?P<time>[^\]]+)\] "(?:\S+ (?P<uri>[^" ]*))?[^"]*" (?P<status>\d{3}) '
 )
+
+
+def endpoint_label(uri):
+    path = (uri or "").split("?", 1)[0]
+    return path if path in KNOWN_ENDPOINTS else "other"
 
 
 def parse_cp_log_line(line):
-    """-> (datetime, status, request_time_seconds) or None for an unparsable line."""
+    """-> (datetime, status, request_time_seconds, endpoint) or None for an unparsable line."""
     m = _CP_LOG.match(line.strip())
     if not m:
         return None
@@ -54,11 +73,11 @@ def parse_cp_log_line(line):
         when = dt.datetime.fromisoformat(m.group("time"))
     except ValueError:
         return None
-    return when, int(m.group("status")), float(m.group("rt"))
+    return when, int(m.group("status")), float(m.group("rt")), endpoint_label(m.group("uri"))
 
 
 def parse_combined_line(line):
-    """-> (datetime, status, None) or None. The client address is never kept."""
+    """-> (datetime, status, None, endpoint) or None. The client address is never kept."""
     m = _COMBINED.match(line.strip())
     if not m:
         return None
@@ -66,7 +85,7 @@ def parse_combined_line(line):
         when = dt.datetime.strptime(m.group("time"), "%d/%b/%Y:%H:%M:%S %z")
     except ValueError:
         return None
-    return when, int(m.group("status")), None
+    return when, int(m.group("status")), None, endpoint_label(m.group("uri"))
 
 
 def percentile(sorted_values, p):
@@ -81,6 +100,7 @@ def summarize_requests(lines, parser, since, window_seconds):
     """Aggregate one log over [since, now]. Unparsable lines are counted, not guessed."""
     statuses = {"2xx": 0, "3xx": 0, "4xx": 0, "429": 0, "5xx": 0}
     latencies, total, unparsed = [], 0, 0
+    by_endpoint = {}
     for line in lines:
         if not line.strip():
             continue
@@ -88,7 +108,7 @@ def summarize_requests(lines, parser, since, window_seconds):
         if parsed is None:
             unparsed += 1
             continue
-        when, status, request_time = parsed
+        when, status, request_time, endpoint = parsed
         if when < since:
             continue
         total += 1
@@ -96,6 +116,10 @@ def summarize_requests(lines, parser, since, window_seconds):
             statuses["429"] += 1
         elif 200 <= status < 600:
             statuses[f"{status // 100}xx"] += 1
+        bucket = by_endpoint.setdefault(endpoint, {"requests": 0})
+        bucket["requests"] += 1
+        code = str(status)
+        bucket[code] = bucket.get(code, 0) + 1
         if request_time is not None:
             latencies.append(request_time)
     latencies.sort()
@@ -106,6 +130,7 @@ def summarize_requests(lines, parser, since, window_seconds):
         "status": statuses,
         "error_rate_5xx": round(errors / total, 4) if total else None,
         "rate_limited_429": statuses["429"],
+        "by_endpoint": by_endpoint,
         "latency_seconds": (
             {p: percentile(latencies, q) for p, q in (("p50", 50), ("p95", 95), ("p99", 99))}
             if latencies else "unavailable"
@@ -135,8 +160,9 @@ def parse_awg_dump(text, now_epoch, active_seconds=AWG_ACTIVE_SECONDS):
         "peers_configured": peers,
         "peers_active": active,
         "active_window_seconds": active_seconds,
-        "rx_bytes_total": rx,
-        "tx_bytes_total": tx,
+        # Cumulative since the interface (or peer) came up - not traffic in this window.
+        "rx_bytes_since_interface_up": rx,
+        "tx_bytes_since_interface_up": tx,
     }
 
 
