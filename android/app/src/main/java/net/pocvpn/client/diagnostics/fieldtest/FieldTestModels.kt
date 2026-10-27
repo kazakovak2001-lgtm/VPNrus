@@ -191,6 +191,8 @@ data class FieldTestReport(
     val logs: List<String> = emptyList(),
     /** B-WL7 checks (DataPlaneCheckLog.reportJson); optional - absent from the JSON when null. */
     val dataPlaneChecks: JSONObject? = null,
+    /** B-WL7 layer 3a checks (TunnelProtectionLog.reportJson); optional - absent from the JSON when null. */
+    val protectionChecks: JSONObject? = null,
 ) {
     companion object {
         const val SCHEMA = "nova-field-test"
@@ -301,6 +303,7 @@ fun FieldTestReport.toJson(): JSONObject {
     root.put("crashes", crashes ?: JSONObject.NULL)
     root.put("logs", JSONArray(logs))
     dataPlaneChecks?.let { root.put("dataPlaneChecks", it) }
+    protectionChecks?.let { root.put("protectionChecks", it) }
     return root
 }
 
