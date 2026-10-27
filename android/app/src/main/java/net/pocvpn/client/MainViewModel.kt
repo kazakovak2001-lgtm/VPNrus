@@ -4135,8 +4135,9 @@ class MainViewModel(
         supportDiagnosticsRecorder?.startSession(
             buildDiagnosticStartContext(rawRestrictionClass = restrictionClass(), stabilizedRestrictionClass = snapshot.restrictionClass),
         )
+        val trustedManifestSource = manifestRepository?.trustedSource()
         supportDiagnosticsRecorder?.recordManifestSourceSelected(
-            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(manifestRepository?.trustedSource()),
+            net.pocvpn.client.diagnostics.support.mapManifestSourceToManifestSourceKind(trustedManifestSource),
         )
         supportDiagnosticsRecorder?.recordCandidateRanked(attempts.size)
         if (attempts.isEmpty()) {
@@ -4157,7 +4158,12 @@ class MainViewModel(
                 supportDiagnosticsRecorder?.finishRestrictedNetworkExhaustion()
                 controller.rejectPreflight(VpnError.RestrictedNetworkNoViableRelay, "Restricted network suspected (possible fixed allowlist) and no eligible relay path exists")
             } else {
-                supportDiagnosticsRecorder?.finishFailed(net.pocvpn.client.diagnostics.support.mapVpnErrorToFailureReason(VpnError.NoCandidateAvailable))
+                supportDiagnosticsRecorder?.finishFailed(
+                    net.pocvpn.client.diagnostics.support.mapNoCandidateToFailureReason(
+                        manifestRepositoryWired = manifestRepository != null,
+                        trustedSource = trustedManifestSource,
+                    ),
+                )
                 controller.rejectPreflight(VpnError.NoCandidateAvailable, "No automatic gateway candidate available")
             }
             return
