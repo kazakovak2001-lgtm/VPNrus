@@ -18,8 +18,23 @@ React + TypeScript + Vite + Tailwind client for the `pocvpn-api` `/admin/*` endp
 
 `/admin/*` is proxied to `http://127.0.0.1:8787` (override with `VPN_ADMIN_API`).
 
+## Activation management
+- **Create** (`POST /admin/activations`, `{max_devices 1-100, expires_in_days 1-3650 | null}`): the
+  credential is returned once (`Cache-Control: no-store`), is shown once in the UI, is stored only as a
+  digest, and is never written to logs, the audit log or browser storage.
+- **Extend** (`POST /admin/activations/<id>/extend`, `{days 1-3650}`): counted from the later of the
+  current expiry and now. Refused with 409 for revoked or never-expiring activations.
+- **List**: `GET /admin/activations?q=<hex id fragment>&status=ACTIVE|EXPIRED|REVOKED&limit=1-100&offset=N`.
+- All mutations require session + CSRF + same-origin and share the mutation rate limit; each is audited
+  (`create`, `extend`, `revoke`) by activation id only.
+
+## Device unbind - decision
+Not implemented on purpose. Unbinding a device frees a slot but does not remove the WireGuard/Xray
+credential already provisioned on the gateway, so the device would keep working. Until gateway-side
+removal exists, the only real cut-off is revoking the whole activation.
+
 ## Not implemented
-Admin/viewer roles (single shared password), per-device revocation, traffic stats,
+Admin/viewer roles (single shared password), per-device unbind, traffic stats,
 production deployment (UI is not served by nginx yet).
 
 ## Rate limits
