@@ -1167,6 +1167,46 @@ compared and rolled back. Stop if 2096 is taken and pick another free port
 Same method as the 2026-10-08 Salamander rollout: back up and replace only
 the changed files, then compile-check.
 
+**1a. Package the four files on the owner's PC** (PowerShell, repository
+root). `git archive` takes them byte-exact from the commit itself, so the
+local branch, working tree and line-ending settings do not matter:
+
+```
+git cat-file -e 21e70783c63cb021c2fd606492b2d09268e56d53^{commit}
+git archive --format=tar -o rx-api-21e7078.tar 21e70783c63cb021c2fd606492b2d09268e56d53 gateway/api/config.py gateway/api/handler.py gateway/api/xray_activation.py gateway/api/xray_config_renderer.py
+(Get-FileHash -Algorithm SHA256 rx-api-21e7078.tar).Hash.ToLower()   # record as RXSHA
+scp rx-api-21e7078.tar <admin>@<gateway>:rx-api-21e7078.tar
+```
+
+`<admin>@<gateway>` is the Stockholm login, as in 6b. The archive holds
+only public source code, no secrets.
+
+**1b. On Stockholm: verify and stage** in a fresh temporary directory,
+before anything live changes (`export RXSHA=<hash from 1a>` first). The
+block stops unless the hash matches and the archive holds exactly the four
+expected files, each non-empty:
+
+```
+case "${RXSHA:-}" in *[!0-9a-f]*|"") false ;; *) [ ${#RXSHA} -eq 64 ] ;; esac && {
+  RX="$HOME/rx-api-21e7078" &&
+  echo "$RXSHA  $HOME/rx-api-21e7078.tar" | sha256sum -c - &&
+  [ "$(tar -tf "$HOME/rx-api-21e7078.tar" | grep -v '/$' | sort | tr '\n' ' ')" = "gateway/api/config.py gateway/api/handler.py gateway/api/xray_activation.py gateway/api/xray_config_renderer.py " ] &&
+  mkdir "$RX" &&
+  tar -xf "$HOME/rx-api-21e7078.tar" -C "$RX" &&
+  test -s "$RX/gateway/api/config.py" && test -s "$RX/gateway/api/handler.py" &&
+  test -s "$RX/gateway/api/xray_activation.py" && test -s "$RX/gateway/api/xray_config_renderer.py" &&
+  echo "staged OK in $RX"
+}
+```
+
+`mkdir` (no `-p`) fails if an earlier attempt left the directory: inspect
+and remove it deliberately, then rerun.
+
+**1c. Back up, install, compile-check, restart** - only after "staged OK".
+The backup block is unchanged; the install block re-checks `TS`, the
+staged files and the backups, installs as `root:root 0644`, and restarts
+`pocvpn-api` only if `py_compile` passed:
+
 ```
 cd /opt/pocvpn/gateway
 TS=$(date -u +%Y%m%dT%H%M%SZ); export TS   # the ONLY place TS is generated
@@ -1177,10 +1217,25 @@ case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][
   sudo cp -p api/xray_config_renderer.py "api/xray_config_renderer.py.backup-rx-$TS" &&
   echo "backups done - record TS"
 }
-# only after "backups done": copy the four files from main 21e7078 into place (root:root 0644), then:
-sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py \
-  && sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+# only after "backups done":
+case "${TS:-}" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) echo "TS=$TS" ;; *) echo "TS unset/invalid - STOP" >&2; false ;; esac && {
+  RX="$HOME/rx-api-21e7078/gateway/api" &&
+  test -s "$RX/config.py" && sudo test -f "api/config.py.backup-rx-$TS" &&
+  test -s "$RX/handler.py" && sudo test -f "api/handler.py.backup-rx-$TS" &&
+  test -s "$RX/xray_activation.py" && sudo test -f "api/xray_activation.py.backup-rx-$TS" &&
+  test -s "$RX/xray_config_renderer.py" && sudo test -f "api/xray_config_renderer.py.backup-rx-$TS" &&
+  sudo install -o root -g root -m 0644 "$RX/config.py" api/config.py &&
+  sudo install -o root -g root -m 0644 "$RX/handler.py" api/handler.py &&
+  sudo install -o root -g root -m 0644 "$RX/xray_activation.py" api/xray_activation.py &&
+  sudo install -o root -g root -m 0644 "$RX/xray_config_renderer.py" api/xray_config_renderer.py &&
+  sudo -u pocvpn-api python3 -m py_compile api/config.py api/handler.py api/xray_activation.py api/xray_config_renderer.py &&
+  sudo systemctl restart pocvpn-api && systemctl is-active pocvpn-api
+}
 ```
+
+If `py_compile` fails, nothing was restarted: restore the four
+`api/*.py.backup-rx-$TS` files (rollback A) before doing anything else.
+Remove `~/rx-api-21e7078*` once step 1 is confirmed.
 
 Check: `/v1/manifest` still 200; `/v1/xray-profile` with
 `{"transport":"reality-xhttp"}` and any bearer value answers **503
