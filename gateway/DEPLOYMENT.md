@@ -1141,6 +1141,7 @@ helpers block below:
 | `TS` | step 1b, ONLY there | UTC `YYYYMMDDTHHMMSSZ`; names every backup, so rollbacks find exactly this rollout's backups |
 | `RXSHA` | step 1a | SHA-256 of the API snapshot archive |
 | `SHA9`, `SHA10` | step 6a | SHA-256 of the signed v9 / v10 artifacts |
+| `SHA7` | step 6c | SHA-256 of the committed signed v7 (`endpoint-manifest-2026-10-08-v7.bin`), the manifest served before v9 |
 
 ```
 export XPORT=<step 0> TS=<step 1b> RXSHA=<step 1a>    # SHA9/SHA10 from step 6a when needed
@@ -1621,16 +1622,25 @@ beside it first.
 
 | | JSON (committed) | Content |
 |---|---|---|
-| v9 | `gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json` | v8 + ONE Stockholm binding `{"kindOrdinal": 7, "host": "16.170.208.231", "port": 2096}` |
-| v10 | `gateway/tools/production_manifest_2026-10-27_v10_ROLLBACK_DRAFT.json` | v8's endpoints unchanged (no kind 7), `manifestVersion: 10`, v9's key, `issuedAt` v9 + 1 ms, v9's expiry |
+| v7 (served) | `gateway/tools/production_manifest_2026-10-08_v7.json` + signed `endpoint-manifest-2026-10-08-v7.bin` | what both gateways' `/v1/manifest` returns today (Stockholm verified 2026-10-27: sha256 `b5f74d8e…` = the committed `.bin`) |
+| v9 | `gateway/tools/production_manifest_2026-10-27_v9_DRAFT.json` | v7 + ONE Stockholm binding `{"kindOrdinal": 7, "host": "16.170.208.231", "port": 2096}`, `manifestVersion: 9`, new `issuedAt` |
+| v10 | `gateway/tools/production_manifest_2026-10-27_v10_ROLLBACK_DRAFT.json` | v7's endpoints unchanged (no kind 7), `manifestVersion: 10`, v9's key, `issuedAt` v9 + 1 ms, v9's expiry |
 
-Both use `signingKeyId: prod-manifest-key-2026-09-01`, the app's bootstrap
-anchor. The v9 binding's `port` MUST equal `XPORT`: if step 0 chose
+v8 (`production_manifest_2026-10-09_v8.json`, Frankfurt REALITY moved to
+443) was never signed or served and is NOT a base here: building on it
+would point every client at a Frankfurt port that is not deployed. Once
+v9/v10 are signed, that Frankfurt change can only ship as a new manifest
+(> v10) built on whatever is served then.
+
+v7, v9 and v10 all use `signingKeyId: prod-manifest-key-2026-09-01`, the
+app's bootstrap anchor. The v9 binding's `port` MUST equal `XPORT`: if step 0 chose
 another port, change it in the v9 JSON first, then regenerate the test
 fixtures (`python3 gateway/tools/tests/manifest_rollback_fixtures.py`)
 and update the `2096` expectation in `RealityXhttpManifestRollbackChainTest`;
-`test_manifest_rollback_fixtures` keeps v10 equal to its derivation from
-v8/v9 and fails on any drift. The client-side chain v8 -> v9 -> v8
+`test_manifest_rollback_fixtures` checks that v7's JSON is byte-for-byte the
+canonical content of the committed signed v7 artifact, that v9 is exactly
+v7 plus that one binding, that Frankfurt REALITY stays on 2053, and that
+v10 equals its derivation from v7/v9. The client-side chain v7 -> v9 -> v7
 rejected -> v10 -> v9 rejected runs against the real
 `EndpointManifestRepository`/`Ed25519ManifestVerifier` in
 `RealityXhttpManifestRollbackChainTest` - with a TEST key: it proves
@@ -1706,24 +1716,25 @@ scp gateway/tools/endpoint-manifest-2026-10-27-v10-rollback.bin <admin>@<gateway
 ```
 
 **6c. Install on EACH gateway** (Stockholm, then Frankfurt; both serve
-`/v1/manifest`), with `TS`, `SHA9`, `SHA10` exported and the helpers
-pasted. Order inside the block: both hashes verified; v10 installed as
-the standby `endpoint-manifest-v10-rollback.bin` (not served) and
-re-verified; only then the served v8 backed up and v9 installed, owner,
-mode and hash re-checked. The `.bin` files are public, their hashes may
-be printed:
+`/v1/manifest`), with `TS`, `SHA9`, `SHA10` and `SHA7` exported
+(`SHA7` = `sha256sum gateway/tools/endpoint-manifest-2026-10-08-v7.bin`,
+expected `b5f74d8e…`) and the helpers pasted. Order inside the block: both
+hashes verified; the served manifest checked to be exactly v7 (the base v9
+and v10 were built on) and backed up; v10 installed as the standby
+`endpoint-manifest-v10-rollback.bin` (not served) and re-verified; only
+then v9 installed, owner, mode and hash re-checked. The `.bin` files are public, their hashes may be printed:
 
 <!-- rx-block:manifest-install -->
 
 ```
-rx_ts_ok && rx_sha_ok "${SHA9:-}" && rx_sha_ok "${SHA10:-}" && {
+rx_ts_ok && rx_sha_ok "${SHA9:-}" && rx_sha_ok "${SHA10:-}" && rx_sha_ok "${SHA7:-}" && {
   echo "$SHA9  $HOME/endpoint-manifest-v9.bin" | sha256sum -c - &&
   echo "$SHA10  $HOME/endpoint-manifest-v10.bin" | sha256sum -c - &&
+  { sudo test -e "$MD/endpoint-manifest.bin.v7-backup-$TS" ||
+    { echo "$SHA7  $MD/endpoint-manifest.bin" | sudo sha256sum -c - &&
+      sudo cp -p "$MD/endpoint-manifest.bin" "$MD/endpoint-manifest.bin.v7-backup-$TS"; }; } &&
   sudo install -o root -g pocvpn-api -m 0640 "$HOME/endpoint-manifest-v10.bin" "$MD/endpoint-manifest-v10-rollback.bin" &&
   echo "$SHA10  $MD/endpoint-manifest-v10-rollback.bin" | sudo sha256sum -c - &&
-  { sudo test -e "$MD/endpoint-manifest.bin.v8-backup-$TS" ||
-    { ! echo "$SHA9  $MD/endpoint-manifest.bin" | sudo sha256sum -c --status - &&
-      sudo cp -p "$MD/endpoint-manifest.bin" "$MD/endpoint-manifest.bin.v8-backup-$TS"; }; } &&
   sudo install -o root -g pocvpn-api -m 0640 "$HOME/endpoint-manifest-v9.bin" "$MD/endpoint-manifest.bin.rx-tmp-$TS" &&
   sudo mv -f "$MD/endpoint-manifest.bin.rx-tmp-$TS" "$MD/endpoint-manifest.bin" &&
   [ "$(sudo stat -c '%U:%G %a' "$MD/endpoint-manifest.bin")" = "root:pocvpn-api 640" ] &&
@@ -1733,9 +1744,10 @@ rx_ts_ok && rx_sha_ok "${SHA9:-}" && rx_sha_ok "${SHA10:-}" && {
 ```
 
 Any failed check stops the block; the served file changes only at the
-`mv` (atomic rename). The v8 backup is written once: a rerun with the
-same `TS` keeps the existing `v8-backup-$TS`, and with no backup yet the
-block refuses to back up a served file that already is v9. `pocvpn-api` reads it per request (no restart).
+`mv` (atomic rename). The v7 backup is written once: a rerun with the
+same `TS` keeps the existing `v7-backup-$TS`, and with no backup yet the
+block refuses to continue unless the served file is exactly v7 (`SHA7`) -
+a served v8, v9 or anything else stops it before any change. `pocvpn-api` reads it per request (no restart).
 Then, from the owner's PC, for EACH gateway's public address:
 
 ```
@@ -1788,7 +1800,8 @@ before switching to it.
        says `converged`.
 - **B - after step 6**: on BOTH gateways, the manifest block below (serves
   the standby v10; clients drop kind 7 at their next refresh), then
-  rollback A. Reinstalling `endpoint-manifest.bin.v8-backup-$TS` only
+  rollback A. v10 gives every device v7's endpoints again. Reinstalling
+  `endpoint-manifest.bin.v7-backup-$TS` only
   helps devices that never fetched v9 - every other device rejects it as
   a downgrade. A device still holding v9 sees the inbound gone and fails
   that one attempt closed; other transports are unaffected.
@@ -1904,7 +1917,10 @@ templates, so edit the DEPLOYED files, never replace them with templates):
    client on 443 connects, the Stockholm relay still works (2053).
 7. Sign v8 (`gateway/tools/production_manifest_2026-10-09_v8.json`, only
    Frankfurt XRAY_REALITY 2053 -> 443; key `prod-manifest-key-2026-09-14`),
-   install on both gateways like v7, verify the served hash.
+   install on both gateways like v7, verify the served hash. If the
+   Stockholm XHTTP v9/v10 have been served by then, v8 is rejected as a
+   downgrade: rebuild this change on the served manifest as a version
+   above 10 instead.
 8. Devices: update the app; it picks up v8 by itself. CZ test, then RU tester.
 
 Rollback: restore the three nginx backups, remove the include, `nginx -t`,

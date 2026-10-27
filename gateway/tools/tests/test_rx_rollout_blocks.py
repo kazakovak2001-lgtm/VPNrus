@@ -161,6 +161,7 @@ class RxRolloutBlocksTest(unittest.TestCase):
         full_env = {
             "PATH": f"{self.bin}:/usr/bin:/bin", "HOME": self.home, "RX_LOG": self.log,
             "GW": self.gw, "ENVF": self.envf, "MD": self.etc, "LC_ALL": "C",
+            "SHA7": hashlib.sha256(b"v7").hexdigest(),
             "XENV": self.xenv, "PROC": self.proc, "RX_XRAY_PID": "4242", "RX_XRAY_EXECSTART": self.xray_bin,
         }
         full_env.update(env)
@@ -472,7 +473,7 @@ class RxRolloutBlocksTest(unittest.TestCase):
 
     def _manifests(self):
         served = os.path.join(self.etc, "endpoint-manifest.bin")
-        self._write(served, b"v8", "wb")
+        self._write(served, b"v7", "wb")  # what production serves today
         os.chmod(served, 0o640)
         self._write(os.path.join(self.home, "endpoint-manifest-v9.bin"), b"v9", "wb")
         self._write(os.path.join(self.home, "endpoint-manifest-v10.bin"), b"v10", "wb")
@@ -485,25 +486,30 @@ class RxRolloutBlocksTest(unittest.TestCase):
         self.assertEqual(self._read(served, "rb"), b"v9")
         self.assertEqual(oct(os.stat(served).st_mode & 0o777), "0o640")
         self.assertEqual(self._read(os.path.join(self.etc, "endpoint-manifest-v10-rollback.bin"), "rb"), b"v10")
-        self.assertEqual(self._read(os.path.join(self.etc, f"endpoint-manifest.bin.v8-backup-{_TS}"), "rb"), b"v8")
+        self.assertEqual(self._read(os.path.join(self.etc, f"endpoint-manifest.bin.v7-backup-{_TS}"), "rb"), b"v7")
 
         self.assertIn("v10 served", self._run("rollback-manifest", TS=_TS, SHA10=sha10))
         self.assertEqual(self._read(served, "rb"), b"v10")
 
-    def test_manifest_install_rerun_keeps_the_original_v8_backup(self):
+    def test_manifest_install_rerun_keeps_the_original_v7_backup(self):
         served, sha9, sha10 = self._manifests()
-        backup = os.path.join(self.etc, f"endpoint-manifest.bin.v8-backup-{_TS}")
+        backup = os.path.join(self.etc, f"endpoint-manifest.bin.v7-backup-{_TS}")
         self.assertIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
         self._write(os.path.join(self.home, "endpoint-manifest-v9.bin"), b"v9", "wb")
         self._write(os.path.join(self.home, "endpoint-manifest-v10.bin"), b"v10", "wb")
         self.assertIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
-        self.assertEqual(self._read(backup, "rb"), b"v8")
+        self.assertEqual(self._read(backup, "rb"), b"v7")
 
-    def test_manifest_install_refuses_to_back_up_a_served_v9_as_v8(self):
+    def test_manifest_install_refuses_unless_the_served_manifest_is_v7(self):
+        # v9/v10 are built on v7; a served v9, the never-deployed v8 or
+        # anything else stops the block before any file changes.
         served, sha9, sha10 = self._manifests()
-        self._write(served, b"v9", "wb")
-        self.assertNotIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
-        self.assertFalse(os.path.exists(os.path.join(self.etc, f"endpoint-manifest.bin.v8-backup-{_TS}")))
+        for other in (b"v9", b"v8", b"unknown"):
+            self._write(served, other, "wb")
+            self.assertNotIn("v9 served", self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10))
+            self.assertEqual(self._read(served, "rb"), other)
+            self.assertFalse(os.path.exists(os.path.join(self.etc, f"endpoint-manifest.bin.v7-backup-{_TS}")))
+            self.assertFalse(os.path.exists(os.path.join(self.etc, "endpoint-manifest-v10-rollback.bin")))
 
     def test_manifest_install_reports_failure_on_a_wrong_owner(self):
         _, sha9, sha10 = self._manifests()
@@ -516,7 +522,7 @@ class RxRolloutBlocksTest(unittest.TestCase):
         self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha10)
         self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10="")
         self._run("manifest-install", TS=_TS, SHA9=sha9, SHA10=sha9)
-        self.assertEqual(self._read(served, "rb"), b"v8")
+        self.assertEqual(self._read(served, "rb"), b"v7")
         self.assertFalse(os.path.exists(os.path.join(self.etc, "endpoint-manifest-v10-rollback.bin")))
 
     # --- 0c xray binary identity (read-only) -------------------------------

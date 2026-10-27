@@ -11,12 +11,14 @@ import java.io.File
 
 /**
  * gateway/DEPLOYMENT.md "REALITY + XHTTP on Stockholm", rollback B: once a
- * device adopted v9 it rejects v8, so the rollback is a v10 carrying v8's
- * endpoints. Runs the REAL [EndpointManifestRepository] + [Ed25519ManifestVerifier]
+ * device adopted v9 it rejects v7 (the manifest production serves), so the
+ * rollback is a v10 carrying v7's endpoints. v8 (Frankfurt REALITY on 443)
+ * was never served and is not part of this chain. Runs the REAL [EndpointManifestRepository] + [Ed25519ManifestVerifier]
  * + [FileLastKnownGoodManifestStore] over the Python-signed fixtures from
  * gateway/tools/tests/manifest_rollback_fixtures.py.
  *
- * Proves: v9/v10 CONTENT (the committed v9 draft JSON, v10 derived from v8),
+ * Proves: v9/v10 CONTENT (the committed v9 draft JSON = v7 + one XHTTP
+ * binding, v10 derived from v7),
  * signature verification, expiry/issuedAt acceptance, and rollback
  * monotonicity. Does NOT prove a production signature: the fixtures are
  * signed with the TEST key bytes 0..31, mapped here to the production key
@@ -34,13 +36,13 @@ class RealityXhttpManifestRollbackChainTest {
 
     private fun load(name: String) = SignedManifestCodec.decode(File(fixtures, "test-key-$name.bin").readBytes())
 
-    private val v8 = load("v8")
+    private val v7 = load("v7")
     private val v9 = load("v9")
     private val v10 = load("v10")
 
     private val testPublicKey = Ed25519PrivateKeyParameters(ByteArray(32) { it.toByte() }, 0).generatePublicKey().encoded
     private val anchors = FixedManifestTrustAnchors(
-        listOf(v8, v9, v10).associate { TrustedKeyId(it.manifest.signingKeyId) to testPublicKey },
+        listOf(v7, v9, v10).associate { TrustedKeyId(it.manifest.signingKeyId) to testPublicKey },
     )
     private val now = v10.manifest.issuedAtEpochMillis + 3_600_000L
 
@@ -48,7 +50,7 @@ class RealityXhttpManifestRollbackChainTest {
         verifier = Ed25519ManifestVerifier(),
         trustAnchors = anchors,
         lkgStore = FileLastKnownGoodManifestStore(tmp.newFolder()),
-        bootstrapManifest = v8,
+        bootstrapManifest = v7,
         nowEpochMillis = { now },
     )
 
@@ -60,7 +62,7 @@ class RealityXhttpManifestRollbackChainTest {
 
     @Test
     fun `every fixture verifies with the real client verifier at the test clock`() {
-        listOf(v8, v9, v10).forEach {
+        listOf(v7, v9, v10).forEach {
             assertEquals(ManifestVerificationResult.Valid::class, Ed25519ManifestVerifier().verify(it, anchors, now)::class)
         }
     }
@@ -72,25 +74,42 @@ class RealityXhttpManifestRollbackChainTest {
         assertTrue(repository().offer(tampered) is ManifestUpdateResult.Rejected)
     }
 
+    private fun EndpointManifest.realityPorts(id: String) =
+        endpoints.single { it.id == EndpointId(id) }.transports.filter { it.kind == TransportKind.XRAY_REALITY }.map { it.port }
+
     @Test
-    fun `v8 to v9 to v10 rollback chain`() {
+    fun `an endpoint changed without re-signing is rejected`() {
+        val moved = v9.manifest.copy(endpoints = v9.manifest.endpoints.map { e ->
+            e.copy(transports = e.transports.map { if (it.kind == TransportKind.XRAY_REALITY) it.copy(port = 443) else it })
+        })
+        val forged = SignedManifest(moved, v9.signature)
+        assertTrue(Ed25519ManifestVerifier().verify(forged, anchors, now) is ManifestVerificationResult.Invalid)
+        assertTrue(repository().offer(forged) is ManifestUpdateResult.Rejected)
+    }
+
+    @Test
+    fun `v7 to v9 to v10 rollback chain`() {
         val repo = repository()
         assertEquals(ManifestSource.EMBEDDED_BOOTSTRAP, repo.trustedSource())
-        assertEquals(8, repo.trusted()!!.manifestVersion)
+        assertEquals(7, repo.trusted()!!.manifestVersion)
 
         assertTrue(repo.offer(v9) is ManifestUpdateResult.Accepted)
         val adopted9 = repo.trusted()!!
         assertEquals(9, adopted9.manifestVersion)
         assertEquals(listOf("16.170.208.231" to 2096), adopted9.xhttp().map { it.host to it.port })
         assertTrue(adopted9.endpoints.all { it.opaqueTransports.isEmpty() })
+        assertEquals(listOf(2053), adopted9.realityPorts("frankfurt"))  // never v8's 443
+        assertEquals(v7.manifest.endpoints.filter { it.id != EndpointId("stockholm") },
+            adopted9.endpoints.filter { it.id != EndpointId("stockholm") })
 
-        assertTrue(repo.offer(v8).isRollbackRejection())
+        assertTrue(repo.offer(v7).isRollbackRejection())
         assertEquals(9, repo.trusted()!!.manifestVersion)
 
         assertTrue(repo.offer(v10) is ManifestUpdateResult.Accepted)
         val adopted10 = repo.trusted()!!
         assertEquals(10, adopted10.manifestVersion)
-        assertEquals(v8.manifest.endpoints, adopted10.endpoints)
+        assertEquals(v7.manifest.endpoints, adopted10.endpoints)
+        assertEquals(listOf(2053), adopted10.realityPorts("frankfurt"))
         assertTrue(adopted10.xhttp().isEmpty())
 
         assertTrue(repo.offer(v9).isRollbackRejection())
@@ -101,7 +120,7 @@ class RealityXhttpManifestRollbackChainTest {
     @Test
     fun `the production app trusts every signing key id the chain uses`() {
         val production = EmbeddedBootstrapManifest.trustAnchors()
-        listOf(v8, v9, v10).forEach {
+        listOf(v7, v9, v10).forEach {
             assertTrue(it.manifest.signingKeyId, production.publicKeyFor(TrustedKeyId(it.manifest.signingKeyId)) != null)
         }
     }

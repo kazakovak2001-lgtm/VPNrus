@@ -1,10 +1,16 @@
 """TEST-ONLY fixtures for the REALITY+XHTTP manifest rollback chain
 (gateway/DEPLOYMENT.md, "REALITY + XHTTP on Stockholm", rollback B):
 
-    v8   production_manifest_2026-10-09_v8.json, unchanged
-    v9   production_manifest_2026-10-27_v9_DRAFT.json, unchanged
-    v10  v8's endpoints, manifestVersion 10, v9's signingKeyId,
+    v7   production_manifest_2026-10-08_v7.json, unchanged - the manifest
+         production serves (its committed signed artifact
+         endpoint-manifest-2026-10-08-v7.bin is what /v1/manifest returns)
+    v9   production_manifest_2026-10-27_v9_DRAFT.json, unchanged - v7 plus
+         ONE Stockholm REALITY+XHTTP binding
+    v10  v7's endpoints, manifestVersion 10, v9's signingKeyId,
          issuedAt = v9 issuedAt + 1, expiresAt = v9 expiresAt
+
+v8 (production_manifest_2026-10-09_v8.json, Frankfurt REALITY on 443) was
+never signed or served; nothing here builds on it.
 
 All three are signed with the deterministic TEST key bytes(range(32)) -
 never a production key - so they prove manifest CONTENT and client rollback
@@ -33,7 +39,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey 
 
 TEST_PRIVATE_KEY_BYTES = bytes(range(32))
 FIXTURE_DIR = os.path.join(_THIS_DIR, "fixtures", "manifest-rollback")
-V8_JSON = os.path.join(_TOOLS_DIR, "production_manifest_2026-10-09_v8.json")
+V7_JSON = os.path.join(_TOOLS_DIR, "production_manifest_2026-10-08_v7.json")
+V7_BIN = os.path.join(_TOOLS_DIR, "endpoint-manifest-2026-10-08-v7.bin")
 V9_JSON = os.path.join(_TOOLS_DIR, "production_manifest_2026-10-27_v9_DRAFT.json")
 
 
@@ -43,13 +50,13 @@ def _load(path):
 
 
 def fixture_json() -> dict:
-    v8, v9 = _load(V8_JSON), _load(V9_JSON)
-    v10 = copy.deepcopy(v8)
+    v7, v9 = _load(V7_JSON), _load(V9_JSON)
+    v10 = copy.deepcopy(v7)
     v10["manifestVersion"] = 10
     v10["signingKeyId"] = v9["signingKeyId"]
     v10["issuedAtEpochMillis"] = v9["issuedAtEpochMillis"] + 1
     v10["expiresAtEpochMillis"] = v9["expiresAtEpochMillis"]
-    return {"v8": v8, "v9": v9, "v10": v10}
+    return {"v7": v7, "v9": v9, "v10": v10}
 
 
 def build() -> dict:
