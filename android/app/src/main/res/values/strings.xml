@@ -160,6 +160,7 @@
     <string name="diagnostics_force_xhttp">Force XRAY_XHTTP on next connect</string>
     <string name="diagnostics_force_shadowsocks">Force SHADOWSOCKS_2022 on next connect</string>
     <string name="diagnostics_force_hysteria2">Force HYSTERIA2 on next connect</string>
+    <string name="diagnostics_force_reality_xhttp">Force XRAY_REALITY_XHTTP on next connect</string>
     <string name="diagnostics_reactivate_germany">Re-activate Germany (debug only)</string>
     <string name="diagnostics_reactivate_stockholm">Re-activate Stockholm (debug only)</string>
     <string name="diagnostics_simulate_awg_failure">Simulate AWG failure (debug only)</string>

@@ -186,6 +186,7 @@ val FIELD_TEST_TRANSPORTS = listOf(
     TransportKind.XRAY_XHTTP,
     TransportKind.SHADOWSOCKS_2022,
     TransportKind.HYSTERIA2,
+    TransportKind.XRAY_REALITY_XHTTP,
 )
 
 /** Pure: API origins to check - every IP-literal host in the manifest, then the control-plane hostname. */
@@ -218,7 +219,7 @@ private val IPV4_LITERAL = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
 private const val POLL_MS = 250L
 private const val NO_VPN_NETWORK_NOTE = "no VPN network visible to the app"
 private const val NOT_STARTED = "NotStarted"
-private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
+private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP, TransportKind.XRAY_REALITY_XHTTP)
 
 /** Readable state names for reports (plain objects would print as Class@hash). */
 internal fun TransportState.label(): String = when (this) {

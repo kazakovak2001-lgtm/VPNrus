@@ -85,6 +85,10 @@ class NovaXrayVpnService : VpnService() {
         net.pocvpn.client.identity.XrayTlsProfileRepositoryFactory.create(context, endpointId)
     }
 
+    /** REALITY + XHTTP counterpart of [tlsProfileRepositoryFactory]; same test-seam contract, its own alias/file. */
+    internal var realityXhttpProfileRepositoryFactory: (Context, EndpointId) -> net.pocvpn.client.identity.XrayRealityXhttpProfileRepository =
+        { context, endpointId -> net.pocvpn.client.identity.XrayRealityXhttpProfileRepositoryFactory.create(context, endpointId) }
+
     // B13 (2026-08-30 PR #25 review fix) - the ONE place [XrayCoreController]
     // is ever constructed, and the ONE place its per-endpoint selection AND
     // requestStart/requestStop calls are serialized - see that class's own
@@ -105,6 +109,7 @@ class NovaXrayVpnService : VpnService() {
                 establishTun = { plan -> establishInterface(plan)?.also { tunInterface = it }?.fd },
                 closeTun = { closeTunInterface() },
                 tlsRepository = tlsProfileRepositoryFactory(applicationContext, endpointId),
+                realityXhttpRepository = realityXhttpProfileRepositoryFactory(applicationContext, endpointId),
                 // B33 review fix (round 2) - the SAME supervisorJob-backed
                 // scope this whole service already uses, so an abandoned
                 // post-timeout remote-confirmation probe (see

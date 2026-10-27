@@ -50,7 +50,9 @@ data class TrafficProgressPolicy(
          */
         const val XRAY_STALL_WINDOW_MILLIS: Long = 65_000L
 
-        private val XRAY_FAMILY = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)
+        private val XRAY_FAMILY = setOf(
+            TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP, TransportKind.XRAY_REALITY_XHTTP,
+        )
 
         // H2-GATE - the tun2socks child's counters are relayed payload only
         // (no TCP ACKs), the same M1 counter shape as Xray's VLESS totals, so

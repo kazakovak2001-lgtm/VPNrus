@@ -92,6 +92,7 @@ class XrayCoreControllerTest {
         establishedFd: Int? = 42,
         establishThrows: Throwable? = null,
         tlsRepository: SecureXrayTlsProfileRepository? = null,
+        realityXhttpRepository: net.pocvpn.client.identity.XrayRealityXhttpProfileRepository? = null,
     ) {
         var ensureCoreEnvCallCount = 0
             private set
@@ -112,7 +113,54 @@ class XrayCoreControllerTest {
             },
             closeTun = { closeTunCallCount++ },
             tlsRepository = tlsRepository,
+            realityXhttpRepository = realityXhttpRepository,
         )
+    }
+
+    // --- REALITY + XHTTP: resolved in this process from the stored profile ---
+
+    private val realityXhttpProfile = net.pocvpn.client.identity.XrayRealityXhttpProfile(
+        server = "16.170.208.231", serverPort = 8443,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        serverName = "www.microsoft.com", fingerprint = "chrome",
+        realityPublicKey = "A".repeat(43), shortId = "a1b2c3d4",
+        xhttpPath = "/nova-rx/", mode = "packet-up", uplinkHttpMethod = "POST",
+    )
+
+    private fun newRealityXhttpRepository() = net.pocvpn.client.identity.SecureXrayRealityXhttpProfileRepository(
+        net.pocvpn.client.identity.FileXrayRealityXhttpProfileStore(Files.createTempDirectory("xray-rx-test").toFile()),
+        FakeAesGcmKeyEncryptor(),
+    )
+
+    @Test
+    fun `REALITY+XHTTP with a stored profile starts the core with its own rendered config`() = runBlocking {
+        val repository = newRealityXhttpRepository().also { it.saveProfile(realityXhttpProfile) }
+        val harness = Harness(newRepository(), realityXhttpRepository = repository, establishedFd = 11)
+
+        val outcome = harness.controller.requestStart(TransportKind.XRAY_REALITY_XHTTP)
+
+        assertEquals(XrayCoreStartOutcome.Started, outcome)
+        assertEquals(1, harness.coreRuntime.startLoopCallCount)
+        assertEquals(11, harness.coreRuntime.lastStartedTunFd)
+        assertEquals(
+            XrayConfigRenderer.render(realityXhttpProfile.toXrayVlessRealityXhttpConfig()!!),
+            harness.coreRuntime.lastStartedConfigContent,
+        )
+    }
+
+    @Test
+    fun `REALITY+XHTTP without a wired repository or a stored profile never establishes tun or starts core`() = runBlocking {
+        val notWired = Harness(newRepository())
+        assertEquals(
+            XrayCoreStartOutcome.Rejected("Xray REALITY+XHTTP profile repository not wired"),
+            notWired.controller.requestStart(TransportKind.XRAY_REALITY_XHTTP),
+        )
+        val empty = Harness(newRepository(), realityXhttpRepository = newRealityXhttpRepository())
+        assertTrue(empty.controller.requestStart(TransportKind.XRAY_REALITY_XHTTP) is XrayCoreStartOutcome.Rejected)
+        for (h in listOf(notWired, empty)) {
+            assertEquals(0, h.establishTunCallCount)
+            assertEquals(0, h.coreRuntime.startLoopCallCount)
+        }
     }
 
     // --- absent/corrupt/invalid profile never starts Xray ---

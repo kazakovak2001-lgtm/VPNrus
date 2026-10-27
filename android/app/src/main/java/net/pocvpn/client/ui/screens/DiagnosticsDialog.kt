@@ -208,6 +208,12 @@ fun DiagnosticsDialog(
                     TextButton(onClick = { onSetTransportForce(TransportKind.HYSTERIA2) }, modifier = Modifier.fillMaxWidth()) {
                         Text(stringResource(R.string.diagnostics_force_hysteria2))
                     }
+                    // Same debug-only entry point: the registry still reports
+                    // XRAY_REALITY_XHTTP unavailable unless a stored profile
+                    // resolves AND the trusted manifest offers the binding.
+                    TextButton(onClick = { onSetTransportForce(TransportKind.XRAY_REALITY_XHTTP) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.diagnostics_force_reality_xhttp))
+                    }
                     // Build-type-scoped DebugPathOverride: the debug source set
                     // supplies the status line and actions; the release one
                     // returns null / no actions, so nothing renders there. Not

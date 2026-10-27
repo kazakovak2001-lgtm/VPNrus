@@ -109,7 +109,7 @@ class TrafficProgressMonitorTest {
 
     @Test
     fun `Xray family transports get the 65s stall window`() {
-        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP)) {
+        for (kind in listOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP, TransportKind.XRAY_REALITY_XHTTP)) {
             assertEquals(kind.name, 65_000L, TrafficProgressPolicy.forTransport(kind).stallWindowMillis)
         }
     }
@@ -121,7 +121,9 @@ class TrafficProgressMonitorTest {
 
     @Test
     fun `AWG and every other transport keep the 20s stall window`() {
-        val payloadOnly = setOf(TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP, TransportKind.HYSTERIA2)
+        val payloadOnly = setOf(
+            TransportKind.XRAY_REALITY, TransportKind.TLS_TCP, TransportKind.XRAY_XHTTP, TransportKind.XRAY_REALITY_XHTTP, TransportKind.HYSTERIA2,
+        )
         for (kind in TransportKind.values().filterNot { it in payloadOnly }) {
             assertEquals(kind.name, 20_000L, TrafficProgressPolicy.forTransport(kind).stallWindowMillis)
         }

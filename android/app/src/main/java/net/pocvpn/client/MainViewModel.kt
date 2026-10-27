@@ -441,6 +441,12 @@ class MainViewModel(
     // simply skips this step, exactly like every other optional
     // provisioner in this class when unset.
     private val xrayXhttpProfileProvisioners: Map<net.pocvpn.client.reachability.EndpointId, net.pocvpn.client.provisioning.XrayXhttpProfileProvisioner> = emptyMap(),
+    // REALITY + XHTTP - same endpoint-scoped shape as the XHTTP transport,
+    // repositories and provisioners above. Empty/null (the default) means the
+    // kind is never available and never provisioned.
+    private val xrayRealityXhttpTransport: VpnTransport? = null,
+    private val xrayRealityXhttpProfileRepositories: Map<net.pocvpn.client.reachability.EndpointId, net.pocvpn.client.identity.XrayRealityXhttpProfileRepository> = emptyMap(),
+    private val xrayRealityXhttpProfileProvisioners: Map<net.pocvpn.client.reachability.EndpointId, net.pocvpn.client.provisioning.XrayRealityXhttpProfileProvisioner> = emptyMap(),
     // B45B-4 - additive, defaults to null (same "no wiring, no behavior"
     // seam every other optional transport instance above already uses). The
     // SAME real ShadowsocksTransport instance registered here (Smart Connect
@@ -1074,6 +1080,9 @@ class MainViewModel(
         xrayProfileRepositoryResolver = xrayProfileRepositoryResolver,
         xrayTlsProfileRepositoryResolver = xrayTlsProfileRepositoryResolver,
         xrayXhttpProfileRepositoryResolver = xrayXhttpProfileRepositoryResolver,
+        xrayRealityXhttpProfileRepositoryFor = xrayRealityXhttpProfileRepositories
+            .takeIf { it.isNotEmpty() }
+            ?.let { repositories -> { endpointId -> repositories[endpointId] } },
         relayXrayProfileRepositoryResolver = relayXrayProfileRepositoryResolver,
         relayXrayTlsProfileRepositoryResolver = relayXrayTlsProfileRepositoryResolver,
         cdnRuntimeCapabilities = cdnRuntimeCapabilities,
@@ -1164,6 +1173,21 @@ class MainViewModel(
 
     private fun isXrayXhttpAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
         endpointId in xrayXhttpAvailableEndpoints.value
+
+    // REALITY + XHTTP - endpoints whose stored profile resolves Ready (same
+    // authoritative XrayRuntimeResolver check connect() runs).
+    private val xrayRealityXhttpReadyEndpoints = MutableStateFlow<Set<net.pocvpn.client.reachability.EndpointId>>(emptySet())
+
+    /**
+     * Available only when BOTH hold: a stored profile resolves Ready for this
+     * endpoint AND the currently trusted signed manifest offers an
+     * XRAY_REALITY_XHTTP binding for it. The manifest is the rollout switch:
+     * a profile left over after the operator removes the binding never makes
+     * the kind selectable.
+     */
+    private fun isXrayRealityXhttpAvailableFor(endpointId: net.pocvpn.client.reachability.EndpointId): Boolean =
+        endpointId in xrayRealityXhttpReadyEndpoints.value &&
+            trustedTransportBindingFor(endpointId, TransportKind.XRAY_REALITY_XHTTP) != null
 
     // B45B-4 - same per-endpoint Set<EndpointId> shape/reasoning as
     // [xrayAvailableEndpoints]/[xrayTlsAvailableEndpoints] above - a
@@ -1453,6 +1477,20 @@ class MainViewModel(
                 status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
                 capabilities = if (available) xhttp.capabilities else TransportCapabilities.notImplemented(),
                 factory = if (available) ({ xhttp }) else null,
+            )
+        }
+        // REALITY + XHTTP - Direct gateway endpoints only (no ingress/relay
+        // path exists). Never an AutoGatewaySelector candidate: it becomes
+        // selectable only through Manual(XRAY_REALITY_XHTTP), the field test
+        // and, as the last PREFERRED_ORDER entry, Manual-mode Auto transport.
+        val realityXhttp = xrayRealityXhttpTransport
+        if (realityXhttp != null) {
+            val available = !isKnownIngressEndpoint && isXrayRealityXhttpAvailableFor(endpointId)
+            descriptors += TransportDescriptor(
+                kind = TransportKind.XRAY_REALITY_XHTTP,
+                status = if (available) TransportStatus.AVAILABLE else TransportStatus.NOT_IMPLEMENTED,
+                capabilities = if (available) realityXhttp.capabilities else TransportCapabilities.notImplemented(),
+                factory = if (available) ({ realityXhttp }) else null,
             )
         }
         // B45B-4 - same shape as XRAY_REALITY/TLS_TCP above: AVAILABLE only
@@ -2224,6 +2262,14 @@ class MainViewModel(
                 if (ready) xrayXhttpAvailableEndpoints.update { it + endpointId }
             }
         }
+        // REALITY + XHTTP - same one-time startup check.
+        xrayRealityXhttpProfileRepositories.forEach { (endpointId, repository) ->
+            viewModelScope.launch {
+                val ready = XrayRuntimeResolver.resolveRealityXhttp(repository) is
+                    net.pocvpn.client.vpn.xray.XrayRealityXhttpRuntimeResolution.Ready
+                if (ready) xrayRealityXhttpReadyEndpoints.update { it + endpointId }
+            }
+        }
         // B45B-4 (review fix) - same startup-check shape as the Xray/TLS
         // blocks above, generalized over EVERY wired endpoint (never a
         // single fixed one): checked ONCE at init per repository (never
@@ -2736,6 +2782,24 @@ class MainViewModel(
                                 val repository = xrayXhttpProfileRepositories[targetEndpointId]
                                 if (repository != null && XrayRuntimeResolver.resolveXhttp(repository) is XrayXhttpRuntimeResolution.Ready) {
                                     xrayXhttpAvailableEndpoints.update { it + targetEndpointId }
+                                }
+                            }
+                        }
+                        // REALITY + XHTTP - same "only after AWG activation
+                        // succeeded, same key/credential, never touches AWG
+                        // state" model. Asked for only when the trusted
+                        // signed manifest offers the binding for this
+                        // endpoint, so a gateway without the inbound is never
+                        // sent a request that can only 503.
+                        if (trustedTransportBindingFor(targetEndpointId, TransportKind.XRAY_REALITY_XHTTP) != null) {
+                            xrayRealityXhttpProfileProvisioners[targetEndpointId]?.let { provisioner ->
+                                val outcome = withContext(ioDispatcher) { provisioner.provision(key, trimmedCredential) }
+                                val repository = xrayRealityXhttpProfileRepositories[targetEndpointId]
+                                if (outcome == XrayProfileProvisioningOutcome.Saved && repository != null &&
+                                    XrayRuntimeResolver.resolveRealityXhttp(repository) is
+                                    net.pocvpn.client.vpn.xray.XrayRealityXhttpRuntimeResolution.Ready
+                                ) {
+                                    xrayRealityXhttpReadyEndpoints.update { it + targetEndpointId }
                                 }
                             }
                         }
@@ -5353,6 +5417,17 @@ class MainViewModel(
                     diagnosticsRecorder = supportDiagnosticsRecorder,
                 )
             }
+            // REALITY + XHTTP - same catalog-driven, one-per-gateway shape.
+            val xrayRealityXhttpProfileRepositories = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                gateway.endpointId to net.pocvpn.client.identity.XrayRealityXhttpProfileRepositoryFactory.create(context, gateway.endpointId)
+            }
+            val xrayRealityXhttpProfileProvisioners = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all.associate { gateway ->
+                gateway.endpointId to net.pocvpn.client.provisioning.XrayRealityXhttpProfileProvisioner(
+                    xrayRealityXhttpProfileRepositories.getValue(gateway.endpointId),
+                    gatewayId = gateway.id,
+                    diagnosticsRecorder = supportDiagnosticsRecorder,
+                )
+            }
             val ingressProfileStore = net.pocvpn.client.relay.IngressProfileStoreFactory.create(context)
             val relayComposition = net.pocvpn.client.relay.RelayCompositionFactory.build(context, ingressProfileStore, supportDiagnosticsRecorder)
 
@@ -5460,6 +5535,11 @@ class MainViewModel(
                 // constructor param's own docs.
                 xrayXhttpProfileRepositories = xrayXhttpProfileRepositories,
                 xrayXhttpProfileProvisioners = xrayXhttpProfileProvisioners,
+                // REALITY + XHTTP - one shared transport instance for registry and controller,
+                // the repositories its availability reads, the provisioners that write them.
+                xrayRealityXhttpTransport = net.pocvpn.client.vpn.VlessRealityXhttpTransport(context),
+                xrayRealityXhttpProfileRepositories = xrayRealityXhttpProfileRepositories,
+                xrayRealityXhttpProfileProvisioners = xrayRealityXhttpProfileProvisioners,
                 // B45B-4 (review fix) - the SAME real ShadowsocksTransport
                 // instance registered for BOTH Smart Connect selection
                 // (buildTransportRegistry) and execution (VpnController) -
