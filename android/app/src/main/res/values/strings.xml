@@ -19,6 +19,12 @@
     <string name="home_location_content_description">Server location</string>
     <string name="home_location_chevron_content_description">Change location</string>
     <string name="home_diagnostics_entry">Diagnostics</string>
+    <string name="servers_title">Servers</string>
+    <string name="servers_blocked_notice">Disconnect to change the server.</string>
+    <string name="nav_vpn">VPN</string>
+    <string name="nav_servers">Servers</string>
+    <string name="nav_diagnostics">Diagnostics</string>
+    <string name="nav_settings">Settings</string>
     <string name="home_stat_session">Session</string>
     <string name="home_stat_download">Download</string>
     <string name="home_stat_upload">Upload</string>

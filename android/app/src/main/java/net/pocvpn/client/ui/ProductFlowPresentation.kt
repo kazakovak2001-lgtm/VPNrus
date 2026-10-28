@@ -305,3 +305,18 @@ fun net.pocvpn.client.transport.TransportKind.toHomeProtocolLabel(): String = wh
     net.pocvpn.client.transport.TransportKind.HYSTERIA2 -> "Hysteria2"
     net.pocvpn.client.transport.TransportKind.XRAY_REALITY_XHTTP -> "REALITY + XHTTP"
 }
+
+/** Bottom navigation destinations, in display order. */
+enum class NavDestination { VPN, SERVERS, DIAGNOSTICS, SETTINGS }
+
+/**
+ * Tabs shown in the bottom bar. DIAGNOSTICS exists only in debug builds: the
+ * release app has no diagnostics screen (see [shouldShowDiagnostics]), and a
+ * tab must never lead nowhere.
+ */
+fun bottomNavDestinations(isDebugBuild: Boolean): List<NavDestination> =
+    if (shouldShowDiagnostics(isDebugBuild)) {
+        listOf(NavDestination.VPN, NavDestination.SERVERS, NavDestination.DIAGNOSTICS, NavDestination.SETTINGS)
+    } else {
+        listOf(NavDestination.VPN, NavDestination.SERVERS, NavDestination.SETTINGS)
+    }
