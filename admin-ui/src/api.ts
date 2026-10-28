@@ -93,6 +93,24 @@ export interface GatewayInfo {
 
 export const gatewayInfo = () => call<GatewayInfo>("GET", "/admin/gateway");
 
+export interface HubNode {
+  id: string;
+  name: string;
+  role: string;
+  status: "OK" | "UNREACHABLE" | "AUTH_FAILED" | "MISCONFIGURED" | "ERROR";
+  detail: string;
+  latency_ms: number | null;
+  gateway: GatewayInfo | null;
+}
+
+// Optional local hub (SSH-tunnelled gateways). Not part of the session API:
+// it is read-only and is simply absent when the hub is not running.
+export async function hubNodes(): Promise<HubNode[]> {
+  const res = await fetch("/hub/nodes", { credentials: "omit" });
+  if (!res.ok) throw new ApiError(res.status, "hub_unavailable");
+  return ((await res.json()) as { nodes: HubNode[] }).nodes;
+}
+
 export const revoke = (id: string) =>
   call<{ status: string }>("POST", `/admin/activations/${id}/revoke`, undefined, true);
 
