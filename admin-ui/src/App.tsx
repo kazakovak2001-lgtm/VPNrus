@@ -89,6 +89,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [sessionOk, setSessionOk] = useState<boolean | null>(null);
   const [role, setRole] = useState<"admin" | "viewer" | null>(null);
+  const [gateway, setGateway] = useState<api.GatewayInfo | null>(null);
   const [searchInput, setSearchInput] = useState("");
   const [query, setQuery] = useState<api.ListQuery>({ q: "", status: "", limit: PAGE_SIZE, offset: 0 });
   // One-time credential of a just-created activation. Kept in component
@@ -107,6 +108,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     setError(null);
     api.status().then((s) => { setSessionOk(s.session_exists); setRole(s.role); }, fail);
     api.listActivations(query).then(setPage, fail);
+    api.gatewayInfo().then(setGateway, fail);
   }, [fail, query]);
 
   // Reconcile with the server after a failed mutation without clearing its
@@ -215,6 +217,40 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         <Stat label="Matching activations" value={page ? String(total) : "…"} />
         <Stat label="Active (this page)" value={items ? String(active) : "…"} />
         <Stat label="Bound devices (this page)" value={items ? String(devices) : "…"} />
+      </section>
+
+      <section className="bg-white rounded-xl shadow p-4 space-y-2 text-sm">
+        <h2 className="font-medium">This gateway</h2>
+        {gateway === null ? (
+          <p className="text-slate-500">Loading…</p>
+        ) : (
+          <>
+            <p className="text-slate-600">
+              <span className="font-mono">{gateway.endpoint.host}:{gateway.endpoint.port}</span>
+              {" · "}up {formatUptime(gateway.uptime_seconds)}
+              {" · "}manifest {gateway.manifest.present ? "present" : gateway.manifest.configured ? "configured but missing" : "not configured"}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(gateway.transports).map(([name, on]) => (
+                <span key={name} className={`rounded px-2 py-0.5 text-xs ${on ? "bg-green-100 text-green-800" : "bg-slate-200 text-slate-600"}`}>
+                  {name.replace(/_/g, " ")}: {on ? "on" : "off"}
+                </span>
+              ))}
+            </div>
+            {gateway.activations ? (
+              <p className="text-slate-600">
+                Activations: {gateway.activations.total} total, {gateway.activations.active} active,{" "}
+                {gateway.activations.expired} expired, {gateway.activations.revoked} revoked;{" "}
+                {gateway.activations.bound_devices} bound devices.
+              </p>
+            ) : (
+              <p className="text-slate-500">Activation store not configured.</p>
+            )}
+            <p className="text-xs text-slate-500">
+              Shows this API node only. Other gateways and traffic statistics are not available yet.
+            </p>
+          </>
+        )}
       </section>
 
       {role === "admin" && (
@@ -363,6 +399,13 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     </div>
   );
 }
+
+const formatUptime = (s: number) => {
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+};
 
 const Stat = ({ label, value }: { label: string; value: string }) => (
   <div className="bg-white rounded-xl shadow p-3">

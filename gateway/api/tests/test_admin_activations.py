@@ -370,5 +370,52 @@ class AdminActivationTests(unittest.TestCase):
             self.assertEqual(len(json.load(f)), 3)
 
 
+    # --- GET /admin/gateway ---
+    def test_gateway_requires_session_and_get_only(self):
+        self.assertEqual(self._req("GET", "/admin/gateway")[0], 401)
+        sid, csrf = self._login()
+        self.assertEqual(self._req("POST", "/admin/gateway", self._mut_headers(sid, csrf))[0], 405)
+
+    def test_gateway_snapshot_has_counts_and_no_secrets(self):
+        sid, _ = self._login()
+        status, _, body = self._req("GET", "/admin/gateway", {"Cookie": f"pocvpn-admin-session={sid}"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["activations"], {"total": 2, "active": 1, "expired": 0, "revoked": 1, "bound_devices": 1})
+        self.assertTrue(data["transports"]["awg"])
+        self.assertFalse(data["transports"]["hysteria2"])
+        self.assertEqual(data["manifest"], {"configured": False, "present": False})
+        self.assertEqual(data["endpoint"]["host"], "203.0.113.1")
+        self.assertGreaterEqual(data["uptime_seconds"], 0)
+        text = body.decode()
+        for forbidden in (self._tmp.name, "admin-secret", "x" * 32, "cred-one", "public_key"):
+            self.assertNotIn(forbidden, text)
+
+    def test_gateway_uses_read_limiter_before_any_store_read(self):
+        self._limit("admin_read_limiter", 1)
+        sid, _ = self._login()
+        h = {"Cookie": f"pocvpn-admin-session={sid}"}
+        self.assertEqual(self._req("GET", "/admin/gateway", h)[0], 200)
+        with mock.patch.object(activations_module, "list_all") as la:
+            status, _, body = self._req("GET", "/admin/gateway", h)
+            la.assert_not_called()
+        self.assertEqual((status, json.loads(body)["error"]), (429, "rate_limited"))
+
+    def test_gateway_without_activation_store_reports_null(self):
+        d = self._tmp.name
+        script = os.path.join(d, "prov.sh")
+        cfg = make_app_config(d, script, admin_secret_file=os.path.join(d, "admin-secret"))
+        srv = RunningServer(cfg)
+        self.addCleanup(srv.close)
+        payload = json.dumps({"password": "x" * 32}).encode()
+        _, headers, _ = raw_request(
+            srv.port, "POST", "/admin/login",
+            {"Content-Type": "application/json", "Content-Length": str(len(payload))}, payload)
+        sid = headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        status, _, body = raw_request(srv.port, "GET", "/admin/gateway", {"Cookie": f"pocvpn-admin-session={sid}"})
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(body)["activations"])
+
+
 if __name__ == "__main__":
     unittest.main()

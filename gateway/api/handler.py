@@ -55,6 +55,7 @@ from . import (
 from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
+_STARTED_AT = time.time()
 
 
 def _log_provision_error(exc):
@@ -84,6 +85,7 @@ _PATH_ADMIN_LOGOUT = "/admin/logout"
 _PATH_ADMIN_SESSION = "/admin/session"
 _PATH_ADMIN_STATUS = "/admin/status"
 _PATH_ADMIN_ACTIVATIONS = "/admin/activations"
+_PATH_ADMIN_GATEWAY = "/admin/gateway"
 _ADMIN_ACTIVATION_PATH_RE = re.compile(r"^/admin/activations/([0-9a-f]{32})(/revoke|/extend)?$")
 
 # B26 (task B) - the same TransportKind.name strings Android's TransportKind
@@ -249,6 +251,11 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                     status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
                 else:
                     status_code = self._handle_admin_status()
+            elif self.path == _PATH_ADMIN_GATEWAY:
+                if method != "GET":
+                    status_code = self._error(HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed")
+                else:
+                    status_code = self._handle_admin_gateway()
             elif self.path.split("?", 1)[0] == _PATH_ADMIN_ACTIVATIONS:
                 if method == "GET":
                     status_code = self._handle_admin_activations(None)
@@ -1732,6 +1739,47 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
             except OSError:
                 logger.error("admin_audit_write_failed")
             return self._success(HTTPStatus.OK, {"expires_at": new_expires_at})
+        except _RequestError as exc:
+            return self._error(exc.status, exc.error_code)
+
+    def _handle_admin_gateway(self):
+        """GET /admin/gateway: read-only snapshot of THIS gateway node. Only
+        non-secret facts: which transports are configured (booleans / the
+        public listen ports), activation counts, uptime. Never paths, keys,
+        credentials or per-device data."""
+        try:
+            self._admin_session_or_raise(mutating=False, limiter="admin_read_limiter", need_store=False)
+            cfg = self.server.config
+            now = datetime.now(tz=timezone.utc)
+            counts = {"total": 0, "active": 0, "expired": 0, "revoked": 0, "bound_devices": 0}
+            store = None
+            if cfg.activation_store_path:
+                try:
+                    records = activations.list_all(cfg.activation_store_path, cfg.activation_lock_path)
+                except activations.ActivationStoreError:
+                    raise _RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+                for record in records:
+                    counts["total"] += 1
+                    counts[activations.entitlement_state(record, now).lower()] += 1
+                    counts["bound_devices"] += len(record["bound_devices"])
+                store = counts
+            manifest_present = bool(cfg.manifest_path) and os.path.isfile(cfg.manifest_path)
+            return self._success(HTTPStatus.OK, {
+                "uptime_seconds": int(time.time() - _STARTED_AT),
+                "endpoint": {"host": cfg.endpoint_host, "port": cfg.endpoint_port},
+                "transports": {
+                    "awg": True,
+                    "xray_reality": cfg.xray_server_port > 0,
+                    "xray_tls": cfg.xray_tls_server_port > 0,
+                    "xray_xhttp": cfg.xray_xhttp_server_port > 0,
+                    "xray_reality_xhttp": cfg.xray_reality_xhttp_server_port > 0,
+                    "hysteria2": cfg.hysteria2_server_port > 0,
+                    "ingress": self.server.ingress_config is not None,
+                    "field_enrollment": bool(cfg.field_enrollment_enabled),
+                },
+                "manifest": {"configured": bool(cfg.manifest_path), "present": manifest_present},
+                "activations": store,
+            })
         except _RequestError as exc:
             return self._error(exc.status, exc.error_code)
 
