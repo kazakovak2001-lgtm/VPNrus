@@ -95,3 +95,62 @@ fun BugGlyph(tint: Color, modifier: Modifier = Modifier) {
         drawLine(tint, Offset(w * 0.78f, h * 0.7f), Offset(w * 0.95f, h * 0.8f), strokeWidth, cap = StrokeCap.Round)
     }
 }
+
+/** Bottom-nav VPN tab: a shield outline. */
+@Composable
+fun ShieldGlyph(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val path = Path().apply {
+            moveTo(w * 0.5f, h * 0.08f)
+            lineTo(w * 0.86f, h * 0.22f)
+            lineTo(w * 0.86f, h * 0.52f)
+            cubicTo(w * 0.86f, h * 0.74f, w * 0.68f, h * 0.88f, w * 0.5f, h * 0.94f)
+            cubicTo(w * 0.32f, h * 0.88f, w * 0.14f, h * 0.74f, w * 0.14f, h * 0.52f)
+            lineTo(w * 0.14f, h * 0.22f)
+            close()
+        }
+        drawPath(path, color = tint, style = Stroke(width = size.minDimension * 0.09f, cap = StrokeCap.Round))
+        val check = Path().apply {
+            moveTo(w * 0.36f, h * 0.5f)
+            lineTo(w * 0.46f, h * 0.6f)
+            lineTo(w * 0.66f, h * 0.38f)
+        }
+        drawPath(check, color = tint, style = Stroke(width = size.minDimension * 0.09f, cap = StrokeCap.Round))
+    }
+}
+
+/** Bottom-nav Servers tab: two stacked server units. */
+@Composable
+fun ServersGlyph(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = Stroke(width = size.minDimension * 0.09f)
+        val corner = androidx.compose.ui.geometry.CornerRadius(w * 0.1f, w * 0.1f)
+        val unit = androidx.compose.ui.geometry.Size(w * 0.76f, h * 0.32f)
+        drawRoundRect(tint, topLeft = Offset(w * 0.12f, h * 0.12f), size = unit, cornerRadius = corner, style = stroke)
+        drawRoundRect(tint, topLeft = Offset(w * 0.12f, h * 0.56f), size = unit, cornerRadius = corner, style = stroke)
+        drawCircle(tint, radius = size.minDimension * 0.045f, center = Offset(w * 0.28f, h * 0.28f))
+        drawCircle(tint, radius = size.minDimension * 0.045f, center = Offset(w * 0.28f, h * 0.72f))
+    }
+}
+
+/** Bottom-nav Diagnostics tab: a pulse line. */
+@Composable
+fun PulseGlyph(tint: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val path = Path().apply {
+            moveTo(w * 0.06f, h * 0.54f)
+            lineTo(w * 0.28f, h * 0.54f)
+            lineTo(w * 0.38f, h * 0.2f)
+            lineTo(w * 0.56f, h * 0.84f)
+            lineTo(w * 0.66f, h * 0.54f)
+            lineTo(w * 0.94f, h * 0.54f)
+        }
+        drawPath(path, color = tint, style = Stroke(width = size.minDimension * 0.09f, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+    }
+}

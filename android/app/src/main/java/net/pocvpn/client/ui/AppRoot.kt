@@ -30,6 +30,7 @@ import net.pocvpn.client.smartconnect.ConnectionOutcome
 import net.pocvpn.client.smartconnect.ConnectionOutcomeResult
 import net.pocvpn.client.smartconnect.SmartConnectDecision
 import net.pocvpn.client.transport.TransportHealthState
+import net.pocvpn.client.ui.components.WithBottomNav
 import net.pocvpn.client.ui.screens.ActivationScreen
 import net.pocvpn.client.ui.screens.AppSelectorScreen
 import net.pocvpn.client.ui.screens.DiagnosticsDialog
@@ -230,6 +231,17 @@ fun AppRoot(
         }
     }
 
+    // Bottom bar actions reuse the EXISTING routes/dialogs - no new navigation state.
+    val onNavSelect: (NavDestination) -> Unit = { destination ->
+        when (destination) {
+            NavDestination.VPN -> settingsRoute = null
+            // Same guard as the Home location card: never open the picker during a session.
+            NavDestination.SERVERS -> if (!transportState.blocksGatewaySelection()) showGatewayPicker = true
+            NavDestination.DIAGNOSTICS -> showDiagnostics = true
+            NavDestination.SETTINGS -> settingsRoute = SettingsRoute.Settings
+        }
+    }
+
     Surface(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxSize()) {
             when {
@@ -330,7 +342,11 @@ fun AppRoot(
                 // touches the transport/tunnel (see MainViewModel
                 // .updateAppRoutingPolicy's own docs) - showReconnectNotice
                 // is purely informational.
-                settingsRoute == SettingsRoute.Settings -> SettingsScreen(
+                settingsRoute == SettingsRoute.Settings -> WithBottomNav(
+                    selected = NavDestination.SETTINGS,
+                    destinations = bottomNavDestinations(isDebugBuild),
+                    onSelect = onNavSelect,
+                ) { SettingsScreen(
                     routingMode = savedRoutingMode,
                     onRoutingModeSelected = { viewModel.updateRoutingMode(it) },
                     mode = savedRoutingPolicy.mode,
@@ -362,15 +378,20 @@ fun AppRoot(
                     } else {
                         null
                     },
-                )
-                else -> HomeScreen(
+                ) }
+                else -> WithBottomNav(
+                    selected = NavDestination.VPN,
+                    destinations = bottomNavDestinations(isDebugBuild),
+                    onSelect = onNavSelect,
+                ) { HomeScreen(
                     visualState = sessionHealth.toHomeVisualState(),
                     statusHeadline = sessionHealth.toHomeStatusText(),
                     onPowerButtonClick = {
                         if (transportState.isConnectedOrConnecting()) viewModel.disconnect() else viewModel.connect()
                     },
                     onSettingsClick = { settingsRoute = SettingsRoute.Settings },
-                    showDiagnosticsEntry = isDebugBuild,
+                    // Debug diagnostics now live in the bottom bar's own tab.
+                    showDiagnosticsEntry = false,
                     onDiagnosticsClick = { showDiagnostics = true },
                     showKillSwitchNotice = transportState.showsKillSwitchNotice(),
                     // Re-read on every session change: a clone/work profile can be
@@ -404,7 +425,7 @@ fun AppRoot(
                     protocolLabel = if (transportState.isConnectedOrConnecting()) currentTransportKind?.toHomeProtocolLabel() else null,
                     sessionStartedAtMillis = sessionStartedAtMillis,
                     sessionTraffic = sessionTraffic,
-                )
+                ) }
             }
         }
     }
