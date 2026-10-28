@@ -380,6 +380,12 @@ fun AppRoot(
                     } else {
                         null
                     },
+                    // The same full dialog the Diagnostics tab and the old Home button open; debug / field-test only.
+                    onAdvancedDiagnosticsClick = if (shouldShowDiagnostics(isDebugBuild)) {
+                        { showDiagnostics = true }
+                    } else {
+                        null
+                    },
                 ) }
                 showServers -> WithBottomNav(
                     selected = NavDestination.SERVERS,
