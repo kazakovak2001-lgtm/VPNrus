@@ -72,6 +72,10 @@ interface FieldTestHost {
     fun dataPlaneChecks(): JSONObject? = null
     /** B-WL7 layer 3a checks kept in memory (see TunnelProtectionLog); null when not wired - the report then omits the section. */
     fun protectionChecks(): JSONObject? = null
+    /** Starts the Android connectivity timeline for this test (no-op by default). */
+    fun startNetworkEvents() {}
+    /** Stops it and returns the timeline; null when the host provides none - the report then omits the section. */
+    fun stopNetworkEvents(): NetworkEventSnapshot? = null
     /**
      * Xray-family sessions exclude the Nova app from their own tunnel, so the
      * app cannot probe through them; the `:xray` process measures with the
@@ -289,6 +293,7 @@ class FieldTestRunner(
             onProgress(FieldTestProgress(true, phase, step, totalSteps, log.toList()))
         }
 
+        host.startNetworkEvents()
         val networkBefore = host.networkContext()
         val appBefore = host.appState()
         val saved = host.saveSelection()
@@ -365,6 +370,7 @@ class FieldTestRunner(
         }
         val logs = kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { host.logs() }
         val dataPlaneChecks = host.dataPlaneChecks()
+        val networkEvents = host.stopNetworkEvents()
         step = totalSteps
         val report = FieldTestReport(
             startedAtEpochMillis = startedAt,
@@ -391,6 +397,7 @@ class FieldTestRunner(
             logs = logs,
             dataPlaneChecks = dataPlaneChecks,
             protectionChecks = host.protectionChecks(),
+            networkEvents = networkEvents,
         )
         abort?.let { log += "ABORTED: $it" }
         // QUICK during a normal session: give the user the connection back.

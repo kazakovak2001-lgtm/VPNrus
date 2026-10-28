@@ -193,6 +193,8 @@ data class FieldTestReport(
     val dataPlaneChecks: JSONObject? = null,
     /** B-WL7 layer 3a checks (TunnelProtectionLog.reportJson); optional - absent from the JSON when null. */
     val protectionChecks: JSONObject? = null,
+    /** Android connectivity timeline for the whole test; null when the host does not provide one. */
+    val networkEvents: NetworkEventSnapshot? = null,
 ) {
     companion object {
         const val SCHEMA = "nova-field-test"
@@ -233,6 +235,7 @@ internal fun FieldTestReport.summaryLines(): List<String> {
     }
     crashes?.let { if (it.length() > 0) lines += "Recorded crashes: ${it.length()}" }
     if (runs.isNotEmpty()) lines += "-- VPN runs --"
+    val diagnosisList = diagnoses()
     runs.forEach { r ->
         val detail = when (r.outcome) {
             FieldRunOutcome.SKIPPED -> r.skipReason.orEmpty()
@@ -251,6 +254,13 @@ internal fun FieldTestReport.summaryLines(): List<String> {
             }
         }
         lines += "  ${r.target.label}: ${r.outcome} - $detail"
+        val d = diagnosisList[runs.indexOf(r)]
+        lines += "    diagnosis: ${d.category} (${d.confidence.name.lowercase()})" + d.evidence.firstOrNull()?.let { " - $it" }.orEmpty()
+    }
+    networkEvents?.let { n ->
+        val lost = n.events.count { it.type == NetworkEventType.LOST && !it.isVpn }
+        lines += "Network events: ${n.events.size}, underlying lost $lost, not validated ${if (n.events.any { it.validated == false && !it.isVpn }) "seen" else "not seen"}" +
+            (n.registrationError?.let { ", timeline UNAVAILABLE ($it)" } ?: "")
     }
     if (runs.isNotEmpty()) {
         val working = runs.filter { it.outcome == FieldRunOutcome.DATA_PLANE_OK || it.outcome == FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED }.map { it.target.label }
@@ -291,7 +301,8 @@ fun FieldTestReport.toJson(): JSONObject {
     root.put("appStateBefore", appStateBefore)
     root.put("appStateAfter", appStateAfter ?: JSONObject.NULL)
     root.put("direct", direct?.toJson() ?: JSONObject.NULL)
-    root.put("runs", JSONArray().apply { runs.forEach { put(it.toJson()) } })
+    val diagnoses = diagnoses()
+    root.put("runs", JSONArray().apply { runs.forEachIndexed { i, r -> put(r.toJson().put("diagnosis", diagnoses[i].toJson())) } })
     root.put("supportBundle", supportBundle ?: JSONObject.NULL)
     root.put("mode", mode.name)
     root.put("censorship", censorship?.toJson() ?: JSONObject.NULL)
@@ -304,6 +315,8 @@ fun FieldTestReport.toJson(): JSONObject {
     root.put("logs", JSONArray(logs))
     dataPlaneChecks?.let { root.put("dataPlaneChecks", it) }
     protectionChecks?.let { root.put("protectionChecks", it) }
+    networkEvents?.let { root.put("networkEvents", it.toJson()) }
+    root.put("diagnosisSummary", diagnosisSummary(diagnoses))
     return root
 }
 
@@ -364,3 +377,20 @@ internal fun HttpProbeResult.toJson(): JSONObject = JSONObject()
     .put("bodyComplete", bodyComplete)
     .put("error", error ?: JSONObject.NULL)
     .put("trace", JSONObject().apply { trace.toSortedMap().forEach { (k, v) -> put(k, v) } })
+
+/** Report-level roll-up: how many attempts fell in each diagnosis category, plus the network timeline totals. */
+internal fun FieldTestReport.diagnosisSummary(diagnoses: List<RunDiagnosis>): JSONObject {
+    val byCategory = JSONObject()
+    diagnoses.groupingBy { it.category.name }.eachCount().toSortedMap().forEach { (k, v) -> byCategory.put(k, v) }
+    val events = networkEvents
+    return JSONObject()
+        .put("attempts", diagnoses.size)
+        .put("byCategory", byCategory)
+        .put("networkTimeline", when {
+            events == null -> "NOT_PROVIDED"
+            events.registrationError != null -> "UNAVAILABLE"
+            else -> "RECORDED"
+        })
+        .put("underlyingNetworkLost", events?.events?.count { it.type == NetworkEventType.LOST && !it.isVpn } ?: JSONObject.NULL)
+        .put("unvalidatedSeen", events?.events?.any { it.validated == false && !it.isVpn } ?: JSONObject.NULL)
+}
