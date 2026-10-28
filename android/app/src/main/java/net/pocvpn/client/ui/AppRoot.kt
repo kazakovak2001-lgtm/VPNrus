@@ -162,6 +162,8 @@ fun AppRoot(
     var showFieldTest by remember { mutableStateOf(false) }
     var fieldTestSaveStatus by remember { mutableStateOf<String?>(null) }
     var showGatewayPicker by remember { mutableStateOf(false) }
+    // Secure Orbit - the full-screen Servers tab (same data/actions as the picker dialog).
+    var showServers by remember { mutableStateOf(false) }
     var showPrivateGatewayDialog by remember { mutableStateOf(false) }
     var privateGatewayValidationError by remember { mutableStateOf<net.pocvpn.client.vpn.config.PrivateGatewayConfigFailureReason?>(null) }
     var privateGatewayPublicKey by remember { mutableStateOf<String?>(null) }
@@ -234,11 +236,11 @@ fun AppRoot(
     // Bottom bar actions reuse the EXISTING routes/dialogs - no new navigation state.
     val onNavSelect: (NavDestination) -> Unit = { destination ->
         when (destination) {
-            NavDestination.VPN -> settingsRoute = null
-            // Same guard as the Home location card: never open the picker during a session.
-            NavDestination.SERVERS -> if (!transportState.blocksGatewaySelection()) showGatewayPicker = true
+            NavDestination.VPN -> { settingsRoute = null; showServers = false }
+            // Always reachable; selection itself is blocked (and explained) during a session.
+            NavDestination.SERVERS -> { settingsRoute = null; showServers = true }
             NavDestination.DIAGNOSTICS -> showDiagnostics = true
-            NavDestination.SETTINGS -> settingsRoute = SettingsRoute.Settings
+            NavDestination.SETTINGS -> { showServers = false; settingsRoute = SettingsRoute.Settings }
         }
     }
 
@@ -379,6 +381,42 @@ fun AppRoot(
                         null
                     },
                 ) }
+                showServers -> WithBottomNav(
+                    selected = NavDestination.SERVERS,
+                    destinations = bottomNavDestinations(isDebugBuild),
+                    onSelect = onNavSelect,
+                ) {
+                    net.pocvpn.client.ui.screens.ServersScreen(
+                        current = selectedGatewayId,
+                        autoMode = gatewayAutoMode,
+                        options = net.pocvpn.client.vpn.config.ProductionGatewayCatalog.all,
+                        provisionedGatewayIds = viewModel.provisionedGatewayIds,
+                        selectionBlocked = transportState.blocksGatewaySelection(),
+                        // Same backstops as the picker dialog: never act while a session exists.
+                        onSelect = { id ->
+                            if (!transportState.blocksGatewaySelection()) {
+                                viewModel.selectGateway(id)
+                                showServers = false
+                            }
+                        },
+                        onSelectAuto = {
+                            if (!transportState.blocksGatewaySelection()) {
+                                viewModel.setGatewayAutoMode(true)
+                                showServers = false
+                            }
+                        },
+                        onActivate = { id -> activatingGatewayId = id },
+                        privateMode = gatewaySelectionMode == net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE,
+                        privateConfigured = viewModel.privateGatewayConfig != null,
+                        onSelectPrivate = {
+                            if (!transportState.blocksGatewaySelection()) {
+                                viewModel.selectGatewaySelectionMode(net.pocvpn.client.vpn.config.GatewaySelectionMode.PRIVATE)
+                                showServers = false
+                            }
+                        },
+                        onConfigurePrivate = { showPrivateGatewayDialog = true },
+                    )
+                }
                 else -> WithBottomNav(
                     selected = NavDestination.VPN,
                     destinations = bottomNavDestinations(isDebugBuild),
