@@ -696,6 +696,8 @@ class MainViewModel(
     // the Factory passes the real notification sink + screen-state flow.
     private val trafficIndicatorSink: net.pocvpn.client.vpn.traffic.VpnTrafficIndicatorSink? = null,
     private val screenInteractive: kotlinx.coroutines.flow.Flow<Boolean> = kotlinx.coroutines.flow.flowOf(true),
+    // Home dashboard - monotonic clock for the protected-session timer only.
+    private val elapsedRealtimeMillis: () -> Long = android.os.SystemClock::elapsedRealtime,
     // B-WL7 layer 3a - reads the system's view of this app's VPN network after
     // Connected. Null (tests/legacy) means no protection check at all; the
     // Factory passes AndroidTunnelLinkReader.
@@ -1167,14 +1169,57 @@ class MainViewModel(
 
     // Live speed indicator - observation only (see VpnTrafficIndicator's own
     // docs); started once here, stopped in onCleared together with the controller.
-    private val trafficIndicator = trafficIndicatorSink?.let { sink ->
+    //
+    // Home dashboard - the SAME single loop also feeds [sessionTraffic]: the
+    // counters read and the sink callback both happen once per tick, in the
+    // same coroutine, so no second poller exists. Without a sink (tests/
+    // legacy) there is no loop and [sessionTraffic] stays null.
+    private val _sessionTraffic = MutableStateFlow<net.pocvpn.client.ui.SessionTraffic?>(null)
+
+    /** Cumulative tunnel bytes + smoothed rate of the current Connected period, or null while unavailable. */
+    val sessionTraffic: StateFlow<net.pocvpn.client.ui.SessionTraffic?> = _sessionTraffic.asStateFlow()
+
+    private val trafficIndicator = trafficIndicatorSink?.let { notifier ->
+        var latestCounters: net.pocvpn.client.transport.TransportStats = net.pocvpn.client.transport.TransportStats.Unavailable
         net.pocvpn.client.vpn.traffic.VpnTrafficIndicator(
             state = controller.state,
-            counters = { controller.liveTrafficCounters() },
-            sink = sink,
+            counters = { controller.liveTrafficCounters().also { latestCounters = it } },
+            sink = object : net.pocvpn.client.vpn.traffic.VpnTrafficIndicatorSink {
+                override fun show(rate: net.pocvpn.client.vpn.traffic.TrafficRate) {
+                    val counters = latestCounters as? net.pocvpn.client.transport.TransportStats.Counters
+                    _sessionTraffic.value = counters?.let {
+                        net.pocvpn.client.ui.SessionTraffic(it.bytesReceived, it.bytesSent, rate)
+                    }
+                    notifier.show(rate)
+                }
+
+                override fun hide(sessionEnded: Boolean) {
+                    _sessionTraffic.value = null
+                    notifier.hide(sessionEnded)
+                }
+
+                override fun release() = notifier.release()
+            },
             elapsedRealtimeMillis = android.os.SystemClock::elapsedRealtime,
             interactive = screenInteractive,
         ).also { it.start(viewModelScope) }
+    }
+
+    // Home dashboard - protected-session start on a monotonic clock, driven
+    // only by the existing sessionHealth flow (see SessionUptimeTracker's docs).
+    private val sessionUptimeTracker = net.pocvpn.client.ui.SessionUptimeTracker(elapsedRealtimeMillis)
+    private val _sessionStartedAtMillis = MutableStateFlow<Long?>(null)
+
+    /** elapsedRealtime millis when the current protected period began; null when not protected or unknown. */
+    val sessionStartedAtMillis: StateFlow<Long?> = _sessionStartedAtMillis.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            controller.sessionHealth.collect { health ->
+                sessionUptimeTracker.onHealth(health)
+                _sessionStartedAtMillis.value = sessionUptimeTracker.startedAtMillis
+            }
+        }
     }
 
     // B8I7 - gains the endpointId of a gateway the moment a real Xray

@@ -16,16 +16,19 @@ import androidx.compose.ui.graphics.Color
 // Single strong accent - used for the power button, the primary Activate
 // button, and small highlight touches. Same hue in both schemes so the
 // brand reads consistently regardless of theme.
-private val Accent = Color(0xFF3DDC97)
-private val AccentOnDark = Color(0xFF0B1220)
+// Secure Orbit - cyan/turquoise. The light scheme uses a darker cyan so
+// white-on-accent text keeps AA contrast.
+private val Accent = Color(0xFF22D3EE)
+private val AccentLight = Color(0xFF00778A)
+private val AccentOnDark = Color(0xFF031A22)
 
-private val NavyBackground = Color(0xFF0B1220)
-private val NavySurface = Color(0xFF141B2E)
-private val NavySurfaceVariant = Color(0xFF1E2740)
-private val NavyOnBackground = Color(0xFFE7ECF7)
-private val NavyOnSurfaceVariant = Color(0xFFA9B2C7)
+private val NavyBackground = Color(0xFF07111F)
+private val NavySurface = Color(0xFF0E1B2E)
+private val NavySurfaceVariant = Color(0xFF15263D)
+private val NavyOnBackground = Color(0xFFE6F1FA)
+private val NavyOnSurfaceVariant = Color(0xFFA3B8CC)
 
-private val NeutralBackground = Color(0xFFF7F8FB)
+private val NeutralBackground = Color(0xFFF4F8FB)
 private val NeutralSurface = Color(0xFFFFFFFF)
 private val NeutralSurfaceVariant = Color(0xFFEDEFF5)
 private val NeutralOnBackground = Color(0xFF14182B)
@@ -34,6 +37,7 @@ private val NeutralOnSurfaceVariant = Color(0xFF5C6478)
 private val NovaDarkColorScheme = darkColorScheme(
     primary = Accent,
     onPrimary = AccentOnDark,
+    outlineVariant = Color(0xFF24405C),
     background = NavyBackground,
     onBackground = NavyOnBackground,
     surface = NavySurface,
@@ -44,8 +48,9 @@ private val NovaDarkColorScheme = darkColorScheme(
 )
 
 private val NovaLightColorScheme = lightColorScheme(
-    primary = Accent,
-    onPrimary = AccentOnDark,
+    primary = AccentLight,
+    onPrimary = Color.White,
+    outlineVariant = Color(0xFFC3D3E0),
     background = NeutralBackground,
     onBackground = NeutralOnBackground,
     surface = NeutralSurface,

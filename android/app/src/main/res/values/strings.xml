@@ -19,6 +19,10 @@
     <string name="home_location_content_description">Server location</string>
     <string name="home_location_chevron_content_description">Change location</string>
     <string name="home_diagnostics_entry">Diagnostics</string>
+    <string name="home_stat_session">Session</string>
+    <string name="home_stat_download">Download</string>
+    <string name="home_stat_upload">Upload</string>
+    <string name="home_stat_unavailable">–</string>
     <string name="home_kill_switch_notice">Internet blocked until VPN reconnects</string>
     <string name="home_other_profile_notice">Cloned apps and work-profile apps on this phone are NOT protected</string>
     <string name="lockdown_hint_title">Stay protected if Nova stops</string>

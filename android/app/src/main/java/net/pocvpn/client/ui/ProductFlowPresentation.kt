@@ -255,3 +255,53 @@ fun homeConnectedSubtitle(appliedRoutingMode: AppRoutingMode): HomeConnectedSubt
     AppRoutingMode.BYPASS_SELECTED -> HomeConnectedSubtitle.BYPASS_SELECTED_APPS
     AppRoutingMode.VPN_ONLY_SELECTED -> HomeConnectedSubtitle.VPN_ONLY_SELECTED_APPS
 }
+
+/** Home dashboard - true only when the health model itself confirms protection (never raw TransportState.Connected). */
+fun VpnSessionHealth.isProtected(): Boolean = toHomeVisualState() == HomeVisualState.CONNECTED
+
+/** Home dashboard - elapsed protected time as HH:MM:SS (hours are not capped). Negative input clamps to zero. */
+fun formatSessionDuration(elapsedMillis: Long): String {
+    val totalSeconds = (elapsedMillis.coerceAtLeast(0L)) / 1_000
+    return "%02d:%02d:%02d".format(java.util.Locale.US, totalSeconds / 3_600, (totalSeconds / 60) % 60, totalSeconds % 60)
+}
+
+
+private val BYTE_UNITS = listOf("B", "kB", "MB", "GB", "TB")
+
+/**
+ * Home dashboard - cumulative session bytes in DECIMAL units (1 kB = 1000 B),
+ * the same base and spelling as the speed notification's TrafficRateFormat,
+ * so the same traffic reads the same in both places.
+ */
+fun formatByteCount(bytes: Long): String {
+    val clamped = bytes.coerceAtLeast(0L)
+    if (clamped < 1_000) return "$clamped B"
+    var scaled = clamped.toDouble()
+    var index = 0
+    while (scaled >= 1_000.0 && index < BYTE_UNITS.lastIndex) {
+        scaled /= 1_000.0
+        index++
+    }
+    // Rounding 999.96 kB would print "1000.0 kB" - carry into the next unit instead.
+    if (scaled >= 999.95 && index < BYTE_UNITS.lastIndex) {
+        scaled /= 1_000.0
+        index++
+    }
+    return "%.1f %s".format(java.util.Locale.US, scaled, BYTE_UNITS[index])
+}
+
+/** Home dashboard - instantaneous rate; delegates to the notification's own formatter so both always agree. */
+fun formatByteRate(bytesPerSecond: Long): String =
+    net.pocvpn.client.vpn.traffic.TrafficRateFormat.speed(bytesPerSecond)
+
+/** Home dashboard - short display name of the transport that is ACTUALLY running (exhaustive on purpose). */
+fun net.pocvpn.client.transport.TransportKind.toHomeProtocolLabel(): String = when (this) {
+    net.pocvpn.client.transport.TransportKind.AMNEZIA_WG -> "AmneziaWG"
+    net.pocvpn.client.transport.TransportKind.XRAY_REALITY -> "VLESS REALITY"
+    net.pocvpn.client.transport.TransportKind.QUIC -> "QUIC"
+    net.pocvpn.client.transport.TransportKind.TLS_TCP -> "VLESS TLS"
+    net.pocvpn.client.transport.TransportKind.XRAY_XHTTP -> "VLESS XHTTP"
+    net.pocvpn.client.transport.TransportKind.SHADOWSOCKS_2022 -> "Shadowsocks 2022"
+    net.pocvpn.client.transport.TransportKind.HYSTERIA2 -> "Hysteria2"
+    net.pocvpn.client.transport.TransportKind.XRAY_REALITY_XHTTP -> "REALITY + XHTTP"
+}
