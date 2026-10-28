@@ -120,6 +120,9 @@ fun AppRoot(
     // from - see VpnSessionHealth's own docs for why this is not merely a
     // second, possibly-diverging copy of transportState for Direct sessions.
     val sessionHealth by viewModel.sessionHealth.collectAsStateWithLifecycle()
+    val currentTransportKind by viewModel.currentTransportKind.collectAsStateWithLifecycle()
+    val sessionStartedAtMillis by viewModel.sessionStartedAtMillis.collectAsStateWithLifecycle()
+    val sessionTraffic by viewModel.sessionTraffic.collectAsStateWithLifecycle()
     val provisioningState by viewModel.provisioningState.collectAsStateWithLifecycle()
     val activationPackageState by viewModel.activationPackageState.collectAsStateWithLifecycle()
     val activationInputAdapterState by viewModel.activationInputAdapterState.collectAsStateWithLifecycle()
@@ -397,6 +400,10 @@ fun AppRoot(
                     // actually using, so there is nothing truthful this
                     // dialog could offer to change right now.
                     onLocationClick = { if (!transportState.blocksGatewaySelection()) showGatewayPicker = true },
+                    // Secure Orbit - the transport actually running (null with no session).
+                    protocolLabel = if (transportState.isConnectedOrConnecting()) currentTransportKind?.toHomeProtocolLabel() else null,
+                    sessionStartedAtMillis = sessionStartedAtMillis,
+                    sessionTraffic = sessionTraffic,
                 )
             }
         }

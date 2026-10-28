@@ -10,6 +10,24 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.style.TextAlign
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
+import net.pocvpn.client.ui.SessionTraffic
+import net.pocvpn.client.ui.formatByteCount
+import net.pocvpn.client.ui.formatByteRate
+import net.pocvpn.client.ui.formatSessionDuration
+import net.pocvpn.client.ui.components.StatTile
+import net.pocvpn.client.vpn.traffic.TrafficRate
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -61,6 +79,14 @@ fun HomeScreen(
     locationCity: String,
     onLocationClick: () -> Unit,
     modifier: Modifier = Modifier,
+    // Secure Orbit - the transport ACTUALLY running (null while no session).
+    protocolLabel: String? = null,
+    // elapsedRealtime millis when the current PROTECTED period began
+    // (MainViewModel.sessionStartedAtMillis); null = not protected / unknown.
+    sessionStartedAtMillis: Long? = null,
+    // Cumulative session bytes + rate from the single existing sampling loop
+    // (MainViewModel.sessionTraffic); null = unavailable, never shown as zero.
+    sessionTraffic: SessionTraffic? = null,
 ) {
     val statusSubtitle = when (visualState) {
         HomeVisualState.CONNECTED -> when (homeConnectedSubtitle(appliedRoutingMode)) {
@@ -73,7 +99,23 @@ fun HomeScreen(
         HomeVisualState.FAILED -> stringResource(R.string.home_status_subtitle_failed)
     }
 
-    Column(modifier = modifier.fillMaxSize().padding(horizontal = 28.dp)) {
+    // Session timer display only: the START lives in MainViewModel; this just
+    // re-reads the monotonic clock once a second while the screen is STARTED
+    // and a protected session has a known start (no work otherwise).
+    var nowMillis by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(sessionStartedAtMillis, visualState) {
+        if (visualState == HomeVisualState.CONNECTED && sessionStartedAtMillis != null) {
+            lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (true) {
+                    nowMillis = android.os.SystemClock.elapsedRealtime()
+                    delay(1_000)
+                }
+            }
+        }
+    }
+
+    Column(modifier = modifier.fillMaxSize().padding(horizontal = 20.dp)) {
         Spacer(modifier = Modifier.height(24.dp))
 
         Row(
@@ -94,7 +136,11 @@ fun HomeScreen(
         }
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            // Scrolls on small screens / large font scales instead of clipping.
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+            ) {
                 val powerButtonDescription = if (visualState == HomeVisualState.CONNECTED || visualState == HomeVisualState.IN_PROGRESS) {
                     stringResource(R.string.home_power_button_content_description_disconnect)
                 } else {
@@ -105,18 +151,24 @@ fun HomeScreen(
                     onClick = onPowerButtonClick,
                     contentDescription = powerButtonDescription,
                 )
-                Spacer(modifier = Modifier.height(28.dp))
+                Spacer(modifier = Modifier.height(20.dp))
                 Text(
                     text = statusHeadline,
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = when (visualState) {
+                        HomeVisualState.CONNECTED -> MaterialTheme.colorScheme.primary
+                        HomeVisualState.FAILED -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.onBackground
+                    },
+                    textAlign = TextAlign.Center,
                 )
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = statusSubtitle,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
                 )
                 if (showKillSwitchNotice) {
                     Spacer(modifier = Modifier.height(4.dp))
@@ -132,13 +184,46 @@ fun HomeScreen(
                         text = stringResource(R.string.home_other_profile_notice),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        textAlign = TextAlign.Center,
                     )
+                }
+                // Session stats exist only while the health model confirms
+                // protection; each value falls back to a neutral dash.
+                if (visualState == HomeVisualState.CONNECTED) {
+                    Spacer(modifier = Modifier.height(20.dp))
+                    val unavailable = stringResource(R.string.home_stat_unavailable)
+                    val uptimeText = sessionStartedAtMillis
+                        ?.let { formatSessionDuration(nowMillis - it) }
+                        ?: unavailable
+                    val rate = sessionTraffic?.rate
+                    fun rateText(bytesPerSecond: (TrafficRate.Rate) -> Long): String? = when (rate) {
+                        is TrafficRate.Rate -> formatByteRate(bytesPerSecond(rate))
+                        else -> null
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        StatTile(
+                            label = stringResource(R.string.home_stat_session),
+                            value = uptimeText,
+                            modifier = Modifier.weight(1f),
+                        )
+                        StatTile(
+                            label = stringResource(R.string.home_stat_download),
+                            value = sessionTraffic?.let { formatByteCount(it.bytesReceived) } ?: unavailable,
+                            secondary = rateText { it.downloadBytesPerSecond },
+                            modifier = Modifier.weight(1f),
+                        )
+                        StatTile(
+                            label = stringResource(R.string.home_stat_upload),
+                            value = sessionTraffic?.let { formatByteCount(it.bytesSent) } ?: unavailable,
+                            secondary = rateText { it.uploadBytesPerSecond },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
                 }
             }
         }
 
-        LocationCard(country = locationCountry, city = locationCity, onClick = onLocationClick)
+        LocationCard(country = locationCountry, city = locationCity, onClick = onLocationClick, protocol = protocolLabel)
 
         Spacer(modifier = Modifier.height(12.dp))
 

@@ -255,3 +255,49 @@ fun homeConnectedSubtitle(appliedRoutingMode: AppRoutingMode): HomeConnectedSubt
     AppRoutingMode.BYPASS_SELECTED -> HomeConnectedSubtitle.BYPASS_SELECTED_APPS
     AppRoutingMode.VPN_ONLY_SELECTED -> HomeConnectedSubtitle.VPN_ONLY_SELECTED_APPS
 }
+
+/** Home dashboard - true only when the health model itself confirms protection (never raw TransportState.Connected). */
+fun VpnSessionHealth.isProtected(): Boolean = toHomeVisualState() == HomeVisualState.CONNECTED
+
+/** Home dashboard - elapsed protected time as HH:MM:SS (hours are not capped). Negative input clamps to zero. */
+fun formatSessionDuration(elapsedMillis: Long): String {
+    val totalSeconds = (elapsedMillis.coerceAtLeast(0L)) / 1_000
+    return "%02d:%02d:%02d".format(java.util.Locale.US, totalSeconds / 3_600, (totalSeconds / 60) % 60, totalSeconds % 60)
+}
+
+private const val BYTES_PER_UNIT = 1024.0
+
+private fun formatScaled(value: Long, suffixes: List<String>): String {
+    val clamped = value.coerceAtLeast(0L)
+    if (clamped < 1024) return "$clamped ${suffixes[0]}"
+    var scaled = clamped.toDouble()
+    var index = 0
+    while (scaled >= BYTES_PER_UNIT && index < suffixes.lastIndex) {
+        scaled /= BYTES_PER_UNIT
+        index++
+    }
+    // Rounding 1023.96 KB would print "1024.0 KB" - carry into the next unit instead.
+    if (scaled >= 1023.95 && index < suffixes.lastIndex) {
+        scaled /= BYTES_PER_UNIT
+        index++
+    }
+    return "%.1f %s".format(java.util.Locale.US, scaled, suffixes[index])
+}
+
+/** Home dashboard - cumulative session bytes (binary units: 1 KB = 1024 B). */
+fun formatByteCount(bytes: Long): String = formatScaled(bytes, listOf("B", "KB", "MB", "GB", "TB"))
+
+/** Home dashboard - instantaneous transfer rate, same units as [formatByteCount]. */
+fun formatByteRate(bytesPerSecond: Long): String = formatScaled(bytesPerSecond, listOf("B/s", "KB/s", "MB/s", "GB/s", "TB/s"))
+
+/** Home dashboard - short display name of the transport that is ACTUALLY running (exhaustive on purpose). */
+fun net.pocvpn.client.transport.TransportKind.toHomeProtocolLabel(): String = when (this) {
+    net.pocvpn.client.transport.TransportKind.AMNEZIA_WG -> "AmneziaWG"
+    net.pocvpn.client.transport.TransportKind.XRAY_REALITY -> "VLESS REALITY"
+    net.pocvpn.client.transport.TransportKind.QUIC -> "QUIC"
+    net.pocvpn.client.transport.TransportKind.TLS_TCP -> "VLESS TLS"
+    net.pocvpn.client.transport.TransportKind.XRAY_XHTTP -> "VLESS XHTTP"
+    net.pocvpn.client.transport.TransportKind.SHADOWSOCKS_2022 -> "Shadowsocks 2022"
+    net.pocvpn.client.transport.TransportKind.HYSTERIA2 -> "Hysteria2"
+    net.pocvpn.client.transport.TransportKind.XRAY_REALITY_XHTTP -> "REALITY + XHTTP"
+}

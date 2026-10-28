@@ -1,6 +1,7 @@
 package net.pocvpn.client.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,7 +32,15 @@ import net.pocvpn.client.R
  * note no longer applies - see [onClick]).
  */
 @Composable
-fun LocationCard(country: String, city: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun LocationCard(
+    country: String,
+    city: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    // Secure Orbit - the transport ACTUALLY running; null while no session
+    // exists (never a guess at what will be used).
+    protocol: String? = null,
+) {
     val locationDescription = stringResource(R.string.home_location_content_description)
     val chevronDescription = stringResource(R.string.home_location_chevron_content_description)
 
@@ -41,6 +50,7 @@ fun LocationCard(country: String, city: String, onClick: () -> Unit, modifier: M
         modifier = modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(20.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(20.dp))
             .clickable(onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 18.dp)
             .semantics { contentDescription = locationDescription },
@@ -65,6 +75,13 @@ fun LocationCard(country: String, city: String, onClick: () -> Unit, modifier: M
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (protocol != null) {
+                Text(
+                    text = protocol,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
         }
 
         ChevronRightGlyph(
