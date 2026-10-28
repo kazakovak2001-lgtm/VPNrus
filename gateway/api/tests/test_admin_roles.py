@@ -118,6 +118,12 @@ class AdminRoleTests(unittest.TestCase):
         status, _, body = self._req("POST", f"/admin/activations/{_ID}/revoke", h)
         self.assertEqual((status, json.loads(body)["error"]), (400, "missing_csrf_token"))
 
+    def test_viewer_can_read_gateway_snapshot(self):
+        _, sid, _, _ = self._login(VIEWER_PW)
+        status, _, body = self._req("GET", "/admin/gateway", {"Cookie": f"pocvpn-admin-session={sid}"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["activations"]["total"], 1)
+
     def test_viewer_can_log_out_and_session_dies(self):
         _, sid, csrf, _ = self._login(VIEWER_PW)
         self.assertEqual(self._req("POST", "/admin/logout", self._mut(sid, csrf))[0], 200)

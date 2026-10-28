@@ -83,6 +83,16 @@ export const listActivations = (query: ListQuery) => {
   return call<ListResult>("GET", `/admin/activations?${params.toString()}`);
 };
 
+export interface GatewayInfo {
+  uptime_seconds: number;
+  endpoint: { host: string; port: number };
+  transports: Record<string, boolean>;
+  manifest: { configured: boolean; present: boolean };
+  activations: { total: number; active: number; expired: number; revoked: number; bound_devices: number } | null;
+}
+
+export const gatewayInfo = () => call<GatewayInfo>("GET", "/admin/gateway");
+
 export const revoke = (id: string) =>
   call<{ status: string }>("POST", `/admin/activations/${id}/revoke`, undefined, true);
 
