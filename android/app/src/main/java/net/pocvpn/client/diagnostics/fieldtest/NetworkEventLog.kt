@@ -22,6 +22,21 @@ import org.json.JSONObject
  */
 enum class NetworkEventType { AVAILABLE, LOST, CAPABILITIES_CHANGED, LINK_CHANGED }
 
+/**
+ * What a network is. Android's onLost carries no capabilities (empty transports), so the role of a
+ * LOST event cannot be read from the event itself - [NetworkEventLog] resolves it from the transports
+ * the same network id was seen with. [UNKNOWN] = never seen with any transport (it is NOT assumed to be
+ * the underlying network).
+ */
+enum class NetworkRole { VPN, UNDERLYING, UNKNOWN }
+
+/** Role from a transport list alone; an empty list says nothing. */
+fun roleOfTransports(transports: List<String>): NetworkRole = when {
+    "VPN" in transports -> NetworkRole.VPN
+    transports.isNotEmpty() -> NetworkRole.UNDERLYING
+    else -> NetworkRole.UNKNOWN
+}
+
 data class NetworkEvent(
     val tUtcMillis: Long,
     /** Milliseconds since the log began (the test start). */
@@ -39,9 +54,11 @@ data class NetworkEvent(
      * registered; such events describe the starting situation, not a change.
      */
     val initial: Boolean = false,
+    /** Resolved by [NetworkEventLog.record]; the default is the role the event's own transports imply. */
+    val role: NetworkRole = roleOfTransports(transports),
 ) {
     /** True for the network carrying our own tunnel. */
-    val isVpn: Boolean get() = "VPN" in transports
+    val isVpn: Boolean get() = role == NetworkRole.VPN
 
     fun toJson(): JSONObject = JSONObject()
         .put("tUtcMillis", tUtcMillis)
@@ -55,6 +72,7 @@ data class NetworkEvent(
         .put("interfaceName", interfaceName ?: JSONObject.NULL)
         .put("dnsServerCount", dnsServerCount ?: JSONObject.NULL)
         .put("initial", initial)
+        .put("role", role.name)
 }
 
 data class NetworkEventSnapshot(
@@ -66,6 +84,18 @@ data class NetworkEventSnapshot(
     /** Non-null when the callback could not be registered: the timeline is then empty, not "no changes". */
     val registrationError: String?,
 ) {
+    /** LOST events of a physical network (the only ones that can explain a failed attempt). */
+    val underlyingLost: Int get() = events.count { it.type == NetworkEventType.LOST && it.role == NetworkRole.UNDERLYING }
+
+    /** LOST events of our own tunnel network: every disconnect produces one. */
+    val vpnLost: Int get() = events.count { it.type == NetworkEventType.LOST && it.role == NetworkRole.VPN }
+
+    /** LOST events whose network was never seen with a transport; not counted as underlying. */
+    val unknownLost: Int get() = events.count { it.type == NetworkEventType.LOST && it.role == NetworkRole.UNKNOWN }
+
+    /** A physical network reported "not validated" at some point. */
+    val unvalidatedSeen: Boolean get() = events.any { it.validated == false && it.role != NetworkRole.VPN }
+
     fun toJson(): JSONObject = JSONObject()
         .put("events", JSONArray().apply { events.forEach { put(it.toJson()) } })
         .put("dropped", dropped)
@@ -78,6 +108,8 @@ data class NetworkWindow(
     val underlyingLost: Int,
     val unvalidatedSeen: Boolean,
     val changes: Int,
+    /** LOST events of a network never seen with a transport: shown as evidence, never as an underlying loss. */
+    val unknownLost: Int = 0,
 )
 
 /** Bounded, thread-safe event buffer with an injectable clock (pure and JVM-testable). */
@@ -90,6 +122,8 @@ class NetworkEventLog(
     private var dropped = 0
     private var suppressed = 0
     private val lastByKey = HashMap<String, List<Any?>>()
+    private val vpnIds = HashSet<String>()
+    private val underlyingIds = HashSet<String>()
     private var registrationError: String? = null
 
     @Synchronized fun begin() {
@@ -97,6 +131,8 @@ class NetworkEventLog(
         dropped = 0
         suppressed = 0
         lastByKey.clear()
+        vpnIds.clear()
+        underlyingIds.clear()
         registrationError = null
         startedAt = clock()
     }
@@ -115,6 +151,17 @@ class NetworkEventLog(
         interfaceName: String?,
         dnsServerCount: Int?,
     ) {
+        // The role is resolved before any early return below, so a later LOST of this id is attributed
+        // even when this event itself was suppressed or dropped.
+        val role = when (roleOfTransports(transports)) {
+            NetworkRole.VPN -> { vpnIds += networkId; NetworkRole.VPN }
+            NetworkRole.UNDERLYING -> { underlyingIds += networkId; NetworkRole.UNDERLYING }
+            NetworkRole.UNKNOWN -> when (networkId) {
+                in vpnIds -> NetworkRole.VPN
+                in underlyingIds -> NetworkRole.UNDERLYING
+                else -> NetworkRole.UNKNOWN
+            }
+        }
         // Wi-Fi reports a capability change every ~2 s (bandwidth estimate, signal); identical repeats
         // would fill the buffer within minutes and hide the end of a long monitor run.
         val state = listOf(transports, validated, hasInternet, hasDefaultRoute, interfaceName, dnsServerCount)
@@ -132,7 +179,7 @@ class NetworkEventLog(
         }
         val now = clock()
         val relative = now - startedAt
-        events += NetworkEvent(now, relative, type, networkId, transports, validated, hasInternet, hasDefaultRoute, interfaceName, dnsServerCount, initial = relative < INITIAL_SNAPSHOT_MS)
+        events += NetworkEvent(now, relative, type, networkId, transports, validated, hasInternet, hasDefaultRoute, interfaceName, dnsServerCount, initial = relative < INITIAL_SNAPSHOT_MS, role = role)
     }
 
     @Synchronized fun snapshot(): NetworkEventSnapshot = NetworkEventSnapshot(events.toList(), dropped, suppressed, registrationError)
@@ -144,15 +191,12 @@ class NetworkEventLog(
 
 /** Reduces [events] inside [fromUtc, toUtc) to a [NetworkWindow]. VPN networks are ignored: they are our own tunnel. */
 fun networkWindow(events: List<NetworkEvent>, fromUtc: Long, toUtc: Long): NetworkWindow {
-    // onLost carries no capabilities (empty transports), so a LOST of our own tunnel network is only
-    // recognisable by the id it was seen with earlier: without this, every tunnel teardown counted
-    // as an underlying-network loss.
-    val vpnIds = events.filter { it.isVpn }.map { it.networkId }.toSet()
-    val inWindow = events.filter { it.tUtcMillis in fromUtc until toUtc && !it.isVpn && it.networkId !in vpnIds }
+    val inWindow = events.filter { it.tUtcMillis in fromUtc until toUtc && it.role != NetworkRole.VPN }
     return NetworkWindow(
-        underlyingLost = inWindow.count { it.type == NetworkEventType.LOST },
+        underlyingLost = inWindow.count { it.type == NetworkEventType.LOST && it.role == NetworkRole.UNDERLYING },
         unvalidatedSeen = inWindow.any { it.validated == false },
         changes = inWindow.size,
+        unknownLost = inWindow.count { it.type == NetworkEventType.LOST && it.role == NetworkRole.UNKNOWN },
     )
 }
 

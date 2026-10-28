@@ -76,6 +76,7 @@ fun diagnoseRun(run: FieldTransportRun, window: NetworkWindow?): RunDiagnosis {
     val missing = mutableListOf<String>()
     val lost = window?.underlyingLost ?: 0
     if (window?.unvalidatedSeen == true) evidence += "Android marked the default network as not validated during this attempt"
+    window?.unknownLost?.takeIf { it > 0 }?.let { evidence += "$it network loss event(s) could not be attributed to the tunnel or the underlying network and are not counted" }
 
     val dnsVerified = run.dns?.ok
     val exitIpVerified = if (run.exitIp != null && run.expectedExitIps.isNotEmpty()) run.exitIp in run.expectedExitIps else null

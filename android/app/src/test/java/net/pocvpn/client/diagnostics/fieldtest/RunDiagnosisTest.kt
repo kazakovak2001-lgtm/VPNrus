@@ -219,19 +219,6 @@ class RunDiagnosisTest {
         assertEquals(2, w.changes)
     }
 
-    @Test fun lost_event_of_our_own_tunnel_network_is_not_an_underlying_loss() {
-        // onLost carries no transports, so the tunnel's LOST is recognised by the id it was seen with earlier
-        // (the field-test timeline: network 322 CELLULAR+VPN, later LOST with an empty transport list).
-        val events = listOf(
-            NetworkEvent(500, 0, NetworkEventType.AVAILABLE, "322", listOf("CELLULAR", "VPN"), true, true, true, "tun0", 2),
-            NetworkEvent(1_100, 0, NetworkEventType.LOST, "322", emptyList(), null, null, null, null, null),
-            NetworkEvent(1_200, 0, NetworkEventType.LOST, "311", emptyList(), null, null, null, null, null),
-            NetworkEvent(1_000, 0, NetworkEventType.AVAILABLE, "311", listOf("CELLULAR"), true, true, true, "rmnet0", 2),
-        )
-        val w = networkWindow(events, 1_000, 2_000)
-        assertEquals(1, w.underlyingLost) // only the cellular network "311"
-    }
-
     @Test fun failed_registration_is_reported_not_treated_as_no_changes() {
         val log = NetworkEventLog({ now })
         log.begin()

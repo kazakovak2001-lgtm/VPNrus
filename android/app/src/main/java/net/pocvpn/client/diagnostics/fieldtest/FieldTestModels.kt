@@ -260,8 +260,11 @@ internal fun FieldTestReport.summaryLines(): List<String> {
         lines += "    diagnosis: ${d.category} (${d.confidence.name.lowercase()})" + d.evidence.firstOrNull()?.let { " - $it" }.orEmpty()
     }
     networkEvents?.let { n ->
-        val lost = n.events.count { it.type == NetworkEventType.LOST && !it.isVpn }
-        lines += "Network events: ${n.events.size}${if (n.suppressedRepeats > 0) " (+${n.suppressedRepeats} identical repeats not stored)" else ""}, underlying lost $lost, not validated ${if (n.events.any { it.validated == false && !it.isVpn }) "seen" else "not seen"}" +
+        val lost = n.underlyingLost
+        lines += "Network events: ${n.events.size}${if (n.suppressedRepeats > 0) " (+${n.suppressedRepeats} identical repeats not stored)" else ""}, underlying lost $lost" +
+            (if (n.vpnLost > 0) ", tunnel network lost ${n.vpnLost} (own disconnects)" else "") +
+            (if (n.unknownLost > 0) ", unattributed lost ${n.unknownLost}" else "") +
+            ", not validated ${if (n.unvalidatedSeen) "seen" else "not seen"}" +
             (n.registrationError?.let { ", timeline UNAVAILABLE ($it)" } ?: "")
     }
     if (runs.isNotEmpty()) {
@@ -410,6 +413,8 @@ internal fun FieldTestReport.diagnosisSummary(diagnoses: List<RunDiagnosis>): JS
             events.registrationError != null -> "UNAVAILABLE"
             else -> "RECORDED"
         })
-        .put("underlyingNetworkLost", events?.events?.count { it.type == NetworkEventType.LOST && !it.isVpn } ?: JSONObject.NULL)
-        .put("unvalidatedSeen", events?.events?.any { it.validated == false && !it.isVpn } ?: JSONObject.NULL)
+        .put("underlyingNetworkLost", events?.underlyingLost ?: JSONObject.NULL)
+        .put("vpnNetworkLost", events?.vpnLost ?: JSONObject.NULL)
+        .put("unknownNetworkLost", events?.unknownLost ?: JSONObject.NULL)
+        .put("unvalidatedSeen", events?.unvalidatedSeen ?: JSONObject.NULL)
 }
