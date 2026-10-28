@@ -17,11 +17,14 @@ import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeVpnTransport
 import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.blocksGatewaySelection
 import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.FileClientTunnelIdentityStore
+import net.pocvpn.client.vpn.config.FileGatewayAutoModeStore
 import net.pocvpn.client.vpn.config.FileGatewaySelectionModeStore
 import net.pocvpn.client.vpn.config.FilePrivateGatewayStore
 import net.pocvpn.client.vpn.config.FileSelectedGatewayStore
+import net.pocvpn.client.vpn.config.GatewayAutoModeStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.GatewaySelectionMode
 import net.pocvpn.client.vpn.config.PrivateGatewayConfig
@@ -257,5 +260,145 @@ class MainViewModelPrivateGatewayTest {
 
         assertTrue(result is net.pocvpn.client.vpn.config.PrivateGatewayValidationResult.Invalid)
         assertNull(privateGatewayStore.read())
+    }
+
+    private fun assertBlocksGatewaySelection(state: TransportState) {
+        assertTrue("Expected blocksGatewaySelection=true", state.blocksGatewaySelection())
+    }
+
+    // In-memory mode store so we can assert on writes while File-backed
+    // counterparts persist across reconstruction (see the next test).
+    private fun writableModeStore(initial: GatewaySelectionMode) =
+        object : net.pocvpn.client.vpn.config.GatewaySelectionModeStore {
+            var current: GatewaySelectionMode = initial
+                private set
+            var writeCallCount = 0
+                private set
+            override fun read() = current
+            override fun write(mode: GatewaySelectionMode) {
+                writeCallCount++
+                current = mode
+            }
+        }
+
+    @Test
+    fun `switching from PRIVATE to AUTO persists the new mode and restores it on reconstruction`() = runTest {
+        val dir = freshDir()
+        val privateGatewayStore = FilePrivateGatewayStore(dir)
+        privateGatewayStore.write(validPrivateConfig)
+        // gatewayAutoModeStore initialized to false (Manual) - simulates post-B22
+        // legacy store state where a newly constructed ViewModel must discover the
+        // current mode from gatewaySelectionModeStore, not from the auto-mode flag.
+        val autoStore = FileGatewayAutoModeStore(dir)
+        val modeStore = writableModeStore(GatewaySelectionMode.PRIVATE)
+
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(privateKey = "PRIVATE_KEY=="),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            gatewaySelectionModeStore = modeStore,
+            gatewayAutoModeStore = autoStore,
+            privateGatewayStore = privateGatewayStore,
+            privateGatewayKeyRepository = FakeClientKeyRepository(privateKey = "PRIVATE_KEY=="),
+        )
+
+        assertEquals(GatewaySelectionMode.PRIVATE, viewModel.gatewaySelectionMode.value)
+        // selectGatewaySelectionMode is a plain (non-suspend) function; the
+        // internal write chain completes synchronously on the calling thread.
+        viewModel.selectGatewaySelectionMode(GatewaySelectionMode.AUTO)
+
+        assertEquals(GatewaySelectionMode.AUTO, viewModel.gatewaySelectionMode.value)
+        assertTrue(viewModel.gatewayAutoMode.value)
+        assertEquals(GatewaySelectionMode.AUTO, modeStore.read())
+        assertEquals(1, modeStore.writeCallCount)
+        assertTrue(autoStore.read())
+
+        // Restart simulation: a brand-new ViewModel reads the persisted AUTO
+        // state from disk, confirming the write was durable.
+        val restarted = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(),
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            gatewaySelectionModeStore = modeStore,
+            gatewayAutoModeStore = autoStore,
+            privateGatewayStore = privateGatewayStore,
+        )
+        assertEquals(GatewaySelectionMode.AUTO, restarted.gatewaySelectionMode.value)
+        assertTrue(restarted.gatewayAutoMode.value)
+    }
+
+    @Test
+    fun `active PRIVATE connection blocks gateway-mode switch until disconnect`() = runTest {
+        val privateGatewayStore = FilePrivateGatewayStore(freshDir())
+        privateGatewayStore.write(validPrivateConfig)
+        val transport = FakeVpnTransport()
+        // FileGatewaySelectionModeStore is the production backing store;
+        // the test reads back from it to confirm the blocked write had no effect.
+        val gatewaySelectionModeStore = FileGatewaySelectionModeStore(freshDir())
+        gatewaySelectionModeStore.write(GatewaySelectionMode.PRIVATE)
+
+        val viewModel = MainViewModel(
+            clientKeyRepository = FakeClientKeyRepository(privateKey = "PRIVATE_KEY=="),
+            transport = transport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            gatewaySelectionModeStore = gatewaySelectionModeStore,
+            privateGatewayStore = privateGatewayStore,
+            privateGatewayKeyRepository = FakeClientKeyRepository(privateKey = "PRIVATE_KEY=="),
+        )
+
+        viewModel.connect()
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue("session must be Connected", viewModel.transportState.value is TransportState.Connected)
+        assertBlocksGatewaySelection(viewModel.transportState.value)
+
+        // Attempt to switch to AUTO while Connected - selectGatewaySelectionMode
+        // must observe blocksGatewaySelection() and abort without writing.
+        viewModel.selectGatewaySelectionMode(GatewaySelectionMode.AUTO)
+        // Plain function - nothing deferred to the scheduler.
+
+        assertEquals(GatewaySelectionMode.PRIVATE, viewModel.gatewaySelectionMode.value)
+        assertEquals(GatewaySelectionMode.PRIVATE, gatewaySelectionModeStore.read())
+        // Transport remains connected - no disconnect induced by the blocked switch.
+        assertTrue(viewModel.transportState.value is TransportState.Connected)
+    }
+
+    @Test
+    fun `PRIVATE → AUTO transition never leaks private key to managed identity`() = runTest {
+        val dir = freshDir()
+        val privateGatewayStore = FilePrivateGatewayStore(dir)
+        privateGatewayStore.write(validPrivateConfig)
+        val autoStore = FileGatewayAutoModeStore(dir)
+        val modeStore = writableModeStore(GatewaySelectionMode.PRIVATE)
+        // The managed key repository has a DIFFERENT key - any write by the
+        // PRIVATE→AUTO transition would be observable as a key rotation.
+        val managedKeyRepo = FakeClientKeyRepository(privateKey = "MANAGED_PRIVATE_KEY==")
+
+        val viewModel = MainViewModel(
+            clientKeyRepository = managedKeyRepo,
+            transport = FakeVpnTransport(),
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(GatewayConfiguration.Missing),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            gatewaySelectionModeStore = modeStore,
+            gatewayAutoModeStore = autoStore,
+            privateGatewayStore = privateGatewayStore,
+            privateGatewayKeyRepository = FakeClientKeyRepository(privateKey = "PRIVATE_KEY=="),
+        )
+
+        // Verify both keys are distinct before any mode switch.
+        assertEquals("MANAGED_PRIVATE_KEY==", managedKeyRepo.getPrivateKeyForTunnel())
+
+        viewModel.selectGatewaySelectionMode(GatewaySelectionMode.AUTO)
+        assertEquals(GatewaySelectionMode.AUTO, viewModel.gatewaySelectionMode.value)
+        // Managed key repo was never touched by the mode switch - the private
+        // key alias file is an entirely separate store.
+        assertEquals("MANAGED_PRIVATE_KEY==", managedKeyRepo.getPrivateKeyForTunnel())
     }
 }

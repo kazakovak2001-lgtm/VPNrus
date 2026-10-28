@@ -26,15 +26,21 @@ import net.pocvpn.client.identity.ManagedIdentityLifecycle
 import net.pocvpn.client.identity.ManagedKeyPeek
 import net.pocvpn.client.provisioning.ProvisioningResult
 import net.pocvpn.client.provisioning.ProvisioningUiState
+import net.pocvpn.client.provisioning.XrayProfileResult
+import net.pocvpn.client.provisioning.toXrayProfile
 import net.pocvpn.client.vpn.FakeGatewayConfigurationRepository
 import net.pocvpn.client.vpn.FakeReconnectManager
 import net.pocvpn.client.vpn.FakeVpnTransport
+import net.pocvpn.client.vpn.FakeXrayProfileRepository
+import net.pocvpn.client.vpn.TransportState
+import net.pocvpn.client.vpn.config.AwgProfile
 import net.pocvpn.client.vpn.config.FileClientTunnelIdentityStore
 import net.pocvpn.client.vpn.config.FileProfileStore
 import net.pocvpn.client.vpn.config.GatewayConfiguration
 import net.pocvpn.client.vpn.config.ProductionGatewayCatalog
 import net.pocvpn.client.vpn.config.ProductionGatewayId
 import net.pocvpn.client.vpn.config.ProfileLoadResult
+import net.pocvpn.client.transport.TransportKind
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -335,5 +341,68 @@ class MainViewModelManagedAwgIdentityTest {
         assertEquals(oldKey, env.currentPublicKey())
         assertEquals(before, env.fileBindings.read())
         assertEquals(ManagedAwgEligibilityReason.AWG_ACTIVE, eligibility(env))
+    }
+
+    // --- B8I8 regression: Managed AWG REACTIVATION_REQUIRED → Xray fallback ---
+
+    private fun validXrayProfileForFailoverTests() = net.pocvpn.client.provisioning.XrayProfileResult.Success(
+        serverAddress = "152.70.43.1",
+        serverPort = 443,
+        uuid = "3f29c1a4-6b8e-4d2a-9c3e-7a1b2c3d4e5f",
+        flow = "xtls-rprx-vision",
+        serverName = "www.microsoft.com",
+        fingerprint = "chrome",
+        realityPublicKey = "A".repeat(43),
+        shortId = "a1b2c3d4",
+    ).toXrayProfile()
+
+    private val CONFIGURED_GATEWAY = GatewayConfiguration.Configured(
+        endpointHost = "203.0.113.10", endpointPort = 51820,
+        serverPublicKeyBase64 = "hU7ohcV8fjAtDFISvpnfLhYFSlxY4lso0XofszDN81Y=",
+        clientTunnelIp = "10.77.0.2", gatewayTunnelIp = "10.77.0.1",
+        allowedIps = listOf("0.0.0.0/0", "::/0"), profile = AwgProfile.none(),
+    )
+
+    private val USABLE_WIFI = net.pocvpn.client.network.NetworkProfile(
+        type = net.pocvpn.client.network.NetworkType.WIFI, validatedInternet = true, metered = false,
+        roaming = false, captivePortal = false, ipv4Available = true, ipv6Available = false,
+        vpnActive = false, generation = 1,
+    )
+
+    @Test
+    fun `managed AWG with no binding errors REACTIVATION_REQUIRED and falls back to Xray when available`() = runTest {
+        val env = Env()
+        env.repo.getOrCreateIdentity() // key exists but NO binding → REACTIVATION_REQUIRED
+        val awgTransport = FakeVpnTransport()
+        val xrayTransport = FakeVpnTransport(kind = TransportKind.XRAY_REALITY)
+        val xrayRepository = FakeXrayProfileRepository(validXrayProfileForFailoverTests())
+        val guard = ManagedAwgIdentityGuard(ManagedIdentityLifecycle(), env.fileBindings, env.tunnels::read)
+        val vm = MainViewModel(
+            clientKeyRepository = env.repo,
+            transport = awgTransport,
+            gatewayConfigurationRepository = FakeGatewayConfigurationRepository(CONFIGURED_GATEWAY),
+            reconnectManager = FakeReconnectManager(),
+            diagnosticsStore = DiagnosticsStore(),
+            clientTunnelIdentityStore = env.tunnels,
+            profileStore = env.profiles,
+            activationClient = { _, _, _ -> germanyActivation },
+            ioDispatcher = testDispatcher,
+            managedAwgIdentityGuard = guard,
+            xrayTransport = xrayTransport,
+            xrayProfileRepository = xrayRepository,
+            initialNetworkProfile = USABLE_WIFI,
+        )
+        testDispatcher.scheduler.runCurrent() // init creates the key under L
+
+        // Verify the guard reports REACTIVATION_REQUIRED before connect.
+        assertEquals(ManagedAwgEligibilityReason.REACTIVATION_REQUIRED, eligibility(env))
+
+        vm.connect()
+        testDispatcher.scheduler.runCurrent()
+        // The REACTIVATION_REQUIRED error causes AWG to fail, then armFailoverWatch
+        // triggers Xray fallback synchronously within the same scheduler tick.
+        assertEquals(0, awgTransport.connectCallCount)
+        assertEquals(1, xrayTransport.connectCallCount)
+        assertTrue(vm.transportState.value is TransportState.Connected)
     }
 }
