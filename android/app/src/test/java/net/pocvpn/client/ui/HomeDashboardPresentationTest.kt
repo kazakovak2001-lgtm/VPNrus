@@ -28,17 +28,17 @@ class HomeDashboardPresentationTest {
 
     @Test fun bytes_boundaries() {
         assertEquals("0 B", formatByteCount(0))
-        assertEquals("1023 B", formatByteCount(1023))
-        assertEquals("1.0 KB", formatByteCount(1024))
-        assertEquals("1.5 KB", formatByteCount(1536))
-        assertEquals("1.0 MB", formatByteCount(1024L * 1024))
-        assertEquals("128.4 MB", formatByteCount((128.4 * 1024 * 1024).toLong()))
-        assertEquals("1.0 GB", formatByteCount(1024L * 1024 * 1024))
+        assertEquals("999 B", formatByteCount(999))
+        assertEquals("1.0 kB", formatByteCount(1_000))
+        assertEquals("1.5 kB", formatByteCount(1_500))
+        assertEquals("1.0 MB", formatByteCount(1_000_000))
+        assertEquals("128.4 MB", formatByteCount(128_400_000))
+        assertEquals("1.0 GB", formatByteCount(1_000_000_000))
     }
 
     @Test fun bytes_rounding_carries_into_next_unit() {
-        // 1023.96 KB must not print as "1024.0 KB".
-        assertEquals("1.0 MB", formatByteCount((1023.96 * 1024).toLong()))
+        // 999.96 kB must not print as "1000.0 kB".
+        assertEquals("1.0 MB", formatByteCount(999_960))
     }
 
     @Test fun bytes_negative_clamps_and_huge_values_stay_in_largest_unit() {
@@ -49,7 +49,13 @@ class HomeDashboardPresentationTest {
     @Test fun rates_use_per_second_units() {
         assertEquals("0 B/s", formatByteRate(0))
         assertEquals("512 B/s", formatByteRate(512))
-        assertEquals("2.1 MB/s", formatByteRate((2.1 * 1024 * 1024).toLong()))
+        assertEquals("2.1 MB/s", formatByteRate(2_100_000))
+    }
+
+    @Test fun rate_text_is_identical_to_the_speed_notification() {
+        listOf(0L, 512L, 1_500L, 314_573L, 2_202_009L, 999_600L).forEach {
+            assertEquals(net.pocvpn.client.vpn.traffic.TrafficRateFormat.speed(it), formatByteRate(it))
+        }
     }
 
     // --- protocol label -------------------------------------------------

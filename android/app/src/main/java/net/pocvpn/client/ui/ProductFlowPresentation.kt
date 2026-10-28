@@ -265,30 +265,34 @@ fun formatSessionDuration(elapsedMillis: Long): String {
     return "%02d:%02d:%02d".format(java.util.Locale.US, totalSeconds / 3_600, (totalSeconds / 60) % 60, totalSeconds % 60)
 }
 
-private const val BYTES_PER_UNIT = 1024.0
 
-private fun formatScaled(value: Long, suffixes: List<String>): String {
-    val clamped = value.coerceAtLeast(0L)
-    if (clamped < 1024) return "$clamped ${suffixes[0]}"
+private val BYTE_UNITS = listOf("B", "kB", "MB", "GB", "TB")
+
+/**
+ * Home dashboard - cumulative session bytes in DECIMAL units (1 kB = 1000 B),
+ * the same base and spelling as the speed notification's TrafficRateFormat,
+ * so the same traffic reads the same in both places.
+ */
+fun formatByteCount(bytes: Long): String {
+    val clamped = bytes.coerceAtLeast(0L)
+    if (clamped < 1_000) return "$clamped B"
     var scaled = clamped.toDouble()
     var index = 0
-    while (scaled >= BYTES_PER_UNIT && index < suffixes.lastIndex) {
-        scaled /= BYTES_PER_UNIT
+    while (scaled >= 1_000.0 && index < BYTE_UNITS.lastIndex) {
+        scaled /= 1_000.0
         index++
     }
-    // Rounding 1023.96 KB would print "1024.0 KB" - carry into the next unit instead.
-    if (scaled >= 1023.95 && index < suffixes.lastIndex) {
-        scaled /= BYTES_PER_UNIT
+    // Rounding 999.96 kB would print "1000.0 kB" - carry into the next unit instead.
+    if (scaled >= 999.95 && index < BYTE_UNITS.lastIndex) {
+        scaled /= 1_000.0
         index++
     }
-    return "%.1f %s".format(java.util.Locale.US, scaled, suffixes[index])
+    return "%.1f %s".format(java.util.Locale.US, scaled, BYTE_UNITS[index])
 }
 
-/** Home dashboard - cumulative session bytes (binary units: 1 KB = 1024 B). */
-fun formatByteCount(bytes: Long): String = formatScaled(bytes, listOf("B", "KB", "MB", "GB", "TB"))
-
-/** Home dashboard - instantaneous transfer rate, same units as [formatByteCount]. */
-fun formatByteRate(bytesPerSecond: Long): String = formatScaled(bytesPerSecond, listOf("B/s", "KB/s", "MB/s", "GB/s", "TB/s"))
+/** Home dashboard - instantaneous rate; delegates to the notification's own formatter so both always agree. */
+fun formatByteRate(bytesPerSecond: Long): String =
+    net.pocvpn.client.vpn.traffic.TrafficRateFormat.speed(bytesPerSecond)
 
 /** Home dashboard - short display name of the transport that is ACTUALLY running (exhaustive on purpose). */
 fun net.pocvpn.client.transport.TransportKind.toHomeProtocolLabel(): String = when (this) {
