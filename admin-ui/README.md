@@ -36,6 +36,25 @@ extend and revoke returns 403 `forbidden` after the CSRF/Origin checks. The role
 session, never taken from the client, and is recorded in the audit log. These are two shared secrets, not
 per-person accounts. Locally, create `<state-dir>/viewer-secret` to enable the viewer in the dev launcher.
 
+## Local hub (several gateways)
+`gateway/tools/run_admin_hub.py` runs on your own machine and aggregates the read-only `GET /admin/gateway` of
+several gateways, reached through SSH tunnels to their loopback admin API. It is optional; without it the
+dashboard just says the hub is not running.
+
+1. Tunnel each gateway: `ssh -N -L 18787:127.0.0.1:<api port> <host>` (one local port per gateway).
+2. Put each gateway's **viewer** secret in its own 0600 file (never the admin secret) and list the nodes in a
+   registry file outside the repo (no secrets in it):
+   `{"nodes": [{"id": "frankfurt", "name": "Frankfurt", "role": "primary", "url": "http://127.0.0.1:18787", "viewer_secret_file": "/abs/path/frankfurt-viewer"}]}`
+3. `python3 gateway/tools/run_admin_hub.py --registry /abs/path/nodes.json [--port 8790]`; the Vite dev server
+   proxies `/hub` to it (override with `VPN_HUB_API`).
+
+Safety: registry URLs must be loopback `http://host:port`; a secret that turns out to be an admin credential is
+refused (`MISCONFIGURED`) and its session closed; no redirects, 3 s timeout, 64 KiB response cap; the hub binds to
+127.0.0.1, sends no CORS headers, rejects foreign `Host` headers, caches for 5 s and returns names, roles and
+status only (no tunnel addresses, secrets or cookies). Each node shows `OK`, `UNREACHABLE`, `AUTH_FAILED`,
+`MISCONFIGURED` or `ERROR`; one dead node does not affect the others. Remote gateways need the admin endpoints
+deployed and a viewer secret configured first.
+
 ## Device unbind - decision
 Not implemented on purpose. Unbinding a device frees a slot but does not remove the WireGuard/Xray
 credential already provisioned on the gateway, so the device would keep working. Until gateway-side

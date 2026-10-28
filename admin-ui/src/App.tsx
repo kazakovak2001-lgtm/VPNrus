@@ -253,6 +253,8 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         )}
       </section>
 
+      <HubCard />
+
       {role === "admin" && (
       <section className="bg-white rounded-xl shadow p-4">
         <h2 className="font-medium mb-3">Create activation</h2>
@@ -397,6 +399,66 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         </section>
       )}
     </div>
+  );
+}
+
+const STATUS_STYLE: Record<string, string> = {
+  OK: "bg-green-100 text-green-800",
+  UNREACHABLE: "bg-red-100 text-red-800",
+  AUTH_FAILED: "bg-red-100 text-red-800",
+  MISCONFIGURED: "bg-amber-100 text-amber-800",
+  ERROR: "bg-amber-100 text-amber-800",
+};
+
+function HubCard() {
+  const [nodes, setNodes] = useState<api.HubNode[] | null>(null);
+  const [absent, setAbsent] = useState(false);
+  const refresh = useCallback(() => {
+    api.hubNodes().then((n) => { setNodes(n); setAbsent(false); }, () => { setNodes(null); setAbsent(true); });
+  }, []);
+  useEffect(refresh, [refresh]);
+
+  return (
+    <section className="bg-white rounded-xl shadow p-4 space-y-2 text-sm">
+      <div className="flex items-center justify-between">
+        <h2 className="font-medium">All gateways (local hub)</h2>
+        <button onClick={refresh} className="rounded border px-2 py-1 text-xs">Refresh</button>
+      </div>
+      {absent ? (
+        <p className="text-slate-500">
+          The local hub is not running. Start it with gateway/tools/run_admin_hub.py (see admin-ui/README.md) to see
+          several gateways at once.
+        </p>
+      ) : nodes === null ? (
+        <p className="text-slate-500">Loading…</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="text-left text-slate-500">
+              <tr><th className="py-1">Node</th><th>Role</th><th>Status</th><th>Uptime</th><th>Activations</th><th>Transports on</th></tr>
+            </thead>
+            <tbody>
+              {nodes.map((n) => (
+                <tr key={n.id} className="border-t">
+                  <td className="py-1">{n.name}</td>
+                  <td>{n.role}</td>
+                  <td>
+                    <span className={`rounded px-2 py-0.5 text-xs ${STATUS_STYLE[n.status] ?? ""}`}>{n.status}</span>
+                    {n.detail && <span className="ml-2 text-xs text-slate-500">{n.detail.replace(/_/g, " ")}</span>}
+                  </td>
+                  <td>{n.gateway ? formatUptime(n.gateway.uptime_seconds) : "-"}</td>
+                  <td>{n.gateway?.activations ? `${n.gateway.activations.active} active / ${n.gateway.activations.total}` : "-"}</td>
+                  <td>{n.gateway ? Object.values(n.gateway.transports).filter(Boolean).length : "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="text-xs text-slate-500">
+        Read-only. The hub logs in to each gateway with its viewer secret over an SSH tunnel; it cannot change anything.
+      </p>
+    </section>
   );
 }
 
