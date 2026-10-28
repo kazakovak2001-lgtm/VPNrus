@@ -243,7 +243,16 @@ configs at the same file path is NOT a shared store across hosts. The fix
 is `field_enrollment.py` being deployed, independently and identically, on
 EVERY control-plane role a device needs zero-touch authority against (the
 target gateway AND, separately, the ingress role) - never a
-server-to-server call or a shared filesystem. Client:
+server-to-server call or a shared filesystem. On the ingress role
+(`handler.py` passes `provision_awg_peer=False` exactly when the process
+was started with an `ingress_config`) `enroll_device` reserves and
+registers only - no `provision_with_activation`, since the ingress's
+provision script is a no-op placeholder (until this was fixed every
+ingress enrollment returned 500, Stockholm 2026-10-28) - then checks the
+registered record's entitlement read-only; the device binds on its first
+`/v1/ingress-profile` (`provision_and_activate_identity_selfbind`). The
+success response keeps its shape with `client_tunnel_ip` `0.0.0.0`
+(nothing assigned). Client:
 `MainViewModel.ensureZeroTouchEnrollment()` (called from `connect()` only
 when `BuildConfig.FIELD_ENROLLMENT_ENABLED` and the device has never been
 activated) calls `ProvisioningClient.fieldEnroll` against the TARGET

@@ -56,6 +56,8 @@ from .wgkey import is_valid_wg_public_key
 
 logger = logging.getLogger("pocvpn.api")
 _STARTED_AT = time.time()
+# /v1/field-enroll on an ingress: no tunnel address was assigned.
+_INGRESS_NO_TUNNEL_IP = "0.0.0.0"
 
 
 def _log_provision_error(exc):
@@ -1114,6 +1116,9 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
                 cfg.field_enrollment_max_devices,
                 cfg.field_enrollment_wrap_key_file,
                 sudo_path=cfg.sudo_path or None,
+                # Ingress role (set at process start, never by the request):
+                # register only - no AWG peer, its provision script is a no-op.
+                provision_awg_peer=self.server.ingress_config is None,
             )
         except (activations.ActivationStoreError, field_enrollment.FieldEnrollmentIndexError):
             logger.error("field_enrollment_store_error")
@@ -1152,10 +1157,14 @@ class ProvisioningRequestHandler(BaseHTTPRequestHandler):
         # credential was minted for, delivered once, over TLS. Every other
         # field mirrors /v1/activate's own success payload exactly, so the
         # client's existing response-parsing/persistence path needs no new
-        # shape beyond the one new field.
+        # shape beyond the one new field. On the ingress role nothing was
+        # provisioned (client_tunnel_ip None): "0.0.0.0" keeps the existing
+        # client parser's IPv4 shape while naming no address, next to the
+        # ingress's own placeholder gateway key/tunnel IP (ingress.env.example);
+        # the client's ingress path uses only activation_credential.
         payload = {
             "activation_credential": result.credential,
-            "client_tunnel_ip": result.client_tunnel_ip,
+            "client_tunnel_ip": result.client_tunnel_ip or _INGRESS_NO_TUNNEL_IP,
             "gateway_public_key": cfg.gateway_public_key,
             "gateway_tunnel_ip": cfg.gateway_tunnel_ip,
             "endpoint_host": cfg.endpoint_host,
