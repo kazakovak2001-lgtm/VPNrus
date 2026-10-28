@@ -111,6 +111,7 @@ class FieldTestRunnerTest {
         override fun supportBundle(): JSONObject? = JSONObject().put("schemaVersion", 1)
         var context: (TransportState) -> JSONObject = { JSONObject().put("summary", "WIFI, operator Test (25001, ru)") }
         override fun networkContext() = context(transportState.value)
+        override fun physicalResolvers() = listOf("192.168.1.1", "193.232.160.49")
         override fun vpnNetwork(): Network? = null
         /** B54 Scope B - a VPN network is "visible" while Connected; [vpnHandle] identifies it. */
         var vpnVisible = true
@@ -151,6 +152,8 @@ class FieldTestRunnerTest {
         tcp = { l, h, p, _ -> TcpProbeResult(l, h, p, true, 5, null) },
         censorship = { _ -> CensorshipReport(emptyList(), mapOf("8.8.8.8:53" to false), mapOf("cloudflare" to true), listOf("UDP53_TO_FOREIGN_RESOLVERS_BLOCKED")) },
         api = { origins -> org.json.JSONArray().apply { origins.forEach { put(JSONObject().put("origin", it).put("path", "/v1/activate").put("verdict", "API_REACHABLE").put("httpStatus", 400)) } } },
+        stageProbe = { id, b -> StageProbeResult(id, b.kind.name, b.host, b.port, "not run in unit tests", emptyList()) },
+        dnsDirect = { emptyList() },
         leaks = { _, direct, v6 -> leakBaselines += v6; JSONObject().put("verdict", if (direct.isEmpty()) "NO_LEAK_OBSERVED" else "NO_LEAK_OBSERVED") },
         https = { label, url, _, maxBytes, parseTrace ->
             if (host.transportState.value is TransportState.Connected) {
@@ -173,6 +176,37 @@ class FieldTestRunnerTest {
         connectTimeoutMs = 5_000, healthGraceMs = 1_000, settleMs = 10, stabilityHoldMs = 10,
         disconnectTimeoutMs = 1_000, betweenRunsMs = 10, notStartedGraceMs = 1_000,
     )
+
+    @Test
+    fun `stage probe and direct resolver probe run once, only while disconnected, on TLS_TCP bindings and the physical resolvers`() = runTest {
+        val host = FakeHost()
+        val stageCalls = mutableListOf<Triple<String, String, Int>>()
+        val resolverCalls = mutableListOf<List<String>>()
+        val stateAtCall = mutableListOf<TransportState>()
+        val base = fakeProbes(host)
+        val probes = FieldProbeSet(
+            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks, https = base.https,
+            stageProbe = { id, b ->
+                stateAtCall += host.transportState.value
+                stageCalls += Triple(id, b.kind.name, b.port)
+                StageProbeResult(id, b.kind.name, b.host, b.port, null, emptyList())
+            },
+            dnsDirect = { r ->
+                stateAtCall += host.transportState.value
+                resolverCalls += r
+                emptyList()
+            },
+        )
+        val report = runner(host, probes).run { }
+
+        assertEquals(1, stageCalls.size) // only the one TLS_TCP binding of the fake manifest
+        assertEquals("TLS_TCP", stageCalls.single().second)
+        assertEquals(2083, stageCalls.single().third)
+        assertEquals(listOf(listOf("192.168.1.1", "193.232.160.49")), resolverCalls)
+        assertTrue(stateAtCall.all { it is TransportState.Disconnected })
+        assertEquals(1, report.stageProbes.size)
+        assertEquals(1, report.toJson().getJSONArray("stageProbes").length())
+    }
 
     private fun TestScope.runner(host: FakeHost, probes: FieldProbeSet = fakeProbes(host)) =
         FieldTestRunner(host, probes, fastTimings, clock = { testScheduler.currentTime })
@@ -693,7 +727,7 @@ class FieldTestRunnerTest {
         val base = fakeProbes(host)
         val traceUrls = mutableListOf<Pair<String, String>>()
         val probes = FieldProbeSet(
-            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks,
+            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks, stageProbe = base.stageProbe, dnsDirect = base.dnsDirect,
             https = { label, url, network, maxBytes, parseTrace ->
                 if (parseTrace) traceUrls += label to url
                 val result = base.https(label, url, network, maxBytes, parseTrace)
@@ -727,7 +761,7 @@ class FieldTestRunnerTest {
         val base = fakeProbes(host)
         // The direct trace (VPN off) fails; every in-tunnel probe still answers.
         val probes = FieldProbeSet(
-            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks,
+            dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks, stageProbe = base.stageProbe, dnsDirect = base.dnsDirect,
             https = { label, url, network, maxBytes, parseTrace ->
                 if (parseTrace && host.transportState.value !is TransportState.Connected) {
                     HttpProbeResult(label, url, false, null, 1, null, 0, null, false, "IOException: down")
@@ -767,7 +801,7 @@ class FieldTestRunnerTest {
             host.transportState.value = if (disconnectedBefore) TransportState.Disconnected else TransportState.Reconnecting(1)
             val base = fakeProbes(host)
             val probes = FieldProbeSet(
-                dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks,
+                dns = base.dns, tcp = base.tcp, censorship = base.censorship, api = base.api, leaks = base.leaks, stageProbe = base.stageProbe, dnsDirect = base.dnsDirect,
                 https = { label, url, network, maxBytes, parseTrace ->
                     val result = base.https(label, url, network, maxBytes, parseTrace)
                     if (label == "Cloudflare trace") {

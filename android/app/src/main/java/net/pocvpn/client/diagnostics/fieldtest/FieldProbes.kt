@@ -109,6 +109,12 @@ data class HttpProbeResult(
     /** Parsed key=value lines of a Cloudflare `/cdn-cgi/trace` body (filtered by the caller). */
     val trace: Map<String, String> = emptyMap(),
     val failureKind: ProbeFailureKind? = null,
+    /**
+     * First received body byte -> last received body byte (null when no body byte arrived or the
+     * probe predates this field). Unlike [elapsedMs] it excludes DNS, connect, TLS and any final
+     * stall wait, so it is the only window a transfer rate may be computed over.
+     */
+    val transferMs: Long? = null,
 )
 
 /** One short, non-secret description of a failure: exception class + first line of the message. */
@@ -173,6 +179,8 @@ object FieldProbes {
         var bytes = 0L
         var status: Int? = null
         var headersMs: Long? = null
+        var firstByteNanos: Long? = null
+        var lastByteNanos: Long? = null
         val body = if (parseTrace) StringBuilder() else null
         try {
             val target = URL(url)
@@ -207,6 +215,9 @@ object FieldProbes {
                             break
                         }
                         if (body != null && body.length < 4_096) body.append(String(buffer, 0, n, Charsets.UTF_8))
+                        val now = System.nanoTime()
+                        if (firstByteNanos == null) firstByteNanos = now
+                        lastByteNanos = now
                         bytes += n
                         if (bytes >= maxBytes) {
                             complete = true
@@ -227,6 +238,7 @@ object FieldProbes {
                 bodyComplete = complete,
                 error = if (stalledAt != null) "stalled after $stalledAt bytes" else if (!complete) "time budget exhausted" else null,
                 trace = body?.let { parseTraceBody(it.toString()) }.orEmpty(),
+                transferMs = firstByteNanos?.let { first -> lastByteNanos?.let { last -> (last - first) / 1_000_000 } },
             )
         } catch (e: Exception) {
             HttpProbeResult(

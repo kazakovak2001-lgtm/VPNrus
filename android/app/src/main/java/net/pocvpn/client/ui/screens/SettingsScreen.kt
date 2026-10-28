@@ -70,6 +70,10 @@ fun SettingsScreen(
     onOpenVpnSettingsClick: () -> Unit = {},
     // Settings -> GeoData; the row is shown only when a handler is supplied.
     onGeoDataClick: (() -> Unit)? = null,
+    // The full Diagnostics dialog (force transport, re-activate, refresh manifest, field test, ...).
+    // The button is shown only when a handler is supplied - AppRoot supplies one in debug / field-test
+    // builds only, never in a normal release (see shouldShowDiagnostics).
+    onAdvancedDiagnosticsClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     // B30A - physical-validation fix: this Column has no bound on its
@@ -323,6 +327,11 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurface,
         )
         Spacer(modifier = Modifier.height(12.dp))
+        onAdvancedDiagnosticsClick?.let { open ->
+            androidx.compose.material3.TextButton(onClick = open, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.settings_diagnostics_advanced))
+            }
+        }
         androidx.compose.material3.TextButton(onClick = onNetworkCheckClick, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.settings_network_check))
         }

@@ -60,5 +60,25 @@
             android:name="net.pocvpn.client.debug.shadowsocksvalidation.ShadowsocksAdapterValidationActivity"
             android:exported="true"
             android:label="Shadowsocks Adapter Validation (debug, not production)" />
+
+        <!-- TEMPORARY - Secure Orbit Home visual preview with FICTIONAL data (no ViewModel, no
+             network, no credentials). Debug source set only, so absent from release. DUMP
+             permission like XrayDiagnosticsActivity: launchable from adb shell only. -->
+        <activity
+            android:name="net.pocvpn.client.debug.homepreview.HomePreviewActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:label="Home Preview (debug)" />
+
+        <!-- F2A - EXPERIMENT HARNESS, debug source set only (absent from release). Runs one bounded
+             attempt through the real VlessXhttpTransport with a test-only endpoint (private IPv4 or
+             reserved *.invalid/.test/.example/.localhost hosts); see F2XhttpTestProfile. DUMP
+             permission: launchable from adb shell only. -->
+        <activity
+            android:name="net.pocvpn.client.debug.f2.F2XhttpHarnessActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:launchMode="singleTop"
+            android:label="F2 XHTTP Harness (debug)" />
     </application>
 </manifest>

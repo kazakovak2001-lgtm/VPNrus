@@ -3950,6 +3950,15 @@ class MainViewModel(
         override val currentTransportKind get() = this@MainViewModel.currentTransportKind
 
         override fun vpnPermissionGranted(): Boolean = android.net.VpnService.prepare(context) == null
+
+        // Connectivity timeline for the field test (observation only, see NetworkEventLog).
+        private val networkEventSource = net.pocvpn.client.diagnostics.fieldtest.AndroidNetworkEventSource(
+            context,
+            net.pocvpn.client.diagnostics.fieldtest.NetworkEventLog(System::currentTimeMillis),
+        )
+
+        override fun startNetworkEvents() = networkEventSource.start()
+        override fun stopNetworkEvents() = networkEventSource.stop()
         override fun provisionedGateways() = provisionedGatewayIds
         override fun trustedManifest() = manifestRepository?.trusted()
         override fun endpointIdFor(gateway: net.pocvpn.client.vpn.config.ProductionGatewayId): String =
@@ -4014,6 +4023,7 @@ class MainViewModel(
             try { org.json.JSONObject(exportSupportBundleJson()) } catch (e: org.json.JSONException) { null }
 
         override fun networkContext() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.collect(context)
+        override fun physicalResolvers() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.physicalResolvers(context)
         override fun vpnNetwork() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.vpnNetwork(context)
         override fun deviceInfo() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.device()
 

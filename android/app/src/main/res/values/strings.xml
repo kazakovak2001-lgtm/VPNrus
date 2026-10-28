@@ -119,7 +119,7 @@
 
     <!-- B29 - Field diagnostics / support bundle: a sanitized, structured connection report the user can export and share, no technical knowledge required. -->
     <string name="settings_diagnostics_title">Diagnostics</string>
-    <string name="settings_diagnostics_explanation">If you have a connection problem, export diagnostics and share them with support.</string>
+    <string name="settings_diagnostics_explanation">If you have a connection problem, export diagnostics and share them with support. A full field test also sends simple test TLS and DNS packets to Nova\'s own servers and to your network\'s DNS resolver.</string>
     <string name="settings_diagnostics_last_result_label">Last connection result</string>
     <string name="settings_diagnostics_export">Export diagnostics</string>
     <string name="settings_diagnostics_clear">Clear diagnostics</string>
@@ -153,6 +153,7 @@
     <string name="field_test_start_monitor">Monitor my connection for %1$d min</string>
     <string name="field_test_intro_quick">Checks what this network blocks and how (DNS, IP, SNI filtering, throttling, block pages), whether the Nova servers and activation are reachable, and collects recent errors and logs (secrets removed). The VPN is paused during the check and reconnected afterwards. Nothing is sent anywhere - you choose whether to share the report.</string>
     <string name="settings_network_check">Network check (diagnostics report)</string>
+    <string name="settings_diagnostics_advanced">Diagnostics (all tools)</string>
     <string name="field_test_cancel">Cancel (keeps a partial report)</string>
     <string name="field_test_share">Share report (JSON)</string>
     <string name="field_test_share_summary">Share summary (text)</string>

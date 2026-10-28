@@ -185,6 +185,10 @@ data class FieldTestReport(
     val apiChecks: JSONArray? = null,
     val manifestRefresh: String? = null,
     val directResolver: DnsProbeResult? = null,
+    /** Stage-by-stage answers of the TLS_TCP gateway ports; empty when not run. */
+    val stageProbes: List<StageProbeResult> = emptyList(),
+    /** Direct UDP/53 answers of the physical network's resolver; empty when not run. */
+    val resolverQueries: List<DnsQueryRecord> = emptyList(),
     val monitor: JSONObject? = null,
     val exitReasons: JSONArray? = null,
     val crashes: JSONArray? = null,
@@ -193,10 +197,12 @@ data class FieldTestReport(
     val dataPlaneChecks: JSONObject? = null,
     /** B-WL7 layer 3a checks (TunnelProtectionLog.reportJson); optional - absent from the JSON when null. */
     val protectionChecks: JSONObject? = null,
+    /** Android connectivity timeline for the whole test; null when the host does not provide one. */
+    val networkEvents: NetworkEventSnapshot? = null,
 ) {
     companion object {
         const val SCHEMA = "nova-field-test"
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
     }
 }
 
@@ -223,6 +229,8 @@ internal fun FieldTestReport.summaryLines(): List<String> {
     }
     manifestRefresh?.let { lines += "Manifest refresh: $it" }
     directResolver?.let { lines += "DNS resolver (VPN off): ${it.addresses.joinToString(",").ifBlank { it.error.orEmpty() }}" }
+    stageProbes.forEach { lines += it.summaryLine() }
+    resolverQueryLines().forEach { lines += it }
     monitor?.let { m ->
         lines += "-- Monitor --"
         lines += "  connected ${m.optLong("connectedPercent")}% of ${m.optLong("durationMs") / 1000}s, probes ${m.optString("probeSuccess")}, reconnects ${m.optInt("reconnects")}, events ${m.optJSONArray("events")?.length() ?: 0}"
@@ -233,6 +241,7 @@ internal fun FieldTestReport.summaryLines(): List<String> {
     }
     crashes?.let { if (it.length() > 0) lines += "Recorded crashes: ${it.length()}" }
     if (runs.isNotEmpty()) lines += "-- VPN runs --"
+    val diagnosisList = diagnoses()
     runs.forEach { r ->
         val detail = when (r.outcome) {
             FieldRunOutcome.SKIPPED -> r.skipReason.orEmpty()
@@ -243,7 +252,9 @@ internal fun FieldTestReport.summaryLines(): List<String> {
                 r.activeTransport?.let { append(", via $it") }
                 r.exitIp?.let { append(", exit $it") }
                 r.exitColo?.let { append(" ($it)") }
-                r.throughput?.let { append(", bulk ${throughputText(it)}") }
+                // A voided session's transfer is never shown as a rate (it would read as "0 kbit/s").
+                r.throughput?.takeIf { r.outcome != FieldRunOutcome.MEASUREMENT_INVALIDATED }
+                    ?.let { append(", bulk ${throughputText(throughputVerdict(it, sessionInvalidated = false))}") }
                 val stalls = (r.probes + r.stability + listOfNotNull(r.throughput)).mapNotNull { it.stalledAtBytes }
                 if (stalls.isNotEmpty()) append(", STALL at ${stalls.joinToString("/")} B")
                 r.leaks?.let { append(", leaks ${LeakChecks.summaryText(it)}") }
@@ -251,6 +262,16 @@ internal fun FieldTestReport.summaryLines(): List<String> {
             }
         }
         lines += "  ${r.target.label}: ${r.outcome} - $detail"
+        val d = diagnosisList[runs.indexOf(r)]
+        lines += "    diagnosis: ${d.category} (${d.confidence.name.lowercase()})" + d.evidence.firstOrNull()?.let { " - $it" }.orEmpty()
+    }
+    networkEvents?.let { n ->
+        val lost = n.underlyingLost
+        lines += "Network events: ${n.events.size}${if (n.suppressedRepeats > 0) " (+${n.suppressedRepeats} identical repeats not stored)" else ""}, underlying lost $lost" +
+            (if (n.vpnLost > 0) ", tunnel network lost ${n.vpnLost} (own disconnects)" else "") +
+            (if (n.unknownLost > 0) ", unattributed lost ${n.unknownLost}" else "") +
+            ", not validated ${if (n.unvalidatedSeen) "seen" else "not seen"}" +
+            (n.registrationError?.let { ", timeline UNAVAILABLE ($it)" } ?: "")
     }
     if (runs.isNotEmpty()) {
         val working = runs.filter { it.outcome == FieldRunOutcome.DATA_PLANE_OK || it.outcome == FieldRunOutcome.DATA_PLANE_CORE_CONFIRMED }.map { it.target.label }
@@ -268,9 +289,14 @@ private fun httpVerdict(r: HttpProbeResult): String = when {
     else -> "FAIL (${r.error})"
 }
 
-private fun throughputText(r: HttpProbeResult): String {
-    val kbps = if (r.elapsedMs > 0) r.bytesRead * 8 / r.elapsedMs else 0
-    return "${r.bytesRead / 1024}KB/${r.elapsedMs}ms (~${kbps}kbit/s)${if (r.ok) "" else " INCOMPLETE"}"
+private fun throughputText(v: ThroughputVerdict): String = when (v) {
+    is ThroughputVerdict.Measured -> "${v.bytes / 1024}KB/${v.transferMs}ms (~${v.rateKbps}kbit/s)"
+    is ThroughputVerdict.NotMeasured -> buildString {
+        append("not measured (${v.reason}")
+        if (v.bytesRead > 0) append(", ${v.bytesRead}B read")
+        v.stalledAtBytes?.let { append(", stalled at ${it}B") }
+        append(")")
+    }
 }
 
 // --- JSON (fixed key order, same discipline as SupportBundle.toJson) --------
@@ -291,19 +317,24 @@ fun FieldTestReport.toJson(): JSONObject {
     root.put("appStateBefore", appStateBefore)
     root.put("appStateAfter", appStateAfter ?: JSONObject.NULL)
     root.put("direct", direct?.toJson() ?: JSONObject.NULL)
-    root.put("runs", JSONArray().apply { runs.forEach { put(it.toJson()) } })
+    val diagnoses = diagnoses()
+    root.put("runs", JSONArray().apply { runs.forEachIndexed { i, r -> put(r.toJson().put("diagnosis", diagnoses[i].toJson())) } })
     root.put("supportBundle", supportBundle ?: JSONObject.NULL)
     root.put("mode", mode.name)
     root.put("censorship", censorship?.toJson() ?: JSONObject.NULL)
     root.put("apiChecks", apiChecks ?: JSONObject.NULL)
     root.put("manifestRefresh", manifestRefresh ?: JSONObject.NULL)
     root.put("directResolver", directResolver?.toJson() ?: JSONObject.NULL)
+    root.put("stageProbes", JSONArray().apply { stageProbes.forEach { put(it.toJson()) } })
+    root.put("resolverQueries", resolverQueries.toJsonArray())
     root.put("monitor", monitor ?: JSONObject.NULL)
     root.put("exitReasons", exitReasons ?: JSONObject.NULL)
     root.put("crashes", crashes ?: JSONObject.NULL)
     root.put("logs", JSONArray(logs))
     dataPlaneChecks?.let { root.put("dataPlaneChecks", it) }
     protectionChecks?.let { root.put("protectionChecks", it) }
+    networkEvents?.let { root.put("networkEvents", it.toJson()) }
+    root.put("diagnosisSummary", diagnosisSummary(diagnoses))
     return root
 }
 
@@ -331,7 +362,7 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("exitLoc", exitLoc ?: JSONObject.NULL)
     .put("dns", dns?.toJson() ?: JSONObject.NULL)
     .put("probes", JSONArray().apply { probes.forEach { put(it.toJson()) } })
-    .put("throughput", throughput?.toJson() ?: JSONObject.NULL)
+    .put("throughput", throughput?.let { throughputJson(it, outcome == FieldRunOutcome.MEASUREMENT_INVALIDATED) } ?: JSONObject.NULL)
     .put("stability", JSONArray().apply { stability.forEach { put(it.toJson()) } })
     .put("transportScoresBefore", JSONObject().apply { transportScoresBefore.toSortedMap().forEach { (k, v) -> put(k, v) } })
     .put("diagnosticSession", diagnosticSession ?: JSONObject.NULL)
@@ -364,3 +395,42 @@ internal fun HttpProbeResult.toJson(): JSONObject = JSONObject()
     .put("bodyComplete", bodyComplete)
     .put("error", error ?: JSONObject.NULL)
     .put("trace", JSONObject().apply { trace.toSortedMap().forEach { (k, v) -> put(k, v) } })
+
+/** One line per resolver and name: the attempts' outcomes in order, e.g. "control.aknova.pp.ua A: NXDOMAIN NXDOMAIN ANSWER". */
+internal fun FieldTestReport.resolverQueryLines(): List<String> =
+    resolverQueries.groupBy { Triple(it.resolver, it.host, it.qtype) }.map { (key, records) ->
+        val (resolver, host, qtype) = key
+        if (host == "-") "  direct resolver ($resolver): ${records.joinToString("; ") { it.note ?: it.result.name }}"
+        else "  direct resolver ($resolver) $host $qtype: ${records.sortedBy { it.attempt }.joinToString(" ") { it.result.name }}"
+    }
+
+/** The raw probe plus the validity verdict: `rateKbps` is null unless a transfer was actually observed in a valid session. */
+internal fun throughputJson(r: HttpProbeResult, sessionInvalidated: Boolean): JSONObject {
+    val json = r.toJson().put("totalMs", r.elapsedMs)
+    when (val v = throughputVerdict(r, sessionInvalidated)) {
+        is ThroughputVerdict.Measured -> json.put("valid", true).put("invalidReason", JSONObject.NULL)
+            .put("transferMs", v.transferMs).put("rateKbps", v.rateKbps)
+        is ThroughputVerdict.NotMeasured -> json.put("valid", false).put("invalidReason", v.reason.name)
+            .put("transferMs", r.transferMs ?: JSONObject.NULL).put("rateKbps", JSONObject.NULL)
+    }
+    return json
+}
+
+/** Report-level roll-up: how many attempts fell in each diagnosis category, plus the network timeline totals. */
+internal fun FieldTestReport.diagnosisSummary(diagnoses: List<RunDiagnosis>): JSONObject {
+    val byCategory = JSONObject()
+    diagnoses.groupingBy { it.category.name }.eachCount().toSortedMap().forEach { (k, v) -> byCategory.put(k, v) }
+    val events = networkEvents
+    return JSONObject()
+        .put("attempts", diagnoses.size)
+        .put("byCategory", byCategory)
+        .put("networkTimeline", when {
+            events == null -> "NOT_PROVIDED"
+            events.registrationError != null -> "UNAVAILABLE"
+            else -> "RECORDED"
+        })
+        .put("underlyingNetworkLost", events?.underlyingLost ?: JSONObject.NULL)
+        .put("vpnNetworkLost", events?.vpnLost ?: JSONObject.NULL)
+        .put("unknownNetworkLost", events?.unknownLost ?: JSONObject.NULL)
+        .put("unvalidatedSeen", events?.unvalidatedSeen ?: JSONObject.NULL)
+}

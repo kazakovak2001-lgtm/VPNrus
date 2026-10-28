@@ -49,6 +49,25 @@ object FieldNetworkContext {
         return "$transports validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)} net=$underlying"
     }
 
+    /**
+     * IPv4 resolvers of the physical (non-VPN) network that has internet, at most two. They are used to
+     * ask the resolver directly; the report shows a resolver address only when it is public.
+     */
+    fun physicalResolvers(context: Context): List<String> {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        val candidates = listOfNotNull(cm.activeNetwork) + cm.allNetworks.toList()
+        val underlying = candidates.firstOrNull { n ->
+            val c = cm.getNetworkCapabilities(n)
+            c != null && !c.hasTransport(NetworkCapabilities.TRANSPORT_VPN) && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } ?: return emptyList()
+        return cm.getLinkProperties(underlying)?.dnsServers.orEmpty()
+            .filterIsInstance<Inet4Address>()
+            .mapNotNull { it.hostAddress }
+            .filter { ProbeTargets.isAcceptableResolver(it) }
+            .distinct()
+            .take(2)
+    }
+
     /** The network carrying our own VPN tunnel, or null when no VPN network exists. */
     fun vpnNetwork(context: Context): Network? = vpnNetwork(context.getSystemService(ConnectivityManager::class.java))
 
