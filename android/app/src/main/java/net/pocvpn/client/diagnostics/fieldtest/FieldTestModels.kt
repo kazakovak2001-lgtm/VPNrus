@@ -198,7 +198,7 @@ data class FieldTestReport(
 ) {
     companion object {
         const val SCHEMA = "nova-field-test"
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
     }
 }
 
@@ -246,7 +246,9 @@ internal fun FieldTestReport.summaryLines(): List<String> {
                 r.activeTransport?.let { append(", via $it") }
                 r.exitIp?.let { append(", exit $it") }
                 r.exitColo?.let { append(" ($it)") }
-                r.throughput?.let { append(", bulk ${throughputText(it)}") }
+                // A voided session's transfer is never shown as a rate (it would read as "0 kbit/s").
+                r.throughput?.takeIf { r.outcome != FieldRunOutcome.MEASUREMENT_INVALIDATED }
+                    ?.let { append(", bulk ${throughputText(throughputVerdict(it, sessionInvalidated = false))}") }
                 val stalls = (r.probes + r.stability + listOfNotNull(r.throughput)).mapNotNull { it.stalledAtBytes }
                 if (stalls.isNotEmpty()) append(", STALL at ${stalls.joinToString("/")} B")
                 r.leaks?.let { append(", leaks ${LeakChecks.summaryText(it)}") }
@@ -278,9 +280,14 @@ private fun httpVerdict(r: HttpProbeResult): String = when {
     else -> "FAIL (${r.error})"
 }
 
-private fun throughputText(r: HttpProbeResult): String {
-    val kbps = if (r.elapsedMs > 0) r.bytesRead * 8 / r.elapsedMs else 0
-    return "${r.bytesRead / 1024}KB/${r.elapsedMs}ms (~${kbps}kbit/s)${if (r.ok) "" else " INCOMPLETE"}"
+private fun throughputText(v: ThroughputVerdict): String = when (v) {
+    is ThroughputVerdict.Measured -> "${v.bytes / 1024}KB/${v.transferMs}ms (~${v.rateKbps}kbit/s)"
+    is ThroughputVerdict.NotMeasured -> buildString {
+        append("not measured (${v.reason}")
+        if (v.bytesRead > 0) append(", ${v.bytesRead}B read")
+        v.stalledAtBytes?.let { append(", stalled at ${it}B") }
+        append(")")
+    }
 }
 
 // --- JSON (fixed key order, same discipline as SupportBundle.toJson) --------
@@ -344,7 +351,7 @@ internal fun FieldTransportRun.toJson(): JSONObject = JSONObject()
     .put("exitLoc", exitLoc ?: JSONObject.NULL)
     .put("dns", dns?.toJson() ?: JSONObject.NULL)
     .put("probes", JSONArray().apply { probes.forEach { put(it.toJson()) } })
-    .put("throughput", throughput?.toJson() ?: JSONObject.NULL)
+    .put("throughput", throughput?.let { throughputJson(it, outcome == FieldRunOutcome.MEASUREMENT_INVALIDATED) } ?: JSONObject.NULL)
     .put("stability", JSONArray().apply { stability.forEach { put(it.toJson()) } })
     .put("transportScoresBefore", JSONObject().apply { transportScoresBefore.toSortedMap().forEach { (k, v) -> put(k, v) } })
     .put("diagnosticSession", diagnosticSession ?: JSONObject.NULL)
@@ -377,6 +384,18 @@ internal fun HttpProbeResult.toJson(): JSONObject = JSONObject()
     .put("bodyComplete", bodyComplete)
     .put("error", error ?: JSONObject.NULL)
     .put("trace", JSONObject().apply { trace.toSortedMap().forEach { (k, v) -> put(k, v) } })
+
+/** The raw probe plus the validity verdict: `rateKbps` is null unless a transfer was actually observed in a valid session. */
+internal fun throughputJson(r: HttpProbeResult, sessionInvalidated: Boolean): JSONObject {
+    val json = r.toJson().put("totalMs", r.elapsedMs)
+    when (val v = throughputVerdict(r, sessionInvalidated)) {
+        is ThroughputVerdict.Measured -> json.put("valid", true).put("invalidReason", JSONObject.NULL)
+            .put("transferMs", v.transferMs).put("rateKbps", v.rateKbps)
+        is ThroughputVerdict.NotMeasured -> json.put("valid", false).put("invalidReason", v.reason.name)
+            .put("transferMs", r.transferMs ?: JSONObject.NULL).put("rateKbps", JSONObject.NULL)
+    }
+    return json
+}
 
 /** Report-level roll-up: how many attempts fell in each diagnosis category, plus the network timeline totals. */
 internal fun FieldTestReport.diagnosisSummary(diagnoses: List<RunDiagnosis>): JSONObject {
