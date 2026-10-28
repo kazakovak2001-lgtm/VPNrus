@@ -64,10 +64,47 @@ class RunDiagnosisTest {
         assertEquals(DiagnosisConfidence.HIGH, d.confidence)
     }
 
-    @Test fun network_lost_during_failed_attempt_is_network_unavailable_medium() {
-        val d = diagnoseRun(run(FieldRunOutcome.HANDSHAKE_FAILED), NetworkWindow(underlyingLost = 2, unvalidatedSeen = false, changes = 3))
+    @Test fun network_lost_during_a_non_handshake_failure_is_network_unavailable_medium() {
+        val d = diagnoseRun(run(FieldRunOutcome.CONNECT_FAILED, errorMessage = "connect failed"), NetworkWindow(underlyingLost = 2, unvalidatedSeen = false, changes = 3))
         assertEquals(DiagnosisCategory.NETWORK_UNAVAILABLE, d.category)
         assertEquals(DiagnosisConfidence.MEDIUM, d.confidence)
+    }
+
+    @Test fun network_loss_does_not_override_a_failed_handshake_outcome() {
+        val d = diagnoseRun(run(FieldRunOutcome.HANDSHAKE_FAILED), NetworkWindow(underlyingLost = 2, unvalidatedSeen = false, changes = 3))
+        assertEquals(DiagnosisCategory.HANDSHAKE_FAILED, d.category)
+        assertEquals(DiagnosisConfidence.LOW, d.confidence)
+        assertTrue(d.evidence.any { "lost 2 time(s)" in it && "may have contributed" in it })
+    }
+
+    @Test fun connect_failed_with_handshake_not_confirmed_is_a_handshake_failure_even_after_a_network_loss() {
+        // The field-test shape (TLS_TCP / Xray): terminal "Error(remote handshake not confirmed)" + 1 loss in the window.
+        val d = diagnoseRun(
+            run(FieldRunOutcome.CONNECT_FAILED, terminalState = "Error(remote handshake not confirmed)", errorMessage = "remote handshake not confirmed"),
+            NetworkWindow(underlyingLost = 1, unvalidatedSeen = false, changes = 2),
+        )
+        assertEquals(DiagnosisCategory.HANDSHAKE_FAILED, d.category)
+        assertEquals(DiagnosisConfidence.LOW, d.confidence)
+        assertEquals(false, d.tunnelEstablished)
+        assertTrue(d.missingMeasurements.any { "independent reachability probe" in it })
+    }
+
+    @Test fun connect_failed_with_handshake_not_confirmed_and_no_loss_is_medium() {
+        val d = diagnoseRun(
+            run(FieldRunOutcome.CONNECT_FAILED, errorMessage = "remote handshake not confirmed"),
+            NetworkWindow(underlyingLost = 0, unvalidatedSeen = false, changes = 0),
+        )
+        assertEquals(DiagnosisCategory.HANDSHAKE_FAILED, d.category)
+        assertEquals(DiagnosisConfidence.MEDIUM, d.confidence)
+    }
+
+    @Test fun explicit_no_network_text_still_wins_over_a_handshake_failure() {
+        val d = diagnoseRun(
+            run(FieldRunOutcome.CONNECT_FAILED, errorMessage = "remote handshake not confirmed: no underlying network"),
+            NetworkWindow(underlyingLost = 1, unvalidatedSeen = false, changes = 1),
+        )
+        assertEquals(DiagnosisCategory.NETWORK_UNAVAILABLE, d.category)
+        assertEquals(DiagnosisConfidence.HIGH, d.confidence)
     }
 
     @Test fun unvalidated_network_is_recorded_as_evidence_only() {
@@ -180,6 +217,19 @@ class RunDiagnosisTest {
         assertEquals(1, w.underlyingLost)
         assertTrue(w.unvalidatedSeen)
         assertEquals(2, w.changes)
+    }
+
+    @Test fun lost_event_of_our_own_tunnel_network_is_not_an_underlying_loss() {
+        // onLost carries no transports, so the tunnel's LOST is recognised by the id it was seen with earlier
+        // (the field-test timeline: network 322 CELLULAR+VPN, later LOST with an empty transport list).
+        val events = listOf(
+            NetworkEvent(500, 0, NetworkEventType.AVAILABLE, "322", listOf("CELLULAR", "VPN"), true, true, true, "tun0", 2),
+            NetworkEvent(1_100, 0, NetworkEventType.LOST, "322", emptyList(), null, null, null, null, null),
+            NetworkEvent(1_200, 0, NetworkEventType.LOST, "311", emptyList(), null, null, null, null, null),
+            NetworkEvent(1_000, 0, NetworkEventType.AVAILABLE, "311", listOf("CELLULAR"), true, true, true, "rmnet0", 2),
+        )
+        val w = networkWindow(events, 1_000, 2_000)
+        assertEquals(1, w.underlyingLost) // only the cellular network "311"
     }
 
     @Test fun failed_registration_is_reported_not_treated_as_no_changes() {

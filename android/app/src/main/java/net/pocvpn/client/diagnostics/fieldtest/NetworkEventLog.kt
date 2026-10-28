@@ -144,7 +144,11 @@ class NetworkEventLog(
 
 /** Reduces [events] inside [fromUtc, toUtc) to a [NetworkWindow]. VPN networks are ignored: they are our own tunnel. */
 fun networkWindow(events: List<NetworkEvent>, fromUtc: Long, toUtc: Long): NetworkWindow {
-    val inWindow = events.filter { it.tUtcMillis in fromUtc until toUtc && !it.isVpn }
+    // onLost carries no capabilities (empty transports), so a LOST of our own tunnel network is only
+    // recognisable by the id it was seen with earlier: without this, every tunnel teardown counted
+    // as an underlying-network loss.
+    val vpnIds = events.filter { it.isVpn }.map { it.networkId }.toSet()
+    val inWindow = events.filter { it.tUtcMillis in fromUtc until toUtc && !it.isVpn && it.networkId !in vpnIds }
     return NetworkWindow(
         underlyingLost = inWindow.count { it.type == NetworkEventType.LOST },
         unvalidatedSeen = inWindow.any { it.validated == false },

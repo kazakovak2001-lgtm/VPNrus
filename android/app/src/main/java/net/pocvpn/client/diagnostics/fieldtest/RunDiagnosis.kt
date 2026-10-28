@@ -67,6 +67,7 @@ data class RunDiagnosis(
 }
 
 private val NO_NETWORK_MARKERS = listOf("no underlying network", "network is unreachable", "no default network")
+private val HANDSHAKE_MARKERS = listOf("handshake")
 private val IPV4_LITERAL_HOST = Regex("""^https?://\d{1,3}(\.\d{1,3}){3}[:/]""")
 
 /** [window] is the network timeline slice for this attempt, or null when no timeline exists. */
@@ -99,15 +100,22 @@ fun diagnoseRun(run: FieldTransportRun, window: NetworkWindow?): RunDiagnosis {
                     evidence += "Android reported no usable underlying network"
                     result(DiagnosisCategory.NETWORK_UNAVAILABLE, DiagnosisConfidence.HIGH, false, false)
                 }
+                // A handshake that did not complete is the observed failure; a network loss in the same
+                // window is context, not the explanation (the tunnel's own teardown and Android's
+                // network switching also show up there), so it only lowers the confidence.
+                run.outcome == FieldRunOutcome.HANDSHAKE_FAILED || HANDSHAKE_MARKERS.any { it in text } -> {
+                    if (lost > 0) {
+                        evidence += "the default network was lost $lost time(s) during this attempt (it may have contributed; the failure itself is a handshake that did not complete)"
+                    } else {
+                        evidence += "the network was available but the handshake did not complete"
+                    }
+                    run.terminalState?.let { evidence += "terminal state: $it" }
+                    missing += "independent reachability probe of the endpoint (separates a blocked endpoint from a failed handshake)"
+                    result(DiagnosisCategory.HANDSHAKE_FAILED, if (lost > 0) DiagnosisConfidence.LOW else DiagnosisConfidence.MEDIUM, false, false)
+                }
                 lost > 0 -> {
                     evidence += "the default network was lost $lost time(s) during this attempt"
                     result(DiagnosisCategory.NETWORK_UNAVAILABLE, DiagnosisConfidence.MEDIUM, false, false)
-                }
-                run.outcome == FieldRunOutcome.HANDSHAKE_FAILED -> {
-                    evidence += "the network was available but the handshake did not complete"
-                    run.terminalState?.let { evidence += "terminal state: $it" }
-                    missing += "independent reachability probe of the endpoint (separates a blocked endpoint from a failed handshake)"
-                    result(DiagnosisCategory.HANDSHAKE_FAILED, DiagnosisConfidence.MEDIUM, false, false)
                 }
                 run.outcome == FieldRunOutcome.CONNECT_TIMEOUT -> {
                     evidence += "no connection within ${run.connectMs?.let { "${it} ms" } ?: "the time limit"}"

@@ -32,7 +32,8 @@ class FieldTestReportDiagnosisTest {
     @Test fun json_has_per_run_diagnosis_timeline_and_rollup() {
         val events = NetworkEventSnapshot(listOf(lost(2_500)), dropped = 0, suppressedRepeats = 0, registrationError = null)
         val json = report(
-            listOf(failedRun(2_000, FieldRunOutcome.HANDSHAKE_FAILED), failedRun(5_000, FieldRunOutcome.HANDSHAKE_FAILED)),
+            // A handshake failure is no longer re-labelled by a loss in its window, so the first (windowed) attempt is a plain connect failure.
+            listOf(failedRun(2_000, FieldRunOutcome.CONNECT_FAILED), failedRun(5_000, FieldRunOutcome.HANDSHAKE_FAILED)),
             events,
         ).toJson()
 
@@ -73,7 +74,7 @@ class FieldTestReportDiagnosisTest {
 
     @Test fun text_summary_shows_diagnosis_and_network_events() {
         val events = NetworkEventSnapshot(listOf(lost(2_500)), 0, 0, null)
-        val lines = report(listOf(failedRun(2_000, FieldRunOutcome.HANDSHAKE_FAILED)), events).summaryLines()
+        val lines = report(listOf(failedRun(2_000, FieldRunOutcome.CONNECT_FAILED)), events).summaryLines()
         assertTrue(lines.any { it.trim().startsWith("diagnosis: NETWORK_UNAVAILABLE (medium)") })
         assertTrue(lines.any { it.startsWith("Network events: 1, underlying lost 1") })
     }
