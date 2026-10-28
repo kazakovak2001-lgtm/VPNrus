@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import net.pocvpn.client.reachability.EndpointManifest
+import net.pocvpn.client.reachability.EndpointTransportBinding
 import net.pocvpn.client.reachability.ingressKind
 import net.pocvpn.client.transport.TransportKind
 import net.pocvpn.client.vpn.TransportState
@@ -29,6 +30,9 @@ interface FieldTestHost {
     val sessionHealth: StateFlow<VpnSessionHealth>
     val currentTransportKind: StateFlow<TransportKind?>
     fun vpnPermissionGranted(): Boolean
+
+    /** IPv4 resolvers of the PHYSICAL (non-VPN) network, at most two; empty when unknown. The direct resolver probe asks only these. */
+    fun physicalResolvers(): List<String> = emptyList()
     fun provisionedGateways(): Set<ProductionGatewayId>
     fun trustedManifest(): EndpointManifest?
     fun endpointIdFor(gateway: ProductionGatewayId): String
@@ -160,6 +164,11 @@ class FieldProbeSet(
     val censorship: suspend ((String) -> Unit) -> CensorshipReport = { onLine -> CensorshipProbe.run(onLine) },
     val api: suspend (List<String>) -> org.json.JSONArray = { origins -> ApiReachability.check(origins) },
     val leaks: suspend (Network?, List<String>, Boolean?) -> JSONObject = { n, direct, v6 -> LeakChecks.inTunnel(n, direct, v6) },
+    /** One TLS_TCP manifest binding -> which stage answers (TCP / ClientHello without SNI / neutral SNI). Observation only. */
+    val stageProbe: suspend (endpointId: String, binding: EndpointTransportBinding) -> StageProbeResult =
+        { id, b -> StageProbe().probe(id, b) },
+    /** Direct UDP/53 queries to the given physical-network resolvers (RCODE / answer count / bogon). */
+    val dnsDirect: suspend (List<String>) -> List<DnsQueryRecord> = { resolvers -> DnsDirectProbe().run(resolvers) },
 )
 
 /**
@@ -304,6 +313,8 @@ class FieldTestRunner(
         var api: org.json.JSONArray? = null
         var manifestRefresh: String? = null
         var directResolver: DnsProbeResult? = null
+        var stageProbeResults: List<StageProbeResult> = emptyList()
+        var resolverQueryRecords: List<DnsQueryRecord> = emptyList()
         var monitor: JSONObject? = null
         var abort: String? = null
         var cancelled = false
@@ -331,6 +342,13 @@ class FieldTestRunner(
                 val resolver = probes.dns(LeakChecks.RESOLVER_WHOAMI, null)
                 directResolver = resolver
                 progress("Direct probes", "  DNS resolver (VPN off): ${resolver.addresses.joinToString(",").ifBlank { resolver.error.orEmpty() }}")
+                // Only while confirmed Disconnected: these must reach the ordinary network, never the tunnel.
+                if (host.transportState.value is TransportState.Disconnected) {
+                    progress("Direct probes", "Stage probes (TLS_TCP) and direct resolver queries...")
+                    stageProbeResults = stageProbes(manifest)
+                    stageProbeResults.forEach { progress("Direct probes", it.summaryLine()) }
+                    resolverQueryRecords = probes.dnsDirect(host.physicalResolvers())
+                }
                 step++
                 progress("Censorship analysis", "What is blocked on this network, and how...")
                 val c = probes.censorship { progress("Censorship analysis", it) }
@@ -391,6 +409,8 @@ class FieldTestRunner(
             apiChecks = api,
             manifestRefresh = manifestRefresh,
             directResolver = directResolver,
+            stageProbes = stageProbeResults,
+            resolverQueries = resolverQueryRecords,
             monitor = monitor,
             exitReasons = host.exitReasons(),
             crashes = host.crashes(),
@@ -510,6 +530,17 @@ class FieldTestRunner(
             .put("reconnects", reconnects)
             .put("events", events)
             .put("samples", samples)
+    }
+
+    /** One probe per distinct TLS_TCP manifest binding; the probe itself refuses anything but a public IPv4 literal. */
+    private suspend fun stageProbes(manifest: EndpointManifest?): List<StageProbeResult> {
+        val seen = mutableSetOf<String>()
+        val out = mutableListOf<StageProbeResult>()
+        manifest?.endpoints?.forEach { e ->
+            e.transports.filter { it.kind == TransportKind.TLS_TCP && seen.add("${it.host}:${it.port}") }
+                .forEach { b -> out += probes.stageProbe(e.id.value, b) }
+        }
+        return out
     }
 
     private suspend fun directProbes(manifest: EndpointManifest?, onLine: (String) -> Unit): FieldDirectProbes {

@@ -185,6 +185,10 @@ data class FieldTestReport(
     val apiChecks: JSONArray? = null,
     val manifestRefresh: String? = null,
     val directResolver: DnsProbeResult? = null,
+    /** Stage-by-stage answers of the TLS_TCP gateway ports; empty when not run. */
+    val stageProbes: List<StageProbeResult> = emptyList(),
+    /** Direct UDP/53 answers of the physical network's resolver; empty when not run. */
+    val resolverQueries: List<DnsQueryRecord> = emptyList(),
     val monitor: JSONObject? = null,
     val exitReasons: JSONArray? = null,
     val crashes: JSONArray? = null,
@@ -225,6 +229,8 @@ internal fun FieldTestReport.summaryLines(): List<String> {
     }
     manifestRefresh?.let { lines += "Manifest refresh: $it" }
     directResolver?.let { lines += "DNS resolver (VPN off): ${it.addresses.joinToString(",").ifBlank { it.error.orEmpty() }}" }
+    stageProbes.forEach { lines += it.summaryLine() }
+    resolverQueryLines().forEach { lines += it }
     monitor?.let { m ->
         lines += "-- Monitor --"
         lines += "  connected ${m.optLong("connectedPercent")}% of ${m.optLong("durationMs") / 1000}s, probes ${m.optString("probeSuccess")}, reconnects ${m.optInt("reconnects")}, events ${m.optJSONArray("events")?.length() ?: 0}"
@@ -319,6 +325,8 @@ fun FieldTestReport.toJson(): JSONObject {
     root.put("apiChecks", apiChecks ?: JSONObject.NULL)
     root.put("manifestRefresh", manifestRefresh ?: JSONObject.NULL)
     root.put("directResolver", directResolver?.toJson() ?: JSONObject.NULL)
+    root.put("stageProbes", JSONArray().apply { stageProbes.forEach { put(it.toJson()) } })
+    root.put("resolverQueries", resolverQueries.toJsonArray())
     root.put("monitor", monitor ?: JSONObject.NULL)
     root.put("exitReasons", exitReasons ?: JSONObject.NULL)
     root.put("crashes", crashes ?: JSONObject.NULL)
@@ -387,6 +395,14 @@ internal fun HttpProbeResult.toJson(): JSONObject = JSONObject()
     .put("bodyComplete", bodyComplete)
     .put("error", error ?: JSONObject.NULL)
     .put("trace", JSONObject().apply { trace.toSortedMap().forEach { (k, v) -> put(k, v) } })
+
+/** One line per resolver and name: the attempts' outcomes in order, e.g. "control.aknova.pp.ua A: NXDOMAIN NXDOMAIN ANSWER". */
+internal fun FieldTestReport.resolverQueryLines(): List<String> =
+    resolverQueries.groupBy { Triple(it.resolver, it.host, it.qtype) }.map { (key, records) ->
+        val (resolver, host, qtype) = key
+        if (host == "-") "  direct resolver ($resolver): ${records.joinToString("; ") { it.note ?: it.result.name }}"
+        else "  direct resolver ($resolver) $host $qtype: ${records.sortedBy { it.attempt }.joinToString(" ") { it.result.name }}"
+    }
 
 /** The raw probe plus the validity verdict: `rateKbps` is null unless a transfer was actually observed in a valid session. */
 internal fun throughputJson(r: HttpProbeResult, sessionInvalidated: Boolean): JSONObject {

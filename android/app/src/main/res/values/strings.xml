@@ -119,7 +119,7 @@
 
     <!-- B29 - Field diagnostics / support bundle: a sanitized, structured connection report the user can export and share, no technical knowledge required. -->
     <string name="settings_diagnostics_title">Diagnostics</string>
-    <string name="settings_diagnostics_explanation">If you have a connection problem, export diagnostics and share them with support.</string>
+    <string name="settings_diagnostics_explanation">If you have a connection problem, export diagnostics and share them with support. A full field test also sends simple test TLS and DNS packets to Nova\'s own servers and to your network\'s DNS resolver.</string>
     <string name="settings_diagnostics_last_result_label">Last connection result</string>
     <string name="settings_diagnostics_export">Export diagnostics</string>
     <string name="settings_diagnostics_clear">Clear diagnostics</string>

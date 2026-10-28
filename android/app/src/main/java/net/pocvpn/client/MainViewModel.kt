@@ -4023,6 +4023,7 @@ class MainViewModel(
             try { org.json.JSONObject(exportSupportBundleJson()) } catch (e: org.json.JSONException) { null }
 
         override fun networkContext() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.collect(context)
+        override fun physicalResolvers() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.physicalResolvers(context)
         override fun vpnNetwork() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.vpnNetwork(context)
         override fun deviceInfo() = net.pocvpn.client.diagnostics.fieldtest.FieldNetworkContext.device()
 
