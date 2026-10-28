@@ -1232,5 +1232,149 @@ class ActivationIdConsistencyTests(FieldEnrollmentTestBase):
         self.assertIsNone(field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key))
 
 
+class IngressRoleEnrollmentTests(FieldEnrollmentTestBase):
+    """Ingress role (provision_awg_peer=False): register only. Stockholm's
+    xhttp ingress returned 500 for every enrollment because the gateway path
+    ran its no-op `exit 99` provision script (2026-10-28)."""
+
+    def setUp(self):
+        super().setUp()
+        self.noop_path = os.path.join(self._tmp.name, "noop-provision-peer")
+        with open(self.noop_path, "w") as f:
+            f.write("#!/bin/sh\nexit 99\n")
+        os.chmod(self.noop_path, 0o750)
+
+    def _enroll_ingress(self, public_key, cap=5):
+        return field_enrollment_module.enroll_device(
+            public_key,
+            self.index_path, self.index_lock_path,
+            self.store_path, self.lock_path,
+            self.noop_path, 5.0,
+            global_device_cap=cap,
+            wrap_key_file=self.wrap_key_file,
+            provision_awg_peer=False,
+        )
+
+    def _record(self, credential):
+        return activations_module.find_by_credential_digest(
+            self.store_path, self.lock_path, activations_module.credential_digest(credential),
+        )
+
+    def test_ingress_enrolls_without_any_awg_provisioning(self):
+        key = make_public_key(0x71)
+        with mock.patch.object(activations_module, "provision_with_activation") as prov, \
+                mock.patch.object(activations_module, "decide_and_bind") as bind:
+            result = self._enroll_ingress(key)
+        prov.assert_not_called()
+        bind.assert_not_called()
+        self.assertEqual(result.outcome, field_enrollment_module.ENROLLED)
+        self.assertIsNone(result.client_tunnel_ip)
+        record = self._record(result.credential)
+        self.assertEqual(record["status"], activations_module.ACTIVE)
+        self.assertEqual(record["max_devices"], 1)
+        self.assertEqual(record["bound_devices"], [], "the ingress binds on first /v1/ingress-profile, not here")
+        self.assertIsNotNone(field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key))
+
+    def test_ingress_never_executes_the_noop_provision_script(self):
+        os.chmod(self.noop_path, 0o000)
+        self.addCleanup(os.chmod, self.noop_path, 0o750)
+        result = self._enroll_ingress(make_public_key(0x72))
+        self.assertEqual(result.outcome, field_enrollment_module.ENROLLED)
+
+    def test_gateway_role_with_the_noop_script_still_fails_closed(self):
+        """The production bug, gateway semantics unchanged: provisioning
+        failure is PROVISION_FAILED with nothing left behind."""
+        key = make_public_key(0x73)
+        result = field_enrollment_module.enroll_device(
+            key, self.index_path, self.index_lock_path, self.store_path, self.lock_path,
+            self.noop_path, 5.0, global_device_cap=5, wrap_key_file=self.wrap_key_file,
+        )
+        self.assertEqual(result.outcome, field_enrollment_module.PROVISION_FAILED)
+        self.assertIsNone(result.credential)
+        self.assertEqual(activations_module.read_store_shared(self.store_path, self.lock_path), {})
+        self.assertIsNone(field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key))
+
+    def test_gateway_role_still_provisions_by_default(self):
+        with mock.patch.object(
+            activations_module, "provision_with_activation", wraps=activations_module.provision_with_activation,
+        ) as prov:
+            result = self._enroll(make_public_key(0x74))
+        prov.assert_called_once()
+        self.assertEqual(result.outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(result.client_tunnel_ip, "10.77.0.9")
+
+    def test_ingress_repeat_enrollment_is_idempotent(self):
+        key = make_public_key(0x75)
+        r1 = self._enroll_ingress(key)
+        r2 = self._enroll_ingress(key)
+        self.assertEqual(r2.outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(r1.credential, r2.credential)
+        self.assertEqual(len(activations_module.read_store_shared(self.store_path, self.lock_path)), 1)
+        self.assertEqual(len(field_enrollment_module.list_index(self.index_path, self.index_lock_path)), 1)
+
+    def test_ingress_global_device_cap_is_enforced(self):
+        self.assertEqual(self._enroll_ingress(make_public_key(0x76), cap=1).outcome, field_enrollment_module.ENROLLED)
+        self.assertEqual(
+            self._enroll_ingress(make_public_key(0x77), cap=1).outcome, field_enrollment_module.DEVICE_CAP_REACHED,
+        )
+
+    def test_ingress_refuses_a_credential_whose_slot_another_device_holds(self):
+        key = make_public_key(0x78)
+        credential = self._enroll_ingress(key).credential
+        other = make_public_key(0x79)
+        decision = activations_module.decide_and_bind(credential, other, self.store_path, self.lock_path)
+        self.assertEqual(decision.outcome, activations_module.BOUND_NEW)
+        self.assertEqual(self._enroll_ingress(key).outcome, field_enrollment_module.DEVICE_CAP_REACHED)
+
+    def test_ingress_reports_revoked_and_expired(self):
+        key = make_public_key(0x7A)
+        credential = self._enroll_ingress(key).credential
+        activations_module.revoke_activation(self.store_path, self.lock_path, self._record(credential)["activation_id"])
+        self.assertEqual(self._enroll_ingress(key).outcome, field_enrollment_module.REVOKED)
+
+        key2 = make_public_key(0x7B)
+        credential2 = self._enroll_ingress(key2).credential
+        data = activations_module.read_store_shared(self.store_path, self.lock_path)
+        data[activations_module.credential_digest(credential2)]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        with open(self.store_path, "w") as f:
+            json.dump(data, f)
+        self.assertEqual(self._enroll_ingress(key2).outcome, field_enrollment_module.EXPIRED)
+
+    def test_ingress_registration_failure_leaves_no_partial_state(self):
+        key = make_public_key(0x7C)
+        with mock.patch.object(
+            activations_module, "register_credential", side_effect=activations_module.ActivationStoreError("disk full"),
+        ):
+            with self.assertRaises(activations_module.ActivationStoreError):
+                self._enroll_ingress(key)
+        self.assertIsNone(field_enrollment_module.find_in_index(self.index_path, self.index_lock_path, key))
+        self.assertEqual(activations_module.read_store_shared(self.store_path, self.lock_path), {})
+
+    def test_ingress_concurrent_distinct_keys_never_exceed_the_cap(self):
+        cap = 2
+        keys = [make_public_key(0x80 + i) for i in range(5)]
+        results, errors = [], []
+        barrier = threading.Barrier(len(keys))
+
+        def worker(k):
+            barrier.wait()
+            try:
+                results.append(self._enroll_ingress(k, cap=cap))
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(k,)) for k in keys]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        enrolled = [r for r in results if r.outcome == field_enrollment_module.ENROLLED]
+        self.assertEqual(len(enrolled), cap)
+        self.assertEqual(len(activations_module.read_store_shared(self.store_path, self.lock_path)), cap)
+        self.assertEqual(len(field_enrollment_module.list_index(self.index_path, self.index_lock_path)), cap)
+
+
 if __name__ == "__main__":
     unittest.main()

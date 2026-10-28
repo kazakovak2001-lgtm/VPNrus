@@ -18,6 +18,7 @@ from _fixtures import (
     RunningServer,
     make_app_config,
     make_field_enrollment_wrap_key_file,
+    make_ingress_config,
     make_public_key,
     set_plan,
     write_fake_provision_script,
@@ -153,6 +154,61 @@ class FieldEnrollEndpointTests(unittest.TestCase):
         post_field_enroll(server.port, body_obj={"public_key": make_public_key(0x60)})
         _status, _headers, body = post_field_enroll(server.port, body_obj={"public_key": make_public_key(0x61)})
         self.assertNotIn("activation_credential", json.loads(body))
+
+
+class IngressFieldEnrollEndpointTests(FieldEnrollEndpointTests):
+    """A server started with an ingress_config registers only: Stockholm's
+    xhttp ingress answered 500 for every /v1/field-enroll because the
+    gateway path ran its no-op provision script."""
+
+    def _ingress_server(self):
+        noop = os.path.join(self._tmp.name, "noop-provision-peer")
+        with open(noop, "w") as f:
+            f.write("#!/bin/sh\nexit 99\n")
+        os.chmod(noop, 0o750)
+        app_config = make_app_config(
+            self._tmp.name, noop,
+            activation_store_path=self.activation_store_path,
+            activation_lock_path=self.activation_lock_path,
+            field_enrollment_enabled=True,
+            field_enrollment_max_devices=5,
+            field_enrollment_index_path=self.index_path,
+            field_enrollment_index_lock_path=self.index_lock_path,
+            field_enrollment_wrap_key_file=self.wrap_key_file,
+        )
+        server = RunningServer(app_config, make_ingress_config(self._tmp.name))
+        self.addCleanup(server.close)
+        return server
+
+    def test_ingress_enrolls_and_registers_without_provisioning(self):
+        server = self._ingress_server()
+        key = make_public_key(0x60)
+        status, _headers, body = post_field_enroll(server.port, body_obj={"public_key": key})
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertTrue(payload["activation_credential"])
+        self.assertEqual(payload["client_tunnel_ip"], "0.0.0.0")
+        self.assertEqual(
+            set(payload),
+            {"activation_credential", "client_tunnel_ip", "gateway_public_key", "gateway_tunnel_ip", "endpoint_host", "endpoint_port"},
+        )
+        record = activations_module.find_by_credential_digest(
+            self.activation_store_path, self.activation_lock_path,
+            activations_module.credential_digest(payload["activation_credential"]),
+        )
+        self.assertEqual(record["bound_devices"], [])
+
+    def test_ingress_replay_returns_the_same_credential(self):
+        server = self._ingress_server()
+        key = make_public_key(0x61)
+        _s1, _h1, b1 = post_field_enroll(server.port, body_obj={"public_key": key})
+        _s2, _h2, b2 = post_field_enroll(server.port, body_obj={"public_key": key})
+        self.assertEqual(json.loads(b1)["activation_credential"], json.loads(b2)["activation_credential"])
+
+    def test_ingress_still_rejects_an_invalid_public_key(self):
+        server = self._ingress_server()
+        status, _headers, _body = post_field_enroll(server.port, body_obj={"public_key": "not-a-key"})
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

@@ -715,6 +715,26 @@ def _reserve_locked(index_path, index_lock_path, wrap_key_bytes, public_key, glo
         return _Reservation(credential, activation_id, is_new_index_entry=True)
 
 
+def _ingress_registration_result(activation_store_path, activation_lock_path, credential, public_key, now):
+    """Read-only step 3 of enroll_device for the ingress role - see its
+    docstring. Raises ActivationStoreError (via the store read) like every
+    other store access here; never writes."""
+    record = activations.find_by_credential_digest(
+        activation_store_path, activation_lock_path, activations.credential_digest(credential),
+    )
+    if record is None:
+        return FieldEnrollmentResult(DISABLED)
+    state = activations.entitlement_state(record, now or datetime.now(timezone.utc))
+    if state == activations.ENTITLEMENT_REVOKED:
+        return FieldEnrollmentResult(REVOKED)
+    if state == activations.ENTITLEMENT_EXPIRED:
+        return FieldEnrollmentResult(EXPIRED)
+    bound = [d["public_key"] for d in record["bound_devices"]]
+    if public_key not in bound and len(bound) >= record["max_devices"]:
+        return FieldEnrollmentResult(DEVICE_CAP_REACHED)
+    return FieldEnrollmentResult(ENROLLED, credential=credential, client_tunnel_ip=None)
+
+
 def enroll_device(
     public_key,
     index_path, index_lock_path,
@@ -724,6 +744,7 @@ def enroll_device(
     wrap_key_file,
     sudo_path=None,
     now=None,
+    provision_awg_peer=True,
 ):
     """The ONE function POST /v1/field-enroll calls once handler.py's own
     config/enabled gate has already passed. Caller is responsible for rate
@@ -799,6 +820,21 @@ def enroll_device(
     it was writing may already durably exist, and deleting the index
     reservation naming it would strand that record with no way back to
     its public key on a same-key retry.
+
+    `provision_awg_peer=False` is the INGRESS role (handler.py passes it
+    only when the server process was started with an ingress_config - never
+    from request data). An ingress has no AWG peer to provision - its
+    POCVPN_API_PROVISION_SCRIPT_PATH is a no-op placeholder that must never
+    run - and its own POST /v1/ingress-profile is the first-use binding
+    authority (xray_provisioning.provision_and_activate_identity_selfbind,
+    which enforces max_devices through decide_and_bind/finalize_reservation).
+    So steps 1-2 (reserve, register) run unchanged and step 3 is replaced by
+    a read-only entitlement check of the record step 2 just registered or
+    confirmed: REVOKED/EXPIRED map as in step 3, a record whose device slots
+    are already taken by OTHER public keys is DEVICE_CAP_REACHED, and only
+    an ACTIVE record with a free or own slot is ENROLLED (with
+    client_tunnel_ip None - nothing was provisioned). Nothing is written in
+    that step, so it needs no rollback of its own.
     """
     if not is_valid_wg_public_key(public_key):
         return FieldEnrollmentResult(INVALID_PUBLIC_KEY)
@@ -887,6 +923,11 @@ def enroll_device(
                 f"activation_id={activation_id!r} for this public key, but the activation store's "
                 f"own record for this exact credential digest carries activation_id="
                 f"{register_result.activation_id!r} - refusing to provision or report success"
+            )
+
+        if not provision_awg_peer:
+            return _ingress_registration_result(
+                activation_store_path, activation_lock_path, credential, public_key, now,
             )
 
         # Reuse the EXACT SAME orchestration POST /v1/activate uses - decide_and_bind
