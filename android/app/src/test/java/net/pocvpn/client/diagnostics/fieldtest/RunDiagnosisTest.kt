@@ -188,4 +188,49 @@ class RunDiagnosisTest {
         log.failRegistration("SecurityException")
         assertEquals("SecurityException", log.snapshot().registrationError)
     }
+
+    @Test fun identical_repeats_are_suppressed_but_real_changes_are_kept() {
+        val log = NetworkEventLog({ now }, capacity = 50)
+        log.begin()
+        fun caps(validated: Boolean?) = log.record(NetworkEventType.CAPABILITIES_CHANGED, "201", listOf("WIFI"), validated, true, true, "wlan0", 3)
+        now += 1_000
+        caps(true)
+        now += 2_000
+        caps(true)
+        now += 2_000
+        caps(true)
+        now += 2_000
+        caps(false)
+        now += 2_000
+        caps(true)
+        // A different network with the same state is its own sequence.
+        log.record(NetworkEventType.CAPABILITIES_CHANGED, "202", listOf("WIFI"), true, true, true, "wlan0", 3)
+        val snap = log.snapshot()
+        assertEquals(4, snap.events.size)
+        assertEquals(2, snap.suppressedRepeats)
+        assertEquals(0, snap.dropped)
+        assertEquals(listOf<Boolean?>(true, false, true, true), snap.events.map { it.validated })
+    }
+
+    @Test fun lost_and_available_are_never_suppressed() {
+        val log = NetworkEventLog({ now })
+        log.begin()
+        now += 1_000
+        log.record(NetworkEventType.LOST, "1", listOf("CELLULAR"), null, null, null, null, null)
+        log.record(NetworkEventType.LOST, "1", listOf("CELLULAR"), null, null, null, null, null)
+        assertEquals(2, log.snapshot().events.size)
+    }
+
+    @Test fun events_replayed_right_after_registration_are_marked_initial() {
+        val log = NetworkEventLog({ now })
+        log.begin()
+        now += 5
+        log.record(NetworkEventType.AVAILABLE, "1", listOf("WIFI"), true, true, true, "wlan0", 3)
+        now += 2_000
+        log.record(NetworkEventType.CAPABILITIES_CHANGED, "1", listOf("WIFI"), false, true, true, "wlan0", 3)
+        val events = log.snapshot().events
+        assertTrue(events[0].initial)
+        assertFalse(events[1].initial)
+    }
+
 }

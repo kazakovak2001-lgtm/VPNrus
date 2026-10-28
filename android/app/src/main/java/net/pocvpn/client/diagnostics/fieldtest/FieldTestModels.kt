@@ -259,7 +259,7 @@ internal fun FieldTestReport.summaryLines(): List<String> {
     }
     networkEvents?.let { n ->
         val lost = n.events.count { it.type == NetworkEventType.LOST && !it.isVpn }
-        lines += "Network events: ${n.events.size}, underlying lost $lost, not validated ${if (n.events.any { it.validated == false && !it.isVpn }) "seen" else "not seen"}" +
+        lines += "Network events: ${n.events.size}${if (n.suppressedRepeats > 0) " (+${n.suppressedRepeats} identical repeats not stored)" else ""}, underlying lost $lost, not validated ${if (n.events.any { it.validated == false && !it.isVpn }) "seen" else "not seen"}" +
             (n.registrationError?.let { ", timeline UNAVAILABLE ($it)" } ?: "")
     }
     if (runs.isNotEmpty()) {

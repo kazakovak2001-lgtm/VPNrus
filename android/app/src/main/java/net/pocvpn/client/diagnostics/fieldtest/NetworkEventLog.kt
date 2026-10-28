@@ -34,6 +34,11 @@ data class NetworkEvent(
     val hasDefaultRoute: Boolean?,
     val interfaceName: String?,
     val dnsServerCount: Int?,
+    /**
+     * Android replays the CURRENT state of every network right after a callback is
+     * registered; such events describe the starting situation, not a change.
+     */
+    val initial: Boolean = false,
 ) {
     /** True for the network carrying our own tunnel. */
     val isVpn: Boolean get() = "VPN" in transports
@@ -49,18 +54,22 @@ data class NetworkEvent(
         .put("hasDefaultRoute", hasDefaultRoute ?: JSONObject.NULL)
         .put("interfaceName", interfaceName ?: JSONObject.NULL)
         .put("dnsServerCount", dnsServerCount ?: JSONObject.NULL)
+        .put("initial", initial)
 }
 
 data class NetworkEventSnapshot(
     val events: List<NetworkEvent>,
     /** Events discarded because the log was full (the oldest are kept). */
     val dropped: Int,
+    /** Repeated capability/link callbacks identical to the previous one for the same network, not stored. */
+    val suppressedRepeats: Int,
     /** Non-null when the callback could not be registered: the timeline is then empty, not "no changes". */
     val registrationError: String?,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("events", JSONArray().apply { events.forEach { put(it.toJson()) } })
         .put("dropped", dropped)
+        .put("suppressedRepeats", suppressedRepeats)
         .put("registrationError", registrationError ?: JSONObject.NULL)
 }
 
@@ -79,11 +88,15 @@ class NetworkEventLog(
     private val events = ArrayList<NetworkEvent>()
     private var startedAt = clock()
     private var dropped = 0
+    private var suppressed = 0
+    private val lastByKey = HashMap<String, List<Any?>>()
     private var registrationError: String? = null
 
     @Synchronized fun begin() {
         events.clear()
         dropped = 0
+        suppressed = 0
+        lastByKey.clear()
         registrationError = null
         startedAt = clock()
     }
@@ -102,15 +115,31 @@ class NetworkEventLog(
         interfaceName: String?,
         dnsServerCount: Int?,
     ) {
+        // Wi-Fi reports a capability change every ~2 s (bandwidth estimate, signal); identical repeats
+        // would fill the buffer within minutes and hide the end of a long monitor run.
+        val state = listOf(transports, validated, hasInternet, hasDefaultRoute, interfaceName, dnsServerCount)
+        if (type == NetworkEventType.CAPABILITIES_CHANGED || type == NetworkEventType.LINK_CHANGED) {
+            val key = "$networkId/${type.name}"
+            if (lastByKey[key] == state) {
+                suppressed++
+                return
+            }
+            lastByKey[key] = state
+        }
         if (events.size >= capacity) {
             dropped++
             return
         }
         val now = clock()
-        events += NetworkEvent(now, now - startedAt, type, networkId, transports, validated, hasInternet, hasDefaultRoute, interfaceName, dnsServerCount)
+        val relative = now - startedAt
+        events += NetworkEvent(now, relative, type, networkId, transports, validated, hasInternet, hasDefaultRoute, interfaceName, dnsServerCount, initial = relative < INITIAL_SNAPSHOT_MS)
     }
 
-    @Synchronized fun snapshot(): NetworkEventSnapshot = NetworkEventSnapshot(events.toList(), dropped, registrationError)
+    @Synchronized fun snapshot(): NetworkEventSnapshot = NetworkEventSnapshot(events.toList(), dropped, suppressed, registrationError)
+
+    private companion object {
+        const val INITIAL_SNAPSHOT_MS = 500L
+    }
 }
 
 /** Reduces [events] inside [fromUtc, toUtc) to a [NetworkWindow]. VPN networks are ignored: they are our own tunnel. */

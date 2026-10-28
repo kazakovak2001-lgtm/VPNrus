@@ -30,7 +30,7 @@ class FieldTestReportDiagnosisTest {
     private fun lost(at: Long) = NetworkEvent(at, at - 1_000, NetworkEventType.LOST, "100", listOf("CELLULAR"), null, null, null, null, null)
 
     @Test fun json_has_per_run_diagnosis_timeline_and_rollup() {
-        val events = NetworkEventSnapshot(listOf(lost(2_500)), dropped = 0, registrationError = null)
+        val events = NetworkEventSnapshot(listOf(lost(2_500)), dropped = 0, suppressedRepeats = 0, registrationError = null)
         val json = report(
             listOf(failedRun(2_000, FieldRunOutcome.HANDSHAKE_FAILED), failedRun(5_000, FieldRunOutcome.HANDSHAKE_FAILED)),
             events,
@@ -62,7 +62,7 @@ class FieldTestReportDiagnosisTest {
     }
 
     @Test fun failed_registration_is_unavailable_not_recorded() {
-        val events = NetworkEventSnapshot(emptyList(), 0, "SecurityException")
+        val events = NetworkEventSnapshot(emptyList(), 0, 0, "SecurityException")
         val json = report(listOf(failedRun(2_000, FieldRunOutcome.HANDSHAKE_FAILED)), events).toJson()
         assertEquals("UNAVAILABLE", json.getJSONObject("diagnosisSummary").getString("networkTimeline"))
         assertTrue(json.getJSONObject("diagnosisSummary").getInt("underlyingNetworkLost") == 0)
@@ -72,7 +72,7 @@ class FieldTestReportDiagnosisTest {
     }
 
     @Test fun text_summary_shows_diagnosis_and_network_events() {
-        val events = NetworkEventSnapshot(listOf(lost(2_500)), 0, null)
+        val events = NetworkEventSnapshot(listOf(lost(2_500)), 0, 0, null)
         val lines = report(listOf(failedRun(2_000, FieldRunOutcome.HANDSHAKE_FAILED)), events).summaryLines()
         assertTrue(lines.any { it.trim().startsWith("diagnosis: NETWORK_UNAVAILABLE (medium)") })
         assertTrue(lines.any { it.startsWith("Network events: 1, underlying lost 1") })
